@@ -25,12 +25,17 @@ output "control_table_arns" {
 }
 
 output "authority_runtime_contract" {
-  description = "Validated nullable version-1 Authority runtime contract. Both current environment wrappers keep this null and the runtime dark."
+  description = "Validated nullable version-1 Authority runtime contract. The exact-main generator is the only supported non-null sandbox caller."
   value       = var.authority_runtime_contract
 }
 
+output "authority_image_uri" {
+  description = "Verified immutable Authority image URI, or null while the runtime contract is disabled."
+  value       = local.authority_runtime_image_uri
+}
+
 output "authority_selected_alias_targets" {
-  description = "Plan-derived same-color Hub and provisioned-cell Authority alias ARNs. This schema-only precursor creates no function or caller path."
+  description = "Plan-derived same-color Hub and provisioned-cell Authority alias ARNs. This contract-only foundation creates no function or caller path."
   value       = local.authority_selected_alias_targets
 }
 

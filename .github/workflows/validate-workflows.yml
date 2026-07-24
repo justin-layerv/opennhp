@@ -53,6 +53,7 @@ on:
       - "scripts/verify-control-otp-pepper.sh"
       - "scripts/verify-control-sandbox-first-apply.sh"
       - "scripts/verify-control-sandbox-live-boundary.sh"
+      - "docs/evidence/connector-authority/v1/**"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       # qURL v2 revocation-latency SLO lockstep (#2817): trigger on the script
       # and on BOTH source-of-truth sites it compares so a one-sided edit to the
@@ -554,6 +555,7 @@ jobs:
             tests/scripts/check-control-global-routing_test.sh
           python3 tests/scripts/test_check_control_sandbox_first_apply.py
           python3 tests/scripts/test_check_control_sandbox_update.py
+          python3 tests/scripts/test_generate_connector_authority_runtime_contract.py
           tests/scripts/check-control-global-routing_test.sh
 
       - name: Test one-time sandbox terraform_read recovery contract

@@ -83,6 +83,21 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
             },
             {},
         ),
+        "module.control.terraform_data.foundation_contract": (
+            {
+                "input": {
+                    "account_id": CHECKER.ACCOUNT_ID,
+                    "control_table_prefix": CHECKER.CONTROL_PREFIX,
+                    "region": CHECKER.AWS_REGION,
+                },
+                "output": {
+                    "account_id": CHECKER.ACCOUNT_ID,
+                    "control_table_prefix": CHECKER.CONTROL_PREFIX,
+                    "region": CHECKER.AWS_REGION,
+                },
+            },
+            {},
+        ),
         "module.control.aws_kms_key.authority_data": (
             {
                 "bypass_policy_lockout_safety_check": False,
@@ -345,6 +360,55 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
     return result
 
 
+def authority_runtime_input_fixture() -> dict:
+    evidence = {
+        "repository": "layervai/nhp",
+        "source_commit": "a" * 40,
+        "path": (
+            "docs/evidence/connector-authority/v1/"
+            "sandbox-measurement-basis.json"
+        ),
+        "sha256": "b" * 64,
+        "schema_version": 1,
+    }
+    digest = "sha256:" + "1" * 64
+    repository = (
+        f"{CHECKER.ACCOUNT_ID}.dkr.ecr.{CHECKER.AWS_REGION}.amazonaws.com/"
+        "layerv/qurl-connector-authority"
+    )
+    functions = {
+        name: {
+            "basis_evidence": copy.deepcopy(evidence),
+            "result_evidence": None,
+        }
+        for name in (
+            "layerv-nhp-sandbox-ca-ia",
+            "layerv-nhp-sandbox-ca-ra",
+            "layerv-nhp-sandbox-ca-icr",
+        )
+    }
+    return {
+        "account_id": CHECKER.ACCOUNT_ID,
+        "control_table_prefix": CHECKER.CONTROL_PREFIX,
+        "region": CHECKER.AWS_REGION,
+        "authority_image_uri": f"{repository}@{digest}",
+        "authority_runtime_contract": {
+            "schema_version": 1,
+            "phase": "measurement",
+            "selected_authority_color": "blue",
+            "provisioned_cells": {"cell0": {"caller_role_arn": "fixture"}},
+            "provisioned_cells_evidence": copy.deepcopy(evidence),
+            "global": {
+                "authority_repository_url": repository,
+                "authority_image_digest": digest,
+                "basis_evidence": copy.deepcopy(evidence),
+                "result_evidence": None,
+            },
+            "functions": functions,
+        },
+    }
+
+
 def set_expression_path(
     expressions: dict, path: tuple[str | int, ...], value: object
 ) -> None:
@@ -410,6 +474,11 @@ def configuration_fixture() -> dict:
         by_address[address] = resource
     for address, paths in CHECKER.CONFIG_REFERENCE_CONTRACT.items():
         for path, references in paths.items():
+            if path == ("count",):
+                by_address[address]["count_expression"] = {
+                    "references": references
+                }
+                continue
             set_expression_path(
                 by_address[address]["expressions"],
                 path,
@@ -500,6 +569,22 @@ def plan_fixture() -> dict:
         "resource_drift": [],
         "resource_changes": changes,
     }
+
+
+def authority_contract_transition_fixture() -> dict:
+    result = plan_fixture()
+    result["applyable"] = True
+    change = next(
+        item["change"]
+        for item in result["resource_changes"]
+        if item["address"]
+        == "module.control.terraform_data.foundation_contract"
+    )
+    change["actions"] = ["update"]
+    change["after"]["input"] = authority_runtime_input_fixture()
+    change["after"]["output"] = None
+    change["after_unknown"] = {"output": True}
+    return result
 
 
 def redis_split_transition_fixture(create_addresses: set[str] | None = None) -> dict:
@@ -852,6 +937,33 @@ class PlanContractTests(unittest.TestCase):
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
         self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 50)
+
+    def test_exact_authority_contract_binding_passes_and_drift_fails(self) -> None:
+        candidate = authority_contract_transition_fixture()
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-contract-binding")
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+
+        mutations = (
+            lambda payload: payload.__setitem__(
+                "authority_image_uri", "repository.example/authority:latest"
+            ),
+            lambda payload: payload["authority_runtime_contract"][
+                "provisioned_cells_evidence"
+            ].__setitem__("sha256", "0" * 64),
+            lambda payload: payload["authority_runtime_contract"][
+                "functions"
+            ].pop("layerv-nhp-sandbox-ca-icr"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                changed = authority_contract_transition_fixture()
+                foundation = self.change(
+                    changed,
+                    "module.control.terraform_data.foundation_contract",
+                )["after"]["input"]
+                mutate(foundation)
+                self.assert_rejected(changed)
 
         normalized = plan_fixture()
         normalized_changes = {
@@ -2718,7 +2830,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 4, "managed_resource_count": 50},
+            {"data_resource_count": 6, "managed_resource_count": 50},
         )
 
     def test_missing_managed_or_data_address_fails(self) -> None:
@@ -2753,6 +2865,14 @@ def state_fixture() -> dict:
         for address, resource_type in CHECKER.EXPECTED_RESOURCES.items()
     ]
     by_address = {item["address"]: item["values"] for item in resources}
+    runtime_input = authority_runtime_input_fixture()
+    by_address["module.control.terraform_data.foundation_contract"].clear()
+    by_address["module.control.terraform_data.foundation_contract"].update(
+        {
+            "input": copy.deepcopy(runtime_input),
+            "output": copy.deepcopy(runtime_input),
+        }
+    )
     by_address["module.control.aws_vpc.control"].update(
         {"id": "vpc-abc123", "cidr_block": "10.102.0.0/16"}
     )
@@ -2978,7 +3098,18 @@ def state_fixture() -> dict:
             "user_ids": [default_id, issuer_id, activator_id],
         }
     )
-    return {"values": {"root_module": {"resources": resources}}}
+    return {
+        "values": {
+            "outputs": {
+                "authority_image_uri": {
+                    "sensitive": False,
+                    "type": "string",
+                    "value": runtime_input["authority_image_uri"],
+                }
+            },
+            "root_module": {"resources": resources},
+        }
+    }
 
 
 class StateContractTests(unittest.TestCase):

@@ -48,6 +48,7 @@ METADATA_KEYS = {
     "plan_text_sha256",
     "planned_at_epoch",
     "repository",
+    "runtime_contract_sha256",
     "run_attempt",
     "run_id",
     "schema_version",
@@ -229,6 +230,7 @@ def _artifact_values(
         "plan_text_sha256": sha256_file(args.plan_text),
         "planned_at_epoch": planned_at_epoch,
         "repository": REPOSITORY,
+        "runtime_contract_sha256": sha256_file(args.runtime_contract),
         "run_attempt": int(args.run_attempt),
         "run_id": int(args.run_id),
         "schema_version": 1,
@@ -326,6 +328,7 @@ def _add_artifact_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--plan-text", type=Path, required=True)
     parser.add_argument("--contract-summary", type=Path, required=True)
     parser.add_argument("--contract-checker", type=Path, required=True)
+    parser.add_argument("--runtime-contract", type=Path, required=True)
     parser.add_argument("--state-summary", type=Path, required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--commit-sha", required=True)

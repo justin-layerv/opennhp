@@ -49,9 +49,15 @@ variable "ses_configuration_set_name" {
 }
 
 variable "authority_runtime_contract" {
-  description = "Nullable closed Connector Authority runtime contract. This schema-only precursor intentionally rejects every non-null root value until a later reviewed exact-main evidence composition verifies and supplies the complete sandbox measurement object."
+  description = "Nullable closed Connector Authority runtime contract. The permanent workflow supplies the only supported non-null value through its exact-main byte-verifying generator."
   type        = any
   default     = null
+}
+
+variable "authority_runtime_contract_evidence_verified" {
+  description = "Internal exact-main generator latch. The generated ephemeral tfvars file sets this with the complete verified sandbox contract; committed inputs must leave it false."
+  type        = bool
+  default     = false
 }
 
 variable "tags" {

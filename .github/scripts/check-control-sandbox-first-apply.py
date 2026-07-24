@@ -206,6 +206,7 @@ _DYNAMODB_TABLES = (
 # refresh-only output-contract test parses that file and fails on either drift.
 EXPECTED_CONTROL_OUTPUTS = frozenset(
     {
+        "authority_image_uri",
         "authority_data_kms_key_arn",
         "authority_ecr_repository_url",
         "authority_image_digest_parameter_name",
@@ -445,10 +446,12 @@ INTERFACE_ENDPOINT_SERVICES = (
     "secretsmanager",
 )
 EXPECTED_DATA_RESOURCES = {
+    "module.control.data.aws_ecr_image.authority_runtime[0]": "aws_ecr_image",
     "module.control.data.aws_availability_zones.available": "aws_availability_zones",
     "module.control.data.aws_caller_identity.current": "aws_caller_identity",
     "module.control.data.aws_partition.current": "aws_partition",
     "module.control.data.aws_region.current": "aws_region",
+    "module.control.data.aws_ssm_parameter.authority_runtime_digest[0]": "aws_ssm_parameter",
 }
 DENY_ENDPOINT_POLICY = {
     "Statement": [
@@ -533,11 +536,40 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
             "aws",
         ),
         "module.control.data.aws_region.current": ("data", "aws_region", "aws"),
+        "module.control.data.aws_ssm_parameter.authority_runtime_digest": (
+            "data",
+            "aws_ssm_parameter",
+            "aws",
+        ),
+        "module.control.data.aws_ecr_image.authority_runtime": (
+            "data",
+            "aws_ecr_image",
+            "aws",
+        ),
     }
 )
 
 ExpressionPath = tuple[str | int, ...]
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
+    "module.control.data.aws_ssm_parameter.authority_runtime_digest": {
+        ("count",): ["local.authority_runtime_contract_enabled"],
+        ("name",): [
+            "aws_ssm_parameter.authority_image_digest.name",
+            "aws_ssm_parameter.authority_image_digest",
+        ],
+    },
+    "module.control.data.aws_ecr_image.authority_runtime": {
+        ("count",): ["local.authority_runtime_contract_enabled"],
+        ("image_digest",): [
+            "data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value",
+            "data.aws_ssm_parameter.authority_runtime_digest[0]",
+            "data.aws_ssm_parameter.authority_runtime_digest",
+        ],
+        ("repository_name",): [
+            "aws_ecr_repository.authority.name",
+            "aws_ecr_repository.authority",
+        ],
+    },
     "module.control.aws_vpc.control": {
         ("cidr_block",): ["var.vpc_cidr"],
     },
@@ -1103,7 +1135,11 @@ def _check_configuration_security(
             raise ContractError(
                 f"Terraform configuration expressions missing: {address}"
             )
-        return expressions
+        normalized = dict(expressions)
+        count_expression = resources[address].get("count_expression", _MISSING)
+        if count_expression is not _MISSING:
+            normalized["count"] = count_expression
+        return normalized
 
     for address, paths in CONFIG_REFERENCE_CONTRACT.items():
         expressions = expressions_of(address)
@@ -1282,6 +1318,87 @@ def _require_hub_publisher_identity(
     )
 
 
+def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
+    """Require the generated contract to bind one immutable ECR image URI.
+
+    The exact-main generator owns byte/schema validation. This independent plan
+    boundary verifies that Terraform received the generator's closed evidence
+    shape and that the only deployable image identity is repository@digest.
+    """
+    payload = values.get("input")
+    if not isinstance(payload, dict):
+        raise ContractError("foundation contract input must be an object")
+    dark_keys = {"account_id", "control_table_prefix", "region"}
+    if set(payload) == dark_keys:
+        return False
+    if set(payload) != {
+        *dark_keys,
+        "authority_image_uri",
+        "authority_runtime_contract",
+    }:
+        raise ContractError("foundation runtime input keys are not exact")
+    contract = payload.get("authority_runtime_contract")
+    if not isinstance(contract, dict):
+        raise ContractError("foundation runtime contract must be an object")
+    global_contract = contract.get("global")
+    functions = contract.get("functions")
+    catalog = contract.get("provisioned_cells")
+    evidence = contract.get("provisioned_cells_evidence")
+    if (
+        contract.get("schema_version") != 1
+        or contract.get("phase") != "measurement"
+        or contract.get("selected_authority_color") not in ("blue", "green")
+        or not isinstance(global_contract, dict)
+        or not isinstance(functions, dict)
+        or set(functions)
+        != {
+            "layerv-nhp-sandbox-ca-ia",
+            "layerv-nhp-sandbox-ca-ra",
+            "layerv-nhp-sandbox-ca-icr",
+        }
+        or not isinstance(catalog, dict)
+        or set(catalog) != {"cell0"}
+    ):
+        raise ContractError("foundation runtime contract graph is not exact measurement")
+    digest = global_contract.get("authority_image_digest")
+    repository = global_contract.get("authority_repository_url")
+    image_uri = payload.get("authority_image_uri")
+    if (
+        repository
+        != (
+            f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
+            "layerv/qurl-connector-authority"
+        )
+        or not isinstance(digest, str)
+        or _DIGEST_PATTERN.fullmatch(digest) is None
+        or image_uri != f"{repository}@{digest}"
+    ):
+        raise ContractError("foundation runtime image URI is not exact repository@digest")
+    evidence_objects = [
+        evidence,
+        global_contract.get("basis_evidence"),
+        *(function.get("basis_evidence") for function in functions.values()),
+    ]
+    if (
+        any(not isinstance(item, dict) for item in evidence_objects)
+        or any(item != evidence_objects[0] for item in evidence_objects[1:])
+        or set(evidence_objects[0])
+        != {"path", "repository", "schema_version", "sha256", "source_commit"}
+        or evidence_objects[0].get("repository") != "layervai/nhp"
+        or evidence_objects[0].get("path")
+        != "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+        or evidence_objects[0].get("schema_version") != 1
+        or re.fullmatch(r"[0-9a-f]{40}", str(evidence_objects[0].get("source_commit")))
+        is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(evidence_objects[0].get("sha256")))
+        is None
+        or global_contract.get("result_evidence") is not None
+        or any(function.get("result_evidence") is not None for function in functions.values())
+    ):
+        raise ContractError("foundation runtime evidence binding is not exact")
+    return True
+
+
 def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
@@ -1292,6 +1409,12 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         return after, unknown
 
     vpc, _ = values("module.control.aws_vpc.control")
+    foundation, foundation_unknown = values(
+        "module.control.terraform_data.foundation_contract"
+    )
+    _require_authority_runtime_binding(foundation)
+    if foundation_unknown.get("input") not in (None, {}, False):
+        raise ContractError("foundation runtime input may not remain unknown")
     # Keep the complete provider-version-specific no-op shape visible here as
     # literals rather than deriving its dimensions independently. The empty-
     # string / zero IPv6 values below are the exact no-op shape emitted by the
@@ -2394,6 +2517,19 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             for address in changed_redis_user_addresses
         )
     )
+    authority_contract_address = (
+        "module.control.terraform_data.foundation_contract"
+    )
+    authority_contract_transition = (
+        changed == {authority_contract_address}
+        and actual_non_noop.get(authority_contract_address) == ["update"]
+        and not _require_authority_runtime_binding(
+            by_address[authority_contract_address]["change"].get("before", {})
+        )
+        and _require_authority_runtime_binding(
+            by_address[authority_contract_address]["change"].get("after", {})
+        )
+    )
 
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
@@ -2440,10 +2576,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(
                 "Redis split user-group update may change only user_ids"
             )
+    elif authority_contract_transition:
+        plan_mode = "authority-contract-binding"
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
-            "Hub artifact bootstrap, or reviewed Redis split; "
+            "Hub artifact bootstrap, reviewed Redis split, or exact Authority "
+            "contract binding; "
             f"got {actual_non_noop}"
         )
 
@@ -2466,7 +2605,11 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "publisher role normalization cannot be combined with a resource transition"
         )
     if normalization_drift_kind == "authority-digest":
-        if plan_mode not in ("no-op", "redis-split-transition"):
+        if plan_mode not in (
+            "no-op",
+            "redis-split-transition",
+            "authority-contract-binding",
+        ):
             raise ContractError(
                 "authority digest normalization may accompany only the reviewed "
                 "Redis split transition"
@@ -2667,6 +2810,19 @@ def check_state(state: Any) -> dict[str, Any]:
             raise ContractError(f"refreshed state values missing for {address}")
 
     values = {address: item["values"] for address, item in by_address.items()}
+    foundation = values["module.control.terraform_data.foundation_contract"]
+    if not _require_authority_runtime_binding(foundation):
+        raise ContractError("refreshed state is missing the Authority runtime binding")
+    outputs = values_root.get("outputs")
+    authority_image_output = (
+        outputs.get("authority_image_uri") if isinstance(outputs, dict) else None
+    )
+    if (
+        not _is_exact_nonsensitive_output_entry(authority_image_output)
+        or authority_image_output.get("value")
+        != foundation["input"]["authority_image_uri"]
+    ):
+        raise ContractError("refreshed state Authority image URI output is not exact")
     vpc_id = values["module.control.aws_vpc.control"].get("id")
     if (
         not re.fullmatch(r"vpc-[0-9a-f]+", str(vpc_id))

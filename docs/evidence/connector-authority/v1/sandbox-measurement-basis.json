@@ -1,0 +1,121 @@
+{
+  "contract": {
+    "functions": {
+      "layerv-nhp-sandbox-ca-ia": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-icr": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-ra": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      }
+    },
+    "global": {
+      "authority_digest_parameter_name": "/sandbox/nhp/control/connector-authority/image-digest",
+      "authority_image_digest": "sha256:2fc24118d8ff36d6ecfc1e1e948e8868639689dc8282d9c497c711806309451d",
+      "authority_repository_url": "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority",
+      "aws_account_id": "767397897469",
+      "aws_partition": "aws",
+      "aws_region": "us-east-2",
+      "caller_capacity": {
+        "cell_workers": {
+          "cell0": {
+            "max_replicas": 2,
+            "preinvoke_limits": {
+              "activate_registration": 1,
+              "complete_credential_recovery": 1,
+              "complete_registration": 1,
+              "issue_registration_otp": 1
+            },
+            "preinvoke_rate_limits": {
+              "activate_registration": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "complete_credential_recovery": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "complete_registration": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "issue_registration_otp": {
+                "burst": 1,
+                "refill_per_second": 1
+              }
+            }
+          }
+        },
+        "hub_workers": {
+          "max_replicas": 2,
+          "preinvoke_limits": {
+            "issue_assignment": 1,
+            "issue_credential_recovery": 1,
+            "refresh_assignment": 1
+          },
+          "preinvoke_rate_limits": {
+            "issue_assignment": {
+              "burst": 1,
+              "refill_per_second": 1
+            },
+            "issue_credential_recovery": {
+              "burst": 1,
+              "refill_per_second": 1
+            },
+            "refresh_assignment": {
+              "burst": 1,
+              "refill_per_second": 1
+            }
+          }
+        }
+      },
+      "dependency_headroom": {
+        "dynamodb_max_in_flight": 20,
+        "kms_max_in_flight": 20,
+        "redis_max_connections": 20,
+        "ses_max_in_flight": 20
+      },
+      "environment": "sandbox",
+      "non_authority_reserved_concurrency": 0,
+      "otp_redis_cache_name": "layerv-nhp-sandbox-control-otp",
+      "otp_redis_endpoint": "layerv-nhp-sandbox-control-otp-9bd8jz.serverless.use2.cache.amazonaws.com:6379",
+      "qat1_alias_arn": "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1",
+      "qat1_raw_key_arn": "arn:aws:kms:us-east-2:767397897469:key/90bcbd44-48aa-4489-aee9-8ce86027024a",
+      "regional_lambda_concurrency_quota": 1000,
+      "retained_unreserved_concurrency": 100
+    },
+    "phase": "measurement",
+    "provisioned_cells": {
+      "cell0": {
+        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+      }
+    },
+    "qat1_kid": "sandbox-qat1-2026-07-v1",
+    "schema_version": 1,
+    "selected_authority_color": "blue"
+  },
+  "schema_version": 1
+}

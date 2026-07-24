@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = (
+    ROOT
+    / ".github"
+    / "scripts"
+    / "generate-connector-authority-runtime-contract.py"
+)
+MANIFEST_REL = Path(
+    "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+)
+MANIFEST = ROOT / MANIFEST_REL
+SPEC = importlib.util.spec_from_file_location("authority_evidence", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+CHECKER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CHECKER)
+
+
+def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        cwd=cwd,
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, indent=2) + "\n"
+
+
+class ManifestValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+
+    def test_repository_manifest_is_canonical_and_valid(self) -> None:
+        self.assertEqual(MANIFEST.read_text(encoding="utf-8"), canonical(self.manifest))
+        contract = CHECKER.validate_manifest(self.manifest)
+        self.assertEqual(contract["phase"], "measurement")
+        self.assertEqual(set(contract["functions"]), {
+            "layerv-nhp-sandbox-ca-ia",
+            "layerv-nhp-sandbox-ca-ra",
+            "layerv-nhp-sandbox-ca-icr",
+        })
+
+    def assert_rejected(self, mutate) -> None:
+        value = copy.deepcopy(self.manifest)
+        mutate(value)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.validate_manifest(value)
+
+    def test_rejects_closed_schema_defects(self) -> None:
+        cases = {
+            "extra manifest key": lambda value: value.__setitem__("extra", True),
+            "missing contract key": lambda value: value["contract"].pop("phase"),
+            "unsupported schema": lambda value: value.__setitem__("schema_version", 2),
+            "ready phase": lambda value: value["contract"].__setitem__("phase", "ready"),
+            "extra global key": lambda value: value["contract"]["global"].__setitem__("extra", 1),
+            "boolean integer": lambda value: value["contract"]["global"].__setitem__(
+                "regional_lambda_concurrency_quota", True
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                self.assert_rejected(mutate)
+
+    def test_rejects_environment_account_region_and_aws_identity_drift(self) -> None:
+        cases = {
+            "environment": ("environment", "prod"),
+            "account": ("aws_account_id", "235500187906"),
+            "region": ("aws_region", "us-west-2"),
+            "partition": ("aws_partition", "aws-us-gov"),
+            "repository": (
+                "authority_repository_url",
+                "example.invalid/layerv/qurl-connector-authority",
+            ),
+            "parameter": (
+                "authority_digest_parameter_name",
+                "/prod/nhp/control/connector-authority/image-digest",
+            ),
+            "alias": (
+                "qat1_alias_arn",
+                "arn:aws:kms:us-east-2:767397897469:alias/other",
+            ),
+            "raw key": (
+                "qat1_raw_key_arn",
+                "arn:aws:kms:us-east-2:767397897469:"
+                "key/11111111-1111-1111-1111-111111111111",
+            ),
+            "redis": ("otp_redis_cache_name", "other"),
+            "redis endpoint": (
+                "otp_redis_endpoint",
+                "layerv-nhp-sandbox-control-otp-other."
+                "serverless.use2.cache.amazonaws.com:6379",
+            ),
+        }
+        for label, (key, replacement) in cases.items():
+            with self.subTest(label=label):
+                self.assert_rejected(
+                    lambda value, key=key, replacement=replacement: value["contract"][
+                        "global"
+                    ].__setitem__(key, replacement)
+                )
+
+    def test_rejects_function_inventory_and_capacity_drift(self) -> None:
+        cases = {
+            "missing function": lambda value: value["contract"]["functions"].pop(
+                "layerv-nhp-sandbox-ca-ra"
+            ),
+            "extra function": lambda value: value["contract"]["functions"].__setitem__(
+                "layerv-nhp-sandbox-ca-extra",
+                copy.deepcopy(value["contract"]["functions"]["layerv-nhp-sandbox-ca-ia"]),
+            ),
+            "steady algebra": lambda value: value["contract"]["functions"][
+                "layerv-nhp-sandbox-ca-ia"
+            ].__setitem__("steady_reserved_concurrency", 3),
+            "rollout algebra": lambda value: value["contract"]["functions"][
+                "layerv-nhp-sandbox-ca-ia"
+            ].__setitem__("rollout_reserved_concurrency", 5),
+            "caller concurrency": lambda value: value["contract"]["functions"][
+                "layerv-nhp-sandbox-ca-ia"
+            ].__setitem__("max_caller_in_flight", 1),
+            "caller rate": lambda value: value["contract"]["functions"][
+                "layerv-nhp-sandbox-ca-ia"
+            ].__setitem__("max_caller_requests_per_second", 5),
+            "regional aggregate": lambda value: value["contract"]["global"].__setitem__(
+                "regional_lambda_concurrency_quota", 110
+            ),
+            "regional steady aggregate": lambda value: (
+                value["contract"]["global"].__setitem__(
+                    "regional_lambda_concurrency_quota", 112
+                ),
+                [
+                    function.update(
+                        {
+                            "steady_provisioned_concurrency": 5,
+                            "steady_reserved_concurrency": 5,
+                        }
+                    )
+                    for function in value["contract"]["functions"].values()
+                ],
+            ),
+            "unknown operation": lambda value: value["contract"]["global"][
+                "caller_capacity"
+            ]["hub_workers"]["preinvoke_limits"].__setitem__("unknown", 1),
+            "cell mismatch": lambda value: value["contract"]["global"][
+                "caller_capacity"
+            ]["cell_workers"].__setitem__(
+                "cell1",
+                copy.deepcopy(
+                    value["contract"]["global"]["caller_capacity"]["cell_workers"][
+                        "cell0"
+                    ]
+                ),
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                self.assert_rejected(mutate)
+
+
+class GitBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        run("git", "init", "-q", cwd=self.root)
+        run("git", "config", "user.name", "Test", cwd=self.root)
+        run("git", "config", "user.email", "test@example.com", cwd=self.root)
+        run("git", "config", "commit.gpgsign", "false", cwd=self.root)
+        self.path = self.root / MANIFEST_REL
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(MANIFEST.read_bytes())
+        self.path.chmod(0o644)
+        run("git", "add", str(MANIFEST_REL), cwd=self.root)
+        run("git", "commit", "-q", "-m", "basis", cwd=self.root)
+        self.source_commit = run("git", "rev-parse", "HEAD", cwd=self.root).stdout.strip()
+        (self.root / "unrelated.txt").write_text("later\n", encoding="utf-8")
+        run("git", "add", "unrelated.txt", cwd=self.root)
+        run("git", "commit", "-q", "-m", "unrelated", cwd=self.root)
+        self.head = run("git", "rev-parse", "HEAD", cwd=self.root).stdout.strip()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def generate(
+        self,
+        *,
+        mode: str = "sandbox-exact-main",
+        manifest: str = MANIFEST_REL.as_posix(),
+        expected: str | None = None,
+        output: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        destination = output or (self.root / "generated.tfvars.json")
+        return run(
+            "python3",
+            str(SCRIPT),
+            "--mode",
+            mode,
+            "--repository-root",
+            str(self.root),
+            "--manifest",
+            manifest,
+            "--expected-checkout-commit",
+            expected or self.head,
+            "--output",
+            str(destination),
+            cwd=self.root,
+            check=False,
+        )
+
+    def test_generates_stable_blob_owned_evidence_and_private_atomic_output(self) -> None:
+        output = self.root / "generated.tfvars.json"
+        result = self.generate(output=output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        generated = json.loads(output.read_text(encoding="utf-8"))
+        evidence = generated["authority_runtime_contract"]["global"]["basis_evidence"]
+        self.assertEqual(summary["source_commit"], self.source_commit)
+        self.assertEqual(evidence["source_commit"], self.source_commit)
+        self.assertEqual(
+            evidence["sha256"],
+            __import__("hashlib").sha256(MANIFEST.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            generated["authority_runtime_contract"]["provisioned_cells_evidence"],
+            evidence,
+        )
+        self.assertTrue(generated["authority_runtime_contract_evidence_verified"])
+        self.assertTrue(
+            all(
+                function["basis_evidence"] == evidence
+                and function["result_evidence"] is None
+                for function in generated["authority_runtime_contract"][
+                    "functions"
+                ].values()
+            )
+        )
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertEqual(output.read_text(encoding="utf-8"), canonical(generated))
+
+    def test_rejects_mode_path_checkout_and_byte_mismatch(self) -> None:
+        cases = {
+            "mode": {"mode": "sandbox"},
+            "absolute path": {"manifest": str(self.path)},
+            "traversal": {
+                "manifest": "docs/evidence/connector-authority/v1/../basis.json"
+            },
+            "wrong checkout": {"expected": self.source_commit},
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label=label):
+                result = self.generate(
+                    output=self.root / f"{label.replace(' ', '-')}.json", **kwargs
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+        self.path.write_text(self.path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        result = self.generate(output=self.root / "tampered.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bytes differ", result.stderr)
+
+    def test_rejects_symlink_and_non_regular_source_mode(self) -> None:
+        original = self.path.read_bytes()
+        self.path.unlink()
+        self.path.symlink_to(self.root / "unrelated.txt")
+        result = self.generate(output=self.root / "symlink.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-symlink", result.stderr)
+
+        self.path.unlink()
+        self.path.write_bytes(original)
+        self.path.chmod(0o755)
+        run("git", "add", str(MANIFEST_REL), cwd=self.root)
+        run("git", "commit", "-q", "-m", "executable", cwd=self.root)
+        executable_head = run("git", "rev-parse", "HEAD", cwd=self.root).stdout.strip()
+        result = self.generate(
+            expected=executable_head, output=self.root / "executable.json"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("100644", result.stderr)
+
+    def test_rejects_duplicate_keys_and_noncanonical_json(self) -> None:
+        self.path.write_text('{"schema_version":1,"schema_version":1}\n', encoding="utf-8")
+        run("git", "add", str(MANIFEST_REL), cwd=self.root)
+        run("git", "commit", "-q", "-m", "duplicate", cwd=self.root)
+        duplicate_head = run("git", "rev-parse", "HEAD", cwd=self.root).stdout.strip()
+        result = self.generate(
+            expected=duplicate_head, output=self.root / "duplicate.json"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate key", result.stderr)
+
+    def test_rejects_shallow_history(self) -> None:
+        clone = self.root.parent / f"{self.root.name}-shallow"
+        run(
+            "git",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            f"file://{self.root}",
+            str(clone),
+            cwd=self.root.parent,
+        )
+        head = run("git", "rev-parse", "HEAD", cwd=clone).stdout.strip()
+        output = clone / "generated.json"
+        result = run(
+            "python3",
+            str(SCRIPT),
+            "--mode",
+            "sandbox-exact-main",
+            "--repository-root",
+            str(clone),
+            "--manifest",
+            MANIFEST_REL.as_posix(),
+            "--expected-checkout-commit",
+            head,
+            "--output",
+            str(output),
+            cwd=clone,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("full Git history", result.stderr)
+        subprocess.run(["rm", "-rf", str(clone)], check=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

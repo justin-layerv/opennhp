@@ -350,6 +350,8 @@ def _route53_zone_actions(body: dict[str, Any]) -> list[str]:
 
 
 DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
+    # internal/service/ecr/image_data_source.go calls ecr:DescribeImages.
+    "aws_ecr_image": ["ecr:DescribeImages"],
     # No-grant data sources -------------------------------------------
     # internal/service/iam/policy_document_data_source.go — no API call.
     "aws_iam_policy_document": [],

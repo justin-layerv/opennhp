@@ -17,6 +17,7 @@ region="us-east-2"
 state_bucket="layerv-terraform-state-767397897469"
 state_key="nhp/sandbox/control/terraform.tfstate"
 control_prefix="layerv-nhp-sandbox-control"
+authority_prefix="layerv-nhp-sandbox-ca-"
 checker="$repo_root/.github/scripts/check-control-sandbox-first-apply.py"
 
 if [[ ! -f "$plan_json" ]]; then
@@ -163,12 +164,20 @@ aws s3api head-object \
   --key "$state_key" \
   --output json >"$evidence_dir/state-head.json"
 aws lambda list-functions --region "$region" --output json \
-  | jq --arg prefix "$control_prefix" \
-    '[.Functions[] | select(.FunctionName | startswith($prefix))]' \
+  | jq --arg control_prefix "$control_prefix" \
+    --arg authority_prefix "$authority_prefix" \
+    '[.Functions[] | select(
+      (.FunctionName | startswith($control_prefix))
+      or (.FunctionName | startswith($authority_prefix))
+    )]' \
     >"$evidence_dir/control-lambdas.json"
 aws elbv2 describe-load-balancers --region "$region" --output json \
-  | jq --arg prefix "$control_prefix" \
-    '[.LoadBalancers[] | select((.LoadBalancerName // "") | startswith($prefix))]' \
+  | jq --arg control_prefix "$control_prefix" \
+    --arg authority_prefix "$authority_prefix" \
+    '[.LoadBalancers[] | select(
+      ((.LoadBalancerName // "") | startswith($control_prefix))
+      or ((.LoadBalancerName // "") | startswith($authority_prefix))
+    )]' \
     >"$evidence_dir/control-load-balancers.json"
 
 python3 "$checker" live "$evidence_dir" \

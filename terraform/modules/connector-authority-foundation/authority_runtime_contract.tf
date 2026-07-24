@@ -272,6 +272,9 @@ locals {
     local.authority_contract_global.authority_repository_url == aws_ecr_repository.authority.repository_url &&
     local.authority_contract_global.authority_digest_parameter_name == local.authority_image_digest_parameter_name &&
     can(regex("^sha256:[0-9a-f]{64}$", local.authority_contract_global.authority_image_digest)) &&
+    local.authority_contract_global.authority_image_digest == local.authority_runtime_image_digest &&
+    data.aws_ecr_image.authority_runtime[0].image_digest == local.authority_runtime_image_digest &&
+    data.aws_ecr_image.authority_runtime[0].image_uri == "${aws_ecr_repository.authority.repository_url}@${local.authority_runtime_image_digest}" &&
     local.authority_contract_global.qat1_raw_key_arn == aws_kms_key.qat1_signing.arn &&
     local.authority_contract_global.qat1_alias_arn == aws_kms_alias.qat1_signing.arn &&
     jsonencode(var.authority_runtime_contract.qat1_kid) == jsonencode(tostring(var.authority_runtime_contract.qat1_kid)) &&

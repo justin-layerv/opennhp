@@ -44,9 +44,12 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
   assert {
     condition = (
       output.authority_runtime_contract == null &&
-      output.authority_selected_alias_targets == null
+      output.authority_selected_alias_targets == null &&
+      output.authority_image_uri == null &&
+      length(data.aws_ssm_parameter.authority_runtime_digest) == 0 &&
+      length(data.aws_ecr_image.authority_runtime) == 0
     )
-    error_message = "The schema-only sandbox foundation must retain a null Authority contract and no selected targets."
+    error_message = "A null Authority contract must retain no selected targets, image URI, or SSM/ECR reads."
   }
 
   assert {

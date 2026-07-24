@@ -378,6 +378,14 @@ class ShippedConstants(unittest.TestCase):
             ],
             IAM.RESOURCE_ACTIONS["aws_elasticache_serverless_cache"],
         )
+        self.assertEqual(
+            ["ecr:DescribeImages"],
+            IAM.DATA_SOURCE_ACTIONS["aws_ecr_image"],
+        )
+        self.assertEqual(
+            ["ssm:GetParameter"],
+            IAM.DATA_SOURCE_ACTIONS["aws_ssm_parameter"],
+        )
 
 
 class RequiredActionsDispatch(unittest.TestCase):

@@ -44,3 +44,26 @@ resource "aws_ssm_parameter" "authority_image_digest" {
     ignore_changes = [value]
   }
 }
+
+# These reads exist only after the exact-main evidence generator has supplied
+# the complete atomic runtime contract. The managed parameter remains the
+# publisher-owned sentinel; its current external value selects an immutable
+# ECR digest, and both reads disappear entirely while the contract is null.
+data "aws_ssm_parameter" "authority_runtime_digest" {
+  count = local.authority_runtime_contract_enabled ? 1 : 0
+
+  name            = aws_ssm_parameter.authority_image_digest.name
+  with_decryption = false
+}
+
+data "aws_ecr_image" "authority_runtime" {
+  count = local.authority_runtime_contract_enabled ? 1 : 0
+
+  repository_name = aws_ecr_repository.authority.name
+  image_digest    = data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value
+}
+
+locals {
+  authority_runtime_image_digest = local.authority_runtime_contract_enabled ? data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value : null
+  authority_runtime_image_uri    = local.authority_runtime_contract_enabled ? data.aws_ecr_image.authority_runtime[0].image_uri : null
+}

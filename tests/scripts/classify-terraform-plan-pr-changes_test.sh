@@ -83,6 +83,12 @@ run_case "Connector Authority contract checker triggers sandbox plan" true false
 	$'M\tscripts/check-connector-authority-foundation.sh'
 run_case "Control foundation checker triggers sandbox plan" true false false \
 	$'M\t.github/scripts/check-control-sandbox-first-apply.py'
+run_case "Authority evidence generator triggers sandbox plan" true false false \
+	$'M\t.github/scripts/generate-connector-authority-runtime-contract.py'
+run_case "Authority evidence manifest triggers sandbox plan" true false false \
+	$'M\tdocs/evidence/connector-authority/v1/sandbox-measurement-basis.json'
+run_case "Authority evidence generator tests trigger sandbox plan" true false false \
+	$'M\ttests/scripts/test_generate_connector_authority_runtime_contract.py'
 run_case "control CIDR preflight triggers sandbox plan" true false false \
 	$'M\tscripts/check-control-vpc-cidr-overlap.sh'
 run_case "unrelated docs stay skipped" false false false \

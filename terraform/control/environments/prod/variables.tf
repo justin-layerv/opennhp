@@ -49,9 +49,25 @@ variable "ses_configuration_set_name" {
 }
 
 variable "authority_runtime_contract" {
-  description = "Nullable closed Connector Authority runtime contract. This schema-only precursor intentionally rejects every non-null root value; production must remain null until its independent repository, publication, and measurement evidence are reviewed."
+  description = "Production Connector Authority runtime contract. It remains unconditionally null throughout sandbox measurement."
   type        = any
   default     = null
+
+  validation {
+    condition     = var.authority_runtime_contract == null
+    error_message = "Production Authority runtime contract must remain null throughout sandbox measurement."
+  }
+}
+
+variable "authority_runtime_contract_evidence_verified" {
+  description = "Production evidence latch remains false throughout sandbox measurement."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.authority_runtime_contract_evidence_verified
+    error_message = "Production Authority evidence latch must remain false throughout sandbox measurement."
+  }
 }
 
 variable "tags" {

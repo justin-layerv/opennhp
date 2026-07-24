@@ -28,11 +28,21 @@ locals {
 }
 
 resource "terraform_data" "foundation_contract" {
-  input = {
-    account_id           = data.aws_caller_identity.current.account_id
-    control_table_prefix = local.control_table_prefix
-    region               = data.aws_region.current.region
-  }
+  input = merge(
+    {
+      account_id           = data.aws_caller_identity.current.account_id
+      control_table_prefix = local.control_table_prefix
+      region               = data.aws_region.current.region
+    },
+    jsondecode(
+      local.authority_runtime_contract_enabled
+      ? jsonencode({
+        authority_image_uri        = local.authority_runtime_image_uri
+        authority_runtime_contract = var.authority_runtime_contract
+      })
+      : "{}"
+    ),
+  )
 
   lifecycle {
     precondition {

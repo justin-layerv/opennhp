@@ -55,6 +55,7 @@ env:
   TF_VERSION: '1.14.3'
   CONTROL_ROOT: terraform/control/environments/sandbox
   PLAN_ARTIFACT_PREFIX: control-sandbox-update-plan
+  AUTHORITY_RUNTIME_BASIS: docs/evidence/connector-authority/v1/sandbox-measurement-basis.json
 
 permissions:
   contents: read
@@ -158,6 +159,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Python
@@ -181,6 +183,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Generate verified ephemeral Authority runtime input
+        run: |
+          .github/scripts/generate-connector-authority-runtime-contract.py \
+            --mode sandbox-exact-main \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --manifest "$AUTHORITY_RUNTIME_BASIS" \
+            --expected-checkout-commit "$GITHUB_SHA" \
+            --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -218,7 +229,9 @@ jobs:
           if [[ "$OPERATION" == 'plan-refresh-only' ]]; then
             plan_mode=(-refresh-only)
           fi
-          terraform plan "${plan_mode[@]}" -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt
+          terraform plan "${plan_mode[@]}" \
+            -var-file=authority-runtime.generated.tfvars.json \
+            -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt
           terraform show -json tfplan >tfplan.json
           ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
             tfplan.json "$RUNNER_TEMP/control-state-before-plan/state.json" \
@@ -261,6 +274,7 @@ jobs:
             --plan-text tfplan.txt \
             --contract-summary plan-contract-summary.json \
             --contract-checker ../../../../.github/scripts/check-control-sandbox-first-apply.py \
+            --runtime-contract authority-runtime.generated.tfvars.json \
             --state-summary planned-state-summary.json \
             --repository "$REPOSITORY" \
             --commit-sha "$commit_sha" \
@@ -295,6 +309,7 @@ jobs:
             terraform/control/environments/sandbox/tfplan
             terraform/control/environments/sandbox/tfplan.txt
             terraform/control/environments/sandbox/plan-contract-summary.json
+            terraform/control/environments/sandbox/authority-runtime.generated.tfvars.json
             terraform/control/environments/sandbox/planned-state-summary.json
             terraform/control/environments/sandbox/plan-metadata.json
           # Match the checker's two-day freshness ceiling so an artifact is not
@@ -355,6 +370,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.planned_commit_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Python
@@ -417,6 +433,7 @@ jobs:
             --plan-text "$artifact/tfplan.txt" \
             --contract-summary "$artifact/plan-contract-summary.json" \
             --contract-checker .github/scripts/check-control-sandbox-first-apply.py \
+            --runtime-contract "$artifact/authority-runtime.generated.tfvars.json" \
             --state-summary "$artifact/planned-state-summary.json" \
             --metadata "$artifact/plan-metadata.json" \
             --repository "$REPOSITORY" \
@@ -436,6 +453,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
         run: scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
+
+      - name: Re-generate and bind exact Authority runtime input
+        env:
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: |
+          set -euo pipefail
+          .github/scripts/generate-connector-authority-runtime-contract.py \
+            --mode sandbox-exact-main \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --manifest "$AUTHORITY_RUNTIME_BASIS" \
+            --expected-checkout-commit "$PLANNED_COMMIT_SHA" \
+            --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
+          cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
+            echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
+            exit 1
+          }
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -524,6 +558,7 @@ jobs:
               ;;
           esac
           terraform plan -refresh-only -input=false -lock-timeout=5m -no-color \
+            -var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             -out="$RUNNER_TEMP/live-refresh-plan" >/dev/null
           terraform show -json "$RUNNER_TEMP/live-refresh-plan" \
             >"$RUNNER_TEMP/live-refresh-plan.json"
@@ -647,7 +682,11 @@ jobs:
 
       - name: Verify refresh-enabled no-op and live dark boundary
         if: success()
-        run: scripts/verify-control-sandbox-first-apply.sh "$CONTROL_ROOT" "$RUNNER_TEMP/control-update-verification"
+        run: |
+          scripts/verify-control-sandbox-first-apply.sh \
+            "$CONTROL_ROOT" \
+            "$RUNNER_TEMP/control-update-verification" \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
 
       - name: Upload sanitized verification summaries
         if: success()
@@ -688,6 +727,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Python
@@ -711,6 +751,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Generate verified ephemeral Authority runtime input
+        run: |
+          .github/scripts/generate-connector-authority-runtime-contract.py \
+            --mode sandbox-exact-main \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --manifest "$AUTHORITY_RUNTIME_BASIS" \
+            --expected-checkout-commit "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -745,7 +794,9 @@ jobs:
           set -euo pipefail
           scripts/check-no-checkout-credentials.sh
           scripts/verify-control-sandbox-first-apply.sh \
-            "$CONTROL_ROOT" "$RUNNER_TEMP/control-update-verification"
+            "$CONTROL_ROOT" \
+            "$RUNNER_TEMP/control-update-verification" \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
 
       - name: Re-bind unchanged state after verification
         run: |

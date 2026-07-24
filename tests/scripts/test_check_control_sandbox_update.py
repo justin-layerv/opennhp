@@ -133,6 +133,8 @@ class ArtifactContractTests(unittest.TestCase):
         )
         self.contract_checker = self.root / "source-owned-checker.py"
         self.contract_checker.write_text("# reviewed checker\n")
+        self.runtime_contract = self.root / "authority-runtime.generated.tfvars.json"
+        self.runtime_contract.write_text('{"authority_runtime_contract":{}}\n')
         self.metadata = self.root / "plan-metadata.json"
 
     def tearDown(self) -> None:
@@ -144,6 +146,7 @@ class ArtifactContractTests(unittest.TestCase):
             "plan_text": self.plan_text,
             "contract_summary": self.contract_summary,
             "contract_checker": self.contract_checker,
+            "runtime_contract": self.runtime_contract,
             "state_summary": self.state_summary,
             "repository": CHECKER.REPOSITORY,
             "commit_sha": "b" * 40,
@@ -180,6 +183,13 @@ class ArtifactContractTests(unittest.TestCase):
             ("plan", lambda: self.plan.write_bytes(b"tampered"), {}),
             ("text", lambda: self.plan_text.write_text("tampered\n"), {}),
             (
+                "runtime-contract",
+                lambda: self.runtime_contract.write_text(
+                    '{"authority_runtime_contract":null}\n'
+                ),
+                {},
+            ),
+            (
                 "contract",
                 lambda: write_json(self.contract_summary, {"resource_count": 999}),
                 {},
@@ -205,7 +215,12 @@ class ArtifactContractTests(unittest.TestCase):
             with self.subTest(label=label):
                 original = {
                     path: path.read_bytes()
-                    for path in (self.plan, self.plan_text, self.contract_summary)
+                    for path in (
+                        self.plan,
+                        self.plan_text,
+                        self.contract_summary,
+                        self.runtime_contract,
+                    )
                 }
                 mutate()
                 with self.assertRaises(CHECKER.ContractError):
@@ -606,6 +621,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn('attempt < 20', source)
         self.assertNotIn('within 20 checks', source)
 
+    def test_live_boundary_checks_control_and_authority_runtime_namespaces(self) -> None:
+        source = LIVE_BOUNDARY_PATH.read_text(encoding="utf-8")
+        self.assertIn('authority_prefix="layerv-nhp-sandbox-ca-"', source)
+        self.assertEqual(source.count("startswith($authority_prefix)"), 2)
+
     def test_workflow_is_sandbox_only_saved_plan_and_transition_agnostic(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertNotIn("AWS_ACCOUNT_ID:", workflow)
@@ -646,8 +666,20 @@ class WorkflowContractTests(unittest.TestCase):
             "Do not replay the consumed saved plan",
             "Dispatch `verify` from current main",
             "Production Control remains blocked on the state migration in #3279",
+            "generate-connector-authority-runtime-contract.py",
+            "sandbox-measurement-basis.json",
+            "authority-runtime.generated.tfvars.json",
+            "--runtime-contract",
+            "-var-file=authority-runtime.generated.tfvars.json",
+            '-var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json"',
+            "Verified Authority runtime input differs from the reviewed plan input",
         ):
             self.assertIn(marker, workflow)
+        self.assertEqual(workflow.count("fetch-depth: 0"), 3)
+        self.assertEqual(
+            workflow.count("generate-connector-authority-runtime-contract.py"),
+            3,
+        )
         self.assertEqual(workflow.count("environment: sandbox"), 3)
         self.assertEqual(workflow.count("persist-credentials: false"), 3)
         self.assertNotIn("persist-credentials: true", workflow)
@@ -798,6 +830,8 @@ class WorkflowContractTests(unittest.TestCase):
     def test_refresh_verifier_uses_remote_state_lock(self) -> None:
         verifier = VERIFY_PATH.read_text(encoding="utf-8")
         self.assertIn("-lock-timeout=5m", verifier)
+        self.assertIn('-var-file="$runtime_contract_var_file"', verifier)
+        self.assertIn("verified runtime tfvars must be a regular non-symlink", verifier)
         self.assertNotIn("-lock=false", verifier)
         self.assertIn("verify-control-sandbox-live-boundary.sh", verifier)
 

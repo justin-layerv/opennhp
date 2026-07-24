@@ -5,17 +5,27 @@
 # retired one-time first-apply workflow.
 set -euo pipefail
 
-if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 <control-terraform-root> <empty-evidence-directory>" >&2
+if [[ "$#" -ne 3 ]]; then
+  echo "usage: $0 <control-terraform-root> <empty-evidence-directory> <verified-runtime-tfvars>" >&2
   exit 2
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 terraform_root="$(cd "$1" && pwd)"
 evidence_dir="$2"
+runtime_contract_var_file="$3"
 region="us-east-2"
 state_kms_key_arn="arn:aws:kms:us-east-2:767397897469:key/289dbe35-ab5a-4752-8564-4c96c607c9f4"
 checker="$repo_root/.github/scripts/check-control-sandbox-first-apply.py"
+
+if [[ ! -f "$runtime_contract_var_file" || -L "$runtime_contract_var_file" ]]; then
+  echo "ERROR: verified runtime tfvars must be a regular non-symlink file" >&2
+  exit 1
+fi
+if [[ "$(stat -c '%a' "$runtime_contract_var_file")" != "600" ]]; then
+  echo "ERROR: verified runtime tfvars must have exact mode 600" >&2
+  exit 1
+fi
 
 if [[ -e "$evidence_dir" ]] && [[ -n "$(find "$evidence_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   echo "ERROR: evidence directory must be empty: $evidence_dir" >&2
@@ -31,6 +41,7 @@ set +e
 terraform -chdir="$terraform_root" plan \
   -input=false \
   -lock-timeout=5m \
+  -var-file="$runtime_contract_var_file" \
   -detailed-exitcode \
   -out="$evidence_dir/post-apply.tfplan" \
   >"$evidence_dir/post-apply-plan.txt"

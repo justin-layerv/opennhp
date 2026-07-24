@@ -194,27 +194,56 @@ if ! cmp -s "$sandbox_wrapper" "$prod_wrapper"; then
   exit 1
 fi
 
-# This schema-only precursor has no evidence generator. Keep the child-module
-# latch unreachable from either environment root so a caller-supplied contract
-# and caller-supplied boolean can never substitute for exact-main verification.
+# Both roots compose the same child-module interface. Sandbox may open the
+# latch only through the exact-main generated tfvars; production locks both
+# inputs dark at the variable boundary.
 for environment in sandbox prod; do
   environment_root="${control_dir}/environments/${environment}"
-  status=0
-  grep -R -nH -E --include='*.tf' \
-    'authority_runtime_contract_evidence_verified' \
-    "$environment_root" || status=$?
-  case "$status" in
-    0)
-      echo "ERROR: ${environment} Control root must not expose or set the internal Authority runtime evidence latch in this schema-only precursor" >&2
-      exit 1
-      ;;
-    1) ;;
-    *)
-      echo "ERROR: ${environment} Control evidence-latch scan failed with status ${status}" >&2
-      exit 2
-      ;;
-  esac
+  wrapper_count="$(grep -c \
+    'authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified' \
+    "${environment_root}/main.tf" || true)"
+  if [[ "$wrapper_count" -ne 1 ]]; then
+    echo "ERROR: ${environment} Control wrapper must pass the internal evidence latch exactly once from its root variable" >&2
+    exit 1
+  fi
+  if find "$environment_root" -maxdepth 1 -type f \
+    \( -name '*.tfvars' -o -name '*.tfvars.json' \
+       -o -name '*.auto.tfvars' -o -name '*.auto.tfvars.json' \) -print -quit \
+    | grep -q .; then
+    echo "ERROR: ${environment} Control root must not commit generated runtime tfvars" >&2
+    exit 1
+  fi
 done
+
+prod_variables="${control_dir}/environments/prod/variables.tf"
+for required in \
+  'Production Authority runtime contract must remain null throughout sandbox measurement.' \
+  'Production Authority evidence latch must remain false throughout sandbox measurement.'; do
+  if ! grep -Fq "$required" "$prod_variables"; then
+    echo "ERROR: production Control variables must fail closed: ${required}" >&2
+    exit 1
+  fi
+done
+
+ssm_read_count="$(
+  { grep -R -h -E --include='*.tf' \
+      'data[[:space:]]+"aws_ssm_parameter"[[:space:]]+"authority_runtime_digest"' \
+      "$module_dir" || true; } | wc -l | tr -d ' '
+)"
+ecr_read_count="$(
+  { grep -R -h -E --include='*.tf' \
+      'data[[:space:]]+"aws_ecr_image"[[:space:]]+"authority_runtime"' \
+      "$module_dir" || true; } | wc -l | tr -d ' '
+)"
+if [[ "$ssm_read_count" -ne 1 || "$ecr_read_count" -ne 1 ]]; then
+  echo "ERROR: Connector Authority runtime must declare exactly one conditional SSM digest read and one conditional ECR digest read" >&2
+  exit 1
+fi
+if ! grep -Fq 'count = local.authority_runtime_contract_enabled ? 1 : 0' \
+  "${module_dir}/ecr.tf"; then
+  echo "ERROR: Connector Authority runtime SSM/ECR reads must remain conditional on the verified contract" >&2
+  exit 1
+fi
 
 sandbox_outputs="${control_dir}/environments/sandbox/outputs.tf"
 prod_outputs="${control_dir}/environments/prod/outputs.tf"

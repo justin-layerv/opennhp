@@ -63,6 +63,10 @@ output "authority_ecr_repository_url" {
   value = module.control.authority_ecr_repository_url
 }
 
+output "authority_image_uri" {
+  value = module.control.authority_image_uri
+}
+
 output "authority_image_digest_parameter_name" {
   value = module.control.authority_image_digest_parameter_name
 }

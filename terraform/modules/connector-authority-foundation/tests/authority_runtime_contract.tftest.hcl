@@ -23,6 +23,19 @@ mock_provider "aws" {
       region = "us-east-2"
     }
   }
+
+  mock_data "aws_ssm_parameter" {
+    defaults = {
+      insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
+
+  mock_data "aws_ecr_image" {
+    defaults = {
+      image_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      image_uri    = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
 }
 
 override_resource {
@@ -57,6 +70,23 @@ override_resource {
       address = "layerv-nhp-sandbox-control-otp.serverless.use2.cache.amazonaws.com"
       port    = 6379
     }]
+  }
+}
+
+override_data {
+  target          = data.aws_ssm_parameter.authority_runtime_digest[0]
+  override_during = plan
+  values = {
+    insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}
+
+override_data {
+  target          = data.aws_ecr_image.authority_runtime[0]
+  override_during = plan
+  values = {
+    image_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    image_uri    = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 }
 
@@ -229,6 +259,8 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
 
   assert {
     condition = (
+      length(data.aws_ssm_parameter.authority_runtime_digest) == 1 &&
+      length(data.aws_ecr_image.authority_runtime) == 1 &&
       length(local.authority_expected_functions) == 3 + 4 * 2 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-ia"] == 10 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-iro-cell0"] == 9 &&
