@@ -1399,6 +1399,49 @@ def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
     return True
 
 
+# The dark contract input is `{account_id, control_table_prefix, region}` and the
+# enabled input adds `authority_image_uri`/`authority_runtime_contract`. To keep
+# the dark shape exactly three keys (a no-op against live state) while adding two
+# heterogeneously-typed keys, main.tf builds the input with
+# `merge(base, jsondecode(jsonencode(enabled ? {...} : "{}")))`. Terraform then
+# marks those two jsondecode-derived keys in `after_unknown.input` even though
+# `after.input` already holds their exact concrete values. That is a false
+# positive: `_require_authority_runtime_binding` verifies `after.input` is the
+# exact repository@digest contract, and the enablement is applied from the
+# reviewed *saved plan* (`op=apply`), which binds `after.input` deterministically
+# without re-reading data sources. Tolerate that exact artifact only.
+_FOUNDATION_INPUT_JSONDECODE_KEYS = frozenset(
+    {"authority_image_uri", "authority_runtime_contract"}
+)
+
+
+def _require_foundation_input_known(
+    after_unknown: dict[str, Any], *, enabled: bool
+) -> None:
+    """Reject a non-deterministic foundation contract input.
+
+    The dark input is pure data-source/local values and must be fully known. The
+    enabled input may carry the jsondecode false-positive described above, but
+    only on the two derived keys; the static merge-base keys
+    (``account_id``/``control_table_prefix``/``region``) must stay known.
+    """
+    input_unknown = after_unknown.get("input")
+    if input_unknown in (None, {}, False):
+        return
+    if not enabled or not isinstance(input_unknown, dict):
+        raise ContractError("foundation runtime input may not remain unknown")
+    stray = sorted(
+        key
+        for key, marked in input_unknown.items()
+        if marked not in (None, {}, False)
+        and key not in _FOUNDATION_INPUT_JSONDECODE_KEYS
+    )
+    if stray:
+        raise ContractError(
+            f"foundation runtime input has unexpected unknown keys: {stray}"
+        )
+
+
 def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
@@ -1412,9 +1455,8 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     foundation, foundation_unknown = values(
         "module.control.terraform_data.foundation_contract"
     )
-    _require_authority_runtime_binding(foundation)
-    if foundation_unknown.get("input") not in (None, {}, False):
-        raise ContractError("foundation runtime input may not remain unknown")
+    enabled = _require_authority_runtime_binding(foundation)
+    _require_foundation_input_known(foundation_unknown, enabled=enabled)
     # Keep the complete provider-version-specific no-op shape visible here as
     # literals rather than deriving its dimensions independently. The empty-
     # string / zero IPv6 values below are the exact no-op shape emitted by the

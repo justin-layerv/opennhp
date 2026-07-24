@@ -583,7 +583,19 @@ def authority_contract_transition_fixture() -> dict:
     change["actions"] = ["update"]
     change["after"]["input"] = authority_runtime_input_fixture()
     change["after"]["output"] = None
-    change["after_unknown"] = {"output": True}
+    # Model the REAL enablement plan shape: main.tf builds the input with
+    # merge(base, jsondecode(jsonencode(...))), so Terraform marks the two
+    # jsondecode-derived keys unknown in after_unknown.input even though
+    # after.input holds their exact concrete values. The static merge-base keys
+    # stay known. (Previously this fixture used only {"output": True}, which did
+    # not exercise _require_foundation_input_known — the gap the live plan hit.)
+    change["after_unknown"] = {
+        "output": True,
+        "input": {
+            "authority_image_uri": True,
+            "authority_runtime_contract": True,
+        },
+    }
     return result
 
 
@@ -937,6 +949,31 @@ class PlanContractTests(unittest.TestCase):
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
         self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 50)
+
+    def test_foundation_input_jsondecode_unknown_tolerance_boundary(self) -> None:
+        # The enablement fixture carries the real after_unknown.input jsondecode
+        # artifact ({authority_image_uri, authority_runtime_contract}); it must
+        # be accepted because after.input is the exact validated binding.
+        CHECKER.check_plan(authority_contract_transition_fixture())
+
+        # An unknown marker on any static merge-base key (or any unexpected key)
+        # is a genuine non-determinism and must fail closed.
+        for stray_key in ("account_id", "control_table_prefix", "region", "surprise"):
+            with self.subTest(stray_key=stray_key):
+                candidate = authority_contract_transition_fixture()
+                self.change(
+                    candidate,
+                    "module.control.terraform_data.foundation_contract",
+                )["after_unknown"]["input"][stray_key] = True
+                self.assert_rejected(candidate)
+
+        # A wholesale-unknown input (not the bounded jsondecode dict) is rejected.
+        candidate = authority_contract_transition_fixture()
+        self.change(
+            candidate,
+            "module.control.terraform_data.foundation_contract",
+        )["after_unknown"]["input"] = True
+        self.assert_rejected(candidate)
 
     def test_exact_authority_contract_binding_passes_and_drift_fails(self) -> None:
         candidate = authority_contract_transition_fixture()
