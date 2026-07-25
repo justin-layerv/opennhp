@@ -66,6 +66,12 @@ variable "authority_runtime_functions_enabled" {
   default     = false
 }
 
+variable "hub_edge_enabled" {
+  description = "Dark-first Step-5 gate for the Connector Hub public UDP edge (the three public edge subnets, the internet gateway and public route table + 0.0.0.0/0 route, and the public UDP-62206 Hub NLB, listener, and target group). Committed inputs leave it false; the Step-5 edge apply supplies it true (via -var or the generated tfvars). See the module variable of the same name."
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   type = map(string)
   default = {

@@ -20,6 +20,14 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      hub_edge_enabled:
+        description: 'Step-5 Hub public UDP edge gate. true emits hub_edge_enabled=true into the generated tfvars; false keeps the committed default (dark). Pass the SAME value to plan, apply, and verify.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -195,11 +203,16 @@ jobs:
       - name: Generate verified ephemeral Authority runtime input
         env:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
           if [[ "$ENABLE_RUNTIME_FUNCTIONS" == 'true' ]]; then
             runtime_functions_flag=(--runtime-functions-enabled)
+          fi
+          hub_edge_flag=()
+          if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
+            hub_edge_flag=(--hub-edge-enabled)
           fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
@@ -207,7 +220,8 @@ jobs:
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
-            "${runtime_functions_flag[@]}"
+            "${runtime_functions_flag[@]}" \
+            "${hub_edge_flag[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -474,11 +488,16 @@ jobs:
         env:
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
           if [[ "$ENABLE_RUNTIME_FUNCTIONS" == 'true' ]]; then
             runtime_functions_flag=(--runtime-functions-enabled)
+          fi
+          hub_edge_flag=()
+          if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
+            hub_edge_flag=(--hub-edge-enabled)
           fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
@@ -486,7 +505,8 @@ jobs:
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$PLANNED_COMMIT_SHA" \
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
-            "${runtime_functions_flag[@]}"
+            "${runtime_functions_flag[@]}" \
+            "${hub_edge_flag[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -800,11 +820,16 @@ jobs:
       - name: Generate verified ephemeral Authority runtime input
         env:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
           if [[ "$ENABLE_RUNTIME_FUNCTIONS" == 'true' ]]; then
             runtime_functions_flag=(--runtime-functions-enabled)
+          fi
+          hub_edge_flag=()
+          if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
+            hub_edge_flag=(--hub-edge-enabled)
           fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
@@ -812,7 +837,8 @@ jobs:
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
-            "${runtime_functions_flag[@]}"
+            "${runtime_functions_flag[@]}" \
+            "${hub_edge_flag[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

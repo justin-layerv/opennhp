@@ -110,3 +110,18 @@ output "hub_publisher_github_environment" {
 output "hub_publisher_github_subject" {
   value = module.control.hub_publisher_github_subject
 }
+
+output "hub_nlb_dns_name" {
+  description = "Public Hub UDP NLB DNS name; null while the edge is dark."
+  value       = module.control.hub_nlb_dns_name
+}
+
+output "hub_nlb_zone_id" {
+  description = "Public Hub UDP NLB hosted zone id for a Route 53 alias; null while dark."
+  value       = module.control.hub_nlb_zone_id
+}
+
+output "hub_udp_listener_arn" {
+  description = "Public Hub UDP-62206 listener ARN; null while the edge is dark."
+  value       = module.control.hub_udp_listener_arn
+}

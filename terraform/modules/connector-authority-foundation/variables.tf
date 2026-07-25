@@ -68,6 +68,22 @@ variable "authority_runtime_functions_enabled" {
   default     = false
 }
 
+variable "hub_edge_enabled" {
+  description = <<-EOT
+    Dark-first enable gate for the Connector Hub public UDP edge (Step 5): the
+    three public edge subnets, the internet gateway and public route table, and
+    the public UDP-62206 Hub network load balancer + listener + target group.
+
+    Independent of the authority runtime gate: the Hub NLB is caller-facing
+    while the runtime functions are dark, and they flip in separate applies.
+    When false the Control VPC keeps its no-public-edge posture (no internet
+    gateway, no public subnet, no non-local route). Committed inputs leave it
+    false; prod stays dark.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Additional tags applied to every supported resource."
   type        = map(string)

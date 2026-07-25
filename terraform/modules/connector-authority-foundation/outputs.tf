@@ -203,3 +203,18 @@ output "hub_publisher_github_subject" {
   description = "Exact NHP GitHub OIDC subject admitted by the Hub publisher role."
   value       = local.hub_publisher_github_subject
 }
+
+output "hub_nlb_dns_name" {
+  description = "Public Hub UDP NLB DNS name (null while the edge is dark)."
+  value       = one(aws_lb.hub[*].dns_name)
+}
+
+output "hub_nlb_zone_id" {
+  description = "Public Hub UDP NLB hosted zone id for a Route 53 alias (null while dark)."
+  value       = one(aws_lb.hub[*].zone_id)
+}
+
+output "hub_udp_listener_arn" {
+  description = "Public Hub UDP-62206 listener ARN (null while the edge is dark)."
+  value       = one(aws_lb_listener.hub[*].arn)
+}

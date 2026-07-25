@@ -1193,6 +1193,26 @@ def authority_runtime_retry_fixture() -> dict:
     return result
 
 
+def _hub_edge_resource_changes() -> list[dict]:
+    return [
+        {
+            "address": address,
+            "mode": "managed",
+            "type": resource_type,
+            "change": _runtime_create({"id": address}),
+        }
+        for address, resource_type in CHECKER.HUB_EDGE_RESOURCES.items()
+    ]
+
+
+def hub_edge_transition_fixture() -> dict:
+    """The Hub public edge slice: the exact edge resources as pure creates."""
+    result = plan_fixture()
+    result["applyable"] = True
+    result["resource_changes"].extend(_hub_edge_resource_changes())
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -5279,6 +5299,65 @@ class WorkflowContractTests(unittest.TestCase):
             "Fail closed on any unreviewed Control mutation",
             plan_workflow,
         )
+
+
+class HubEdgeSliceTests(unittest.TestCase):
+    """Step 5 slice 5a: the Hub public UDP edge admission + plan_mode."""
+
+    def test_hub_edge_slice_admitted(self) -> None:
+        summary = CHECKER.check_plan(hub_edge_transition_fixture())
+        self.assertEqual(summary["plan_mode"], "hub-edge-slice")
+
+    def test_hub_edge_partial_slice_rejected(self) -> None:
+        candidate = hub_edge_transition_fixture()
+        candidate["resource_changes"] = [
+            change
+            for change in candidate["resource_changes"]
+            if change["address"] != "module.control.aws_lb.hub[0]"
+        ]
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(candidate)
+
+    def test_hub_edge_foreign_resource_rejected(self) -> None:
+        candidate = hub_edge_transition_fixture()
+        candidate["resource_changes"].append(
+            {
+                "address": "module.control.aws_lb.rogue[0]",
+                "mode": "managed",
+                "type": "aws_lb",
+                "change": _runtime_create({"id": "rogue"}),
+            }
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(candidate)
+
+    def test_hub_edge_update_rejected(self) -> None:
+        candidate = hub_edge_transition_fixture()
+        for change in candidate["resource_changes"]:
+            if change["address"] == "module.control.aws_lb_listener.hub[0]":
+                change["change"]["actions"] = ["update"]
+                change["change"]["before"] = copy.deepcopy(change["change"]["after"])
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(candidate)
+
+    def test_hub_edge_created_over_steady_runtime(self) -> None:
+        # The edge slice applies independently while the runtime slice is already
+        # steady (every runtime change a no-op): still exactly hub-edge-slice.
+        result = authority_runtime_steady_fixture()
+        result["applyable"] = True
+        result["resource_changes"].extend(_hub_edge_resource_changes())
+        summary = CHECKER.check_plan(result)
+        self.assertEqual(summary["plan_mode"], "hub-edge-slice")
+
+    def test_both_slices_steady_is_noop(self) -> None:
+        # Both slices already applied (all no-op) is a valid steady inventory.
+        result = authority_runtime_steady_fixture()
+        for change in _hub_edge_resource_changes():
+            change["change"]["actions"] = ["no-op"]
+            change["change"]["before"] = copy.deepcopy(change["change"]["after"])
+            result["resource_changes"].append(change)
+        summary = CHECKER.check_plan(result)
+        self.assertEqual(summary["plan_mode"], "no-op")
 
 
 if __name__ == "__main__":

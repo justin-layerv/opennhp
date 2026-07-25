@@ -320,7 +320,8 @@ jobs:
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
-            --runtime-functions-enabled
+            --runtime-functions-enabled \
+            --hub-edge-enabled
 
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'

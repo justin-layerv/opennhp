@@ -47,19 +47,21 @@ forbidden_resource_types=(
   aws_default_route_table
   aws_eip
   aws_egress_only_internet_gateway
-  aws_internet_gateway
-  # aws_lambda_function and aws_lambda_alias are legitimized by the Connector
-  # Authority runtime slice (the 3 Hub-facing functions plus their closed
-  # blue/green aliases). They are gated instead by the exact inventory +
+  # aws_internet_gateway, aws_lb, aws_lb_listener, and aws_route are legitimized
+  # by the Connector Hub public UDP edge slice (Step 5): one edge IGW, one public
+  # route table with a single 0.0.0.0/0 route to it, and the public UDP-62206 Hub
+  # NLB + listener in the public subnets. Like the authority runtime functions
+  # they are NOT free here -- they are gated instead by the exact inventory +
   # transition contract in check-control-sandbox-first-apply.py, which admits
-  # them only as an all-or-nothing runtime transition. aws_lambda_function_url
-  # stays forbidden: the authority operations never expose a public URL, API
-  # Gateway, or ALB route.
+  # them only as the exact Hub-edge set and asserts the internet route lives ONLY
+  # on the public edge route table (the isolated workload tables stay local-only).
+  # aws_lambda_function and aws_lambda_alias are similarly legitimized by the
+  # Connector Authority runtime slice. aws_lambda_function_url,
+  # aws_egress_only_internet_gateway, aws_nat_gateway, and aws_eip stay forbidden:
+  # the authority never exposes a public URL/API Gateway/ALB route, the Hub
+  # workers hold no public IP, and the edge needs no NAT or elastic IP.
   aws_lambda_function_url
-  aws_lb
-  aws_lb_listener
   aws_nat_gateway
-  aws_route
   aws_route53_record
   aws_vpc_peering_connection
   aws_vpc_peering_connection_accepter

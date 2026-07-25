@@ -466,6 +466,7 @@ def generated_input(
     evidence: dict[str, Any],
     *,
     runtime_functions_enabled: bool = False,
+    hub_edge_enabled: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     generated["provisioned_cells_evidence"] = evidence
@@ -485,6 +486,12 @@ def generated_input(
     # authority_runtime_functions_enabled exactly.
     if runtime_functions_enabled:
         payload["authority_runtime_functions_enabled"] = True
+    # Third, independent Step-5 Hub public edge gate. Emit the key ONLY when the
+    # caller explicitly opts in; when omitted the key is absent entirely so the
+    # committed Terraform default (false) governs and the edge stays dark. The
+    # key name matches the Terraform variable hub_edge_enabled exactly.
+    if hub_edge_enabled:
+        payload["hub_edge_enabled"] = True
     return payload
 
 
@@ -526,6 +533,16 @@ def main(argv: list[str] | None = None) -> int:
             "foundation dark."
         ),
     )
+    parser.add_argument(
+        "--hub-edge-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit hub_edge_enabled=true into the generated tfvars (the "
+            "Step-5 Hub public edge opt-in). Omit to leave the key absent so "
+            "the committed default (false) keeps the edge dark."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -541,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
                 contract,
                 evidence,
                 runtime_functions_enabled=args.runtime_functions_enabled,
+                hub_edge_enabled=args.hub_edge_enabled,
             )
         )
         atomic_write(args.output, payload)

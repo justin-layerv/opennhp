@@ -222,6 +222,9 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "hub_publisher_github_subject",
         "hub_publisher_role_arn",
         "hub_publisher_role_name",
+        "hub_nlb_dns_name",
+        "hub_nlb_zone_id",
+        "hub_udp_listener_arn",
         "interface_endpoint_ids",
         "isolated_subnet_ids",
         "otp_pepper_secret_arn",
@@ -440,6 +443,64 @@ for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
         f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
     ] = "aws_cloudwatch_metric_alarm"
 AUTHORITY_RUNTIME_RESOURCES[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS] = "aws_security_group"
+
+# Connector Hub public UDP edge slice (Step 5 slice 5a): the authority's only
+# caller-facing public edge. These types are moved out of the lexical forbidden
+# set (check-connector-authority-foundation.sh) and gated instead by this exact
+# set -- admitted only all-at-once, compositionally alongside the runtime slice.
+# check_live additionally proves the 0.0.0.0/0 route lives ONLY on the public
+# edge route table and that exactly this one internet gateway exists.
+HUB_EDGE_RESOURCES: dict[str, str] = {
+    "module.control.aws_subnet.hub_public[0]": "aws_subnet",
+    "module.control.aws_subnet.hub_public[1]": "aws_subnet",
+    "module.control.aws_subnet.hub_public[2]": "aws_subnet",
+    "module.control.aws_internet_gateway.hub_edge[0]": "aws_internet_gateway",
+    "module.control.aws_route_table.hub_public[0]": "aws_route_table",
+    "module.control.aws_route.hub_public_default[0]": "aws_route",
+    "module.control.aws_route_table_association.hub_public[0]": "aws_route_table_association",
+    "module.control.aws_route_table_association.hub_public[1]": "aws_route_table_association",
+    "module.control.aws_route_table_association.hub_public[2]": "aws_route_table_association",
+    "module.control.aws_lb.hub[0]": "aws_lb",
+    "module.control.aws_lb_target_group.hub[0]": "aws_lb_target_group",
+    "module.control.aws_lb_listener.hub[0]": "aws_lb_listener",
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": "aws_ssm_parameter",
+}
+
+# Configuration-block view of the Hub edge (un-indexed resource addresses). The
+# blocks are declared unconditionally, so -- exactly like the runtime blocks --
+# they always appear in the plan configuration even while count=0 (dark). Added
+# to EXPECTED_CONFIGURATION_RESOURCES unconditionally below.
+HUB_EDGE_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
+    "module.control.aws_subnet.hub_public": ("managed", "aws_subnet", "aws"),
+    "module.control.aws_internet_gateway.hub_edge": (
+        "managed",
+        "aws_internet_gateway",
+        "aws",
+    ),
+    "module.control.aws_route_table.hub_public": (
+        "managed",
+        "aws_route_table",
+        "aws",
+    ),
+    "module.control.aws_route.hub_public_default": ("managed", "aws_route", "aws"),
+    "module.control.aws_route_table_association.hub_public": (
+        "managed",
+        "aws_route_table_association",
+        "aws",
+    ),
+    "module.control.aws_lb.hub": ("managed", "aws_lb", "aws"),
+    "module.control.aws_lb_target_group.hub": (
+        "managed",
+        "aws_lb_target_group",
+        "aws",
+    ),
+    "module.control.aws_lb_listener.hub": ("managed", "aws_lb_listener", "aws"),
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn": (
+        "managed",
+        "aws_ssm_parameter",
+        "aws",
+    ),
+}
 
 AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
     "module.control.aws_lambda_function.authority": (
@@ -815,6 +876,7 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
 # in the dark plan as well as the runtime plan. The managed inventory checked
 # against resource_changes stays gated separately (AUTHORITY_RUNTIME_RESOURCES).
 EXPECTED_CONFIGURATION_RESOURCES.update(AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES)
+EXPECTED_CONFIGURATION_RESOURCES.update(HUB_EDGE_CONFIGURATION_RESOURCES)
 
 ExpressionPath = tuple[str | int, ...]
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
@@ -3268,29 +3330,35 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
 
-    # Exactly two managed inventories are admitted: the base foundation, and the
-    # base plus the complete runtime slice. Anything else fails closed.
+    # The base foundation, plus any complete subset of the two independent
+    # optional slices: the authority runtime (Lambda functions/aliases/roles/…)
+    # and the Hub public edge (public subnets/IGW/route/NLB/…). Each slice is
+    # ALL-OR-NOTHING -- its resources appear together or not at all. The slices
+    # flip in separate applies, so all four combinations are valid steady
+    # inventories. A partial slice (some but not all of its addresses) or any
+    # address outside base∪slices fails closed via the exact-set equality below.
     base_inventory = set(EXPECTED_RESOURCES)
-    runtime_inventory = base_inventory | set(AUTHORITY_RUNTIME_RESOURCES)
+    runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    hub_edge_extra = set(HUB_EDGE_RESOURCES)
     actual_inventory = set(by_address)
-    if actual_inventory == base_inventory:
-        runtime_mode = False
-        expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
-    elif actual_inventory == runtime_inventory:
-        runtime_mode = True
-        expected_resources = {**EXPECTED_RESOURCES, **AUTHORITY_RUNTIME_RESOURCES}
-    else:
-        nearest = (
-            runtime_inventory
-            if len(actual_inventory & runtime_inventory)
-            > len(actual_inventory & base_inventory)
-            else base_inventory
-        )
-        missing = sorted(nearest - actual_inventory)
-        extra = sorted(actual_inventory - nearest)
+    runtime_mode = bool(actual_inventory & runtime_extra)
+    hub_edge_mode = bool(actual_inventory & hub_edge_extra)
+    expected_inventory = (
+        base_inventory
+        | (runtime_extra if runtime_mode else set())
+        | (hub_edge_extra if hub_edge_mode else set())
+    )
+    if actual_inventory != expected_inventory:
+        missing = sorted(expected_inventory - actual_inventory)
+        extra = sorted(actual_inventory - expected_inventory)
         raise ContractError(
             f"Terraform resource inventory mismatch; missing={missing}, extra={extra}"
         )
+    expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    if runtime_mode:
+        expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
+    if hub_edge_mode:
+        expected_resources.update(HUB_EDGE_RESOURCES)
 
     actual_non_noop: dict[str, list[str]] = {}
     for address, expected_type in expected_resources.items():
@@ -3459,6 +3527,24 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         )
     )
 
+    # The Hub public edge slice (5a): every edge resource is a pending create (or
+    # an already-applied no-op) and NOTHING else moves. This slice opens no
+    # endpoint -- the caller lambda endpoint opens with the workers (5b).
+    hub_edge_creates_pending = {
+        address
+        for address in HUB_EDGE_RESOURCES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    hub_edge_transition = (
+        hub_edge_mode
+        and bool(changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in HUB_EDGE_RESOURCES
+        )
+        and changed == hub_edge_creates_pending
+    )
+
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
@@ -3518,11 +3604,17 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # updates are validated by their exact after-state security checks below
         # (_check_authority_runtime_resources), not as pure creates.
         _require_create_shapes(runtime_creates_pending, by_address)
+    elif hub_edge_transition:
+        plan_mode = "hub-edge-slice"
+        # Every edge resource is a still-pending pure create; an edge resource
+        # that already applied on an earlier attempt is a validated no-op.
+        _require_create_shapes(hub_edge_creates_pending, by_address)
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
-            "contract binding, or the exact Authority runtime slice; "
+            "contract binding, the exact Authority runtime slice, or the exact "
+            "Hub public edge slice; "
             f"got {actual_non_noop}"
         )
 
@@ -4194,8 +4286,8 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         raise ContractError("live isolated route-table IDs are malformed")
 
     route_tables = load_json(evidence_dir / "route-tables.json").get("RouteTables")
-    if not isinstance(route_tables, list) or len(route_tables) != 4:
-        raise ContractError("Control VPC must have exactly four route tables")
+    if not isinstance(route_tables, list):
+        raise ContractError("Control VPC route tables evidence is malformed")
     by_id = {item.get("RouteTableId"): item for item in route_tables}
     if not isolated.issubset(by_id):
         raise ContractError("isolated route tables are absent from live VPC")
@@ -4209,6 +4301,35 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
     ]
     if len(main) != 1 or main[0].get("RouteTableId") in isolated:
         raise ContractError("Control VPC main route table is not singular/unmanaged")
+    main_id = main[0].get("RouteTableId")
+
+    # The Hub public edge (Step 5) adds ONE public route table tagged
+    # Type=public-edge -- the only table permitted an internet route. Every live
+    # table must be one of: the three isolated workload tables, the single
+    # unmanaged main table, or a tagged public-edge table. Anything else fails
+    # closed, so a hidden internet route cannot hide in an untagged table.
+    def _route_table_type(route_table: dict[str, Any]) -> str | None:
+        for tag in route_table.get("Tags", []):
+            if tag.get("Key") == "Type":
+                return tag.get("Value")
+        return None
+
+    public_edge_ids = {
+        route_table_id
+        for route_table_id, route_table in by_id.items()
+        if route_table_id not in isolated
+        and route_table_id != main_id
+        and _route_table_type(route_table) == "public-edge"
+    }
+    unexpected = set(by_id) - isolated - {main_id} - public_edge_ids
+    if unexpected:
+        raise ContractError(
+            f"Control VPC has unexpected route tables: {sorted(unexpected)}"
+        )
+    if len(route_tables) != 4 + len(public_edge_ids):
+        raise ContractError(
+            "Control VPC route-table count is not isolated(3)+main(1)+public-edge"
+        )
     for route_table_id, route_table in by_id.items():
         routes = route_table.get("Routes")
         if not isinstance(routes, list):
@@ -4220,26 +4341,59 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             and route.get("DestinationCidrBlock") == "10.102.0.0/16"
             and route.get("State") == "active"
         ]
-        dynamodb_routes = [
-            route
-            for route in routes
-            if route.get("GatewayId") == expected["dynamodb_endpoint_id"]
-            and re.fullmatch(
-                r"pl-[0-9a-f]+", str(route.get("DestinationPrefixListId", ""))
-            )
-            and route.get("State") == "active"
-        ]
-        allowed = [*local_routes, *dynamodb_routes]
-        expected_count = 2 if route_table_id in isolated else 1
-        if len(local_routes) != 1 or len(dynamodb_routes) != expected_count - 1:
-            raise ContractError(f"live route ownership drifted for {route_table_id}")
+        if route_table_id in public_edge_ids:
+            # The public edge table: exactly the local route plus ONE default
+            # route to an internet gateway. The internet route lives here and
+            # ONLY here; the isolated/main tables are proven internet-free by the
+            # else-branch below.
+            internet_routes = [
+                route
+                for route in routes
+                if re.fullmatch(r"igw-[0-9a-f]+", str(route.get("GatewayId", "")))
+                and route.get("DestinationCidrBlock") == "0.0.0.0/0"
+                and route.get("State") == "active"
+            ]
+            allowed = [*local_routes, *internet_routes]
+            if len(local_routes) != 1 or len(internet_routes) != 1:
+                raise ContractError(
+                    f"public edge route ownership drifted for {route_table_id}"
+                )
+        else:
+            dynamodb_routes = [
+                route
+                for route in routes
+                if route.get("GatewayId") == expected["dynamodb_endpoint_id"]
+                and re.fullmatch(
+                    r"pl-[0-9a-f]+", str(route.get("DestinationPrefixListId", ""))
+                )
+                and route.get("State") == "active"
+            ]
+            allowed = [*local_routes, *dynamodb_routes]
+            expected_count = 2 if route_table_id in isolated else 1
+            if len(local_routes) != 1 or len(dynamodb_routes) != expected_count - 1:
+                raise ContractError(
+                    f"live route ownership drifted for {route_table_id}"
+                )
         if len(routes) != len(allowed):
             raise ContractError(
                 f"live route table has an internet/remote route: {route_table_id}"
             )
 
+    # The Hub public edge attaches exactly one internet gateway; while dark there
+    # is none. Egress-only IGW, peering, and transit-gateway attachments stay
+    # empty regardless -- the workers never egress to the internet.
+    internet_gateways = load_json(evidence_dir / "internet-gateways.json").get(
+        "InternetGateways"
+    )
+    igw_expected = 1 if public_edge_ids else 0
+    if (
+        not isinstance(internet_gateways, list)
+        or len(internet_gateways) != igw_expected
+    ):
+        raise ContractError(
+            f"Control VPC internet gateway count must be {igw_expected}"
+        )
     empty_arrays = {
-        "internet-gateways.json": "InternetGateways",
         "egress-only-internet-gateways.json": "EgressOnlyInternetGateways",
         "vpc-peerings.json": "VpcPeeringConnections",
         "transit-gateway-attachments.json": "TransitGatewayAttachments",
