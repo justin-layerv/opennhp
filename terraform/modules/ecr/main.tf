@@ -3061,9 +3061,12 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Resource = "*"
       },
       {
-        # Terraform invokes exactly these five unqualified helper functions to
-        # seed/read infrastructure state. Connector Authority aliases are
-        # runtime capabilities and must never enter the shared apply role.
+        # Terraform invokes exactly these six unqualified helper functions to
+        # seed/read infrastructure state. The sixth (control-hub-keygen) seeds the
+        # Connector Hub key-material secret in-account at apply (slice 5b), so no
+        # key ever enters tfstate. Connector Authority aliases (ca-ia/ra/icr) are
+        # runtime capabilities invoked by the Hub worker, NOT deploy helpers, and
+        # must never enter the shared apply role.
         Sid    = "TerraformHelperInvoke"
         Effect = "Allow"
         Action = ["lambda:InvokeFunction"]
@@ -3073,6 +3076,7 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-etcd-tls-gen",
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-registration-keygen",
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-keygen",
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-control-hub-keygen",
         ]
       },
       {

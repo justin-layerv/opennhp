@@ -124,6 +124,9 @@ _HELPER_SUFFIXES = (
     "etcd-tls-gen",
     "registration-keygen",
     "relay-keygen",
+    # Slice 5b: the Connector Hub keygen seeds the Hub key-material secret
+    # in-account at apply, invoked by the shared apply role like the others.
+    "control-hub-keygen",
 )
 HELPER_INVOKE_RESOURCES = frozenset(
     "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-"
@@ -199,7 +202,7 @@ def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str |
         or len(resources) != len(HELPER_INVOKE_RESOURCES)
         or set(resources) != HELPER_INVOKE_RESOURCES
     ):
-        return "TerraformHelperInvoke must grant only the five exact helper ARNs"
+        return "TerraformHelperInvoke must grant only the six exact helper ARNs"
     return None
 
 
