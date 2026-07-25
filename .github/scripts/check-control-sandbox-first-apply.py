@@ -646,12 +646,24 @@ HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS = 'module.control.aws_vpc_endpoint.interface[
 HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS = (
     'module.control.aws_vpc_endpoint.interface["secretsmanager"]'
 )
+HUB_WORKER_LOGS_ENDPOINT_ADDRESS = 'module.control.aws_vpc_endpoint.interface["logs"]'
+HUB_WORKER_MONITORING_ENDPOINT_ADDRESS = (
+    'module.control.aws_vpc_endpoint.interface["monitoring"]'
+)
 HUB_WORKER_OPENED_ADDRESSES = frozenset(
     {
         HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
         HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS,
+        HUB_WORKER_LOGS_ENDPOINT_ADDRESS,
+        HUB_WORKER_MONITORING_ENDPOINT_ADDRESS,
         "module.control.aws_security_group.interface_endpoints",
     }
+)
+# The Hub worker container log group ARN (awslogs driver target), matched exactly
+# in the opened logs endpoint policy. Slash-namespaced, distinct from the dash
+# CONTROL_PREFIX.
+HUB_LOG_GROUP_ARN = (
+    f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/layerv/nhp/sandbox/control/hub:*"
 )
 # The Hub key-material secret ARN carries a random 6-char Secrets Manager suffix,
 # so the opened secretsmanager endpoint policy Resource is matched by shape, not a
@@ -2155,6 +2167,10 @@ def _check_planned_security(
             _check_hub_lambda_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS:
             _check_hub_secretsmanager_endpoint_policy(after, address)
+        elif hub_worker_mode and address == HUB_WORKER_LOGS_ENDPOINT_ADDRESS:
+            _check_hub_logs_endpoint_policy(after, address)
+        elif hub_worker_mode and address == HUB_WORKER_MONITORING_ENDPOINT_ADDRESS:
+            _check_hub_monitoring_endpoint_policy(after, address)
         else:
             _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
 
@@ -2696,6 +2712,76 @@ def _check_hub_secretsmanager_endpoint_policy(
         raise ContractError(
             f"{address} resource must be exactly the Hub key-material secret"
         )
+
+
+def _check_hub_logs_endpoint_policy(after: dict[str, Any], address: str) -> None:
+    # The opened logs interface endpoint admits ONLY the Hub execution role's
+    # awslogs driver creating the stream + putting events, scoped to EXACTLY the
+    # Hub worker container log group. No CreateLogGroup (the group is pre-created).
+    stmt = _authority_single_allow_statement(after, address, "HubWorkerContainerLogs")
+    if _authority_principalarn_condition(stmt, address) != {HUB_EXECUTION_ROLE_ARN}:
+        raise ContractError(
+            f"{address} principal must be exactly the Hub execution role"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+    }:
+        raise ContractError(
+            f"{address} actions must be exactly CreateLogStream+PutLogEvents"
+        )
+    if _authority_string_set(stmt.get("Resource"), address, "Resource") != {
+        HUB_LOG_GROUP_ARN
+    }:
+        raise ContractError(
+            f"{address} resource must be exactly the Hub worker log group"
+        )
+
+
+def _check_hub_monitoring_endpoint_policy(
+    after: dict[str, Any], address: str
+) -> None:
+    # The opened monitoring interface endpoint admits ONLY the Hub task role
+    # publishing metrics. PutMetricData is resource-less (Resource "*"), so BOTH
+    # the caller AND the LayerV/NHP namespace are fenced in the condition (every
+    # Terraform PutMetricData grant must be namespace-scoped).
+    stmt = _authority_single_allow_statement(
+        after, address, "HubWorkerPublishMetrics"
+    )
+    if stmt.get("Principal") != "*":
+        raise ContractError(
+            f'{address} principal must be "*" scoped by an aws:PrincipalArn condition'
+        )
+    condition = stmt.get("Condition")
+    if not isinstance(condition, dict) or set(condition) != {"StringEquals"}:
+        raise ContractError(
+            f"{address} must scope with exactly one StringEquals condition"
+        )
+    equals = condition["StringEquals"]
+    if not isinstance(equals, dict) or set(equals) != {
+        "aws:PrincipalArn",
+        "cloudwatch:namespace",
+    }:
+        raise ContractError(
+            f"{address} condition must key on exactly aws:PrincipalArn + "
+            "cloudwatch:namespace"
+        )
+    if _authority_string_set(
+        equals["aws:PrincipalArn"], address, "aws:PrincipalArn"
+    ) != {HUB_TASK_ROLE_ARN}:
+        raise ContractError(f"{address} principal must be exactly the Hub task role")
+    if equals.get("cloudwatch:namespace") != "LayerV/NHP":
+        raise ContractError(
+            f"{address} PutMetricData must be scoped to the LayerV/NHP namespace"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {
+        "cloudwatch:PutMetricData"
+    }:
+        raise ContractError(
+            f"{address} action must be exactly cloudwatch:PutMetricData"
+        )
+    if stmt.get("Resource") != "*":
+        raise ContractError(f'{address} PutMetricData resource must be "*"')
 
 
 def _check_hub_ecr_endpoint_policy(after: dict[str, Any], address: str) -> None:
@@ -4681,6 +4767,10 @@ def check_state(state: Any) -> dict[str, Any]:
             _check_hub_lambda_endpoint_policy(item, address)
         elif hub_worker_present and service == "secretsmanager":
             _check_hub_secretsmanager_endpoint_policy(item, address)
+        elif hub_worker_present and service == "logs":
+            _check_hub_logs_endpoint_policy(item, address)
+        elif hub_worker_present and service == "monitoring":
+            _check_hub_monitoring_endpoint_policy(item, address)
         elif json.loads(item.get("policy", "{}")) != deny_policy:
             raise ContractError(
                 f"dark interface endpoint contract failed for {service}"

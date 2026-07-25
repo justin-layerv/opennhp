@@ -5280,6 +5280,117 @@ class HubSecretsmanagerEndpointPolicyTests(unittest.TestCase):
             CHECKER._check_hub_secretsmanager_endpoint_policy(after, "sm")
 
 
+class HubLogsEndpointPolicyTests(unittest.TestCase):
+    def _after(self, **overrides) -> dict:
+        stmt = {
+            "Sid": "HubWorkerContainerLogs",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": [CHECKER.HUB_LOG_GROUP_ARN],
+            "Condition": {
+                "StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_EXECUTION_ROLE_ARN]}
+            },
+        }
+        stmt.update(overrides)
+        return {"policy": json.dumps({"Version": "2012-10-17", "Statement": [stmt]})}
+
+    def test_exact_passes(self) -> None:
+        CHECKER._check_hub_logs_endpoint_policy(self._after(), "logs")
+
+    def test_wrong_principal_fails(self) -> None:
+        after = self._after(
+            Condition={"StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]}}
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_logs_endpoint_policy(after, "logs")
+
+    def test_extra_action_fails(self) -> None:
+        after = self._after(
+            Action=["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"]
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_logs_endpoint_policy(after, "logs")
+
+    def test_wrong_log_group_fails(self) -> None:
+        after = self._after(
+            Resource=[
+                f"arn:aws:logs:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}"
+                ":log-group:/layerv/nhp/sandbox/control/other:*"
+            ]
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_logs_endpoint_policy(after, "logs")
+
+
+class HubMonitoringEndpointPolicyTests(unittest.TestCase):
+    def _after(self, **overrides) -> dict:
+        stmt = {
+            "Sid": "HubWorkerPublishMetrics",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "cloudwatch:PutMetricData",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN],
+                    "cloudwatch:namespace": "LayerV/NHP",
+                }
+            },
+        }
+        stmt.update(overrides)
+        return {"policy": json.dumps({"Version": "2012-10-17", "Statement": [stmt]})}
+
+    def test_exact_passes(self) -> None:
+        CHECKER._check_hub_monitoring_endpoint_policy(self._after(), "mon")
+
+    def test_wrong_principal_fails(self) -> None:
+        after = self._after(
+            Condition={
+                "StringEquals": {
+                    "aws:PrincipalArn": [CHECKER.HUB_EXECUTION_ROLE_ARN],
+                    "cloudwatch:namespace": "LayerV/NHP",
+                }
+            }
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_monitoring_endpoint_policy(after, "mon")
+
+    def test_missing_namespace_condition_fails(self) -> None:
+        after = self._after(
+            Condition={
+                "StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]}
+            }
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_monitoring_endpoint_policy(after, "mon")
+
+    def test_wrong_namespace_fails(self) -> None:
+        after = self._after(
+            Condition={
+                "StringEquals": {
+                    "aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN],
+                    "cloudwatch:namespace": "Other/NS",
+                }
+            }
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_monitoring_endpoint_policy(after, "mon")
+
+    def test_non_wildcard_resource_fails(self) -> None:
+        after = self._after(
+            Resource=[f"arn:aws:cloudwatch:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:*"]
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_monitoring_endpoint_policy(after, "mon")
+
+    def test_wrong_action_fails(self) -> None:
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_monitoring_endpoint_policy(
+                self._after(Action="cloudwatch:PutMetricStream"), "mon"
+            )
+
+
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

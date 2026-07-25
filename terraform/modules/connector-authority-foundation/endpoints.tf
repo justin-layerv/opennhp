@@ -195,9 +195,55 @@ locals {
     }]
   })
 
+  # CloudWatch Logs interface endpoint: the Fargate EXECUTION role's awslogs
+  # driver creates the log stream and puts events for the init + worker
+  # containers, scoped to exactly the Hub worker log group. The log group itself
+  # is pre-created by Terraform (awslogs-create-group is not set), so no
+  # CreateLogGroup is needed. Opened only with the Hub worker.
+  hub_logs_endpoint_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "HubWorkerContainerLogs"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource = [
+        "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:${local.hub_log_group_name}:*"
+      ]
+      Condition = {
+        StringEquals = {
+          "aws:PrincipalArn" = [local.hub_execution_role_arn]
+        }
+      }
+    }]
+  })
+
+  # CloudWatch (monitoring) interface endpoint: the Hub worker TASK role publishes
+  # its LayerV/NHP operational metrics. PutMetricData is a namespace-scoped action
+  # with no resource ARN (Resource must be "*"), so BOTH the caller (aws:PrincipalArn)
+  # and the LayerV/NHP namespace are fenced here -- every Terraform PutMetricData
+  # grant must be namespace-scoped (validate-workflows enforces this), matching the
+  # task IAM policy. Opened only with the Hub worker.
+  hub_monitoring_endpoint_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "HubWorkerPublishMetrics"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "cloudwatch:PutMetricData"
+      Resource  = "*"
+      Condition = {
+        StringEquals = {
+          "aws:PrincipalArn"     = [local.hub_task_role_arn]
+          "cloudwatch:namespace" = "LayerV/NHP"
+        }
+      }
+    }]
+  })
+
   # Per-service interface-endpoint policy. KMS opens with the authority runtime;
-  # the caller (lambda) and secretsmanager endpoints open with the Hub worker
-  # (slice 5b). Every other interface endpoint (email, logs, monitoring) stays
+  # the caller (lambda), secretsmanager, logs, and monitoring endpoints open with
+  # the Hub worker (slice 5b). Every other interface endpoint (email) stays
   # deny-all. The ecr.api/ecr.dkr interface endpoints are separate resources
   # (hub_worker.tf) and carry hub_ecr_endpoint_policy directly.
   interface_endpoint_policies = {
@@ -206,6 +252,8 @@ locals {
       local.authority_runtime_functions_deploy && service == "kms" ? local.authority_kms_endpoint_policy
       : local.hub_worker_deploy && service == "lambda" ? local.hub_lambda_endpoint_policy
       : local.hub_worker_deploy && service == "secretsmanager" ? local.hub_secretsmanager_endpoint_policy
+      : local.hub_worker_deploy && service == "logs" ? local.hub_logs_endpoint_policy
+      : local.hub_worker_deploy && service == "monitoring" ? local.hub_monitoring_endpoint_policy
       : local.deny_all_endpoint_policy
     )
   }
