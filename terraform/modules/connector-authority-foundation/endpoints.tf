@@ -169,9 +169,35 @@ locals {
     }]
   })
 
+  # Secrets Manager interface endpoint: the Fargate EXECUTION role (agent
+  # identity), and only it, may read the Hub key-material secret so the ECS agent
+  # can inject the three key env vars into the short-lived materialize-config init
+  # container. Opened only with the Hub worker. `[*].arn` resolves to an empty
+  # Resource list while the worker is dark (this policy is never selected then --
+  # secretsmanager stays deny-all). Same Principal "*" + aws:PrincipalArn scoping
+  # (a role-ARN Principal would silently deny the assumed-role session). The KMS
+  # decrypt of the CMK-encrypted secret happens server-side inside Secrets Manager
+  # (checked against the exec role's IAM kms:Decrypt), NOT via the caller's KMS
+  # endpoint, so the KMS interface endpoint needs no Hub opening.
+  hub_secretsmanager_endpoint_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "HubWorkerReadKeyMaterial"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.hub_key_material[*].arn
+      Condition = {
+        StringEquals = {
+          "aws:PrincipalArn" = [local.hub_execution_role_arn]
+        }
+      }
+    }]
+  })
+
   # Per-service interface-endpoint policy. KMS opens with the authority runtime;
-  # the caller (lambda) endpoint opens with the Hub worker (slice 5b). Every
-  # other interface endpoint (email, logs, monitoring, secretsmanager) stays
+  # the caller (lambda) and secretsmanager endpoints open with the Hub worker
+  # (slice 5b). Every other interface endpoint (email, logs, monitoring) stays
   # deny-all. The ecr.api/ecr.dkr interface endpoints are separate resources
   # (hub_worker.tf) and carry hub_ecr_endpoint_policy directly.
   interface_endpoint_policies = {
@@ -179,6 +205,7 @@ locals {
     service => (
       local.authority_runtime_functions_deploy && service == "kms" ? local.authority_kms_endpoint_policy
       : local.hub_worker_deploy && service == "lambda" ? local.hub_lambda_endpoint_policy
+      : local.hub_worker_deploy && service == "secretsmanager" ? local.hub_secretsmanager_endpoint_policy
       : local.deny_all_endpoint_policy
     )
   }

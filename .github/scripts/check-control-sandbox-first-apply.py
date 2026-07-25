@@ -643,11 +643,22 @@ HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
 # not change; their policy/ingress does). Used by the plan_mode transition and
 # the partial-retry normalization lane.
 HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS = 'module.control.aws_vpc_endpoint.interface["lambda"]'
+HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS = (
+    'module.control.aws_vpc_endpoint.interface["secretsmanager"]'
+)
 HUB_WORKER_OPENED_ADDRESSES = frozenset(
     {
         HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
+        HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS,
         "module.control.aws_security_group.interface_endpoints",
     }
+)
+# The Hub key-material secret ARN carries a random 6-char Secrets Manager suffix,
+# so the opened secretsmanager endpoint policy Resource is matched by shape, not a
+# constructed literal.
+HUB_KEY_MATERIAL_SECRET_ARN_RE = re.compile(
+    rf"^arn:aws:secretsmanager:{AWS_REGION}:{ACCOUNT_ID}:secret:"
+    rf"{CONTROL_PREFIX}-hub-key-material-[A-Za-z0-9]+$"
 )
 
 # Constructed, plan-known worker principal ARNs (same technique as
@@ -2142,6 +2153,8 @@ def _check_planned_security(
             _check_authority_kms_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
             _check_hub_lambda_endpoint_policy(after, address)
+        elif hub_worker_mode and address == HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS:
+            _check_hub_secretsmanager_endpoint_policy(after, address)
         else:
             _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
 
@@ -2651,6 +2664,37 @@ def _check_hub_lambda_endpoint_policy(after: dict[str, Any], address: str) -> No
     ):
         raise ContractError(
             f"{address} resources must be exactly the 3 selected-color authority aliases"
+        )
+
+
+def _check_hub_secretsmanager_endpoint_policy(
+    after: dict[str, Any], address: str
+) -> None:
+    # The opened secretsmanager interface endpoint admits ONLY the Hub execution
+    # role reading the Hub key-material secret (the ECS agent fetches it to inject
+    # the init container's key env vars). Same Principal "*" + aws:PrincipalArn
+    # shape; the secret ARN carries a random Secrets Manager suffix so it is
+    # matched by shape rather than a constructed literal.
+    stmt = _authority_single_allow_statement(
+        after, address, "HubWorkerReadKeyMaterial"
+    )
+    if _authority_principalarn_condition(stmt, address) != {HUB_EXECUTION_ROLE_ARN}:
+        raise ContractError(
+            f"{address} principal must be exactly the Hub execution role"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {
+        "secretsmanager:GetSecretValue"
+    }:
+        raise ContractError(
+            f"{address} action must be exactly secretsmanager:GetSecretValue"
+        )
+    resources = _authority_string_set(stmt.get("Resource"), address, "Resource")
+    if (
+        len(resources) != 1
+        or HUB_KEY_MATERIAL_SECRET_ARN_RE.fullmatch(next(iter(resources))) is None
+    ):
+        raise ContractError(
+            f"{address} resource must be exactly the Hub key-material secret"
         )
 
 
@@ -4635,6 +4679,8 @@ def check_state(state: Any) -> dict[str, Any]:
             _check_authority_kms_endpoint_policy(item, address)
         elif hub_worker_present and service == "lambda":
             _check_hub_lambda_endpoint_policy(item, address)
+        elif hub_worker_present and service == "secretsmanager":
+            _check_hub_secretsmanager_endpoint_policy(item, address)
         elif json.loads(item.get("policy", "{}")) != deny_policy:
             raise ContractError(
                 f"dark interface endpoint contract failed for {service}"

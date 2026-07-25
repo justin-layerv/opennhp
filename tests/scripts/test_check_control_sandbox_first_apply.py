@@ -5235,6 +5235,51 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
                 CHECKER.check_live(root)
 
 
+class HubSecretsmanagerEndpointPolicyTests(unittest.TestCase):
+    def _after(self, **overrides) -> dict:
+        stmt = {
+            "Sid": "HubWorkerReadKeyMaterial",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": [
+                f"arn:aws:secretsmanager:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}"
+                f":secret:{CHECKER.CONTROL_PREFIX}-hub-key-material-Ab3xYz"
+            ],
+            "Condition": {
+                "StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_EXECUTION_ROLE_ARN]}
+            },
+        }
+        stmt.update(overrides)
+        return {"policy": json.dumps({"Version": "2012-10-17", "Statement": [stmt]})}
+
+    def test_exact_policy_passes(self) -> None:
+        CHECKER._check_hub_secretsmanager_endpoint_policy(self._after(), "sm")
+
+    def test_wrong_principal_fails(self) -> None:
+        after = self._after(
+            Condition={"StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]}}
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_secretsmanager_endpoint_policy(after, "sm")
+
+    def test_wrong_action_fails(self) -> None:
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_secretsmanager_endpoint_policy(
+                self._after(Action="secretsmanager:PutSecretValue"), "sm"
+            )
+
+    def test_wrong_resource_shape_fails(self) -> None:
+        after = self._after(
+            Resource=[
+                f"arn:aws:secretsmanager:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}"
+                ":secret:some-other-secret-Ab3xYz"
+            ]
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_secretsmanager_endpoint_policy(after, "sm")
+
+
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
