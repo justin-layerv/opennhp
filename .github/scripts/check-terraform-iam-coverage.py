@@ -429,6 +429,19 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
     # (GetPublicKey on the key id). The github_actions role already grants
     # kms:Get* which covers this via IAM glob.
     "aws_kms_public_key": ["kms:GetPublicKey"],
+    # internal/service/elbv2/load_balancer_data_source.go: FindLoadBalancer
+    # calls elasticloadbalancing:DescribeLoadBalancers to resolve the LB by
+    # name, then the read populates attributes + tags via
+    # elasticloadbalancing:DescribeLoadBalancerAttributes and
+    # elasticloadbalancing:DescribeTags. Consumed at
+    # terraform/environments/sandbox-hub-dns/main.tf to alias hub.nhp.layerv.xyz
+    # to the Connector Hub NLB; the same Describe* verbs already back the
+    # aws_lb RESOURCE refresh.
+    "aws_lb": [
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeTags",
+    ],
 }
 
 

@@ -660,9 +660,18 @@ def require_alarm_registry(
 #   full instantiation is unsafe here. cell1 ships no AC / qurl-service / relay
 #   to alarm on; its L7 data plane and observability ride cell0, which this
 #   lint checks in full. Removing cell1's tree should drop this entry too.
+#
+#   sandbox-hub-dns: a DNS-only root that emits exactly one public A-alias,
+#   hub.nhp.layerv.xyz -> the Connector Hub UDP:62206 NLB (Step 5 slice 5c). It
+#   instantiates no compute/AC/relay/security and no `module "nhp"` — the Hub
+#   worker + its alarms live in the Control tree (module.control), not here, so
+#   there is no server observability surface to enforce parity on. It lives
+#   OUTSIDE the Control tree only because aws_route53_record is lexically
+#   forbidden there. Removing the record's root should drop this entry too.
 OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS: frozenset[str] = frozenset(
     {
         "sandbox-cell1",
+        "sandbox-hub-dns",
     }
 )
 

@@ -1087,6 +1087,37 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("observability parity surfaces are wired", result.stdout)
 
+    def test_exempt_hub_dns_root_without_module_nhp_passes(self) -> None:
+        # sandbox-hub-dns is a DNS-only root emitting one public A-alias
+        # (hub.nhp.layerv.xyz -> the Connector Hub NLB, Step 5 slice 5c). It
+        # instantiates no compute/AC/relay/security and no `module "nhp"`; the
+        # Hub worker and its alarms live in the Control tree, not here, so there
+        # is no server observability surface to enforce parity on. It must pass
+        # the guard by name while any other unexempted root fails closed.
+        self.assertIn(
+            "sandbox-hub-dns", CHECKER.OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            write(
+                root / "terraform" / "environments" / "sandbox-hub-dns" / "main.tf",
+                """
+                data "aws_lb" "hub" {
+                  name = "layerv-nhp-sandbox-control-hub"
+                }
+
+                module "dns" {
+                  source = "../../modules/dns"
+                }
+                """,
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("observability parity surfaces are wired", result.stdout)
+
     def test_env_root_exemptions_stay_narrow(self) -> None:
         # The #1141 guard must keep checking every real deployable root; only
         # the explicitly-justified lean cells opt out. Guard against the
