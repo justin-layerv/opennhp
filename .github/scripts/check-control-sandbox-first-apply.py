@@ -656,6 +656,10 @@ HUB_WORKER_OPENED_ADDRESSES = frozenset(
 # plan time and independently checkable, with no function<->role<->policy cycle.
 HUB_TASK_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{CONTROL_PREFIX}-hub-task"
 HUB_EXECUTION_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{CONTROL_PREFIX}-hub-exec"
+# The Hub keygen Lambda persists in the Control prefix once the worker slice is
+# live (it seeds the key-material secret once, then stays). check_live admits it
+# ONLY alongside the 3 authority functions -- the worker requires the runtime.
+HUB_KEYGEN_FUNCTION_NAME = f"{CONTROL_PREFIX}-hub-keygen"
 
 # The Hub invokes the SELECTED authority color's alias for each of the 3 Hub
 # operations. The merged measurement basis freezes selected_authority_color=blue
@@ -4957,11 +4961,13 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             "Control state object is not versioned under the exact KMS key"
         )
 
-    # The Control/authority prefixes own no Lambda while dark, and exactly the 3
-    # Hub-facing functions once the runtime slice is live. Any other function
-    # fails closed. `control-lambdas.json` is the reviewed `aws lambda
-    # list-functions` projection (function objects filtered to the control and
-    # layerv-nhp-<env>-ca- prefixes).
+    # The Control/authority prefixes own no Lambda while dark; exactly the 3
+    # Hub-facing functions once the runtime slice is live; and additionally the
+    # Hub keygen function once the Hub worker slice (5b) is live (the keygen only
+    # appears alongside the runtime). Any other function set fails closed.
+    # `control-lambdas.json` is the reviewed `aws lambda list-functions`
+    # projection (function objects filtered to the control and layerv-nhp-<env>-ca-
+    # prefixes).
     live_lambdas = load_json(evidence_dir / "control-lambdas.json")
     if not isinstance(live_lambdas, list):
         raise ContractError("Control Lambda inventory evidence is malformed")
@@ -4971,10 +4977,16 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         if not isinstance(name, str):
             raise ContractError("Control Lambda inventory evidence is malformed")
         live_lambda_names.add(name)
-    if live_lambda_names not in (set(), set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)):
+    authority_functions = set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+    if live_lambda_names not in (
+        set(),
+        authority_functions,
+        authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
+    ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "3 Hub-facing Authority functions are admitted"
+            "3 Hub-facing Authority functions (plus the Hub keygen once the worker "
+            "slice is live) are admitted"
         )
     # The Hub public UDP edge (slice 5a) is the authority's only load balancer,
     # and it exists in lockstep with the tagged public-edge route table proven

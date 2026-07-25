@@ -5198,6 +5198,42 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.check_live(root)
 
+    def test_live_worker_admits_the_keygen_lambda(self) -> None:
+        # The persisted keygen function is admitted ONLY alongside the 3 authority
+        # functions (the worker requires the live runtime).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            write_json(
+                root / "control-lambdas.json",
+                [
+                    {"FunctionName": name}
+                    for name in [
+                        *CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+                        CHECKER.HUB_KEYGEN_FUNCTION_NAME,
+                    ]
+                ],
+            )
+            self.assertEqual(CHECKER.check_live(root)["hub_load_balancer_count"], 1)
+
+    def test_live_worker_rejects_extra_lambda_beyond_keygen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            write_json(
+                root / "control-lambdas.json",
+                [
+                    {"FunctionName": name}
+                    for name in [
+                        *CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+                        CHECKER.HUB_KEYGEN_FUNCTION_NAME,
+                        "layerv-nhp-sandbox-control-rogue",
+                    ]
+                ],
+            )
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
 
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
