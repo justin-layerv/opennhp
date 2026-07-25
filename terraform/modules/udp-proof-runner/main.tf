@@ -82,6 +82,13 @@ resource "aws_security_group" "runner" {
 
   lifecycle {
     create_before_destroy = true
+    # egress = [] revokes the AWS default allow-all on create; the real
+    # outbound rules are owned by the aws_vpc_security_group_egress_rule
+    # resources below. Ignore inline egress drift so those authoritative
+    # rules don't fight the empty inline set on every subsequent plan
+    # (otherwise a plain re-apply strips the runner's egress). ingress
+    # stays inline-[] and enforced: there are no separate ingress rules.
+    ignore_changes = [egress]
   }
 }
 

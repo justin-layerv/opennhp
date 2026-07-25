@@ -141,12 +141,19 @@ resource "aws_iam_role_policy" "controller" {
         Effect   = "Allow"
         Action   = "kms:GenerateDataKey"
         Resource = aws_kms_key.jit.arn
+        # Scope to Secrets-Manager-invoked calls only. Deliberately NOT
+        # constrained by kms:EncryptionContext:SecretARN: during CreateSecret
+        # the secret ARN is assigned *as part of* the create, so Secrets
+        # Manager's GenerateDataKey encryption context does not yet carry
+        # SecretARN (it only appears on Put/Get of an existing secret). An
+        # ArnLike condition on that key is therefore unsatisfiable at create
+        # time and denies the one-use secret's sole KMS operation. The
+        # controller's secretsmanager:CreateSecret is already resource-scoped to
+        # local.jit_secret_arn_pattern with required tags, and this is a
+        # dedicated single-purpose CMK, so ViaService is the correct fence here.
         Condition = {
           StringEquals = {
             "kms:ViaService" = local.secrets_kms_via_service
-          }
-          ArnLike = {
-            "kms:EncryptionContext:SecretARN" = local.jit_secret_arn_pattern
           }
         }
       },
