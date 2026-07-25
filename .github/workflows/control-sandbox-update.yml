@@ -28,6 +28,14 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      hub_worker_enabled:
+        description: 'Step-5 Hub Fargate worker gate (slice 5b). true emits hub_worker_enabled=true into the generated tfvars; false keeps the committed default (dark). Requires hub_edge_enabled=true and a live authority runtime. Pass the SAME value to plan, apply, and verify.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -204,6 +212,7 @@ jobs:
         env:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+          HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -214,6 +223,10 @@ jobs:
           if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
             hub_edge_flag=(--hub-edge-enabled)
           fi
+          hub_worker_flag=()
+          if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
+            hub_worker_flag=(--hub-worker-enabled)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -221,7 +234,8 @@ jobs:
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
-            "${hub_edge_flag[@]}"
+            "${hub_edge_flag[@]}" \
+            "${hub_worker_flag[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -489,6 +503,7 @@ jobs:
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+          HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -499,6 +514,10 @@ jobs:
           if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
             hub_edge_flag=(--hub-edge-enabled)
           fi
+          hub_worker_flag=()
+          if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
+            hub_worker_flag=(--hub-worker-enabled)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -506,7 +525,8 @@ jobs:
             --expected-checkout-commit "$PLANNED_COMMIT_SHA" \
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
-            "${hub_edge_flag[@]}"
+            "${hub_edge_flag[@]}" \
+            "${hub_worker_flag[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -821,6 +841,7 @@ jobs:
         env:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+          HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -831,6 +852,10 @@ jobs:
           if [[ "$HUB_EDGE_ENABLED" == 'true' ]]; then
             hub_edge_flag=(--hub-edge-enabled)
           fi
+          hub_worker_flag=()
+          if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
+            hub_worker_flag=(--hub-worker-enabled)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -838,7 +863,8 @@ jobs:
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
-            "${hub_edge_flag[@]}"
+            "${hub_edge_flag[@]}" \
+            "${hub_worker_flag[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

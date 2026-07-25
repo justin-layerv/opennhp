@@ -84,6 +84,25 @@ variable "hub_edge_enabled" {
   default     = false
 }
 
+variable "hub_worker_enabled" {
+  description = <<-EOT
+    Dark-first enable gate for the Connector Hub Fargate worker (Step 5, slice
+    5b): the ECS cluster/task/service, the execution and task roles, the seeded
+    key-material secret plus its one-shot keygen Lambda, the dedicated worker
+    security group, the Hub log group, and the ECR/S3 image-pull endpoints. It
+    also opens the caller (Lambda) interface endpoint to the Hub task role.
+
+    It requires BOTH hub_edge_enabled AND a live authority runtime
+    (authority_runtime_functions_enabled on a bound contract): the worker fronts
+    the 5a public UDP NLB target group and invokes the three live authority
+    aliases (issue/refresh assignment, credential recovery). The module fails
+    closed if this is set while either dependency is dark. Committed inputs leave
+    it false; prod stays dark.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Additional tags applied to every supported resource."
   type        = map(string)

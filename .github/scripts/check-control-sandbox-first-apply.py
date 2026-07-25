@@ -508,6 +508,178 @@ HUB_EDGE_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
+# Connector Hub Fargate worker slice (Step 5 slice 5b): the ECS cluster/service/
+# task-definition fronting the 5a NLB target group, the Hub key-material secret
+# and its keygen Lambda (which seeds the value in-account so no key ever enters
+# tfstate), the worker security group, the Hub log group, and the ECR/S3 image-
+# pull endpoints. This slice both CREATES the above AND OPENS two pre-existing
+# base resources: the `lambda` interface endpoint policy (deny -> scoped to the
+# worker task role) and the interface-endpoints SG (a second 443 ingress from the
+# worker SG). Admitted only all-at-once, compositionally, and only alongside BOTH
+# the authority runtime slice (the aliases it invokes) and the Hub edge slice
+# (the target group it registers into).
+HUB_WORKER_RESOURCES: dict[str, str] = {
+    "module.control.aws_secretsmanager_secret.hub_key_material[0]": "aws_secretsmanager_secret",
+    "module.control.aws_iam_role.hub_keygen[0]": "aws_iam_role",
+    "module.control.aws_iam_role_policy.hub_keygen[0]": "aws_iam_role_policy",
+    "module.control.aws_cloudwatch_log_group.hub_keygen[0]": "aws_cloudwatch_log_group",
+    "module.control.aws_lambda_function.hub_keygen[0]": "aws_lambda_function",
+    "module.control.aws_lambda_invocation.hub_keygen[0]": "aws_lambda_invocation",
+    "module.control.aws_iam_role.hub_execution[0]": "aws_iam_role",
+    "module.control.aws_iam_role_policy_attachment.hub_execution[0]": "aws_iam_role_policy_attachment",
+    "module.control.aws_iam_role_policy.hub_execution[0]": "aws_iam_role_policy",
+    "module.control.aws_iam_role.hub_task[0]": "aws_iam_role",
+    "module.control.aws_iam_role_policy.hub_task[0]": "aws_iam_role_policy",
+    "module.control.aws_security_group.hub_worker[0]": "aws_security_group",
+    "module.control.aws_cloudwatch_log_group.hub[0]": "aws_cloudwatch_log_group",
+    "module.control.aws_ecs_cluster.hub[0]": "aws_ecs_cluster",
+    "module.control.aws_ecs_task_definition.hub[0]": "aws_ecs_task_definition",
+    "module.control.aws_ecs_service.hub[0]": "aws_ecs_service",
+    "module.control.aws_vpc_endpoint.hub_ecr_api[0]": "aws_vpc_endpoint",
+    "module.control.aws_vpc_endpoint.hub_ecr_dkr[0]": "aws_vpc_endpoint",
+    "module.control.aws_vpc_endpoint.hub_s3[0]": "aws_vpc_endpoint",
+}
+
+# Count-gated data sources the worker slice adds (the published image digest and
+# the keygen zip). Present in state only when the slice is live -- compositional,
+# exactly like the managed set above.
+HUB_WORKER_DATA_RESOURCES: dict[str, str] = {
+    "module.control.data.aws_ssm_parameter.hub_image_digest[0]": "aws_ssm_parameter",
+    "module.control.data.archive_file.hub_keygen[0]": "archive_file",
+}
+
+# Configuration-block view (un-indexed). Declared unconditionally in the module,
+# so -- exactly like the runtime/edge blocks -- they always appear in the plan
+# configuration even while count=0 (dark). The archive_file data source is the
+# only non-aws provider block the Control root declares.
+HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
+    "module.control.aws_secretsmanager_secret.hub_key_material": (
+        "managed",
+        "aws_secretsmanager_secret",
+        "aws",
+    ),
+    "module.control.aws_iam_role.hub_keygen": ("managed", "aws_iam_role", "aws"),
+    "module.control.aws_iam_role_policy.hub_keygen": (
+        "managed",
+        "aws_iam_role_policy",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_log_group.hub_keygen": (
+        "managed",
+        "aws_cloudwatch_log_group",
+        "aws",
+    ),
+    "module.control.aws_lambda_function.hub_keygen": (
+        "managed",
+        "aws_lambda_function",
+        "aws",
+    ),
+    "module.control.aws_lambda_invocation.hub_keygen": (
+        "managed",
+        "aws_lambda_invocation",
+        "aws",
+    ),
+    "module.control.aws_iam_role.hub_execution": ("managed", "aws_iam_role", "aws"),
+    "module.control.aws_iam_role_policy_attachment.hub_execution": (
+        "managed",
+        "aws_iam_role_policy_attachment",
+        "aws",
+    ),
+    "module.control.aws_iam_role_policy.hub_execution": (
+        "managed",
+        "aws_iam_role_policy",
+        "aws",
+    ),
+    "module.control.aws_iam_role.hub_task": ("managed", "aws_iam_role", "aws"),
+    "module.control.aws_iam_role_policy.hub_task": (
+        "managed",
+        "aws_iam_role_policy",
+        "aws",
+    ),
+    "module.control.aws_security_group.hub_worker": (
+        "managed",
+        "aws_security_group",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_log_group.hub": (
+        "managed",
+        "aws_cloudwatch_log_group",
+        "aws",
+    ),
+    "module.control.aws_ecs_cluster.hub": ("managed", "aws_ecs_cluster", "aws"),
+    "module.control.aws_ecs_task_definition.hub": (
+        "managed",
+        "aws_ecs_task_definition",
+        "aws",
+    ),
+    "module.control.aws_ecs_service.hub": ("managed", "aws_ecs_service", "aws"),
+    "module.control.aws_vpc_endpoint.hub_ecr_api": (
+        "managed",
+        "aws_vpc_endpoint",
+        "aws",
+    ),
+    "module.control.aws_vpc_endpoint.hub_ecr_dkr": (
+        "managed",
+        "aws_vpc_endpoint",
+        "aws",
+    ),
+    "module.control.aws_vpc_endpoint.hub_s3": ("managed", "aws_vpc_endpoint", "aws"),
+    "module.control.data.aws_ssm_parameter.hub_image_digest": (
+        "data",
+        "aws_ssm_parameter",
+        "aws",
+    ),
+    "module.control.data.archive_file.hub_keygen": (
+        "data",
+        "archive_file",
+        # Module-local provider (declared in the module's required_providers, not
+        # configured at the root), so its provider_config_key is namespaced like
+        # terraform_data's "module.control:terraform".
+        "module.control:archive",
+    ),
+}
+
+# The two pre-existing base resources the worker slice OPENS (their addresses do
+# not change; their policy/ingress does). Used by the plan_mode transition and
+# the partial-retry normalization lane.
+HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS = 'module.control.aws_vpc_endpoint.interface["lambda"]'
+HUB_WORKER_OPENED_ADDRESSES = frozenset(
+    {
+        HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
+        "module.control.aws_security_group.interface_endpoints",
+    }
+)
+
+# Constructed, plan-known worker principal ARNs (same technique as
+# AUTHORITY_RUNTIME_EXEC_ROLE_ARNS): the module names the roles deterministically
+# so the opened lambda-endpoint policy and the task policy are fully known at
+# plan time and independently checkable, with no function<->role<->policy cycle.
+HUB_TASK_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{CONTROL_PREFIX}-hub-task"
+HUB_EXECUTION_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{CONTROL_PREFIX}-hub-exec"
+
+# The Hub invokes the SELECTED authority color's alias for each of the 3 Hub
+# operations. The merged measurement basis freezes selected_authority_color=blue
+# (docs/evidence/connector-authority/v1/sandbox-measurement-basis.json), which is
+# the live sandbox deployment; a future green switch revises this in lockstep
+# with the runtime slice.
+HUB_AUTHORITY_ALIAS_ARNS = frozenset(
+    f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{_fn}:blue"
+    for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+)
+
+# ECR/S3 image-pull endpoint policy expectations (scoped to the execution role).
+HUB_ECR_REPOSITORY_ARN = (
+    f"arn:aws:ecr:{AWS_REGION}:{ACCOUNT_ID}:repository/layerv/nhp-hub"
+)
+HUB_ECR_PULL_ACTIONS = frozenset(
+    {
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability",
+    }
+)
+HUB_S3_LAYER_BUCKET_ARN = f"arn:aws:s3:::prod-{AWS_REGION}-starport-layer-bucket/*"
+
 AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
     "module.control.aws_lambda_function.authority": (
         "managed",
@@ -883,6 +1055,9 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
 # against resource_changes stays gated separately (AUTHORITY_RUNTIME_RESOURCES).
 EXPECTED_CONFIGURATION_RESOURCES.update(AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES)
 EXPECTED_CONFIGURATION_RESOURCES.update(HUB_EDGE_CONFIGURATION_RESOURCES)
+# The Hub worker slice's blocks (including its two count-gated data sources) are
+# likewise declared unconditionally, so the configuration always lists them.
+EXPECTED_CONFIGURATION_RESOURCES.update(HUB_WORKER_CONFIGURATION_RESOURCES)
 
 ExpressionPath = tuple[str | int, ...]
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
@@ -1395,10 +1570,17 @@ def _configuration_resource_map(plan: dict[str, Any]) -> dict[str, dict[str, Any
     if not isinstance(provider_config, dict) or set(provider_config) != {
         "aws",
         "module.control:terraform",
+        "module.control:archive",
     }:
         raise ContractError("Terraform provider configuration map is not exact")
     aws_provider = provider_config["aws"]
     terraform_provider = provider_config["module.control:terraform"]
+    # The Hub keygen (slice 5b) packages its handler via data.archive_file, a
+    # module-local provider (declared in the module's required_providers, not
+    # configured at the root), so it appears namespaced like terraform_data's
+    # provider. It carries no provider config block; validate its identity
+    # tolerantly (the version_constraint field may or may not be projected).
+    archive_provider = provider_config["module.control:archive"]
     if (
         not isinstance(aws_provider, dict)
         or set(aws_provider)
@@ -1417,6 +1599,11 @@ def _configuration_resource_map(plan: dict[str, Any]) -> dict[str, dict[str, Any
             "full_name": "terraform.io/builtin/terraform",
             "module_address": "module.control",
         }
+        or not isinstance(archive_provider, dict)
+        or archive_provider.get("name") != "archive"
+        or archive_provider.get("full_name")
+        != "registry.terraform.io/hashicorp/archive"
+        or archive_provider.get("module_address") != "module.control"
     ):
         raise ContractError("Terraform provider configuration identity drifted")
 
@@ -1799,7 +1986,10 @@ def _require_foundation_input_known(
 
 
 def _check_planned_security(
-    by_address: dict[str, dict[str, Any]], *, runtime_mode: bool = False
+    by_address: dict[str, dict[str, Any]],
+    *,
+    runtime_mode: bool = False,
+    hub_worker_mode: bool = False,
 ) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
@@ -1849,11 +2039,15 @@ def _check_planned_security(
         # The interface-endpoint SG gains exactly one TLS/443 SG-scoped ingress
         # in the runtime slice; the default and OTP Redis SGs stay closed. Egress
         # stays empty on all three.
-        if runtime_mode and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
+        if (
+            runtime_mode or hub_worker_mode
+        ) and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
             _require_fields(after, {"egress": []}, address)
             if unknown.get("egress", []) != []:
                 raise ContractError(f"{address} has unknown planned egress rules")
-            _check_authority_interface_endpoint_ingress(after, unknown, address)
+            _check_authority_interface_endpoint_ingress(
+                after, unknown, address, hub_worker_mode=hub_worker_mode
+            )
             continue
         _require_fields(after, {"ingress": [], "egress": []}, address)
         if unknown.get("ingress", []) != [] or unknown.get("egress", []) != []:
@@ -1933,15 +2127,45 @@ def _check_planned_security(
             expected["private_dns_enabled"] = True
         _require_fields(after, expected, address)
         # In the runtime slice exactly the DynamoDB gateway and KMS interface
-        # endpoints carry a scoped Allow to the execution roles; every other
-        # endpoint (email, lambda [caller-only], logs, monitoring,
-        # secretsmanager) stays deny-all and fails closed here otherwise.
+        # endpoints carry a scoped Allow to the execution roles; the Hub worker
+        # slice additionally opens the lambda interface endpoint to the worker
+        # task role. Every other endpoint (email, logs, monitoring,
+        # secretsmanager -- and lambda while the worker is dark) stays deny-all
+        # and fails closed here otherwise.
         if runtime_mode and address == AUTHORITY_RUNTIME_DYNAMODB_ADDRESS:
             _check_authority_dynamodb_endpoint_policy(after, address)
         elif runtime_mode and address == AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS:
             _check_authority_kms_endpoint_policy(after, address)
+        elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
+            _check_hub_lambda_endpoint_policy(after, address)
         else:
             _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
+
+    # The Hub worker slice adds three image-pull endpoints that are NOT part of
+    # the base interface_endpoint_services for_each: the ecr.api + ecr.dkr
+    # interface endpoints and the S3 gateway endpoint, each opened ONLY to the Hub
+    # execution role for the exact pull actions. While the worker is dark these
+    # resources do not exist (the inventory admission gates that); when live their
+    # policies are validated here exactly like the runtime dependency endpoints.
+    if hub_worker_mode:
+        for address, service, endpoint_type in (
+            ("module.control.aws_vpc_endpoint.hub_ecr_api[0]", "ecr.api", "Interface"),
+            ("module.control.aws_vpc_endpoint.hub_ecr_dkr[0]", "ecr.dkr", "Interface"),
+            ("module.control.aws_vpc_endpoint.hub_s3[0]", "s3", "Gateway"),
+        ):
+            after, _ = values(address)
+            expected = {
+                "region": AWS_REGION,
+                "service_name": f"com.amazonaws.{AWS_REGION}.{service}",
+                "vpc_endpoint_type": endpoint_type,
+            }
+            if endpoint_type == "Interface":
+                expected["private_dns_enabled"] = True
+            _require_fields(after, expected, address)
+            if service == "s3":
+                _check_hub_s3_endpoint_policy(after, address)
+            else:
+                _check_hub_ecr_endpoint_policy(after, address)
 
     redis_contracts = {
         "module.control.aws_elasticache_user.otp_activator": {
@@ -2372,43 +2596,168 @@ def _check_authority_kms_endpoint_policy(
         raise ContractError(f"{address} must target exactly the qat1 signing key")
 
 
-def _check_authority_interface_endpoint_ingress(
-    after: dict[str, Any], unknown: dict[str, Any], address: str
-) -> None:
-    ingress = after.get("ingress")
-    if not isinstance(ingress, list) or len(ingress) != 1:
-        raise ContractError(f"{address} must open exactly one runtime ingress rule")
-    rule = ingress[0]
-    if not isinstance(rule, dict):
-        raise ContractError(f"{address} ingress rule is malformed")
-    if (
-        rule.get("from_port") != 443
-        or rule.get("to_port") != 443
-        or rule.get("protocol") != "tcp"
-    ):
-        raise ContractError(f"{address} ingress must be exactly TLS/443/tcp")
-    if (
-        rule.get("cidr_blocks") not in (None, [])
-        or rule.get("ipv6_cidr_blocks") not in (None, [])
-        or rule.get("prefix_list_ids") not in (None, [])
-        or rule.get("self") not in (None, False)
+def _endpoint_allow_statements(
+    after: dict[str, Any], address: str, count: int
+) -> dict[str, dict[str, Any]]:
+    # Decode a scoped endpoint policy holding exactly ``count`` Allow statements
+    # with unique Sids and no Not* elements; return them keyed by Sid. The
+    # multi-statement generalization of _authority_single_allow_statement (used by
+    # the two-statement ECR pull policy).
+    policy = _authority_decode_policy(after, address)
+    if not isinstance(policy, dict) or policy.get("Version") != "2012-10-17":
+        raise ContractError(f"{address} scoped policy is not a 2012-10-17 document")
+    statements = policy.get("Statement")
+    if not isinstance(statements, list) or len(statements) != count:
+        raise ContractError(
+            f"{address} scoped policy must hold exactly {count} statements"
+        )
+    by_sid: dict[str, dict[str, Any]] = {}
+    for stmt in statements:
+        if not isinstance(stmt, dict):
+            raise ContractError(f"{address} scoped statement is malformed")
+        if stmt.get("Effect") != "Allow":
+            raise ContractError(f"{address} scoped statement must be Allow")
+        if any(key in stmt for key in ("NotPrincipal", "NotAction", "NotResource")):
+            raise ContractError(f"{address} scoped statement may not use Not* elements")
+        sid = stmt.get("Sid")
+        if not isinstance(sid, str) or sid in by_sid:
+            raise ContractError(f"{address} statements must carry unique string Sids")
+        by_sid[sid] = stmt
+    return by_sid
+
+
+def _check_hub_lambda_endpoint_policy(after: dict[str, Any], address: str) -> None:
+    # The opened lambda interface endpoint admits ONLY the Hub worker task role,
+    # invoking ONLY the 3 selected-color authority aliases. Same Principal "*" +
+    # aws:PrincipalArn shape as the runtime dependency endpoints -- a role-ARN
+    # Principal would silently deny the worker's assumed-role session.
+    stmt = _authority_single_allow_statement(
+        after, address, "HubWorkersInvokeAuthority"
+    )
+    if _authority_principalarn_condition(stmt, address) != {HUB_TASK_ROLE_ARN}:
+        raise ContractError(
+            f"{address} principal must be exactly the Hub worker task role"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {
+        "lambda:InvokeFunction"
+    }:
+        raise ContractError(f"{address} action must be exactly lambda:InvokeFunction")
+    if _authority_string_set(stmt.get("Resource"), address, "Resource") != set(
+        HUB_AUTHORITY_ALIAS_ARNS
     ):
         raise ContractError(
-            f"{address} ingress must be SG-scoped, never CIDR/prefix/self reachable"
+            f"{address} resources must be exactly the 3 selected-color authority aliases"
         )
-    security_groups = rule.get("security_groups")
-    # The referenced function SG id is computed at create. Accept exactly one
-    # known id, or the provider's single-element unknown projection (empty list
-    # in after with the ingress marked unknown); reject a broader/absent set. If
-    # a future provider render hides the whole rule, this fails closed and the
+
+
+def _check_hub_ecr_endpoint_policy(after: dict[str, Any], address: str) -> None:
+    # Both ECR interface endpoints (api + dkr) open with the SAME policy: the Hub
+    # execution role may pull ONLY the nhp-hub repository (layers/manifest), plus
+    # the resource-less GetAuthorizationToken. No push, no other repo/principal.
+    by_sid = _endpoint_allow_statements(after, address, 2)
+    if set(by_sid) != {"HubPullImage", "HubAuthToken"}:
+        raise ContractError(
+            f"{address} statements must be exactly HubPullImage + HubAuthToken"
+        )
+    pull = by_sid["HubPullImage"]
+    if _authority_principalarn_condition(pull, address) != {HUB_EXECUTION_ROLE_ARN}:
+        raise ContractError(
+            f"{address} pull principal must be exactly the Hub execution role"
+        )
+    if _authority_string_set(pull.get("Action"), address, "Action") != set(
+        HUB_ECR_PULL_ACTIONS
+    ):
+        raise ContractError(f"{address} pull actions drifted from the reviewed ECR set")
+    if _authority_string_set(pull.get("Resource"), address, "Resource") != {
+        HUB_ECR_REPOSITORY_ARN
+    }:
+        raise ContractError(
+            f"{address} pull resource must be exactly the nhp-hub repository"
+        )
+    auth = by_sid["HubAuthToken"]
+    if _authority_principalarn_condition(auth, address) != {HUB_EXECUTION_ROLE_ARN}:
+        raise ContractError(
+            f"{address} auth-token principal must be exactly the Hub execution role"
+        )
+    if _authority_string_set(auth.get("Action"), address, "Action") != {
+        "ecr:GetAuthorizationToken"
+    }:
+        raise ContractError(
+            f"{address} auth-token action must be exactly ecr:GetAuthorizationToken"
+        )
+    # GetAuthorizationToken is resource-less; AWS requires Resource "*" here -- the
+    # only place a "*" resource is admitted, and only for this one action.
+    if auth.get("Resource") != "*":
+        raise ContractError(f'{address} auth-token resource must be "*"')
+
+
+def _check_hub_s3_endpoint_policy(after: dict[str, Any], address: str) -> None:
+    # The S3 GATEWAY endpoint opens ONLY the Hub execution role's read of the
+    # region's ECR layer bucket -- the object store the ECR download URLs target.
+    stmt = _authority_single_allow_statement(after, address, "HubPullLayers")
+    if _authority_principalarn_condition(stmt, address) != {HUB_EXECUTION_ROLE_ARN}:
+        raise ContractError(
+            f"{address} principal must be exactly the Hub execution role"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {"s3:GetObject"}:
+        raise ContractError(f"{address} action must be exactly s3:GetObject")
+    if _authority_string_set(stmt.get("Resource"), address, "Resource") != {
+        HUB_S3_LAYER_BUCKET_ARN
+    }:
+        raise ContractError(
+            f"{address} resource must be exactly the region ECR layer bucket"
+        )
+
+
+def _check_authority_interface_endpoint_ingress(
+    after: dict[str, Any],
+    unknown: dict[str, Any],
+    address: str,
+    *,
+    hub_worker_mode: bool = False,
+) -> None:
+    # The shared interface-endpoints SG carries exactly one TLS/443 SG-scoped
+    # ingress per live caller slice: the runtime function SG (always, in this
+    # lane) plus -- once the Hub worker slice (5b) is live -- the Hub worker SG.
+    # Each rule is validated to the same exact 443/tcp SG-scoped shape; only the
+    # count grows. A CIDR/prefix/self-reachable or multi-SG rule fails closed.
+    ingress = after.get("ingress")
+    expected_count = 2 if hub_worker_mode else 1
+    if not isinstance(ingress, list) or len(ingress) != expected_count:
+        raise ContractError(
+            f"{address} must open exactly {expected_count} TLS/443 ingress rule(s)"
+        )
+    # The referenced caller SG id is computed at create. Accept exactly one known
+    # id per rule, or the provider's single-element unknown projection (empty list
+    # in after with ingress marked unknown); reject a broader/absent set. If a
+    # future provider render hides the rules, this fails closed and the
     # POST-STEP-3 calibration must observe and admit the exact shape.
     ingress_unknown = unknown.get("ingress")
-    known_single = isinstance(security_groups, list) and len(security_groups) == 1
-    unknown_single = security_groups in (None, []) and bool(ingress_unknown)
-    if not (known_single or unknown_single):
-        raise ContractError(
-            f"{address} ingress must reference exactly the one function SG"
-        )
+    for rule in ingress:
+        if not isinstance(rule, dict):
+            raise ContractError(f"{address} ingress rule is malformed")
+        if (
+            rule.get("from_port") != 443
+            or rule.get("to_port") != 443
+            or rule.get("protocol") != "tcp"
+        ):
+            raise ContractError(f"{address} ingress must be exactly TLS/443/tcp")
+        if (
+            rule.get("cidr_blocks") not in (None, [])
+            or rule.get("ipv6_cidr_blocks") not in (None, [])
+            or rule.get("prefix_list_ids") not in (None, [])
+            or rule.get("self") not in (None, False)
+        ):
+            raise ContractError(
+                f"{address} ingress must be SG-scoped, never CIDR/prefix/self reachable"
+            )
+        security_groups = rule.get("security_groups")
+        known_single = isinstance(security_groups, list) and len(security_groups) == 1
+        unknown_single = security_groups in (None, []) and bool(ingress_unknown)
+        if not (known_single or unknown_single):
+            raise ContractError(
+                f"{address} each ingress rule must reference exactly one caller SG"
+            )
 
 
 def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> None:
@@ -3336,23 +3685,37 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
 
-    # The base foundation, plus any complete subset of the two independent
-    # optional slices: the authority runtime (Lambda functions/aliases/roles/…)
-    # and the Hub public edge (public subnets/IGW/route/NLB/…). Each slice is
-    # ALL-OR-NOTHING -- its resources appear together or not at all. The slices
-    # flip in separate applies, so all four combinations are valid steady
-    # inventories. A partial slice (some but not all of its addresses) or any
-    # address outside base∪slices fails closed via the exact-set equality below.
+    # The base foundation, plus any complete subset of the three independent
+    # optional slices: the authority runtime (Lambda functions/aliases/roles/…),
+    # the Hub public edge (public subnets/IGW/route/NLB/…), and the Hub Fargate
+    # worker (ECS/secret/keygen/endpoints/…). Each slice is ALL-OR-NOTHING -- its
+    # resources appear together or not at all. Two slices flip independently; the
+    # worker DEPENDS on the other two (it fronts the edge target group and invokes
+    # the runtime aliases), so a worker inventory without both is rejected below.
+    # Data sources are resolved at plan time (planned_values/configuration, not
+    # resource_changes), so ``by_address`` here is effectively managed-only; the
+    # worker's two data sources are gated by the configuration map and the state
+    # list, not this managed inventory. A partial slice (some but not all of its
+    # addresses) or any address outside base∪slices fails closed via the exact-set
+    # equality below.
     base_inventory = set(EXPECTED_RESOURCES)
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
+    hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_inventory = set(by_address)
     runtime_mode = bool(actual_inventory & runtime_extra)
     hub_edge_mode = bool(actual_inventory & hub_edge_extra)
+    hub_worker_mode = bool(actual_inventory & hub_worker_extra)
+    if hub_worker_mode and not (hub_edge_mode and runtime_mode):
+        raise ContractError(
+            "Hub worker slice requires both the Hub edge slice and the authority "
+            "runtime slice to be present"
+        )
     expected_inventory = (
         base_inventory
         | (runtime_extra if runtime_mode else set())
         | (hub_edge_extra if hub_edge_mode else set())
+        | (hub_worker_extra if hub_worker_mode else set())
     )
     if actual_inventory != expected_inventory:
         missing = sorted(expected_inventory - actual_inventory)
@@ -3365,6 +3728,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if hub_edge_mode:
         expected_resources.update(HUB_EDGE_RESOURCES)
+    if hub_worker_mode:
+        expected_resources.update(HUB_WORKER_RESOURCES)
 
     actual_non_noop: dict[str, list[str]] = {}
     for address, expected_type in expected_resources.items():
@@ -3551,6 +3916,35 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and changed == hub_edge_creates_pending
     )
 
+    # The Hub Fargate worker slice (5b): every worker resource is a still-pending
+    # pure create (or an already-applied no-op), the two opened base resources
+    # UPDATE (the lambda endpoint policy deny->scoped, the interface-endpoints SG
+    # ingress 1->2), and NOTHING else moves. Modeled on the runtime slice
+    # (creates+opens), not the edge slice (creates only).
+    hub_worker_creates_pending = {
+        address
+        for address in HUB_WORKER_RESOURCES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    hub_worker_opens_pending = {
+        address
+        for address in HUB_WORKER_OPENED_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
+    hub_worker_transition = (
+        hub_worker_mode
+        and bool(changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in HUB_WORKER_RESOURCES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in HUB_WORKER_OPENED_ADDRESSES
+        )
+        and changed == (hub_worker_creates_pending | hub_worker_opens_pending)
+    )
+
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
@@ -3615,18 +4009,27 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # Every edge resource is a still-pending pure create; an edge resource
         # that already applied on an earlier attempt is a validated no-op.
         _require_create_shapes(hub_edge_creates_pending, by_address)
+    elif hub_worker_transition:
+        plan_mode = "hub-worker-slice"
+        # Only the still-pending worker creates must present a pure-create shape;
+        # the two opened base resources present as updates validated by their
+        # exact after-state security checks in _check_planned_security below.
+        _require_create_shapes(hub_worker_creates_pending, by_address)
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
-            "contract binding, the exact Authority runtime slice, or the exact "
-            "Hub public edge slice; "
+            "contract binding, the exact Authority runtime slice, the exact "
+            "Hub public edge slice, or the exact Hub Fargate worker slice; "
             f"got {actual_non_noop}"
         )
 
-    # runtime_mode with no non-no-op change is the steady post-slice state; its
-    # scoped policies and function fields are still validated below.
-    _check_planned_security(by_address, runtime_mode=runtime_mode)
+    # runtime_mode / hub_worker_mode with no non-no-op change is the steady
+    # post-slice state; the scoped policies, endpoint opens, and SG ingress are
+    # still validated below regardless of transition vs steady.
+    _check_planned_security(
+        by_address, runtime_mode=runtime_mode, hub_worker_mode=hub_worker_mode
+    )
 
     normalization_drift_kind = _check_state_normalization_drift(
         drift,
@@ -3743,12 +4146,25 @@ def check_state_list(path: Path) -> dict[str, int]:
     base_expected = set(EXPECTED_RESOURCES) | data_expected
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
+    # The worker slice contributes both managed resources AND its two count-gated
+    # data sources (the published image digest and the keygen zip); presence is
+    # detected on the managed set. It may appear only alongside both the edge and
+    # runtime slices (the same dependency the plan lane enforces).
+    hub_worker_managed = set(HUB_WORKER_RESOURCES)
+    hub_worker_extra = hub_worker_managed | set(HUB_WORKER_DATA_RESOURCES)
     runtime_present = bool(addresses & runtime_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
+    hub_worker_present = bool(addresses & hub_worker_managed)
+    if hub_worker_present and not (hub_edge_present and runtime_present):
+        raise ContractError(
+            "Hub worker slice requires both the Hub edge slice and the authority "
+            "runtime slice in state"
+        )
     expected = (
         base_expected
         | (runtime_extra if runtime_present else set())
         | (hub_edge_extra if hub_edge_present else set())
+        | (hub_worker_extra if hub_worker_present else set())
     )
     if addresses != expected:
         missing = sorted(expected - addresses)
@@ -3757,11 +4173,15 @@ def check_state_list(path: Path) -> dict[str, int]:
             f"Terraform state inventory mismatch; missing={missing}, extra={extra}"
         )
     return {
-        "data_resource_count": len(EXPECTED_DATA_RESOURCES),
+        "data_resource_count": (
+            len(EXPECTED_DATA_RESOURCES)
+            + (len(HUB_WORKER_DATA_RESOURCES) if hub_worker_present else 0)
+        ),
         "managed_resource_count": (
             len(EXPECTED_RESOURCES)
             + (len(AUTHORITY_RUNTIME_RESOURCES) if runtime_present else 0)
             + (len(HUB_EDGE_RESOURCES) if hub_edge_present else 0)
+            + (len(HUB_WORKER_RESOURCES) if hub_worker_present else 0)
         ),
     }
 
@@ -3980,13 +4400,21 @@ def check_state(state: Any) -> dict[str, Any]:
     base_expected = set(EXPECTED_RESOURCES)
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
+    hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_addresses = set(by_address)
     runtime_present = bool(actual_addresses & runtime_extra)
     hub_edge_present = bool(actual_addresses & hub_edge_extra)
+    hub_worker_present = bool(actual_addresses & hub_worker_extra)
+    if hub_worker_present and not (hub_edge_present and runtime_present):
+        raise ContractError(
+            "Hub worker slice requires both the Hub edge slice and the authority "
+            "runtime slice in refreshed state"
+        )
     state_expected = (
         base_expected
         | (runtime_extra if runtime_present else set())
         | (hub_edge_extra if hub_edge_present else set())
+        | (hub_worker_extra if hub_worker_present else set())
     )
     if actual_addresses != state_expected:
         missing = sorted(state_expected - actual_addresses)
@@ -3999,6 +4427,8 @@ def check_state(state: Any) -> dict[str, Any]:
         state_expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if hub_edge_present:
         state_expected_resources.update(HUB_EDGE_RESOURCES)
+    if hub_worker_present:
+        state_expected_resources.update(HUB_WORKER_RESOURCES)
     for address, expected_type in state_expected_resources.items():
         resource = by_address[address]
         if resource.get("mode") != "managed" or resource.get("type") != expected_type:
@@ -4033,28 +4463,34 @@ def check_state(state: Any) -> dict[str, Any]:
     ):
         item = values[address]
         # The interface-endpoint SG carries exactly one TLS/443 SG-scoped ingress
-        # once the runtime slice is live; the default and OTP Redis SGs stay
-        # closed. Egress stays empty on all three.
-        if runtime_present and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
+        # per live caller slice: the runtime function SG, plus -- once the Hub
+        # worker slice is live -- the Hub worker SG. The default and OTP Redis SGs
+        # stay closed. Egress stays empty on all three.
+        if (
+            runtime_present or hub_worker_present
+        ) and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
             ingress = item.get("ingress")
             if item.get("egress") not in ([], None):
                 raise ContractError(f"interface-endpoint SG has egress rules: {address}")
-            if not isinstance(ingress, list) or len(ingress) != 1:
+            expected_ingress = 2 if hub_worker_present else 1
+            if not isinstance(ingress, list) or len(ingress) != expected_ingress:
                 raise ContractError(
-                    f"interface-endpoint SG must carry exactly one runtime ingress: {address}"
+                    "interface-endpoint SG must carry exactly "
+                    f"{expected_ingress} TLS/443 ingress rule(s): {address}"
                 )
-            rule = ingress[0]
-            if (
-                not isinstance(rule, dict)
-                or rule.get("from_port") != 443
-                or rule.get("to_port") != 443
-                or rule.get("protocol") != "tcp"
-                or rule.get("cidr_blocks") not in (None, [])
-                or len(rule.get("security_groups") or []) != 1
-            ):
-                raise ContractError(
-                    f"interface-endpoint SG ingress is not exactly TLS/443 from the function SG: {address}"
-                )
+            for rule in ingress:
+                if (
+                    not isinstance(rule, dict)
+                    or rule.get("from_port") != 443
+                    or rule.get("to_port") != 443
+                    or rule.get("protocol") != "tcp"
+                    or rule.get("cidr_blocks") not in (None, [])
+                    or len(rule.get("security_groups") or []) != 1
+                ):
+                    raise ContractError(
+                        "interface-endpoint SG ingress is not exactly TLS/443 from "
+                        f"one caller SG: {address}"
+                    )
             continue
         if item.get("ingress") not in ([], None) or item.get("egress") not in (
             [],
@@ -4188,9 +4624,13 @@ def check_state(state: Any) -> dict[str, Any]:
                 f"dark interface endpoint contract failed for {service}"
             )
         # Only the KMS interface endpoint opens (to the execution roles) once the
-        # runtime slice is live; every other interface endpoint stays deny-all.
+        # runtime slice is live, and the lambda interface endpoint opens (to the
+        # worker task role) once the Hub worker slice is live; every other
+        # interface endpoint stays deny-all.
         if runtime_present and service == "kms":
             _check_authority_kms_endpoint_policy(item, address)
+        elif hub_worker_present and service == "lambda":
+            _check_hub_lambda_endpoint_policy(item, address)
         elif json.loads(item.get("policy", "{}")) != deny_policy:
             raise ContractError(
                 f"dark interface endpoint contract failed for {service}"
@@ -4210,6 +4650,43 @@ def check_state(state: Any) -> dict[str, Any]:
         )
     elif json.loads(dynamodb.get("policy", "{}")) != deny_policy:
         raise ContractError("dark DynamoDB endpoint contract failed")
+
+    # The Hub worker slice's three image-pull endpoints exist only when the worker
+    # is live (the inventory admission gates that). The two ECR interface
+    # endpoints share the interface-endpoints SG and isolated subnets; the S3
+    # gateway attaches to the isolated route tables. Each opens ONLY to the Hub
+    # execution role for the exact pull actions.
+    if hub_worker_present:
+        for hub_address, hub_service, hub_type in (
+            ("module.control.aws_vpc_endpoint.hub_ecr_api[0]", "ecr.api", "Interface"),
+            ("module.control.aws_vpc_endpoint.hub_ecr_dkr[0]", "ecr.dkr", "Interface"),
+            ("module.control.aws_vpc_endpoint.hub_s3[0]", "s3", "Gateway"),
+        ):
+            hub_item = values[hub_address]
+            if (
+                hub_item.get("state") != "available"
+                or hub_item.get("vpc_endpoint_type") != hub_type
+                or hub_item.get("service_name")
+                != f"com.amazonaws.{AWS_REGION}.{hub_service}"
+                or hub_item.get("vpc_id") != vpc_id
+            ):
+                raise ContractError(f"Hub {hub_service} endpoint contract failed")
+            if hub_type == "Interface":
+                if (
+                    hub_item.get("private_dns_enabled") is not True
+                    or set(hub_item.get("subnet_ids", [])) != subnet_ids
+                    or set(hub_item.get("security_group_ids", [])) != {interface_sg}
+                ):
+                    raise ContractError(
+                        f"Hub {hub_service} interface endpoint contract failed"
+                    )
+                _check_hub_ecr_endpoint_policy(hub_item, hub_address)
+            else:
+                if set(hub_item.get("route_table_ids", [])) != route_table_ids:
+                    raise ContractError(
+                        f"Hub {hub_service} gateway endpoint route tables drifted"
+                    )
+                _check_hub_s3_endpoint_policy(hub_item, hub_address)
 
     cache = values["module.control.aws_elasticache_serverless_cache.otp"]
     if (
@@ -4280,6 +4757,10 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         "flow_log_id",
         "flow_log_role_arn",
         "isolated_route_table_ids",
+        # The Hub worker slice's S3 gateway endpoint id. ALWAYS present in the
+        # manifest for exact-set equality; null while the worker is dark (the
+        # evidence generator emits null when the endpoint is absent from state).
+        "s3_endpoint_id",
         "vpc_id",
     }
     if not isinstance(expected, dict) or set(expected) != required_expected:
@@ -4292,6 +4773,14 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         re.fullmatch(r"rtb-[0-9a-f]+", str(value)) for value in isolated
     ):
         raise ContractError("live isolated route-table IDs are malformed")
+    # The S3 gateway endpoint (Hub worker slice) injects one prefix-list route
+    # into EACH isolated route table. Its id is null while the worker is dark; a
+    # vpce-id once live. s3_present toggles the isolated-table route accounting
+    # below from local+DynamoDB (2) to local+DynamoDB+S3 (3).
+    s3_endpoint_id = expected["s3_endpoint_id"]
+    s3_present = s3_endpoint_id is not None
+    if s3_present and not re.fullmatch(r"vpce-[0-9a-f]+", str(s3_endpoint_id)):
+        raise ContractError("live S3 gateway endpoint ID is malformed")
 
     route_tables = load_json(evidence_dir / "route-tables.json").get("RouteTables")
     if not isinstance(route_tables, list):
@@ -4376,9 +4865,30 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
                 )
                 and route.get("State") == "active"
             ]
-            allowed = [*local_routes, *dynamodb_routes]
-            expected_count = 2 if route_table_id in isolated else 1
-            if len(local_routes) != 1 or len(dynamodb_routes) != expected_count - 1:
+            # The S3 gateway route lives ONLY on the isolated tables (the endpoint
+            # attaches to aws_route_table.isolated[*]), exactly like DynamoDB, and
+            # ONLY once the Hub worker slice is live.
+            s3_routes = (
+                [
+                    route
+                    for route in routes
+                    if route.get("GatewayId") == s3_endpoint_id
+                    and re.fullmatch(
+                        r"pl-[0-9a-f]+", str(route.get("DestinationPrefixListId", ""))
+                    )
+                    and route.get("State") == "active"
+                ]
+                if s3_present and route_table_id in isolated
+                else []
+            )
+            allowed = [*local_routes, *dynamodb_routes, *s3_routes]
+            dynamodb_expected = 1 if route_table_id in isolated else 0
+            s3_expected = 1 if (s3_present and route_table_id in isolated) else 0
+            if (
+                len(local_routes) != 1
+                or len(dynamodb_routes) != dynamodb_expected
+                or len(s3_routes) != s3_expected
+            ):
                 raise ContractError(
                     f"live route ownership drifted for {route_table_id}"
                 )

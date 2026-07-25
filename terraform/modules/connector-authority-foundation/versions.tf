@@ -7,5 +7,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.27"
     }
+    # The Hub keygen Lambda (slice 5b) packages its handler via data.archive_file.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.7"
+    }
   }
 }

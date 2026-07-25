@@ -65,11 +65,30 @@ state_value() {
   printf '%s\n' "$value"
 }
 
+state_value_optional() {
+  # Like state_value but tolerates an absent resource (a count=0 gated slice):
+  # emits the attribute as a JSON scalar, or JSON `null` when the resource is not
+  # in state. Used for the Hub worker S3 gateway endpoint id, which exists only
+  # once slice 5b is live; the checker admits null (dark) or a vpce-id (live).
+  local address="$1"
+  local attribute="$2"
+  jq -c \
+    --arg address "$address" \
+    --arg attribute "$attribute" \
+    '[.prior_state.values.root_module
+      | recurse(.child_modules[]?)
+      | .resources[]?
+      | select(.mode == "managed" and .address == $address)
+      | .values[$attribute]][0] // null' \
+    "$plan_json"
+}
+
 vpc_id="$(state_value 'module.control.aws_vpc.control' id)"
 dynamodb_endpoint_id="$(state_value 'module.control.aws_vpc_endpoint.dynamodb' id)"
 flow_log_id="$(state_value 'module.control.aws_flow_log.control' id)"
 flow_log_destination="$(state_value 'module.control.aws_flow_log.control' log_destination)"
 flow_log_role_arn="$(state_value 'module.control.aws_flow_log.control' iam_role_arn)"
+s3_endpoint_id="$(state_value_optional 'module.control.aws_vpc_endpoint.hub_s3[0]' id)"
 route_table_ids=()
 for index in 0 1 2; do
   route_table_ids+=("$(state_value "module.control.aws_route_table.isolated[$index]" id)")
@@ -81,13 +100,15 @@ jq -n \
   --arg flow_log_id "$flow_log_id" \
   --arg flow_log_destination "$flow_log_destination" \
   --arg flow_log_role_arn "$flow_log_role_arn" \
+  --argjson s3_endpoint_id "$s3_endpoint_id" \
   --arg rtb0 "${route_table_ids[0]}" \
   --arg rtb1 "${route_table_ids[1]}" \
   --arg rtb2 "${route_table_ids[2]}" \
   '{vpc_id:$vpc_id,dynamodb_endpoint_id:$dynamodb_endpoint_id,
     flow_log_id:$flow_log_id,flow_log_destination:$flow_log_destination,
     flow_log_role_arn:$flow_log_role_arn,
-    isolated_route_table_ids:[$rtb0,$rtb1,$rtb2]}' \
+    isolated_route_table_ids:[$rtb0,$rtb1,$rtb2],
+    s3_endpoint_id:$s3_endpoint_id}' \
   >"$evidence_dir/expected-live.json"
 
 aws ec2 describe-route-tables \

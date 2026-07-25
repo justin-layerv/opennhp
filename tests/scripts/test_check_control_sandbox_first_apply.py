@@ -507,6 +507,12 @@ def configuration_fixture() -> dict:
                 "full_name": "terraform.io/builtin/terraform",
                 "module_address": "module.control",
             },
+            "module.control:archive": {
+                "name": "archive",
+                "full_name": "registry.terraform.io/hashicorp/archive",
+                "module_address": "module.control",
+                "version_constraint": "~> 2.7",
+            },
         },
         "root_module": {
             "resources": [],
@@ -4318,6 +4324,43 @@ class StateListTests(unittest.TestCase):
         with self.assertRaises(CHECKER.ContractError):
             self.check(partial)
 
+    def test_hub_worker_inventory_requires_edge_and_runtime(self) -> None:
+        worker_managed = list(CHECKER.HUB_WORKER_RESOURCES)
+        worker_data = list(CHECKER.HUB_WORKER_DATA_RESOURCES)
+        full = [
+            *self.expected_addresses(),
+            *CHECKER.AUTHORITY_RUNTIME_RESOURCES,
+            *CHECKER.HUB_EDGE_RESOURCES,
+            *worker_managed,
+            *worker_data,
+        ]
+        self.assertEqual(
+            self.check(full),
+            {
+                "data_resource_count": 6 + len(worker_data),
+                "managed_resource_count": (
+                    50
+                    + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
+                    + len(CHECKER.HUB_EDGE_RESOURCES)
+                    + len(worker_managed)
+                ),
+            },
+        )
+        # The worker without the edge slice fails closed (dependency).
+        without_edge = [
+            address
+            for address in full
+            if address not in set(CHECKER.HUB_EDGE_RESOURCES)
+        ]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "requires both the Hub edge"
+        ):
+            self.check(without_edge)
+        # A partial worker inventory (missing one managed resource) fails closed.
+        partial = [address for address in full if address != worker_managed[0]]
+        with self.assertRaises(CHECKER.ContractError):
+            self.check(partial)
+
 
 def state_fixture() -> dict:
     resources = [
@@ -4968,6 +5011,9 @@ def live_fixture(root: Path) -> None:
         "flow_log_destination": "arn:aws:logs:flow-group",
         "flow_log_role_arn": "arn:aws:iam::role/flow",
         "isolated_route_table_ids": ["rtb-0abc", "rtb-1abc", "rtb-2abc"],
+        # Dark by default: the Hub worker S3 gateway endpoint is absent, so the
+        # manifest carries a null id and the isolated tables stay local+DynamoDB.
+        "s3_endpoint_id": None,
     }
     local_route = {
         "GatewayId": "local",
@@ -5071,6 +5117,86 @@ def live_edge_fixture(root: Path) -> None:
         {"InternetGateways": [{"InternetGatewayId": "igw-abc123"}]},
     )
     write_json(root / "control-load-balancers.json", [hub_nlb_evidence()])
+
+
+def live_worker_fixture(root: Path) -> None:
+    """The live Hub public edge PLUS the Step-5 Hub Fargate worker: the S3 gateway
+    endpoint injects one prefix-list route into EACH isolated route table, and the
+    manifest carries the endpoint id (null while the worker is dark)."""
+    live_edge_fixture(root)
+    expected = json.loads((root / "expected-live.json").read_text())
+    expected["s3_endpoint_id"] = "vpce-0a1b2c3"
+    write_json(root / "expected-live.json", expected)
+    isolated = set(expected["isolated_route_table_ids"])
+    route_payload = json.loads((root / "route-tables.json").read_text())
+    for table in route_payload["RouteTables"]:
+        if table.get("RouteTableId") in isolated:
+            table["Routes"].append(
+                {
+                    "GatewayId": "vpce-0a1b2c3",
+                    "DestinationPrefixListId": "pl-0abc123",
+                    "State": "active",
+                }
+            )
+    write_json(root / "route-tables.json", route_payload)
+
+
+class LiveHubWorkerBoundaryTests(unittest.TestCase):
+    def test_live_worker_admits_the_s3_gateway_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            self.assertEqual(CHECKER.check_live(root)["vpc_id"], "vpc-abc123")
+
+    def test_live_worker_missing_s3_route_on_an_isolated_table_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            payload = json.loads((root / "route-tables.json").read_text())
+            expected = json.loads((root / "expected-live.json").read_text())
+            isolated = set(expected["isolated_route_table_ids"])
+            for table in payload["RouteTables"]:
+                if table.get("RouteTableId") in isolated:
+                    table["Routes"] = [
+                        route
+                        for route in table["Routes"]
+                        if route.get("GatewayId") != "vpce-0a1b2c3"
+                    ]
+                    break  # drop the S3 route from exactly one isolated table
+            write_json(root / "route-tables.json", payload)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
+    def test_stray_s3_route_while_worker_dark_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)  # worker dark: s3_endpoint_id stays null
+            payload = json.loads((root / "route-tables.json").read_text())
+            expected = json.loads((root / "expected-live.json").read_text())
+            isolated = set(expected["isolated_route_table_ids"])
+            for table in payload["RouteTables"]:
+                if table.get("RouteTableId") in isolated:
+                    table["Routes"].append(
+                        {
+                            "GatewayId": "vpce-0a1b2c3",
+                            "DestinationPrefixListId": "pl-0abc123",
+                            "State": "active",
+                        }
+                    )
+                    break
+            write_json(root / "route-tables.json", payload)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
+    def test_malformed_s3_endpoint_id_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            expected = json.loads((root / "expected-live.json").read_text())
+            expected["s3_endpoint_id"] = "not-a-vpce-id"
+            write_json(root / "expected-live.json", expected)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
 
 
 class LiveContractTests(unittest.TestCase):

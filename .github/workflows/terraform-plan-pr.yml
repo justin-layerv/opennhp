@@ -289,10 +289,13 @@ jobs:
 
       # Deliberately gate every Terraform-input PR. Shared modules, IAM, and
       # workflow helpers can affect this root without living below
-      # terraform/control. The converged 50-resource foundation must remain an
-      # exact no-op. The checker separately recognizes Authority publisher,
-      # Redis split, and Hub artifact bootstrap partial-retry shapes, but rejects
-      # combined transitions so each must be applied and converged in order.
+      # terraform/control. The converged foundation must remain an exact no-op
+      # once every enabled slice is applied. The checker separately recognizes
+      # Authority publisher, Redis split, Hub artifact bootstrap partial-retry,
+      # the Hub public-edge slice (5a), and the Hub Fargate worker slice (5b)
+      # shapes, but rejects combined transitions so each must be applied and
+      # converged in order. Until slice 5b is applied to live sandbox this plan
+      # shows exactly the single admitted hub-worker-slice create+open transition.
       # Any other intentional update must
       # revise this policy and its exact tests in the same PR. The plan contract
       # below also rejects any desired public-network or runtime resource type
@@ -321,7 +324,8 @@ jobs:
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
             --runtime-functions-enabled \
-            --hub-edge-enabled
+            --hub-edge-enabled \
+            --hub-worker-enabled
 
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'

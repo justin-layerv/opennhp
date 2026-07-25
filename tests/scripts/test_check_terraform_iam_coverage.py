@@ -227,6 +227,7 @@ class TerraformHelperInvokeScope(unittest.TestCase):
         root = REPO_ROOT / "terraform"
         keygen = "${aws_lambda_function.keygen.function_name}"
         etcd = "${aws_lambda_function.etcd_tls[0].function_name}"
+        hub_keygen = "${aws_lambda_function.hub_keygen[0].function_name}"
         parsed = IAM.parse_tf_files(root)
         self.assertIsNone(IAM.terraform_helper_invoke_scope_error(parsed))
         actual = {
@@ -248,6 +249,14 @@ class TerraformHelperInvokeScope(unittest.TestCase):
                 ("modules/nhp-keypair/main.tf", "keygen", keygen),
                 ("modules/relay-identity/main.tf", "keygen", keygen),
                 ("modules/relay-identity/main.tf", "publish_public_key", keygen),
+                # Slice 5b: the Hub keygen seeds the key-material secret at APPLY
+                # (CREATE_ONLY), invoked by the apply role -- not a plan-time
+                # data.aws_lambda_invocation, so the PR read scope is unaffected.
+                (
+                    "modules/connector-authority-foundation/hub_keygen.tf",
+                    "hub_keygen",
+                    hub_keygen,
+                ),
             },
         )
 

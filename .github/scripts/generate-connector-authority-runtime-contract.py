@@ -467,6 +467,7 @@ def generated_input(
     *,
     runtime_functions_enabled: bool = False,
     hub_edge_enabled: bool = False,
+    hub_worker_enabled: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     generated["provisioned_cells_evidence"] = evidence
@@ -492,6 +493,14 @@ def generated_input(
     # key name matches the Terraform variable hub_edge_enabled exactly.
     if hub_edge_enabled:
         payload["hub_edge_enabled"] = True
+    # Fourth, independent Step-5 Hub Fargate worker gate (slice 5b). Emit the key
+    # ONLY when the caller explicitly opts in; when omitted the key is absent
+    # entirely so the committed Terraform default (false) governs and the worker
+    # stays dark. The key name matches the Terraform variable hub_worker_enabled
+    # exactly. The module fails closed if it is set without hub_edge_enabled and a
+    # live authority runtime.
+    if hub_worker_enabled:
+        payload["hub_worker_enabled"] = True
     return payload
 
 
@@ -543,6 +552,17 @@ def main(argv: list[str] | None = None) -> int:
             "the committed default (false) keeps the edge dark."
         ),
     )
+    parser.add_argument(
+        "--hub-worker-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit hub_worker_enabled=true into the generated tfvars (the "
+            "Step-5 Hub Fargate worker opt-in, slice 5b). Omit to leave the key "
+            "absent so the committed default (false) keeps the worker dark. "
+            "Requires hub_edge_enabled and a live authority runtime."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -559,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
                 evidence,
                 runtime_functions_enabled=args.runtime_functions_enabled,
                 hub_edge_enabled=args.hub_edge_enabled,
+                hub_worker_enabled=args.hub_worker_enabled,
             )
         )
         atomic_write(args.output, payload)

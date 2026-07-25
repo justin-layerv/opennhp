@@ -115,5 +115,14 @@ resource "terraform_data" "foundation_contract" {
       condition     = !var.authority_runtime_functions_enabled || local.authority_runtime_contract_enabled
       error_message = "authority_runtime_functions_enabled requires a non-null authority_runtime_contract."
     }
+
+    precondition {
+      # The Hub worker slice (5b) fronts the 5a public UDP NLB target group and
+      # invokes the 3 live authority aliases, so it may deploy only on top of
+      # BOTH a live public edge and a live authority runtime. Setting the gate
+      # while either dependency is dark is a fail-closed hard error.
+      condition     = !var.hub_worker_enabled || (var.hub_edge_enabled && local.authority_runtime_functions_deploy)
+      error_message = "hub_worker_enabled requires hub_edge_enabled and a live authority runtime (the worker fronts the 5a NLB target group and invokes the 3 live authority aliases)."
+    }
   }
 }

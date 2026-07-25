@@ -92,6 +92,17 @@ variable "hub_edge_enabled" {
   }
 }
 
+variable "hub_worker_enabled" {
+  description = "Production Hub Fargate worker gate remains false throughout sandbox measurement."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.hub_worker_enabled
+    error_message = "Production Hub Fargate worker must remain dark throughout sandbox measurement."
+  }
+}
+
 variable "tags" {
   type = map(string)
   default = {

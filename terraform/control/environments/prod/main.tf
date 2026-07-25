@@ -10,5 +10,6 @@ module "control" {
   authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified
   authority_runtime_functions_enabled          = var.authority_runtime_functions_enabled
   hub_edge_enabled                             = var.hub_edge_enabled
+  hub_worker_enabled                           = var.hub_worker_enabled
   tags                                         = var.tags
 }

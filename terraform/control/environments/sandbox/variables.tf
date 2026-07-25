@@ -72,6 +72,12 @@ variable "hub_edge_enabled" {
   default     = false
 }
 
+variable "hub_worker_enabled" {
+  description = "Dark-first Step-5 gate for the Connector Hub Fargate worker (slice 5b): the ECS cluster/service/task-definition, the Hub key-material secret + keygen, the worker security group, and the ECR/S3 image-pull endpoints; it also opens the Lambda interface endpoint to the worker's task role. Requires hub_edge_enabled and a live authority runtime. Committed inputs leave it false; the Step-5 worker apply supplies it true (via -var or the generated tfvars). See the module variable of the same name."
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   type = map(string)
   default = {
