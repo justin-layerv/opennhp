@@ -27,9 +27,14 @@ locals {
 
   # DynamoDB gateway endpoint: allow exactly the 3 hub execution roles the union
   # of the exact per-op actions (reads incl. DescribeTable; the replay Put and the
-  # recovery Update) on the canonical tables (+ the agent_keys pubkey GSI). The
-  # per-operation identity policies in authority_runtime.tf are the finer
-  # intersecting gate (e.g. UpdateItem is reachable only by IssueCredentialRecovery).
+  # recovery Update) on the three canonical BASE tables. Gateway VPC-endpoint
+  # policies are TABLE-GRANULAR: DynamoDB rejects a /index/* sub-resource here
+  # with InvalidPolicyDocument, and a Query against agent_keys' pubkey GSI is
+  # authorized at this coarse network gate by the base-table ARN. So this lists
+  # only the base-table ARNs (authority_runtime_table_arns), NOT the identity
+  # resource sets. The per-operation identity policies in authority_runtime.tf
+  # are the finer intersecting gate: they carry the /index/* grant IAM does
+  # accept, and e.g. UpdateItem is reachable only by IssueCredentialRecovery.
   authority_dynamodb_endpoint_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -42,10 +47,10 @@ locals {
         local.authority_runtime_ddb_read_actions,
         local.authority_runtime_ddb_recovery_write_actions,
       )
-      Resource = flatten([
+      Resource = [
         for name in ["api_keys", "agent_keys", "connector_authority"] :
-        local.authority_runtime_table_resources[name]
-      ])
+        local.authority_runtime_table_arns[name]
+      ]
     }]
   })
 

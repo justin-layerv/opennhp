@@ -517,12 +517,13 @@ AUTHORITY_RUNTIME_TABLE_RESOURCES = {
         {AUTHORITY_RUNTIME_TABLE_ARNS["connector_authority"]}
     ),
 }
-# The DynamoDB gateway-endpoint resource union (coarse gate for all three roles).
-AUTHORITY_RUNTIME_DYNAMODB_RESOURCES = frozenset(
-    arn
-    for resources in AUTHORITY_RUNTIME_TABLE_RESOURCES.values()
-    for arn in resources
-)
+# The DynamoDB gateway-endpoint resource union (coarse, TABLE-GRANULAR gate for
+# all three roles). Gateway VPC-endpoint policies reject a /index/* sub-resource
+# with InvalidPolicyDocument, so the endpoint lists only the three BASE-table
+# ARNs; a GSI Query is authorized at this network gate by its base table, and the
+# finer /index/* grant lives in the per-op identity policies
+# (AUTHORITY_RUNTIME_TABLE_RESOURCES, checked separately on the exec-role policies).
+AUTHORITY_RUNTIME_DYNAMODB_RESOURCES = frozenset(AUTHORITY_RUNTIME_TABLE_ARNS.values())
 # Shared read set. DescribeTable is REQUIRED: every op verifies its Control
 # tables' SSE-KMS key at cold start (dynamodb_sse.go). BatchGetItem/
 # TransactGetItems are intentionally absent (a read inside a transaction is
@@ -3318,20 +3319,42 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             by_address[authority_contract_address]["change"].get("after", {})
         )
     )
-    # The runtime slice: every runtime resource is a pure create and exactly the
-    # three dependency-endpoint/SG opens are updates. Nothing else may move.
+    # The runtime slice: every runtime resource is created and exactly the three
+    # dependency-endpoint/SG opens are updated. This admits BOTH the clean full
+    # slice AND a partial-apply RETRY. A create that already succeeded on an
+    # earlier attempt replans as a validated no-op (before==after, proven in the
+    # no-op branch above), so it is neither "pending" here nor a drift; the same
+    # holds for an open that already applied. The split is:
+    #   pending create = slice resource this plan still creates (actions ["create"])
+    #   pending open    = dependency open this plan still updates (actions ["update"])
+    # An already-applied create/open is simply absent from actual_non_noop. The
+    # transition requires: nothing in the slice is updated/replaced/destroyed
+    # (creates are ["create"] or no-op; opens are ["update"] or no-op), at least
+    # one thing moves, and NOTHING outside the pending creates + pending opens
+    # moves — a drifted base resource lands in ``changed`` and fails the equality.
     authority_runtime_creates = set(AUTHORITY_RUNTIME_RESOURCES)
+    runtime_creates_pending = {
+        address
+        for address in authority_runtime_creates
+        if actual_non_noop.get(address) == ["create"]
+    }
+    runtime_opens_pending = {
+        address
+        for address in AUTHORITY_RUNTIME_OPENED_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
     authority_runtime_transition = (
         runtime_mode
-        and changed == (authority_runtime_creates | AUTHORITY_RUNTIME_OPENED_ADDRESSES)
+        and bool(changed)
         and all(
-            actual_non_noop.get(address) == ["create"]
+            actual_non_noop.get(address) in (None, ["create"])
             for address in authority_runtime_creates
         )
         and all(
-            actual_non_noop.get(address) == ["update"]
+            actual_non_noop.get(address) in (None, ["update"])
             for address in AUTHORITY_RUNTIME_OPENED_ADDRESSES
         )
+        and changed == (runtime_creates_pending | runtime_opens_pending)
     )
 
     if publisher_transition:
@@ -3383,7 +3406,9 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         plan_mode = "authority-contract-binding"
     elif authority_runtime_transition:
         plan_mode = "authority-runtime-slice"
-        _require_create_shapes(authority_runtime_creates, by_address)
+        # Only the still-pending creates must present a pure-create shape; any
+        # create that already applied on an earlier attempt is a validated no-op.
+        _require_create_shapes(runtime_creates_pending, by_address)
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "

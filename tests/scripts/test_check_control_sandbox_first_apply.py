@@ -1128,6 +1128,23 @@ def authority_runtime_steady_fixture() -> dict:
     return result
 
 
+def authority_runtime_partial_retry_fixture(applied_addresses: set[str]) -> dict:
+    """A partial-apply RETRY of the runtime slice: every address in
+    ``applied_addresses`` already applied on an earlier attempt and now replans
+    as a validated no-op (before==after); the remaining slice creates plus all
+    three endpoint/SG opens stay pending. Models the real failure where the exec
+    roles/policies/spillover alarms/log groups applied before the DynamoDB
+    gateway-endpoint open was rejected and the run aborted."""
+    result = authority_runtime_transition_fixture()
+    for item in result["resource_changes"]:
+        change = item["change"]
+        if item["address"] in applied_addresses and change["actions"] == ["create"]:
+            change["actions"] = ["no-op"]
+            change["before"] = copy.deepcopy(change["after"])
+            change["after_unknown"] = {}
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -3316,6 +3333,71 @@ class PlanContractTests(unittest.TestCase):
             summary["resource_count"],
             len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
+
+    def test_authority_runtime_slice_partial_retry_passes(self) -> None:
+        """After a partial apply (e.g. the DynamoDB gateway open was rejected
+        mid-run) the already-created slice resources replan as no-ops and only
+        the remaining creates plus the three opens stay pending. The slice
+        transition must still be accepted across the full-slice (``set()``),
+        one-applied, and real 12-applied boundaries."""
+        full = authority_runtime_transition_fixture()
+        early_applied = {
+            item["address"]
+            for item in full["resource_changes"]
+            if item["change"]["actions"] == ["create"]
+            and item["type"]
+            in {
+                "aws_iam_role",
+                "aws_iam_role_policy",
+                "aws_cloudwatch_metric_alarm",
+                "aws_cloudwatch_log_group",
+            }
+        }
+        # 3 hub functions x {exec role, exec policy, spillover alarm, log group}.
+        self.assertEqual(len(early_applied), 12)
+        for applied in (set(), {next(iter(early_applied))}, early_applied):
+            with self.subTest(applied=len(applied)):
+                summary = CHECKER.check_plan(
+                    authority_runtime_partial_retry_fixture(applied)
+                )
+                self.assertEqual(summary["plan_mode"], "authority-runtime-slice")
+                self.assertEqual(
+                    summary["resource_count"],
+                    len(CHECKER.EXPECTED_RESOURCES)
+                    + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+                )
+
+    def test_authority_runtime_partial_retry_rejects_drifted_applied_resource(
+        self,
+    ) -> None:
+        """A slice resource that already applied but now replans as an in-place
+        update (drift), not a no-op, fails closed: a retry may only complete
+        still-pending creates and the three opens, never mutate applied state."""
+        applied = {
+            item["address"]
+            for item in authority_runtime_transition_fixture()["resource_changes"]
+            if item["change"]["actions"] == ["create"]
+            and item["type"] == "aws_iam_role"
+        }
+        candidate = authority_runtime_partial_retry_fixture(applied)
+        drifted = self.change(candidate, next(iter(applied)))
+        drifted["actions"] = ["update"]
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_index_arn_in_ddb_endpoint(self) -> None:
+        """Gateway VPC-endpoint policies are table-granular; a /index/* resource
+        is InvalidPolicyDocument at apply (the real failure this fix resolves).
+        The endpoint policy must carry only base-table ARNs, so an index ARN
+        here fails the contract; the finer /index/* grant lives on the exec-role
+        identity policies, which are checked separately."""
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        policy["Statement"][0]["Resource"].append(
+            f"{CHECKER.AUTHORITY_RUNTIME_TABLE_ARNS['agent_keys']}/index/*"
+        )
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
 
     def test_authority_runtime_rejects_broadened_dynamodb_principal(self) -> None:
         candidate = authority_runtime_transition_fixture()

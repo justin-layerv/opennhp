@@ -299,13 +299,16 @@ jobs:
       # from the machine-readable plan.
 
       # The committed dark Control config carries authority_runtime_contract =
-      # null, but LIVE sandbox Control state has the Connector Authority runtime
-      # contract enabled. Regenerate the same verified ephemeral tfvars that
-      # control-sandbox-update.yml plans with so this PR-time convergence plan
-      # reflects the live-enabled contract instead of planning a revert. The
-      # generator is deterministic from the committed basis and the full Git
-      # history (fetch-depth: 0 above) and needs no AWS access; the read-only
-      # PR plan role can read the resulting data sources
+      # null AND authority_runtime_functions_enabled = false, but LIVE sandbox
+      # Control state has BOTH the Connector Authority runtime contract bound
+      # (Step 3) AND the runtime-slice functions enabled (Step 4). Regenerate the
+      # same verified ephemeral tfvars that control-sandbox-update.yml plans with,
+      # including --runtime-functions-enabled, so this PR-time convergence plan
+      # reflects the live-enabled slice instead of planning to destroy it. (Prod
+      # stays dark: this workflow is sandbox-only, and the prod var validation
+      # forbids the flag.) The generator is deterministic from the committed basis
+      # and the full Git history (fetch-depth: 0 above) and needs no AWS access;
+      # the read-only PR plan role can read the resulting data sources
       # (data.aws_ssm_parameter -> ssm:GetParameter, data.aws_ecr_image ->
       # ecr:DescribeImages).
       - name: Generate verified ephemeral Authority runtime input
@@ -316,7 +319,8 @@ jobs:
             --repository-root "$GITHUB_WORKSPACE" \
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$GITHUB_SHA" \
-            --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json"
+            --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
+            --runtime-functions-enabled
 
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'

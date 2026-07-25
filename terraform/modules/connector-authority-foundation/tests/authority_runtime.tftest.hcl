@@ -389,6 +389,23 @@ run "gate_on_deploys_three_hub_functions_and_opens_only_dependency_endpoints" {
     )
     error_message = "KMS endpoint must open to ca-ia alone (GetPublicKey+Sign, no Verify); the DynamoDB endpoint must add DescribeTable and drop Delete/Transact* actions."
   }
+
+  assert {
+    condition = (
+      # Gateway VPC-endpoint policies are TABLE-GRANULAR: the DynamoDB endpoint
+      # Resource must be EXACTLY the three base tables. A /index/* sub-resource
+      # is InvalidPolicyDocument at ModifyVpcEndpoint (the apply-time failure this
+      # guards). The finer pubkey-GSI grant lives on the RefreshAssignment
+      # identity policy (asserted above), never on this coarse network gate.
+      toset(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Resource) == toset([
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority",
+      ]) &&
+      !contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys/index/*")
+    )
+    error_message = "The DynamoDB gateway-endpoint policy must list only the three base-table ARNs (table-granular); a /index/* sub-resource is InvalidPolicyDocument at apply."
+  }
 }
 
 run "gate_on_without_contract_fails_closed" {
