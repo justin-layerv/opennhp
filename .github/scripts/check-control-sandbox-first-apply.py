@@ -3385,6 +3385,68 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and changed == (runtime_creates_pending | runtime_opens_pending)
     )
 
+    # Bounded RECOVERY transition, distinct from the strict completion above so
+    # the clean slice contract is not weakened. Admitted only when an earlier
+    # partial apply left one or more hub functions in a Failed state (Terraform
+    # auto-taints them, so they replan as ["delete","create"]) AND the exec-role
+    # trust is being normalized (the confused-deputy Condition removed -> an
+    # in-place ["update"]). Everything else stays as in the completion: aliases /
+    # provisioned-concurrency are pending creates, the three opens are updates or
+    # no-op, and NOTHING outside {pending creates, tainted-function replaces,
+    # exec-role trust updates, pending opens} may move. Every function and role
+    # after-state is still fully validated by _check_authority_runtime_resources.
+    runtime_function_addresses = {
+        address
+        for address, resource_type in AUTHORITY_RUNTIME_RESOURCES.items()
+        if resource_type == "aws_lambda_function"
+    }
+    runtime_exec_role_addresses = {
+        address
+        for address, resource_type in AUTHORITY_RUNTIME_RESOURCES.items()
+        if resource_type == "aws_iam_role"
+    }
+    runtime_functions_replaced = {
+        address
+        for address in runtime_function_addresses
+        if actual_non_noop.get(address) == ["delete", "create"]
+    }
+    runtime_roles_updated = {
+        address
+        for address in runtime_exec_role_addresses
+        if actual_non_noop.get(address) == ["update"]
+    }
+    authority_runtime_retry_transition = (
+        runtime_mode
+        and bool(runtime_functions_replaced)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"], ["delete", "create"])
+            for address in runtime_function_addresses
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["create"], ["update"])
+            for address in runtime_exec_role_addresses
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in (
+                authority_runtime_creates
+                - runtime_function_addresses
+                - runtime_exec_role_addresses
+            )
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in AUTHORITY_RUNTIME_OPENED_ADDRESSES
+        )
+        and changed
+        == (
+            runtime_creates_pending
+            | runtime_functions_replaced
+            | runtime_roles_updated
+            | runtime_opens_pending
+        )
+    )
+
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
@@ -3436,6 +3498,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         plan_mode = "authority-runtime-slice"
         # Only the still-pending creates must present a pure-create shape; any
         # create that already applied on an earlier attempt is a validated no-op.
+        _require_create_shapes(runtime_creates_pending, by_address)
+    elif authority_runtime_retry_transition:
+        plan_mode = "authority-runtime-slice-retry"
+        # Pending pure-creates (aliases / provisioned-concurrency) present a
+        # create shape; the tainted-function replaces and the exec-role trust
+        # updates are validated by their exact after-state security checks below
+        # (_check_authority_runtime_resources), not as pure creates.
         _require_create_shapes(runtime_creates_pending, by_address)
     elif changed:
         raise ContractError(
@@ -3515,9 +3584,10 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # confined to the slice in ``_check_state_normalization_drift``; here we
         # bind it to the exact plan shapes it may accompany and fail closed on
         # anything else (e.g. a config-changing no-op or a non-slice transition).
-        if plan_mode != "authority-runtime-slice" and not (
-            plan_mode == "no-op" and "resource_changes" not in plan
-        ):
+        if plan_mode not in (
+            "authority-runtime-slice",
+            "authority-runtime-slice-retry",
+        ) and not (plan_mode == "no-op" and "resource_changes" not in plan):
             raise ContractError(
                 "authority runtime-slice state normalization is admitted only for "
                 "the runtime-slice completion transition or a refresh-only steady "

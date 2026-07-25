@@ -1153,6 +1153,35 @@ def _slice_refresh_drift(address: str, resource_type: str) -> dict:
     }
 
 
+def authority_runtime_retry_fixture() -> dict:
+    """A recovery re-plan after a partial apply left the 3 hub functions Failed:
+    Terraform auto-taints them (replace = ["delete","create"]) and the exec-role
+    trust is normalized (the confused-deputy Condition removed -> in-place
+    update). The spillover alarms / log groups / function SG already applied
+    (no-op); the aliases + provisioned-concurrency are still pending creates; the
+    three opens are updates."""
+    result = authority_runtime_transition_fixture()
+    for item in result["resource_changes"]:
+        change = item["change"]
+        if change["actions"] != ["create"]:
+            continue
+        if item["type"] == "aws_lambda_function":
+            change["actions"] = ["delete", "create"]
+            change["before"] = copy.deepcopy(change["after"])
+        elif item["type"] == "aws_iam_role":
+            change["actions"] = ["update"]
+            change["before"] = copy.deepcopy(change["after"])
+        elif item["type"] in (
+            "aws_cloudwatch_metric_alarm",
+            "aws_cloudwatch_log_group",
+            "aws_security_group",
+        ):
+            change["actions"] = ["no-op"]
+            change["before"] = copy.deepcopy(change["after"])
+            change["after_unknown"] = {}
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -3511,6 +3540,35 @@ class PlanContractTests(unittest.TestCase):
                 "module.control.aws_kms_key.authority_data", "aws_kms_key"
             ),
         ]
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_slice_retry_transition_passes(self) -> None:
+        """A recovery re-plan after a partial apply left the hub functions Failed
+        (Terraform auto-tainted -> replace) and normalized the exec-role trust
+        (confused-deputy Condition removed -> in-place update) is admitted as the
+        distinct authority-runtime-slice-retry transition (the strict clean
+        completion stays creates-only)."""
+        summary = CHECKER.check_plan(authority_runtime_retry_fixture())
+        self.assertEqual(summary["plan_mode"], "authority-runtime-slice-retry")
+        self.assertEqual(
+            summary["resource_count"],
+            len(CHECKER.EXPECTED_RESOURCES)
+            + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+        )
+
+    def test_authority_runtime_retry_requires_a_tainted_function(self) -> None:
+        """The retry transition is admitted ONLY when >=1 function is actually
+        being replaced. Un-tainting the functions (leaving trust updates + creates
+        with no replace) is neither the strict completion nor a retry, so it fails
+        closed."""
+        candidate = authority_runtime_retry_fixture()
+        for item in candidate["resource_changes"]:
+            if (
+                item["type"] == "aws_lambda_function"
+                and item["change"]["actions"] == ["delete", "create"]
+            ):
+                item["change"]["actions"] = ["no-op"]
+                item["change"]["after_unknown"] = {}
         self.assert_rejected(candidate)
 
     def test_authority_runtime_rejects_index_arn_in_ddb_endpoint(self) -> None:
