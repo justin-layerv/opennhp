@@ -579,6 +579,21 @@ jobs:
               exit 1
               ;;
           esac
+          if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' ]]; then
+            # The runtime-slice completion's benign drift is a deterministic
+            # re-read of ALREADY-APPLIED slice resources, not an externally
+            # rolling value (unlike the digest kinds). A live refresh-only
+            # re-observation cannot even evaluate the module here: with functions
+            # enabled the config references the still-pending function security
+            # group as aws_security_group.authority_lambda[0], which is an empty
+            # tuple in a refresh-only plan (count is not expanded for
+            # not-yet-created resources). The immediately-before-apply state
+            # {serial, sha256} binding in the next step is the staleness guard --
+            # an unchanged state yields identical drift -- and check_plan already
+            # bound the drift to the exact slice-confined set at plan time. So the
+            # refresh-only re-observation is both impossible and redundant here.
+            exit 0
+          fi
           terraform plan -refresh-only -input=false -lock-timeout=5m -no-color \
             -var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             -out="$RUNNER_TEMP/live-refresh-plan" >/dev/null
@@ -596,11 +611,9 @@ jobs:
                 exit 1
               }
               ;;
-            authority-digest|hub-digest|authority-enablement-normalization|authority-runtime-slice-normalization)
-              # The externally owned digest kinds, the Authority enablement drift
-              # pair (Hub-publisher-role reflection + authority-digest roll), and
-              # the runtime-slice completion re-read (benign re-projection of the
-              # already-applied slice resources during a partial-apply retry)
+            authority-digest|hub-digest|authority-enablement-normalization)
+              # The externally owned digest kinds and the Authority enablement
+              # drift pair (Hub-publisher-role reflection + authority-digest roll)
               # accompany a config change or an unapplied output change, so the
               # full refresh-only plan contract cannot describe them. Re-prove them
               # in the output-ignoring normalization-drift mode and bind only the
