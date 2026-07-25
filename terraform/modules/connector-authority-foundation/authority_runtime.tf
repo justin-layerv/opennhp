@@ -390,7 +390,7 @@ resource "aws_lambda_function" "authority" {
   # image architecture (docker/Dockerfile.connector-authority-lambda in
   # layervai/qurl-service). A mismatch fails the function at create. Confirm
   # before apply.
-  architectures = ["arm64"]
+  architectures = ["x86_64"]
 
   # The immutable startup graph may consume up to ~9s; keep the whole request
   # inside the source-derived structural ladder. FLAG: resolve the exact
