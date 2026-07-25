@@ -18,7 +18,10 @@
 #                     cell0's bucket would overwrite cell0's bootstrap script.
 #     * dynamodb    — cell1's cell-scoped assignment/licenses/resources/ack
 #                     tables (cell_id="cell1").
-#     * nhp_keypair — cell1's AC-registration keypair.
+#     * server keypair access — an INLINE IAM policy (NOT module.nhp-keypair):
+#                     the registration key pool is account-global and owned by
+#                     cell0, so cell1 references it read-only and never re-creates
+#                     it. See the aws_iam_policy.server_keypair_access header.
 #     * compute     — the NHP server: ASG (+ blue/green), public UDP:62206 NLB,
 #                     UDP listener, and the /sandbox-cell1/nhp/server/* SSM
 #                     parameters incl. udp-listener-arn.
@@ -213,15 +216,56 @@ module "dynamodb" {
 # -----------------------------------------------------------------------------
 # NHP keypair — cell1's AC-registration keypair.
 # -----------------------------------------------------------------------------
-module "nhp_keypair" {
-  source = "../../modules/nhp-keypair"
+# Server keypair access policy — INLINE, not module.nhp-keypair.
+#
+# The nhp-keypair module CREATES the account-global registration key pool
+# (`/nhp/pool/registration-key` via a keygen Lambda + `/nhp/pool/registration-
+# public-key` as a Terraform-managed aws_ssm_parameter). Those are SHARED across
+# every cell in the account and are already owned by cell0's Terraform, so a
+# second instantiation here collides (`ParameterAlreadyExists` on the public-key
+# param; the private-key Lambda is idempotent but the TF-managed param is not).
+# cell1 is the SECOND cell — it must REFERENCE the pool key, never re-create it.
+#
+# cell1's server also never reads the pool key at boot (user_data.sh.tpl has no
+# `/nhp/pool/registration-key` fetch), but attach_storage_policies=true still
+# requires a keypair policy ARN, and the module's server policy is cell0-pathed
+# (`/nhp/server/*`, not this cell's `/sandbox-cell1/nhp/server/*`). So publish a
+# minimal, correctly-scoped inline policy instead: read cell0's shared pool key
+# (harmless if unused at runtime) + manage THIS cell's own server key path +
+# decrypt with this cell's secrets CMK. Nothing here creates a pool resource.
+resource "aws_iam_policy" "server_keypair_access" {
+  name        = "${local.name_prefix}-server-keypair-read"
+  description = "cell1 server SSM keypair access (references the shared pool key; creates none)"
 
-  environment = var.environment
-  cell_id     = var.cell_id
-  name_prefix = local.name_prefix
-  tags        = local.common_tags
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "SSMReadSharedRegistrationKey"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = ["arn:aws:ssm:${data.aws_region.current.region}:${var.aws_account_id}:parameter/nhp/pool/registration-key"]
+      },
+      {
+        Sid      = "SSMManageThisCellServerKey"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = ["arn:aws:ssm:${data.aws_region.current.region}:${var.aws_account_id}:parameter/${var.environment}/nhp/server/*"]
+      },
+      {
+        Sid      = "KMSDecryptSecrets"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
+        Resource = [module.kms.secrets_key_arn]
+      },
+    ]
+  })
 
-  kms_key_arn = module.kms.secrets_key_arn
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-server-keypair-read"
+    Component = "nhp-keypair"
+    Cell      = var.cell_id
+  })
 }
 
 # -----------------------------------------------------------------------------
@@ -268,6 +312,16 @@ module "compute" {
   log_level     = var.log_level
   dev_mode      = true
   resource_mode = "api"
+  # cell0's ROOT coalesces auth_url to "" before passing to compute
+  # (terraform/main.tf: `auth_url = var.auth_url != null ? var.auth_url : ""`);
+  # its real value arrives via TF_VAR_auth_url at CI-apply time. This lean cell
+  # has no auth backend wired yet, so pass "" explicitly — the compute
+  # user_data template interpolates ${auth_url} unconditionally (the passcode
+  # plugin config.toml at user_data.sh.tpl:901 is NOT null-guarded, unlike the
+  # sibling SigningKey/AesKey), so a null here fails the plan. Real auth is a
+  # Step-10 concern (inject TF_VAR_auth_url + keys, or move to local mode, once
+  # the udp-proof-runner's knock-auth model is fixed).
+  auth_url = ""
 
   # Minimal plugin set: the passcode knock plugin. The qURL plugin is omitted
   # (no qurl_config) because qurl-service is not deployed in this cell.
@@ -287,7 +341,7 @@ module "compute" {
   attach_storage_policies       = true
   dynamodb_read_policy_arn      = module.dynamodb.read_policy_arn
   dynamodb_read_policy_doc_hash = module.dynamodb.read_policy_doc_hash
-  keypair_policy_arn            = module.nhp_keypair.server_keypair_policy_arn
+  keypair_policy_arn            = aws_iam_policy.server_keypair_access.arn
   storage_backend               = "dynamodb"
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
