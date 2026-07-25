@@ -3729,33 +3729,33 @@ def check_state_list(path: Path) -> dict[str, int]:
         raise ContractError(f"cannot read Terraform state list: {exc}") from exc
 
     # `terraform state list` includes both managed resources and cached data
-    # sources. Require one of the two reviewed unions here (base, or base plus
-    # the complete runtime slice); the subsequent JSON state check remains
-    # mode-aware and independently enforces types and security-sensitive values.
+    # sources. Admit the base union plus any complete subset of the independent
+    # optional slices ({authority runtime, Hub edge}); each slice is
+    # all-or-nothing. The subsequent JSON state check remains mode-aware and
+    # independently enforces types and security-sensitive values.
     data_expected = set(EXPECTED_DATA_RESOURCES)
     base_expected = set(EXPECTED_RESOURCES) | data_expected
-    runtime_expected = base_expected | set(AUTHORITY_RUNTIME_RESOURCES)
-    if addresses == base_expected:
-        runtime_present = False
-    elif addresses == runtime_expected:
-        runtime_present = True
-    else:
-        nearest = (
-            runtime_expected
-            if len(addresses & runtime_expected) > len(addresses & base_expected)
-            else base_expected
-        )
-        missing = sorted(nearest - addresses)
-        extra = sorted(addresses - nearest)
+    runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    hub_edge_extra = set(HUB_EDGE_RESOURCES)
+    runtime_present = bool(addresses & runtime_extra)
+    hub_edge_present = bool(addresses & hub_edge_extra)
+    expected = (
+        base_expected
+        | (runtime_extra if runtime_present else set())
+        | (hub_edge_extra if hub_edge_present else set())
+    )
+    if addresses != expected:
+        missing = sorted(expected - addresses)
+        extra = sorted(addresses - expected)
         raise ContractError(
             f"Terraform state inventory mismatch; missing={missing}, extra={extra}"
         )
     return {
         "data_resource_count": len(EXPECTED_DATA_RESOURCES),
         "managed_resource_count": (
-            len(EXPECTED_RESOURCES) + len(AUTHORITY_RUNTIME_RESOURCES)
-            if runtime_present
-            else len(EXPECTED_RESOURCES)
+            len(EXPECTED_RESOURCES)
+            + (len(AUTHORITY_RUNTIME_RESOURCES) if runtime_present else 0)
+            + (len(HUB_EDGE_RESOURCES) if hub_edge_present else 0)
         ),
     }
 
@@ -3972,25 +3972,27 @@ def check_state(state: Any) -> dict[str, Any]:
     if len(by_address) != len(resources):
         raise ContractError("refreshed state contains duplicate managed addresses")
     base_expected = set(EXPECTED_RESOURCES)
-    runtime_expected = base_expected | set(AUTHORITY_RUNTIME_RESOURCES)
+    runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    hub_edge_extra = set(HUB_EDGE_RESOURCES)
     actual_addresses = set(by_address)
-    runtime_present = actual_addresses == runtime_expected
-    if actual_addresses == base_expected:
-        state_expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
-    elif runtime_present:
-        state_expected_resources = {**EXPECTED_RESOURCES, **AUTHORITY_RUNTIME_RESOURCES}
-    else:
-        nearest = (
-            runtime_expected
-            if len(actual_addresses & runtime_expected)
-            > len(actual_addresses & base_expected)
-            else base_expected
-        )
-        missing = sorted(nearest - actual_addresses)
-        extra = sorted(actual_addresses - nearest)
+    runtime_present = bool(actual_addresses & runtime_extra)
+    hub_edge_present = bool(actual_addresses & hub_edge_extra)
+    state_expected = (
+        base_expected
+        | (runtime_extra if runtime_present else set())
+        | (hub_edge_extra if hub_edge_present else set())
+    )
+    if actual_addresses != state_expected:
+        missing = sorted(state_expected - actual_addresses)
+        extra = sorted(actual_addresses - state_expected)
         raise ContractError(
             f"refreshed state inventory mismatch; missing={missing}, extra={extra}"
         )
+    state_expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    if runtime_present:
+        state_expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
+    if hub_edge_present:
+        state_expected_resources.update(HUB_EDGE_RESOURCES)
     for address, expected_type in state_expected_resources.items():
         resource = by_address[address]
         if resource.get("mode") != "managed" or resource.get("type") != expected_type:
