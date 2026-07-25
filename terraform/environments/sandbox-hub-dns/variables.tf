@@ -32,6 +32,18 @@ variable "hub_nlb_name" {
   default     = "layerv-nhp-sandbox-control-hub"
 }
 
+variable "cell0_dns_name" {
+  description = "Public A-alias record name for the cell0 NHP-server UDP edge."
+  type        = string
+  default     = "cell0.nhp.layerv.xyz"
+}
+
+variable "cell0_nlb_name" {
+  description = "Name of the cell0 public UDP:62206 server NLB to alias (discovered by data source)."
+  type        = string
+  default     = "layerv-nhp-sandbox-nlb"
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

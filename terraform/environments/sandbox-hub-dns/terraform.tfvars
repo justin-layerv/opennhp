@@ -9,3 +9,8 @@ aws_region  = "us-east-2"
 hub_dns_name   = "hub.nhp.layerv.xyz"
 hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 hub_nlb_name   = "layerv-nhp-sandbox-control-hub"
+
+# cell0.nhp.layerv.xyz -> layerv-nhp-sandbox-nlb (cell0 server UDP:62206 NLB),
+# overriding the *.nhp.layerv.xyz wildcard (which points at the AC HTTPS NLB).
+cell0_dns_name = "cell0.nhp.layerv.xyz"
+cell0_nlb_name = "layerv-nhp-sandbox-nlb"
