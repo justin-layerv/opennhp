@@ -1145,6 +1145,23 @@ def authority_runtime_partial_retry_fixture(applied_addresses: set[str]) -> dict
     return result
 
 
+def _slice_refresh_drift(address: str, resource_type: str) -> dict:
+    """A minimal benign refresh re-projection ``resource_drift`` entry. The
+    runtime-slice normalization admits by address (confined to the slice + its
+    opens), so trivial projected values suffice for coverage."""
+    return {
+        "address": address,
+        "mode": "managed",
+        "type": resource_type,
+        "change": {
+            "actions": ["update"],
+            "before": {"tags_all": {}},
+            "after": {"tags_all": {"reviewed": "yes"}},
+            "after_unknown": {},
+        },
+    }
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -3382,6 +3399,56 @@ class PlanContractTests(unittest.TestCase):
         candidate = authority_runtime_partial_retry_fixture(applied)
         drifted = self.change(candidate, next(iter(applied)))
         drifted["actions"] = ["update"]
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_slice_completion_admits_confined_refresh_drift(
+        self,
+    ) -> None:
+        """A partial-apply completion refreshes its already-applied slice
+        resources and the endpoints it opens, recording benign provider
+        re-projections in resource_drift. Drift whose addresses are CONFINED to
+        the slice's own resources + its three opens is admitted alongside the
+        runtime-slice transition (the load-bearing fields are still validated on
+        the after-state)."""
+        full = authority_runtime_transition_fixture()
+        roles = sorted(
+            item["address"]
+            for item in full["resource_changes"]
+            if item["type"] == "aws_iam_role"
+            and item["change"]["actions"] == ["create"]
+        )
+        candidate = authority_runtime_partial_retry_fixture(set(roles))
+        candidate["resource_drift"] = [
+            _slice_refresh_drift(roles[0], "aws_iam_role"),
+            _slice_refresh_drift(roles[1], "aws_iam_role"),
+            _slice_refresh_drift(
+                CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS, "aws_vpc_endpoint"
+            ),
+        ]
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-runtime-slice")
+        self.assertEqual(summary["normalization_drift_count"], 3)
+
+    def test_authority_runtime_slice_completion_rejects_drift_outside_slice(
+        self,
+    ) -> None:
+        """Refresh drift that reaches ANY address outside the slice ∪ its opens
+        is NOT admitted by the slice normalization — it falls through to the exact
+        single-drift handling and fails closed (a base resource must never drift
+        silently during a slice completion)."""
+        role = next(
+            item["address"]
+            for item in authority_runtime_transition_fixture()["resource_changes"]
+            if item["type"] == "aws_iam_role"
+            and item["change"]["actions"] == ["create"]
+        )
+        candidate = authority_runtime_partial_retry_fixture({role})
+        candidate["resource_drift"] = [
+            _slice_refresh_drift(role, "aws_iam_role"),
+            _slice_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            ),
+        ]
         self.assert_rejected(candidate)
 
     def test_authority_runtime_rejects_index_arn_in_ddb_endpoint(self) -> None:

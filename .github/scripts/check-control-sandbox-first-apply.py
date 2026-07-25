@@ -2612,6 +2612,28 @@ def _check_state_normalization_drift(
             spec=_AUTHORITY_DIGEST_SPEC,
         )
         return _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND
+    drift_addresses = [item.get("address") for item in drift]
+    if all(isinstance(address, str) for address in drift_addresses) and set(
+        drift_addresses
+    ) <= (set(AUTHORITY_RUNTIME_RESOURCES) | AUTHORITY_RUNTIME_OPENED_ADDRESSES):
+        # Partial-apply RETRY of the runtime slice. When some slice resources
+        # already applied on an earlier attempt, a refresh-enabled completion
+        # plan re-reads them (and the dependency endpoints being opened) and
+        # records benign provider re-projections in ``resource_drift`` -- no
+        # "changed outside of Terraform" config delta, only state normalization
+        # of already-applied objects. This admission is STRICTLY confined: every
+        # drifted address must be one of the slice's own resources
+        # (AUTHORITY_RUNTIME_RESOURCES) or one of its three opened dependency
+        # endpoints (AUTHORITY_RUNTIME_OPENED_ADDRESSES). It does NOT relax the
+        # field contract: the security-load-bearing fields of every slice
+        # resource are still validated on the post-drift after-state by
+        # ``_check_authority_runtime_resources`` and the endpoint-policy checks,
+        # so this only lets the completion plan reach those checks. Any drift
+        # address OUTSIDE the slice fails this subset test and falls through to
+        # the exact single-drift handling below, which fails closed. The caller
+        # binds this kind to the runtime-slice completion (or a refresh-only
+        # steady re-read); it is rejected against any other plan shape.
+        return "authority-runtime-slice-normalization"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
@@ -3477,6 +3499,23 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(
                 "the benign Hub-publisher-role + authority-digest drift pair is "
                 "admitted only for the Authority contract enablement transition"
+            )
+    if normalization_drift_kind == "authority-runtime-slice-normalization":
+        # Benign refresh re-projection of already-applied slice resources (and
+        # the dependency endpoints being opened) during a partial-apply RETRY.
+        # Admitted only for the runtime-slice completion transition itself, or a
+        # refresh-only steady re-read of the same objects (the immediate
+        # pre-apply convergence and the verify lane). Each drifted address was
+        # confined to the slice in ``_check_state_normalization_drift``; here we
+        # bind it to the exact plan shapes it may accompany and fail closed on
+        # anything else (e.g. a config-changing no-op or a non-slice transition).
+        if plan_mode != "authority-runtime-slice" and not (
+            plan_mode == "no-op" and "resource_changes" not in plan
+        ):
+            raise ContractError(
+                "authority runtime-slice state normalization is admitted only for "
+                "the runtime-slice completion transition or a refresh-only steady "
+                "re-read"
             )
 
     expected_applyable = plan_mode != "no-op" or (
