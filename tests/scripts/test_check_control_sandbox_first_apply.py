@@ -921,15 +921,6 @@ def runtime_exec_trust(fn: str) -> str:
                     "Effect": "Allow",
                     "Principal": {"Service": "lambda.amazonaws.com"},
                     "Action": "sts:AssumeRole",
-                    "Condition": {
-                        "StringEquals": {"aws:SourceAccount": CHECKER.ACCOUNT_ID},
-                        "ArnEquals": {
-                            "aws:SourceArn": (
-                                f"arn:aws:lambda:{CHECKER.AWS_REGION}:"
-                                f"{CHECKER.ACCOUNT_ID}:function:{fn}"
-                            )
-                        },
-                    },
                 }
             ],
         }
@@ -3631,6 +3622,24 @@ class PlanContractTests(unittest.TestCase):
         )
         trust = json.loads(role["after"]["assume_role_policy"])
         trust["Statement"][0]["Principal"] = {"AWS": "*"}
+        role["after"]["assume_role_policy"] = json.dumps(trust)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_confused_deputy_exec_trust(self) -> None:
+        # A per-function aws:SourceArn/aws:SourceAccount confused-deputy Condition
+        # on the EXECUTION role trust breaks VPC ENI creation
+        # (InsufficientRolePermissions on first apply), so it must be rejected;
+        # the bare lambda-principal trust is the only one that lets the function
+        # initialize.
+        candidate = authority_runtime_transition_fixture()
+        role = self.change(
+            candidate,
+            'module.control.aws_iam_role.authority_exec["layerv-nhp-sandbox-ca-ia"]',
+        )
+        trust = json.loads(role["after"]["assume_role_policy"])
+        trust["Statement"][0]["Condition"] = {
+            "StringEquals": {"aws:SourceAccount": CHECKER.ACCOUNT_ID}
+        }
         role["after"]["assume_role_policy"] = json.dumps(trust)
         self.assert_rejected(candidate)
 

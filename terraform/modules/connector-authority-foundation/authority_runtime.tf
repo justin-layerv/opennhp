@@ -68,10 +68,6 @@ locals {
     for function_name, fn in local.authority_runtime_hub_functions :
     function_name => "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${function_name}-exec"
   }
-  authority_runtime_function_arn = {
-    for function_name, fn in local.authority_runtime_hub_functions :
-    function_name => "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
-  }
 
   # Sorted, deduplicated principal list for the dependency endpoint policies.
   authority_runtime_exec_role_arns = sort(values(local.authority_runtime_exec_role_arn))
@@ -338,14 +334,14 @@ resource "aws_iam_role" "authority_exec" {
         Service = "lambda.${data.aws_partition.current.dns_suffix}"
       }
       Action = "sts:AssumeRole"
-      Condition = {
-        StringEquals = {
-          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
-        }
-        ArnEquals = {
-          "aws:SourceArn" = local.authority_runtime_function_arn[each.key]
-        }
-      }
+      # NO confused-deputy Condition. This is a Lambda EXECUTION role: the Lambda
+      # Hyperplane assumes it to create the function's VPC ENI in a context that
+      # does NOT carry the function's aws:SourceArn, so an ArnEquals SourceArn
+      # (or SourceAccount) condition denies that assume and the function fails to
+      # reach Active with InsufficientRolePermissions. The role is usable only by
+      # the function wired to it (the function's role= attribute), never by
+      # arbitrary assumption, so the bare lambda-principal trust is both the
+      # correct least privilege AND the only trust that lets a VPC function init.
     }]
   })
 

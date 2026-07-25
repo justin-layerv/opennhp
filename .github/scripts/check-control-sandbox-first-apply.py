@@ -2357,15 +2357,21 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
         or stmt.get("Action") != "sts:AssumeRole"
     ):
         raise ContractError(f"{fn} trust must allow only the Lambda service to assume")
-    condition = stmt.get("Condition")
-    if not isinstance(condition, dict):
-        raise ContractError(f"{fn} trust must confuse-deputy-scope its source")
-    account = condition.get("StringEquals", {}).get("aws:SourceAccount")
-    source_arn = condition.get("ArnEquals", {}).get("aws:SourceArn")
-    if account != ACCOUNT_ID:
-        raise ContractError(f"{fn} trust must pin the source account")
-    if source_arn != f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{fn}":
-        raise ContractError(f"{fn} trust must pin the exact function source ARN")
+    # A Lambda EXECUTION role trust must carry NO aws:SourceArn/aws:SourceAccount
+    # confused-deputy Condition. The Lambda Hyperplane assumes the execution role
+    # to create the function's VPC ENI in a context that does not satisfy a
+    # per-function SourceArn condition, so such a condition denies that assume and
+    # the function fails to reach Active with InsufficientRolePermissions (all
+    # three ca-{ia,ra,icr} functions hit this on the first live apply). The
+    # execution role is usable only by the function wired to it (its role=
+    # attribute), never by arbitrary assumption, so the bare lambda-principal
+    # trust is the correct least privilege -- and the only trust that lets a VPC
+    # function initialize.
+    if "Condition" in stmt:
+        raise ContractError(
+            f"{fn} execution-role trust must carry no Condition: an aws:SourceArn/"
+            "aws:SourceAccount confused-deputy scope breaks VPC ENI creation"
+        )
 
 
 def _check_authority_exec_role_policy(
