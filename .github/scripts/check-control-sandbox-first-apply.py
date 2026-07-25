@@ -2224,23 +2224,35 @@ def _authority_single_allow_statement(
         raise ContractError(f"{address} scoped statement effect/sid drifted")
     if any(key in stmt for key in ("NotPrincipal", "NotAction", "NotResource")):
         raise ContractError(f"{address} scoped statement may not use Not* elements")
-    if "Condition" in stmt:
-        raise ContractError(f"{address} scoped statement may not add a Condition")
+    # The runtime endpoint policies REQUIRE a Condition: a VPC endpoint policy
+    # does not match an assumed-role session against a role-ARN Principal, so each
+    # grant is Principal "*" scoped by an exact aws:PrincipalArn condition (see
+    # _authority_principalarn_condition). The callers validate that precise shape;
+    # no other condition operator or key may appear.
     return stmt
 
 
-def _authority_principal_set(stmt: dict[str, Any], address: str) -> set[str]:
-    principal = stmt.get("Principal")
-    if not isinstance(principal, dict) or set(principal) != {"AWS"}:
-        raise ContractError(f"{address} principal must be an exact AWS role set")
-    aws = principal.get("AWS")
-    values = aws if isinstance(aws, list) else [aws]
-    result: set[str] = set()
-    for value in values:
-        if not isinstance(value, str) or value == "*":
-            raise ContractError(f"{address} principal must be exact role ARNs, never '*'")
-        result.add(value)
-    return result
+def _authority_principalarn_condition(stmt: dict[str, Any], address: str) -> set[str]:
+    # A VPC endpoint policy does not match an assumed-role session against a
+    # role-ARN (or account-root) Principal -- the session is denied with "no VPC
+    # endpoint policy allows ..." even when the identity policy grants the action.
+    # So the runtime grants use Principal "*" scoped by an exact aws:PrincipalArn
+    # StringEquals condition. Require that precise shape and return the scoped
+    # role-ARN set; fail closed on any broadening (a Principal that is not "*", a
+    # missing/extra condition operator or key, or a "*" arn value).
+    if stmt.get("Principal") != "*":
+        raise ContractError(
+            f'{address} principal must be "*" scoped by an aws:PrincipalArn condition'
+        )
+    condition = stmt.get("Condition")
+    if not isinstance(condition, dict) or set(condition) != {"StringEquals"}:
+        raise ContractError(
+            f"{address} must scope with exactly one StringEquals condition"
+        )
+    equals = condition["StringEquals"]
+    if not isinstance(equals, dict) or set(equals) != {"aws:PrincipalArn"}:
+        raise ContractError(f"{address} condition must key on exactly aws:PrincipalArn")
+    return _authority_string_set(equals["aws:PrincipalArn"], address, "aws:PrincipalArn")
 
 
 def _authority_string_set(value: Any, address: str, field: str) -> set[str]:
@@ -2257,7 +2269,7 @@ def _check_authority_dynamodb_endpoint_policy(
     after: dict[str, Any], address: str
 ) -> None:
     stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsData")
-    if _authority_principal_set(stmt, address) != set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS):
+    if _authority_principalarn_condition(stmt, address) != set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS):
         raise ContractError(
             f"{address} principals must be exactly the three execution roles"
         )
@@ -2277,7 +2289,7 @@ def _check_authority_kms_endpoint_policy(
     after: dict[str, Any], address: str
 ) -> None:
     stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsQat1")
-    if _authority_principal_set(stmt, address) != set(AUTHORITY_RUNTIME_SIGN_ROLE_ARNS):
+    if _authority_principalarn_condition(stmt, address) != set(AUTHORITY_RUNTIME_SIGN_ROLE_ARNS):
         raise ContractError(
             f"{address} principal must be exactly the IssueAssignment execution role"
         )

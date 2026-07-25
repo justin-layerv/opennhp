@@ -419,7 +419,7 @@ resource "aws_lambda_function" "authority" {
   # the SSE key each op verifies at cold start via DescribeTable.
   environment {
     variables = {
-      CONNECTOR_AUTHORITY_OPERATION                = each.value.operation
+      CONNECTOR_AUTHORITY_OPERATION                = local.authority_operation_conformance_name[each.value.operation]
       CONNECTOR_AUTHORITY_ENVIRONMENT_ID           = var.environment
       CONNECTOR_AUTHORITY_ACCOUNT_ID               = data.aws_caller_identity.current.account_id
       CONNECTOR_AUTHORITY_HOME_REGION              = data.aws_region.current.region

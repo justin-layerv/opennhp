@@ -380,8 +380,13 @@ run "gate_on_deploys_three_hub_functions_and_opens_only_dependency_endpoints" {
       # The qat1 interface endpoint opens to the IssueAssignment role ALONE, actions
       # GetPublicKey + Sign (no kms:Verify); the DynamoDB endpoint action union adds
       # DescribeTable and drops every Transact*/BatchGetItem/DeleteItem entry.
-      length(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Principal.AWS) == 1 &&
-      contains(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Principal.AWS, "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec") &&
+      # VPC endpoint policies do not match a role-ARN Principal against an
+      # assumed-role session, so scoping lives in Principal "*" + an exact
+      # aws:PrincipalArn condition (the DynamoDB gateway is the same shape).
+      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Principal == "*" &&
+      jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Principal == "*" &&
+      length(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"]) == 1 &&
+      contains(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec") &&
       toset(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Action) == toset(["kms:GetPublicKey", "kms:Sign"]) &&
       contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:DescribeTable") &&
       !contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:DeleteItem") &&

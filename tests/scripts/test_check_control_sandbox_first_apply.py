@@ -821,6 +821,9 @@ def authority_runtime_input_with_concurrency() -> dict:
 
 
 def runtime_scoped_endpoint_policies() -> tuple[str, str]:
+    # VPC endpoint policies do not match an assumed-role session against a
+    # role-ARN Principal, so the runtime grants use Principal "*" scoped by an
+    # exact aws:PrincipalArn condition. Keep this fixture in that shape.
     roles = sorted(CHECKER.AUTHORITY_RUNTIME_EXEC_ROLE_ARNS)
     dynamodb = json.dumps(
         {
@@ -829,9 +832,10 @@ def runtime_scoped_endpoint_policies() -> tuple[str, str]:
                 {
                     "Sid": "AuthorityFunctionsData",
                     "Effect": "Allow",
-                    "Principal": {"AWS": roles},
+                    "Principal": "*",
                     "Action": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ACTIONS),
                     "Resource": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_RESOURCES),
+                    "Condition": {"StringEquals": {"aws:PrincipalArn": roles}},
                 }
             ],
         }
@@ -843,9 +847,16 @@ def runtime_scoped_endpoint_policies() -> tuple[str, str]:
                 {
                     "Sid": "AuthorityFunctionsQat1",
                     "Effect": "Allow",
-                    "Principal": {"AWS": sorted(CHECKER.AUTHORITY_RUNTIME_SIGN_ROLE_ARNS)},
+                    "Principal": "*",
                     "Action": ["kms:GetPublicKey", "kms:Sign"],
                     "Resource": [RUNTIME_QAT1_KEY_ARN],
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_RUNTIME_SIGN_ROLE_ARNS
+                            )
+                        }
+                    },
                 }
             ],
         }
@@ -3590,7 +3601,9 @@ class PlanContractTests(unittest.TestCase):
         candidate = authority_runtime_transition_fixture()
         ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
         policy = json.loads(ddb["after"]["policy"])
-        policy["Statement"][0]["Principal"] = "*"
+        # Principal "*" is required, so broadening now means dropping the
+        # aws:PrincipalArn condition that scopes it to the three exec roles.
+        policy["Statement"][0].pop("Condition", None)
         ddb["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
 
@@ -3739,8 +3752,9 @@ class PlanContractTests(unittest.TestCase):
         kms = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS)
         policy = json.loads(kms["after"]["policy"])
         # Widening the qat1 endpoint back to all three roles must fail: only the
-        # IssueAssignment role builds a KMS client.
-        policy["Statement"][0]["Principal"]["AWS"] = sorted(
+        # IssueAssignment role builds a KMS client. Scoping now lives in the
+        # aws:PrincipalArn condition (Principal is the required "*").
+        policy["Statement"][0]["Condition"]["StringEquals"]["aws:PrincipalArn"] = sorted(
             CHECKER.AUTHORITY_RUNTIME_EXEC_ROLE_ARNS
         )
         kms["after"]["policy"] = json.dumps(policy)

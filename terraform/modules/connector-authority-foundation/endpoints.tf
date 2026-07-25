@@ -40,9 +40,15 @@ locals {
     Statement = [{
       Sid    = "AuthorityFunctionsData"
       Effect = "Allow"
-      Principal = {
-        AWS = local.authority_runtime_exec_role_arns
-      }
+      # A VPC endpoint policy does NOT match an assumed-role session against an
+      # IAM role-ARN (or account-root) Principal: a role-ARN Principal here
+      # silently denies every hub function with "no VPC endpoint policy allows
+      # the dynamodb:* action" even though the identity policy grants it. Scope
+      # with Principal "*" + an aws:PrincipalArn condition instead. Verified in
+      # sandbox: the role-ARN form denied DescribeTable at cold start ->
+      # control_sse_invalid; this form passes. The condition keeps the network
+      # grant to exactly the constructed execution roles (fail-closed intact).
+      Principal = "*"
       Action = concat(
         local.authority_runtime_ddb_read_actions,
         local.authority_runtime_ddb_recovery_write_actions,
@@ -51,6 +57,11 @@ locals {
         for name in ["api_keys", "agent_keys", "connector_authority"] :
         local.authority_runtime_table_arns[name]
       ]
+      Condition = {
+        StringEquals = {
+          "aws:PrincipalArn" = local.authority_runtime_exec_role_arns
+        }
+      }
     }]
   })
 
@@ -63,11 +74,17 @@ locals {
     Statement = [{
       Sid    = "AuthorityFunctionsQat1"
       Effect = "Allow"
-      Principal = {
-        AWS = local.authority_runtime_sign_role_arns
+      # Same VPC-endpoint principal-matching constraint as the DynamoDB gateway
+      # above: scope with Principal "*" + aws:PrincipalArn, not a role-ARN
+      # Principal, or IssueAssignment's cold-start kms:Sign is denied here.
+      Principal = "*"
+      Action    = ["kms:GetPublicKey", "kms:Sign"]
+      Resource  = [aws_kms_key.qat1_signing.arn]
+      Condition = {
+        StringEquals = {
+          "aws:PrincipalArn" = local.authority_runtime_sign_role_arns
+        }
       }
-      Action   = ["kms:GetPublicKey", "kms:Sign"]
-      Resource = [aws_kms_key.qat1_signing.arn]
     }]
   })
 

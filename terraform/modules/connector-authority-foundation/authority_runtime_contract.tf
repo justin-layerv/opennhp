@@ -86,6 +86,25 @@ locals {
     complete_registration        = "cr"
     complete_credential_recovery = "ccr"
   }
+  # The handler (layervai/qurl-service internal/connectorauthorityruntime,
+  # parseOperation) matches CONNECTOR_AUTHORITY_OPERATION EXACTLY against the
+  # PascalCase operation constants exported by layervai/qurl-conformance. The
+  # snake_case operation keys above are this module's internal identity (exec
+  # role policy names, tags, log/description labels) and are NOT the wire value
+  # -- feeding them verbatim fails the function closed at init with
+  # configuration_invalid. Map each operation to its conformance constant for
+  # the function environment. A missing key fails at plan time, which is the
+  # intended signal to extend this map when an operation is added above. Note
+  # OTP capitalization rules out deriving these from the snake_case keys.
+  authority_operation_conformance_name = {
+    issue_assignment             = "IssueAssignment"
+    refresh_assignment           = "RefreshAssignment"
+    issue_credential_recovery    = "IssueCredentialRecovery"
+    issue_registration_otp       = "IssueRegistrationOTP"
+    activate_registration        = "ActivateRegistration"
+    complete_registration        = "CompleteRegistration"
+    complete_credential_recovery = "CompleteCredentialRecovery"
+  }
   authority_contract_function_keys = toset([
     "steady_provisioned_concurrency",
     "steady_reserved_concurrency",
