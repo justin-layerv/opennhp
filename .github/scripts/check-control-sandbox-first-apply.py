@@ -3696,6 +3696,25 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         # narrow mode, because the enablement's unapplied output change means the
         # full refresh-only ``check_plan`` contract cannot describe the observation.
         return _check_authority_enablement_normalization_drift(drift, prior_state)
+    slice_drift_addresses = [item.get("address") for item in drift]
+    if all(isinstance(a, str) for a in slice_drift_addresses) and set(
+        slice_drift_addresses
+    ) <= (set(AUTHORITY_RUNTIME_RESOURCES) | AUTHORITY_RUNTIME_OPENED_ADDRESSES):
+        # Partial-apply RETRY of the runtime slice. The pre-apply live refresh
+        # re-reads the already-applied slice resources and the dependency
+        # endpoints being opened (benign provider re-projection). Same strict
+        # confinement rule as the check_plan lane (every drifted address inside
+        # the slice + its three opens); any address outside falls through and
+        # fails closed. This narrow lane binds only the exact {count, kind,
+        # sha256} the reviewed completion plan emitted, so a MOVED live
+        # observation aborts the apply. The security-load-bearing after-state
+        # fields are validated by check_plan on the reviewed completion plan, not
+        # in this output-ignoring re-observation.
+        return {
+            "normalization_drift_count": len(drift),
+            "normalization_drift_kind": "authority-runtime-slice-normalization",
+            "normalization_drift_sha256": _normalization_drift_sha256(drift),
+        }
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     specs = {

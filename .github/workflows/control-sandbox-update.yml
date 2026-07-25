@@ -572,7 +572,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2|authority-enablement-normalization:2)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -596,9 +596,11 @@ jobs:
                 exit 1
               }
               ;;
-            authority-digest|hub-digest|authority-enablement-normalization)
-              # The externally owned digest kinds and the Authority enablement
-              # drift pair (Hub-publisher-role reflection + authority-digest roll)
+            authority-digest|hub-digest|authority-enablement-normalization|authority-runtime-slice-normalization)
+              # The externally owned digest kinds, the Authority enablement drift
+              # pair (Hub-publisher-role reflection + authority-digest roll), and
+              # the runtime-slice completion re-read (benign re-projection of the
+              # already-applied slice resources during a partial-apply retry)
               # accompany a config change or an unapplied output change, so the
               # full refresh-only plan contract cannot describe them. Re-prove them
               # in the output-ignoring normalization-drift mode and bind only the

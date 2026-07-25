@@ -2165,6 +2165,77 @@ class PlanContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertEqual(observation[field], plan_summary[field])
 
+    def test_authority_runtime_slice_normalization_reproof_matches_plan(
+        self,
+    ) -> None:
+        # The op=apply pre-apply re-prove lane re-observes the benign slice
+        # completion drift via check_normalization_drift (output-ignoring narrow
+        # mode, which skips the full inventory contract). Its {count, kind,
+        # sha256} must equal the plan lane's for the identical drift, so the
+        # workflow's plan-vs-live cmp matches and the completion apply proceeds.
+        exec_roles = sorted(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
+            if resource_type == "aws_iam_role"
+        )
+        drift = [
+            _slice_refresh_drift(exec_roles[0], "aws_iam_role"),
+            _slice_refresh_drift(exec_roles[1], "aws_iam_role"),
+            _slice_refresh_drift(
+                CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS, "aws_vpc_endpoint"
+            ),
+        ]
+        refresh = plan_fixture()
+        refresh["applyable"] = True
+        refresh["resource_drift"] = copy.deepcopy(drift)
+        prior_state = terraform_1_14_refresh_only_golden(refresh)
+        observation = CHECKER.check_normalization_drift(refresh, prior_state)
+        self.assertEqual(
+            observation["normalization_drift_kind"],
+            "authority-runtime-slice-normalization",
+        )
+        self.assertEqual(observation["normalization_drift_count"], 3)
+        self.assertEqual(
+            set(observation),
+            {
+                "normalization_drift_count",
+                "normalization_drift_kind",
+                "normalization_drift_sha256",
+            },
+        )
+        completion = authority_runtime_partial_retry_fixture(set(exec_roles))
+        completion["resource_drift"] = copy.deepcopy(drift)
+        plan_summary = CHECKER.check_plan(completion)
+        for field in (
+            "normalization_drift_count",
+            "normalization_drift_kind",
+            "normalization_drift_sha256",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(observation[field], plan_summary[field])
+
+    def test_authority_runtime_slice_normalization_reproof_rejects_outside_slice(
+        self,
+    ) -> None:
+        # A re-prove observation whose drift reaches outside the slice must fail
+        # closed in the narrow lane too (not just check_plan).
+        exec_role = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
+            if resource_type == "aws_iam_role"
+        )
+        refresh = plan_fixture()
+        refresh["applyable"] = True
+        refresh["resource_drift"] = [
+            _slice_refresh_drift(exec_role, "aws_iam_role"),
+            _slice_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            ),
+        ]
+        prior_state = terraform_1_14_refresh_only_golden(refresh)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_normalization_drift(refresh, prior_state)
+
     def test_authority_enablement_pair_normalization_drift_is_order_insensitive(
         self,
     ) -> None:
