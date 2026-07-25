@@ -53,19 +53,19 @@ variable "proof_kms_key_arns" {
     set by the external layervai/qurl-connector app). Aliases and wildcards are
     rejected by the module.
 
-    ⚠️ REQUIRED — no default on purpose. The exact sealing CMK is owned/produced by
-    the qurl-connector app and is NOT wired by reference in this repo. A live KMS
-    investigation (2026-07-25) showed the earlier candidate,
-    alias/layerv-nhp-sandbox-control-authority-data
-    (key/83680792-1ed7-4825-beb2-2e67f8056aee), is the DATA-PLANE key — its grants
-    are all DynamoDB/ECR (agent-keys table, connector-authority repo), with NO
-    qurl-agent-x25519-private-key encryption context — so it is NOT the agent
-    PRIVATE-key sealing key. Rather than silently grant Decrypt on a wrong key,
-    this input is required: supply the confirmed sealing CMK (from the qurl-connector
-    owners) via terraform.tfvars before apply. A wrong key still fails safe (the
-    attended proof's decrypt fails, no silent misbehavior).
+    OPTIONAL override. When null (default), this root uses the dedicated proof
+    sealing CMK it creates (aws_kms_key.proof_agent_seal, proof_seal_kms.tf).
+
+    The exact sealing CMK is a proof-setup value — qurl-connector's aws-kms key
+    provider reads it from LAYERV_AWS_KMS_KEY_ID at runtime, and no pre-existing
+    sandbox key exists (a live KMS check refuted the authority-data candidate: it
+    is the DDB/ECR data-plane key with no qurl-agent-x25519-private-key encryption
+    context). Set this only to point the runner's Decrypt grant at a
+    qurl-connector-confirmed key instead of the dedicated one; both a wrong key and
+    a mismatched agent key-provider config fail safe (the attended decrypt fails).
   EOT
   type        = set(string)
+  default     = null
 }
 
 variable "tags" {

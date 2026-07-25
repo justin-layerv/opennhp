@@ -46,7 +46,10 @@ module "udp_proof_runner" {
   github_oidc_provider_arn = var.github_oidc_provider_arn
   runner_archive_url       = var.runner_archive_url
   runner_archive_sha256    = var.runner_archive_sha256
-  proof_kms_key_arns       = var.proof_kms_key_arns
+
+  # Default to the dedicated proof sealing CMK this root creates; a caller may
+  # override with the qurl-connector-confirmed key(s) via proof_kms_key_arns.
+  proof_kms_key_arns = var.proof_kms_key_arns != null ? var.proof_kms_key_arns : [aws_kms_key.proof_agent_seal.arn]
 
   tags = local.common_tags
 }
