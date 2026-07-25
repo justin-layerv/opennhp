@@ -53,15 +53,19 @@ variable "proof_kms_key_arns" {
     set by the external layervai/qurl-connector app). Aliases and wildcards are
     rejected by the module.
 
-    ⚠️ CONFIRM BEFORE THE ATTENDED RUN: the exact sealing CMK is owned/produced by
-    the qurl-connector app and is not wired by reference in this repo. The default
-    below is the LEADING CANDIDATE (Control authority-data CMK) but is UNCONFIRMED;
-    a wrong key fails safe (the attended proof's decrypt fails, no silent misbehavior).
-    Verify with the qurl-connector owners and correct if needed.
+    ⚠️ REQUIRED — no default on purpose. The exact sealing CMK is owned/produced by
+    the qurl-connector app and is NOT wired by reference in this repo. A live KMS
+    investigation (2026-07-25) showed the earlier candidate,
+    alias/layerv-nhp-sandbox-control-authority-data
+    (key/83680792-1ed7-4825-beb2-2e67f8056aee), is the DATA-PLANE key — its grants
+    are all DynamoDB/ECR (agent-keys table, connector-authority repo), with NO
+    qurl-agent-x25519-private-key encryption context — so it is NOT the agent
+    PRIVATE-key sealing key. Rather than silently grant Decrypt on a wrong key,
+    this input is required: supply the confirmed sealing CMK (from the qurl-connector
+    owners) via terraform.tfvars before apply. A wrong key still fails safe (the
+    attended proof's decrypt fails, no silent misbehavior).
   EOT
   type        = set(string)
-  # alias/layerv-nhp-sandbox-control-authority-data -> this key/<uuid>.
-  default = ["arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"]
 }
 
 variable "tags" {

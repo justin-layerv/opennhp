@@ -12,6 +12,10 @@ availability_zone = "us-east-2a"
 runner_archive_url    = "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz"
 runner_archive_sha256 = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
 
-# ⚠️ CONFIRM WITH qurl-connector OWNERS before the attended run. Leading candidate
-# = alias/layerv-nhp-sandbox-control-authority-data. A wrong key fails safe.
-proof_kms_key_arns = ["arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"]
+# ⚠️ REQUIRED — set the confirmed agent-x25519-private-key SEALING CMK here before
+# apply (get it from the qurl-connector owners). It is NOT authority-data: a live
+# KMS grant check showed authority-data is the DDB/ECR data-plane key with no
+# qurl-agent-x25519-private-key encryption context. Leaving this unset makes
+# `terraform plan/apply` fail loudly (required variable), which is intended — the
+# runner must not be applied with a guessed sealing key.
+# proof_kms_key_arns = ["arn:aws:kms:us-east-2:767397897469:key/<confirmed-uuid>"]
