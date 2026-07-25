@@ -446,18 +446,22 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
   }
 
   assert {
-    # The ECR interface endpoints and the S3 gateway endpoint admit ONLY the
-    # execution role, scoped to the Hub repository / the region's ECR layer
-    # bucket.
+    # The ECR interface endpoints admit ONLY the execution role, scoped to the
+    # Hub repository. The S3 gateway endpoint carries NO principal condition: ECR
+    # layer blobs are fetched via presigned URLs signed by the ECR service (not
+    # the execution role), so an aws:PrincipalArn condition would 403 the pull.
+    # The exact bucket + opaque layer-digest object keys are the access control.
     condition = (
       jsondecode(aws_vpc_endpoint.hub_ecr_api[0].policy).Statement[0].Sid == "HubPullImage" &&
       contains(jsondecode(aws_vpc_endpoint.hub_ecr_api[0].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-control-hub-exec") &&
       jsondecode(aws_vpc_endpoint.hub_ecr_api[0].policy).Statement[0].Resource[0] == "arn:aws:ecr:us-east-2:767397897469:repository/layerv/nhp-hub" &&
       jsondecode(aws_vpc_endpoint.hub_ecr_dkr[0].policy).Statement[1].Action == "ecr:GetAuthorizationToken" &&
       jsondecode(aws_vpc_endpoint.hub_s3[0].policy).Statement[0].Resource[0] == "arn:aws:s3:::prod-us-east-2-starport-layer-bucket/*" &&
-      contains(jsondecode(aws_vpc_endpoint.hub_s3[0].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-control-hub-exec")
+      jsondecode(aws_vpc_endpoint.hub_s3[0].policy).Statement[0].Principal == "*" &&
+      jsondecode(aws_vpc_endpoint.hub_s3[0].policy).Statement[0].Action == "s3:GetObject" &&
+      !contains(keys(jsondecode(aws_vpc_endpoint.hub_s3[0].policy).Statement[0]), "Condition")
     )
-    error_message = "The ECR endpoints must scope image pull to the Hub repository for the execution role (auth token registry-wide), and S3 must scope GetObject to the region's ECR layer bucket for the execution role."
+    error_message = "The ECR endpoints must scope image pull to the Hub repository for the execution role (auth token registry-wide); S3 must allow s3:GetObject on exactly the region's ECR layer bucket with Principal \"*\" and NO condition (ECR presigned-URL layer GETs are not signed by the execution role)."
   }
 
   assert {

@@ -5391,6 +5391,44 @@ class HubMonitoringEndpointPolicyTests(unittest.TestCase):
             )
 
 
+class HubS3EndpointPolicyTests(unittest.TestCase):
+    def _after(self, **overrides) -> dict:
+        stmt = {
+            "Sid": "HubPullLayers",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": [CHECKER.HUB_S3_LAYER_BUCKET_ARN],
+        }
+        stmt.update(overrides)
+        return {"policy": json.dumps({"Version": "2012-10-17", "Statement": [stmt]})}
+
+    def test_exact_passes(self) -> None:
+        CHECKER._check_hub_s3_endpoint_policy(self._after(), "s3")
+
+    def test_principal_condition_rejected(self) -> None:
+        # A principal condition 403s ECR presigned-URL layer GETs, so it is banned.
+        after = self._after(
+            Condition={
+                "StringEquals": {"aws:PrincipalArn": [CHECKER.HUB_EXECUTION_ROLE_ARN]}
+            }
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_s3_endpoint_policy(after, "s3")
+
+    def test_wrong_bucket_fails(self) -> None:
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_s3_endpoint_policy(
+                self._after(Resource=["arn:aws:s3:::some-other-bucket/*"]), "s3"
+            )
+
+    def test_wrong_action_fails(self) -> None:
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_s3_endpoint_policy(
+                self._after(Action="s3:PutObject"), "s3"
+            )
+
+
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

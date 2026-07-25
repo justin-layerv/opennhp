@@ -150,9 +150,14 @@ locals {
     ]
   })
 
-  # S3 gateway endpoint: the execution role may GET only from the region's
-  # managed ECR layer bucket (where image layer blobs actually live). No other S3
-  # reach is granted. Same Principal "*" + aws:PrincipalArn scoping.
+  # S3 gateway endpoint: GET only from the region's managed ECR layer bucket
+  # (where image layer blobs actually live). No other S3 reach is granted. Unlike
+  # the other Hub endpoint policies this carries NO aws:PrincipalArn condition:
+  # ECR layer blobs are fetched from S3 via presigned URLs generated and signed by
+  # the ECR service (not the execution role), so a principal condition 403s the
+  # pull ("CannotPullContainerError: httpReadSeeker: unexpected status"). The
+  # exact starport bucket + opaque layer-digest object keys are the access
+  # control; this is the AWS-standard ECR-over-endpoint pattern.
   hub_s3_endpoint_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -161,11 +166,6 @@ locals {
       Principal = "*"
       Action    = "s3:GetObject"
       Resource  = ["arn:${data.aws_partition.current.partition}:s3:::prod-${data.aws_region.current.region}-starport-layer-bucket/*"]
-      Condition = {
-        StringEquals = {
-          "aws:PrincipalArn" = [local.hub_execution_role_arn]
-        }
-      }
     }]
   })
 

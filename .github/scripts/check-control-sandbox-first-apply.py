@@ -659,6 +659,12 @@ HUB_WORKER_OPENED_ADDRESSES = frozenset(
         "module.control.aws_security_group.interface_endpoints",
     }
 )
+# The Hub S3 gateway endpoint. Unlike the interface endpoints above (pre-existing,
+# opened deny->scoped by the slice), hub_s3 is CREATED by the worker slice with
+# its policy inline, so a later policy correction presents as a standalone in-place
+# ["update"] on a HUB_WORKER_RESOURCES member -- admitted by the bounded
+# hub-s3-endpoint-policy-correction lane, not the opened-address tolerance.
+HUB_WORKER_S3_ENDPOINT_ADDRESS = "module.control.aws_vpc_endpoint.hub_s3[0]"
 # The Hub worker container log group ARN (awslogs driver target), matched exactly
 # in the opened logs endpoint policy. Slash-namespaced, distinct from the dash
 # CONTROL_PREFIX.
@@ -2826,12 +2832,18 @@ def _check_hub_ecr_endpoint_policy(after: dict[str, Any], address: str) -> None:
 
 
 def _check_hub_s3_endpoint_policy(after: dict[str, Any], address: str) -> None:
-    # The S3 GATEWAY endpoint opens ONLY the Hub execution role's read of the
-    # region's ECR layer bucket -- the object store the ECR download URLs target.
+    # The S3 GATEWAY endpoint opens s3:GetObject on EXACTLY the region's ECR layer
+    # bucket. Unlike the other Hub endpoint policies it carries NO aws:PrincipalArn
+    # condition: ECR layer blobs are fetched via presigned URLs signed by the ECR
+    # service, not the execution role, so a principal condition 403s the pull. The
+    # exact starport bucket + opaque layer-digest keys are the access control.
     stmt = _authority_single_allow_statement(after, address, "HubPullLayers")
-    if _authority_principalarn_condition(stmt, address) != {HUB_EXECUTION_ROLE_ARN}:
+    if stmt.get("Principal") != "*":
+        raise ContractError(f'{address} principal must be "*"')
+    if "Condition" in stmt:
         raise ContractError(
-            f"{address} principal must be exactly the Hub execution role"
+            f"{address} must carry no Condition: ECR presigned-URL layer GETs are "
+            "not signed by the execution role, so a principal condition denies them"
         )
     if _authority_string_set(stmt.get("Action"), address, "Action") != {"s3:GetObject"}:
         raise ContractError(f"{address} action must be exactly s3:GetObject")
@@ -4079,6 +4091,23 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and changed == (hub_worker_creates_pending | hub_worker_opens_pending)
     )
 
+    # A bounded, post-slice correction to the Hub S3 gateway-endpoint policy. The
+    # worker slice (5b) created hub_s3 with an aws:PrincipalArn=hub-exec Condition,
+    # but ECR layer-blob GETs ride presigned URLs signed by the ECR service -- NOT
+    # the execution role -- so that Condition 403'd the image pull
+    # (CannotPullContainerError). This lane admits EXACTLY the single hub_s3 in-place
+    # policy update with nothing else moving; the corrected after-state (Principal
+    # "*", no Condition, s3:GetObject on exactly the region starport layer bucket) is
+    # validated by _check_hub_s3_endpoint_policy in _check_planned_security. Gated on
+    # the worker slice being the committed default (hub_worker_mode), so it cannot
+    # fire before the endpoint exists; once applied, hub_s3 is no-op and the steady
+    # post-slice state's s3 policy check still enforces the corrected shape.
+    hub_s3_correction = (
+        hub_worker_mode
+        and changed == {HUB_WORKER_S3_ENDPOINT_ADDRESS}
+        and actual_non_noop.get(HUB_WORKER_S3_ENDPOINT_ADDRESS) == ["update"]
+    )
+
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
@@ -4149,12 +4178,18 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # the two opened base resources present as updates validated by their
         # exact after-state security checks in _check_planned_security below.
         _require_create_shapes(hub_worker_creates_pending, by_address)
+    elif hub_s3_correction:
+        plan_mode = "hub-s3-endpoint-policy-correction"
+        # A single in-place policy update on the already-created hub_s3 gateway
+        # endpoint -- no create shape to assert. The corrected after-state is
+        # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
             "contract binding, the exact Authority runtime slice, the exact "
-            "Hub public edge slice, or the exact Hub Fargate worker slice; "
+            "Hub public edge slice, the exact Hub Fargate worker slice, or the "
+            "exact Hub S3 endpoint-policy correction; "
             f"got {actual_non_noop}"
         )
 
