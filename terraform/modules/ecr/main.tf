@@ -3032,6 +3032,19 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "lambda:PutFunctionEventInvokeConfig",
           "lambda:UpdateFunctionEventInvokeConfig",
           "lambda:DeleteFunctionEventInvokeConfig",
+          # Connector Authority runtime slice: Terraform manages the closed
+          # blue/green aliases and the steady provisioned-concurrency config on
+          # each hub function. These are MANAGEMENT actions (create/update/delete/
+          # read) only -- NOT lambda:InvokeFunction, which stays fenced to the
+          # exact helper ARNs in TerraformHelperInvoke so the apply role can never
+          # invoke an Authority alias.
+          "lambda:CreateAlias",
+          "lambda:UpdateAlias",
+          "lambda:DeleteAlias",
+          "lambda:GetAlias",
+          "lambda:PutProvisionedConcurrencyConfig",
+          "lambda:DeleteProvisionedConcurrencyConfig",
+          "lambda:GetProvisionedConcurrencyConfig",
           "lambda:AddPermission",
           "lambda:RemovePermission",
           "lambda:TagResource",
