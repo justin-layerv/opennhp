@@ -109,9 +109,23 @@ if [[ -n "$plan_json" ]]; then
     exit 1
   fi
 
+  # A tainted Connector Authority hub FUNCTION replan (delete+create) recreates
+  # the resource in place -- it is the authority-runtime-slice-retry recovery for
+  # a function left in a Failed state by an earlier partial apply, not a net
+  # teardown -- so it is not destructive. Everything else carrying a delete
+  # (a pure delete, or a replace of any other resource type) stays flagged.
   destructive_resources="$(jq -r '
     (.resource_changes[]?, .resource_drift[]?)
     | select(.change.actions | index("delete"))
+    | select(
+        (
+          (.address | startswith("module.control.aws_lambda_function.authority["))
+          and (
+            (.change.actions == ["delete", "create"])
+            or (.change.actions == ["create", "delete"])
+          )
+        ) | not
+      )
     | "\(.address) [\(.change.actions | join(","))]"
   ' "$plan_json")"
   if [[ -n "$destructive_resources" ]]; then
