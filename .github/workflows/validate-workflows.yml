@@ -475,6 +475,7 @@ jobs:
           node --test terraform/modules/relay-identity/lambda/relay_identity.test.js
           node --test terraform/modules/compute/lambda/keygen/index.test.js
           node --test terraform/modules/compute/relay_toml_template.test.js
+          node --test terraform/modules/compute/passcode_config_template.test.js
           python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 
       # Regression fence for aws cloudwatch put-metric-data: its --dimensions

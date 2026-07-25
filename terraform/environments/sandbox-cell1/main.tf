@@ -315,12 +315,13 @@ module "compute" {
   # cell0's ROOT coalesces auth_url to "" before passing to compute
   # (terraform/main.tf: `auth_url = var.auth_url != null ? var.auth_url : ""`);
   # its real value arrives via TF_VAR_auth_url at CI-apply time. This lean cell
-  # has no auth backend wired yet, so pass "" explicitly — the compute
-  # user_data template interpolates ${auth_url} unconditionally (the passcode
-  # plugin config.toml at user_data.sh.tpl:901 is NOT null-guarded, unlike the
-  # sibling SigningKey/AesKey), so a null here fails the plan. Real auth is a
-  # Step-10 concern (inject TF_VAR_auth_url + keys, or move to local mode, once
-  # the udp-proof-runner's knock-auth model is fixed).
+  # has no auth backend wired yet, so pass "" explicitly to match cell0's
+  # posture (renders `AuthUrl = ""` in the passcode plugin config.toml). The
+  # compute module now null-guards that line (user_data.sh.tpl, alongside the
+  # sibling SigningKey/AesKey), so a null would render safely too — "" is kept
+  # for a byte-identical render and cell0 parity. Real auth is a Step-10 concern
+  # (inject TF_VAR_auth_url + keys, or move to local mode, once the
+  # udp-proof-runner's knock-auth model is fixed).
   auth_url = ""
 
   # Minimal plugin set: the passcode knock plugin. The qURL plugin is omitted

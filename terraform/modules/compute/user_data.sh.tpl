@@ -898,7 +898,9 @@ cat > /opt/layerv/nhp-server/plugins/passcode/etc/config.toml << PLUGINEOF
 # ResourceMode: "api" uses external auth API, "file" uses local resource.toml
 ResourceMode = "${resource_mode}"
 # AuthUrl: Auth backend endpoint for API mode
+%{ if auth_url != null ~}
 AuthUrl = "${auth_url}"
+%{ endif ~}
 # JWT/Encryption settings
 %{ if auth_signing_key != null ~}
 SigningKey = "${auth_signing_key}"
