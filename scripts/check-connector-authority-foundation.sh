@@ -149,13 +149,18 @@ if [[ -n "$plan_json" ]]; then
     fi
   done
 
-  # The AWS provider marks after_unknown.route=true for clean route tables, so
-  # unknown route metadata is not evidence of an inline declaration. The
-  # lexical source fence above owns that case; plan JSON independently rejects
-  # every known non-empty route list.
+  # The AWS provider marks after_unknown.route=true for a clean route table at
+  # CREATE, so a freshly-created edge table has after.route=null and is not
+  # flagged. Once the edge is live, a no-op refresh reports the KNOWN route list
+  # populated by the standalone aws_route resource -- that reflection is not an
+  # inline declaration, so skip unchanged (no-op/read) tables. A real inline
+  # route entering on a create/update/replace still surfaces a known non-empty
+  # route list and is rejected; and the unconditional lexical source fence above
+  # owns authored inline routes on every run regardless of plan action.
   inline_route_tables="$(jq -r '
     (.resource_changes[]?, .resource_drift[]?)
     | select(.type == "aws_route_table" and .change.after != null)
+    | select(.change.actions != ["no-op"] and .change.actions != ["read"])
     | select(((.change.after.route? // []) | length) > 0)
     | .address
   ' "$plan_json")"

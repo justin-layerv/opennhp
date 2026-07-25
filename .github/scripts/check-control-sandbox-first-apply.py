@@ -466,6 +466,12 @@ HUB_EDGE_RESOURCES: dict[str, str] = {
     "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": "aws_ssm_parameter",
 }
 
+# The Hub public UDP edge's network load balancer name -- `${name_prefix}-hub`
+# in the module, where name_prefix == CONTROL_PREFIX for sandbox. check_live
+# admits exactly this one internet-facing NLB, and only once the tagged
+# public-edge route table proves the edge is live.
+HUB_EDGE_LOAD_BALANCER_NAME = f"{CONTROL_PREFIX}-hub"
+
 # Configuration-block view of the Hub edge (un-indexed resource addresses). The
 # blocks are declared unconditionally, so -- exactly like the runtime blocks --
 # they always appear in the plan configuration even while count=0 (dark). Added
@@ -4445,7 +4451,7 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
     # Hub-facing functions once the runtime slice is live. Any other function
     # fails closed. `control-lambdas.json` is the reviewed `aws lambda
     # list-functions` projection (function objects filtered to the control and
-    # layerv-nhp-<env>-ca- prefixes). The load-balancer boundary stays absolute.
+    # layerv-nhp-<env>-ca- prefixes).
     live_lambdas = load_json(evidence_dir / "control-lambdas.json")
     if not isinstance(live_lambdas, list):
         raise ContractError("Control Lambda inventory evidence is malformed")
@@ -4460,12 +4466,47 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             "Control prefix owns an unexpected Lambda function set; only the exact "
             "3 Hub-facing Authority functions are admitted"
         )
-    if load_json(evidence_dir / "control-load-balancers.json") != []:
-        raise ContractError("Control prefix unexpectedly owns a load balancer")
+    # The Hub public UDP edge (slice 5a) is the authority's only load balancer,
+    # and it exists in lockstep with the tagged public-edge route table proven
+    # above: while the edge is dark (no public-edge table) the Control/authority
+    # prefixes own no load balancer; once it is live they own EXACTLY the one
+    # internet-facing network NLB fronting the Hub workers, in the Control VPC.
+    # `control-load-balancers.json` is the reviewed `aws elbv2
+    # describe-load-balancers` projection filtered to the control and
+    # layerv-nhp-<env>-ca- prefixes. Any other shape fails closed.
+    live_load_balancers = load_json(evidence_dir / "control-load-balancers.json")
+    if not isinstance(live_load_balancers, list):
+        raise ContractError("Control load-balancer inventory evidence is malformed")
+    if not public_edge_ids:
+        if live_load_balancers != []:
+            raise ContractError(
+                "Control prefix owns a load balancer while the public edge is dark"
+            )
+    else:
+        if len(live_load_balancers) != 1:
+            raise ContractError(
+                "Control prefix owns an unexpected load-balancer set; only the "
+                "single Hub public UDP edge NLB is admitted"
+            )
+        hub_lb = live_load_balancers[0]
+        if not isinstance(hub_lb, dict):
+            raise ContractError("Control load-balancer evidence is malformed")
+        if (
+            hub_lb.get("LoadBalancerName") != HUB_EDGE_LOAD_BALANCER_NAME
+            or hub_lb.get("Type") != "network"
+            or hub_lb.get("Scheme") != "internet-facing"
+            or hub_lb.get("VpcId") != vpc_id
+            or (hub_lb.get("State") or {}).get("Code") != "active"
+        ):
+            raise ContractError(
+                "Control Hub load balancer is not the exact active internet-facing "
+                "network edge in the Control VPC"
+            )
     return {
         "flow_log_id": flow["FlowLogId"],
         "vpc_id": vpc_id,
         "authority_function_count": len(live_lambda_names),
+        "hub_load_balancer_count": len(live_load_balancers),
     }
 
 

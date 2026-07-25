@@ -5030,6 +5030,49 @@ def live_fixture(root: Path) -> None:
         write_json(root / filename, value)
 
 
+def hub_nlb_evidence() -> dict:
+    return {
+        "LoadBalancerName": CHECKER.HUB_EDGE_LOAD_BALANCER_NAME,
+        "Type": "network",
+        "Scheme": "internet-facing",
+        "VpcId": "vpc-abc123",
+        "State": {"Code": "active"},
+    }
+
+
+def live_edge_fixture(root: Path) -> None:
+    """The dark live boundary plus the Step-5 Hub public UDP edge: one tagged
+    public-edge route table carrying the sole internet route, exactly one
+    internet gateway, and the single internet-facing Hub NLB."""
+    live_fixture(root)
+    route_payload = json.loads((root / "route-tables.json").read_text())
+    route_payload["RouteTables"].append(
+        {
+            "RouteTableId": "rtb-edge",
+            "Associations": [{"Main": False}],
+            "Tags": [{"Key": "Type", "Value": "public-edge"}],
+            "Routes": [
+                {
+                    "GatewayId": "local",
+                    "DestinationCidrBlock": "10.102.0.0/16",
+                    "State": "active",
+                },
+                {
+                    "GatewayId": "igw-abc123",
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "State": "active",
+                },
+            ],
+        }
+    )
+    write_json(root / "route-tables.json", route_payload)
+    write_json(
+        root / "internet-gateways.json",
+        {"InternetGateways": [{"InternetGatewayId": "igw-abc123"}]},
+    )
+    write_json(root / "control-load-balancers.json", [hub_nlb_evidence()])
+
+
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5095,6 +5138,63 @@ class LiveContractTests(unittest.TestCase):
                 root = Path(directory)
                 live_fixture(root)
                 write_json(root / "control-lambdas.json", payload)
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_live(root)
+
+
+class LiveHubEdgeBoundaryTests(unittest.TestCase):
+    def test_live_public_edge_admits_exactly_the_hub_nlb(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            summary = CHECKER.check_live(root)
+            self.assertEqual(summary["hub_load_balancer_count"], 1)
+            self.assertEqual(summary["vpc_id"], "vpc-abc123")
+
+    def test_dark_boundary_reports_no_load_balancer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_fixture(root)
+            self.assertEqual(CHECKER.check_live(root)["hub_load_balancer_count"], 0)
+
+    def test_load_balancer_while_edge_dark_fails(self) -> None:
+        # A load balancer without the tagged public-edge route table proving the
+        # edge is live is a boundary breach and must fail closed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_fixture(root)
+            write_json(root / "control-load-balancers.json", [hub_nlb_evidence()])
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
+    def test_live_public_edge_without_load_balancer_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            write_json(root / "control-load-balancers.json", [])
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
+    def test_live_public_edge_rejects_wrong_or_extra_load_balancer(self) -> None:
+        base = hub_nlb_evidence()
+        mutations = (
+            [{**base, "LoadBalancerName": "layerv-nhp-sandbox-control-rogue"}],
+            [{**base, "Type": "application"}],
+            [{**base, "Scheme": "internal"}],
+            [{**base, "VpcId": "vpc-other"}],
+            [{**base, "State": {"Code": "provisioning"}}],
+            [base, base],
+            ["not-an-object"],
+            "not-a-list",
+        )
+        for payload in mutations:
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                live_edge_fixture(root)
+                write_json(root / "control-load-balancers.json", payload)
                 with self.assertRaises(CHECKER.ContractError):
                     CHECKER.check_live(root)
 

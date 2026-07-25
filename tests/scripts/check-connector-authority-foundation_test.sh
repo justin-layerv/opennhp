@@ -144,6 +144,13 @@ NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 printf '%s\n' '{"resource_changes":[{"address":"aws_route_table.isolated[0]","type":"aws_route_table","change":{"actions":["create"],"after":{"route":[{"cidr_block":"0.0.0.0/0","network_interface_id":"eni-123"}]},"after_unknown":{"route":[]}}}]}' >"$plan_json"
 expect_failure 'plan contains inline route declarations' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# A live public-edge route table on a no-op refresh reports the KNOWN route list
+# populated by the standalone aws_route resource; that reflection is not an
+# inline declaration and must not be flagged. Regression: pre-fix this
+# false-positived on every plan once slice 5a's edge went live.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_route_table.hub_public[0]","type":"aws_route_table","change":{"actions":["no-op"],"after":{"route":[{"cidr_block":"0.0.0.0/0","gateway_id":"igw-abc"}]},"after_unknown":{"route":false}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
 printf '%s\n' '{"format_version":"1.2"}' >"$plan_json"
 expect_failure 'must contain a resource_changes array or non-empty resource_drift array' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
