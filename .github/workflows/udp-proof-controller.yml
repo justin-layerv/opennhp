@@ -1,0 +1,260 @@
+# NHP UDP-proof controller (Step 10).
+#
+# Attended, dispatch-only orchestrator for the two-cell UDP proof — the sole
+# OIDC/AWS controller. Connector first, qurl-go second, under ONE non-canceling
+# concurrency group. Each run: mint an org JIT runner config against the
+# udp-proof-sandbox runner group (reading back its 4 controls first), write the
+# one-use JIT secret, start the serialized broker (which launches one EIP-pinned
+# runner), dispatch the exact client proof workflow with the controller identity,
+# verify the external run, and always stop the broker. See
+# terraform/modules/udp-proof-runner/README.md composition contract (points 7-9).
+#
+# Requires (provisioned by Step 9):
+#   * secrets.UDP_PROOF_JIT_APP_ID / UDP_PROOF_JIT_APP_PRIVATE_KEY — the narrow
+#     JIT GitHub App (org self-hosted-runners write + Actions dispatch/read in
+#     qurl-connector + qurl-go only). Store in the udp-proof-sandbox environment.
+#   * vars.UDP_PROOF_RUNNER_GROUP_ID — the udp-proof-sandbox org runner group id.
+# The App is the ONLY remaining input; everything else is wired.
+
+name: UDP proof controller (sandbox, attended)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_UDP_PROOF to launch the attended two-client proof.'
+        required: true
+        type: string
+
+concurrency:
+  group: udp-proof-controller
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  CONTROLLER_ROLE_ARN: arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-controller
+  BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
+  JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
+  JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
+  # Exact SHAs the runner group pins; the read-back fails closed on any drift.
+  CONNECTOR_WORKFLOW: layervai/qurl-connector/.github/workflows/sandbox-smoke.yml@272a940b13b535a3911cb9bc648d3cb417f1de52
+  QURLGO_WORKFLOW: layervai/qurl-go/.github/workflows/native-udp-sandbox.yml@29e22ade0d03eea6cc26981bf2748a51dff214d2
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the attended confirmation
+        run: |
+          [ "${{ inputs.confirm }}" = "RUN_UDP_PROOF" ] || { echo "::error::confirmation phrase not exact"; exit 1; }
+
+  # ── Connector first ─────────────────────────────────────────────────────────
+  connector:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: udp-proof-sandbox
+    outputs:
+      client_run_id: ${{ steps.dispatch.outputs.client_run_id }}
+    steps:
+      - name: Mint the narrow JIT App installation token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            qurl-connector
+            qurl-go
+      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Read back the runner group's 4 controls (fail closed on drift)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          g=$(gh api "orgs/layervai/actions/runner-groups/${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}")
+          echo "$g" | jq -e '.visibility=="selected" and .allows_public_repositories==true and .restricted_to_workflows==true' >/dev/null \
+            || { echo "::error::runner-group visibility/public/restricted control drift"; exit 1; }
+          echo "$g" | jq -e --arg c "$CONNECTOR_WORKFLOW" --arg q "$QURLGO_WORKFLOW" \
+            '(.selected_workflows|sort) == ([$c,$q]|sort)' >/dev/null \
+            || { echo "::error::runner-group selected_workflows are not the exact pinned SHAs"; exit 1; }
+          reposn=$(gh api "orgs/layervai/actions/runner-groups/${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}/repositories" --jq '.repositories|length')
+          [ "$reposn" = "2" ] || { echo "::error::runner-group repo access is not exactly the two clients"; exit 1; }
+      - name: Mint the one-use JIT config (labels = required + derived per-run)
+        id: jit
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          LABEL="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          cfg=$(gh api -X POST "orgs/layervai/actions/runners/generate-jitconfig" \
+            -f "name=udp-proof-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -F "runner_group_id=${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}" \
+            -f "labels[]=self-hosted" -f "labels[]=Linux" -f "labels[]=X64" \
+            -f "labels[]=udp-proof" -f "labels[]=sandbox" -f "labels[]=$LABEL" \
+            -f "work_folder=_work" --jq '.encoded_jit_config')
+          echo "::add-mask::$cfg"
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+      - name: Write the one-use JIT secret (runner consumes + deletes it)
+        run: |
+          set -euo pipefail
+          aws secretsmanager create-secret \
+            --name "${JIT_SECRET_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}" \
+            --kms-key-id "$JIT_KMS_KEY_ARN" \
+            --secret-string "${{ steps.jit.outputs.cfg }}" \
+            --tags Key=Environment,Value=sandbox Key=Purpose,Value=udp-proof \
+                   Key=GitHubRunId,Value=${{ github.run_id }} Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
+            --region "$AWS_REGION" >/dev/null
+      - name: Start the broker (synchronous, bounded retry on throttle)
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if aws lambda invoke --function-name "$BROKER_FUNCTION" \
+                 --cli-binary-format raw-in-base64-out \
+                 --payload "{\"action\":\"start\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
+                 --region "$AWS_REGION" /tmp/broker.json >/dev/null 2>&1; then
+              cat /tmp/broker.json; grep -q '"status"' /tmp/broker.json && break
+            fi
+            echo "broker throttled/failed (attempt $attempt); retrying"; sleep $((attempt*10))
+          done
+          grep -q '"status"' /tmp/broker.json || { echo "::error::broker did not confirm a ready runner"; exit 1; }
+      - name: Dispatch the Connector proof + capture its run id
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run sandbox-smoke.yml --repo layervai/qurl-connector --ref main \
+            -f nhp_controller_run_id=${{ github.run_id }} \
+            -f nhp_controller_run_attempt=${{ github.run_attempt }}
+          # workflow_dispatch does not return the run id; poll for the run this
+          # controller run created (matching created>=before, event=workflow_dispatch).
+          for _ in $(seq 1 20); do
+            rid=$(gh run list --repo layervai/qurl-connector --workflow sandbox-smoke.yml \
+              --event workflow_dispatch --created ">=$before" --limit 1 \
+              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+            [ -n "${rid:-}" ] && { echo "client_run_id=$rid" >> "$GITHUB_OUTPUT"; break; }
+            sleep 10
+          done
+          [ -n "${rid:-}" ] || { echo "::error::could not resolve the dispatched Connector run id"; exit 1; }
+      - name: Verify the Connector proof run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          rid="${{ steps.dispatch.outputs.client_run_id }}"
+          gh run watch "$rid" --repo layervai/qurl-connector --exit-status >/dev/null 2>&1 || true
+          j=$(gh api "repos/layervai/qurl-connector/actions/runs/$rid")
+          echo "$j" | jq -e '.status=="completed" and .conclusion=="success" and .event=="workflow_dispatch"' >/dev/null \
+            || { echo "::error::Connector proof run did not conclude successfully"; exit 1; }
+      - name: Stop the broker (always)
+        if: always()
+        run: |
+          aws lambda invoke --function-name "$BROKER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "{\"action\":\"stop\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
+            --region "$AWS_REGION" /tmp/broker-stop.json >/dev/null 2>&1 || true
+
+  # ── qurl-go second (requires the verified Connector run id) ──────────────────
+  qurl_go:
+    needs: connector
+    runs-on: ubuntu-latest
+    environment: udp-proof-sandbox
+    steps:
+      - name: Mint the narrow JIT App installation token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            qurl-connector
+            qurl-go
+      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Mint the one-use JIT config
+        id: jit
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          LABEL="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          cfg=$(gh api -X POST "orgs/layervai/actions/runners/generate-jitconfig" \
+            -f "name=udp-proof-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -F "runner_group_id=${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}" \
+            -f "labels[]=self-hosted" -f "labels[]=Linux" -f "labels[]=X64" \
+            -f "labels[]=udp-proof" -f "labels[]=sandbox" -f "labels[]=$LABEL" \
+            -f "work_folder=_work" --jq '.encoded_jit_config')
+          echo "::add-mask::$cfg"
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+      - name: Write the one-use JIT secret
+        run: |
+          set -euo pipefail
+          aws secretsmanager create-secret \
+            --name "${JIT_SECRET_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}" \
+            --kms-key-id "$JIT_KMS_KEY_ARN" \
+            --secret-string "${{ steps.jit.outputs.cfg }}" \
+            --tags Key=Environment,Value=sandbox Key=Purpose,Value=udp-proof \
+                   Key=GitHubRunId,Value=${{ github.run_id }} Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
+            --region "$AWS_REGION" >/dev/null
+      - name: Start the broker
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if aws lambda invoke --function-name "$BROKER_FUNCTION" \
+                 --cli-binary-format raw-in-base64-out \
+                 --payload "{\"action\":\"start\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
+                 --region "$AWS_REGION" /tmp/broker.json >/dev/null 2>&1; then
+              grep -q '"status"' /tmp/broker.json && break
+            fi
+            sleep $((attempt*10))
+          done
+          grep -q '"status"' /tmp/broker.json || { echo "::error::broker did not confirm a ready runner"; exit 1; }
+      - name: Dispatch the qurl-go proof (requires the verified Connector run id)
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run native-udp-sandbox.yml --repo layervai/qurl-go --ref main \
+            -f nhp_controller_run_id=${{ github.run_id }} \
+            -f nhp_controller_run_attempt=${{ github.run_attempt }} \
+            -f connector_proof_run_id=${{ needs.connector.outputs.client_run_id }}
+          for _ in $(seq 1 20); do
+            rid=$(gh run list --repo layervai/qurl-go --workflow native-udp-sandbox.yml \
+              --event workflow_dispatch --created ">=$before" --limit 1 \
+              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+            [ -n "${rid:-}" ] && { echo "client_run_id=$rid" >> "$GITHUB_OUTPUT"; break; }
+            sleep 10
+          done
+          [ -n "${rid:-}" ] || { echo "::error::could not resolve the dispatched qurl-go run id"; exit 1; }
+      - name: Verify the qurl-go proof run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          rid="${{ steps.dispatch.outputs.client_run_id }}"
+          gh run watch "$rid" --repo layervai/qurl-go --exit-status >/dev/null 2>&1 || true
+          j=$(gh api "repos/layervai/qurl-go/actions/runs/$rid")
+          echo "$j" | jq -e '.status=="completed" and .conclusion=="success" and .event=="workflow_dispatch"' >/dev/null \
+            || { echo "::error::qurl-go proof run did not conclude successfully"; exit 1; }
+      - name: Stop the broker (always)
+        if: always()
+        run: |
+          aws lambda invoke --function-name "$BROKER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "{\"action\":\"stop\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
+            --region "$AWS_REGION" /tmp/broker-stop.json >/dev/null 2>&1 || true
