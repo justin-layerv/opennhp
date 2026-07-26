@@ -13,8 +13,12 @@ bucket_name = "layerv-nhp-sandbox-runtime-attestations"
 # <role-id>:<instance-id> — and gets no list, read, delete, or
 # overwrite-by-shared-prefix authority.
 attested_node_roles = {
-  nhp_cell0                  = "layerv-nhp-sandbox-server"
-  nhp_cell1                  = "layerv-nhp-sandbox-cell1-server"
+  nhp_cell0 = "layerv-nhp-sandbox-server"
+  # The sandbox-cell1 root prefixes its compute module with the cell name, so
+  # the live role carries "cell1" twice. Verified against the running node's
+  # instance profile (arn:...:instance-profile/layerv-nhp-sandbox-cell1-cell1-server);
+  # the singular form does not exist and makes the KMS key policy unresolvable.
+  nhp_cell1                  = "layerv-nhp-sandbox-cell1-cell1-server"
   qurl_reverse_tunnel_server = "layerv-nhp-sandbox-frps"
 }
 
