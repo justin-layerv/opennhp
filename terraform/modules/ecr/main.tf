@@ -3038,6 +3038,18 @@ resource "aws_iam_policy" "terraform_apply_data" {
           # read) only -- NOT lambda:InvokeFunction, which stays fenced to the
           # exact helper ARNs in TerraformHelperInvoke so the apply role can never
           # invoke an Authority alias.
+          # An image change on an Authority function is only half-applied
+          # without this: update_function_code moves $LATEST, but the blue/green
+          # aliases resolve to immutable published versions, so Terraform must
+          # publish a new version before it can repoint them. Without it an
+          # apply leaves $LATEST on the new digest while both aliases -- the
+          # actual serving path -- stay on the old one, and the apply fails
+          # mid-transition. Observed on control-update-apply run 30218341432.
+          # Publishing a version is a MANAGEMENT action over code Terraform has
+          # already been authorized to update; it grants no new invoke rights,
+          # and lambda:InvokeFunction stays fenced to the exact helper ARNs in
+          # TerraformHelperInvoke.
+          "lambda:PublishVersion",
           "lambda:CreateAlias",
           "lambda:UpdateAlias",
           "lambda:DeleteAlias",
