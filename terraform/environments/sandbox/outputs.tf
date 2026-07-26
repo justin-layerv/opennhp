@@ -10,6 +10,16 @@ output "connector_authority_cell_caller_role_arn" {
   value       = module.nhp.connector_authority_cell_caller_role_arn
 }
 
+output "qurl_service_runtime_contract_parameter" {
+  description = "Canonical cell0 qurl-service runtime contract promoted by the qurl-service main workflow."
+  value       = aws_ssm_parameter.qurl_service_runtime_contract.name
+}
+
+output "qurl_service_publisher_role_arn" {
+  description = "Main-ref-only qurl-service role scoped to cell0 image promotion and ECS deployment."
+  value       = aws_iam_role.qurl_service_publisher.arn
+}
+
 # QURL Link DNS records
 output "qurl_link_acm_validation_records" {
   description = "ACM certificate validation DNS records for QURL link frontend"
