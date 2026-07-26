@@ -179,7 +179,7 @@ class RelocationPlanTest(unittest.TestCase):
     def test_exact_forward_plan_passes(self) -> None:
         result = run_checker(plan_fixture())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("50 add, 10 change, 50 destroy", result.stdout)
+        self.assertIn("53 add, 12 change, 50 destroy", result.stdout)
 
     def test_exact_rollback_plan_passes(self) -> None:
         result = run_checker(plan_fixture("rollback"), "rollback")

@@ -32,6 +32,19 @@ REQUIRED_SUSPENDED_PROCESSES = {
 # behavior change, or new replacement must be reviewed as a new plan rather
 # than hidden inside the attended VPC relocation.
 EXPECTED_ACTIONS: dict[str, tuple[str, ...]] = {
+    # Landed with the private cell1 qurl-service (#3461) after this inventory
+    # was first captured. Step 3 of docs/runbooks/deploy-sandbox-cell1-qurl-service.md
+    # applies this root with deploy_qurl_service = false precisely to create the
+    # publisher role and the UNPUBLISHED runtime-contract sentinel, so they are
+    # part of the relocation plan rather than a separate transition.
+    "aws_iam_role.qurl_service_publisher": ("create",),
+    "aws_iam_role_policy.qurl_service_publisher": ("create",),
+    "aws_ssm_parameter.qurl_service_runtime_contract": ("create",),
+    # In-place config updates driven by the relocation itself: both functions
+    # are VPC-attached, so moving the VPC re-points their subnet and security
+    # group ids. Update-only -- neither is replaced.
+    "module.compute.aws_lambda_function.key_validator": ("update",),
+    "module.compute.aws_lambda_function.keygen": ("update",),
     "aws_service_discovery_private_dns_namespace.cell1": ("create", "delete"),
     "module.compute.aws_autoscaling_attachment.server[0]": ("delete", "create"),
     "module.compute.aws_autoscaling_group.server": ("update",),
