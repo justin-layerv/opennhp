@@ -170,9 +170,14 @@ The composing PR must:
    Actions write. It needs no client contents write, no AWS permission, and no
    Actions permission in NHP. A PAT is forbidden.
 6. Update the client workflows in their own reviewed PRs before composing this
-   module. Each strict `workflow_dispatch` path must accept exactly the required
-   `nhp_controller_run_id` and `nhp_controller_run_attempt` identity inputs,
-   validate them against the broker's respective
+   module. Each strict `workflow_dispatch` path must accept the required
+   canonical `deployment_manifest_b64` and `deployment_runtime_inputs_b64`
+   bytes plus the authenticated producer run ID, run attempt, head SHA,
+   artifact ID, and artifact digest. The clients hash and echo those inputs in
+   typed proof evidence; they never source the Hub trust root or candidate
+   identity from mutable repository variables. Each path also requires
+   `nhp_controller_run_id` and `nhp_controller_run_attempt`, validates them
+   against the broker's respective
    `[1-9][0-9]{0,19}` and `[1-9][0-9]{0,9}` bounds, and derive
    `run-<id>-attempt-<attempt>` itself. A client must not accept a
    preconstructed `runner_label` input. Each strict path must also require

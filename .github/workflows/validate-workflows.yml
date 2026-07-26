@@ -291,7 +291,12 @@ jobs:
         run: python3 scripts/check-claude-model-lockstep.py
 
       - name: Test UDP proof controller input and dispatch contracts
-        run: python3 tests/scripts/test_udp_proof_controller_inputs.py
+        run: >-
+          python3 -m unittest
+          tests/scripts/test_udp_proof_controller_inputs.py
+          tests/scripts/test_udp_proof_deployment_contract.py
+          tests/scripts/test_udp_proof_producer_artifact.py
+          tests/scripts/test_udp_proof_client_artifact.py
 
       # resolve-app-image-required_test.sh verifies that the relay image's
       # hand-maintained path list covers the actual Go import surface. Pin and

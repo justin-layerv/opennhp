@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import importlib.util
 import json
 import os
@@ -44,74 +43,37 @@ SHA = {
 
 def valid_manifest(phase: str = "pre_removal") -> dict[str, object]:
     return {
-        "cells": [
-            {
-                "cell_id": "cell0",
-                "host": "cell0.sandbox.nhp.layerv.xyz",
-                "port": 62206,
-                "server_public_key_sha256": "1" * 64,
-            },
-            {
-                "cell_id": "cell1",
-                "host": "cell1.sandbox.nhp.layerv.xyz",
-                "port": 62206,
-                "server_public_key_sha256": "2" * 64,
-            },
-        ],
-        "connector_modules": {"frp": SHA["frp"], "qurl_go": SHA["qurl_go"]},
-        "hub": {
-            "host": "hub.sandbox.nhp.layerv.xyz",
-            "port": 62206,
-            "server_public_key_sha256": "3" * 64,
-        },
-        "images": {
-            "nhp_cell0": "sha256:" + "1" * 64,
-            "nhp_cell1": "sha256:" + "2" * 64,
-            "nhp_hub": "sha256:" + "3" * 64,
-            "qurl_connector": "sha256:" + "4" * 64,
-            "qurl_reverse_tunnel_server": "sha256:" + "5" * 64,
-            "qurl_service_authority": "sha256:" + "6" * 64,
-            "qurl_service_cell0": "sha256:" + "7" * 64,
-            "qurl_service_cell1": "sha256:" + "8" * 64,
-        },
         "phase": phase,
         "repositories": dict(SHA),
-        "retirement_state": (
-            "http_lifecycle_present"
-            if phase == "pre_removal"
-            else "http_lifecycle_removed"
-        ),
-        "schema_version": 1,
     }
 
 
-def encode_manifest(manifest: dict[str, object]) -> str:
-    canonical = json.dumps(
-        manifest,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return base64.b64encode(canonical).decode("ascii")
+def valid_candidates() -> dict[str, object]:
+    return {
+        "qurl_connector": {
+            "head_ref": "justin/fix/connector-routing-identity",
+        },
+        "qurl_go": {
+            "head_ref": "justin/feat/udp-credential-recovery",
+        },
+    }
 
 
 class ValidatorTest(unittest.TestCase):
-    def call_validator(self, **overrides: str) -> dict[str, str]:
-        values = {
+    def select_dispatch(self, **overrides: object) -> dict[str, str]:
+        values: dict[str, object] = {
             "client": "connector",
             "proof_phase": "pre_removal",
-            "deployment_manifest_b64": encode_manifest(valid_manifest()),
-            "connector_ref": "justin/fix/connector-routing-identity",
-            "qurl_go_ref": "justin/feat/udp-credential-recovery",
+            "manifest": valid_manifest(),
+            "candidates": valid_candidates(),
             "connector_proof_run_id": "",
             "pre_removal_run_id": "",
         }
         values.update(overrides)
-        return validator.validate_inputs(**values)
+        return validator.select_dispatch(**values)
 
-    def test_accepts_canonical_pre_removal_connector_manifest(self) -> None:
-        outputs = self.call_validator()
+    def test_selects_connector_from_authenticated_provenance(self) -> None:
+        outputs = self.select_dispatch()
         self.assertEqual(outputs["client_repository"], "layervai/qurl-connector")
         self.assertEqual(outputs["client_workflow"], "sandbox-smoke.yml")
         self.assertEqual(outputs["client_ref"], "justin/fix/connector-routing-identity")
@@ -124,11 +86,11 @@ class ValidatorTest(unittest.TestCase):
             ),
         )
 
-    def test_accepts_post_removal_qurl_go_linkage(self) -> None:
-        outputs = self.call_validator(
+    def test_selects_qurl_go_from_authenticated_provenance(self) -> None:
+        outputs = self.select_dispatch(
             client="qurl_go",
             proof_phase="post_removal",
-            deployment_manifest_b64=encode_manifest(valid_manifest("post_removal")),
+            manifest=valid_manifest("post_removal"),
             connector_proof_run_id="12345",
             pre_removal_run_id="67890",
         )
@@ -148,146 +110,22 @@ class ValidatorTest(unittest.TestCase):
         with self.assertRaisesRegex(
             validator.ValidationError, "Connector proof run ID"
         ):
-            self.call_validator(client="qurl_go")
+            self.select_dispatch(client="qurl_go")
         with self.assertRaisesRegex(validator.ValidationError, "must be empty"):
-            self.call_validator(connector_proof_run_id="123")
+            self.select_dispatch(connector_proof_run_id="123")
         with self.assertRaisesRegex(validator.ValidationError, "pre-removal run ID"):
-            self.call_validator(
+            self.select_dispatch(
                 proof_phase="post_removal",
-                deployment_manifest_b64=encode_manifest(valid_manifest("post_removal")),
+                manifest=valid_manifest("post_removal"),
             )
         with self.assertRaisesRegex(validator.ValidationError, "must be empty"):
-            self.call_validator(pre_removal_run_id="123")
+            self.select_dispatch(pre_removal_run_id="123")
 
-    def test_rejects_noncanonical_and_duplicate_json(self) -> None:
-        noncanonical = base64.b64encode(json.dumps(valid_manifest()).encode()).decode()
-        with self.assertRaisesRegex(validator.ValidationError, "canonical JSON"):
-            self.call_validator(deployment_manifest_b64=noncanonical)
-
-        canonical = base64.b64decode(encode_manifest(valid_manifest())).decode()
-        duplicate = canonical[:-1] + ',"schema_version":1}'
-        with self.assertRaisesRegex(validator.ValidationError, "duplicate key"):
-            self.call_validator(
-                deployment_manifest_b64=base64.b64encode(duplicate.encode()).decode()
-            )
-
-    def test_rejects_manifest_larger_than_dispatch_transport_budget(self) -> None:
-        oversized = base64.b64encode(
-            b"x" * (validator.MAX_MANIFEST_BYTES + 1)
-        ).decode()
-        with self.assertRaisesRegex(validator.ValidationError, "1..32768 bytes"):
-            self.call_validator(deployment_manifest_b64=oversized)
-
-    def test_rejects_numeric_overflow_without_a_traceback(self) -> None:
-        canonical = base64.b64decode(encode_manifest(valid_manifest())).decode()
-        overflow = canonical.replace('"schema_version":1', '"schema_version":1e400')
-        with self.assertRaisesRegex(
-            validator.ValidationError, "numbers must be finite"
-        ):
-            self.call_validator(
-                deployment_manifest_b64=base64.b64encode(overflow.encode()).decode()
-            )
-
-    def test_rejects_manifest_phase_sha_and_topology_drift(self) -> None:
-        with self.assertRaisesRegex(validator.ValidationError, "phase"):
-            self.call_validator(
-                proof_phase="post_removal",
-                deployment_manifest_b64=encode_manifest(valid_manifest()),
-                pre_removal_run_id="123",
-            )
-
-        bad_sha = valid_manifest()
-        bad_sha["repositories"]["qurl_go"] = "not-a-sha"  # type: ignore[index]
-        with self.assertRaisesRegex(validator.ValidationError, "commit SHAs"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(bad_sha))
-
-        duplicate_cell = valid_manifest()
-        duplicate_cell["cells"][1]["host"] = duplicate_cell["cells"][0]["host"]  # type: ignore[index]
-        with self.assertRaisesRegex(validator.ValidationError, "unique host"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(duplicate_cell))
-
-        boolean_schema = valid_manifest()
-        boolean_schema["schema_version"] = True
-        with self.assertRaisesRegex(validator.ValidationError, "schema_version"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(boolean_schema))
-
-        boolean_port = valid_manifest()
-        boolean_port["hub"]["port"] = True  # type: ignore[index]
-        with self.assertRaisesRegex(validator.ValidationError, "UDP 62206"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(boolean_port))
-
-    def test_rejects_missing_extra_or_misnamed_sandbox_cells(self) -> None:
-        missing = valid_manifest()
-        missing["cells"] = missing["cells"][:1]  # type: ignore[index]
-        with self.assertRaisesRegex(validator.ValidationError, "exactly the two"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(missing))
-
-        extra = valid_manifest()
-        extra["cells"].append(  # type: ignore[union-attr]
-            {
-                "cell_id": "cell2",
-                "host": "cell2.sandbox.nhp.layerv.xyz",
-                "port": 62206,
-                "server_public_key_sha256": "4" * 64,
-            }
-        )
-        with self.assertRaisesRegex(validator.ValidationError, "exactly the two"):
-            self.call_validator(deployment_manifest_b64=encode_manifest(extra))
-
-        misnamed = valid_manifest()
-        misnamed["cells"][1]["cell_id"] = "cell2"  # type: ignore[index]
-        with self.assertRaisesRegex(
-            validator.ValidationError, "exactly cell0 and cell1"
-        ):
-            self.call_validator(deployment_manifest_b64=encode_manifest(misnamed))
-
-    def test_rejects_sha_or_shell_syntax_as_dispatch_ref(self) -> None:
-        with self.assertRaisesRegex(validator.ValidationError, "branch name"):
-            self.call_validator(connector_ref=SHA["qurl_connector"])
-        with self.assertRaisesRegex(validator.ValidationError, "safe Git branch"):
-            self.call_validator(qurl_go_ref="candidate;echo-owned")
-
-    def test_cli_writes_only_validated_dispatch_outputs(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "github-output"
-            env = os.environ.copy()
-            env["DEPLOYMENT_MANIFEST_B64"] = encode_manifest(valid_manifest())
-            subprocess.run(
-                [
-                    "python3",
-                    str(VALIDATOR_PATH),
-                    "--client",
-                    "connector",
-                    "--proof-phase",
-                    "pre_removal",
-                    "--connector-ref",
-                    "justin/fix/connector-routing-identity",
-                    "--qurl-go-ref",
-                    "justin/feat/udp-credential-recovery",
-                    "--github-output",
-                    str(output),
-                ],
-                check=True,
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            self.assertEqual(
-                dict(line.split("=", 1) for line in output.read_text().splitlines()),
-                {
-                    "connector_workflow_identity": (
-                        "layervai/qurl-connector/.github/workflows/"
-                        f"sandbox-smoke.yml@{SHA['qurl_connector']}"
-                    ),
-                    "qurl_go_workflow_identity": (
-                        "layervai/qurl-go/.github/workflows/"
-                        f"native-udp-sandbox.yml@{SHA['qurl_go']}"
-                    ),
-                    "client_repository": "layervai/qurl-connector",
-                    "client_workflow": "sandbox-smoke.yml",
-                    "client_ref": "justin/fix/connector-routing-identity",
-                    "client_sha": SHA["qurl_connector"],
-                },
-            )
+    def test_rejects_invalid_client_or_phase_before_selection(self) -> None:
+        with self.assertRaisesRegex(validator.ValidationError, "client"):
+            self.select_dispatch(client="other")
+        with self.assertRaisesRegex(validator.ValidationError, "proof_phase"):
+            self.select_dispatch(proof_phase="other")
 
 
 class WorkflowContractTest(unittest.TestCase):
@@ -295,15 +133,40 @@ class WorkflowContractTest(unittest.TestCase):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "udp-proof-controller.yml"
         ).read_text()
+        gate = workflow.split("jobs:\n  gate:\n", 1)[1].split("\n  proof:\n", 1)[0]
+        proof = workflow.split("\n  proof:\n", 1)[1]
+        self.assertIn("\npermissions: {}\n", workflow.split("\njobs:\n", 1)[0])
+        self.assertIn("      actions: read\n", gate)
+        self.assertIn("      contents: read\n", gate)
+        self.assertIn("    timeout-minutes: 10\n", gate)
+        self.assertIn('if timeout 30s gh api "$@" >"${destination}.tmp"; then', gate)
+        self.assertNotIn("id-token: write", gate)
+        self.assertIn("      contents: read\n", proof)
+        self.assertIn("      id-token: write\n", proof)
+        self.assertEqual(workflow.count("id-token: write"), 1)
         for required in (
             "client:",
             "proof_phase:",
-            "deployment_manifest_b64:",
-            "connector_ref:",
-            "qurl_go_ref:",
+            "deployment_producer_run_id:",
             "connector_proof_run_id:",
             "pre_removal_run_id:",
-            "validate_udp_proof_controller_inputs.py",
+            "validate_udp_proof_producer_artifact.py metadata",
+            "validate_udp_proof_producer_artifact.py files",
+            "validate_udp_proof_client_artifact.py metadata",
+            "validate_udp_proof_client_artifact.py archive",
+            "validate_udp_proof_client_artifact.py files",
+            "actions: read",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "artifact-ids: ${{ steps.metadata.outputs.producer_artifact_id }}",
+            "digest-mismatch: error",
+            "actions/runs/${PRODUCER_RUN_ID}",
+            "actions/runs/${PRODUCER_RUN_ID}/artifacts?per_page=100",
+            "could not authenticate the producer run after bounded retries",
+            "could not authenticate the producer artifact after bounded retries",
+            "PINNED_CONNECTOR_SHA: 16cdff6260c20b671cdee735333a9096007b5f6e",
+            "PINNED_QURL_GO_SHA: aaf682e3cd8836cf874627e95a5d2d4b9e8b12ab",
+            "producer artifact does not bind the frozen Connector head",
+            "producer artifact does not bind the frozen qurl-go head",
             "invoke_udp_proof_broker.sh",
             "wait_for_action_run.sh",
             "permission-actions: write",
@@ -313,12 +176,21 @@ class WorkflowContractTest(unittest.TestCase):
             "could not read runner-group repositories after bounded retries",
             '-f "proof_phase=$PROOF_PHASE"',
             '-f "deployment_manifest_b64=$DEPLOYMENT_MANIFEST_B64"',
+            '-f "deployment_runtime_inputs_b64=$DEPLOYMENT_RUNTIME_INPUTS_B64"',
+            '-f "deployment_producer_run_id=$DEPLOYMENT_PRODUCER_RUN_ID"',
+            '-f "deployment_producer_run_attempt=$DEPLOYMENT_PRODUCER_RUN_ATTEMPT"',
+            '-f "deployment_producer_head_sha=$DEPLOYMENT_PRODUCER_HEAD_SHA"',
+            '-f "deployment_artifact_id=$DEPLOYMENT_ARTIFACT_ID"',
+            '-f "deployment_artifact_digest=$DEPLOYMENT_ARTIFACT_DIGEST"',
             '-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID"',
             '-f "connector_proof_run_id=$CONNECTOR_PROOF_RUN_ID"',
             '-f "dispatch_correlation_id=$correlation_id"',
             '--branch "$CLIENT_REF"',
             "--limit 100",
             "client_run_title=$expected_title",
+            "dispatch_correlation_id=$correlation_id",
+            "deployment_manifest_sha256:",
+            "deployment_runtime_inputs_sha256:",
             ".head_sha == $sha",
             ".display_title == $title",
             "index($runner_label)",
@@ -329,6 +201,8 @@ class WorkflowContractTest(unittest.TestCase):
             "id: app_wait2",
             "id: app_final",
             "id: app_cancel",
+            "id: result",
+            "steps.result.outcome != 'success'",
             "steps.app_cancel.outputs.token",
             "steps.dispatch.outputs.client_run_title != ''",
             'if [[ -z "$CLIENT_RUN_ID" ]]; then',
@@ -342,8 +216,22 @@ class WorkflowContractTest(unittest.TestCase):
             "for attempt in $(seq 1 24)",
             "for attempt in $(seq 1 60)",
             "resolved_client_sha",
+            "actions/runs/${CLIENT_RUN_ID}/artifacts?per_page=100",
+            "actions/artifacts/${CLIENT_ARTIFACT_ID}/zip",
+            "could not authenticate the client artifact after bounded retries",
+            "could not download the exact client artifact after bounded retries",
+            "--expected-digest \"$CLIENT_ARTIFACT_DIGEST\"",
+            "--dispatch-correlation-id \"$DISPATCH_CORRELATION_ID\"",
+            "--producer-artifact-digest \"$PRODUCER_ARTIFACT_DIGEST\"",
+            "Client artifact: \\`${CLIENT_ARTIFACT_ID}\\` / \\`${CLIENT_ARTIFACT_DIGEST}\\`",
         ):
             self.assertIn(required, workflow)
+        dispatch_inputs = workflow.split("    inputs:\n", 1)[1].split(
+            "\nconcurrency:", 1
+        )[0]
+        self.assertNotIn("deployment_manifest_b64:", dispatch_inputs)
+        self.assertNotIn("connector_ref:", dispatch_inputs)
+        self.assertNotIn("qurl_go_ref:", dispatch_inputs)
         self.assertNotIn("--ref main", workflow)
         self.assertNotIn("--created", workflow)
         self.assertNotIn("needs: connector", workflow)

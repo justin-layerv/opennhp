@@ -7,12 +7,14 @@
 # run ID. This preserves the one-secret/one-runner contract and gives each
 # client independent controller provenance.
 #
-# The deployment manifest is an explicit canonical input. This workflow does
-# not derive topology, keys, image digests, or repository SHAs. The gate fails
-# closed on its complete public schema; the controller then binds each candidate
-# branch to the exact manifest commit through runner-group pinning and the
-# external run's head SHA. A reviewed live-manifest producer is a separate
-# prerequisite; operators must not hand-invent its values.
+# The operator supplies only one successful trusted-main producer run ID. The
+# gate authenticates that exact run and its unique current-attempt artifact,
+# downloads the artifact by immutable ID with digest enforcement, and fails
+# closed on the complete canonical deployment/provenance/runtime contract. The
+# controller never accepts operator-authored topology, keys, image digests,
+# repository SHAs, or candidate refs. It binds the producer-selected branches
+# to exact manifest commits through runner-group pinning and the external run's
+# head SHA.
 
 name: UDP proof controller (sandbox, attended)
 
@@ -37,16 +39,8 @@ on:
         options:
           - pre_removal
           - post_removal
-      deployment_manifest_b64:
-        description: Base64 of the canonical, non-secret live deployment manifest
-        required: true
-        type: string
-      connector_ref:
-        description: Exact Connector candidate branch (SHA is bound by the manifest)
-        required: true
-        type: string
-      qurl_go_ref:
-        description: Exact qurl-go candidate branch (SHA is bound by the manifest)
+      deployment_producer_run_id:
+        description: Successful trusted-main deployment-manifest producer run ID
         required: true
         type: string
       connector_proof_run_id:
@@ -62,9 +56,7 @@ concurrency:
   group: udp-proof-controller
   cancel-in-progress: false
 
-permissions:
-  id-token: write
-  contents: read
+permissions: {}
 
 env:
   AWS_REGION: us-east-2
@@ -72,46 +64,136 @@ env:
   BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
   JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
   JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
+  PINNED_CONNECTOR_SHA: 16cdff6260c20b671cdee735333a9096007b5f6e
+  PINNED_QURL_GO_SHA: aaf682e3cd8836cf874627e95a5d2d4b9e8b12ab
 
 jobs:
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      connector_workflow_identity: ${{ steps.inputs.outputs.connector_workflow_identity }}
-      qurl_go_workflow_identity: ${{ steps.inputs.outputs.qurl_go_workflow_identity }}
-      client_repository: ${{ steps.inputs.outputs.client_repository }}
-      client_workflow: ${{ steps.inputs.outputs.client_workflow }}
-      client_ref: ${{ steps.inputs.outputs.client_ref }}
-      client_sha: ${{ steps.inputs.outputs.client_sha }}
+      connector_workflow_identity: ${{ steps.files.outputs.connector_workflow_identity }}
+      qurl_go_workflow_identity: ${{ steps.files.outputs.qurl_go_workflow_identity }}
+      client_repository: ${{ steps.files.outputs.client_repository }}
+      client_workflow: ${{ steps.files.outputs.client_workflow }}
+      client_ref: ${{ steps.files.outputs.client_ref }}
+      client_sha: ${{ steps.files.outputs.client_sha }}
+      deployment_manifest_b64: ${{ steps.files.outputs.deployment_manifest_b64 }}
+      deployment_runtime_inputs_b64: ${{ steps.files.outputs.deployment_runtime_inputs_b64 }}
+      deployment_manifest_sha256: ${{ steps.files.outputs.deployment_manifest_sha256 }}
+      deployment_runtime_inputs_sha256: ${{ steps.files.outputs.deployment_runtime_inputs_sha256 }}
+      producer_run_id: ${{ steps.metadata.outputs.producer_run_id }}
+      producer_run_attempt: ${{ steps.metadata.outputs.producer_run_attempt }}
+      producer_head_sha: ${{ steps.metadata.outputs.producer_head_sha }}
+      producer_artifact_id: ${{ steps.metadata.outputs.producer_artifact_id }}
+      producer_artifact_digest: ${{ steps.metadata.outputs.producer_artifact_digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Validate attended confirmation and exact proof inputs
-        id: inputs
+      - name: Authenticate the exact trusted-main producer artifact
+        id: metadata
         env:
-          DEPLOYMENT_MANIFEST_B64: ${{ inputs.deployment_manifest_b64 }}
+          GH_TOKEN: ${{ github.token }}
           CONFIRM: ${{ inputs.confirm }}
-          CLIENT: ${{ inputs.client }}
-          PROOF_PHASE: ${{ inputs.proof_phase }}
-          CONNECTOR_REF: ${{ inputs.connector_ref }}
-          QURL_GO_REF: ${{ inputs.qurl_go_ref }}
-          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
-          PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
+          PRODUCER_RUN_ID: ${{ inputs.deployment_producer_run_id }}
         run: |
           set -euo pipefail
           test "$CONFIRM" = "RUN_UDP_PROOF" || {
             echo "::error::confirmation phrase not exact"
             exit 1
           }
-          python3 .github/scripts/validate_udp_proof_controller_inputs.py \
+          [[ "$PRODUCER_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || {
+            echo "::error::deployment producer run ID must be a positive integer"
+            exit 1
+          }
+
+          retry_gh_api_to_file() {
+            local destination="$1"
+            shift
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh api "$@" >"${destination}.tmp"; then
+                mv "${destination}.tmp" "$destination"
+                return 0
+              fi
+              rm -f "${destination}.tmp"
+              echo "::warning::producer API read failed on attempt ${attempt}/3; retrying" >&2
+              if (( attempt < 3 )); then
+                sleep 5
+              fi
+            done
+            return 1
+          }
+
+          retry_gh_api_to_file \
+            /tmp/udp-proof-producer-run.json \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCER_RUN_ID}" || {
+            echo "::error::could not authenticate the producer run after bounded retries"
+            exit 1
+          }
+          retry_gh_api_to_file \
+            /tmp/udp-proof-producer-artifacts.json \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCER_RUN_ID}/artifacts?per_page=100" || {
+            echo "::error::could not authenticate the producer artifact after bounded retries"
+            exit 1
+          }
+          python3 .github/scripts/validate_udp_proof_producer_artifact.py metadata \
+            --run-json /tmp/udp-proof-producer-run.json \
+            --artifacts-json /tmp/udp-proof-producer-artifacts.json \
+            --producer-run-id "$PRODUCER_RUN_ID" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download the authenticated producer artifact by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.metadata.outputs.producer_artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.metadata.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: udp-proof-producer-artifact
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Validate exact producer files and derive candidate dispatch
+        id: files
+        env:
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
+          PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/validate_udp_proof_producer_artifact.py files \
+            --directory udp-proof-producer-artifact \
             --client "$CLIENT" \
             --proof-phase "$PROOF_PHASE" \
-            --connector-ref "$CONNECTOR_REF" \
-            --qurl-go-ref "$QURL_GO_REF" \
+            --producer-run-id "${{ steps.metadata.outputs.producer_run_id }}" \
+            --producer-run-attempt "${{ steps.metadata.outputs.producer_run_attempt }}" \
+            --producer-head-sha "${{ steps.metadata.outputs.producer_head_sha }}" \
             --connector-proof-run-id "$CONNECTOR_PROOF_RUN_ID" \
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
+
+      - name: Require the frozen client candidate heads
+        env:
+          CONNECTOR_WORKFLOW: ${{ steps.files.outputs.connector_workflow_identity }}
+          QURL_GO_WORKFLOW: ${{ steps.files.outputs.qurl_go_workflow_identity }}
+        run: |
+          set -euo pipefail
+          test "$CONNECTOR_WORKFLOW" = \
+            "layervai/qurl-connector/.github/workflows/sandbox-smoke.yml@${PINNED_CONNECTOR_SHA}" || {
+            echo "::error::producer artifact does not bind the frozen Connector head"
+            exit 1
+          }
+          test "$QURL_GO_WORKFLOW" = \
+            "layervai/qurl-go/.github/workflows/native-udp-sandbox.yml@${PINNED_QURL_GO_SHA}" || {
+            echo "::error::producer artifact does not bind the frozen qurl-go head"
+            exit 1
+          }
 
   proof:
     needs: gate
@@ -119,6 +201,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 165
     environment: udp-proof-sandbox
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -275,7 +360,13 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           CLIENT: ${{ inputs.client }}
           PROOF_PHASE: ${{ inputs.proof_phase }}
-          DEPLOYMENT_MANIFEST_B64: ${{ inputs.deployment_manifest_b64 }}
+          DEPLOYMENT_MANIFEST_B64: ${{ needs.gate.outputs.deployment_manifest_b64 }}
+          DEPLOYMENT_RUNTIME_INPUTS_B64: ${{ needs.gate.outputs.deployment_runtime_inputs_b64 }}
+          DEPLOYMENT_PRODUCER_RUN_ID: ${{ needs.gate.outputs.producer_run_id }}
+          DEPLOYMENT_PRODUCER_RUN_ATTEMPT: ${{ needs.gate.outputs.producer_run_attempt }}
+          DEPLOYMENT_PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
+          DEPLOYMENT_ARTIFACT_ID: ${{ needs.gate.outputs.producer_artifact_id }}
+          DEPLOYMENT_ARTIFACT_DIGEST: ${{ needs.gate.outputs.producer_artifact_digest }}
           CLIENT_REPOSITORY: ${{ needs.gate.outputs.client_repository }}
           CLIENT_WORKFLOW: ${{ needs.gate.outputs.client_workflow }}
           CLIENT_REF: ${{ needs.gate.outputs.client_ref }}
@@ -308,10 +399,17 @@ jobs:
             echo "client_ref=$CLIENT_REF"
             echo "client_sha=$CLIENT_SHA"
             echo "client_run_title=$expected_title"
+            echo "dispatch_correlation_id=$correlation_id"
           } >>"$GITHUB_OUTPUT"
           dispatch_args=(
             -f "proof_phase=$PROOF_PHASE"
             -f "deployment_manifest_b64=$DEPLOYMENT_MANIFEST_B64"
+            -f "deployment_runtime_inputs_b64=$DEPLOYMENT_RUNTIME_INPUTS_B64"
+            -f "deployment_producer_run_id=$DEPLOYMENT_PRODUCER_RUN_ID"
+            -f "deployment_producer_run_attempt=$DEPLOYMENT_PRODUCER_RUN_ATTEMPT"
+            -f "deployment_producer_head_sha=$DEPLOYMENT_PRODUCER_HEAD_SHA"
+            -f "deployment_artifact_id=$DEPLOYMENT_ARTIFACT_ID"
+            -f "deployment_artifact_digest=$DEPLOYMENT_ARTIFACT_DIGEST"
             -f "nhp_controller_run_id=${{ github.run_id }}"
             -f "nhp_controller_run_attempt=${{ github.run_attempt }}"
             -f "dispatch_correlation_id=$correlation_id"
@@ -449,6 +547,8 @@ jobs:
           CLIENT_REF: ${{ steps.dispatch.outputs.client_ref }}
           CLIENT_SHA: ${{ steps.dispatch.outputs.client_sha }}
           CLIENT_RUN_TITLE: ${{ steps.dispatch.outputs.client_run_title }}
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
         run: |
           set -euo pipefail
           bash .github/scripts/wait_for_action_run.sh \
@@ -496,13 +596,123 @@ jobs:
             exit 1
           }
 
+          artifact_metadata_read=false
+          for attempt in 1 2 3; do
+            if timeout 30s gh api \
+              "repos/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID}/artifacts?per_page=100" \
+              > /tmp/udp-proof-client-artifacts.json.tmp; then
+              mv /tmp/udp-proof-client-artifacts.json.tmp /tmp/udp-proof-client-artifacts.json
+              artifact_metadata_read=true
+              break
+            fi
+            rm -f /tmp/udp-proof-client-artifacts.json.tmp
+            echo "::warning::client artifact metadata read failed on attempt ${attempt}/3; retrying" >&2
+            if (( attempt < 3 )); then
+              sleep 5
+            fi
+          done
+          "$artifact_metadata_read" || {
+            echo "::error::could not authenticate the client artifact after bounded retries"
+            exit 1
+          }
+          python3 .github/scripts/validate_udp_proof_client_artifact.py metadata \
+            --run-json /tmp/udp-proof-client-run.json \
+            --artifacts-json /tmp/udp-proof-client-artifacts.json \
+            --client "$CLIENT" \
+            --proof-phase "$PROOF_PHASE" \
+            --client-run-id "$CLIENT_RUN_ID" \
+            --client-repository "$CLIENT_REPOSITORY" \
+            --client-ref "$CLIENT_REF" \
+            --client-sha "$CLIENT_SHA" \
+            --client-run-title "$CLIENT_RUN_TITLE" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download and validate exact client proof artifact
+        id: result
+        if: steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app_final.outputs.token }}
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_RUN_ATTEMPT: ${{ steps.verify.outputs.client_run_attempt }}
+          CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
+          CLIENT_SHA: ${{ steps.dispatch.outputs.client_sha }}
+          DISPATCH_CORRELATION_ID: ${{ steps.dispatch.outputs.dispatch_correlation_id }}
+          CLIENT_ARTIFACT_ID: ${{ steps.verify.outputs.client_artifact_id }}
+          CLIENT_ARTIFACT_DIGEST: ${{ steps.verify.outputs.client_artifact_digest }}
+          DEPLOYMENT_MANIFEST_SHA256: ${{ needs.gate.outputs.deployment_manifest_sha256 }}
+          DEPLOYMENT_RUNTIME_INPUTS_SHA256: ${{ needs.gate.outputs.deployment_runtime_inputs_sha256 }}
+          PRODUCER_RUN_ID: ${{ needs.gate.outputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ needs.gate.outputs.producer_run_attempt }}
+          PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
+          PRODUCER_ARTIFACT_ID: ${{ needs.gate.outputs.producer_artifact_id }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ needs.gate.outputs.producer_artifact_digest }}
+          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
+          PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/udp-proof-client-artifact.zip"
+          directory="${RUNNER_TEMP}/udp-proof-client-artifact"
+          rm -f "$archive" "${archive}.tmp"
+          rm -rf "$directory"
+          downloaded=false
+          for attempt in 1 2 3; do
+            if timeout 30s gh api \
+              "repos/${CLIENT_REPOSITORY}/actions/artifacts/${CLIENT_ARTIFACT_ID}/zip" \
+              > "${archive}.tmp"; then
+              mv "${archive}.tmp" "$archive"
+              downloaded=true
+              break
+            fi
+            rm -f "${archive}.tmp"
+            echo "::warning::client artifact download failed on attempt ${attempt}/3; retrying" >&2
+            if (( attempt < 3 )); then
+              sleep 5
+            fi
+          done
+          "$downloaded" || {
+            echo "::error::could not download the exact client artifact after bounded retries"
+            exit 1
+          }
+
+          python3 .github/scripts/validate_udp_proof_client_artifact.py archive \
+            --archive "$archive" \
+            --directory "$directory" \
+            --client "$CLIENT" \
+            --expected-digest "$CLIENT_ARTIFACT_DIGEST"
+          python3 .github/scripts/validate_udp_proof_client_artifact.py files \
+            --directory "$directory" \
+            --client "$CLIENT" \
+            --proof-phase "$PROOF_PHASE" \
+            --client-repository "$CLIENT_REPOSITORY" \
+            --client-sha "$CLIENT_SHA" \
+            --client-run-id "$CLIENT_RUN_ID" \
+            --client-run-attempt "$CLIENT_RUN_ATTEMPT" \
+            --dispatch-correlation-id "$DISPATCH_CORRELATION_ID" \
+            --controller-run-id "${{ github.run_id }}" \
+            --controller-run-attempt "${{ github.run_attempt }}" \
+            --deployment-manifest-sha256 "$DEPLOYMENT_MANIFEST_SHA256" \
+            --deployment-runtime-inputs-sha256 "$DEPLOYMENT_RUNTIME_INPUTS_SHA256" \
+            --producer-run-id "$PRODUCER_RUN_ID" \
+            --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" \
+            --producer-head-sha "$PRODUCER_HEAD_SHA" \
+            --producer-artifact-id "$PRODUCER_ARTIFACT_ID" \
+            --producer-artifact-digest "$PRODUCER_ARTIFACT_DIGEST" \
+            --connector-proof-run-id "$CONNECTOR_PROOF_RUN_ID" \
+            --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
+            --github-output "$GITHUB_OUTPUT"
+
           {
             echo "### UDP proof dispatch"
             echo
             echo "- Client: \`${{ inputs.client }}\`"
             echo "- Phase: \`${{ inputs.proof_phase }}\`"
             echo "- Candidate: \`${CLIENT_SHA}\`"
+            echo "- Deployment producer: [run ${{ needs.gate.outputs.producer_run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ needs.gate.outputs.producer_run_id }})"
+            echo "- Deployment artifact: \`${{ needs.gate.outputs.producer_artifact_id }}\` / \`${{ needs.gate.outputs.producer_artifact_digest }}\`"
             echo "- Client run: [${CLIENT_RUN_ID}](https://github.com/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID})"
+            echo "- Client artifact: \`${CLIENT_ARTIFACT_ID}\` / \`${CLIENT_ARTIFACT_DIGEST}\`"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Refresh the narrow App token for failure cancellation
@@ -510,7 +720,7 @@ jobs:
         if: >-
           always() &&
           steps.dispatch.outputs.client_run_title != '' &&
-          steps.verify.outcome != 'success'
+          steps.result.outcome != 'success'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
@@ -523,7 +733,7 @@ jobs:
         if: >-
           always() &&
           steps.dispatch.outputs.client_run_title != '' &&
-          steps.verify.outcome != 'success'
+          steps.result.outcome != 'success'
         env:
           # app_final is at most one 155-poll window old here. Earlier tokens
           # may be expired after a full proof and are intentionally not fallbacks.
