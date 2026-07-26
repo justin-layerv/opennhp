@@ -47,12 +47,19 @@ write_clean_fixture() {
     'module "connector_authority_foundation" {' \
     '  source = "../../../modules/connector-authority-foundation"' \
     '  authority_runtime_contract = var.authority_runtime_contract' \
-    '  authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified' \
+    '  authority_runtime_contract_evidence_verified     = var.authority_runtime_contract_evidence_verified' \
+    '  provisioned_cell_catalog_materialization_enabled = var.provisioned_cell_catalog_materialization_enabled' \
     '}' >"${control_dir}/environments/sandbox/main.tf"
   cp "${control_dir}/environments/sandbox/main.tf" "${control_dir}/environments/prod/main.tf"
   printf '%s\n' \
     'variable "authority_runtime_contract" { default = null }' \
     'variable "authority_runtime_contract_evidence_verified" { default = false }' \
+    'variable "provisioned_cell_catalog_materialization_enabled" {' \
+    '  default = false' \
+    '  validation {' \
+    '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+    '  }' \
+    '}' \
     >"${control_dir}/environments/sandbox/variables.tf"
   printf '%s\n' \
     'variable "authority_runtime_contract" {' \
@@ -62,6 +69,12 @@ write_clean_fixture() {
     'variable "authority_runtime_contract_evidence_verified" {' \
     '  default = false' \
     '  validation { error_message = "Production Authority evidence latch must remain false throughout sandbox measurement." }' \
+    '}' \
+    'variable "provisioned_cell_catalog_materialization_enabled" {' \
+    '  default = false' \
+    '  validation {' \
+    '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+    '  }' \
     '}' >"${control_dir}/environments/prod/variables.tf"
   printf '%s\n' \
     'output "vpc_id" {' \
@@ -97,6 +110,13 @@ expect_success() {
   fi
 }
 
+# Exercise the checked-in wrappers before the synthetic fixture matrix. This
+# catches Terraform-fmt alignment or other real-source drift that a simplified
+# fixture could otherwise mask.
+NHP_REPO_ROOT="$repo_root" "$checker" >/dev/null
+
+# The clean fixture deliberately uses Terraform-fmt alignment around "=". The
+# source guard must accept that whitespace while keeping the lhs/rhs exact.
 write_clean_fixture
 NHP_REPO_ROOT="$fixture_root" "$checker" >/dev/null
 
@@ -199,12 +219,65 @@ printf '%s\n' '# unintended environment drift' >>"${control_dir}/environments/pr
 expect_failure 'module wrappers must remain byte-identical' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
-sed -i.bak \
-  '/authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified/d' \
+sed -E -i.bak \
+  '/^[[:space:]]*authority_runtime_contract_evidence_verified[[:space:]]*=[[:space:]]*var\.authority_runtime_contract_evidence_verified[[:space:]]*$/d' \
   "${control_dir}/environments/sandbox/main.tf"
 rm "${control_dir}/environments/sandbox/main.tf.bak"
 cp "${control_dir}/environments/sandbox/main.tf" "${control_dir}/environments/prod/main.tf"
 expect_failure 'must pass the internal evidence latch exactly once' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+sed -E -i.bak \
+  '/^[[:space:]]*provisioned_cell_catalog_materialization_enabled[[:space:]]*=[[:space:]]*var\.provisioned_cell_catalog_materialization_enabled[[:space:]]*$/d' \
+  "${control_dir}/environments/sandbox/main.tf"
+rm "${control_dir}/environments/sandbox/main.tf.bak"
+cp "${control_dir}/environments/sandbox/main.tf" "${control_dir}/environments/prod/main.tf"
+expect_failure 'must pass the provisioned-cell materialization gate exactly once' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+for environment in sandbox prod; do
+  printf '%s\n' \
+    '  provisioned_cell_catalog_materialization_enabled = var.provisioned_cell_catalog_materialization_enabled' \
+    >>"${control_dir}/environments/${environment}/main.tf"
+done
+expect_failure 'must pass the provisioned-cell materialization gate exactly once' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+sed -i.bak \
+  '/^variable "provisioned_cell_catalog_materialization_enabled" {$/,/^}$/d' \
+  "${control_dir}/environments/sandbox/variables.tf"
+rm "${control_dir}/environments/sandbox/variables.tf.bak"
+expect_failure 'sandbox Control variables must declare exactly one closed provisioned-cell materialization gate' \
+  env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+printf '%s\n' \
+  'variable "provisioned_cell_catalog_materialization_enabled" {' \
+  '  default = false' \
+  '  validation {' \
+  '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+  '  }' \
+  '}' >>"${control_dir}/environments/sandbox/variables.tf"
+expect_failure 'sandbox Control variables must declare exactly one closed provisioned-cell materialization gate' \
+  env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+for environment in sandbox prod; do
+  write_clean_fixture
+  sed -i.bak \
+    '/variable "provisioned_cell_catalog_materialization_enabled"/,/^}$/s/  default = false/  default = true/' \
+    "${control_dir}/environments/${environment}/variables.tf"
+  rm "${control_dir}/environments/${environment}/variables.tf.bak"
+  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization false" \
+    env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+  write_clean_fixture
+  sed -i.bak \
+    '/variable "provisioned_cell_catalog_materialization_enabled"/,/^}$/s/condition = !var\./condition = var./' \
+    "${control_dir}/environments/${environment}/variables.tf"
+  rm "${control_dir}/environments/${environment}/variables.tf.bak"
+  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization false" \
+    env NHP_REPO_ROOT="$fixture_root" "$checker"
+done
 
 write_clean_fixture
 printf '%s\n' '{}' >"${control_dir}/environments/sandbox/unreviewed.auto.tfvars"

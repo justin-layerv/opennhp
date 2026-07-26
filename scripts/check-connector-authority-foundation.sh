@@ -220,18 +220,83 @@ if ! cmp -s "$sandbox_wrapper" "$prod_wrapper"; then
   exit 1
 fi
 
+# This source guard intentionally pins the temporary Authority-first holdback.
+# The reviewed restoration PR must update it and its fixtures to the true-only
+# sandbox latch described in the rollout ledger.
+require_catalog_materialization_holdback() {
+  local variables_file="$1"
+  local environment="$2"
+  local variable_block
+
+  if ! variable_block="$(
+    awk -v name='provisioned_cell_catalog_materialization_enabled' '
+      $0 ~ "^[[:space:]]*variable[[:space:]]+\"" name "\"[[:space:]]*\\{[[:space:]]*$" {
+        if (seen != 0 || capture != 0) {
+          exit 2
+        }
+        seen = 1
+        capture = 1
+      }
+      capture != 0 {
+        print
+      }
+      capture != 0 && $0 ~ "^}[[:space:]]*$" {
+        capture = 0
+      }
+      END {
+        if (seen != 1 || capture != 0) {
+          exit 2
+        }
+      }
+    ' "$variables_file"
+  )"; then
+    echo "ERROR: ${environment} Control variables must declare exactly one closed provisioned-cell materialization gate" >&2
+    exit 1
+  fi
+
+  local default_count
+  local false_default_count
+  local condition_count
+  local false_condition_count
+  default_count="$(grep -E -c \
+    '^[[:space:]]*default[[:space:]]*=' <<<"$variable_block" || true)"
+  false_default_count="$(grep -E -c \
+    '^[[:space:]]*default[[:space:]]*=[[:space:]]*false[[:space:]]*$' \
+    <<<"$variable_block" || true)"
+  condition_count="$(grep -E -c \
+    '^[[:space:]]*condition[[:space:]]*=' <<<"$variable_block" || true)"
+  false_condition_count="$(grep -E -c \
+    '^[[:space:]]*condition[[:space:]]*=[[:space:]]*!var\.provisioned_cell_catalog_materialization_enabled[[:space:]]*$' \
+    <<<"$variable_block" || true)"
+
+  if [[ "$default_count" -ne 1 || "$false_default_count" -ne 1 ||
+        "$condition_count" -ne 1 || "$false_condition_count" -ne 1 ]]; then
+    echo "ERROR: ${environment} Control variables must hard-lock provisioned-cell catalog materialization false during the Authority-first holdback" >&2
+    exit 1
+  fi
+}
+
 # Both roots compose the same child-module interface. Sandbox may open the
 # latch only through the exact-main generated tfvars; production locks both
 # inputs dark at the variable boundary.
 for environment in sandbox prod; do
   environment_root="${control_dir}/environments/${environment}"
-  wrapper_count="$(grep -c \
-    'authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified' \
+  wrapper_count="$(grep -E -c \
+    '^[[:space:]]*authority_runtime_contract_evidence_verified[[:space:]]*=[[:space:]]*var\.authority_runtime_contract_evidence_verified[[:space:]]*$' \
     "${environment_root}/main.tf" || true)"
   if [[ "$wrapper_count" -ne 1 ]]; then
     echo "ERROR: ${environment} Control wrapper must pass the internal evidence latch exactly once from its root variable" >&2
     exit 1
   fi
+  catalog_wrapper_count="$(grep -E -c \
+    '^[[:space:]]*provisioned_cell_catalog_materialization_enabled[[:space:]]*=[[:space:]]*var\.provisioned_cell_catalog_materialization_enabled[[:space:]]*$' \
+    "${environment_root}/main.tf" || true)"
+  if [[ "$catalog_wrapper_count" -ne 1 ]]; then
+    echo "ERROR: ${environment} Control wrapper must pass the provisioned-cell materialization gate exactly once from its root variable" >&2
+    exit 1
+  fi
+  require_catalog_materialization_holdback \
+    "${environment_root}/variables.tf" "$environment"
   # Reject any COMMITTED tfvars in the Control root (a committed *.auto.tfvars /
   # *.auto.tfvars.json would be terraform-auto-loaded and could open the latch),
   # but EXCLUDE the sanctioned exact-main runtime output

@@ -32,7 +32,7 @@ locals {
       server_public_key_b64 = { S = cell.server_public_key_b64 }
       selection_weight      = { N = cell.selection_weight }
       updated_at            = { S = cell.updated_at }
-    }
+    } if var.provisioned_cell_catalog_materialization_enabled
   }
 }
 

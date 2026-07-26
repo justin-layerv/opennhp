@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -512,6 +513,39 @@ for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
         f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
     ] = "aws_cloudwatch_metric_alarm"
 AUTHORITY_RUNTIME_RESOURCES[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS] = "aws_security_group"
+AUTHORITY_IMAGE_UPDATE_RESOURCES = {
+    address: resource_type
+    for address, resource_type in AUTHORITY_RUNTIME_RESOURCES.items()
+    if resource_type in {"aws_lambda_alias", "aws_lambda_function"}
+}
+AUTHORITY_IMAGE_UPDATE_FROM_URI = (
+    f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
+    "layerv/qurl-connector-authority@"
+    "sha256:d50ec8ee0153b4ac62491209a03442e12ca484b9ca88a72daf70a3880d77c070"
+)
+AUTHORITY_IMAGE_UPDATE_TO_URI = (
+    f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
+    "layerv/qurl-connector-authority@"
+    "sha256:97d3822c1ebaa2304ec4189eca45264245c6c2d87a70f9122ff742b66a085d00"
+)
+AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS = (
+    "module.control.terraform_data.foundation_contract"
+)
+AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256 = (
+    "d535970977ba3b31da2b224c01897c535786ff802a91edbe8319884c23924eff"
+)
+AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE = (
+    "388a22f7a5333a246e623a19dd5ca3793bd89f60"
+)
+AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256 = (
+    "080ee0590adb720bf58e59af9d6090647c52186f059f170a2f74c771f3390de9"
+)
+AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE = (
+    "44169944e44b6ee990261eb2bc5f06653569185b"
+)
+_AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS = frozenset(
+    {"last_modified", "qualified_arn", "qualified_invoke_arn", "version"}
+)
 
 # Connector Hub public UDP edge slice (Step 5 slice 5a): the authority's only
 # caller-facing public edge. These types are moved out of the lexical forbidden
@@ -1910,20 +1944,7 @@ def _require_provisioned_cell_values(
 
 def _require_provisioned_cell_create_output(plan: dict[str, Any]) -> None:
     """Bind the catalog-row create to the exact public Control output."""
-    planned_values = plan.get("planned_values")
-    outputs = (
-        planned_values.get("outputs")
-        if isinstance(planned_values, dict)
-        else None
-    )
-    output = outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
-    if (
-        not _is_exact_nonsensitive_output_entry(output)
-        or output.get("value") != PROVISIONED_CELL_CATALOG
-    ):
-        raise ContractError(
-            "provisioned-cell create must expose the exact nonsensitive catalog output"
-        )
+    _require_provisioned_cell_planned_output(plan, catalog_present=True)
 
     output_changes = plan.get("output_changes")
     change = (
@@ -1943,6 +1964,28 @@ def _require_provisioned_cell_create_output(plan: dict[str, Any]) -> None:
     ):
         raise ContractError(
             "provisioned-cell create output change is not the exact public contract"
+        )
+
+
+def _require_provisioned_cell_planned_output(
+    plan: dict[str, Any], *, catalog_present: bool
+) -> None:
+    """Bind every plan mode to the catalog slice's exact public projection."""
+    planned_values = plan.get("planned_values")
+    outputs = (
+        planned_values.get("outputs")
+        if isinstance(planned_values, dict)
+        else None
+    )
+    output = outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
+    expected = PROVISIONED_CELL_CATALOG if catalog_present else {}
+    if (
+        not _is_exact_nonsensitive_output_entry(output)
+        or output.get("value") != expected
+    ):
+        raise ContractError(
+            "planned provisioned-cell output does not match the all-or-nothing "
+            "catalog inventory"
         )
 
 
@@ -2206,6 +2249,7 @@ def _require_foundation_input_known(
 def _check_planned_security(
     by_address: dict[str, dict[str, Any]],
     *,
+    catalog_mode: bool = False,
     runtime_mode: bool = False,
     hub_worker_mode: bool = False,
 ) -> None:
@@ -2223,31 +2267,32 @@ def _check_planned_security(
     )
     enabled = _require_authority_runtime_binding(foundation)
     _require_foundation_input_known(foundation_unknown, enabled=enabled)
-    for address in PROVISIONED_CELL_RESOURCES:
-        item, item_unknown = values(address)
-        change = by_address[address]["change"]
-        create = change.get("actions") == ["create"]
-        _require_provisioned_cell_values(
-            item,
-            item_unknown,
-            address,
-            create=create,
-        )
-        if create and (
-            change.get("before_sensitive") is not False
-            or change.get("after_sensitive") != {}
-            or change.get("after_identity")
-            != {
-                "account_id": None,
-                "hash_key_value": None,
-                "range_key_value": None,
-                "region": None,
-                "table_name": None,
-            }
-        ):
-            raise ContractError(
-                f"{address} create metadata envelope is not exact"
+    if catalog_mode:
+        for address in PROVISIONED_CELL_RESOURCES:
+            item, item_unknown = values(address)
+            change = by_address[address]["change"]
+            create = change.get("actions") == ["create"]
+            _require_provisioned_cell_values(
+                item,
+                item_unknown,
+                address,
+                create=create,
             )
+            if create and (
+                change.get("before_sensitive") is not False
+                or change.get("after_sensitive") != {}
+                or change.get("after_identity")
+                != {
+                    "account_id": None,
+                    "hash_key_value": None,
+                    "range_key_value": None,
+                    "region": None,
+                    "table_name": None,
+                }
+            ):
+                raise ContractError(
+                    f"{address} create metadata envelope is not exact"
+                )
     # Keep the complete provider-version-specific no-op shape visible here as
     # literals rather than deriving its dimensions independently. The empty-
     # string / zero IPv6 values below are the exact no-op shape emitted by the
@@ -3347,6 +3392,503 @@ def _check_authority_runtime_resources(
         raise ContractError("function SG must expose no ingress")
 
 
+def _has_unknown_value(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, dict):
+        return any(_has_unknown_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_unknown_value(item) for item in value)
+    return False
+
+
+def _mapping_shape(value: dict[str, Any]) -> dict[str, Any]:
+    """Return Terraform's value-free object mask for a dynamic value."""
+    return {
+        key: _mapping_shape(item)
+        for key, item in value.items()
+        if isinstance(item, dict)
+    }
+
+
+def _authority_basis_evidence(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    contract = payload["authority_runtime_contract"]
+    return [
+        contract["provisioned_cells_evidence"],
+        contract["global"]["basis_evidence"],
+        *(
+            contract["functions"][function_name]["basis_evidence"]
+            for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+        ),
+    ]
+
+
+def _check_authority_image_foundation_update(
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Validate the exact reviewed foundation input/evidence migration."""
+    item = by_address[AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+    change = item.get("change")
+    if (
+        item.get("mode") != "managed"
+        or item.get("type") != "terraform_data"
+        or not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["update"]
+    ):
+        raise ContractError("Authority image foundation update envelope is not exact")
+
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        not isinstance(before, dict)
+        or set(before) != {"id", "input", "output", "triggers_replace"}
+        or not isinstance(after, dict)
+        or set(after) != {"id", "input", "triggers_replace"}
+        or not isinstance(before.get("id"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}",
+            before["id"],
+        )
+        is None
+        or after.get("id") != before["id"]
+        or before.get("triggers_replace") is not None
+        or after.get("triggers_replace") is not None
+    ):
+        raise ContractError(
+            "Authority image foundation id/triggers envelope is not exact"
+        )
+
+    before_input = before.get("input")
+    before_output = before.get("output")
+    after_input = after.get("input")
+    if (
+        not isinstance(before_input, dict)
+        or not isinstance(before_output, dict)
+        or not isinstance(after_input, dict)
+        or not _json_equal(before_input, before_output)
+        or not _require_authority_runtime_binding({"input": before_input})
+        or not _require_authority_runtime_binding({"input": after_input})
+    ):
+        raise ContractError(
+            "Authority image foundation input/output binding is not exact"
+        )
+
+    before_contract = before_input["authority_runtime_contract"]
+    after_contract = after_input["authority_runtime_contract"]
+    before_evidence = _authority_basis_evidence(before_input)
+    after_evidence = _authority_basis_evidence(after_input)
+    after_source = after_evidence[0].get("source_commit")
+    if (
+        before_input.get("authority_image_uri") != AUTHORITY_IMAGE_UPDATE_FROM_URI
+        or before_contract["global"].get("authority_image_digest")
+        != AUTHORITY_IMAGE_UPDATE_FROM_URI.rsplit("@", 1)[1]
+        or any(
+            evidence.get("sha256")
+            != AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256
+            or evidence.get("source_commit")
+            != AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
+            for evidence in before_evidence
+        )
+        or after_input.get("authority_image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+        or after_contract["global"].get("authority_image_digest")
+        != AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit("@", 1)[1]
+        or after_source != AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+        or any(
+            evidence.get("sha256")
+            != AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+            or evidence.get("source_commit") != after_source
+            for evidence in after_evidence
+        )
+    ):
+        raise ContractError(
+            "Authority image foundation is not the exact reviewed "
+            "image/evidence migration"
+        )
+
+    expected_after = copy.deepcopy(before_input)
+    expected_after["authority_image_uri"] = AUTHORITY_IMAGE_UPDATE_TO_URI
+    expected_after_contract = expected_after["authority_runtime_contract"]
+    expected_after_contract["global"]["authority_image_digest"] = (
+        AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit("@", 1)[1]
+    )
+    for evidence in _authority_basis_evidence(expected_after):
+        evidence["sha256"] = AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+        evidence["source_commit"] = after_source
+    if not _json_equal(after_input, expected_after):
+        raise ContractError(
+            "Authority image foundation migration changed an unrelated contract field"
+        )
+
+    contract_shape = _mapping_shape(after_contract)
+    expected_unknown = {
+        "input": {"authority_runtime_contract": contract_shape},
+        "output": True,
+    }
+    expected_before_sensitive = {
+        "input": {"authority_runtime_contract": contract_shape},
+        "output": {"authority_runtime_contract": contract_shape},
+    }
+    expected_after_sensitive = {
+        "input": {"authority_runtime_contract": contract_shape},
+        "output": {},
+    }
+    if (
+        change.get("after_unknown") != expected_unknown
+        or change.get("before_sensitive") != expected_before_sensitive
+        or change.get("after_sensitive") != expected_after_sensitive
+    ):
+        raise ContractError(
+            "Authority image foundation unknown/sensitive envelope is not exact"
+        )
+
+
+def _check_authority_image_foundation_noop(
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Require the already-applied foundation to be the exact target no-op."""
+    item = by_address[AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+    change = item.get("change")
+    if (
+        item.get("mode") != "managed"
+        or item.get("type") != "terraform_data"
+        or not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["no-op"]
+        or change.get("after_unknown") != {}
+    ):
+        raise ContractError(
+            "Authority image recovery foundation no-op envelope is not exact"
+        )
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        not isinstance(before, dict)
+        or set(before) != {"id", "input", "output", "triggers_replace"}
+        or not isinstance(after, dict)
+        or not _json_equal(before, after)
+        or not isinstance(after.get("id"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}",
+            after["id"],
+        )
+        is None
+        or after.get("triggers_replace") is not None
+        or not isinstance(after.get("input"), dict)
+        or not _json_equal(after.get("input"), after.get("output"))
+        or not _require_authority_runtime_binding({"input": after["input"]})
+    ):
+        raise ContractError(
+            "Authority image recovery foundation value is not the exact target no-op"
+        )
+    payload = after["input"]
+    contract = payload["authority_runtime_contract"]
+    evidence_objects = _authority_basis_evidence(payload)
+    if (
+        payload.get("authority_image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+        or contract["global"].get("authority_image_digest")
+        != AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit("@", 1)[1]
+        or any(
+            evidence.get("sha256")
+            != AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+            or evidence.get("source_commit")
+            != AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+            for evidence in evidence_objects
+        )
+    ):
+        raise ContractError(
+            "Authority image recovery foundation is not bound to target evidence"
+        )
+    contract_shape = _mapping_shape(contract)
+    expected_sensitive = {
+        "input": {"authority_runtime_contract": contract_shape},
+        "output": {"authority_runtime_contract": contract_shape},
+    }
+    if (
+        change.get("before_sensitive") != expected_sensitive
+        or change.get("after_sensitive") != expected_sensitive
+    ):
+        raise ContractError(
+            "Authority image recovery foundation sensitive envelope is not exact"
+        )
+
+
+def _is_exact_output_change(
+    change: Any, *, actions: list[str], before: Any, after: Any
+) -> bool:
+    return (
+        isinstance(change, dict)
+        and set(change) == _CHANGE_KEYS
+        and change.get("actions") == actions
+        and change.get("after_unknown") is False
+        and change.get("before_sensitive") is False
+        and change.get("after_sensitive") is False
+        and _json_equal(change.get("before"), before)
+        and _json_equal(change.get("after"), after)
+    )
+
+
+def _check_authority_image_output_changes(
+    plan: dict[str, Any], *, full_transition: bool
+) -> None:
+    """Bind the image migration to the exact root-output projection."""
+    output_changes = plan.get("output_changes")
+    if (
+        not isinstance(output_changes, dict)
+        or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
+    ):
+        raise ContractError("Authority image root-output inventory is not exact")
+
+    image_change = output_changes["authority_image_uri"]
+    catalog_change = output_changes["provisioned_cells"]
+    exact_image_transition = _is_exact_output_change(
+        image_change,
+        actions=["update"],
+        before=AUTHORITY_IMAGE_UPDATE_FROM_URI,
+        after=AUTHORITY_IMAGE_UPDATE_TO_URI,
+    )
+    exact_catalog_transition = _is_exact_output_change(
+        catalog_change,
+        actions=["create"],
+        before=None,
+        after={},
+    )
+    if full_transition:
+        if not exact_image_transition or not exact_catalog_transition:
+            raise ContractError(
+                "full Authority image migration must update the image output "
+                "and create the exact empty catalog output"
+            )
+    elif (
+        not exact_image_transition
+        and not _is_exact_output_change(
+            image_change,
+            actions=["no-op"],
+            before=AUTHORITY_IMAGE_UPDATE_TO_URI,
+            after=AUTHORITY_IMAGE_UPDATE_TO_URI,
+        )
+    ) or (
+        not exact_catalog_transition
+        and not _is_exact_output_change(
+            catalog_change,
+            actions=["no-op"],
+            before={},
+            after={},
+        )
+    ):
+        raise ContractError(
+            "Authority image recovery output changes are outside the bounded "
+            "transition/no-op envelope"
+        )
+
+    for output_name in EXPECTED_CONTROL_OUTPUTS - {
+        "authority_image_uri",
+        "provisioned_cells",
+    }:
+        change = output_changes[output_name]
+        if (
+            not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["no-op"]
+            or change.get("after_unknown") is not False
+            or change.get("before_sensitive") is not False
+            or change.get("after_sensitive") is not False
+            or not _json_equal(change.get("before"), change.get("after"))
+        ):
+            raise ContractError(
+                f"Authority image migration may not change root output {output_name}"
+            )
+
+
+def _authority_function_identity(function_name: str) -> dict[str, str]:
+    return {
+        "account_id": ACCOUNT_ID,
+        "function_name": function_name,
+        "region": AWS_REGION,
+    }
+
+
+def _check_authority_image_new_noops(
+    by_address: dict[str, dict[str, Any]],
+    addresses: set[str],
+) -> None:
+    """Prove every already-applied runtime complement is an exact target no-op."""
+    for address in addresses:
+        resource_type = AUTHORITY_IMAGE_UPDATE_RESOURCES[address]
+        change = by_address[address]["change"]
+        after = change.get("after")
+        expected_change_keys = _CHANGE_KEYS
+        if resource_type == "aws_lambda_function":
+            expected_change_keys = {
+                *_CHANGE_KEYS,
+                "before_identity",
+                "after_identity",
+            }
+        if (
+            set(change) != expected_change_keys
+            or not isinstance(change.get("after_unknown"), dict)
+            or change.get("actions") != ["no-op"]
+            or not isinstance(after, dict)
+            or not _json_equal(change.get("before"), after)
+            or _has_unknown_value(change.get("after_unknown"))
+            or change.get("before_sensitive") != change.get("after_sensitive")
+            or _has_unknown_value(change.get("before_sensitive"))
+        ):
+            raise ContractError(
+                "Authority image recovery requires exact target runtime no-ops"
+            )
+        if resource_type == "aws_lambda_function":
+            function_name = address.rsplit('["', 1)[1][:-2]
+            if (
+                change.get("before_identity")
+                != _authority_function_identity(function_name)
+                or change.get("after_identity")
+                != _authority_function_identity(function_name)
+                or after.get("function_name") != function_name
+                or after.get("package_type") != "Image"
+                or after.get("image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+                or re.fullmatch(r"[1-9][0-9]*", str(after.get("version"))) is None
+            ):
+                raise ContractError(
+                    "Authority recovery function state is not exact new image"
+                )
+            continue
+        instance = address.rsplit('["', 1)[1][:-2]
+        function_name, color = instance.rsplit(":", 1)
+        if (
+            color not in {"blue", "green"}
+            or after.get("function_name") != function_name
+            or after.get("name") != color
+            or after.get("routing_config") != []
+            or re.fullmatch(
+                r"[1-9][0-9]*", str(after.get("function_version"))
+            )
+            is None
+        ):
+            raise ContractError(
+                "Authority recovery alias state is not exact new version"
+            )
+
+
+def _check_authority_image_update(
+    changed: set[str],
+    by_address: dict[str, dict[str, Any]],
+    plan: dict[str, Any],
+) -> None:
+    """Admit only the one reviewed d50 -> 97d sandbox image migration."""
+    foundation_changed = AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS in changed
+    image_changed = changed & set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
+    if foundation_changed:
+        _check_authority_image_foundation_update(by_address)
+    else:
+        _check_authority_image_foundation_noop(by_address)
+    _check_authority_image_new_noops(
+        by_address,
+        set(AUTHORITY_IMAGE_UPDATE_RESOURCES) - image_changed,
+    )
+
+    for address in image_changed:
+        item = by_address[address]
+        change = item.get("change")
+        expected_change_keys = _CHANGE_KEYS
+        if item.get("type") == "aws_lambda_function":
+            expected_change_keys = {
+                *_CHANGE_KEYS,
+                "before_identity",
+                "after_identity",
+            }
+        if (
+            item.get("mode") != "managed"
+            or item.get("type") != AUTHORITY_IMAGE_UPDATE_RESOURCES[address]
+            or not isinstance(change, dict)
+            or set(change) != expected_change_keys
+            or change.get("actions") != ["update"]
+        ):
+            raise ContractError("Authority image update envelope is not exact")
+        before = change.get("before")
+        after = change.get("after")
+        after_unknown = change.get("after_unknown")
+        if (
+            not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or not isinstance(after_unknown, dict)
+            or change.get("before_sensitive") != change.get("after_sensitive")
+            or _has_unknown_value(change.get("before_sensitive"))
+        ):
+            raise ContractError("Authority image update values are malformed")
+        changed_fields = {
+            field
+            for field in set(before) | set(after)
+            if field not in before
+            or field not in after
+            or not _json_equal(before[field], after[field])
+        }
+        unknown_fields = {
+            field
+            for field, value in after_unknown.items()
+            if _has_unknown_value(value)
+        }
+
+        if item["type"] == "aws_lambda_function":
+            function_name = address.rsplit('["', 1)[1][:-2]
+            expected_identity = _authority_function_identity(function_name)
+            expected_changed_fields = {
+                "image_uri",
+                *_AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS,
+            }
+            if (
+                before.get("function_name") != function_name
+                or after.get("function_name") != function_name
+                or before.get("package_type") != "Image"
+                or after.get("package_type") != "Image"
+                or change.get("before_identity") != expected_identity
+                or change.get("after_identity") != expected_identity
+                or before.get("image_uri") != AUTHORITY_IMAGE_UPDATE_FROM_URI
+                or after.get("image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+                or changed_fields != expected_changed_fields
+                or unknown_fields != _AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS
+                or any(
+                    field in after
+                    for field in _AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS
+                )
+                or not re.fullmatch(r"[1-9][0-9]*", str(before.get("version")))
+            ):
+                raise ContractError(
+                    "Authority function update is not the exact d50-to-97d "
+                    "immutable image/version migration"
+                )
+            continue
+
+        instance = address.rsplit('["', 1)[1][:-2]
+        function_name, color = instance.rsplit(":", 1)
+        if (
+            color not in {"blue", "green"}
+            or before.get("function_name") != function_name
+            or after.get("function_name") != function_name
+            or before.get("name") != color
+            or after.get("name") != color
+            or before.get("routing_config") != []
+            or after.get("routing_config") != []
+            or changed_fields != {"function_version"}
+            or unknown_fields != {"function_version"}
+            or "function_version" in after
+            or not re.fullmatch(
+                r"[1-9][0-9]*", str(before.get("function_version"))
+            )
+        ):
+            raise ContractError(
+                "Authority alias update may change only its provider-computed "
+                "function_version while retaining exact function/name/routing"
+            )
+    _check_authority_image_output_changes(
+        plan,
+        full_transition=(
+            foundation_changed
+            and image_changed == set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
+        ),
+    )
+
+
 def _check_state_normalization_drift(
     drift: list[dict[str, Any]],
     by_address: dict[str, dict[str, Any]],
@@ -4041,24 +4583,29 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
 
-    # The base foundation, plus any complete subset of the three independent
-    # optional slices: the authority runtime (Lambda functions/aliases/roles/…),
-    # the Hub public edge (public subnets/IGW/route/NLB/…), and the Hub Fargate
-    # worker (ECS/secret/keygen/endpoints/…). Each slice is ALL-OR-NOTHING -- its
-    # resources appear together or not at all. Two slices flip independently; the
-    # worker DEPENDS on the other two (it fronts the edge target group and invokes
-    # the runtime aliases), so a worker inventory without both is rejected below.
+    # The base foundation, plus any complete subset of the independent optional
+    # slices: the two-row provisioned-cell catalog, authority runtime (Lambda
+    # functions/aliases/roles/…), Hub public edge
+    # (public subnets/IGW/route/NLB/…), and Hub Fargate worker
+    # (ECS/secret/keygen/endpoints/…). Each slice is ALL-OR-NOTHING -- its
+    # resources appear together or not at all. The catalog's temporary absence
+    # permits the reviewed Authority-first rollout without weakening its exact
+    # later two-row transition. The worker DEPENDS on the edge and runtime (it
+    # fronts the edge target group and invokes the runtime aliases), so a worker
+    # inventory without both is rejected below.
     # Data sources are resolved at plan time (planned_values/configuration, not
     # resource_changes), so ``by_address`` here is effectively managed-only; the
     # worker's two data sources are gated by the configuration map and the state
     # list, not this managed inventory. A partial slice (some but not all of its
     # addresses) or any address outside base∪slices fails closed via the exact-set
     # equality below.
-    base_inventory = set(EXPECTED_RESOURCES)
+    catalog_extra = set(PROVISIONED_CELL_RESOURCES)
+    base_inventory = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_inventory = set(by_address)
+    catalog_mode = bool(actual_inventory & catalog_extra)
     runtime_mode = bool(actual_inventory & runtime_extra)
     hub_edge_mode = bool(actual_inventory & hub_edge_extra)
     hub_worker_mode = bool(actual_inventory & hub_worker_extra)
@@ -4069,6 +4616,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         )
     expected_inventory = (
         base_inventory
+        | (catalog_extra if catalog_mode else set())
         | (runtime_extra if runtime_mode else set())
         | (hub_edge_extra if hub_edge_mode else set())
         | (hub_worker_extra if hub_worker_mode else set())
@@ -4079,7 +4627,14 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         raise ContractError(
             f"Terraform resource inventory mismatch; missing={missing}, extra={extra}"
         )
-    expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    _require_provisioned_cell_planned_output(plan, catalog_present=catalog_mode)
+    expected_resources = {
+        address: resource_type
+        for address, resource_type in EXPECTED_RESOURCES.items()
+        if address not in catalog_extra
+    }
+    if catalog_mode:
+        expected_resources.update(PROVISIONED_CELL_RESOURCES)
     if runtime_mode:
         expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if hub_edge_mode:
@@ -4261,6 +4816,25 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         )
     )
 
+    # Immutable Authority image refresh. Terraform publishes one new version of
+    # the foundation binding, publishes one new version of each of the three
+    # Hub-facing functions, and advances both closed aliases to that version.
+    # Admit only update-only work on those exact ten addresses; a nonempty
+    # subset is the bounded recovery shape after a partial apply.
+    # Existing runtime/config checks below still validate every function and
+    # alias against the contract-pinned image and exact Terraform references.
+    authority_image_update_addresses = set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
+    authority_image_update_scope = {
+        *authority_image_update_addresses,
+        AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
+    }
+    authority_image_update_transition = (
+        runtime_mode
+        and bool(changed)
+        and changed.issubset(authority_image_update_scope)
+        and all(actual_non_noop.get(address) == ["update"] for address in changed)
+    )
+
     # The Hub public edge slice (5a): every edge resource is a pending create (or
     # an already-applied no-op) and NOTHING else moves. This slice opens no
     # endpoint -- the caller lambda endpoint opens with the workers (5b).
@@ -4388,6 +4962,9 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # updates are validated by their exact after-state security checks below
         # (_check_authority_runtime_resources), not as pure creates.
         _require_create_shapes(runtime_creates_pending, by_address)
+    elif authority_image_update_transition:
+        plan_mode = "authority-image-update"
+        _check_authority_image_update(changed, by_address, plan)
     elif hub_edge_transition:
         plan_mode = "hub-edge-slice"
         # Every edge resource is a still-pending pure create; an edge resource
@@ -4409,7 +4986,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
             "contract binding, the exact provisioned-cell catalog create, the exact "
-            "Authority runtime slice, the exact "
+            "Authority runtime slice or image update, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction; "
             f"got {actual_non_noop}"
@@ -4419,7 +4996,10 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     # post-slice state; the scoped policies, endpoint opens, and SG ingress are
     # still validated below regardless of transition vs steady.
     _check_planned_security(
-        by_address, runtime_mode=runtime_mode, hub_worker_mode=hub_worker_mode
+        by_address,
+        catalog_mode=catalog_mode,
+        runtime_mode=runtime_mode,
+        hub_worker_mode=hub_worker_mode,
     )
 
     normalization_drift_kind = _check_state_normalization_drift(
@@ -4530,11 +5110,13 @@ def check_state_list(path: Path) -> dict[str, int]:
 
     # `terraform state list` includes both managed resources and cached data
     # sources. Admit the base union plus any complete subset of the independent
-    # optional slices ({authority runtime, Hub edge}); each slice is
-    # all-or-nothing. The subsequent JSON state check remains mode-aware and
-    # independently enforces types and security-sensitive values.
+    # optional slices ({provisioned-cell catalog, authority runtime, Hub edge,
+    # Hub worker}); each slice is all-or-nothing. The subsequent JSON state
+    # check remains mode-aware and independently enforces types and
+    # security-sensitive values.
     data_expected = set(EXPECTED_DATA_RESOURCES)
-    base_expected = set(EXPECTED_RESOURCES) | data_expected
+    catalog_extra = set(PROVISIONED_CELL_RESOURCES)
+    base_expected = (set(EXPECTED_RESOURCES) - catalog_extra) | data_expected
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
@@ -4543,6 +5125,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     # runtime slices (the same dependency the plan lane enforces).
     hub_worker_managed = set(HUB_WORKER_RESOURCES)
     hub_worker_extra = hub_worker_managed | set(HUB_WORKER_DATA_RESOURCES)
+    catalog_present = bool(addresses & catalog_extra)
     runtime_present = bool(addresses & runtime_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
@@ -4553,6 +5136,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         )
     expected = (
         base_expected
+        | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
@@ -4570,6 +5154,8 @@ def check_state_list(path: Path) -> dict[str, int]:
         ),
         "managed_resource_count": (
             len(EXPECTED_RESOURCES)
+            - len(PROVISIONED_CELL_RESOURCES)
+            + (len(PROVISIONED_CELL_RESOURCES) if catalog_present else 0)
             + (len(AUTHORITY_RUNTIME_RESOURCES) if runtime_present else 0)
             + (len(HUB_EDGE_RESOURCES) if hub_edge_present else 0)
             + (len(HUB_WORKER_RESOURCES) if hub_worker_present else 0)
@@ -4788,11 +5374,13 @@ def check_state(state: Any) -> dict[str, Any]:
     by_address = {item.get("address"): item for item in resources}
     if len(by_address) != len(resources):
         raise ContractError("refreshed state contains duplicate managed addresses")
-    base_expected = set(EXPECTED_RESOURCES)
+    catalog_extra = set(PROVISIONED_CELL_RESOURCES)
+    base_expected = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_addresses = set(by_address)
+    catalog_present = bool(actual_addresses & catalog_extra)
     runtime_present = bool(actual_addresses & runtime_extra)
     hub_edge_present = bool(actual_addresses & hub_edge_extra)
     hub_worker_present = bool(actual_addresses & hub_worker_extra)
@@ -4803,6 +5391,7 @@ def check_state(state: Any) -> dict[str, Any]:
         )
     state_expected = (
         base_expected
+        | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
@@ -4813,7 +5402,13 @@ def check_state(state: Any) -> dict[str, Any]:
         raise ContractError(
             f"refreshed state inventory mismatch; missing={missing}, extra={extra}"
         )
-    state_expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    state_expected_resources = {
+        address: resource_type
+        for address, resource_type in EXPECTED_RESOURCES.items()
+        if address not in catalog_extra
+    }
+    if catalog_present:
+        state_expected_resources.update(PROVISIONED_CELL_RESOURCES)
     if runtime_present:
         state_expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if hub_edge_present:
@@ -4831,13 +5426,14 @@ def check_state(state: Any) -> dict[str, Any]:
     foundation = values["module.control.terraform_data.foundation_contract"]
     if not _require_authority_runtime_binding(foundation):
         raise ContractError("refreshed state is missing the Authority runtime binding")
-    for address in PROVISIONED_CELL_RESOURCES:
-        _require_provisioned_cell_values(
-            values[address],
-            {},
-            address,
-            create=False,
-        )
+    if catalog_present:
+        for address in PROVISIONED_CELL_RESOURCES:
+            _require_provisioned_cell_values(
+                values[address],
+                {},
+                address,
+                create=False,
+            )
     outputs = values_root.get("outputs")
     authority_image_output = (
         outputs.get("authority_image_uri") if isinstance(outputs, dict) else None
@@ -4853,7 +5449,8 @@ def check_state(state: Any) -> dict[str, Any]:
     )
     if (
         not _is_exact_nonsensitive_output_entry(catalog_output)
-        or catalog_output.get("value") != PROVISIONED_CELL_CATALOG
+        or catalog_output.get("value")
+        != (PROVISIONED_CELL_CATALOG if catalog_present else {})
     ):
         raise ContractError(
             "refreshed state provisioned-cell catalog output is not exact"

@@ -172,6 +172,18 @@ variable "provisioned_cells" {
   }
 }
 
+variable "provisioned_cell_catalog_materialization_enabled" {
+  description = <<-EOT
+    Fail-closed deployment gate for the Terraform-owned provisioned-cell rows
+    and their root output. The reviewed provisioned_cells input remains
+    available to the independently generated Authority identity contract while
+    this is false, but no row is written or published until a separate attended
+    catalog transition flips the gate true.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "authority_runtime_functions_enabled" {
   description = <<-EOT
     Second, independent enable gate for the Connector Authority Lambda runtime

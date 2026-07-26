@@ -362,11 +362,12 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
   command = plan
 
   variables {
-    environment                = "sandbox"
-    aws_account_id             = "767397897469"
-    vpc_cidr                   = "10.102.0.0/16"
-    otp_email_from             = "noreply@notify.layerv.xyz"
-    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    environment                                      = "sandbox"
+    aws_account_id                                   = "767397897469"
+    vpc_cidr                                         = "10.102.0.0/16"
+    otp_email_from                                   = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name                       = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cell_catalog_materialization_enabled = true
     provisioned_cells = {
       cell0 = {
         cell_id               = "cell0"
@@ -429,7 +430,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
   }
 
   assert {
-    condition = output.provisioned_cells == {
+    condition = jsonencode(output.provisioned_cells) == jsonencode({
       cell0 = {
         cell_id               = "cell0"
         status                = "active"
@@ -450,8 +451,42 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
       }
-    }
+    })
     error_message = "The public catalog projection must preserve the reviewed opaque endpoint and responder identity values."
+  }
+}
+
+run "sandbox_provisioned_cell_catalog_holdback_keeps_rows_unmaterialized" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  assert {
+    condition     = length(aws_dynamodb_table_item.provisioned_cell) == 0
+    error_message = "A disabled catalog-materialization gate must emit no DynamoDB registry rows."
+  }
+
+  assert {
+    condition     = length(output.provisioned_cells) == 0
+    error_message = "A disabled catalog-materialization gate must publish no catalog output."
   }
 }
 
@@ -485,11 +520,12 @@ run "catalog_accepts_draining_status" {
   command = plan
 
   variables {
-    environment                = "sandbox"
-    aws_account_id             = "767397897469"
-    vpc_cidr                   = "10.102.0.0/16"
-    otp_email_from             = "noreply@notify.layerv.xyz"
-    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    environment                                      = "sandbox"
+    aws_account_id                                   = "767397897469"
+    vpc_cidr                                         = "10.102.0.0/16"
+    otp_email_from                                   = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name                       = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cell_catalog_materialization_enabled = true
     provisioned_cells = {
       cell0 = {
         cell_id               = "cell0"
@@ -683,11 +719,12 @@ run "catalog_accepts_and_canonicalizes_dynamodb_number_boundaries" {
   command = plan
 
   variables {
-    environment                = "sandbox"
-    aws_account_id             = "767397897469"
-    vpc_cidr                   = "10.102.0.0/16"
-    otp_email_from             = "noreply@notify.layerv.xyz"
-    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    environment                                      = "sandbox"
+    aws_account_id                                   = "767397897469"
+    vpc_cidr                                         = "10.102.0.0/16"
+    otp_email_from                                   = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name                       = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cell_catalog_materialization_enabled = true
     provisioned_cells = {
       cell0 = {
         cell_id               = "cell0"

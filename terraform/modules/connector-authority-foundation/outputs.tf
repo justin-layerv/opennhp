@@ -26,7 +26,7 @@ output "control_table_arns" {
 
 output "provisioned_cells" {
   description = "Validated public native-UDP cell catalog projection. Consumers must use nhp_host/nhp_port verbatim and authenticate server_public_key_b64."
-  value       = local.provisioned_cell_catalog
+  value       = var.provisioned_cell_catalog_materialization_enabled ? local.provisioned_cell_catalog : {}
 }
 
 output "authority_runtime_contract" {

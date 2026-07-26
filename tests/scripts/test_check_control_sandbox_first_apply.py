@@ -598,9 +598,29 @@ def plan_fixture() -> dict:
         "applyable": False,
         "action_invocations": [],
         "configuration": configuration_fixture(),
+        "planned_values": {
+            "outputs": {
+                "provisioned_cells": {
+                    "sensitive": False,
+                    "type": ["object", {}],
+                    "value": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
+                }
+            }
+        },
         "resource_drift": [],
         "resource_changes": changes,
     }
+
+
+def provisioned_cell_catalog_holdback_fixture() -> dict:
+    result = plan_fixture()
+    result["resource_changes"] = [
+        item
+        for item in result["resource_changes"]
+        if item["address"] not in CHECKER.PROVISIONED_CELL_RESOURCES
+    ]
+    result["planned_values"]["outputs"]["provisioned_cells"]["value"] = {}
+    return result
 
 
 def provisioned_cell_catalog_transition_fixture() -> dict:
@@ -1220,6 +1240,230 @@ def authority_runtime_steady_fixture() -> dict:
     return result
 
 
+def authority_image_update_fixture(
+    pending_addresses: set[str] | None = None,
+    *,
+    foundation_pending: bool | None = None,
+) -> dict:
+    """Exact foundation/runtime d50-to-97d migration with catalog held back.
+
+    ``pending_addresses`` models a partial-apply completion: already-applied
+    function/alias addresses are exact no-ops at the new version, while the
+    supplied subset remains update-only. By default the full migration includes
+    the foundation update; an explicit subset defaults to foundation-applied.
+    """
+    result = authority_runtime_steady_fixture()
+    result["applyable"] = True
+    result["resource_changes"] = [
+        item
+        for item in result["resource_changes"]
+        if item["address"] not in CHECKER.PROVISIONED_CELL_RESOURCES
+    ]
+    result["planned_values"]["outputs"]["provisioned_cells"]["value"] = {}
+    changes = {item["address"]: item["change"] for item in result["resource_changes"]}
+
+    image_addresses = set(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES)
+    if pending_addresses is None:
+        pending_addresses = image_addresses
+        if foundation_pending is None:
+            foundation_pending = True
+    elif foundation_pending is None:
+        foundation_pending = False
+    assert pending_addresses <= image_addresses
+    assert pending_addresses or foundation_pending
+
+    foundation = changes["module.control.terraform_data.foundation_contract"]
+    new_input = copy.deepcopy(foundation["after"]["input"])
+    new_input["authority_image_uri"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI
+    new_contract = new_input["authority_runtime_contract"]
+    new_contract["global"]["authority_image_digest"] = (
+        CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit("@", 1)[1]
+    )
+    new_source = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+    for evidence in CHECKER._authority_basis_evidence(new_input):
+        evidence["sha256"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+        evidence["source_commit"] = new_source
+
+    if foundation_pending:
+        old_input = copy.deepcopy(new_input)
+        old_input["authority_image_uri"] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+        old_input["authority_runtime_contract"]["global"][
+            "authority_image_digest"
+        ] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI.rsplit("@", 1)[1]
+        for evidence in CHECKER._authority_basis_evidence(old_input):
+            evidence["sha256"] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256
+            evidence["source_commit"] = (
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
+            )
+        contract_shape = CHECKER._mapping_shape(new_contract)
+        foundation.clear()
+        foundation.update(
+            {
+                "actions": ["update"],
+                "before": {
+                    "id": "6cdf8fea-de09-e404-1191-338120049d2e",
+                    "input": old_input,
+                    "output": copy.deepcopy(old_input),
+                    "triggers_replace": None,
+                },
+                "after": {
+                    "id": "6cdf8fea-de09-e404-1191-338120049d2e",
+                    "input": new_input,
+                    "triggers_replace": None,
+                },
+                "after_unknown": {
+                    "input": {"authority_runtime_contract": contract_shape},
+                    "output": True,
+                },
+                "before_sensitive": {
+                    "input": {"authority_runtime_contract": contract_shape},
+                    "output": {"authority_runtime_contract": contract_shape},
+                },
+                "after_sensitive": {
+                    "input": {"authority_runtime_contract": contract_shape},
+                    "output": {},
+                },
+            }
+        )
+    else:
+        contract_shape = CHECKER._mapping_shape(new_contract)
+        target_value = {
+            "id": "6cdf8fea-de09-e404-1191-338120049d2e",
+            "input": copy.deepcopy(new_input),
+            "output": copy.deepcopy(new_input),
+            "triggers_replace": None,
+        }
+        target_sensitive = {
+            "input": {"authority_runtime_contract": contract_shape},
+            "output": {"authority_runtime_contract": contract_shape},
+        }
+        foundation.clear()
+        foundation.update(
+            {
+                "actions": ["no-op"],
+                "before": copy.deepcopy(target_value),
+                "after": copy.deepcopy(target_value),
+                "after_unknown": {},
+                "before_sensitive": copy.deepcopy(target_sensitive),
+                "after_sensitive": copy.deepcopy(target_sensitive),
+            }
+        )
+
+    for fn in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+        function_address = (
+            f'module.control.aws_lambda_function.authority["{fn}"]'
+        )
+        function = changes[function_address]
+        function["after"].update(
+            {
+                "image_uri": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
+                "last_modified": "2026-07-25T05:00:00.000+0000",
+                "qualified_arn": (
+                    f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                    f"function:{fn}:6"
+                ),
+                "qualified_invoke_arn": (
+                    f"arn:aws:apigateway:{CHECKER.AWS_REGION}:lambda:path/"
+                    "2015-03-31/functions/"
+                    f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                    f"function:{fn}:6/invocations"
+                ),
+                "version": "6",
+            }
+        )
+        function["before"] = copy.deepcopy(function["after"])
+        function["before_sensitive"] = {}
+        function["after_sensitive"] = {}
+        function["before_identity"] = {
+            "account_id": CHECKER.ACCOUNT_ID,
+            "function_name": fn,
+            "region": CHECKER.AWS_REGION,
+        }
+        function["after_identity"] = copy.deepcopy(function["before_identity"])
+        if function_address in pending_addresses:
+            function["actions"] = ["update"]
+            function["before"].update(
+                {
+                    "image_uri": CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI,
+                    "last_modified": "2026-07-25T04:44:39.000+0000",
+                    "qualified_arn": (
+                        f"arn:aws:lambda:{CHECKER.AWS_REGION}:"
+                        f"{CHECKER.ACCOUNT_ID}:function:{fn}:5"
+                    ),
+                    "qualified_invoke_arn": (
+                        f"arn:aws:apigateway:{CHECKER.AWS_REGION}:lambda:path/"
+                        "2015-03-31/functions/"
+                        f"arn:aws:lambda:{CHECKER.AWS_REGION}:"
+                        f"{CHECKER.ACCOUNT_ID}:function:{fn}:5/invocations"
+                    ),
+                    "version": "5",
+                }
+            )
+            for field in CHECKER._AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS:
+                function["after"].pop(field)
+            function["after_unknown"] = {
+                field: True
+                for field in CHECKER._AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS
+            }
+
+        for color in ("blue", "green"):
+            alias_address = (
+                f'module.control.aws_lambda_alias.authority["{fn}:{color}"]'
+            )
+            alias = changes[alias_address]
+            alias["after"].update(
+                {
+                    "function_name": fn,
+                    "function_version": "6",
+                    "routing_config": [],
+                }
+            )
+            alias["before"] = copy.deepcopy(alias["after"])
+            alias["before_sensitive"] = {}
+            alias["after_sensitive"] = {}
+            if alias_address in pending_addresses:
+                alias["actions"] = ["update"]
+                alias["before"]["function_version"] = "5"
+                alias["after"].pop("function_version")
+                alias["after_unknown"] = {"function_version": True}
+
+    outputs = control_outputs_fixture()
+    result["output_changes"] = {
+        name: {
+            "actions": ["no-op"],
+            "before": copy.deepcopy(output["value"]),
+            "after": copy.deepcopy(output["value"]),
+            "after_unknown": False,
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+        for name, output in outputs.items()
+    }
+    if foundation_pending and pending_addresses == image_addresses:
+        result["output_changes"]["authority_image_uri"].update(
+            {
+                "actions": ["update"],
+                "before": CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI,
+                "after": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
+            }
+        )
+        result["output_changes"]["provisioned_cells"].update(
+            {"actions": ["create"], "before": None, "after": {}}
+        )
+    else:
+        result["output_changes"]["authority_image_uri"].update(
+            {
+                "before": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
+                "after": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
+            }
+        )
+        result["output_changes"]["provisioned_cells"].update(
+            {"before": {}, "after": {}}
+        )
+
+    return result
+
+
 def authority_runtime_partial_retry_fixture(applied_addresses: set[str]) -> dict:
     """A partial-apply RETRY of the runtime slice: every address in
     ``applied_addresses`` already applied on an earlier attempt and now replans
@@ -1335,6 +1579,11 @@ def control_outputs_fixture() -> dict[str, dict]:
         "sensitive": False,
         "type": ["tuple", ["string", "string"]],
         "value": ["subnet-fixture-a", "subnet-fixture-b"],
+    }
+    outputs["provisioned_cells"] = {
+        "sensitive": False,
+        "type": ["object", {}],
+        "value": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
     }
     return outputs
 
@@ -1929,7 +2178,13 @@ class PlanContractTests(unittest.TestCase):
             }
         }
         candidate["planned_values"] = {
-            "outputs": {},
+            "outputs": {
+                "provisioned_cells": {
+                    "sensitive": False,
+                    "type": ["object", {}],
+                    "value": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
+                }
+            },
             "root_module": {
                 "child_modules": [{"address": "module.control", "resources": []}]
             },
@@ -3626,6 +3881,229 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assertEqual(summary["bootstrap_create_count"], 0)
 
+    def test_exact_authority_image_update_and_partial_completion_pass(self) -> None:
+        exact = authority_image_update_fixture()
+        summary = CHECKER.check_plan(exact)
+        self.assertEqual(summary["plan_mode"], "authority-image-update")
+        self.assertEqual(
+            summary["resource_count"],
+            50 + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+        )
+
+        alias_only = {
+            next(
+                address
+                for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+                if resource_type == "aws_lambda_alias"
+            )
+        }
+        partial = authority_image_update_fixture(alias_only)
+        self.assertEqual(
+            CHECKER.check_plan(partial)["plan_mode"],
+            "authority-image-update",
+        )
+
+        foundation_only = authority_image_update_fixture(
+            set(), foundation_pending=True
+        )
+        self.assertEqual(
+            CHECKER.check_plan(foundation_only)["plan_mode"],
+            "authority-image-update",
+        )
+
+    def test_authority_image_update_rejects_unpinned_source_and_alias_drift(
+        self,
+    ) -> None:
+        function_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+            if resource_type == "aws_lambda_function"
+        )
+        for invalid_uri in (
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI.replace(
+                "layerv/qurl-connector-authority", "layerv/other"
+            ),
+            (
+                f"{CHECKER.ACCOUNT_ID}.dkr.ecr.{CHECKER.AWS_REGION}.amazonaws.com/"
+                "layerv/qurl-connector-authority:latest"
+            ),
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI.replace(
+                "d50ec8ee0153b4ac62491209a03442e12ca484b9ca88a72daf70a3880d77c070",
+                "0" * 64,
+            ),
+        ):
+            with self.subTest(invalid_uri=invalid_uri):
+                candidate = authority_image_update_fixture()
+                self.change(candidate, function_address)["before"]["image_uri"] = (
+                    invalid_uri
+                )
+                self.assert_rejected(candidate)
+
+        alternate_target = authority_image_update_fixture()
+        self.change(alternate_target, function_address)["after"]["image_uri"] = (
+            CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI.replace(
+                "97d3822c1ebaa2304ec4189eca45264245c6c2d87a70f9122ff742b66a085d00",
+                "f" * 64,
+            )
+        )
+        self.assert_rejected(alternate_target)
+
+        alias_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+            if resource_type == "aws_lambda_alias"
+        )
+        routing = authority_image_update_fixture()
+        self.change(routing, alias_address)["after"]["routing_config"] = [
+            {"additional_version_weights": {"4": 0.1}}
+        ]
+        self.assert_rejected(routing)
+
+        mixed = authority_image_update_fixture()
+        role_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
+            if resource_type == "aws_iam_role"
+        )
+        self.change(mixed, role_address)["actions"] = ["update"]
+        self.assert_rejected(mixed)
+
+    def test_authority_image_update_rejects_foundation_and_output_drift(
+        self,
+    ) -> None:
+        foundation_address = CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS
+
+        unrelated_contract = authority_image_update_fixture()
+        self.change(unrelated_contract, foundation_address)["after"]["input"][
+            "authority_runtime_contract"
+        ]["selected_authority_color"] = "green"
+        self.assert_rejected(unrelated_contract)
+
+        mismatched_output = authority_image_update_fixture()
+        self.change(mismatched_output, foundation_address)["before"]["output"][
+            "authority_runtime_contract"
+        ]["selected_authority_color"] = "green"
+        self.assert_rejected(mismatched_output)
+
+        wrong_old_uri = authority_image_update_fixture()
+        self.change(wrong_old_uri, foundation_address)["before"]["input"][
+            "authority_image_uri"
+        ] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI
+        self.assert_rejected(wrong_old_uri)
+
+        wrong_new_digest = authority_image_update_fixture()
+        self.change(wrong_new_digest, foundation_address)["after"]["input"][
+            "authority_runtime_contract"
+        ]["global"]["authority_image_digest"] = "sha256:" + "f" * 64
+        self.assert_rejected(wrong_new_digest)
+
+        evidence_drift = authority_image_update_fixture()
+        self.change(evidence_drift, foundation_address)["after"]["input"][
+            "authority_runtime_contract"
+        ]["functions"]["layerv-nhp-sandbox-ca-ia"]["basis_evidence"][
+            "sha256"
+        ] = "f" * 64
+        self.assert_rejected(evidence_drift)
+
+        wrong_target_source = authority_image_update_fixture()
+        self.change(wrong_target_source, foundation_address)["after"]["input"][
+            "authority_runtime_contract"
+        ]["global"]["basis_evidence"]["source_commit"] = "f" * 40
+        self.assert_rejected(wrong_target_source)
+
+        trigger_drift = authority_image_update_fixture()
+        self.change(trigger_drift, foundation_address)["after"][
+            "triggers_replace"
+        ] = ["unexpected"]
+        self.assert_rejected(trigger_drift)
+
+        unknown_drift = authority_image_update_fixture()
+        self.change(unknown_drift, foundation_address)["after_unknown"][
+            "triggers_replace"
+        ] = True
+        self.assert_rejected(unknown_drift)
+
+        sensitive_drift = authority_image_update_fixture()
+        self.change(sensitive_drift, foundation_address)["after_sensitive"][
+            "output"
+        ] = {"unexpected": {}}
+        self.assert_rejected(sensitive_drift)
+
+        unrelated_output = authority_image_update_fixture()
+        unrelated_output["output_changes"]["authority_data_kms_key_arn"][
+            "after"
+        ] = "drift"
+        self.assert_rejected(unrelated_output)
+
+        wrong_image_output = authority_image_update_fixture()
+        wrong_image_output["output_changes"]["authority_image_uri"]["after"] = (
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+        )
+        self.assert_rejected(wrong_image_output)
+
+    def test_authority_image_recovery_requires_exact_new_noops(self) -> None:
+        candidate = authority_image_update_fixture(set(), foundation_pending=True)
+        function_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+            if resource_type == "aws_lambda_function"
+        )
+        change = self.change(candidate, function_address)
+        for side in ("before", "after"):
+            change[side]["image_uri"] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+        self.assert_rejected(candidate)
+
+        alias_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+            if resource_type == "aws_lambda_alias"
+        )
+        old_foundation = authority_image_update_fixture({alias_address})
+        foundation = self.change(
+            old_foundation, CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS
+        )
+        for side in ("before", "after"):
+            foundation[side]["input"]["authority_image_uri"] = (
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+            )
+            foundation[side]["output"]["authority_image_uri"] = (
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+            )
+        self.assert_rejected(old_foundation)
+
+        malformed_complement = authority_image_update_fixture({alias_address})
+        complement_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES.items()
+            if resource_type == "aws_lambda_function"
+        )
+        complement = self.change(malformed_complement, complement_address)
+        for side in ("before", "after"):
+            complement[side]["version"] = "0"
+        self.assert_rejected(malformed_complement)
+
+        unknown_complement = authority_image_update_fixture({alias_address})
+        self.change(unknown_complement, complement_address)["after_unknown"][
+            "unexpected"
+        ] = True
+        self.assert_rejected(unknown_complement)
+
+        sensitive_complement = authority_image_update_fixture({alias_address})
+        sensitive_change = self.change(sensitive_complement, complement_address)
+        sensitive_change["before_sensitive"] = {"unexpected": True}
+        sensitive_change["after_sensitive"] = {"unexpected": True}
+        self.assert_rejected(sensitive_complement)
+
+        identity_complement = authority_image_update_fixture({alias_address})
+        self.change(identity_complement, complement_address)["after_identity"][
+            "account_id"
+        ] = "000000000000"
+        self.assert_rejected(identity_complement)
+
+        extra_envelope = authority_image_update_fixture()
+        self.change(extra_envelope, alias_address)["unexpected"] = False
+        self.assert_rejected(extra_envelope)
+
     def test_authority_runtime_steady_state_noop_passes(self) -> None:
         summary = CHECKER.check_plan(authority_runtime_steady_fixture())
         self.assertEqual(summary["plan_mode"], "no-op")
@@ -4144,6 +4622,37 @@ class PlanContractTests(unittest.TestCase):
         unequal_noop["resource_changes"][0]["change"]["after"] = {"id": "changed"}
         self.assert_rejected(unequal_noop)
 
+    def test_catalog_holdback_is_exact_all_or_nothing(self) -> None:
+        holdback = provisioned_cell_catalog_holdback_fixture()
+        summary = CHECKER.check_plan(holdback)
+        self.assertEqual(summary["resource_count"], 50)
+        self.assertEqual(summary["plan_mode"], "no-op")
+
+        partial = provisioned_cell_catalog_holdback_fixture()
+        partial["resource_changes"].append(
+            copy.deepcopy(
+                next(
+                    item
+                    for item in plan_fixture()["resource_changes"]
+                    if item["address"]
+                    == CHECKER.PROVISIONED_CELL_ADDRESSES["cell0"]
+                )
+            )
+        )
+        self.assert_rejected(partial)
+
+        full_output_without_rows = provisioned_cell_catalog_holdback_fixture()
+        full_output_without_rows["planned_values"]["outputs"][
+            "provisioned_cells"
+        ]["value"] = copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG)
+        self.assert_rejected(full_output_without_rows)
+
+        empty_output_with_rows = plan_fixture()
+        empty_output_with_rows["planned_values"]["outputs"]["provisioned_cells"][
+            "value"
+        ] = {}
+        self.assert_rejected(empty_output_with_rows)
+
     def test_configuration_actions_and_provisioners_fail(self) -> None:
         action = plan_fixture()
         action["action_invocations"] = [{"action": "aws_lambda_invoke.forbidden"}]
@@ -4463,6 +4972,25 @@ class StateListTests(unittest.TestCase):
             self.check(self.expected_addresses()),
             {"data_resource_count": 6, "managed_resource_count": 52},
         )
+
+    def test_catalog_holdback_inventory_is_exact_all_or_nothing(self) -> None:
+        held_back = [
+            address
+            for address in self.expected_addresses()
+            if address not in CHECKER.PROVISIONED_CELL_RESOURCES
+        ]
+        self.assertEqual(
+            self.check(held_back),
+            {"data_resource_count": 6, "managed_resource_count": 50},
+        )
+
+        partial = [
+            address
+            for address in self.expected_addresses()
+            if address != CHECKER.PROVISIONED_CELL_ADDRESSES["cell0"]
+        ]
+        with self.assertRaises(CHECKER.ContractError):
+            self.check(partial)
 
     def test_missing_managed_or_data_address_fails(self) -> None:
         for address in (
@@ -4838,6 +5366,30 @@ class StateContractTests(unittest.TestCase):
 
     def test_exact_state_passes(self) -> None:
         self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 52)
+
+    def test_catalog_holdback_state_is_exact_and_output_bound(self) -> None:
+        holdback = state_fixture()
+        holdback["values"]["root_module"]["resources"] = [
+            item
+            for item in holdback["values"]["root_module"]["resources"]
+            if item["address"] not in CHECKER.PROVISIONED_CELL_RESOURCES
+        ]
+        holdback["values"]["outputs"]["provisioned_cells"]["value"] = {}
+        self.assertEqual(CHECKER.check_state(holdback)["resource_count"], 50)
+
+        full_output = copy.deepcopy(holdback)
+        full_output["values"]["outputs"]["provisioned_cells"]["value"] = (
+            copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG)
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(full_output)
+
+        empty_output_with_rows = state_fixture()
+        empty_output_with_rows["values"]["outputs"]["provisioned_cells"][
+            "value"
+        ] = {}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(empty_output_with_rows)
 
     def test_state_rejects_catalog_row_or_public_output_drift(self) -> None:
         missing_row = state_fixture()

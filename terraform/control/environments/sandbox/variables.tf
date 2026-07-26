@@ -110,6 +110,17 @@ variable "provisioned_cells" {
   }
 }
 
+variable "provisioned_cell_catalog_materialization_enabled" {
+  description = "Temporary one-transition rollout gate. The reviewed catalog remains available to the Authority contract while false, but Terraform neither materializes nor publishes catalog rows until the Authority-only transition is verified."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.provisioned_cell_catalog_materialization_enabled
+    error_message = "The sandbox provisioned-cell catalog must remain unmaterialized during the temporary Authority-first rollout holdback."
+  }
+}
+
 variable "authority_runtime_contract" {
   description = "Nullable closed Connector Authority runtime contract. The permanent workflow supplies the only supported non-null value through its exact-main byte-verifying generator."
   type        = any

@@ -68,6 +68,17 @@ variable "provisioned_cells" {
   }
 }
 
+variable "provisioned_cell_catalog_materialization_enabled" {
+  description = "Production catalog materialization remains disabled throughout sandbox proof."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.provisioned_cell_catalog_materialization_enabled
+    error_message = "Production provisioned-cell catalog materialization must remain disabled throughout sandbox proof."
+  }
+}
+
 variable "authority_runtime_contract" {
   description = "Production Connector Authority runtime contract. It remains unconditionally null throughout sandbox measurement."
   type        = any
