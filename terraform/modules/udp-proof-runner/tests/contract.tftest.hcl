@@ -87,6 +87,8 @@ variables {
     "arn:aws:kms:us-east-2:767397897469:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     "arn:aws:kms:us-east-2:767397897469:key/11111111-aaaa-bbbb-cccc-222222222222",
   ]
+  runtime_attestation_bucket_arn  = "arn:aws:s3:::layerv-nhp-sandbox-runtime-attestations"
+  runtime_attestation_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/33333333-aaaa-bbbb-cccc-444444444444"
 }
 
 run "secure_ephemeral_runner_contract" {
@@ -189,6 +191,97 @@ run "secure_ephemeral_runner_contract" {
       jsondecode(aws_iam_role.controller.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
     )
     error_message = "Controller OIDC trust must be exact-repository and exact-protected-environment scoped."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.manifest_producer.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:layervai/nhp:environment:udp-proof-manifest-sandbox" &&
+      jsondecode(aws_iam_role.manifest_producer.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com" &&
+      output.manifest_producer_role_arn == aws_iam_role.manifest_producer.arn
+    )
+    error_message = "The manifest producer must have its own exact protected-environment OIDC trust and output."
+  }
+
+  assert {
+    condition = (
+      toset([for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid]) == toset([
+        "ReadExactPublicRuntimeParameters",
+        "ReadExactRepairDocument",
+        "ReadProvisionedCellCatalog",
+        "ReadExactRuntimeImages",
+        "ReadECRAuthorizationToken",
+        "ReadExactAuthorityFunctions",
+        "ReadExactECSDeployments",
+        "DescribeExactECSTasks",
+        "ListExactECSTasks",
+        "ReadExactECSTaskDefinitions",
+        "ReadExactInstanceProfiles",
+        "ReadExactPublicDNSZone",
+        "ReadRegionalFleetTopology",
+        "ConfirmSandboxIdentity",
+      ]) &&
+      !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "secretsmanager:") &&
+      !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "kms:Decrypt") &&
+      !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "ssm:GetParametersByPath") &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactPublicRuntimeParameters"].Resource) == 8 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRepairDocument"].Resource == "arn:aws:ssm:us-east-2:767397897469:document/layerv-nhp-sandbox-runtime-attestation-repair" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadProvisionedCellCatalog"].Action == "dynamodb:GetItem" &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRuntimeImages"].Resource) == 5 &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRuntimeImages"].Action) == toset(["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Action == "ecr:GetAuthorizationToken" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2" &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactAuthorityFunctions"].Resource) == 22 &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactECSDeployments"].Resource) == toset([
+        "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-control-hub/layerv-nhp-sandbox-control-hub",
+        "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-cell0-qurl-api/layerv-nhp-sandbox-cell0-qurl-api",
+        "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-cell1-qurl-api/layerv-nhp-sandbox-cell1-qurl-api",
+      ]) &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["DescribeExactECSTasks"].Resource) == 3 &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["DescribeExactECSTasks"].Condition.ArnEquals["ecs:cluster"]) == 3 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ListExactECSTasks"].Resource == "*" &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ListExactECSTasks"].Condition.ArnEquals["ecs:cluster"]) == 3 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactECSTaskDefinitions"].Resource == "*" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactECSTaskDefinitions"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2" &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadRegionalFleetTopology"].Action) == toset([
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeInstanceRefreshes",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroups",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "ssm:DescribeAssociation",
+        "ssm:DescribeAssociationExecutions",
+        "ssm:DescribeAssociationExecutionTargets",
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadRegionalFleetTopology"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2"
+    )
+    error_message = "The manifest producer core policy must remain read-only and exact-resource scoped wherever AWS supports it."
+  }
+
+  assert {
+    condition = (
+      length(aws_iam_role_policy.manifest_producer_attestations) == 1 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["ReadAttestationBucketControls"].Resource == var.runtime_attestation_bucket_arn &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["ReadAttestationBucketControls"].Action) == toset(["s3:GetBucketEncryption", "s3:GetBucketOwnershipControls", "s3:GetBucketPolicy", "s3:GetBucketPolicyStatus", "s3:GetBucketPublicAccessBlock", "s3:GetBucketVersioning"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["ListVersionedRuntimeAttestations"].Condition.StringLike["s3:prefix"] == "runtime/*" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["ReadImmutableRuntimeAttestationVersions"].Action == "s3:GetObjectVersion" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Resource == var.runtime_attestation_kms_key_arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.StringEquals["kms:ViaService"] == "s3.us-east-2.amazonaws.com" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.ArnLike["kms:EncryptionContext:aws:s3:arn"] == "${var.runtime_attestation_bucket_arn}/runtime/*"
+    )
+    error_message = "Runtime-attestation access must be version-only, prefix-scoped, and exact-key/context bound."
+  }
+
+  assert {
+    condition = (
+      length(aws_iam_role_policy.manifest_producer_core.policy) +
+      length(aws_iam_role_policy.manifest_producer_attestations[0].policy)
+    ) <= 10240
+    error_message = "The manifest producer's aggregate inline-policy text must remain within IAM's 10,240-character role quota."
   }
 
   assert {
@@ -298,6 +391,20 @@ run "reject_cross_account_proof_key" {
   }
 
   expect_failures = [aws_iam_role_policy.runner]
+}
+
+run "omit_attestation_access_until_storage_is_pinned" {
+  command = plan
+
+  variables {
+    runtime_attestation_bucket_arn  = null
+    runtime_attestation_kms_key_arn = null
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.manifest_producer_attestations) == 0
+    error_message = "The manifest producer must receive no wildcard or placeholder attestation access before exact storage is provisioned."
+  }
 }
 
 run "reject_noncanonical_ami_length" {

@@ -68,6 +68,20 @@ variable "proof_kms_key_arns" {
   default     = null
 }
 
+variable "runtime_attestation_bucket_arn" {
+  description = "Exact versioned sandbox runtime-attestation bucket ARN; null until the collector storage predecessor is provisioned."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "runtime_attestation_kms_key_arn" {
+  description = "Exact CMK ARN for runtime-attestation objects; set with runtime_attestation_bucket_arn."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

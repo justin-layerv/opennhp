@@ -75,6 +75,12 @@ remain proof consumers; neither should grow an AWS runner control plane.
   key through Secrets Manager, and the controller has no `GetSecretValue`
   permission with which to turn its service-bound decrypt grant into a secret
   read path.
+- The distinct deployment-manifest producer is trusted only for
+  `repo:layervai/nhp:environment:udp-proof-manifest-sandbox`. It is read-only:
+  exact public SSM parameters, catalog rows, runtime images/functions/tasks,
+  fleet identity, public DNS, and immutable versioned attestations. Its S3/KMS
+  statement does not exist until the composing root pins both exact storage
+  ARNs; it never shares the runner controller's mutation permissions.
 - The serialized broker starts the exact Terraform-owned launch-template
   version. The workflow cannot override user data, the instance profile, AMI,
   instance type, storage, or network interface. AWS's
@@ -119,6 +125,11 @@ The composing PR must:
    credentials only in that protected environment. NHP remains the sole
    OIDC/AWS controller; neither client repository receives the controller role,
    EC2 permissions, or broker credentials.
+   Separately create `udp-proof-manifest-sandbox`, restrict it to NHP `main`,
+   and store only the dedicated read-only manifest GitHub App credentials
+   there. That App is installed on the producer's exact repository set with
+   Actions, Attestations, Contents, Packages, and Pull requests read
+   permissions; it has no write permission and is not reused as the JIT App.
 4. Create a dedicated `udp-proof-sandbox` organization runner group with
    `visibility=selected` and repository access restricted to exactly private
    `layervai/qurl-connector` plus public `layervai/qurl-go`. Because qurl-go is

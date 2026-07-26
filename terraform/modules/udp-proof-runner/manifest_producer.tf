@@ -1,0 +1,310 @@
+locals {
+  manifest_producer_role_name = "${var.name_prefix}-udp-proof-manifest-producer"
+  manifest_producer_sub       = "repo:${var.github_repository}:environment:${var.manifest_github_environment}"
+
+  manifest_ssm_parameters = [
+    "sandbox/nhp/control/hub/identity/public-key",
+    "sandbox/nhp/udp-proof/runtime-attestation-bucket-arn",
+    "sandbox/nhp/udp-proof/runtime-attestation-collector-contract",
+    "sandbox/nhp/server/asg-name",
+    "sandbox-cell1/nhp/server/asg-name",
+    "sandbox/nhp/reverse-tunnel-server/asg-name",
+    "sandbox/nhp/qurl-service/runtime-contract",
+    "sandbox-cell1/nhp/qurl-service/runtime-contract",
+  ]
+  manifest_ssm_parameter_arns = [
+    for parameter in local.manifest_ssm_parameters :
+    "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter/${parameter}"
+  ]
+  manifest_ecr_repositories = [
+    "layerv/nhp-hub",
+    "layerv/nhp-qurl",
+    "layerv/nhp-server",
+    "layerv/qurl-connector-authority",
+    "layerv/qurl-reverse-tunnel-server",
+  ]
+  manifest_ecr_repository_arns = [
+    for repository in local.manifest_ecr_repositories :
+    "arn:${data.aws_partition.current.partition}:ecr:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:repository/${repository}"
+  ]
+  manifest_authority_functions = [
+    "layerv-nhp-sandbox-ca-ar-cell0",
+    "layerv-nhp-sandbox-ca-ar-cell1",
+    "layerv-nhp-sandbox-ca-ccr-cell0",
+    "layerv-nhp-sandbox-ca-ccr-cell1",
+    "layerv-nhp-sandbox-ca-cr-cell0",
+    "layerv-nhp-sandbox-ca-cr-cell1",
+    "layerv-nhp-sandbox-ca-ia",
+    "layerv-nhp-sandbox-ca-icr",
+    "layerv-nhp-sandbox-ca-iro-cell0",
+    "layerv-nhp-sandbox-ca-iro-cell1",
+    "layerv-nhp-sandbox-ca-ra",
+  ]
+  manifest_authority_function_arns = flatten([
+    for function in local.manifest_authority_functions : [
+      "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function}",
+      "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function}:*",
+    ]
+  ])
+  manifest_ecs_clusters = [
+    "layerv-nhp-sandbox-control-hub",
+    "layerv-nhp-sandbox-cell0-qurl-api",
+    "layerv-nhp-sandbox-cell1-qurl-api",
+  ]
+  manifest_ecs_cluster_arns = [
+    for cluster in local.manifest_ecs_clusters :
+    "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:cluster/${cluster}"
+  ]
+  manifest_ecs_service_arns = [
+    for cluster in local.manifest_ecs_clusters :
+    "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:service/${cluster}/${cluster}"
+  ]
+  manifest_ecs_task_arns = [
+    for cluster in local.manifest_ecs_clusters :
+    "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:task/${cluster}/*"
+  ]
+  manifest_instance_profile_arns = [
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-server",
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-cell1-server",
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-frps",
+  ]
+}
+
+resource "aws_iam_role" "manifest_producer" {
+  name        = local.manifest_producer_role_name
+  description = "Read-only trusted-main producer for exact sandbox UDP proof deployment evidence"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Principal = {
+        Federated = var.github_oidc_provider_arn
+      }
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = local.manifest_producer_sub
+        }
+      }
+    }]
+  })
+
+  max_session_duration = 3600
+  tags                 = local.tags
+}
+
+resource "aws_iam_role_policy" "manifest_producer_core" {
+  name = "udp-proof-manifest-read"
+  role = aws_iam_role.manifest_producer.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadExactPublicRuntimeParameters"
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = local.manifest_ssm_parameter_arns
+      },
+      {
+        Sid      = "ReadExactRepairDocument"
+        Effect   = "Allow"
+        Action   = "ssm:GetDocument"
+        Resource = "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:document/${var.name_prefix}-runtime-attestation-repair"
+      },
+      {
+        Sid      = "ReadProvisionedCellCatalog"
+        Effect   = "Allow"
+        Action   = "dynamodb:GetItem"
+        Resource = "arn:${data.aws_partition.current.partition}:dynamodb:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:table/${var.name_prefix}-control-connector-authority"
+      },
+      {
+        Sid    = "ReadExactRuntimeImages"
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ]
+        Resource = local.manifest_ecr_repository_arns
+      },
+      {
+        Sid      = "ReadECRAuthorizationToken"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.region
+          }
+        }
+      },
+      {
+        Sid      = "ReadExactAuthorityFunctions"
+        Effect   = "Allow"
+        Action   = ["lambda:GetAlias", "lambda:GetFunction", "lambda:ListProvisionedConcurrencyConfigs"]
+        Resource = local.manifest_authority_function_arns
+      },
+      {
+        Sid      = "ReadExactECSDeployments"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeServices"
+        Resource = local.manifest_ecs_service_arns
+      },
+      {
+        Sid      = "DescribeExactECSTasks"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTasks"
+        Resource = local.manifest_ecs_task_arns
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = local.manifest_ecs_cluster_arns
+          }
+        }
+      },
+      {
+        Sid      = "ListExactECSTasks"
+        Effect   = "Allow"
+        Action   = "ecs:ListTasks"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.region
+          }
+          ArnEquals = {
+            "ecs:cluster" = local.manifest_ecs_cluster_arns
+          }
+        }
+      },
+      {
+        Sid      = "ReadExactECSTaskDefinitions"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTaskDefinition"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.region
+          }
+        }
+      },
+      {
+        Sid      = "ReadExactInstanceProfiles"
+        Effect   = "Allow"
+        Action   = "iam:GetInstanceProfile"
+        Resource = local.manifest_instance_profile_arns
+      },
+      {
+        Sid      = "ReadExactPublicDNSZone"
+        Effect   = "Allow"
+        Action   = "route53:ListResourceRecordSets"
+        Resource = "arn:${data.aws_partition.current.partition}:route53:::hostedzone/Z10394893FM38A1RXLL32"
+      },
+      {
+        Sid    = "ReadRegionalFleetTopology"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeInstanceRefreshes",
+          "ec2:DescribeAddresses",
+          "ec2:DescribeInstances",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeSecurityGroups",
+          "elasticloadbalancing:DescribeListeners",
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeTargetGroups",
+          "elasticloadbalancing:DescribeTargetHealth",
+          "ssm:DescribeAssociation",
+          "ssm:DescribeAssociationExecutions",
+          "ssm:DescribeAssociationExecutionTargets",
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.region
+          }
+        }
+      },
+      {
+        Sid      = "ConfirmSandboxIdentity"
+        Effect   = "Allow"
+        Action   = "sts:GetCallerIdentity"
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "manifest_producer_attestations" {
+  count = var.runtime_attestation_bucket_arn == null ? 0 : 1
+
+  name = "udp-proof-runtime-attestation-read"
+  role = aws_iam_role.manifest_producer.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadAttestationBucketControls"
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketEncryption",
+          "s3:GetBucketOwnershipControls",
+          "s3:GetBucketPolicy",
+          "s3:GetBucketPolicyStatus",
+          "s3:GetBucketPublicAccessBlock",
+          "s3:GetBucketVersioning",
+        ]
+        Resource = var.runtime_attestation_bucket_arn
+      },
+      {
+        Sid      = "ListVersionedRuntimeAttestations"
+        Effect   = "Allow"
+        Action   = "s3:ListBucketVersions"
+        Resource = var.runtime_attestation_bucket_arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = "runtime/*"
+          }
+        }
+      },
+      {
+        Sid      = "ReadImmutableRuntimeAttestationVersions"
+        Effect   = "Allow"
+        Action   = "s3:GetObjectVersion"
+        Resource = "${var.runtime_attestation_bucket_arn}/runtime/*"
+      },
+      {
+        Sid      = "DecryptOnlyAttestationObjects"
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = var.runtime_attestation_kms_key_arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "s3.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+          }
+          ArnLike = {
+            "kms:EncryptionContext:aws:s3:arn" = "${var.runtime_attestation_bucket_arn}/runtime/*"
+          }
+        }
+      },
+    ]
+  })
+
+  lifecycle {
+    precondition {
+      condition = (
+        startswith(
+          var.runtime_attestation_bucket_arn,
+          "arn:${data.aws_partition.current.partition}:s3:::layerv-nhp-sandbox-",
+        ) &&
+        startswith(
+          var.runtime_attestation_kms_key_arn,
+          "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/",
+        )
+      )
+      error_message = "Runtime attestation storage must be an exact sandbox-owned bucket and current-account regional KMS key."
+    }
+  }
+}

@@ -51,5 +51,8 @@ module "udp_proof_runner" {
   # override with the qurl-connector-confirmed key(s) via proof_kms_key_arns.
   proof_kms_key_arns = var.proof_kms_key_arns != null ? var.proof_kms_key_arns : [aws_kms_key.proof_agent_seal.arn]
 
+  runtime_attestation_bucket_arn  = var.runtime_attestation_bucket_arn
+  runtime_attestation_kms_key_arn = var.runtime_attestation_kms_key_arn
+
   tags = local.common_tags
 }

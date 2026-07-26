@@ -266,6 +266,13 @@ jobs:
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
 
+      - name: Test UDP proof deployment-manifest contracts
+        run: |
+          python3 -m unittest -v \
+            tests.scripts.test_udp_proof_deployment_collector \
+            tests.scripts.test_udp_proof_deployment_contract \
+            tests.scripts.test_udp_proof_deployment_workflow
+
       # Both Claude entry points must use the same proven action SHA and explicit
       # model. Automatic review must remain a default-branch-trusted
       # pull_request_target, same-repo, non-bot, ready-candidate terminal gate

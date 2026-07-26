@@ -113,6 +113,58 @@ variable "github_environment" {
   }
 }
 
+variable "manifest_github_environment" {
+  description = "Protected GitHub environment used only by the trusted-main deployment-manifest producer."
+  type        = string
+  default     = "udp-proof-manifest-sandbox"
+
+  validation {
+    condition     = var.manifest_github_environment == "udp-proof-manifest-sandbox"
+    error_message = "manifest_github_environment must remain udp-proof-manifest-sandbox."
+  }
+}
+
+variable "runtime_attestation_bucket_arn" {
+  description = "Exact versioned sandbox bucket ARN for runtime attestations. Null keeps S3 access absent until the collector predecessor is provisioned."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.runtime_attestation_bucket_arn == null ||
+      can(regex("^arn:aws[a-z-]*:s3:::layerv-nhp-sandbox-[a-z0-9.-]+$", var.runtime_attestation_bucket_arn))
+    )
+    error_message = "runtime_attestation_bucket_arn must be null or one exact layerv-nhp-sandbox-* bucket ARN."
+  }
+}
+
+variable "runtime_attestation_kms_key_arn" {
+  description = "Exact CMK ARN for the runtime-attestation bucket. Must be set or unset with runtime_attestation_bucket_arn."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      (var.runtime_attestation_bucket_arn == null) ==
+      (var.runtime_attestation_kms_key_arn == null)
+    )
+    error_message = "runtime_attestation_bucket_arn and runtime_attestation_kms_key_arn must be set or unset together."
+  }
+
+  validation {
+    condition = (
+      var.runtime_attestation_kms_key_arn == null ||
+      can(regex(
+        "^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$",
+        var.runtime_attestation_kms_key_arn,
+      ))
+    )
+    error_message = "runtime_attestation_kms_key_arn must be null or one exact KMS key ARN."
+  }
+}
+
 variable "runner_archive_url" {
   description = "Exact official GitHub Actions runner linux-x64 release archive URL."
   type        = string

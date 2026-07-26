@@ -13,6 +13,11 @@ output "controller_role_arn" {
   value       = module.udp_proof_runner.controller_role_arn
 }
 
+output "manifest_producer_role_arn" {
+  description = "The trusted-main read-only deployment-manifest producer role ARN."
+  value       = module.udp_proof_runner.manifest_producer_role_arn
+}
+
 output "broker_function_name" {
   description = "The serialized broker Lambda that launches one JIT runner per approved proof."
   value       = module.udp_proof_runner.broker_function_name

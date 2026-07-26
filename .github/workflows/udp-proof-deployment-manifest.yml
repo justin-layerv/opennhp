@@ -1,0 +1,254 @@
+name: UDP Proof Deployment Manifest
+
+# Trusted-main, read-only producer for the exact deployment observation consumed
+# by the attended UDP proof controller. Operator inputs identify candidates and
+# an already-successful canary; no deployment identity is accepted as input.
+on:
+  workflow_dispatch:
+    inputs:
+      proof_phase:
+        description: Proof lifecycle phase
+        required: true
+        type: choice
+        options:
+          - pre_removal
+          - post_removal
+      qurl_connector_pr_number:
+        description: Current open same-repository qurl-connector PR number
+        required: true
+        type: string
+      qurl_go_pr_number:
+        description: Current open same-repository qurl-go PR number
+        required: true
+        type: string
+      connector_canary_run_id:
+        description: Successful trusted-main Connector canary workflow run ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: udp-proof-deployment-manifest-sandbox
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  PRODUCER_ROLE_ARN: arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-manifest-producer
+
+jobs:
+  produce:
+    name: Authenticate and observe exact sandbox deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: udp-proof-manifest-sandbox
+    steps:
+      - name: Check out the trusted producer snapshot
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the producer runtime
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Require the current signed main workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          expected_workflow_ref="${GITHUB_REPOSITORY}/.github/workflows/udp-proof-deployment-manifest.yml@refs/heads/main"
+          if [[ "${EVENT_REF}" != "refs/heads/main" ]] ||
+             [[ "${WORKFLOW_REF}" != "${expected_workflow_ref}" ]]; then
+            echo "::error::The deployment-manifest producer must be dispatched from main."
+            exit 1
+          fi
+          main_sha="$(timeout 30s gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ ! "${main_sha}" =~ ^[0-9a-f]{40}$ ]] || [[ "${EVENT_SHA}" != "${main_sha}" ]]; then
+            echo "::error::The dispatch is not running the current main commit."
+            exit 1
+          fi
+          commit="$(timeout 30s gh api "repos/${GITHUB_REPOSITORY}/commits/${EVENT_SHA}")"
+          jq -e --arg sha "${EVENT_SHA}" \
+            '.sha == $sha and .commit.verification.verified == true and .commit.verification.reason == "valid"' \
+            <<< "${commit}" >/dev/null ||
+            {
+              echo "::error::The trusted producer commit is not GitHub signature-verified."
+              exit 1
+            }
+
+      - name: Mint the exact read-only evidence token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_MANIFEST_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_MANIFEST_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            frp
+            nhp
+            qurl-connector
+            qurl-go
+            qurl-integrations
+            qurl-mcp
+            qurl-python
+            qurl-reverse-tunnel-server
+            qurl-service
+            qurl-typescript
+            website
+          permission-actions: read
+          permission-attestations: read
+          permission-contents: read
+          permission-packages: read
+          permission-pull-requests: read
+
+      - name: Resolve current candidates and trusted canary
+        id: metadata
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CONNECTOR_PR_NUMBER: ${{ inputs.qurl_connector_pr_number }}
+          QURL_GO_PR_NUMBER: ${{ inputs.qurl_go_pr_number }}
+          CANARY_RUN_ID: ${{ inputs.connector_canary_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -m 700 evidence canary
+          python3 .github/scripts/collect_udp_proof_deployment_evidence.py \
+            github-metadata \
+            --connector-pr-number "${CONNECTOR_PR_NUMBER}" \
+            --qurl-go-pr-number "${QURL_GO_PR_NUMBER}" \
+            --canary-run-id "${CANARY_RUN_ID}" \
+            --output evidence/github-metadata.json \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Download the exact canary evidence artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.metadata.outputs.canary_artifact_id }}
+          path: canary
+          merge-multiple: true
+          repository: layervai/qurl-connector
+          run-id: ${{ inputs.connector_canary_run_id }}
+          github-token: ${{ steps.app.outputs.token }}
+          digest-mismatch: error
+
+      - name: Validate every canary evidence file
+        id: canary
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/collect_udp_proof_deployment_evidence.py \
+            github-files \
+            --metadata evidence/github-metadata.json \
+            --directory canary \
+            --output evidence/github-evidence.json \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Verify the private canary signature and exact attestation
+        env:
+          GHCR_TOKEN: ${{ steps.app.outputs.token }}
+          IMAGE_REF: ${{ steps.canary.outputs.canary_image_ref }}
+          CANARY_WORKFLOW_SHA: ${{ steps.metadata.outputs.canary_head_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" |
+            docker login ghcr.io --username x-access-token --password-stdin >/dev/null
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          identity='^https://github\.com/layervai/qurl-connector/\.github/workflows/connector-canary-publish\.yml@refs/heads/main$'
+          issuer='https://token.actions.githubusercontent.com'
+          cosign verify "${IMAGE_REF}" \
+            --certificate-identity-regexp "${identity}" \
+            --certificate-oidc-issuer "${issuer}" \
+            --certificate-github-workflow-name "Connector Canary Publish" \
+            --certificate-github-workflow-ref "refs/heads/main" \
+            --certificate-github-workflow-repository "layervai/qurl-connector" \
+            --certificate-github-workflow-sha "${CANARY_WORKFLOW_SHA}" >/dev/null
+          cosign verify-attestation "${IMAGE_REF}" \
+            --type https://layerv.ai/attestations/qurl-connector-canary/v1 \
+            --certificate-identity-regexp "${identity}" \
+            --certificate-oidc-issuer "${issuer}" \
+            --certificate-github-workflow-name "Connector Canary Publish" \
+            --certificate-github-workflow-ref "refs/heads/main" \
+            --certificate-github-workflow-repository "layervai/qurl-connector" \
+            --certificate-github-workflow-sha "${CANARY_WORKFLOW_SHA}" \
+            > evidence/verified-attestations.json
+          matched=false
+          while IFS= read -r payload; do
+            if printf '%s' "${payload}" | base64 --decode > evidence/statement.json &&
+               jq -e --slurpfile expected canary/provenance.json \
+                 '.predicate == $expected[0]' evidence/statement.json >/dev/null; then
+              matched=true
+              break
+            fi
+          done < <(jq -s -r \
+            '.[] | if type == "array" then .[] else . end | .payload' \
+            evidence/verified-attestations.json)
+          rm -f evidence/statement.json evidence/verified-attestations.json
+          if [[ "${matched}" != "true" ]]; then
+            echo "::error::No verified attestation contains the exact canary provenance."
+            exit 1
+          fi
+
+      - name: Assume the dedicated sandbox evidence-reader role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.PRODUCER_ROLE_ARN }}
+          role-session-name: udp-proof-manifest-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 1800
+
+      - name: Observe live AWS deployment and build the closed snapshot
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" |
+            docker login \
+              767397897469.dkr.ecr.us-east-2.amazonaws.com \
+              --username AWS \
+              --password-stdin >/dev/null
+          trap 'docker logout 767397897469.dkr.ecr.us-east-2.amazonaws.com >/dev/null 2>&1 || true' EXIT
+          python3 .github/scripts/collect_udp_proof_deployment_evidence.py \
+            aws-build \
+            --github-evidence evidence/github-evidence.json \
+            --proof-phase "${PROOF_PHASE}" \
+            --output evidence/snapshot.json
+
+      - name: Render exactly three canonical proof inputs
+        env:
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/produce_udp_proof_deployment_manifest.py \
+            --snapshot evidence/snapshot.json \
+            --output-directory artifact \
+            --proof-phase "${PROOF_PHASE}" \
+            --producer-run-id "${GITHUB_RUN_ID}" \
+            --producer-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --producer-head-sha "${GITHUB_SHA}"
+          count="$(find artifact -mindepth 1 -maxdepth 1 -type f -print | wc -l)"
+          nonfiles="$(find artifact -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          [[ "${count}" = "3" && -z "${nonfiles}" ]] ||
+            {
+              echo "::error::Artifact output is not exactly three regular files."
+              exit 1
+            }
+
+      - name: Upload the immutable deployment manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: udp-proof-deployment-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifact
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false

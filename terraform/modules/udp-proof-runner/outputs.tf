@@ -3,6 +3,11 @@ output "controller_role_arn" {
   value       = aws_iam_role.controller.arn
 }
 
+output "manifest_producer_role_arn" {
+  description = "Read-only OIDC role assumed only by NHP's protected trusted-main deployment-manifest producer."
+  value       = aws_iam_role.manifest_producer.arn
+}
+
 output "broker_function_name" {
   description = "Invoke with strict action, github_run_id, and github_run_attempt commands; scheduled sweeps use the same bounded broker."
   value       = aws_lambda_function.broker.function_name
