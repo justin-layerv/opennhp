@@ -7855,16 +7855,27 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         if not isinstance(name, str):
             raise ContractError("Control Lambda inventory evidence is malformed")
         live_lambda_names.add(name)
-    authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS)
+    # This proof runs BEFORE the apply, so it must admit the predecessor state as
+    # well as the successor. The complete graph is the 11 functions, but the
+    # legacy Hub-only trio is exactly what is live until the expansion applies;
+    # accepting only the 11 makes that expansion unappliable, because the gate
+    # demands the very functions the apply is about to create. Both sets are
+    # named constants and each is matched whole, so this admits two exact live
+    # shapes rather than relaxing the check to a subset or prefix test.
+    complete_authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS)
+    legacy_authority_functions = set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)
     if live_lambda_names not in (
         set(),
-        authority_functions,
-        authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
+        legacy_authority_functions,
+        legacy_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
+        complete_authority_functions,
+        complete_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
     ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "11 complete Authority functions (plus the Hub keygen once the worker "
-            "slice is live) are admitted"
+            "3 legacy Hub-facing Authority functions or the exact 11 complete "
+            "Authority functions (either optionally plus the Hub keygen once the "
+            "worker slice is live) are admitted"
         )
     # The Hub public UDP edge (slice 5a) is the authority's only load balancer,
     # and it exists in lockstep with the tagged public-edge route table proven

@@ -7728,6 +7728,57 @@ class LiveContractTests(unittest.TestCase):
                 len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS),
             )
 
+    def test_live_boundary_admits_the_legacy_hub_predecessor(self) -> None:
+        # This proof runs BEFORE the expansion apply, so the live set is still
+        # the legacy Hub trio. Admitting only the complete 11 made the expansion
+        # unappliable -- the gate demanded the functions the apply creates.
+        # Observed on control-update-apply run 30220568057.
+        for extra in ((), (CHECKER.HUB_KEYGEN_FUNCTION_NAME,)):
+            with (
+                self.subTest(hub_keygen=bool(extra)),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                live_fixture(root)
+                write_json(
+                    root / "control-lambdas.json",
+                    [
+                        {"FunctionName": name, "Runtime": None}
+                        for name in (
+                            *CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+                            *extra,
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    CHECKER.check_live(root)["authority_function_count"],
+                    len(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS) + len(extra),
+                )
+
+    def test_live_boundary_rejects_partial_expansion_shapes(self) -> None:
+        # Only the two exact endpoints are admitted. Anything part-way through
+        # the 3 -> 11 expansion, or either set missing a member, fails closed.
+        complete = list(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
+        legacy = list(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+        partial = legacy + [n for n in complete if n not in legacy][:1]
+        for payload in (
+            partial,
+            complete[:-1],
+            legacy[:-1],
+        ):
+            with (
+                self.subTest(names=len(payload)),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                live_fixture(root)
+                write_json(
+                    root / "control-lambdas.json",
+                    [{"FunctionName": n, "Runtime": None} for n in payload],
+                )
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_live(root)
+
     def test_live_boundary_rejects_unexpected_or_malformed_lambdas(self) -> None:
         for payload in (
             [{"FunctionName": "layerv-nhp-sandbox-ca-rogue"}],
