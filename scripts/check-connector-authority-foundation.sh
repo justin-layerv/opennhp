@@ -126,10 +126,61 @@ if [[ -n "$plan_json" ]]; then
   #   exact action order; the Python convergence checker proves the new
   #   NLB/SG/worker graph.
   #
-  # Keep the SG admission self-contained and exact here as well as in the
+  # The function-SG generation change also has an exact DEPOSED continuation.
+  # Its create_before_destroy replacement created the generation-2 group and
+  # repointed every function, but the generation-1 delete could not complete
+  # while published function versions still pinned that group to live Lambda
+  # ENIs, so Terraform left the predecessor object deposed and pending delete.
+  # That single reviewed object is admitted below; deposed deletes are NOT
+  # admitted generally. Remove this branch once the object is reaped, together
+  # with the deposed sites in the first-apply checker; KEEP the shared
+  # legacy_authority_sg_before helper, which the replacement above still uses.
+  #
+  # Keep the SG admissions self-contained and exact here as well as in the
   # first-apply checker. Any retained/substituted CIDR or any other delete stays
   # destructive.
   destructive_resources="$(jq -r '
+    # The exact generation-1 function-SG before-state, shared by the replacement
+    # and its deposed continuation so both admissions cannot drift apart. Kept
+    # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
+    # the first-apply checker so the two guards agree across languages too.
+    def legacy_authority_sg_before:
+      .name_prefix == "layerv-nhp-sandbox-control-ca-fn-"
+      and .description == (
+        "Connector Authority function ENIs; egress to Control dependency "
+        + "endpoints only"
+      )
+      and (.vpc_id | test("^vpc-[0-9a-f]+$"))
+      and ((.ingress // []) == [])
+      and (
+        [.egress[]? | select(
+          .description == "HTTPS to Control interface endpoints (KMS) in-VPC"
+          and .cidr_blocks == ["10.102.0.0/16"]
+          and .ipv6_cidr_blocks == []
+          and .prefix_list_ids == []
+          and .security_groups == []
+          and .self == false
+          and .protocol == "tcp"
+          and .from_port == 443
+          and .to_port == 443
+        )] | length
+      ) == 1
+      and (
+        [.egress[]? | select(
+          .description == "HTTPS to the DynamoDB gateway endpoint prefix list"
+          and .cidr_blocks == []
+          and .ipv6_cidr_blocks == []
+          and (.prefix_list_ids | length) == 1
+          and (.prefix_list_ids[0] | test("^pl-[0-9a-f]+$"))
+          and .security_groups == []
+          and .self == false
+          and .protocol == "tcp"
+          and .from_port == 443
+          and .to_port == 443
+        )] | length
+      ) == 1
+      and (.egress | length) == 2;
+
     (.resource_changes[]?, .resource_drift[]?)
     | select(.change.actions | index("delete"))
     | select(
@@ -142,44 +193,25 @@ if [[ -n "$plan_json" ]]; then
         ) or (
           .address == "module.control.aws_security_group.authority_lambda[0]"
           and .type == "aws_security_group"
+          and (.deposed // null) == null
           and .change.actions == ["create", "delete"]
           and .change.replace_paths == [["name_prefix"]]
-          and .change.before.name_prefix == "layerv-nhp-sandbox-control-ca-fn-"
+          and (.change.before | legacy_authority_sg_before)
           and .change.after.name_prefix == "layerv-nhp-sandbox-control-ca-fn-v2-"
           and .change.before.vpc_id == .change.after.vpc_id
-          and ((.change.before.ingress // []) == [])
           and ((.change.after.ingress // []) == [])
           and ((.change.after.egress // []) == [])
           and .change.after_unknown.ingress == true
           and .change.after_unknown.egress == true
-          and (
-            [.change.before.egress[]? | select(
-              .description == "HTTPS to Control interface endpoints (KMS) in-VPC"
-              and .cidr_blocks == ["10.102.0.0/16"]
-              and .ipv6_cidr_blocks == []
-              and .prefix_list_ids == []
-              and .security_groups == []
-              and .self == false
-              and .protocol == "tcp"
-              and .from_port == 443
-              and .to_port == 443
-            )] | length
-          ) == 1
-          and (
-            [.change.before.egress[]? | select(
-              .description == "HTTPS to the DynamoDB gateway endpoint prefix list"
-              and .cidr_blocks == []
-              and .ipv6_cidr_blocks == []
-              and (.prefix_list_ids | length) == 1
-              and (.prefix_list_ids[0] | test("^pl-[0-9a-f]+$"))
-              and .security_groups == []
-              and .self == false
-              and .protocol == "tcp"
-              and .from_port == 443
-              and .to_port == 443
-            )] | length
-          ) == 1
-          and (.change.before.egress | length) == 2
+        ) or (
+          .address == "module.control.aws_security_group.authority_lambda[0]"
+          and .type == "aws_security_group"
+          and .mode == "managed"
+          and .deposed == "4a2844f4"
+          and .change.actions == ["delete"]
+          and .change.after == null
+          and .change.before.id == "sg-0584cd75da80a2c7d"
+          and (.change.before | legacy_authority_sg_before)
         ) or (
           .address == "module.control.aws_lb.hub[0]"
           and .change.actions == ["create", "delete"]

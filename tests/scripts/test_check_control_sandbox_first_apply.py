@@ -8435,6 +8435,37 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
         ):
             CHECKER._check_hub_source_fence_transition(candidate, deposed)
 
+    def test_identity_and_fence_address_sets_are_disjoint(self) -> None:
+        """The invariant that lets the fence branch withhold identity addresses.
+
+        ``check_plan`` filters the Hub identity addresses out of the map it hands
+        to the fence validator. That is only safe while the two sets share no
+        address -- otherwise a fence resource could be hidden from its own deep
+        validation.
+        """
+        self.assertEqual(
+            CHECKER.HUB_IDENTITY_MIGRATION_ADDRESSES
+            & frozenset(CHECKER.HUB_SOURCE_FENCE_ACTIONS),
+            frozenset(),
+        )
+
+    def test_fence_validator_still_rejects_an_identity_address(self) -> None:
+        """The composition is the call-site filter, not a loosened validator.
+
+        A co-occurring Hub identity create is admitted by ``check_plan`` only
+        after ``_hub_identity_transition_pending`` proves its exact shape. The
+        fence validator itself must stay strict, so that an identity address
+        reaching it directly is still an unreviewed action subset.
+        """
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate[
+            "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+        ] = {"change": {"actions": ["create"], "before": None, "after": {}}}
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exact reviewed remaining action subset"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
     def test_unrelated_drift_is_rejected(self) -> None:
         candidate = hub_source_fence_transition_changes_fixture()
         candidate["module.control.aws_vpc.control"] = {
@@ -8685,6 +8716,142 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
             block = marker + remainder.split('\nvariable "', 1)[0]
             self.assertIn(f'condition     = var.{variable} == "{expected}"', block)
         self.assertNotIn("0.0.0.0/0", variables)
+
+
+def authority_sg_deposed_delete_fixture() -> dict[str, object]:
+    """The exact deposed generation-1 Authority function SG pending delete."""
+
+    return {
+        "address": CHECKER.AUTHORITY_FUNCTION_SG_ADDRESS,
+        "type": "aws_security_group",
+        "mode": "managed",
+        "deposed": CHECKER.AUTHORITY_FUNCTION_SG_DEPOSED_KEY,
+        "change": {
+            "actions": ["delete"],
+            "after": None,
+            "before": {
+                "id": CHECKER.AUTHORITY_FUNCTION_SG_DEPOSED_ID,
+                "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-",
+                "description": (
+                    "Connector Authority function ENIs; egress to Control "
+                    "dependency endpoints only"
+                ),
+                "vpc_id": "vpc-0d911f0d4b6cb7176",
+                "ingress": [],
+                "egress": [
+                    {
+                        "cidr_blocks": [CHECKER.CONTROL_VPC_CIDR],
+                        "description": (
+                            "HTTPS to Control interface endpoints (KMS) in-VPC"
+                        ),
+                        "from_port": 443,
+                        "ipv6_cidr_blocks": [],
+                        "prefix_list_ids": [],
+                        "protocol": "tcp",
+                        "security_groups": [],
+                        "self": False,
+                        "to_port": 443,
+                    },
+                    {
+                        "cidr_blocks": [],
+                        "description": (
+                            "HTTPS to the DynamoDB gateway endpoint prefix list"
+                        ),
+                        "from_port": 443,
+                        "ipv6_cidr_blocks": [],
+                        "prefix_list_ids": ["pl-4ca54025"],
+                        "protocol": "tcp",
+                        "security_groups": [],
+                        "self": False,
+                        "to_port": 443,
+                    },
+                ],
+            },
+        },
+    }
+
+
+class AuthorityFunctionSgDeposedDeleteTests(unittest.TestCase):
+    """The one reviewed deposed object: exact, and admitted only as itself."""
+
+    def test_exact_captured_deposed_delete_is_admitted(self) -> None:
+        self.assertTrue(
+            CHECKER._is_exact_legacy_authority_sg_deposed_delete(
+                authority_sg_deposed_delete_fixture()
+            )
+        )
+
+    def test_identity_must_match_the_reviewed_object(self) -> None:
+        for field, value in (
+            ("deposed", "deadbeef"),
+            ("address", "module.control.aws_security_group.interface_endpoints"),
+            ("type", "aws_vpc"),
+            ("mode", "data"),
+        ):
+            item = authority_sg_deposed_delete_fixture()
+            item[field] = value
+            with self.subTest(field=field):
+                self.assertFalse(
+                    CHECKER._is_exact_legacy_authority_sg_deposed_delete(item)
+                )
+
+    def test_rejects_foreign_group_id(self) -> None:
+        item = authority_sg_deposed_delete_fixture()
+        item["change"]["before"]["id"] = "sg-0000000000000000f"
+        self.assertFalse(CHECKER._is_exact_legacy_authority_sg_deposed_delete(item))
+
+    def test_only_a_pure_delete_of_the_object_is_admitted(self) -> None:
+        for actions, after in (
+            (["delete", "create"], None),
+            (["create", "delete"], None),
+            (["delete"], {"name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-"}),
+        ):
+            item = authority_sg_deposed_delete_fixture()
+            item["change"]["actions"] = actions
+            item["change"]["after"] = after
+            with self.subTest(actions=actions):
+                self.assertFalse(
+                    CHECKER._is_exact_legacy_authority_sg_deposed_delete(item)
+                )
+
+    def test_rejects_generation_one_before_state_drift(self) -> None:
+        widened = authority_sg_deposed_delete_fixture()
+        widened["change"]["before"]["egress"][0]["cidr_blocks"] = ["0.0.0.0/0"]
+        extra = authority_sg_deposed_delete_fixture()
+        extra["change"]["before"]["egress"].append(
+            dict(extra["change"]["before"]["egress"][0], description="extra")
+        )
+        retained_ingress = authority_sg_deposed_delete_fixture()
+        retained_ingress["change"]["before"]["ingress"] = [
+            dict(retained_ingress["change"]["before"]["egress"][0])
+        ]
+        generation_two = authority_sg_deposed_delete_fixture()
+        generation_two["change"]["before"]["name_prefix"] = (
+            f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-"
+        )
+        for label, item in (
+            ("widened_cidr", widened),
+            ("extra_rule", extra),
+            ("retained_ingress", retained_ingress),
+            ("generation_two", generation_two),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(
+                    CHECKER._is_exact_legacy_authority_sg_deposed_delete(item)
+                )
+
+    def test_foreign_deposed_objects_still_fail_closed(self) -> None:
+        """The admission must not weaken the unreviewed-deposed guard."""
+
+        candidate = hub_source_fence_transition_changes_fixture()
+        foreign = authority_sg_deposed_delete_fixture()
+        foreign["address"] = "module.control.aws_vpc.control"
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "unreviewed deposed resources"
+        ):
+            CHECKER._check_hub_source_fence_transition(
+                candidate, {"module.control.aws_vpc.control": [foreign]}
+            )
 
 
 class HubEdgeSliceTests(unittest.TestCase):

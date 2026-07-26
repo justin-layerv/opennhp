@@ -25,6 +25,15 @@ STATE_KMS_KEY_ARN = (
 TF_VERSION = "1.14.3"
 CONTROL_PREFIX = "layerv-nhp-sandbox-control"
 PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# The single reviewed deposed object left by the Authority function-SG
+# generation change: its create-before-destroy replacement applied, but the
+# generation-1 delete could not complete while published function versions still
+# pinned that group to live Lambda ENIs. Pinned exactly so no other deposed
+# object is admitted; see _is_exact_legacy_authority_sg_deposed_delete. Remove
+# all three once the object is reaped.
+AUTHORITY_FUNCTION_SG_ADDRESS = "module.control.aws_security_group.authority_lambda[0]"
+AUTHORITY_FUNCTION_SG_DEPOSED_KEY = "4a2844f4"
+AUTHORITY_FUNCTION_SG_DEPOSED_ID = "sg-0584cd75da80a2c7d"
 AUTHORITY_PUBLISHER_ROLE_NAME = (
     "layerv-nhp-sandbox-control-connector-authority-publisher"
 )
@@ -2993,40 +3002,23 @@ def _is_exact_legacy_hub_runtime_expansion(
     return False
 
 
-def _is_exact_legacy_authority_sg_replacement(change: dict[str, Any]) -> bool:
-    """Prove the one-time removal of the legacy function-SG inline rules.
+def _is_exact_legacy_authority_sg_before(before: Any) -> bool:
+    """Prove the exact generation-1 Authority function-SG state.
 
-    Omitting inline rules does not revoke rules already represented in the
-    ``aws_security_group`` state. The generation-2 name prefix therefore forces
-    an empty replacement group; the exact standalone rules then add only the
-    reviewed SG-to-SG, DynamoDB-prefix-list, and Redis paths.
+    Shared by the one-time generation-2 replacement and by its deposed
+    continuation so the two admissions cannot drift apart: both must carry this
+    same predecessor, inline VPC-CIDR egress rule and all.
     """
-    if change.get("actions") != ["create", "delete"] or change.get("replace_paths") != [
-        ["name_prefix"]
-    ]:
-        return False
-    before = change.get("before")
-    after = change.get("after")
-    unknown = change.get("after_unknown")
     if (
         not isinstance(before, dict)
-        or not isinstance(after, dict)
-        or not isinstance(unknown, dict)
         or before.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-"
-        or after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
         or before.get("description")
         != (
             "Connector Authority function ENIs; egress to Control dependency "
             "endpoints only"
         )
-        or after.get("description") != before.get("description")
         or re.fullmatch(r"vpc-[0-9a-f]+", str(before.get("vpc_id"))) is None
-        or after.get("vpc_id") != before.get("vpc_id")
         or before.get("ingress") not in ([], None)
-        or after.get("ingress") not in ([], None)
-        or after.get("egress") not in ([], None)
-        or unknown.get("ingress") is not True
-        or unknown.get("egress") is not True
     ):
         return False
 
@@ -3082,6 +3074,77 @@ def _is_exact_legacy_authority_sg_replacement(change: dict[str, Any]) -> bool:
         and dynamodb_rule.get("security_groups") == []
         and dynamodb_rule.get("self") is False
         and dynamodb_rule.get("to_port") == 443
+    )
+
+
+def _is_exact_legacy_authority_sg_replacement(change: dict[str, Any]) -> bool:
+    """Prove the one-time removal of the legacy function-SG inline rules.
+
+    Omitting inline rules does not revoke rules already represented in the
+    ``aws_security_group`` state. The generation-2 name prefix therefore forces
+    an empty replacement group; the exact standalone rules then add only the
+    reviewed SG-to-SG, DynamoDB-prefix-list, and Redis paths.
+    """
+    if change.get("actions") != ["create", "delete"] or change.get("replace_paths") != [
+        ["name_prefix"]
+    ]:
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    unknown = change.get("after_unknown")
+    return not (
+        not _is_exact_legacy_authority_sg_before(before)
+        or not isinstance(after, dict)
+        or not isinstance(unknown, dict)
+        or after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
+        or after.get("description") != before.get("description")
+        or after.get("vpc_id") != before.get("vpc_id")
+        or after.get("ingress") not in ([], None)
+        or after.get("egress") not in ([], None)
+        or unknown.get("ingress") is not True
+        or unknown.get("egress") is not True
+    )
+
+
+def _is_exact_legacy_authority_sg_deposed_delete(item: dict[str, Any]) -> bool:
+    """Prove the deposed continuation of the function-SG generation change.
+
+    ``_is_exact_legacy_authority_sg_replacement`` above is create-before-destroy.
+    Its create half applied -- the generation-2 group is live and every Authority
+    function already points at it -- but the generation-1 delete could not
+    complete while published function versions still pinned that group to live
+    Lambda ENIs, so Terraform left the predecessor deposed and pending delete.
+
+    Deleting it is therefore the completion of an already-reviewed replacement,
+    not a net teardown. This admits ONLY that one captured object: the reviewed
+    deposed key, its live group id, and the same generation-1 before-state the
+    replacement carries. Deposed objects are not admitted generally -- every
+    other one still fails closed in ``_check_hub_source_fence_transition`` or the
+    fail-closed fallback.
+
+    Remove once the object is reaped -- when a plan carries no deposed entry at
+    all. Five coupled sites go together: the three AUTHORITY_FUNCTION_SG_*
+    constants, this function, its ``continue`` hook in ``check_plan``, the jq
+    deposed branch in check-connector-authority-foundation.sh, and the fixtures
+    in both test suites. KEEP ``_is_exact_legacy_authority_sg_before`` -- the
+    generation-2 replacement admission above still uses it.
+    """
+    change = item.get("change")
+    if (
+        item.get("address") != AUTHORITY_FUNCTION_SG_ADDRESS
+        or item.get("type") != "aws_security_group"
+        or item.get("mode") != "managed"
+        or item.get("deposed") != AUTHORITY_FUNCTION_SG_DEPOSED_KEY
+        or not isinstance(change, dict)
+        or change.get("actions") != ["delete"]
+        or change.get("after") is not None
+    ):
+        return False
+    before = change.get("before")
+    return (
+        isinstance(before, dict)
+        and before.get("id") == AUTHORITY_FUNCTION_SG_DEPOSED_ID
+        and _is_exact_legacy_authority_sg_before(before)
     )
 
 
@@ -7058,6 +7121,14 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
                 raise ContractError(
                     f"Terraform deposed resource key is malformed for {address}"
                 )
+            # The one reviewed Authority function-SG deposed object is validated
+            # exactly here and then retired from the inventory, so it cannot
+            # widen any downstream deposed handling: it must not make a plan look
+            # like the Hub source-fence transition, and every OTHER deposed
+            # object still reaches _check_hub_source_fence_transition's
+            # unreviewed-deposed guard (or the fail-closed fallback) untouched.
+            if _is_exact_legacy_authority_sg_deposed_delete(item):
+                continue
             deposed_by_address.setdefault(address, []).append(item)
             continue
         if address in by_address:
@@ -7452,14 +7523,27 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         for address, actions in HUB_SOURCE_FENCE_ACTIONS.items()
         if actions == ["create"]
     }
+    # The fence may co-occur with a still-pending Hub identity publication. The
+    # identity migration republishes the Hub public key through a
+    # lambda_invocation whose create is independent of the NLB replacement, so a
+    # plan can legitimately carry both and neither is a superset of the other.
+    # Composed exactly as the legacy expansion composes with it above: the
+    # identity addresses must form their OWN exact transition before they are
+    # excluded from the fence subset test, and they are separately create-shape
+    # proved in the branch body. A non-exact identity move keeps the whole
+    # predicate false and falls through to the fail-closed fallback.
+    hub_source_fence_candidate = set(actual_non_noop)
+    if hub_identity_transition:
+        hub_source_fence_candidate -= hub_identity_changed
     hub_source_fence_transition = (
         hub_edge_mode
         and hub_worker_mode
+        and (not hub_identity_changed or hub_identity_transition)
         and (
             bool(deposed_by_address)
             or (
-                bool(actual_non_noop)
-                and set(actual_non_noop).issubset(HUB_SOURCE_FENCE_ACTIONS)
+                bool(hub_source_fence_candidate)
+                and hub_source_fence_candidate.issubset(HUB_SOURCE_FENCE_ACTIONS)
             )
         )
     )
@@ -7568,10 +7652,29 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # never enter ``by_address``/``changed``. The shapes cannot be confused
         # -- the fence address set is disjoint from the image-update, legacy
         # expansion, Hub identity, runtime, edge and worker sets, so any of those
-        # plans leaves this predicate false and falls through.
+        # plans leaves this predicate false and falls through. A co-occurring
+        # Hub identity transition is the one deliberate exception, admitted only
+        # as its own exact shape and proved separately below; ordering ahead of
+        # the standalone identity branch keeps the deposed proof reachable.
         plan_mode = "hub-udp-source-fence-replacement"
         _require_create_shapes(hub_source_fence_creates & changed, by_address)
-        _check_hub_source_fence_transition(by_address, deposed_by_address)
+        if hub_identity_creates_pending:
+            _require_create_shapes(
+                hub_identity_creates_pending,
+                by_address,
+                "Hub public identity parameter must be new",
+            )
+        # The identity addresses are disjoint from the fence set (asserted by
+        # test_identity_and_fence_address_sets_are_disjoint), so withholding
+        # them here cannot hide a fence resource from its own deep validation.
+        _check_hub_source_fence_transition(
+            {
+                address: item
+                for address, item in by_address.items()
+                if address not in hub_identity_changed
+            },
+            deposed_by_address,
+        )
     # Precedence over the legacy expansion below is deliberate. The expansion's
     # update set (AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES) contains
     # the foundation plus the three Hub functions and their six aliases, so a

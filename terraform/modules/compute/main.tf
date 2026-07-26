@@ -1572,7 +1572,15 @@ resource "aws_lb" "server" {
   internal           = false
   load_balancer_type = "network"
   subnets            = var.public_subnet_ids
-  security_groups    = local.public_udp_source_fenced ? [aws_security_group.server_nlb[0].id] : null
+  # Gated on the source-list variable directly, NOT on
+  # local.public_udp_source_fenced. The relay DMZ contract admits exactly the
+  # dedicated SG traversal plus this one reviewed staging-gate variable as
+  # metadata (check-relay-dmz-plan.py: "assigned cell public NLB
+  # security_groups must reference only its dedicated SG in authored config").
+  # A local indirection adds an unreviewed `local.` traversal to the authored
+  # expression and fails that contract, even though it resolves identically --
+  # local.public_udp_source_fenced IS `var.public_nhp_udp_ingress_cidrs != null`.
+  security_groups = var.public_nhp_udp_ingress_cidrs != null ? [aws_security_group.server_nlb[0].id] : null
 
   enable_cross_zone_load_balancing = true
   enable_deletion_protection       = local.is_prod

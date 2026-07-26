@@ -150,12 +150,69 @@ expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_r
 # The one-time generation-2 Authority SG replacement is admitted only for the
 # exact observed legacy predecessor and an empty replacement. This is the
 # deliberate revocation path for the predecessor's VPC-CIDR inline rule.
-printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_security_group.authority_lambda[0]","type":"aws_security_group","change":{"actions":["create","delete"],"before":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-","vpc_id":"vpc-abc123","ingress":[],"egress":[{"description":"HTTPS to Control interface endpoints (KMS) in-VPC","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443},{"description":"HTTPS to the DynamoDB gateway endpoint prefix list","cidr_blocks":[],"ipv6_cidr_blocks":[],"prefix_list_ids":["pl-abc123"],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]},"after":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-v2-","vpc_id":"vpc-abc123"},"after_unknown":{"ingress":true,"egress":true},"replace_paths":[["name_prefix"]]}}]}' >"$plan_json"
+replacement_plan='{"resource_changes":[{"address":"module.control.aws_security_group.authority_lambda[0]","type":"aws_security_group","change":{"actions":["create","delete"],"before":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-","description":"Connector Authority function ENIs; egress to Control dependency endpoints only","vpc_id":"vpc-abc123","ingress":[],"egress":[{"description":"HTTPS to Control interface endpoints (KMS) in-VPC","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443},{"description":"HTTPS to the DynamoDB gateway endpoint prefix list","cidr_blocks":[],"ipv6_cidr_blocks":[],"prefix_list_ids":["pl-abc123"],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]},"after":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-v2-","vpc_id":"vpc-abc123"},"after_unknown":{"ingress":true,"egress":true},"replace_paths":[["name_prefix"]]}}]}'
+printf '%s\n' "$replacement_plan" >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 
-jq '.resource_changes[0].change.before.egress[0].cidr_blocks = ["0.0.0.0/0"]' \
-  "$plan_json" >"${plan_json}.tmp"
-mv "${plan_json}.tmp" "$plan_json"
+# Each mutation below starts from the admitted fixture above, so every case
+# proves exactly the one field it changes.
+printf '%s\n' "$replacement_plan" | jq '.resource_changes[0].change.before.egress[0].cidr_blocks = ["0.0.0.0/0"]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# The shared before-state proof is kept in lockstep with the first-apply
+# checker: a repurposed group description or a malformed VPC id is not the
+# reviewed generation-1 predecessor.
+printf '%s\n' "$replacement_plan" | jq '.resource_changes[0].change.before.description = "repurposed"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$replacement_plan" | jq '.resource_changes[0].change.before.vpc_id = "not-a-vpc"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# The DEPOSED continuation of that same replacement: the generation-2 group is
+# live and every function already points at it, but the generation-1 delete
+# could not complete while published function versions still pinned it, so the
+# predecessor stayed deposed and pending delete. Admitted only as the exact
+# reviewed object -- its deposed key, its live id, and the same generation-1
+# before-state as the replacement above.
+deposed_plan='{"resource_changes":[{"address":"module.control.aws_security_group.authority_lambda[0]","type":"aws_security_group","mode":"managed","deposed":"4a2844f4","change":{"actions":["delete"],"before":{"id":"sg-0584cd75da80a2c7d","name_prefix":"layerv-nhp-sandbox-control-ca-fn-","description":"Connector Authority function ENIs; egress to Control dependency endpoints only","vpc_id":"vpc-abc123","ingress":[],"egress":[{"description":"HTTPS to Control interface endpoints (KMS) in-VPC","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443},{"description":"HTTPS to the DynamoDB gateway endpoint prefix list","cidr_blocks":[],"ipv6_cidr_blocks":[],"prefix_list_ids":["pl-abc123"],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]},"after":null}}]}'
+printf '%s\n' "$deposed_plan" >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# A DIFFERENT deposed key is a different, unreviewed object.
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].deposed = "deadbeef"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# A different live id under the reviewed key is not the reviewed object either.
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.id = "sg-0000000000000000f"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# The admission is pinned to the generation-1 before-state: a widened egress
+# CIDR, an extra egress rule, or a retained ingress rule all stay destructive.
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.egress[0].cidr_blocks = ["0.0.0.0/0"]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.egress += [{"description":"extra","cidr_blocks":["10.0.0.0/8"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.ingress = [{"description":"retained","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.description = "repurposed"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.vpc_id = "not-a-vpc"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# Deposed deletes are NOT admitted generally: the same exact shape at any other
+# address, or any other deposed resource, stays destructive.
+printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].address = "module.control.aws_security_group.interface_endpoints"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_vpc.control","type":"aws_vpc","mode":"managed","deposed":"4a2844f4","change":{"actions":["delete"],"before":{"id":"vpc-abc123"},"after":null}}]}' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# A deposed object must not be able to satisfy the REPLACEMENT admission.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_security_group.authority_lambda[0]","type":"aws_security_group","mode":"managed","deposed":"4a2844f4","change":{"actions":["create","delete"],"before":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-","vpc_id":"vpc-abc123","ingress":[],"egress":[{"description":"HTTPS to Control interface endpoints (KMS) in-VPC","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443},{"description":"HTTPS to the DynamoDB gateway endpoint prefix list","cidr_blocks":[],"ipv6_cidr_blocks":[],"prefix_list_ids":["pl-abc123"],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]},"after":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-v2-","vpc_id":"vpc-abc123"},"after_unknown":{"ingress":true,"egress":true},"replace_paths":[["name_prefix"]]}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
 # A tainted Connector Authority hub FUNCTION replace (delete+create) is the
