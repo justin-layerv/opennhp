@@ -1,0 +1,679 @@
+# Fences for the attended-proof Authority mutation control (MutateProofAgent).
+#
+# This operation mutates live authorization state, so every test below asserts a
+# fence rather than a feature. The two that matter most are
+# prod_rejects_proof_mutation_controls (the control cannot exist in production)
+# and proof_alias_is_absent_from_every_runtime_caller_target (no ordinary caller
+# path can name it).
+
+mock_provider "aws" {
+  mock_data "aws_availability_zones" {
+    defaults = {
+      names = ["us-east-2a", "us-east-2b", "us-east-2c"]
+    }
+  }
+
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "767397897469"
+    }
+  }
+
+  mock_data "aws_partition" {
+    defaults = {
+      partition  = "aws"
+      dns_suffix = "amazonaws.com"
+    }
+  }
+
+  mock_data "aws_region" {
+    defaults = {
+      region = "us-east-2"
+    }
+  }
+
+  mock_data "aws_ssm_parameter" {
+    defaults = {
+      insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
+
+  mock_data "aws_ecr_image" {
+    defaults = {
+      image_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      image_uri    = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
+}
+
+override_resource {
+  target          = aws_ecr_repository.authority
+  override_during = plan
+  values = {
+    repository_url = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
+  }
+}
+
+override_resource {
+  target          = aws_kms_key.qat1_signing
+  override_during = plan
+  values = {
+    arn = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
+  }
+}
+
+override_resource {
+  target          = aws_kms_alias.qat1_signing
+  override_during = plan
+  values = {
+    arn = "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1"
+  }
+}
+
+override_resource {
+  target          = aws_elasticache_serverless_cache.otp
+  override_during = plan
+  values = {
+    endpoint = [{
+      address = "layerv-nhp-sandbox-control-otp.serverless.use2.cache.amazonaws.com"
+      port    = 6379
+    }]
+  }
+}
+
+# Table ARNs must be plan-known so the rendered execution-policy content, not
+# just its shape, is assertable.
+override_resource {
+  target          = aws_dynamodb_table.api_keys
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys" }
+}
+
+override_resource {
+  target          = aws_dynamodb_table.agent_keys
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys" }
+}
+
+override_resource {
+  target          = aws_dynamodb_table.customers
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-customers" }
+}
+
+override_resource {
+  target          = aws_dynamodb_table.connector_authority
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority" }
+}
+
+override_resource {
+  target          = aws_kms_key.authority_data
+  override_during = plan
+  values          = { arn = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000002" }
+}
+
+variables {
+  environment                                  = "sandbox"
+  aws_account_id                               = "767397897469"
+  vpc_cidr                                     = "10.102.0.0/16"
+  otp_email_from                               = "noreply@notify.layerv.xyz"
+  ses_configuration_set_name                   = "layerv-nhp-sandbox-agent-otp"
+  authority_runtime_contract_evidence_verified = true
+
+  authority_proof_mutation_controls_enabled = true
+  authority_proof_mutation_owner_id         = "layerv-nhp-sandbox-udp-proof"
+  authority_proof_mutation_controller_role_arns = [
+    "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-controller",
+  ]
+
+  authority_runtime_contract = {
+    schema_version           = 1
+    phase                    = "measurement"
+    selected_authority_color = "blue"
+    # Measurement phase with the Hub group plus the proof function only: the
+    # cell operation groups are still absent, which is exactly the state the
+    # attended proof substrate binds before the cell graphs are budgeted.
+    provisioned_cells = {
+      cell0 = {
+        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+      }
+    }
+    provisioned_cells_evidence = {
+      repository     = "layervai/nhp"
+      source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path           = "docs/evidence/connector-authority/v1/sandbox-provisioned-cells.json"
+      sha256         = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      schema_version = 1
+    }
+    qat1_kid = "sandbox-qat1-v1"
+    global = {
+      environment                        = "sandbox"
+      aws_partition                      = "aws"
+      aws_account_id                     = "767397897469"
+      aws_region                         = "us-east-2"
+      authority_repository_url           = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
+      authority_digest_parameter_name    = "/sandbox/nhp/control/connector-authority/image-digest"
+      authority_image_digest             = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      qat1_raw_key_arn                   = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
+      qat1_alias_arn                     = "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1"
+      otp_redis_cache_name               = "layerv-nhp-sandbox-control-otp"
+      otp_redis_endpoint                 = "layerv-nhp-sandbox-control-otp.serverless.use2.cache.amazonaws.com:6379"
+      regional_lambda_concurrency_quota  = 1000
+      non_authority_reserved_concurrency = 100
+      retained_unreserved_concurrency    = 100
+      dependency_headroom = {
+        dynamodb_max_in_flight = 100
+        kms_max_in_flight      = 100
+        redis_max_connections  = 100
+        ses_max_in_flight      = 100
+      }
+      caller_capacity = {
+        hub_workers = {
+          max_replicas = 2
+          preinvoke_limits = {
+            issue_assignment          = 1
+            refresh_assignment        = 1
+            issue_credential_recovery = 1
+          }
+          preinvoke_rate_limits = {
+            issue_assignment          = { burst = 3, refill_per_second = 2 }
+            refresh_assignment        = { burst = 3, refill_per_second = 2 }
+            issue_credential_recovery = { burst = 3, refill_per_second = 2 }
+          }
+        }
+        cell_workers = {
+          cell0 = {
+            max_replicas = 2
+            preinvoke_limits = {
+              issue_registration_otp       = 1
+              activate_registration        = 1
+              complete_registration        = 1
+              complete_credential_recovery = 1
+            }
+            preinvoke_rate_limits = {
+              issue_registration_otp       = { burst = 2, refill_per_second = 1 }
+              activate_registration        = { burst = 2, refill_per_second = 1 }
+              complete_registration        = { burst = 2, refill_per_second = 1 }
+              complete_credential_recovery = { burst = 2, refill_per_second = 1 }
+            }
+          }
+        }
+        proof_controller = {
+          max_replicas = 1
+          preinvoke_limits = {
+            mutate_proof_agent = 1
+          }
+          preinvoke_rate_limits = {
+            mutate_proof_agent = { burst = 1, refill_per_second = 1 }
+          }
+        }
+      }
+      basis_evidence = {
+        repository     = "layervai/nhp"
+        source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+        sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        schema_version = 1
+      }
+      result_evidence = null
+    }
+    functions = {
+      "layerv-nhp-sandbox-ca-ia" = {
+        steady_provisioned_concurrency          = 2
+        steady_reserved_concurrency             = 2
+        rollout_active_provisioned_concurrency  = 2
+        rollout_standby_provisioned_concurrency = 2
+        rollout_reserved_concurrency            = 4
+        max_caller_in_flight                    = 2
+        max_caller_requests_per_second          = 10
+        rollback_retention_seconds              = 3600
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
+      "layerv-nhp-sandbox-ca-ra" = {
+        steady_provisioned_concurrency          = 2
+        steady_reserved_concurrency             = 2
+        rollout_active_provisioned_concurrency  = 2
+        rollout_standby_provisioned_concurrency = 2
+        rollout_reserved_concurrency            = 4
+        max_caller_in_flight                    = 2
+        max_caller_requests_per_second          = 10
+        rollback_retention_seconds              = 3600
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
+      "layerv-nhp-sandbox-ca-icr" = {
+        steady_provisioned_concurrency          = 2
+        steady_reserved_concurrency             = 2
+        rollout_active_provisioned_concurrency  = 2
+        rollout_standby_provisioned_concurrency = 2
+        rollout_reserved_concurrency            = 4
+        max_caller_in_flight                    = 2
+        max_caller_requests_per_second          = 10
+        rollback_retention_seconds              = 3600
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
+      "layerv-nhp-sandbox-ca-pm" = {
+        steady_provisioned_concurrency          = 1
+        steady_reserved_concurrency             = 1
+        rollout_active_provisioned_concurrency  = 1
+        rollout_standby_provisioned_concurrency = 1
+        rollout_reserved_concurrency            = 2
+        max_caller_in_flight                    = 1
+        max_caller_requests_per_second          = 2
+        rollback_retention_seconds              = 3600
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
+    }
+  }
+}
+
+run "sandbox_accepts_the_separate_proof_operation_family" {
+  command = plan
+
+  assert {
+    condition = output.authority_selected_alias_targets.proof == {
+      mutate_proof_agent = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue"
+    }
+    error_message = "The proof family must publish exactly its own same-color alias target."
+  }
+}
+
+run "proof_alias_is_absent_from_every_runtime_caller_target" {
+  command = plan
+
+  # The Hub task policy is built from .hub and each cell server policy from
+  # .cells. If the proof alias never appears in either, no ordinary UDP traffic
+  # path can name it, independent of any IAM review.
+  assert {
+    condition = toset(keys(output.authority_selected_alias_targets.hub)) == toset([
+      "issue_assignment",
+      "refresh_assignment",
+      "issue_credential_recovery",
+    ])
+    error_message = "The Hub caller target must remain exactly the three hub operations."
+  }
+
+  assert {
+    condition = length([
+      for target in values(output.authority_selected_alias_targets.hub) :
+      target if strcontains(target, "-ca-pm:")
+    ]) == 0
+    error_message = "The Hub caller target must never contain the proof mutation alias."
+  }
+
+  assert {
+    condition = length(flatten([
+      for cell_targets in values(output.authority_selected_alias_targets.cells) : [
+        for target in values(cell_targets) :
+        target if strcontains(target, "-ca-pm:")
+      ]
+    ])) == 0
+    error_message = "No cell caller target may ever contain the proof mutation alias."
+  }
+}
+
+run "prod_rejects_proof_mutation_controls" {
+  command = plan
+
+  variables {
+    environment    = "prod"
+    aws_account_id = "235500187906"
+    otp_email_from = "noreply@notify.layerv.ai"
+    # Prod cannot bind this contract at all; the proof fence must reject the
+    # gate before any contract identity check even matters.
+    authority_runtime_contract = null
+    authority_proof_mutation_controller_role_arns = [
+      "arn:aws:iam::235500187906:role/layerv-nhp-prod-udp-proof-controller",
+    ]
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_proof_controls_without_a_named_proof_tenant" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_owner_id = null
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_proof_controls_without_an_attended_controller" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controller_role_arns = []
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_the_hub_task_role_as_a_proof_controller" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controller_role_arns = [
+      "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-control-hub-task",
+    ]
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_a_cell_server_role_as_a_proof_controller" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controller_role_arns = [
+      "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server",
+    ]
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_a_foreign_account_proof_controller" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controller_role_arns = [
+      "arn:aws:iam::235500187906:role/layerv-nhp-sandbox-udp-proof-controller",
+    ]
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_a_duplicated_proof_controller" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controller_role_arns = [
+      "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-controller",
+      "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-controller",
+    ]
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_a_proof_function_while_the_gate_is_off" {
+  command = plan
+
+  variables {
+    authority_proof_mutation_controls_enabled     = false
+    authority_proof_mutation_owner_id             = null
+    authority_proof_mutation_controller_role_arns = []
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_proof_controller_capacity_above_one_attended_call" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = {
+      schema_version           = 1
+      phase                    = "measurement"
+      selected_authority_color = "blue"
+      provisioned_cells = {
+        cell0 = {
+          caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        }
+      }
+      provisioned_cells_evidence = {
+        repository     = "layervai/nhp"
+        source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        path           = "docs/evidence/connector-authority/v1/sandbox-provisioned-cells.json"
+        sha256         = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        schema_version = 1
+      }
+      qat1_kid = "sandbox-qat1-v1"
+      global = {
+        environment                        = "sandbox"
+        aws_partition                      = "aws"
+        aws_account_id                     = "767397897469"
+        aws_region                         = "us-east-2"
+        authority_repository_url           = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
+        authority_digest_parameter_name    = "/sandbox/nhp/control/connector-authority/image-digest"
+        authority_image_digest             = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        qat1_raw_key_arn                   = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
+        qat1_alias_arn                     = "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1"
+        otp_redis_cache_name               = "layerv-nhp-sandbox-control-otp"
+        otp_redis_endpoint                 = "layerv-nhp-sandbox-control-otp.serverless.use2.cache.amazonaws.com:6379"
+        regional_lambda_concurrency_quota  = 1000
+        non_authority_reserved_concurrency = 100
+        retained_unreserved_concurrency    = 100
+        dependency_headroom = {
+          dynamodb_max_in_flight = 100
+          kms_max_in_flight      = 100
+          redis_max_connections  = 100
+          ses_max_in_flight      = 100
+        }
+        caller_capacity = {
+          hub_workers = {
+            max_replicas = 2
+            preinvoke_limits = {
+              issue_assignment          = 1
+              refresh_assignment        = 1
+              issue_credential_recovery = 1
+            }
+            preinvoke_rate_limits = {
+              issue_assignment          = { burst = 3, refill_per_second = 2 }
+              refresh_assignment        = { burst = 3, refill_per_second = 2 }
+              issue_credential_recovery = { burst = 3, refill_per_second = 2 }
+            }
+          }
+          cell_workers = {
+            cell0 = {
+              max_replicas = 2
+              preinvoke_limits = {
+                issue_registration_otp       = 1
+                activate_registration        = 1
+                complete_registration        = 1
+                complete_credential_recovery = 1
+              }
+              preinvoke_rate_limits = {
+                issue_registration_otp       = { burst = 2, refill_per_second = 1 }
+                activate_registration        = { burst = 2, refill_per_second = 1 }
+                complete_registration        = { burst = 2, refill_per_second = 1 }
+                complete_credential_recovery = { burst = 2, refill_per_second = 1 }
+              }
+            }
+          }
+          proof_controller = {
+            max_replicas = 2
+            preinvoke_limits = {
+              mutate_proof_agent = 1
+            }
+            preinvoke_rate_limits = {
+              mutate_proof_agent = { burst = 1, refill_per_second = 1 }
+            }
+          }
+        }
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
+      functions = {
+        "layerv-nhp-sandbox-ca-ia" = {
+          steady_provisioned_concurrency          = 2
+          steady_reserved_concurrency             = 2
+          rollout_active_provisioned_concurrency  = 2
+          rollout_standby_provisioned_concurrency = 2
+          rollout_reserved_concurrency            = 4
+          max_caller_in_flight                    = 2
+          max_caller_requests_per_second          = 10
+          rollback_retention_seconds              = 3600
+          basis_evidence = {
+            repository     = "layervai/nhp"
+            source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            schema_version = 1
+          }
+          result_evidence = null
+        }
+        "layerv-nhp-sandbox-ca-ra" = {
+          steady_provisioned_concurrency          = 2
+          steady_reserved_concurrency             = 2
+          rollout_active_provisioned_concurrency  = 2
+          rollout_standby_provisioned_concurrency = 2
+          rollout_reserved_concurrency            = 4
+          max_caller_in_flight                    = 2
+          max_caller_requests_per_second          = 10
+          rollback_retention_seconds              = 3600
+          basis_evidence = {
+            repository     = "layervai/nhp"
+            source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            schema_version = 1
+          }
+          result_evidence = null
+        }
+        "layerv-nhp-sandbox-ca-icr" = {
+          steady_provisioned_concurrency          = 2
+          steady_reserved_concurrency             = 2
+          rollout_active_provisioned_concurrency  = 2
+          rollout_standby_provisioned_concurrency = 2
+          rollout_reserved_concurrency            = 4
+          max_caller_in_flight                    = 2
+          max_caller_requests_per_second          = 10
+          rollback_retention_seconds              = 3600
+          basis_evidence = {
+            repository     = "layervai/nhp"
+            source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            schema_version = 1
+          }
+          result_evidence = null
+        }
+        "layerv-nhp-sandbox-ca-pm" = {
+          steady_provisioned_concurrency          = 1
+          steady_reserved_concurrency             = 1
+          rollout_active_provisioned_concurrency  = 1
+          rollout_standby_provisioned_concurrency = 1
+          rollout_reserved_concurrency            = 2
+          max_caller_in_flight                    = 2
+          max_caller_requests_per_second          = 4
+          rollback_retention_seconds              = 3600
+          basis_evidence = {
+            repository     = "layervai/nhp"
+            source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            schema_version = 1
+          }
+          result_evidence = null
+        }
+      }
+    }
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  # The single strongest fence: every item-level DynamoDB action the mutation
+  # control can take is constrained by dynamodb:LeadingKeys to the dedicated
+  # proof tenant partition (OWNER# + sha256 of the proof owner id) plus the
+  # PROOF directive partition. This is what makes a wrong handler unable to
+  # touch another tenant.
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
+      contains(
+        try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
+        "OWNER#${sha256("layerv-nhp-sandbox-udp-proof")}",
+        ) || contains(
+        try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
+        "REGISTRY",
+      )
+      if startswith(try(statement.Sid, ""), "ProofFenced") || try(statement.Sid, "") == "ProofRegistryRead"
+    ])
+    error_message = "Every fenced proof statement must pin dynamodb:LeadingKeys to the proof tenant or the registry partition."
+  }
+
+  # The control reaches only the placement table. Absent api_keys and agent_keys
+  # means it can neither read an owner's credentials nor revoke one: device
+  # credential revocation stays on the authenticated Control API path.
+  assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
+      statement
+      if length([
+        for resource in try(tolist(statement.Resource), []) :
+        resource
+        if strcontains(resource, "-control-api_keys") || strcontains(resource, "-control-agent_keys") || strcontains(resource, "-control-customers")
+      ]) > 0
+    ]) == 0
+    error_message = "The proof mutation control must not reach api_keys, agent_keys, or customers."
+  }
+
+  # A proof move relocates and advances placement; it never deletes a row, and
+  # it may never edit the Terraform-owned cell catalog.
+  assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
+      statement
+      if contains(try(tolist(statement.Action), []), "dynamodb:DeleteItem")
+    ]) == 0
+    error_message = "The proof mutation control must never hold dynamodb:DeleteItem."
+  }
+
+  assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
+      statement
+      if try(statement.Sid, "") == "ProofRegistryRead" && length(setintersection(
+        toset(try(tolist(statement.Action), [])),
+        toset(["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]),
+      )) > 0
+    ]) == 0
+    error_message = "The registry partition must remain read-only to the proof mutation control."
+  }
+}

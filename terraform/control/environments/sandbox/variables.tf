@@ -173,3 +173,21 @@ variable "tags" {
     Owner        = "platform-team"
   }
 }
+
+variable "authority_proof_mutation_controls_enabled" {
+  description = "Attended-proof Authority mutation control gate. It stays false until the qurl-service MutateProofAgent operation and its qurl-conformance constant ship and are bound by a reviewed contract."
+  type        = bool
+  default     = false
+}
+
+variable "authority_proof_mutation_owner_id" {
+  description = "Dedicated sandbox proof tenant that owns every uniquely tagged ephemeral proof agent. Null until the mutation control is enabled."
+  type        = string
+  default     = null
+}
+
+variable "authority_proof_mutation_controller_role_arns" {
+  description = "Attended proof controller role ARNs permitted to invoke the mutation control alias. Empty until the mutation control is enabled."
+  type        = list(string)
+  default     = []
+}

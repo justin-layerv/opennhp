@@ -98,8 +98,24 @@ locals {
   # Env-only axes (no principal grant): operations that consume the cell DNS
   # suffix (every op that mints or refreshes assignment endpoint data;
   # IssueRegistrationOTP intentionally excluded) and the admission-gated ops.
-  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery"]
+  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "mutate_proof_agent"]
   authority_admission_operations = ["activate_registration", "complete_registration"]
+  # Attended-proof axis. Empty unless the sandbox-only gate is on, so with the
+  # gate off no function matches and no proof environment key is ever rendered.
+  authority_proof_operations = keys(local.authority_contract_proof_operation_suffixes)
+
+  # The uniquely tagged ephemeral agent namespace the control may address. It
+  # matches the attended proof harness's generated identity
+  # (qurl-go-sandbox-<run id>-<run attempt>), so an agent id outside this
+  # namespace is refused by the handler even inside the proof tenant.
+  authority_proof_agent_id_prefix = "qurl-go-sandbox-"
+  # A proof directive is single-run scoped. It expires well inside the attended
+  # job's own 75-minute ceiling so an abandoned run cannot leave an armed
+  # mutation behind.
+  authority_proof_directive_ttl_seconds = 5400
+  # Floor on a shortened proof lease. Short enough to prove expiry inside the
+  # attended run, long enough that the client cannot mistake it for a failure.
+  authority_proof_minimum_lease_seconds = 30
 
   authority_runtime_public_key_role_arns = local.authority_runtime_functions_deploy ? sort([
     for function_name, fn in local.authority_runtime_functions :
@@ -181,6 +197,16 @@ locals {
     "dynamodb:GetItem",
     "dynamodb:Query",
   ]
+  # The item-level subset. dynamodb:LeadingKeys is a key-context condition, so a
+  # statement that also carries the table-level DescribeTable would never match
+  # and the function could not verify SSE at cold start. The attended-proof
+  # operation therefore splits DescribeTable into its own unconditioned
+  # statement and fences only these.
+  authority_runtime_ddb_read_actions_without_describe = [
+    "dynamodb:ConditionCheckItem",
+    "dynamodb:GetItem",
+    "dynamodb:Query",
+  ]
   # The single-item replay tombstone both Hub request ops (issue/refresh) compose
   # as a TransactWriteItems{Put} on connector_authority
   # (repository/dynamodb/hub_request_replay_repo.go). A Put inside a transaction
@@ -237,7 +263,9 @@ locals {
   # Per-operation statement lists. Every operation gets the common ENI statement,
   # a scoped CloudWatch Logs write to its own log group, and its exact — handler-
   # verified — data dependencies. Every resource is a concrete ARN (no wildcard).
-  authority_runtime_operation_statements = {
+  # The attended-proof family is merged in separately and is empty unless its
+  # sandbox-only gate is on.
+  authority_runtime_operation_statements = merge({
     # IssueAssignment: reads the credential (api_keys) + authority placement rows
     # (connector_authority); writes only its single-item replay tombstone (Put)
     # to connector_authority; signs the assignment ticket with qat1.
@@ -403,7 +431,89 @@ locals {
         Resource = local.authority_runtime_table_resources.connector_authority
       },
     ]
+  }, local.authority_runtime_proof_operation_statements)
+
+  # MutateProofAgent: the attended-proof mutation control. It is the ONLY
+  # Authority operation that writes an AGENT# placement row after activation, so
+  # its execution policy carries the tightest fence in the module: every action
+  # is constrained by dynamodb:LeadingKeys to exactly two partitions -- the
+  # dedicated proof tenant's owner partition and the PROOF directive partition.
+  #
+  # That fence is what makes the control safe independently of the handler. Even
+  # a wholly incorrect MutateProofAgent build cannot read or write any other
+  # tenant's placement, credential, or counter rows, because IAM denies the
+  # request before DynamoDB evaluates it. It reaches only connector_authority:
+  # api_keys, agent_keys, and customers are absent, so it can neither revoke a
+  # device credential nor read an owner's credentials. (Device-credential
+  # revocation for the proof agent is performed out of band through the existing
+  # authenticated Control API path, not by this operation.)
+  #
+  # DescribeTable is unconditioned because it is a table-level call that carries
+  # no key context; every item-level action below is fenced.
+  authority_runtime_proof_operation_statements = length(local.authority_contract_proof_operation_suffixes) == 0 ? {} : {
+    mutate_proof_agent = [
+      {
+        Sid      = "ProofVerifyTableEncryption"
+        Effect   = "Allow"
+        Action   = ["dynamodb:DescribeTable"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+      },
+      {
+        Sid      = "ProofFencedPlacementRead"
+        Effect   = "Allow"
+        Action   = local.authority_runtime_ddb_read_actions_without_describe
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = local.authority_runtime_proof_leading_keys
+          }
+        }
+      },
+      {
+        # Read-only resolution of the target cell's endpoint, revision, and
+        # server key, exactly as the ordinary placement reader does. REGISTRY is
+        # deliberately absent from the write fence below, so the control can
+        # read the catalog but can never edit it: cell provisioning stays
+        # Terraform-owned.
+        Sid      = "ProofRegistryRead"
+        Effect   = "Allow"
+        Action   = local.authority_runtime_ddb_read_actions_without_describe
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = local.authority_runtime_proof_registry_leading_keys
+          }
+        }
+      },
+      {
+        Sid    = "ProofFencedPlacementWrite"
+        Effect = "Allow"
+        # DeleteItem is deliberately absent: a proof move relocates and advances
+        # placement, it never removes a row. UpdateItem covers the generation
+        # advance and the active/moving transition; PutItem covers the directive
+        # and the relocated dependent items.
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = local.authority_runtime_proof_leading_keys
+          }
+        }
+      },
+    ]
   }
+
+  # The two partitions the attended-proof control may both read and write: the
+  # dedicated proof tenant's placement partition and the directive partition.
+  # compact() keeps the list well-formed while the owner id is null (gate off),
+  # where the statements are never emitted anyway.
+  authority_runtime_proof_leading_keys = compact([
+    local.authority_proof_owner_partition_key,
+    local.authority_proof_directive_partition_key,
+  ])
+  # Catalog resolution only. REGISTRY is absent from the write fence above, so
+  # cell provisioning stays exclusively Terraform-owned.
+  authority_runtime_proof_registry_leading_keys = ["REGISTRY"]
 
   authority_runtime_environment = local.authority_runtime_functions_deploy ? {
     for function_name, fn in local.authority_runtime_functions :
@@ -434,6 +544,16 @@ locals {
       contains(local.authority_ses_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_OTP_EMAIL_FROM            = var.otp_email_from
         CONNECTOR_AUTHORITY_OTP_SES_CONFIGURATION_SET = var.ses_configuration_set_name
+      } : {},
+      # The attended-proof control is told, in its immutable function
+      # environment, exactly which tenant it may address and how short a proof
+      # lease may be. Both are also enforced by IAM (LeadingKeys) and by the
+      # handler; the environment is the handler's copy, not the only fence.
+      contains(local.authority_proof_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = var.authority_proof_mutation_owner_id
+        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = local.authority_proof_agent_id_prefix
+        CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = tostring(local.authority_proof_directive_ttl_seconds)
+        CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = tostring(local.authority_proof_minimum_lease_seconds)
       } : {},
       contains(local.authority_admission_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_ADMISSION_REQUESTS_PER_SECOND = tostring(local.authority_contract_cell_workers[fn.cell_id].preinvoke_rate_limits[fn.operation].refill_per_second)

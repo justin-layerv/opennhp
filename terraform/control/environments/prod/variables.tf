@@ -153,3 +153,36 @@ variable "tags" {
     Owner        = "platform-team"
   }
 }
+
+variable "authority_proof_mutation_controls_enabled" {
+  description = "Production attended-proof mutation control gate is permanently closed. This control mutates live authorization state and exists only for the sandbox two-cell UDP proof."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.authority_proof_mutation_controls_enabled
+    error_message = "Production Authority proof mutation controls must remain permanently disabled."
+  }
+}
+
+variable "authority_proof_mutation_owner_id" {
+  description = "Production proof tenant must remain unset; the mutation control cannot exist in production."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.authority_proof_mutation_owner_id == null
+    error_message = "Production Authority proof mutation owner must remain null."
+  }
+}
+
+variable "authority_proof_mutation_controller_role_arns" {
+  description = "Production proof controller list must remain empty; the mutation control cannot exist in production."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.authority_proof_mutation_controller_role_arns) == 0
+    error_message = "Production Authority proof mutation controllers must remain empty."
+  }
+}

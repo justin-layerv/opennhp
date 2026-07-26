@@ -62,10 +62,14 @@ locals {
     "redis_max_connections",
     "ses_max_in_flight",
   ])
-  authority_contract_caller_capacity_keys = toset([
-    "hub_workers",
-    "cell_workers",
-  ])
+  # proof_controller is present if and only if the sandbox-only proof gate is
+  # on. With the gate off this set is byte-identical to the historical closure,
+  # so an existing contract that carries a proof_controller block is rejected as
+  # an unknown key rather than silently accepted.
+  authority_contract_caller_capacity_keys = toset(concat(
+    ["hub_workers", "cell_workers"],
+    var.authority_proof_mutation_controls_enabled ? ["proof_controller"] : [],
+  ))
   authority_contract_worker_keys = toset([
     "max_replicas",
     "preinvoke_limits",
@@ -86,6 +90,17 @@ locals {
     complete_registration        = "cr"
     complete_credential_recovery = "ccr"
   }
+  # Attended-proof mutation controls are a THIRD operation family, deliberately
+  # not merged into the hub or cell maps above. Keeping them separate is the
+  # structural fence: the hub/cell caller-capacity closures below are keyed on
+  # those two maps, so a proof operation can never acquire a hub or cell
+  # preinvoke budget, and authority_selected_alias_targets never offers a proof
+  # alias to the Hub task role or a cell server role. The family is empty unless
+  # the sandbox-only gate is on, so the committed default reproduces the exact
+  # historical 3 + 4N graph byte for byte.
+  authority_contract_proof_operation_suffixes = var.authority_proof_mutation_controls_enabled ? {
+    mutate_proof_agent = "pm"
+  } : {}
   # The handler (layervai/qurl-service internal/connectorauthorityruntime,
   # parseOperation) matches CONNECTOR_AUTHORITY_OPERATION EXACTLY against the
   # PascalCase operation constants exported by layervai/qurl-conformance. The
@@ -104,6 +119,7 @@ locals {
     activate_registration        = "ActivateRegistration"
     complete_registration        = "CompleteRegistration"
     complete_credential_recovery = "CompleteCredentialRecovery"
+    mutate_proof_agent           = "MutateProofAgent"
   }
   authority_contract_function_keys = toset([
     "steady_provisioned_concurrency",
@@ -137,6 +153,11 @@ locals {
   }, {})
   authority_contract_caller_capacity = try(var.authority_runtime_contract.global.caller_capacity, {})
   authority_contract_hub_workers     = try(var.authority_runtime_contract.global.caller_capacity.hub_workers, {})
+  # Projected unconditionally, exactly like hub_workers. The gate is enforced by
+  # authority_contract_caller_capacity_keys instead: with the gate off that
+  # closed key set omits proof_controller, so a contract carrying one is
+  # rejected as an unknown key rather than silently projected here.
+  authority_contract_proof_controller = try(var.authority_runtime_contract.global.caller_capacity.proof_controller, {})
   authority_contract_cell_workers = try({
     for cell_id, worker in var.authority_runtime_contract.global.caller_capacity.cell_workers :
     cell_id => worker
@@ -162,9 +183,24 @@ locals {
       }
     ],
   )...)
-  authority_expected_functions      = merge(local.authority_expected_hub_functions, local.authority_expected_cell_functions)
+  # Proof functions are environment-scoped like the hub group (no cell suffix):
+  # the control addresses an agent, not a cell, and one function performs the
+  # cell0-to-cell1 move across both.
+  authority_expected_proof_functions = {
+    for operation, suffix in local.authority_contract_proof_operation_suffixes :
+    "${local.authority_function_prefix}-${suffix}" => {
+      operation = operation
+      cell_id   = ""
+    }
+  }
+  authority_expected_functions = merge(
+    local.authority_expected_hub_functions,
+    local.authority_expected_cell_functions,
+    local.authority_expected_proof_functions,
+  )
   authority_actual_function_names   = toset(keys(local.authority_contract_functions))
   authority_expected_hub_names      = toset(keys(local.authority_expected_hub_functions))
+  authority_expected_proof_names    = toset(keys(local.authority_expected_proof_functions))
   authority_expected_function_names = toset(keys(local.authority_expected_functions))
   authority_expected_cell_names = {
     for cell_id in keys(local.authority_contract_cells) :
@@ -177,7 +213,13 @@ locals {
   authority_expected_caller_in_flight = {
     for function_name, spec in local.authority_expected_functions :
     function_name => (
-      spec.cell_id == ""
+      contains(local.authority_expected_proof_names, function_name)
+      ? try(
+        local.authority_contract_proof_controller.max_replicas *
+        local.authority_contract_proof_controller.preinvoke_limits[spec.operation],
+        -1,
+      )
+      : spec.cell_id == ""
       ? try(
         local.authority_contract_hub_workers.max_replicas *
         local.authority_contract_hub_workers.preinvoke_limits[spec.operation],
@@ -197,7 +239,15 @@ locals {
   authority_expected_caller_requests_per_second = {
     for function_name, spec in local.authority_expected_functions :
     function_name => (
-      spec.cell_id == ""
+      contains(local.authority_expected_proof_names, function_name)
+      ? try(
+        local.authority_contract_proof_controller.max_replicas * (
+          local.authority_contract_proof_controller.preinvoke_rate_limits[spec.operation].burst +
+          local.authority_contract_proof_controller.preinvoke_rate_limits[spec.operation].refill_per_second
+        ),
+        -1,
+      )
+      : spec.cell_id == ""
       ? try(
         local.authority_contract_hub_workers.max_replicas * (
           local.authority_contract_hub_workers.preinvoke_rate_limits[spec.operation].burst +
@@ -259,6 +309,18 @@ locals {
       for rate_limit in values(local.authority_contract_hub_workers.preinvoke_rate_limits) :
       toset(keys(rate_limit)) == local.authority_contract_rate_limit_keys
     ]) &&
+    (
+      !var.authority_proof_mutation_controls_enabled ||
+      (
+        toset(keys(local.authority_contract_proof_controller)) == local.authority_contract_worker_keys &&
+        toset(keys(local.authority_contract_proof_controller.preinvoke_limits)) == toset(keys(local.authority_contract_proof_operation_suffixes)) &&
+        toset(keys(local.authority_contract_proof_controller.preinvoke_rate_limits)) == toset(keys(local.authority_contract_proof_operation_suffixes)) &&
+        alltrue([
+          for rate_limit in values(local.authority_contract_proof_controller.preinvoke_rate_limits) :
+          toset(keys(rate_limit)) == local.authority_contract_rate_limit_keys
+        ])
+      )
+    ) &&
     toset(keys(local.authority_contract_cell_workers)) == toset(keys(local.authority_contract_cells)) &&
     alltrue([
       for worker in values(local.authority_contract_cell_workers) :
@@ -356,6 +418,14 @@ locals {
           for rate_limit in values(local.authority_contract_hub_workers.preinvoke_rate_limits) :
           values(rate_limit)
         ]),
+        var.authority_proof_mutation_controls_enabled ? concat(
+          [local.authority_contract_proof_controller.max_replicas],
+          values(local.authority_contract_proof_controller.preinvoke_limits),
+          flatten([
+            for rate_limit in values(local.authority_contract_proof_controller.preinvoke_rate_limits) :
+            values(rate_limit)
+          ]),
+        ) : [],
         flatten([
           for worker in values(local.authority_contract_cell_workers) :
           concat(
@@ -408,6 +478,24 @@ locals {
       rate_limit.burst >= 1 &&
       rate_limit.refill_per_second >= 1
     ]) &&
+    (
+      !var.authority_proof_mutation_controls_enabled ||
+      (
+        # One attended controller, serialized: a proof mutation is never
+        # concurrent with itself, so a replica or budget above one would only
+        # widen a control that mutates live authorization state.
+        local.authority_contract_proof_controller.max_replicas == 1 &&
+        alltrue([
+          for value in values(local.authority_contract_proof_controller.preinvoke_limits) :
+          value == 1
+        ]) &&
+        alltrue([
+          for rate_limit in values(local.authority_contract_proof_controller.preinvoke_rate_limits) :
+          rate_limit.burst == 1 &&
+          rate_limit.refill_per_second == 1
+        ])
+      )
+    ) &&
     alltrue([
       for worker in values(local.authority_contract_cell_workers) :
       worker.max_replicas >= 1 &&
@@ -496,6 +584,79 @@ locals {
     var.authority_runtime_contract_evidence_verified
   )
 
+  # ---------------------------------------------------------------------------
+  # Attended-proof mutation control fences.
+  #
+  # These are deliberately expressed as plan-time hard failures rather than as
+  # conditional resource creation: a mis-set input must stop the apply, not
+  # quietly produce a narrower graph. Each clause below is independently
+  # sufficient to keep the control out of prod and out of every ordinary caller
+  # path; they are ANDed so no single edit can open it.
+  # ---------------------------------------------------------------------------
+
+  # qurl-service derives the placement partition as OWNER# followed by the
+  # lowercase hex SHA-256 of the authenticated owner identity
+  # (internal/repository/dynamodb/agent_placement_repo.go agentPlacementOwnerPK).
+  # Reproducing it here lets the execution role be pinned to exactly one tenant
+  # partition with dynamodb:LeadingKeys.
+  authority_proof_owner_partition_key = (
+    var.authority_proof_mutation_owner_id == null
+    ? null
+    : "OWNER#${sha256(var.authority_proof_mutation_owner_id)}"
+  )
+  # The directive partition the control arms and reads. It is a single literal
+  # partition so the same LeadingKeys fence covers it.
+  authority_proof_directive_partition_key = "PROOF"
+
+  # Runtime caller roles that must never be able to reach the control. The Hub
+  # task role and every cell server role are constructed exactly as their own
+  # modules construct them.
+  authority_proof_forbidden_caller_role_arns = toset(concat(
+    ["arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/${local.name_prefix}-hub-task"],
+    [
+      for cell_id in keys(local.authority_contract_cells) :
+      "arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/${cell_id == "cell0" ? "layerv-nhp-${var.environment}-server" : "layerv-nhp-${var.environment}-${cell_id}-server"}"
+    ],
+  ))
+
+  authority_proof_mutation_fence_valid = !var.authority_proof_mutation_controls_enabled || try(
+    # 1. Sandbox only. prod can never plan this function.
+    var.environment == "sandbox" &&
+    !local.is_prod &&
+    # 2. The dedicated proof tenant must be named, so the data fence is real.
+    var.authority_proof_mutation_owner_id != null &&
+    local.authority_proof_owner_partition_key != null &&
+    # 3. At least one attended controller, every one of them in this exact
+    #    partition and account, and none of them a runtime caller role.
+    length(var.authority_proof_mutation_controller_role_arns) > 0 &&
+    length(toset(var.authority_proof_mutation_controller_role_arns)) == length(var.authority_proof_mutation_controller_role_arns) &&
+    alltrue([
+      for role_arn in var.authority_proof_mutation_controller_role_arns :
+      startswith(role_arn, "arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/") &&
+      !contains(local.authority_proof_forbidden_caller_role_arns, role_arn)
+    ]) &&
+    # 4. The control may only exist on top of a bound contract that actually
+    #    budgets it, so it can never be enabled ahead of reviewed capacity.
+    local.authority_runtime_contract_enabled &&
+    length(local.authority_expected_proof_names) > 0 &&
+    length(setsubtract(local.authority_expected_proof_names, local.authority_actual_function_names)) == 0,
+    false,
+  )
+
+  # With the gate off, no proof function may appear in the contract at all. The
+  # expected-set subtraction in authority_contract_graph_valid already rejects
+  # it; this states the invariant independently so a future refactor of that
+  # closure cannot silently admit one.
+  authority_proof_absent_when_disabled_valid = (
+    var.authority_proof_mutation_controls_enabled ||
+    !local.authority_runtime_contract_enabled ||
+    length([
+      for function_name in local.authority_actual_function_names :
+      function_name
+      if endswith(function_name, "-pm")
+    ]) == 0
+  )
+
   authority_selected_alias_targets = !local.authority_runtime_contract_enabled ? null : {
     hub = {
       for function_name, spec in local.authority_expected_hub_functions :
@@ -508,6 +669,15 @@ locals {
         local.authority_expected_functions[function_name].operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${var.authority_runtime_contract.selected_authority_color}"
         if contains(local.authority_actual_function_names, function_name)
       }
+    }
+    # Separate key by design. Consumers select .hub or .cells; nothing that
+    # builds a runtime caller policy iterates the whole object, so the proof
+    # alias is unreachable from the Hub task role and every cell server role
+    # even though it lives in the same derivation.
+    proof = {
+      for function_name, spec in local.authority_expected_proof_functions :
+      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${var.authority_runtime_contract.selected_authority_color}"
+      if contains(local.authority_actual_function_names, function_name)
     }
   }
 }

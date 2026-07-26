@@ -268,6 +268,84 @@ variable "hub_worker_enabled" {
   default     = false
 }
 
+variable "authority_proof_mutation_controls_enabled" {
+  description = <<-EOT
+    Dark-first enable gate for the attended-proof Authority mutation control
+    (the MutateProofAgent operation and its layerv-nhp-<environment>-ca-pm
+    function/aliases/execution role).
+
+    This operation MUTATES live authorization state: it arms a bounded proof
+    directive, forces one cell0-to-cell1 placement move at a strictly newer
+    assignment generation, and shortens the derived assignment lease. It exists
+    only to let the attended two-cell UDP proof observe a real move that the
+    client never self-asserts.
+
+    It is fenced four ways and every fence is independent:
+
+      1. environment: the module fails closed unless environment is sandbox, so
+         the function cannot be planned in prod at all. The prod root
+         additionally validation-locks this input false.
+      2. operation family: proof operations are a THIRD family, never merged
+         into the hub or cell graphs. They never appear in
+         authority_selected_alias_targets.hub or .cells, so neither the Hub task
+         role nor any cell server role can name the alias in its invoke policy.
+      3. caller: only the attended proof controller identity supplied through
+         authority_proof_mutation_controller_role_arns may invoke the alias.
+         That identity is a protected GitHub environment role, not a runtime
+         caller, and no ordinary UDP traffic path reaches it.
+      4. data: the execution role is fenced by dynamodb:LeadingKeys to exactly
+         the dedicated proof owner partition plus the PROOF directive
+         partition, so the control cannot read or write any other tenant's
+         placement rows even if the handler were wrong.
+
+    Committed inputs leave it false; prod stays dark. It additionally requires a
+    non-null authority_runtime_contract that lists the proof function, so it can
+    never be enabled ahead of a reviewed capacity and evidence binding.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "authority_proof_mutation_owner_id" {
+  description = <<-EOT
+    Owner identity of the dedicated sandbox proof tenant that owns every
+    uniquely tagged ephemeral proof agent. The module derives the DynamoDB
+    partition key exactly as qurl-service does (OWNER# followed by the lowercase
+    hex SHA-256 of this value) and pins the mutation control's execution role to
+    that single partition with dynamodb:LeadingKeys.
+
+    Null unless authority_proof_mutation_controls_enabled is true. It is an
+    addressing input, not a secret: the derived partition key is already
+    recoverable from any owner identity.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.authority_proof_mutation_owner_id == null ||
+      can(regex("^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$", var.authority_proof_mutation_owner_id))
+    )
+    error_message = "authority_proof_mutation_owner_id must be a canonical lowercase 1-64 character identifier that starts and ends alphanumeric."
+  }
+}
+
+variable "authority_proof_mutation_controller_role_arns" {
+  description = <<-EOT
+    Exact IAM role ARNs of the attended proof controller identities permitted to
+    invoke the mutation control alias. Empty unless
+    authority_proof_mutation_controls_enabled is true.
+
+    These must be the NHP-owned protected GitHub environment controller roles
+    (terraform/modules/udp-proof-runner controller), never the proof runner
+    instance role, never the Hub task role, and never a cell server role. The
+    module rejects any ARN outside the current partition and account, and any
+    role whose name matches a Hub or cell server runtime role.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   description = "Additional tags applied to every supported resource."
   type        = map(string)

@@ -136,5 +136,35 @@ resource "terraform_data" "foundation_contract" {
       condition     = !var.hub_worker_enabled || (var.hub_edge_enabled && local.authority_runtime_functions_deploy)
       error_message = "hub_worker_enabled requires hub_edge_enabled and a live authority runtime (the worker fronts the 5a NLB target group and invokes the 3 live authority aliases)."
     }
+
+    precondition {
+      # The single most important fence: the attended-proof mutation control
+      # MUTATES live authorization state, so prod may never plan it, it must
+      # name its dedicated proof tenant and at least one attended controller
+      # identity that is not a runtime caller role, and it must sit on a bound
+      # contract that already budgets it.
+      condition     = local.authority_proof_mutation_fence_valid
+      error_message = "authority_proof_mutation_controls_enabled requires environment sandbox, a non-null authority_proof_mutation_owner_id, at least one distinct in-account attended controller role ARN that is neither the Hub task role nor a cell server role, and a bound contract listing the proof function."
+    }
+
+    precondition {
+      condition     = local.authority_proof_absent_when_disabled_valid
+      error_message = "authority_runtime_contract may not carry an attended-proof mutation function while authority_proof_mutation_controls_enabled is false."
+    }
+
+    precondition {
+      # Proof operations must never acquire a hub or cell caller budget. The
+      # capacity closures are keyed on the hub/cell suffix maps, so an overlap
+      # would silently give a runtime caller a preinvoke allowance for a
+      # mutating operation.
+      condition = length(setintersection(
+        toset(keys(local.authority_contract_proof_operation_suffixes)),
+        toset(concat(
+          keys(local.authority_contract_hub_operation_suffixes),
+          keys(local.authority_contract_cell_operation_suffixes),
+        )),
+      )) == 0
+      error_message = "An attended-proof mutation operation may not also be a hub or cell operation."
+    }
   }
 }
