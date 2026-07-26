@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+service="$1"
+operation="$2"
+
+case "${service}:${operation}" in
+  sts:get-caller-identity)
+    printf '%s\n' "${FAKE_ACCOUNT_ID:-767397897469}"
+    ;;
+  autoscaling:describe-auto-scaling-groups)
+    blue_min="${FAKE_BLUE_MIN:-0}"
+    blue_max="${FAKE_BLUE_MAX:-0}"
+    blue_desired="${FAKE_BLUE_DESIRED:-0}"
+    blue_instances="${FAKE_BLUE_INSTANCES:-[]}"
+    green_min="${FAKE_GREEN_MIN:-0}"
+    green_max="${FAKE_GREEN_MAX:-0}"
+    green_desired="${FAKE_GREEN_DESIRED:-0}"
+    green_instances="${FAKE_GREEN_INSTANCES:-[]}"
+    default_suspended='[{"ProcessName":"AlarmNotification"},{"ProcessName":"AZRebalance"},{"ProcessName":"InstanceRefresh"},{"ProcessName":"Launch"},{"ProcessName":"ReplaceUnhealthy"},{"ProcessName":"ScheduledActions"}]'
+    blue_suspended="${FAKE_BLUE_SUSPENDED:-$default_suspended}"
+    green_suspended="${FAKE_GREEN_SUSPENDED:-$default_suspended}"
+    printf '{"AutoScalingGroups":['
+    printf '{"AutoScalingGroupName":"layerv-nhp-sandbox-cell1-server","MinSize":%s,"MaxSize":%s,"DesiredCapacity":%s,"Instances":%s,"SuspendedProcesses":%s},' \
+      "$blue_min" "$blue_max" "$blue_desired" "$blue_instances" "$blue_suspended"
+    printf '{"AutoScalingGroupName":"layerv-nhp-sandbox-cell1-server-green","MinSize":%s,"MaxSize":%s,"DesiredCapacity":%s,"Instances":%s,"SuspendedProcesses":%s}' \
+      "$green_min" "$green_max" "$green_desired" "$green_instances" "$green_suspended"
+    if [[ "${FAKE_DUPLICATE_BLUE:-0}" == "1" ]]; then
+      printf ',{"AutoScalingGroupName":"layerv-nhp-sandbox-cell1-server","MinSize":0,"MaxSize":0,"DesiredCapacity":0,"Instances":[],"SuspendedProcesses":[]}'
+    fi
+    printf ']}\n'
+    ;;
+  ec2:describe-vpcs)
+    if [[ "${FAKE_LEGACY_VPC_COUNT:-1}" == "1" ]]; then
+      printf '%s\n' '{"Vpcs":[{"VpcId":"vpc-legacy-cell1"}]}'
+    else
+      printf '%s\n' '{"Vpcs":[]}'
+    fi
+    ;;
+  ec2:describe-network-interfaces)
+    if [[ "${FAKE_INSTANCE_ENI:-0}" == "1" ]]; then
+      printf '%s\n' '{"NetworkInterfaces":[{"NetworkInterfaceId":"eni-instance","Status":"in-use","Attachment":{"InstanceId":"i-old"}}]}'
+    else
+      printf '%s\n' '{"NetworkInterfaces":[{"NetworkInterfaceId":"eni-nlb","Status":"in-use","Attachment":{"InstanceOwnerId":"amazon-elb"}}]}'
+    fi
+    ;;
+  *)
+    echo "unexpected fake aws call: ${service} ${operation}" >&2
+    exit 2
+    ;;
+esac

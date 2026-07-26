@@ -6,7 +6,7 @@ output "vpc_id" {
 }
 
 output "vpc_cidr" {
-  description = "cell1 VPC CIDR (non-overlapping with cell0 10.100.0.0/16 and relay 10.101.0.0/16)."
+  description = "cell1 VPC CIDR (non-overlapping with cell0 10.100.0.0/16, relay 10.101.0.0/16, Control 10.102.0.0/16, and the proof runner 10.103.0.0/28)."
   value       = module.networking.vpc_cidr
 }
 

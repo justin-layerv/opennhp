@@ -10,7 +10,7 @@
 #   discoverable by the control/deploy plane via SSM, in an isolated,
 #   non-overlapping VPC. This root therefore provisions:
 #
-#     * networking  — cell1 VPC (10.102.0.0/16), public/private subnets, 1 NAT.
+#     * networking  — cell1 VPC (10.104.0.0/16), public/private subnets, 1 NAT.
 #     * kms         — cell1 CMKs (ebs/logs/secrets) for at-rest encryption.
 #     * plugins     — cell1's OWN S3 plugin bucket. REQUIRED as its own bucket
 #                     because modules/compute unconditionally writes
@@ -44,7 +44,8 @@
 #   * state key : nhp/sandbox-cell1/terraform.tfstate   (backend.tf)
 #   * names     : name_prefix = layerv-nhp-sandbox-cell1 (distinct env string)
 #   * SSM paths : /sandbox-cell1/nhp/server/*            (keyed on environment)
-#   * VPC CIDR  : 10.102.0.0/16                          (vs cell0 10.100/10.101)
+#   * VPC CIDR  : 10.104.0.0/16                (vs cell0 10.100/10.101,
+#                                                Control 10.102, runner 10.103/28)
 # =============================================================================
 
 locals {

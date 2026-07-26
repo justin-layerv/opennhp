@@ -49,11 +49,19 @@ variable "aws_account_id" {
 variable "vpc_cidr" {
   description = <<-EOT
     cell1 VPC CIDR. MUST NOT overlap cell0's 10.100.0.0/16, cell0's relay
-    DMZ 10.101.0.0/16, or prod's 10.200.0.0/16. 10.102.0.0/16 is the next
-    free /16 in the sandbox account's cell range.
+    DMZ 10.101.0.0/16, the Control VPC's 10.102.0.0/16, the UDP proof
+    runner's 10.103.0.0/28, or prod's 10.200.0.0/16. The 2026-07-25
+    all-enabled-region routing audit selected 10.104.0.0/16.
   EOT
   type        = string
-  default     = "10.102.0.0/16"
+  default     = "10.104.0.0/16"
+
+  validation {
+    # Rollback intentionally changes this literal, the default above, and the
+    # root tfvars together; see docs/runbooks/sandbox-cell1-vpc-cidr-relocation.md.
+    condition     = var.vpc_cidr == "10.104.0.0/16"
+    error_message = "The reviewed sandbox cell1 VPC CIDR is 10.104.0.0/16; change it only with a new all-region routing audit."
+  }
 }
 
 variable "domain_name" {

@@ -11,7 +11,7 @@ variable "aws_region" {
 }
 
 variable "runner_vpc_cidr" {
-  description = "Dedicated, unpeered /28 for the runner VPC. Non-overlapping with cell0 (10.100/10.101), cell1/Control (10.102), prod (10.200)."
+  description = "Dedicated, unpeered /28 for the runner VPC. Non-overlapping with cell0/relay (10.100/10.101), Control (10.102), cell1 (10.104), and prod (10.200)."
   type        = string
   default     = "10.103.0.0/28"
 }

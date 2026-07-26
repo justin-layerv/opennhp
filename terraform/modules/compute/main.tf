@@ -1414,7 +1414,13 @@ resource "aws_autoscaling_group" "server" {
     # on an existing ASG through TF. Use the ASG API / console or a
     # blue/green deploy to adjust scale. This is consistent with the
     # green ASG's existing behaviour and matches how CI already operates.
-    ignore_changes = [desired_capacity, min_size]
+    # Process suspension is also an operational control. An attended migration
+    # or incident response may suspend Launch/policy processes before Terraform
+    # updates the ASG. Reconciliation must not silently resume them in the same
+    # apply; the operator who froze the group owns the explicit, post-health
+    # resume. This is particularly load-bearing for cross-VPC moves, where the
+    # old fleet is drained before its subnets are destroyed.
+    ignore_changes = [desired_capacity, min_size, suspended_processes]
   }
 }
 
@@ -1455,6 +1461,17 @@ resource "aws_lb" "server" {
     Component = "compute"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    # ELBv2 cannot move an existing NLB to subnets in another VPC. Terraform's
+    # AWS provider models `subnets` as an in-place update, so a VPC relocation
+    # would otherwise reach apply and fail in SetSubnets. The server SG's vpc_id
+    # changes exactly when the server VPC changes; key the trigger to that
+    # attribute rather than the whole SG so an unrelated name/description
+    # replacement cannot cascade into NLB downtime. Static NLB names require
+    # destroy-before-create, so do not add create_before_destroy here.
+    replace_triggered_by = [aws_security_group.server.vpc_id]
+  }
 }
 
 # UDP Target Group (PUBLIC knock surface). Constant count preserves state shape.
@@ -1592,6 +1609,14 @@ resource "aws_lb" "server_internal" {
     Component = "compute"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    # Same cross-VPC constraint as the public NLB above. This count is zero for
+    # the lean sandbox cell1 root, but keeping the module's two server NLBs in
+    # lockstep prevents a later relay-enabled VPC relocation from attempting an
+    # impossible in-place SetSubnets call.
+    replace_triggered_by = [aws_security_group.server.vpc_id]
+  }
 }
 
 # Internal UDP Target Group for the BLUE server ASG (mirrors

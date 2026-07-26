@@ -513,7 +513,11 @@ resource "aws_autoscaling_group" "server_green" {
   lifecycle {
     create_before_destroy = true
     # CI/CD manages capacity during blue/green switches
-    ignore_changes = [desired_capacity, min_size]
+    # Suspension state, like desired/min capacity, is an operator-owned
+    # deployment/incident control. Terraform must not resume a deliberately
+    # frozen standby group during an unrelated infrastructure update. Keep this
+    # list in lockstep with the blue ASG in main.tf.
+    ignore_changes = [desired_capacity, min_size, suspended_processes]
   }
 }
 

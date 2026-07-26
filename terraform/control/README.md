@@ -137,6 +137,19 @@ peering, IPAM, VPN, and Direct Connect gateways, gateway associations, and
 other paths for remote CIDRs. A passing local preflight is not proof about
 out-of-region or Direct Connect gateway routing.
 
+The Control CIDR is not a reusable "next cell" allocation. A later cell1 root
+initially reused `10.102.0.0/16`; that did not create reachability because
+Control and cell VPCs have no route, peering, Transit Gateway, or shared
+security group. Even so, overlapping VPCs unnecessarily foreclose unambiguous
+future private routing. The 2026-07-25 replacement audit rejected
+`10.103.0.0/16` because the UDP proof runner already owns `10.103.0.0/28`,
+then accepted cell1 `10.104.0.0/16` across all 17 enabled sandbox regions.
+Every regional inventory found no overlapping VPC/route/peering allocation and
+no active IPAM, Transit Gateway attachment, VPN, Client VPN, Direct Connect
+connection, or virtual interface; the separate global reads found no Direct
+Connect gateway and no Cloud WAN core network. Cell1 is pinned to
+`10.104.0.0/16` and requires a new all-region audit before any later change.
+
 ## PrivateLink service evidence
 
 The 2026-07-16 pre-apply check queried EC2 endpoint-service discovery in both

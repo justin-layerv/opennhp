@@ -134,6 +134,30 @@ else flips it (no plan-time revert):
 - `aws_autoscaling_group.ac` (`modules/ac/main.tf`)
 - `aws_autoscaling_group.frps` blue + green (`modules/qurl-reverse-tunnel-server/main.tf`, `blue_green.tf`)
 
+The NHP server blue + green ASGs in `modules/compute` additionally ignore
+`suspended_processes`. Deploys and attended infrastructure maintenance freeze
+those process sets directly through the Auto Scaling API; Terraform must not
+silently resume them during an unrelated apply. This does not apply to the AC
+or FRPS ASGs.
+
+This is a permanent ownership boundary, not a cell1-only exception. A
+2026-07-25 read-only production check found `layerv-nhp-prod-server` at
+min/max/desired `3/10/3` with `SuspendedProcesses=[]`, so enabling the lifecycle
+rule does not preserve any pre-existing production suspension. Future
+operator-, deploy-, or incident-created suspensions remain externally owned
+until that same workflow explicitly resumes them and verifies the readback.
+That workflow ownership is the detection and cleanup boundary; do not add a
+second speculative alarm in an unrelated migration PR without first defining
+which existing deploy/incident control owns and consumes it.
+
+The compute module's public and enabled internal server NLBs also replace when
+the server security group's `vpc_id` changes. The attribute-specific trigger is
+plan-neutral while the VPC is stable and deliberately does not cascade an
+unrelated SG name/description replacement into NLB downtime. For a VPC move,
+the same-VPC NLBs must replace because an NLB cannot move between VPCs. Their
+static names require destroy-before-create, so such a future production move is
+necessarily an attended downtime operation rather than an ordinary apply.
+
 FRPS ASGs also self-refresh on launch-template version changes. NHP-only
 changes that alter qurl-reverse-tunnel-server user_data/env wiring will roll
 the tunnel fleet without waiting for a qurl-reverse-tunnel-server image

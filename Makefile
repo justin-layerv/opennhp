@@ -497,13 +497,16 @@ lint-workflows:
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@python3 tests/scripts/test_qurl_agent_transact_iam.py
-	@shellcheck scripts/capture-control-sandbox-update-state.sh scripts/check-control-sandbox-aws-identity.sh scripts/check-control-global-routing.sh scripts/check-control-vpc-cidr-overlap.sh scripts/check-live-main-ref.sh scripts/check-no-checkout-credentials.sh scripts/ensure-control-otp-pepper.sh scripts/verify-control-otp-pepper.sh scripts/verify-control-sandbox-first-apply.sh scripts/verify-control-sandbox-live-boundary.sh tests/fixtures/control-vpc-cidr-overlap/aws tests/scripts/check-control-global-routing_test.sh
+	@shellcheck scripts/capture-control-sandbox-update-state.sh scripts/check-control-sandbox-aws-identity.sh scripts/check-control-global-routing.sh scripts/check-control-vpc-cidr-overlap.sh scripts/check-sandbox-cell1-vpc-relocation-preflight.sh scripts/check-live-main-ref.sh scripts/check-no-checkout-credentials.sh scripts/ensure-control-otp-pepper.sh scripts/verify-control-otp-pepper.sh scripts/verify-control-sandbox-first-apply.sh scripts/verify-control-sandbox-live-boundary.sh tests/fixtures/control-vpc-cidr-overlap/aws tests/fixtures/sandbox-cell1-vpc-relocation/aws tests/scripts/check-control-global-routing_test.sh tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 	@python3 tests/scripts/test_check_control_sandbox_first_apply.py
 	@python3 tests/scripts/test_check_control_sandbox_update.py
+	@python3 -m py_compile .github/scripts/check-sandbox-cell1-cidr-relocation-plan.py
+	@python3 tests/scripts/test_check_sandbox_cell1_cidr_relocation_plan.py
 	@python3 tests/scripts/test_generate_connector_authority_runtime_contract.py
 	@python3 tests/scripts/test_check_hub_publication_environment.py
 	@python3 tests/scripts/test_publish_hub_image.py
 	@bash tests/scripts/check-control-global-routing_test.sh
+	@bash tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 	@python3 tests/scripts/test_summarize_terraform_plan.py
 	@python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 	@python3 -m py_compile .github/scripts/check-relay-dmz-plan.py
@@ -587,7 +590,12 @@ lint-terraform-drift:
 	@bash tests/scripts/check-control-global-routing_test.sh
 	@bash tests/scripts/check-control-vpc-cidr-overlap_test.sh
 	@python3 tests/scripts/test_check_control_sandbox_first_apply.py
+	@python3 -m py_compile .github/scripts/check-sandbox-cell1-cidr-relocation-plan.py
+	@python3 tests/scripts/test_check_sandbox_cell1_cidr_relocation_plan.py
+	@shellcheck scripts/check-sandbox-cell1-vpc-relocation-preflight.sh tests/fixtures/sandbox-cell1-vpc-relocation/aws tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
+	@bash tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 	@python3 tests/scripts/test_check_terraform_plan_pr_policy_readonly.py
+	@python3 tests/scripts/test_compute_lifecycle_contract.py
 	@python3 tests/scripts/test_ac_tcp_target_group_contract.py
 	@python3 .github/scripts/check-terraform-plan-pr-policy-readonly.py
 	@./tests/lints/terraform-tag-charset/run-fixtures.sh
