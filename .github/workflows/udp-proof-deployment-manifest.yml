@@ -29,6 +29,13 @@ on:
 permissions:
   contents: read
   id-token: write
+  # Pull the private Connector canary image and its cosign signature from GHCR.
+  # GHCR authorizes container packages per repository through the package's
+  # "Manage Actions access" list, which grants a repository's GITHUB_TOKEN --
+  # not a third-party App installation token. The evidence App can hold
+  # packages:read and still get "Package not found", so the canary pull below
+  # uses this repository's own token instead.
+  packages: read
 
 concurrency:
   group: udp-proof-deployment-manifest-sandbox
@@ -155,7 +162,11 @@ jobs:
 
       - name: Verify the private canary signature and exact attestation
         env:
-          GHCR_TOKEN: ${{ steps.app.outputs.token }}
+          # Repository-scoped, read-only for packages (see permissions above).
+          # The App token cannot read the canary package regardless of its
+          # packages:read grant, because GHCR grants container access to
+          # repositories, not to App installations.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_REF: ${{ steps.canary.outputs.canary_image_ref }}
           CANARY_WORKFLOW_SHA: ${{ steps.metadata.outputs.canary_head_sha }}
         run: |

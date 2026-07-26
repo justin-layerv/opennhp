@@ -53,9 +53,23 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         )
 
     def test_workflow_is_trusted_main_read_only_and_headless(self) -> None:
+        # packages:read is required and is still read-only. GHCR authorizes
+        # container packages per repository via the package's "Manage Actions
+        # access" list, which grants a repository's GITHUB_TOKEN rather than a
+        # third-party App installation token, so the private canary pull cannot
+        # use the evidence App's token no matter what it is granted.
         self.assertEqual(
             self.workflow["permissions"],
-            {"contents": "read", "id-token": "write"},
+            {"contents": "read", "id-token": "write", "packages": "read"},
+        )
+        # Nothing in this workflow may acquire a write permission.
+        self.assertEqual(
+            {
+                scope
+                for scope, level in self.workflow["permissions"].items()
+                if level != "read"
+            },
+            {"id-token"},
         )
         jobs = self.workflow["jobs"]
         self.assertEqual(set(jobs), {"produce"})
