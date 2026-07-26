@@ -275,6 +275,13 @@ resource "aws_iam_role_policy" "manifest_producer_attestations" {
         Action   = "s3:GetObjectVersion"
         Resource = "${var.runtime_attestation_bucket_arn}/runtime/*"
       },
+      # The encryption context is the bare bucket ARN, not an object ARN: the
+      # collector contract requires BucketKeyEnabled on this bucket, and S3
+      # Bucket Keys use the bucket ARN as the KMS encryption context. An
+      # object-scoped context here can never match, so every get-object would
+      # fail AccessDenied on kms:Decrypt. The runtime/ prefix stays enforced by
+      # ReadImmutableRuntimeAttestationVersions above; kms:ViaService keeps this
+      # decrypt reachable only through S3.
       {
         Sid      = "DecryptOnlyAttestationObjects"
         Effect   = "Allow"
@@ -282,10 +289,8 @@ resource "aws_iam_role_policy" "manifest_producer_attestations" {
         Resource = var.runtime_attestation_kms_key_arn
         Condition = {
           StringEquals = {
-            "kms:ViaService" = "s3.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
-          }
-          ArnLike = {
-            "kms:EncryptionContext:aws:s3:arn" = "${var.runtime_attestation_bucket_arn}/runtime/*"
+            "kms:ViaService"                   = "s3.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            "kms:EncryptionContext:aws:s3:arn" = var.runtime_attestation_bucket_arn
           }
         }
       },

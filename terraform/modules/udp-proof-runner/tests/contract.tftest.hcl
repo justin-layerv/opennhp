@@ -271,7 +271,11 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["ReadImmutableRuntimeAttestationVersions"].Action == "s3:GetObjectVersion" &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Resource == var.runtime_attestation_kms_key_arn &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.StringEquals["kms:ViaService"] == "s3.us-east-2.amazonaws.com" &&
-      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.ArnLike["kms:EncryptionContext:aws:s3:arn"] == "${var.runtime_attestation_bucket_arn}/runtime/*"
+      # S3 Bucket Keys (required by the collector contract) put the bucket ARN
+      # in the KMS encryption context, so an object-scoped context can never
+      # match. The runtime/ prefix stays enforced on s3:GetObjectVersion above.
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.StringEquals["kms:EncryptionContext:aws:s3:arn"] == var.runtime_attestation_bucket_arn &&
+      !can(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_attestations[0].policy).Statement : statement.Sid => statement })["DecryptOnlyAttestationObjects"].Condition.ArnLike)
     )
     error_message = "Runtime-attestation access must be version-only, prefix-scoped, and exact-key/context bound."
   }
