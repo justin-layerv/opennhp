@@ -1,14 +1,14 @@
-# Connector Hub key-material seeder (Step 5, slice 5b). A single-shot Lambda that
-# generates the Hub's long-lived private key and cookie keys and writes them into
-# the pre-created Secrets Manager secret EXACTLY ONCE at worker create. It exists
-# so no key byte ever transits Terraform: the material is generated inside the
-# Lambda and put straight into the secret, and the invocation returns only a
-# {"seeded": true} marker (aws_lambda_invocation records the return value in
-# state, so returning any key byte would leak it into tfstate).
+# Connector Hub identity seeder (Step 5, slice 5b). A single-shot Lambda
+# generates the Hub's long-lived X25519 private key and cookie keys, writes the
+# private material into the pre-created Secrets Manager secret, and publishes
+# ONLY the derived public identity to an exact SSM String parameter. No private
+# or cookie key byte transits Terraform: the invocation returns only a
+# {"seeded": true} marker because aws_lambda_invocation records the return value
+# in state; the public identity is intentionally visible after refresh.
 #
 # DARK-FIRST: gated on local.hub_worker_count identically to the worker. Non-VPC
 # (the seeder needs only the Secrets Manager and KMS control-plane APIs over the
-# AWS network, not the isolated data-plane endpoints), python3.13, zip-packaged.
+# AWS network, not the isolated data-plane endpoints), nodejs22.x, zip-packaged.
 
 locals {
   hub_keygen_function_name  = "${local.name_prefix}-hub-keygen"
@@ -19,12 +19,17 @@ locals {
   # policy unknown at plan and un-checkable. The group is created in this same
   # file and gated identically, so the literal is exact.
   hub_keygen_log_group_arn = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:${local.hub_keygen_log_group_name}"
+  # SSM parameter ARNs are deterministic (unlike Secrets Manager's random ARN
+  # suffix). Construct this from the same canonical path so the keygen IAM
+  # policy is plan-known and the fail-closed migration checker can prove it
+  # before the parameter exists.
+  hub_public_key_parameter_arn = "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${local.hub_public_key_parameter_name}"
 }
 
-# Least-privilege seeder identity: PutSecretValue on ONLY the Hub key secret,
-# the GenerateDataKey/Decrypt needed to write a CMK-encrypted secret, and its own
-# log stream. It deliberately has NO GetSecretValue -- the seeder writes, it never
-# reads the material back.
+# Least-privilege seeder identity. Describe/Get are required only for
+# idempotent repair after a partial first invocation: an existing AWSCURRENT is
+# validated and reused, never overwritten. The role can mutate only that exact
+# secret and the exact public-only parameter.
 resource "aws_iam_role" "hub_keygen" {
   count = local.hub_worker_count
 
@@ -59,16 +64,35 @@ resource "aws_iam_role_policy" "hub_keygen" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "SeedHubKeyMaterial"
-        Effect   = "Allow"
-        Action   = "secretsmanager:PutSecretValue"
+        Sid    = "SeedHubKeyMaterial"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue",
+        ]
         Resource = aws_secretsmanager_secret.hub_key_material[0].arn
+      },
+      {
+        Sid    = "PublishHubPublicIdentity"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:PutParameter",
+        ]
+        Resource = local.hub_public_key_parameter_arn
       },
       {
         Sid      = "WrapHubKeyMaterial"
         Effect   = "Allow"
         Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = aws_kms_key.authority_data.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                  = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            "kms:EncryptionContext:SecretARN" = aws_secretsmanager_secret.hub_key_material[0].arn
+          }
+        }
       },
       {
         Sid    = "OwnLogStream"
@@ -97,12 +121,12 @@ resource "aws_cloudwatch_log_group" "hub_keygen" {
 }
 
 # The handler source is zipped in-place at plan time. source_code_hash pins the
-# function to the exact bytes so an edit to keygen.py redeploys it.
+# function to the exact bytes so an edit to keygen.js redeploys it.
 data "archive_file" "hub_keygen" {
   count = local.hub_worker_count
 
   type        = "zip"
-  source_file = "${path.module}/lambda/hub-keygen/keygen.py"
+  source_file = "${path.module}/lambda/hub-keygen/keygen.js"
   output_path = "${path.module}/lambda/hub-keygen.zip"
 }
 
@@ -110,18 +134,24 @@ resource "aws_lambda_function" "hub_keygen" {
   count = local.hub_worker_count
 
   function_name = local.hub_keygen_function_name
-  description   = "Seeds the Connector Hub key material secret once at worker create (${var.environment})"
+  description   = "Seeds or repairs the Connector Hub identity and publishes its public key at worker create (${var.environment})"
   role          = aws_iam_role.hub_keygen[0].arn
-  runtime       = "python3.13"
+  runtime       = "nodejs22.x"
   handler       = "keygen.handler"
   timeout       = 30
+  # Serializes Terraform/provider retries. The handler also reads and validates
+  # AWSCURRENT before any write, so a partial first invocation repairs the
+  # public parameter without rotating or overwriting the private identity.
+  reserved_concurrent_executions = 1
 
   filename         = data.archive_file.hub_keygen[0].output_path
   source_code_hash = data.archive_file.hub_keygen[0].output_base64sha256
 
   environment {
     variables = {
-      SECRET_ID = aws_secretsmanager_secret.hub_key_material[0].arn
+      ENVIRONMENT          = var.environment
+      PUBLIC_KEY_PARAMETER = aws_ssm_parameter.hub_public_key[0].name
+      SECRET_ID            = aws_secretsmanager_secret.hub_key_material[0].arn
     }
   }
 
@@ -136,10 +166,34 @@ resource "aws_lambda_function" "hub_keygen" {
   })
 }
 
-# One-time seed. lifecycle_scope=CREATE_ONLY invokes exactly at create and never
-# on update/destroy, so a routine apply cannot rotate the live keys out from
-# under running workers. The ECS service depends on this so tasks never start
-# against an unseeded secret.
+# Public-only Hub trust root. Terraform owns the stable name and a deliberately
+# invalid placeholder; the CREATE_ONLY seeder conditionally replaces only that
+# placeholder, then reads back the exact canonical padded-base64 X25519 key.
+# A pre-existing third value is a terminal conflict, never blindly overwritten.
+resource "aws_ssm_parameter" "hub_public_key" {
+  count = local.hub_worker_count
+
+  name        = local.hub_public_key_parameter_name
+  description = "Connector Hub X25519 public identity; private key remains in Secrets Manager"
+  type        = "String"
+  value       = "pending-keygen"
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-hub-public-key"
+    Component = "connector-hub"
+    Purpose   = "Connector Hub public identity"
+  })
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Original one-time seed. Keep this resource's configuration byte-for-byte
+# compatible with the already-applied worker slice: adding a trigger would force
+# a destructive replacement, which the dark-plan gate correctly rejects. Fresh
+# environments still invoke it once; the publication migration below waits for
+# this invocation so the function's singleton concurrency cannot self-throttle.
 resource "aws_lambda_invocation" "hub_keygen" {
   count = local.hub_worker_count
 
@@ -151,4 +205,31 @@ resource "aws_lambda_invocation" "hub_keygen" {
     aws_secretsmanager_secret.hub_key_material,
     aws_iam_role_policy.hub_keygen,
   ]
+}
+
+# Additive one-time migration for workers whose original seed invocation is
+# already in state. A distinct address makes the live transition a pure create,
+# preserving the no-unreviewed-destruction gate. It intentionally has no
+# triggers: a future repair must add a separately reviewed migration invocation
+# rather than silently replacing and re-running this identity transaction.
+resource "aws_lambda_invocation" "hub_identity_publication" {
+  count = local.hub_worker_count
+
+  function_name   = aws_lambda_function.hub_keygen[0].function_name
+  input           = jsonencode({})
+  lifecycle_scope = "CREATE_ONLY"
+
+  depends_on = [
+    aws_lambda_invocation.hub_keygen,
+    aws_secretsmanager_secret.hub_key_material,
+    aws_ssm_parameter.hub_public_key,
+    aws_iam_role_policy.hub_keygen,
+  ]
+
+  lifecycle {
+    postcondition {
+      condition     = try(jsondecode(self.result), null) == { seeded = true }
+      error_message = "Hub keygen must return only the exact constant seeded marker."
+    }
+  }
 }

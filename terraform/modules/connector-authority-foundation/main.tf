@@ -16,6 +16,7 @@ locals {
   authority_image_digest_parameter_name = "/${var.environment}/nhp/control/connector-authority/image-digest"
   hub_ecr_repository_name               = "layerv/nhp-hub"
   hub_image_digest_parameter_name       = "/${var.environment}/nhp/control/hub/image-digest"
+  hub_public_key_parameter_name         = "/${var.environment}/nhp/control/hub/identity/public-key"
 
   common_tags = merge(var.tags, {
     Application = "nhp"

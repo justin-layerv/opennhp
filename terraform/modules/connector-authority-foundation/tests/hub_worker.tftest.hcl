@@ -281,6 +281,7 @@ run "hub_worker_dark_creates_nothing" {
       length(aws_cloudwatch_log_group.hub_keygen) == 0 &&
       length(aws_lambda_function.hub_keygen) == 0 &&
       length(aws_lambda_invocation.hub_keygen) == 0 &&
+      length(aws_ssm_parameter.hub_public_key) == 0 &&
       length(aws_iam_role.hub_execution) == 0 &&
       length(aws_iam_role_policy_attachment.hub_execution) == 0 &&
       length(aws_iam_role_policy.hub_execution) == 0 &&
@@ -295,7 +296,7 @@ run "hub_worker_dark_creates_nothing" {
       length(aws_vpc_endpoint.hub_ecr_dkr) == 0 &&
       length(aws_vpc_endpoint.hub_s3) == 0
     )
-    error_message = "With the Hub worker dark the module must create none of the 19 worker resources, even when the 5a edge and the authority runtime are both live."
+    error_message = "With the Hub worker dark the module must create none of the 20 worker resources, even when the 5a edge and the authority runtime are both live."
   }
 
   assert {
@@ -341,6 +342,13 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
     }
   }
   override_resource {
+    target          = aws_ssm_parameter.hub_public_key[0]
+    override_during = plan
+    values = {
+      arn = "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/identity/public-key"
+    }
+  }
+  override_resource {
     target          = aws_lb_target_group.hub[0]
     override_during = plan
     values = {
@@ -370,6 +378,7 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
       length(aws_cloudwatch_log_group.hub_keygen) == 1 &&
       length(aws_lambda_function.hub_keygen) == 1 &&
       length(aws_lambda_invocation.hub_keygen) == 1 &&
+      length(aws_ssm_parameter.hub_public_key) == 1 &&
       length(aws_iam_role.hub_execution) == 1 &&
       length(aws_iam_role_policy_attachment.hub_execution) == 1 &&
       length(aws_iam_role_policy.hub_execution) == 1 &&
@@ -384,7 +393,7 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
       length(aws_vpc_endpoint.hub_ecr_dkr) == 1 &&
       length(aws_vpc_endpoint.hub_s3) == 1
     )
-    error_message = "Enabling the Hub worker must plan exactly the 19-resource worker inventory."
+    error_message = "Enabling the Hub worker must plan exactly the 20-resource worker inventory."
   }
 
   assert {
@@ -457,16 +466,56 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
   }
 
   assert {
-    # Execution role reads only the Hub secret + decrypts only the data CMK;
-    # keygen writes (PutSecretValue) only that secret and never reads it back.
+    # Execution role reads only the Hub secret + decrypts only the data CMK.
+    # Keygen's retry-safe identity transaction reads/writes only that exact
+    # secret and the exact public-only parameter.
     condition = (
       { for s in jsondecode(aws_iam_role_policy.hub_execution[0].policy).Statement : s.Sid => s }["ReadHubKeyMaterial"].Action == "secretsmanager:GetSecretValue" &&
       { for s in jsondecode(aws_iam_role_policy.hub_execution[0].policy).Statement : s.Sid => s }["DecryptHubKeyMaterial"].Action == "kms:Decrypt" &&
-      { for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["SeedHubKeyMaterial"].Action == "secretsmanager:PutSecretValue" &&
-      !contains([for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Action], "secretsmanager:GetSecretValue") &&
-      aws_lambda_invocation.hub_keygen[0].lifecycle_scope == "CREATE_ONLY"
+      toset({ for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["SeedHubKeyMaterial"].Action) == toset([
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+      ]) &&
+      toset({ for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["PublishHubPublicIdentity"].Action) == toset([
+        "ssm:GetParameter",
+        "ssm:PutParameter",
+      ]) &&
+      { for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["PublishHubPublicIdentity"].Resource == "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/identity/public-key"
     )
-    error_message = "The execution role must Get/Decrypt only the Hub secret+CMK; the keygen must Put (never Get) the secret and invoke CREATE_ONLY."
+    error_message = "The execution role and retry-safe keygen must read/write only the exact Hub secret and public parameter."
+  }
+
+  assert {
+    condition = (
+      { for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["WrapHubKeyMaterial"].Condition.StringEquals["kms:ViaService"] == "secretsmanager.us-east-2.amazonaws.com" &&
+      { for s in jsondecode(aws_iam_role_policy.hub_keygen[0].policy).Statement : s.Sid => s }["WrapHubKeyMaterial"].Condition.StringEquals["kms:EncryptionContext:SecretARN"] == aws_secretsmanager_secret.hub_key_material[0].arn &&
+      { for s in jsondecode(aws_iam_role_policy.hub_execution[0].policy).Statement : s.Sid => s }["DecryptHubKeyMaterial"].Condition.StringEquals["kms:ViaService"] == "secretsmanager.us-east-2.amazonaws.com" &&
+      { for s in jsondecode(aws_iam_role_policy.hub_execution[0].policy).Statement : s.Sid => s }["DecryptHubKeyMaterial"].Condition.StringEquals["kms:EncryptionContext:SecretARN"] == aws_secretsmanager_secret.hub_key_material[0].arn
+    )
+    error_message = "Hub keygen and execution KMS use must be mediated by Secrets Manager for the exact Hub secret encryption context."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.hub_keygen[0].runtime == "nodejs22.x" &&
+      aws_lambda_function.hub_keygen[0].reserved_concurrent_executions == 1 &&
+      aws_ssm_parameter.hub_public_key[0].name == "/sandbox/nhp/control/hub/identity/public-key" &&
+      aws_ssm_parameter.hub_public_key[0].type == "String"
+    )
+    error_message = "Hub identity publication must use the exact public-only parameter and a singleton Node 22 keygen."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_invocation.hub_keygen[0].lifecycle_scope == "CREATE_ONLY" &&
+      aws_lambda_invocation.hub_keygen[0].input == "{}" &&
+      aws_lambda_invocation.hub_identity_publication[0].lifecycle_scope == "CREATE_ONLY" &&
+      aws_lambda_invocation.hub_identity_publication[0].input == "{}" &&
+      length(coalesce(aws_lambda_invocation.hub_keygen[0].triggers, {})) == 0 &&
+      length(coalesce(aws_lambda_invocation.hub_identity_publication[0].triggers, {})) == 0
+    )
+    error_message = "The live-compatible keygen and additive publication migration must remain empty, triggerless CREATE_ONLY invocations."
   }
 }
 

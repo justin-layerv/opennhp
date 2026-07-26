@@ -136,6 +136,12 @@ on:
       - "nhp/utils/crypto_fingerprint_test.go"
       - "endpoints/js-agent/test/kdf.test.ts"
       - "nhp/core/kdf_test.go"
+      # Hub identity seeder: the Node test reads the Go-generated NHP knock
+      # vector and fences the Lambda/Terraform boundary. Watch every input so
+      # source, packaging, runtime, or vector drift cannot skip the test.
+      - "endpoints/js-agent/test/testdata/knock.json"
+      - "terraform/modules/connector-authority-foundation/hub_keygen.tf"
+      - "terraform/modules/connector-authority-foundation/lambda/hub-keygen/**"
       - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
@@ -492,6 +498,7 @@ jobs:
           bash tests/scripts/recover-relay-deposed-sg_test.sh
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
           bash tests/scripts/rotate-relay-identity_test.sh
+          node --test terraform/modules/connector-authority-foundation/lambda/hub-keygen/keygen.test.js
           node --test terraform/modules/relay-identity/lambda/relay_identity.test.js
           node --test terraform/modules/compute/lambda/keygen/index.test.js
           node --test terraform/modules/compute/relay_toml_template.test.js

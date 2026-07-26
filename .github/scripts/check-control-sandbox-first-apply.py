@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -15,6 +17,7 @@ from typing import Any, Iterable
 
 ACCOUNT_ID = "767397897469"
 AWS_REGION = "us-east-2"
+CONTROL_VPC_CIDR = "10.102.0.0/16"
 STATE_KMS_KEY_ARN = (
     "arn:aws:kms:us-east-2:767397897469:key/289dbe35-ab5a-4752-8564-4c96c607c9f4"
 )
@@ -225,6 +228,7 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "hub_publisher_role_name",
         "hub_nlb_dns_name",
         "hub_nlb_zone_id",
+        "hub_public_key_parameter_name",
         "hub_udp_listener_arn",
         "interface_endpoint_ids",
         "isolated_subnet_ids",
@@ -457,11 +461,11 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
 # ---------------------------------------------------------------------------
 # Connector Authority runtime slice (Step 4).
 #
-# The runtime slice deploys exactly the 3 Hub-facing functions the frozen
-# measurement basis names, both closed blue/green aliases, per-operation
+# The runtime deploys the complete frozen two-cell graph: 3 Hub functions plus
+# 4 functions for each of cell0/cell1, both closed blue/green aliases, per-operation
 # execution roles, steady provisioned/reserved concurrency, spillover alarms,
-# a dedicated function SG, and the lockstep opening of ONLY the dependency
-# endpoints those functions reach (DynamoDB gateway + KMS interface). It is an
+# a dedicated function SG, and the lockstep opening of only the dependency
+# endpoints those functions reach. It is an
 # all-or-nothing transition on top of the already-bound contract: the plan's
 # managed inventory is either the base foundation OR the base + this exact
 # runtime set, and nothing else may become non-no-op.
@@ -472,7 +476,7 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
 # from a real Terraform 1.14.3 / AWS provider 6.55.0 Step-4 plan, which requires
 # the Step-3 contract bind to be applied first. This checker therefore enforces
 # the fail-closed STRUCTURE now — exact inventory, exact all-or-nothing
-# transition membership, pure-create vs the exact three endpoint/SG opens, the
+# transition membership, pure-create vs the exact dependency endpoint/SG opens, the
 # security content of those opens (principals/actions/resources, no wildcard),
 # the reserved/provisioned concurrency tie-back to the frozen contract, and the
 # dark endpoints staying deny — and the first real plan JSON must extend the
@@ -483,11 +487,37 @@ AUTHORITY_RUNTIME_HUB_FUNCTIONS = {
     f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ra": "refresh_assignment",
     f"{CONTROL_PREFIX.removesuffix('-control')}-ca-icr": "issue_credential_recovery",
 }
+# The provisioned cells and the per-cell operation suffix -> operation map are
+# the two independent axes of the cell function inventory; keep each stated once
+# so adding a cell or an operation is a single-line edit.
+AUTHORITY_CELLS = ("cell0", "cell1")
+AUTHORITY_CELL_OPERATION_SUFFIXES = {
+    "iro": "issue_registration_otp",
+    "ar": "activate_registration",
+    "cr": "complete_registration",
+    "ccr": "complete_credential_recovery",
+}
+AUTHORITY_RUNTIME_CELL_FUNCTIONS = {
+    f"{CONTROL_PREFIX.removesuffix('-control')}-ca-{suffix}-{cell_id}": operation
+    for cell_id in AUTHORITY_CELLS
+    for suffix, operation in AUTHORITY_CELL_OPERATION_SUFFIXES.items()
+}
+AUTHORITY_RUNTIME_FUNCTIONS = {
+    **AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+    **AUTHORITY_RUNTIME_CELL_FUNCTIONS,
+}
+AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE = {
+    "path": "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json",
+    "repository": "layervai/nhp",
+    "schema_version": 1,
+    "sha256": "d535970977ba3b31da2b224c01897c535786ff802a91edbe8319884c23924eff",
+    "source_commit": "388a22f7a5333a246e623a19dd5ca3793bd89f60",
+}
 AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS = (
     "module.control.aws_security_group.authority_lambda[0]"
 )
 AUTHORITY_RUNTIME_RESOURCES: dict[str, str] = {}
-for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+for _fn in AUTHORITY_RUNTIME_FUNCTIONS:
     AUTHORITY_RUNTIME_RESOURCES[
         f'module.control.aws_lambda_function.authority["{_fn}"]'
     ] = "aws_lambda_function"
@@ -513,10 +543,62 @@ for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
         f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
     ] = "aws_cloudwatch_metric_alarm"
 AUTHORITY_RUNTIME_RESOURCES[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS] = "aws_security_group"
+AUTHORITY_RUNTIME_RESOURCES[
+    "module.control.aws_vpc_security_group_egress_rule.authority_interface_endpoints[0]"
+] = "aws_vpc_security_group_egress_rule"
+AUTHORITY_RUNTIME_RESOURCES[
+    "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb[0]"
+] = "aws_vpc_security_group_egress_rule"
+AUTHORITY_RUNTIME_RESOURCES[
+    "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]"
+] = "aws_vpc_security_group_egress_rule"
+AUTHORITY_RUNTIME_RESOURCES[
+    "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]"
+] = "aws_vpc_security_group_ingress_rule"
+AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES = {
+    AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
+}
+for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+    AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES.update(
+        {
+            f'module.control.aws_lambda_function.authority["{_fn}"]',
+            f'module.control.aws_lambda_alias.authority["{_fn}:blue"]',
+            f'module.control.aws_lambda_alias.authority["{_fn}:green"]',
+            (
+                "module.control.aws_lambda_provisioned_concurrency_config."
+                f'authority["{_fn}"]'
+            ),
+            f'module.control.aws_iam_role.authority_exec["{_fn}"]',
+            f'module.control.aws_iam_role_policy.authority_exec["{_fn}"]',
+            f'module.control.aws_cloudwatch_log_group.authority["{_fn}"]',
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                f'authority_spillover["{_fn}"]'
+            ),
+        }
+    )
+AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES = frozenset(
+    set(AUTHORITY_RUNTIME_RESOURCES)
+    - AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
+)
+AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES = frozenset(
+    {AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS}
+)
+# The reviewed image migration retags resources that ALREADY EXIST live, and the
+# live Authority is the Hub-only graph: both pinned endpoints of the transition
+# -- the FROM basis (sha d535970977.../388a22f7a) and the TO basis
+# (sha b44ee0ca10.../38c11ec13) -- publish exactly the three Hub functions. The
+# per-cell functions this branch adds are pending CREATES
+# (AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES), and a resource that does
+# not exist cannot be updated from FROM_URI to TO_URI. Deriving this set from the
+# full runtime inventory instead would admit 24 lambda actions that the reviewed
+# transition provably does not contain, so intersect with the legacy Hub
+# addresses to keep the admitted set at exactly the reviewed nine.
 AUTHORITY_IMAGE_UPDATE_RESOURCES = {
     address: resource_type
     for address, resource_type in AUTHORITY_RUNTIME_RESOURCES.items()
     if resource_type in {"aws_lambda_alias", "aws_lambda_function"}
+    and address in AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
 }
 AUTHORITY_IMAGE_UPDATE_FROM_URI = (
     f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
@@ -623,11 +705,13 @@ HUB_EDGE_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
 # (the target group it registers into).
 HUB_WORKER_RESOURCES: dict[str, str] = {
     "module.control.aws_secretsmanager_secret.hub_key_material[0]": "aws_secretsmanager_secret",
+    "module.control.aws_ssm_parameter.hub_public_key[0]": "aws_ssm_parameter",
     "module.control.aws_iam_role.hub_keygen[0]": "aws_iam_role",
     "module.control.aws_iam_role_policy.hub_keygen[0]": "aws_iam_role_policy",
     "module.control.aws_cloudwatch_log_group.hub_keygen[0]": "aws_cloudwatch_log_group",
     "module.control.aws_lambda_function.hub_keygen[0]": "aws_lambda_function",
     "module.control.aws_lambda_invocation.hub_keygen[0]": "aws_lambda_invocation",
+    "module.control.aws_lambda_invocation.hub_identity_publication[0]": "aws_lambda_invocation",
     "module.control.aws_iam_role.hub_execution[0]": "aws_iam_role",
     "module.control.aws_iam_role_policy_attachment.hub_execution[0]": "aws_iam_role_policy_attachment",
     "module.control.aws_iam_role_policy.hub_execution[0]": "aws_iam_role_policy",
@@ -661,6 +745,11 @@ HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws_secretsmanager_secret",
         "aws",
     ),
+    "module.control.aws_ssm_parameter.hub_public_key": (
+        "managed",
+        "aws_ssm_parameter",
+        "aws",
+    ),
     "module.control.aws_iam_role.hub_keygen": ("managed", "aws_iam_role", "aws"),
     "module.control.aws_iam_role_policy.hub_keygen": (
         "managed",
@@ -678,6 +767,11 @@ HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws",
     ),
     "module.control.aws_lambda_invocation.hub_keygen": (
+        "managed",
+        "aws_lambda_invocation",
+        "aws",
+    ),
+    "module.control.aws_lambda_invocation.hub_identity_publication": (
         "managed",
         "aws_lambda_invocation",
         "aws",
@@ -779,7 +873,41 @@ HUB_LOG_GROUP_ARN = (
 # constructed literal.
 HUB_KEY_MATERIAL_SECRET_ARN_RE = re.compile(
     rf"^arn:aws:secretsmanager:{AWS_REGION}:{ACCOUNT_ID}:secret:"
-    rf"{CONTROL_PREFIX}-hub-key-material-[A-Za-z0-9]+$"
+    rf"{CONTROL_PREFIX}-hub-key-material-[A-Za-z0-9]{{6}}$"
+)
+HUB_KEY_MATERIAL_SECRET_NAME = f"{CONTROL_PREFIX}-hub-key-material"
+HUB_PUBLIC_KEY_PARAMETER_NAME = (
+    "/sandbox/nhp/control/hub/identity/public-key"
+)
+HUB_PUBLIC_KEY_PARAMETER_ARN = (
+    f"arn:aws:ssm:{AWS_REGION}:{ACCOUNT_ID}:parameter"
+    f"{HUB_PUBLIC_KEY_PARAMETER_NAME}"
+)
+HUB_KEYGEN_ROLE_ARN = (
+    f"arn:aws:iam::{ACCOUNT_ID}:role/{CONTROL_PREFIX}-hub-keygen"
+)
+HUB_KEYGEN_LOG_GROUP_ARN = (
+    f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:"
+    f"log-group:/aws/lambda/{CONTROL_PREFIX}-hub-keygen:*"
+)
+HUB_SECRETSMANAGER_KMS_VIA_SERVICE = (
+    f"secretsmanager.{AWS_REGION}.amazonaws.com"
+)
+HUB_IDENTITY_CREATE_ADDRESSES = frozenset(
+    {
+        "module.control.aws_ssm_parameter.hub_public_key[0]",
+        "module.control.aws_lambda_invocation.hub_identity_publication[0]",
+    }
+)
+HUB_IDENTITY_UPDATE_ADDRESSES = frozenset(
+    {
+        "module.control.aws_iam_role_policy.hub_keygen[0]",
+        "module.control.aws_lambda_function.hub_keygen[0]",
+        "module.control.aws_iam_role_policy.hub_execution[0]",
+    }
+)
+HUB_IDENTITY_MIGRATION_ADDRESSES = (
+    HUB_IDENTITY_CREATE_ADDRESSES | HUB_IDENTITY_UPDATE_ADDRESSES
 )
 
 # Constructed, plan-known worker principal ARNs (same technique as
@@ -853,6 +981,26 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws_security_group",
         "aws",
     ),
+    "module.control.aws_vpc_security_group_egress_rule.authority_interface_endpoints": (
+        "managed",
+        "aws_vpc_security_group_egress_rule",
+        "aws",
+    ),
+    "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb": (
+        "managed",
+        "aws_vpc_security_group_egress_rule",
+        "aws",
+    ),
+    "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis": (
+        "managed",
+        "aws_vpc_security_group_egress_rule",
+        "aws",
+    ),
+    "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority": (
+        "managed",
+        "aws_vpc_security_group_ingress_rule",
+        "aws",
+    ),
 }
 
 # Constructed identities (known at plan time, so the opened endpoint policies
@@ -860,7 +1008,7 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
 # pattern rather than a fixed literal.
 AUTHORITY_RUNTIME_EXEC_ROLE_ARNS = frozenset(
     f"arn:aws:iam::{ACCOUNT_ID}:role/{name}-exec"
-    for name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+    for name in AUTHORITY_RUNTIME_FUNCTIONS
 )
 AUTHORITY_RUNTIME_TABLE_ARNS = {
     "api_keys": (
@@ -870,6 +1018,10 @@ AUTHORITY_RUNTIME_TABLE_ARNS = {
     "agent_keys": (
         f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
         f"{CONTROL_PREFIX}-qurl-agent-keys"
+    ),
+    "customers": (
+        f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+        f"{CONTROL_PREFIX}-qurl-customers"
     ),
     "connector_authority": (
         f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
@@ -888,13 +1040,14 @@ AUTHORITY_RUNTIME_TABLE_RESOURCES = {
             f"{AUTHORITY_RUNTIME_TABLE_ARNS['agent_keys']}/index/*",
         }
     ),
+    "customers": frozenset({AUTHORITY_RUNTIME_TABLE_ARNS["customers"]}),
     "connector_authority": frozenset(
         {AUTHORITY_RUNTIME_TABLE_ARNS["connector_authority"]}
     ),
 }
 # The DynamoDB gateway-endpoint resource union (coarse, TABLE-GRANULAR gate for
-# all three roles). Gateway VPC-endpoint policies reject a /index/* sub-resource
-# with InvalidPolicyDocument, so the endpoint lists only the three BASE-table
+# all runtime roles). Gateway VPC-endpoint policies reject a /index/* sub-resource
+# with InvalidPolicyDocument, so the endpoint lists only the four BASE-table
 # ARNs; a GSI Query is authorized at this network gate by its base table, and the
 # finer /index/* grant lives in the per-op identity policies
 # (AUTHORITY_RUNTIME_TABLE_RESOURCES, checked separately on the exec-role policies).
@@ -950,6 +1103,24 @@ _AUTHORITY_SIGN_FUNCTION = next(
 AUTHORITY_RUNTIME_SIGN_ROLE_ARNS = frozenset(
     {f"arn:aws:iam::{ACCOUNT_ID}:role/{_AUTHORITY_SIGN_FUNCTION}-exec"}
 )
+def _authority_exec_role_arns(operations: set[str]) -> frozenset[str]:
+    """Exec-role ARNs of the functions whose operation is in ``operations``."""
+    return frozenset(
+        f"arn:aws:iam::{ACCOUNT_ID}:role/{fn}-exec"
+        for fn, operation in AUTHORITY_RUNTIME_FUNCTIONS.items()
+        if operation in operations
+    )
+
+
+AUTHORITY_RUNTIME_PUBLIC_KEY_ROLE_ARNS = _authority_exec_role_arns(
+    {"issue_assignment", "issue_registration_otp", "activate_registration"}
+)
+AUTHORITY_RUNTIME_OTP_ROLE_ARNS = _authority_exec_role_arns(
+    {"issue_registration_otp", "activate_registration"}
+)
+AUTHORITY_RUNTIME_SES_ROLE_ARNS = _authority_exec_role_arns(
+    {"issue_registration_otp"}
+)
 # Per-operation identity-policy scope, reconciled against the live handler
 # (layervai/qurl-service origin/main).
 AUTHORITY_RUNTIME_OPERATION_IAM = {
@@ -972,23 +1143,132 @@ AUTHORITY_RUNTIME_OPERATION_IAM = {
         "signs": False,
     },
 }
+AUTHORITY_RUNTIME_CELL_OPERATION_IAM = {
+    "issue_registration_otp": {
+        "read_tables": ("api_keys", "customers"),
+        "writes": {},
+        "public_key": True,
+        "otp_user": "issuer",
+        "sends_email": True,
+    },
+    "activate_registration": {
+        "read_tables": ("api_keys", "agent_keys", "connector_authority"),
+        "writes": {
+            "RegistrationCredentialWrite": (
+                frozenset({"dynamodb:UpdateItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["api_keys"],
+            ),
+            "RegistrationIdentityWrite": (
+                frozenset({"dynamodb:PutItem", "dynamodb:UpdateItem"}),
+                frozenset({AUTHORITY_RUNTIME_TABLE_ARNS["agent_keys"]}),
+            ),
+            "RegistrationAuthorityWrite": (
+                frozenset({"dynamodb:PutItem", "dynamodb:UpdateItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"],
+            ),
+        },
+        "public_key": True,
+        "otp_user": "activator",
+        "sends_email": False,
+    },
+    "complete_registration": {
+        "read_tables": ("api_keys", "agent_keys", "connector_authority"),
+        "writes": {
+            "RegistrationCredentialWrite": (
+                frozenset({"dynamodb:PutItem", "dynamodb:UpdateItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["api_keys"],
+            ),
+            "RegistrationAuthorityWrite": (
+                frozenset({"dynamodb:PutItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"],
+            ),
+        },
+        "public_key": False,
+        "otp_user": None,
+        "sends_email": False,
+    },
+    "complete_credential_recovery": {
+        "read_tables": ("api_keys", "agent_keys", "connector_authority"),
+        "writes": {
+            "RecoveryCredentialWrite": (
+                frozenset({"dynamodb:PutItem", "dynamodb:UpdateItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["api_keys"],
+            ),
+            "RecoveryAuthorityWrite": (
+                frozenset({"dynamodb:PutItem"}),
+                AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"],
+            ),
+        },
+        "public_key": False,
+        "otp_user": None,
+        "sends_email": False,
+    },
+}
 _QAT1_KEY_ARN_RE = re.compile(
     rf"^arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_AUTHORITY_OTP_SECRET_ARN_RE = re.compile(
+    rf"^arn:aws:secretsmanager:{AWS_REGION}:{ACCOUNT_ID}:secret:"
+    rf"{CONTROL_PREFIX}-otp-pepper-[A-Za-z0-9]{{6}}$"
+)
+_AUTHORITY_DATA_KEY_ARN_RE = _QAT1_KEY_ARN_RE
+AUTHORITY_RUNTIME_REDIS_CACHE_ARN = (
+    f"arn:aws:elasticache:{AWS_REGION}:{ACCOUNT_ID}:serverlesscache:"
+    f"{CONTROL_PREFIX}-otp"
+)
+AUTHORITY_RUNTIME_REDIS_USER_ARNS = {
+    "issuer": (
+        f"arn:aws:elasticache:{AWS_REGION}:{ACCOUNT_ID}:user:"
+        f"{CONTROL_PREFIX}-otp-issuer"
+    ),
+    "activator": (
+        f"arn:aws:elasticache:{AWS_REGION}:{ACCOUNT_ID}:user:"
+        f"{CONTROL_PREFIX}-otp-activator"
+    ),
+}
+AUTHORITY_RUNTIME_SES_RESOURCES = frozenset(
+    {
+        f"arn:aws:ses:{AWS_REGION}:{ACCOUNT_ID}:identity/notify.layerv.xyz",
+        f"arn:aws:ses:{AWS_REGION}:{ACCOUNT_ID}:configuration-set/layerv-nhp-sandbox-agent-otp",
+    }
 )
 AUTHORITY_RUNTIME_DYNAMODB_ADDRESS = "module.control.aws_vpc_endpoint.dynamodb"
 AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS = (
     'module.control.aws_vpc_endpoint.interface["kms"]'
 )
+AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS = (
+    'module.control.aws_vpc_endpoint.interface["secretsmanager"]'
+)
+AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS = (
+    'module.control.aws_vpc_endpoint.interface["email"]'
+)
 AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS = (
     "module.control.aws_security_group.interface_endpoints"
 )
-# The exact three base resources whose policy/ingress the runtime slice opens.
+# The exact five base resources whose policy/ingress the runtime opens.
 AUTHORITY_RUNTIME_OPENED_ADDRESSES = frozenset(
     {
         AUTHORITY_RUNTIME_DYNAMODB_ADDRESS,
         AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS,
+        AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS,
+        AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS,
         AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS,
+    }
+)
+AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES = frozenset(
+    AUTHORITY_RUNTIME_OPENED_ADDRESSES
+    | {
+        "module.control.terraform_data.foundation_contract",
+        *(
+            (f'module.control.aws_lambda_function.authority["{function_name}"]')
+            for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+        ),
+        *(
+            (f'module.control.aws_lambda_alias.authority["{function_name}:{color}"]')
+            for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+            for color in ("blue", "green")
+        ),
     }
 )
 
@@ -1190,6 +1470,16 @@ EXPECTED_CONFIGURATION_RESOURCES.update(HUB_EDGE_CONFIGURATION_RESOURCES)
 EXPECTED_CONFIGURATION_RESOURCES.update(HUB_WORKER_CONFIGURATION_RESOURCES)
 
 ExpressionPath = tuple[str | int, ...]
+STANDALONE_RULE_SECURITY_GROUPS = frozenset(
+    {
+        "module.control.aws_security_group.authority_lambda",
+        "module.control.aws_security_group.otp_redis",
+    }
+)
+STANDALONE_RULE_EMPTY_PATHS: tuple[ExpressionPath, ...] = (
+    ("egress",),
+    ("ingress",),
+)
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
     "module.control.aws_dynamodb_table_item.provisioned_cell": {
         ("for_each",): ["local.provisioned_cell_dynamodb_items"],
@@ -1233,6 +1523,53 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
     },
     "module.control.aws_security_group.otp_redis": {
         ("vpc_id",): ["aws_vpc.control.id", "aws_vpc.control"],
+    },
+    "module.control.aws_security_group.authority_lambda": {
+        ("vpc_id",): ["aws_vpc.control.id", "aws_vpc.control"],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_interface_endpoints": {
+        ("security_group_id",): [
+            "aws_security_group.authority_lambda[0].id",
+            "aws_security_group.authority_lambda[0]",
+            "aws_security_group.authority_lambda",
+        ],
+        ("referenced_security_group_id",): [
+            "aws_security_group.interface_endpoints.id",
+            "aws_security_group.interface_endpoints",
+        ],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb": {
+        ("security_group_id",): [
+            "aws_security_group.authority_lambda[0].id",
+            "aws_security_group.authority_lambda[0]",
+            "aws_security_group.authority_lambda",
+        ],
+        ("prefix_list_id",): [
+            "aws_vpc_endpoint.dynamodb.prefix_list_id",
+            "aws_vpc_endpoint.dynamodb",
+        ],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis": {
+        ("security_group_id",): [
+            "aws_security_group.authority_lambda[0].id",
+            "aws_security_group.authority_lambda[0]",
+            "aws_security_group.authority_lambda",
+        ],
+        ("referenced_security_group_id",): [
+            "aws_security_group.otp_redis.id",
+            "aws_security_group.otp_redis",
+        ],
+    },
+    "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority": {
+        ("security_group_id",): [
+            "aws_security_group.otp_redis.id",
+            "aws_security_group.otp_redis",
+        ],
+        ("referenced_security_group_id",): [
+            "aws_security_group.authority_lambda[0].id",
+            "aws_security_group.authority_lambda[0]",
+            "aws_security_group.authority_lambda",
+        ],
     },
     "module.control.aws_subnet.isolated": {
         ("availability_zone",): ["local.availability_zones", "count.index"],
@@ -1319,6 +1656,126 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
             "aws_kms_key.authority_data",
         ],
     },
+    "module.control.aws_secretsmanager_secret.hub_key_material": {
+        ("count",): ["local.hub_worker_count"],
+        ("kms_key_id",): [
+            "aws_kms_key.authority_data.arn",
+            "aws_kms_key.authority_data",
+        ],
+    },
+    "module.control.aws_ssm_parameter.hub_public_key": {
+        ("count",): ["local.hub_worker_count"],
+        ("name",): ["local.hub_public_key_parameter_name"],
+    },
+    "module.control.aws_iam_role.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("assume_role_policy",): [
+            "data.aws_partition.current.dns_suffix",
+            "data.aws_partition.current",
+        ],
+        ("name",): ["local.name_prefix"],
+    },
+    "module.control.aws_iam_role_policy.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("policy",): [
+            "aws_secretsmanager_secret.hub_key_material[0].arn",
+            "aws_secretsmanager_secret.hub_key_material[0]",
+            "aws_secretsmanager_secret.hub_key_material",
+            "local.hub_public_key_parameter_arn",
+            "aws_kms_key.authority_data.arn",
+            "aws_kms_key.authority_data",
+            "data.aws_region.current.region",
+            "data.aws_region.current",
+            "data.aws_partition.current.dns_suffix",
+            "data.aws_partition.current",
+            "aws_secretsmanager_secret.hub_key_material[0].arn",
+            "aws_secretsmanager_secret.hub_key_material[0]",
+            "aws_secretsmanager_secret.hub_key_material",
+            "local.hub_keygen_log_group_arn",
+        ],
+        ("role",): [
+            "aws_iam_role.hub_keygen[0].id",
+            "aws_iam_role.hub_keygen[0]",
+            "aws_iam_role.hub_keygen",
+        ],
+    },
+    "module.control.aws_lambda_function.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("description",): ["var.environment"],
+        ("environment", 0, "variables"): [
+            "var.environment",
+            "aws_ssm_parameter.hub_public_key[0].name",
+            "aws_ssm_parameter.hub_public_key[0]",
+            "aws_ssm_parameter.hub_public_key",
+            "aws_secretsmanager_secret.hub_key_material[0].arn",
+            "aws_secretsmanager_secret.hub_key_material[0]",
+            "aws_secretsmanager_secret.hub_key_material",
+        ],
+        ("filename",): [
+            "data.archive_file.hub_keygen[0].output_path",
+            "data.archive_file.hub_keygen[0]",
+            "data.archive_file.hub_keygen",
+        ],
+        ("function_name",): ["local.hub_keygen_function_name"],
+        ("role",): [
+            "aws_iam_role.hub_keygen[0].arn",
+            "aws_iam_role.hub_keygen[0]",
+            "aws_iam_role.hub_keygen",
+        ],
+        ("source_code_hash",): [
+            "data.archive_file.hub_keygen[0].output_base64sha256",
+            "data.archive_file.hub_keygen[0]",
+            "data.archive_file.hub_keygen",
+        ],
+    },
+    "module.control.aws_cloudwatch_log_group.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("name",): ["local.hub_keygen_log_group_name"],
+        ("retention_in_days",): ["local.hub_log_retention_days"],
+    },
+    "module.control.data.archive_file.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("output_path",): ["path.module"],
+        ("source_file",): ["path.module"],
+    },
+    "module.control.aws_lambda_invocation.hub_keygen": {
+        ("count",): ["local.hub_worker_count"],
+        ("function_name",): [
+            "aws_lambda_function.hub_keygen[0].function_name",
+            "aws_lambda_function.hub_keygen[0]",
+            "aws_lambda_function.hub_keygen",
+        ],
+    },
+    "module.control.aws_lambda_invocation.hub_identity_publication": {
+        ("count",): ["local.hub_worker_count"],
+        ("function_name",): [
+            "aws_lambda_function.hub_keygen[0].function_name",
+            "aws_lambda_function.hub_keygen[0]",
+            "aws_lambda_function.hub_keygen",
+        ],
+    },
+    "module.control.aws_iam_role_policy.hub_execution": {
+        ("count",): ["local.hub_worker_count"],
+        ("policy",): [
+            "aws_secretsmanager_secret.hub_key_material[0].arn",
+            "aws_secretsmanager_secret.hub_key_material[0]",
+            "aws_secretsmanager_secret.hub_key_material",
+            "aws_kms_key.authority_data.arn",
+            "aws_kms_key.authority_data",
+            "data.aws_region.current.region",
+            "data.aws_region.current",
+            "data.aws_partition.current.dns_suffix",
+            "data.aws_partition.current",
+            "aws_secretsmanager_secret.hub_key_material[0].arn",
+            "aws_secretsmanager_secret.hub_key_material[0]",
+            "aws_secretsmanager_secret.hub_key_material",
+        ],
+        ("role",): [
+            "aws_iam_role.hub_execution[0].id",
+            "aws_iam_role.hub_execution[0]",
+            "aws_iam_role.hub_execution",
+        ],
+    },
     "module.control.aws_ecr_repository.authority": {
         ("encryption_configuration", 0, "kms_key"): [
             "aws_kms_key.authority_data.arn",
@@ -1365,6 +1822,38 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
     "module.control.aws_iam_role.hub_publisher": {
         ("max_session_duration",): 3600,
     },
+    "module.control.aws_secretsmanager_secret.hub_key_material": {
+        ("description",): (
+            "Connector Hub private key and cookie keys; seeded once by the "
+            "keygen Lambda, never via Terraform state"
+        ),
+    },
+    "module.control.aws_ssm_parameter.hub_public_key": {
+        ("description",): (
+            "Connector Hub X25519 public identity; private key remains in "
+            "Secrets Manager"
+        ),
+        ("type",): "String",
+        ("value",): "pending-keygen",
+    },
+    "module.control.aws_iam_role.hub_keygen": {
+        ("max_session_duration",): 3600,
+    },
+    "module.control.aws_lambda_function.hub_keygen": {
+        ("handler",): "keygen.handler",
+        ("reserved_concurrent_executions",): 1,
+        ("runtime",): "nodejs22.x",
+        ("timeout",): 30,
+    },
+    "module.control.aws_lambda_invocation.hub_keygen": {
+        ("lifecycle_scope",): "CREATE_ONLY",
+    },
+    "module.control.aws_lambda_invocation.hub_identity_publication": {
+        ("lifecycle_scope",): "CREATE_ONLY",
+    },
+    "module.control.data.archive_file.hub_keygen": {
+        ("type",): "zip",
+    },
     "module.control.aws_vpc.control": {
         ("enable_dns_hostnames",): True,
         ("enable_dns_support",): True,
@@ -1381,6 +1870,38 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
     "module.control.aws_security_group.otp_redis": {
         ("egress",): [],
         ("ingress",): [],
+    },
+    "module.control.aws_security_group.authority_lambda": {
+        ("description",): (
+            "Connector Authority function ENIs; egress to Control dependency "
+            "endpoints only"
+        ),
+        ("egress",): [],
+        ("ingress",): [],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_interface_endpoints": {
+        ("description",): "HTTPS to Control interface endpoints",
+        ("from_port",): 443,
+        ("ip_protocol",): "tcp",
+        ("to_port",): 443,
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb": {
+        ("description",): "HTTPS to the DynamoDB gateway endpoint",
+        ("from_port",): 443,
+        ("ip_protocol",): "tcp",
+        ("to_port",): 443,
+    },
+    "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis": {
+        ("description",): "TLS to Connector OTP Redis",
+        ("from_port",): 6379,
+        ("ip_protocol",): "tcp",
+        ("to_port",): 6379,
+    },
+    "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority": {
+        ("description",): "TLS from Connector Authority OTP functions",
+        ("from_port",): 6379,
+        ("ip_protocol",): "tcp",
+        ("to_port",): 6379,
     },
     "module.control.aws_subnet.isolated": {
         ("map_public_ip_on_launch",): False,
@@ -1465,6 +1986,23 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("tier",),
         ("value_wo",),
         ("value_wo_version",),
+    ),
+    "module.control.aws_ssm_parameter.hub_public_key": (
+        ("allowed_pattern",),
+        ("data_type",),
+        ("has_value_wo",),
+        ("insecure_value",),
+        ("key_id",),
+        ("overwrite",),
+        ("tier",),
+        ("value_wo",),
+        ("value_wo_version",),
+    ),
+    "module.control.aws_lambda_function.hub_keygen": (
+        ("dead_letter_config",),
+        ("file_system_config",),
+        ("image_config",),
+        ("vpc_config",),
     ),
     "module.control.aws_elasticache_user.otp_activator": (
         ("authentication_mode", 0, "passwords"),
@@ -1817,6 +2355,15 @@ def _check_configuration_security(
                 f"Terraform configuration expressions missing: {address}"
             )
         normalized = dict(expressions)
+        # The Authority Lambda and OTP Redis SGs deliberately own all rules via
+        # standalone aws_vpc_security_group_*_rule resources. Terraform omits
+        # their inline ingress/egress expressions while the planned/state value
+        # remains []. Normalize only that omission to the existing exact-empty
+        # contract; any configured nonempty inline rule still differs and fails.
+        if address in STANDALONE_RULE_SECURITY_GROUPS:
+            for path in STANDALONE_RULE_EMPTY_PATHS:
+                if _expression_at(normalized, path) is _MISSING:
+                    normalized[path[0]] = {"constant_value": []}
         count_expression = resources[address].get("count_expression", _MISSING)
         if count_expression is not _MISSING:
             normalized["count"] = count_expression
@@ -2140,14 +2687,9 @@ def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
         or contract.get("selected_authority_color") not in ("blue", "green")
         or not isinstance(global_contract, dict)
         or not isinstance(functions, dict)
-        or set(functions)
-        != {
-            "layerv-nhp-sandbox-ca-ia",
-            "layerv-nhp-sandbox-ca-ra",
-            "layerv-nhp-sandbox-ca-icr",
-        }
+        or set(functions) != set(AUTHORITY_RUNTIME_FUNCTIONS)
         or not isinstance(catalog, dict)
-        or set(catalog) != {"cell0"}
+        or set(catalog) != set(AUTHORITY_CELLS)
     ):
         raise ContractError("foundation runtime contract graph is not exact measurement")
     digest = global_contract.get("authority_image_digest")
@@ -2187,6 +2729,196 @@ def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
     ):
         raise ContractError("foundation runtime evidence binding is not exact")
     return True
+
+
+def _is_exact_legacy_hub_runtime_expansion(
+    before_values: dict[str, Any],
+    after_values: dict[str, Any],
+    by_address: dict[str, dict[str, Any]],
+) -> bool:
+    """Prove the one-time live three-Hub-function -> two-cell expansion.
+
+    The prior sandbox slice is already live. Its contract has exactly the three
+    Hub functions and cell0 caller-capacity/catalog metadata, all bound to the
+    immutable predecessor evidence. Build that exact predecessor from the fully
+    validated after-contract so every unchanged field is compared rather than
+    duplicated here.
+    """
+    if not _require_authority_runtime_binding(after_values):
+        return False
+    before_payload = before_values.get("input")
+    after_payload = after_values.get("input")
+    if not isinstance(before_payload, dict) or not isinstance(after_payload, dict):
+        return False
+
+    expected_before = json.loads(json.dumps(after_payload))
+    contract = expected_before.get("authority_runtime_contract")
+    if not isinstance(contract, dict):
+        return False
+    global_contract = contract.get("global")
+    if not isinstance(global_contract, dict):
+        return False
+    before_contract = before_payload.get("authority_runtime_contract")
+    before_global = (
+        before_contract.get("global")
+        if isinstance(before_contract, dict)
+        else None
+    )
+    before_digest = (
+        before_global.get("authority_image_digest")
+        if isinstance(before_global, dict)
+        else None
+    )
+    repository = global_contract.get("authority_repository_url")
+    # qurl-service publishes a new immutable exact-main image independently of
+    # this one-time infrastructure expansion. If that happens before apply, the
+    # live predecessor is still bound to the previous digest while the reviewed
+    # after-graph must roll every retained Hub function to the new one. Admit
+    # only that exact repository@sha256 pair; every other predecessor field is
+    # still reconstructed from and compared with the fully validated after
+    # contract below.
+    if (
+        not isinstance(repository, str)
+        or not isinstance(before_digest, str)
+        or _DIGEST_PATTERN.fullmatch(before_digest) is None
+        or before_payload.get("authority_image_uri")
+        != f"{repository}@{before_digest}"
+    ):
+        return False
+    before_image_uri = f"{repository}@{before_digest}"
+    expected_before["authority_image_uri"] = before_image_uri
+    global_contract["authority_image_digest"] = before_digest
+    for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+        function = by_address.get(
+            f'module.control.aws_lambda_function.authority["{function_name}"]'
+        )
+        change = function.get("change") if isinstance(function, dict) else None
+        function_before = (
+            change.get("before") if isinstance(change, dict) else None
+        )
+        if (
+            not isinstance(function_before, dict)
+            or function_before.get("image_uri") != before_image_uri
+        ):
+            return False
+    caller_capacity = global_contract.get("caller_capacity")
+    cell_workers = (
+        caller_capacity.get("cell_workers")
+        if isinstance(caller_capacity, dict)
+        else None
+    )
+    if not isinstance(cell_workers, dict) or set(cell_workers) != set(
+        AUTHORITY_CELLS
+    ):
+        return False
+    global_contract["basis_evidence"] = dict(
+        AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE
+    )
+    cell_workers.pop("cell1")
+    contract["functions"] = {
+        function_name: {
+            **contract["functions"][function_name],
+            "basis_evidence": dict(AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE),
+        }
+        for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+    }
+    contract["provisioned_cells"].pop("cell1")
+    contract["provisioned_cells_evidence"] = dict(
+        AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE
+    )
+    return before_payload == expected_before
+
+
+def _is_exact_legacy_authority_sg_replacement(change: dict[str, Any]) -> bool:
+    """Prove the one-time removal of the legacy function-SG inline rules.
+
+    Omitting inline rules does not revoke rules already represented in the
+    ``aws_security_group`` state. The generation-2 name prefix therefore forces
+    an empty replacement group; the exact standalone rules then add only the
+    reviewed SG-to-SG, DynamoDB-prefix-list, and Redis paths.
+    """
+    if change.get("actions") != ["create", "delete"] or change.get("replace_paths") != [
+        ["name_prefix"]
+    ]:
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    unknown = change.get("after_unknown")
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or not isinstance(unknown, dict)
+        or before.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-"
+        or after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
+        or before.get("description")
+        != (
+            "Connector Authority function ENIs; egress to Control dependency "
+            "endpoints only"
+        )
+        or after.get("description") != before.get("description")
+        or re.fullmatch(r"vpc-[0-9a-f]+", str(before.get("vpc_id"))) is None
+        or after.get("vpc_id") != before.get("vpc_id")
+        or before.get("ingress") not in ([], None)
+        or after.get("ingress") not in ([], None)
+        or after.get("egress") not in ([], None)
+        or unknown.get("ingress") is not True
+        or unknown.get("egress") is not True
+    ):
+        return False
+
+    egress = before.get("egress")
+    if not isinstance(egress, list) or len(egress) != 2:
+        return False
+    by_description = {
+        rule.get("description"): rule for rule in egress if isinstance(rule, dict)
+    }
+    if len(by_description) != 2:
+        return False
+    interface_rule = by_description.get(
+        "HTTPS to Control interface endpoints (KMS) in-VPC"
+    )
+    dynamodb_rule = by_description.get(
+        "HTTPS to the DynamoDB gateway endpoint prefix list"
+    )
+    if interface_rule != {
+        "cidr_blocks": [CONTROL_VPC_CIDR],
+        "description": "HTTPS to Control interface endpoints (KMS) in-VPC",
+        "from_port": 443,
+        "ipv6_cidr_blocks": [],
+        "prefix_list_ids": [],
+        "protocol": "tcp",
+        "security_groups": [],
+        "self": False,
+        "to_port": 443,
+    }:
+        return False
+    if not isinstance(dynamodb_rule, dict):
+        return False
+    prefix_list_ids = dynamodb_rule.get("prefix_list_ids")
+    return (
+        set(dynamodb_rule)
+        == {
+            "cidr_blocks",
+            "description",
+            "from_port",
+            "ipv6_cidr_blocks",
+            "prefix_list_ids",
+            "protocol",
+            "security_groups",
+            "self",
+            "to_port",
+        }
+        and dynamodb_rule.get("cidr_blocks") == []
+        and dynamodb_rule.get("from_port") == 443
+        and dynamodb_rule.get("ipv6_cidr_blocks") == []
+        and isinstance(prefix_list_ids, list)
+        and len(prefix_list_ids) == 1
+        and re.fullmatch(r"pl-[0-9a-f]+", str(prefix_list_ids[0])) is not None
+        and dynamodb_rule.get("protocol") == "tcp"
+        and dynamodb_rule.get("security_groups") == []
+        and dynamodb_rule.get("self") is False
+        and dynamodb_rule.get("to_port") == 443
+    )
 
 
 # The dark contract input is `{account_id, control_table_prefix, region}` and the
@@ -2229,6 +2961,335 @@ def _require_foundation_input_known(
     if stray:
         raise ContractError(
             f"foundation runtime input has unexpected unknown keys: {stray}"
+        )
+
+
+def _canonical_base64_32(value: Any) -> bytes | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if (
+        len(decoded) != 32
+        or base64.b64encode(decoded).decode("ascii") != value
+    ):
+        return None
+    return decoded
+
+
+def _check_hub_identity_resources(
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Prove the Hub seeder's complete secret-to-public identity transaction.
+
+    The Hub worker predates public identity publication in sandbox. This
+    checker therefore validates both the one-time CREATE_ONLY invocation
+    replacement and the converged no-op state. It never renders secret values
+    in diagnostics.
+    """
+
+    def values(address: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        item = by_address.get(address)
+        change = item.get("change") if isinstance(item, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        unknown = change.get("after_unknown", {}) if isinstance(change, dict) else None
+        if (
+            not isinstance(change, dict)
+            or not isinstance(after, dict)
+            or not isinstance(unknown, dict)
+        ):
+            raise ContractError(f"{address} planned values are malformed")
+        return after, unknown, change
+
+    secret_address = "module.control.aws_secretsmanager_secret.hub_key_material[0]"
+    secret, secret_unknown, _ = values(secret_address)
+    authority_key, _, _ = values("module.control.aws_kms_key.authority_data")
+    authority_key_arn = authority_key.get("arn")
+    secret_arn = secret.get("arn")
+    if (
+        not isinstance(authority_key_arn, str)
+        or not isinstance(secret_arn, str)
+        or HUB_KEY_MATERIAL_SECRET_ARN_RE.fullmatch(secret_arn) is None
+    ):
+        raise ContractError("Hub identity KMS/secret identity is not exact")
+    _require_fields(
+        secret,
+        {
+            "description": (
+                "Connector Hub private key and cookie keys; seeded once by the "
+                "keygen Lambda, never via Terraform state"
+            ),
+            "kms_key_id": authority_key_arn,
+            "name": HUB_KEY_MATERIAL_SECRET_NAME,
+            "policy": "",
+            "recovery_window_in_days": 7,
+            "region": AWS_REGION,
+        },
+        secret_address,
+    )
+    if any(
+        secret_unknown.get(field) not in (None, False, {}, [])
+        for field in ("arn", "kms_key_id", "name", "policy")
+    ):
+        raise ContractError("Hub identity secret has unknown security fields")
+
+    kms_condition = {
+        "StringEquals": {
+            "kms:EncryptionContext:SecretARN": secret_arn,
+            "kms:ViaService": HUB_SECRETSMANAGER_KMS_VIA_SERVICE,
+        }
+    }
+    keygen_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": [
+                    "secretsmanager:DescribeSecret",
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:PutSecretValue",
+                ],
+                "Effect": "Allow",
+                "Resource": secret_arn,
+                "Sid": "SeedHubKeyMaterial",
+            },
+            {
+                "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+                "Effect": "Allow",
+                "Resource": HUB_PUBLIC_KEY_PARAMETER_ARN,
+                "Sid": "PublishHubPublicIdentity",
+            },
+            {
+                "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                "Condition": kms_condition,
+                "Effect": "Allow",
+                "Resource": authority_key_arn,
+                "Sid": "WrapHubKeyMaterial",
+            },
+            {
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Effect": "Allow",
+                "Resource": HUB_KEYGEN_LOG_GROUP_ARN,
+                "Sid": "OwnLogStream",
+            },
+        ],
+    }
+    execution_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "secretsmanager:GetSecretValue",
+                "Effect": "Allow",
+                "Resource": secret_arn,
+                "Sid": "ReadHubKeyMaterial",
+            },
+            {
+                "Action": "kms:Decrypt",
+                "Condition": kms_condition,
+                "Effect": "Allow",
+                "Resource": authority_key_arn,
+                "Sid": "DecryptHubKeyMaterial",
+            },
+        ],
+    }
+    keygen_policy_address = "module.control.aws_iam_role_policy.hub_keygen[0]"
+    keygen_policy_after, keygen_policy_unknown, _ = values(keygen_policy_address)
+    _require_fields(
+        keygen_policy_after,
+        {"name": "hub-keygen", "role": f"{CONTROL_PREFIX}-hub-keygen"},
+        keygen_policy_address,
+    )
+    _require_json_field(
+        keygen_policy_after,
+        "policy",
+        keygen_policy,
+        keygen_policy_address,
+    )
+    execution_policy_address = (
+        "module.control.aws_iam_role_policy.hub_execution[0]"
+    )
+    execution_policy_after, execution_policy_unknown, _ = values(
+        execution_policy_address
+    )
+    _require_fields(
+        execution_policy_after,
+        {"name": "hub-execution", "role": f"{CONTROL_PREFIX}-hub-exec"},
+        execution_policy_address,
+    )
+    _require_json_field(
+        execution_policy_after,
+        "policy",
+        execution_policy,
+        execution_policy_address,
+    )
+    if keygen_policy_unknown or execution_policy_unknown:
+        raise ContractError("Hub identity IAM policies must be fully known")
+
+    role_address = "module.control.aws_iam_role.hub_keygen[0]"
+    role, role_unknown, _ = values(role_address)
+    _require_fields(
+        role,
+        {
+            "arn": HUB_KEYGEN_ROLE_ARN,
+            "max_session_duration": 3600,
+            "name": f"{CONTROL_PREFIX}-hub-keygen",
+            "path": "/",
+        },
+        role_address,
+    )
+    _require_json_field(
+        role,
+        "assume_role_policy",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Action": "sts:AssumeRole",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "lambda.amazonaws.com"},
+                    "Sid": "LambdaAssume",
+                }
+            ],
+        },
+        role_address,
+    )
+    if (
+        role.get("managed_policy_arns") not in (None, [])
+        or role.get("permissions_boundary") not in (None, "")
+        or role_unknown
+    ):
+        raise ContractError("Hub keygen role boundary is not least privilege")
+
+    public_address = "module.control.aws_ssm_parameter.hub_public_key[0]"
+    public, _, public_change = values(public_address)
+    _require_fields(
+        public,
+        {
+            "description": (
+                "Connector Hub X25519 public identity; private key remains in "
+                "Secrets Manager"
+            ),
+            "name": HUB_PUBLIC_KEY_PARAMETER_NAME,
+            "region": AWS_REGION,
+            "type": "String",
+            "value_wo": None,
+            "value_wo_version": None,
+        },
+        public_address,
+    )
+    public_value = public.get("value")
+
+    lambda_address = "module.control.aws_lambda_function.hub_keygen[0]"
+    keygen_lambda, lambda_unknown, _ = values(lambda_address)
+    source_hash = keygen_lambda.get("source_code_hash")
+    if _canonical_base64_32(source_hash) is None:
+        raise ContractError("Hub keygen source hash is not canonical SHA-256")
+    _require_fields(
+        keygen_lambda,
+        {
+            "description": (
+                "Seeds or repairs the Connector Hub identity and publishes its "
+                "public key at worker create (sandbox)"
+            ),
+            "environment": [
+                {
+                    "variables": {
+                        "ENVIRONMENT": "sandbox",
+                        "PUBLIC_KEY_PARAMETER": HUB_PUBLIC_KEY_PARAMETER_NAME,
+                        "SECRET_ID": secret_arn,
+                    }
+                }
+            ],
+            "filename": (
+                "../../../modules/connector-authority-foundation/lambda/"
+                "hub-keygen.zip"
+            ),
+            "function_name": HUB_KEYGEN_FUNCTION_NAME,
+            "handler": "keygen.handler",
+            "package_type": "Zip",
+            "reserved_concurrent_executions": 1,
+            "role": HUB_KEYGEN_ROLE_ARN,
+            "runtime": "nodejs22.x",
+            "timeout": 30,
+            "vpc_config": [],
+        },
+        lambda_address,
+    )
+    if lambda_unknown.get("environment") not in (
+        None,
+        [],
+        [{"variables": {}}],
+    ) or lambda_unknown.get("vpc_config") not in (None, []):
+        raise ContractError("Hub keygen network/environment is not fully known")
+    for field in (
+        "filename",
+        "function_name",
+        "handler",
+        "package_type",
+        "reserved_concurrent_executions",
+        "role",
+        "runtime",
+        "source_code_hash",
+        "timeout",
+    ):
+        if lambda_unknown.get(field) not in (None, False, {}, []):
+            raise ContractError(f"Hub keygen has unknown security field: {field}")
+
+    invocation_address = (
+        "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+    )
+    invocation, invocation_unknown, invocation_change = values(invocation_address)
+    expected_invocation = {
+        "function_name": HUB_KEYGEN_FUNCTION_NAME,
+        "input": "{}",
+        "lifecycle_scope": "CREATE_ONLY",
+        "qualifier": "$LATEST",
+        "region": AWS_REGION,
+        "tenant_id": None,
+        "terraform_key": "tf",
+        "triggers": None,
+    }
+    _require_fields(invocation, expected_invocation, invocation_address)
+    invocation_actions = invocation_change.get("actions")
+    public_actions = public_change.get("actions")
+    public_bytes = _canonical_base64_32(public_value)
+    if invocation_actions == ["create"]:
+        create_shape_is_exact = (
+            invocation_change.get("before") is None
+            and invocation_change.get("replace_paths") in (None, [])
+        )
+        if (
+            not create_shape_is_exact
+            or invocation_unknown
+            not in (
+                {"id": True, "result": True},
+                {"id": True, "result": True, "triggers": True},
+            )
+            or public_value != "pending-keygen"
+            and (public_bytes is None or not any(public_bytes))
+        ):
+            raise ContractError("Hub identity publication create is not exact")
+    elif invocation_actions == ["no-op"]:
+        if invocation_unknown or invocation_change.get("replace_paths") not in (
+            None,
+            [],
+        ):
+            raise ContractError("Hub identity invocation no-op is not exact")
+        result = invocation.get("result")
+        try:
+            decoded_result = json.loads(result) if isinstance(result, str) else None
+        except json.JSONDecodeError as exc:
+            raise ContractError("Hub identity invocation result is malformed") from exc
+        if decoded_result != {"seeded": True} or not public_bytes or not any(
+            public_bytes
+        ):
+            raise ContractError("Hub identity steady publication is not proven")
+    else:
+        raise ContractError("Hub identity invocation action is not admitted")
+    if public_actions == ["create"] and invocation_actions != ["create"]:
+        raise ContractError(
+            "Hub public identity creation requires a keygen invocation"
         )
 
 
@@ -2400,19 +3461,29 @@ def _check_planned_security(
         if endpoint_type == "Interface":
             expected["private_dns_enabled"] = True
         _require_fields(after, expected, address)
-        # In the runtime slice exactly the DynamoDB gateway and KMS interface
-        # endpoints carry a scoped Allow to the execution roles; the Hub worker
-        # slice additionally opens the lambda interface endpoint to the worker
-        # task role. Every other endpoint (email, logs, monitoring,
-        # secretsmanager -- and lambda while the worker is dark) stays deny-all
+        # In the runtime slice DynamoDB, KMS, Secrets Manager, and SES carry
+        # operation-scoped Allows; the Hub worker slice additionally opens the
+        # lambda interface endpoint to the worker task role. Every other
+        # endpoint (logs, monitoring, and lambda while the worker is dark) stays
+        # deny-all
         # and fails closed here otherwise.
         if runtime_mode and address == AUTHORITY_RUNTIME_DYNAMODB_ADDRESS:
             _check_authority_dynamodb_endpoint_policy(after, address)
         elif runtime_mode and address == AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS:
             _check_authority_kms_endpoint_policy(after, address)
+        elif runtime_mode and address == AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS:
+            _check_authority_secrets_endpoint_policy(
+                after, address, hub_worker_mode=hub_worker_mode
+            )
+        elif runtime_mode and address == AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS:
+            _check_authority_email_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
             _check_hub_lambda_endpoint_policy(after, address)
-        elif hub_worker_mode and address == HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS:
+        elif (
+            hub_worker_mode
+            and not runtime_mode
+            and address == HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS
+        ):
             _check_hub_secretsmanager_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LOGS_ENDPOINT_ADDRESS:
             _check_hub_logs_endpoint_policy(after, address)
@@ -2428,6 +3499,7 @@ def _check_planned_security(
     # resources do not exist (the inventory admission gates that); when live their
     # policies are validated here exactly like the runtime dependency endpoints.
     if hub_worker_mode:
+        _check_hub_identity_resources(by_address)
         for address, service, endpoint_type in (
             ("module.control.aws_vpc_endpoint.hub_ecr_api[0]", "ecr.api", "Interface"),
             ("module.control.aws_vpc_endpoint.hub_ecr_dkr[0]", "ecr.dkr", "Interface"),
@@ -2843,7 +3915,7 @@ def _check_authority_dynamodb_endpoint_policy(
     stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsData")
     if _authority_principalarn_condition(stmt, address) != set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS):
         raise ContractError(
-            f"{address} principals must be exactly the three execution roles"
+            f"{address} principals must be exactly the eleven execution roles"
         )
     if _authority_string_set(stmt.get("Action"), address, "Action") != set(
         AUTHORITY_RUNTIME_DYNAMODB_ACTIONS
@@ -2853,27 +3925,108 @@ def _check_authority_dynamodb_endpoint_policy(
         AUTHORITY_RUNTIME_DYNAMODB_RESOURCES
     ):
         raise ContractError(
-            f"{address} resources must be exactly the three tables and their indexes"
+            f"{address} resources must be exactly the four base tables"
         )
 
 
 def _check_authority_kms_endpoint_policy(
     after: dict[str, Any], address: str
 ) -> None:
-    stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsQat1")
-    if _authority_principalarn_condition(stmt, address) != set(AUTHORITY_RUNTIME_SIGN_ROLE_ARNS):
-        raise ContractError(
-            f"{address} principal must be exactly the IssueAssignment execution role"
-        )
-    if _authority_string_set(stmt.get("Action"), address, "Action") != set(
-        AUTHORITY_RUNTIME_KMS_ACTIONS
+    statements = _endpoint_allow_statements(after, address, 2)
+    if set(statements) != {"AuthorityFunctionsQat1PublicKey", "IssueAssignmentQat1Sign"}:
+        raise ContractError(f"{address} KMS statement set drifted")
+    public_key = statements["AuthorityFunctionsQat1PublicKey"]
+    sign = statements["IssueAssignmentQat1Sign"]
+    if _authority_principalarn_condition(public_key, address) != set(
+        AUTHORITY_RUNTIME_PUBLIC_KEY_ROLE_ARNS
     ):
         raise ContractError(
-            f"{address} KMS actions must be exactly GetPublicKey+Sign (no kms:Verify)"
+            f"{address} GetPublicKey principals must be exactly IA/IRO/AR"
         )
-    resources = _authority_string_set(stmt.get("Resource"), address, "Resource")
-    if len(resources) != 1 or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None:
-        raise ContractError(f"{address} must target exactly the qat1 signing key")
+    if _authority_string_set(public_key.get("Action"), address, "Action") != {
+        "kms:GetPublicKey"
+    }:
+        raise ContractError(f"{address} public-key action drifted")
+    if _authority_principalarn_condition(sign, address) != set(
+        AUTHORITY_RUNTIME_SIGN_ROLE_ARNS
+    ):
+        raise ContractError(f"{address} Sign principal must be exactly IssueAssignment")
+    if _authority_string_set(sign.get("Action"), address, "Action") != {"kms:Sign"}:
+        raise ContractError(f"{address} Sign action drifted")
+    for statement in (public_key, sign):
+        resources = _authority_string_set(
+            statement.get("Resource"), address, "Resource"
+        )
+        if (
+            len(resources) != 1
+            or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None
+        ):
+            raise ContractError(f"{address} must target exactly the qat1 signing key")
+
+
+def _check_authority_secrets_endpoint_policy(
+    after: dict[str, Any], address: str, *, hub_worker_mode: bool
+) -> None:
+    expected_count = 2 if hub_worker_mode else 1
+    statements = _endpoint_allow_statements(after, address, expected_count)
+    authority = statements.get("AuthorityOTPSecret")
+    if authority is None:
+        raise ContractError(f"{address} lacks the Authority OTP secret grant")
+    if _authority_principalarn_condition(authority, address) != set(
+        AUTHORITY_RUNTIME_OTP_ROLE_ARNS
+    ):
+        raise ContractError(f"{address} OTP principals must be exactly IRO/AR")
+    if _authority_string_set(authority.get("Action"), address, "Action") != {
+        "secretsmanager:GetSecretValue"
+    }:
+        raise ContractError(f"{address} OTP secret action drifted")
+    resources = _authority_string_set(authority.get("Resource"), address, "Resource")
+    if (
+        len(resources) != 1
+        or _AUTHORITY_OTP_SECRET_ARN_RE.fullmatch(next(iter(resources))) is None
+    ):
+        raise ContractError(f"{address} must target exactly the OTP pepper secret")
+    if hub_worker_mode:
+        # Reuse the existing exact Hub validation against the same combined policy
+        # by validating its statement inline.
+        hub = statements.get("HubWorkerReadKeyMaterial")
+        if hub is None:
+            raise ContractError(f"{address} lacks the Hub key-material grant")
+        if _authority_principalarn_condition(hub, address) != {HUB_EXECUTION_ROLE_ARN}:
+            raise ContractError(f"{address} Hub secret principal drifted")
+        if _authority_string_set(hub.get("Action"), address, "Action") != {
+            "secretsmanager:GetSecretValue"
+        }:
+            raise ContractError(f"{address} Hub secret action drifted")
+        hub_resources = _authority_string_set(
+            hub.get("Resource"), address, "Resource"
+        )
+        if (
+            len(hub_resources) != 1
+            or HUB_KEY_MATERIAL_SECRET_ARN_RE.fullmatch(next(iter(hub_resources)))
+            is None
+        ):
+            raise ContractError(f"{address} Hub secret resource drifted")
+
+
+def _check_authority_email_endpoint_policy(
+    after: dict[str, Any], address: str
+) -> None:
+    stmt = _authority_single_allow_statement(
+        after, address, "AuthorityOTPSendEmail"
+    )
+    if _authority_principalarn_condition(stmt, address) != set(
+        AUTHORITY_RUNTIME_SES_ROLE_ARNS
+    ):
+        raise ContractError(f"{address} SES principals must be exactly IRO")
+    if _authority_string_set(stmt.get("Action"), address, "Action") != {
+        "ses:SendEmail"
+    }:
+        raise ContractError(f"{address} SES action drifted")
+    if _authority_string_set(stmt.get("Resource"), address, "Resource") != set(
+        AUTHORITY_RUNTIME_SES_RESOURCES
+    ):
+        raise ContractError(f"{address} SES resources drifted")
 
 
 def _endpoint_allow_statements(
@@ -3178,7 +4331,7 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
     # to create the function's VPC ENI in a context that does not satisfy a
     # per-function SourceArn condition, so such a condition denies that assume and
     # the function fails to reach Active with InsufficientRolePermissions (all
-    # three ca-{ia,ra,icr} functions hit this on the first live apply). The
+    # complete Authority graph hits this on the first live apply). The
     # execution role is usable only by the function wired to it (its role=
     # attribute), never by arbitrary assumption, so the bare lambda-principal
     # trust is the correct least privilege -- and the only trust that lets a VPC
@@ -3193,7 +4346,7 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
 def _check_authority_exec_role_policy(
     after: dict[str, Any], fn: str, operation: str
 ) -> None:
-    """Validate one hub function's per-operation execution (identity) policy.
+    """Validate one function's per-operation execution (identity) policy.
 
     Every referenced ARN is plan-known (the own-log-group ARN is a constructed
     literal, not the computed resource attribute), so the exact least-privilege
@@ -3202,6 +4355,9 @@ def _check_authority_exec_role_policy(
     exact verbs, KMS Sign only for IssueAssignment, and no wildcard resource
     outside the single AWS-required ENI statement.
     """
+    if operation in AUTHORITY_RUNTIME_CELL_OPERATION_IAM:
+        _check_authority_cell_exec_role_policy(after, fn, operation)
+        return
     spec = AUTHORITY_RUNTIME_OPERATION_IAM.get(operation)
     if spec is None:
         raise ContractError(f"{fn} execution policy has unknown operation {operation!r}")
@@ -3295,6 +4451,168 @@ def _check_authority_exec_role_policy(
             raise ContractError(f"{fn} Sign statement must target exactly the qat1 key")
 
 
+def _check_authority_cell_exec_role_policy(
+    after: dict[str, Any], fn: str, operation: str
+) -> None:
+    spec = AUTHORITY_RUNTIME_CELL_OPERATION_IAM[operation]
+    policy = _authority_decode_policy(after, fn)
+    if not isinstance(policy, dict) or policy.get("Version") != "2012-10-17":
+        raise ContractError(f"{fn} execution policy is not a 2012-10-17 document")
+    statements = policy.get("Statement")
+    if not isinstance(statements, list):
+        raise ContractError(f"{fn} execution policy Statement must be a list")
+    by_sid: dict[str, dict[str, Any]] = {}
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            raise ContractError(f"{fn} execution statements must all be Allow objects")
+        if any(
+            key in stmt
+            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal")
+        ):
+            raise ContractError(f"{fn} execution statement uses a forbidden element")
+        sid = stmt.get("Sid")
+        if not isinstance(sid, str) or sid in by_sid:
+            raise ContractError(f"{fn} execution statement Sid missing or duplicated")
+        if "Condition" in stmt and sid != "OTPSecretDecrypt":
+            raise ContractError(f"{fn} only OTPSecretDecrypt may carry a Condition")
+        by_sid[sid] = stmt
+
+    expected_sids = {
+        "LambdaVpcEni",
+        "OwnLogStream",
+        "AuthorityReads",
+        *spec["writes"],
+    }
+    if spec["public_key"]:
+        expected_sids.add("Qat1PublicKey")
+    if spec["otp_user"] is not None:
+        expected_sids.update({"OTPSecretRead", "OTPSecretDecrypt", "OTPRedisConnect"})
+    if spec["sends_email"]:
+        expected_sids.add("OTPSendEmail")
+    if set(by_sid) != expected_sids:
+        raise ContractError(
+            f"{fn} execution policy statement set drifted: "
+            f"{sorted(by_sid)} != {sorted(expected_sids)}"
+        )
+
+    eni = by_sid["LambdaVpcEni"]
+    if _authority_string_set(eni.get("Action"), fn, "ENI Action") != set(
+        AUTHORITY_RUNTIME_ENI_ACTIONS
+    ) or eni.get("Resource") not in ("*", ["*"]):
+        raise ContractError(f"{fn} ENI statement drifted")
+    log_stmt = by_sid["OwnLogStream"]
+    expected_log = (
+        f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/aws/lambda/{fn}:*"
+    )
+    if _authority_string_set(log_stmt.get("Action"), fn, "log Action") != set(
+        AUTHORITY_RUNTIME_LOG_ACTIONS
+    ) or _authority_string_set(log_stmt.get("Resource"), fn, "log Resource") != {
+        expected_log
+    }:
+        raise ContractError(f"{fn} own-log statement drifted")
+
+    reads = by_sid["AuthorityReads"]
+    expected_read_resources = set().union(
+        *(AUTHORITY_RUNTIME_TABLE_RESOURCES[table] for table in spec["read_tables"])
+    )
+    if _authority_string_set(reads.get("Action"), fn, "read Action") != set(
+        AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS
+    ) or _authority_string_set(
+        reads.get("Resource"), fn, "read Resource"
+    ) != expected_read_resources:
+        raise ContractError(f"{fn} read actions/resources drifted")
+
+    for sid, (actions, resources) in spec["writes"].items():
+        stmt = by_sid[sid]
+        if _authority_string_set(stmt.get("Action"), fn, sid) != set(
+            actions
+        ) or _authority_string_set(stmt.get("Resource"), fn, sid) != set(resources):
+            raise ContractError(f"{fn} {sid} actions/resources drifted")
+
+    if spec["public_key"]:
+        public_key = by_sid["Qat1PublicKey"]
+        if _authority_string_set(public_key.get("Action"), fn, "Qat1PublicKey") != {
+            "kms:GetPublicKey"
+        }:
+            raise ContractError(f"{fn} qat1 public-key action drifted")
+        resources = _authority_string_set(
+            public_key.get("Resource"), fn, "Qat1PublicKey"
+        )
+        if (
+            len(resources) != 1
+            or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None
+        ):
+            raise ContractError(f"{fn} qat1 public-key resource drifted")
+
+    otp_user = spec["otp_user"]
+    if otp_user is not None:
+        secret_read = by_sid["OTPSecretRead"]
+        if _authority_string_set(
+            secret_read.get("Action"), fn, "OTPSecretRead"
+        ) != {"secretsmanager:GetSecretValue"}:
+            raise ContractError(f"{fn} OTP secret read action drifted")
+        secret_resources = _authority_string_set(
+            secret_read.get("Resource"), fn, "OTPSecretRead"
+        )
+        if (
+            len(secret_resources) != 1
+            or _AUTHORITY_OTP_SECRET_ARN_RE.fullmatch(next(iter(secret_resources)))
+            is None
+        ):
+            raise ContractError(f"{fn} OTP secret resource drifted")
+        decrypt = by_sid["OTPSecretDecrypt"]
+        decrypt_resources = _authority_string_set(
+            decrypt.get("Resource"), fn, "OTPSecretDecrypt"
+        )
+        if _authority_string_set(
+            decrypt.get("Action"), fn, "OTPSecretDecrypt"
+        ) != {"kms:Decrypt"} or (
+            len(decrypt_resources) != 1
+            or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(next(iter(decrypt_resources)))
+            is None
+        ):
+            raise ContractError(f"{fn} OTP secret decrypt grant drifted")
+        condition = decrypt.get("Condition")
+        if (
+            not isinstance(condition, dict)
+            or set(condition) != {"StringEquals"}
+            or not isinstance(condition["StringEquals"], dict)
+            or set(condition["StringEquals"])
+            != {
+                "kms:ViaService",
+                "kms:EncryptionContext:SecretARN",
+            }
+            or condition["StringEquals"].get("kms:ViaService")
+            != f"secretsmanager.{AWS_REGION}.amazonaws.com"
+            or _AUTHORITY_OTP_SECRET_ARN_RE.fullmatch(
+                str(
+                    condition["StringEquals"].get(
+                        "kms:EncryptionContext:SecretARN", ""
+                    )
+                )
+            )
+            is None
+        ):
+            raise ContractError(f"{fn} OTP decrypt condition drifted")
+        redis = by_sid["OTPRedisConnect"]
+        if _authority_string_set(redis.get("Action"), fn, "OTPRedisConnect") != {
+            "elasticache:Connect"
+        } or _authority_string_set(redis.get("Resource"), fn, "OTPRedisConnect") != {
+            AUTHORITY_RUNTIME_REDIS_CACHE_ARN,
+            AUTHORITY_RUNTIME_REDIS_USER_ARNS[otp_user],
+        }:
+            raise ContractError(f"{fn} Redis IAM grant drifted")
+
+    if spec["sends_email"]:
+        email = by_sid["OTPSendEmail"]
+        if _authority_string_set(email.get("Action"), fn, "OTPSendEmail") != {
+            "ses:SendEmail"
+        } or _authority_string_set(
+            email.get("Resource"), fn, "OTPSendEmail"
+        ) != set(AUTHORITY_RUNTIME_SES_RESOURCES):
+            raise ContractError(f"{fn} SES grant drifted")
+
+
 def _check_authority_runtime_resources(
     by_address: dict[str, dict[str, Any]], foundation: dict[str, Any]
 ) -> None:
@@ -3312,7 +4630,7 @@ def _check_authority_runtime_resources(
     if not isinstance(functions, dict) or selected not in ("blue", "green"):
         raise ContractError("runtime slice cannot resolve the bound contract functions")
 
-    for fn, _operation in AUTHORITY_RUNTIME_HUB_FUNCTIONS.items():
+    for fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
         spec = functions.get(fn)
         if not isinstance(spec, dict):
             raise ContractError(f"runtime function {fn} is absent from the bound contract")
@@ -3371,11 +4689,179 @@ def _check_authority_runtime_resources(
             if alias_after.get("name") != color:
                 raise ContractError(f"{fn} {color} alias name drifted")
 
+    lambda_sg_change = by_address[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS]["change"]
     lambda_sg_after = _authority_runtime_after(
         by_address, AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
     )
-    if lambda_sg_after.get("ingress") not in ([], None):
-        raise ContractError("function SG must expose no ingress")
+    lambda_sg_unknown = lambda_sg_change.get("after_unknown")
+    if not isinstance(lambda_sg_unknown, dict):
+        lambda_sg_unknown = {}
+    if (
+        lambda_sg_after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
+        or lambda_sg_after.get("ingress") not in ([], None)
+        or lambda_sg_after.get("egress") not in ([], None)
+    ):
+        raise ContractError(
+            "function SG must be generation 2 with no inline ingress or egress"
+        )
+    lambda_sg_id = lambda_sg_after.get("id")
+    lambda_sg_id_is_known = (
+        isinstance(lambda_sg_id, str)
+        and re.fullmatch(r"sg-[0-9a-f]+", lambda_sg_id) is not None
+    )
+    if not lambda_sg_id_is_known and not (
+        lambda_sg_id in (None, "") and lambda_sg_unknown.get("id") is True
+    ):
+        raise ContractError(
+            "function SG ID must be known or exactly create-time unknown"
+        )
+    # The exact SG ID once settled; None while create-time unknown, which the
+    # reference checks treat as "matches the pending function SG".
+    expected_lambda_sg_id = lambda_sg_id if lambda_sg_id_is_known else None
+
+    def require_sg_reference(
+        rule: dict[str, Any],
+        unknown: dict[str, Any],
+        field: str,
+        expected_id: str | None,
+        address: str,
+    ) -> None:
+        actual = rule.get(field)
+        if expected_id is not None:
+            if actual != expected_id:
+                raise ContractError(
+                    f"{address} {field} must reference the exact reviewed SG"
+                )
+            return
+        if actual not in (None, "") or unknown.get(field) is not True:
+            raise ContractError(
+                f"{address} {field} must be exactly create-time unknown"
+            )
+
+    interface_address = (
+        "module.control.aws_vpc_security_group_egress_rule."
+        "authority_interface_endpoints[0]"
+    )
+    interface_sg = _authority_runtime_after(
+        by_address, AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS
+    )
+    interface_sg_id = interface_sg.get("id")
+    if (
+        not isinstance(interface_sg_id, str)
+        or re.fullmatch(r"sg-[0-9a-f]+", interface_sg_id) is None
+    ):
+        raise ContractError("interface-endpoint SG ID must be known in the runtime plan")
+    interface_change = by_address[interface_address]["change"]
+    interface_unknown = interface_change.get("after_unknown")
+    if not isinstance(interface_unknown, dict):
+        interface_unknown = {}
+    interface_rule = _authority_runtime_after(by_address, interface_address)
+    if (
+        interface_rule.get("description") != "HTTPS to Control interface endpoints"
+        or interface_rule.get("from_port") != 443
+        or interface_rule.get("to_port") != 443
+        or interface_rule.get("ip_protocol") != "tcp"
+        or interface_rule.get("cidr_ipv4") not in (None, "")
+        or interface_rule.get("cidr_ipv6") not in (None, "")
+        or interface_rule.get("prefix_list_id") not in (None, "")
+        or interface_rule.get("referenced_security_group_id") != interface_sg_id
+    ):
+        raise ContractError(
+            f"{interface_address} must be exact interface-endpoint-SG HTTPS egress"
+        )
+    require_sg_reference(
+        interface_rule,
+        interface_unknown,
+        "security_group_id",
+        expected_lambda_sg_id,
+        interface_address,
+    )
+
+    dynamodb_address = (
+        "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb[0]"
+    )
+    dynamodb_change = by_address.get(dynamodb_address, {}).get("change", {})
+    dynamodb_unknown = dynamodb_change.get("after_unknown")
+    if not isinstance(dynamodb_unknown, dict):
+        dynamodb_unknown = {}
+    dynamodb_rule = _authority_runtime_after(by_address, dynamodb_address)
+    prefix_list_is_exact = (
+        isinstance(dynamodb_rule.get("prefix_list_id"), str)
+        and re.fullmatch(r"pl-[0-9a-f]+", dynamodb_rule["prefix_list_id"]) is not None
+    ) or (
+        dynamodb_rule.get("prefix_list_id") in (None, "")
+        and dynamodb_unknown.get("prefix_list_id") is True
+    )
+    if (
+        dynamodb_rule.get("description") != "HTTPS to the DynamoDB gateway endpoint"
+        or dynamodb_rule.get("from_port") != 443
+        or dynamodb_rule.get("to_port") != 443
+        or dynamodb_rule.get("ip_protocol") != "tcp"
+        or dynamodb_rule.get("cidr_ipv4") not in (None, "")
+        or dynamodb_rule.get("cidr_ipv6") not in (None, "")
+        or dynamodb_rule.get("referenced_security_group_id") not in (None, "")
+        or not prefix_list_is_exact
+    ):
+        raise ContractError(
+            f"{dynamodb_address} must be exact DynamoDB-prefix-list HTTPS egress"
+        )
+    require_sg_reference(
+        dynamodb_rule,
+        dynamodb_unknown,
+        "security_group_id",
+        expected_lambda_sg_id,
+        dynamodb_address,
+    )
+
+    otp_redis_sg_after = _authority_runtime_after(
+        by_address, "module.control.aws_security_group.otp_redis"
+    )
+    otp_redis_sg_id = otp_redis_sg_after.get("id")
+    if (
+        not isinstance(otp_redis_sg_id, str)
+        or re.fullmatch(r"sg-[0-9a-f]+", otp_redis_sg_id) is None
+    ):
+        raise ContractError("OTP Redis SG ID must be known in the runtime plan")
+
+    for address, description, source_sg_id, referenced_sg_id in (
+        (
+            "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]",
+            "TLS to Connector OTP Redis",
+            expected_lambda_sg_id,
+            otp_redis_sg_id,
+        ),
+        (
+            "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]",
+            "TLS from Connector Authority OTP functions",
+            otp_redis_sg_id,
+            expected_lambda_sg_id,
+        ),
+    ):
+        change = by_address.get(address, {}).get("change", {})
+        rule = _authority_runtime_after(by_address, address)
+        unknown = change.get("after_unknown")
+        if not isinstance(unknown, dict):
+            unknown = {}
+        if (
+            rule.get("description") != description
+            or rule.get("from_port") != 6379
+            or rule.get("to_port") != 6379
+            or rule.get("ip_protocol") != "tcp"
+            or rule.get("cidr_ipv4") not in (None, "")
+            or rule.get("cidr_ipv6") not in (None, "")
+            or rule.get("prefix_list_id") not in (None, "")
+        ):
+            raise ContractError(
+                f"{address} must be the exact SG-to-SG Redis TLS/6379 rule"
+            )
+        require_sg_reference(rule, unknown, "security_group_id", source_sg_id, address)
+        require_sg_reference(
+            rule,
+            unknown,
+            "referenced_security_group_id",
+            referenced_sg_id,
+            address,
+        )
 
 
 def _has_unknown_value(value: Any) -> bool:
@@ -3399,12 +4885,23 @@ def _mapping_shape(value: dict[str, Any]) -> dict[str, Any]:
 
 def _authority_basis_evidence(payload: dict[str, Any]) -> list[dict[str, Any]]:
     contract = payload["authority_runtime_contract"]
+    # Enumerate every function the contract carries, not just the Hub-facing
+    # ones. _require_authority_runtime_binding requires basis evidence to be
+    # identical across ALL functions, so any function the contract carries must
+    # also satisfy the reviewed FROM/TO evidence pins. Enumerating only the Hub
+    # functions would leave a contract that carries more (this repository's
+    # expanded 3 + 4N graph) with its per-cell basis_evidence unpinned by the
+    # image-update checks. Every object this adds must match the reviewed pins,
+    # so the wider enumeration is strictly fail-closed. Note this is independent
+    # of AUTHORITY_IMAGE_UPDATE_RESOURCES, which stays Hub-only because only the
+    # live Hub resources can be retagged; here the concern is evidence coverage
+    # of the contract, not membership of the admitted action set.
     return [
         contract["provisioned_cells_evidence"],
         contract["global"]["basis_evidence"],
         *(
             contract["functions"][function_name]["basis_evidence"]
-            for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+            for function_name in sorted(contract["functions"])
         ),
     ]
 
@@ -3942,7 +5439,7 @@ def _check_state_normalization_drift(
         # "changed outside of Terraform" config delta, only state normalization
         # of already-applied objects. This admission is STRICTLY confined: every
         # drifted address must be one of the slice's own resources
-        # (AUTHORITY_RUNTIME_RESOURCES) or one of its three opened dependency
+        # (AUTHORITY_RUNTIME_RESOURCES) or one of its opened dependency
         # endpoints (AUTHORITY_RUNTIME_OPENED_ADDRESSES). It does NOT relax the
         # field contract: the security-load-bearing fields of every slice
         # resource are still validated on the post-drift after-state by
@@ -4540,6 +6037,35 @@ def _require_create_shapes(
             raise ContractError(message or f"{address} create shape is malformed")
 
 
+def _hub_identity_transition_pending(
+    actual_non_noop: dict[str, list[str]],
+) -> tuple[bool, set[str], set[str]]:
+    creates = {
+        address
+        for address in HUB_IDENTITY_CREATE_ADDRESSES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    updates = {
+        address
+        for address in HUB_IDENTITY_UPDATE_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
+    changed = creates | updates
+    exact = (
+        bool(changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in HUB_IDENTITY_CREATE_ADDRESSES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in HUB_IDENTITY_UPDATE_ADDRESSES
+        )
+        and (set(actual_non_noop) & HUB_IDENTITY_MIGRATION_ADDRESSES) == changed
+    )
+    return exact, creates, updates
+
+
 def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     """Validate one exact reviewed plan shape.
 
@@ -4701,6 +6227,106 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             actual_non_noop.get(address) == ["create"]
             for address in PROVISIONED_CELL_RESOURCES
         )
+    )
+    provisioned_cell_catalog_creates_pending = {
+        address
+        for address in PROVISIONED_CELL_RESOURCES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    # Main may merge the catalog declaration before this Authority expansion is
+    # applied. Admit that overlap only when BOTH reviewed rows are still exact
+    # pure creates; one-row partial state remains a separate failed transition.
+    provisioned_cell_catalog_full_create = (
+        provisioned_cell_catalog_creates_pending
+        == set(PROVISIONED_CELL_RESOURCES)
+    )
+    (
+        hub_identity_transition,
+        hub_identity_creates_pending,
+        hub_identity_updates_pending,
+    ) = _hub_identity_transition_pending(actual_non_noop)
+    hub_identity_changed = hub_identity_creates_pending | hub_identity_updates_pending
+    legacy_candidate_changed = changed
+    if hub_identity_transition:
+        legacy_candidate_changed -= hub_identity_changed
+    if provisioned_cell_catalog_full_create:
+        legacy_candidate_changed -= provisioned_cell_catalog_creates_pending
+    # One-time expansion of the already-live legacy sandbox runtime (three Hub
+    # functions) to the complete cell0+cell1 graph. The first plan must start
+    # from the exact predecessor contract/evidence; a partial-apply retry may
+    # see that foundation update already converged to a no-op. In either case
+    # only the exact missing cell resources, standalone SG rules, dependency
+    # policy expansions, the generation-2 function-SG replacement, and the
+    # dependent Hub function/alias republish may move. The ordinary clean
+    # runtime-slice contract remains unchanged.
+    legacy_expansion_creates_pending = {
+        address
+        for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    legacy_expansion_updates_pending = {
+        address
+        for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
+    legacy_expansion_replaces_pending = {
+        address
+        for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES
+        if actual_non_noop.get(address) == ["create", "delete"]
+    }
+    foundation_change = by_address[authority_contract_address]["change"]
+    legacy_expansion_action_shape = (
+        runtime_mode
+        and bool(legacy_candidate_changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["create", "delete"])
+            for address in AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES
+        )
+        and legacy_candidate_changed
+        == (
+            legacy_expansion_creates_pending
+            | legacy_expansion_updates_pending
+            | legacy_expansion_replaces_pending
+        )
+    )
+    foundation_expands_legacy = False
+    foundation_already_expanded = False
+    if legacy_expansion_action_shape:
+        foundation_expands_legacy = (
+            actual_non_noop.get(authority_contract_address) == ["update"]
+            and _is_exact_legacy_hub_runtime_expansion(
+                foundation_change.get("before", {}),
+                foundation_change.get("after", {}),
+                by_address,
+            )
+        )
+        foundation_already_expanded = (
+            actual_non_noop.get(authority_contract_address) is None
+            and _require_authority_runtime_binding(
+                foundation_change.get("after", {})
+            )
+        )
+    authority_runtime_legacy_expansion = (
+        legacy_expansion_action_shape
+        and (foundation_expands_legacy or foundation_already_expanded)
+        and (not hub_identity_changed or hub_identity_transition)
+        and (
+            not provisioned_cell_catalog_creates_pending
+            or provisioned_cell_catalog_full_create
+        )
+    )
+    standalone_hub_identity_migration = (
+        hub_worker_mode
+        and hub_identity_transition
+        and changed == hub_identity_changed
     )
     # The runtime slice: every runtime resource is created and exactly the three
     # dependency-endpoint/SG opens are updated. This admits BOTH the clean full
@@ -4936,6 +6562,63 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         plan_mode = "provisioned-cell-catalog"
         _require_create_shapes(changed, by_address)
         _require_provisioned_cell_create_output(plan)
+    # Precedence over the legacy expansion below is deliberate. The expansion's
+    # update set (AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES) contains
+    # the foundation plus the three Hub functions and their six aliases, so a
+    # plan whose entire pending work is update-only on exactly those addresses
+    # satisfies BOTH shapes and is indistinguishable from the plan JSON alone --
+    # an expansion whose creates all applied looks exactly like a partially
+    # applied image retag. _check_authority_image_update is the strictly
+    # stronger envelope for that overlap (it pins the FROM->TO image, version
+    # and basis evidence, which the expansion branch does not re-check for pure
+    # updates), so the ambiguous shape must land here. Any plan that still has a
+    # pending create/replace, or that moves a dependency-open address, is not a
+    # subset of authority_image_update_scope and falls through unchanged.
+    elif authority_image_update_transition:
+        plan_mode = "authority-image-update"
+        _check_authority_image_update(changed, by_address, plan)
+    elif authority_runtime_legacy_expansion:
+        plan_mode_parts = ["authority-runtime-legacy-expansion"]
+        if hub_identity_changed:
+            plan_mode_parts.append("hub-identity")
+        if provisioned_cell_catalog_full_create:
+            plan_mode_parts.append("provisioned-cell-catalog")
+        plan_mode = "-".join(plan_mode_parts)
+        _require_create_shapes(
+            legacy_expansion_creates_pending,
+            by_address,
+            "legacy Authority expansion resources must be new",
+        )
+        _require_create_shapes(
+            hub_identity_creates_pending,
+            by_address,
+            "Hub public identity parameter must be new",
+        )
+        _require_create_shapes(
+            provisioned_cell_catalog_creates_pending,
+            by_address,
+            "provisioned-cell catalog rows must be new",
+        )
+        if provisioned_cell_catalog_full_create:
+            _require_provisioned_cell_create_output(plan)
+        if legacy_expansion_replaces_pending and not (
+            legacy_expansion_replaces_pending
+            == set(AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES)
+            and _is_exact_legacy_authority_sg_replacement(
+                by_address[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS]["change"]
+            )
+        ):
+            raise ContractError(
+                "legacy Authority expansion must exactly replace the inline-rule "
+                "function security group"
+            )
+    elif standalone_hub_identity_migration:
+        plan_mode = "hub-identity-migration"
+        _require_create_shapes(
+            hub_identity_creates_pending,
+            by_address,
+            "Hub public identity parameter must be new",
+        )
     elif authority_runtime_transition:
         plan_mode = "authority-runtime-slice"
         # Only the still-pending creates must present a pure-create shape; any
@@ -4948,9 +6631,6 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # updates are validated by their exact after-state security checks below
         # (_check_authority_runtime_resources), not as pure creates.
         _require_create_shapes(runtime_creates_pending, by_address)
-    elif authority_image_update_transition:
-        plan_mode = "authority-image-update"
-        _check_authority_image_update(changed, by_address, plan)
     elif hub_edge_transition:
         plan_mode = "hub-edge-slice"
         # Every edge resource is a still-pending pure create; an edge resource
@@ -4972,6 +6652,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
             "contract binding, the exact provisioned-cell catalog create, the exact "
+            "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction; "
@@ -5069,6 +6750,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         if plan_mode not in (
             "authority-runtime-slice",
             "authority-runtime-slice-retry",
+            "authority-runtime-legacy-expansion",
+            "authority-runtime-legacy-expansion-hub-identity",
+            "authority-runtime-legacy-expansion-provisioned-cell-catalog",
+            (
+                "authority-runtime-legacy-expansion-hub-identity-"
+                "provisioned-cell-catalog"
+            ),
         ) and not (plan_mode == "no-op" and "resource_changes" not in plan):
             raise ContractError(
                 "authority runtime-slice state normalization is admitted only for "
@@ -5358,6 +7046,32 @@ def _require_iam_redis_user(
         raise ContractError(message)
 
 
+def _require_exact_state_sg_rule(
+    values: dict[str, Any],
+    address: str,
+    *,
+    description: str,
+    port: int,
+    security_group_id: str,
+    referenced_security_group_id: str | None = None,
+    prefix_list_id: str | None = None,
+) -> None:
+    """Require one persisted standalone rule with no CIDR escape hatch."""
+    rule = values[address]
+    if (
+        rule.get("description") != description
+        or rule.get("from_port") != port
+        or rule.get("to_port") != port
+        or rule.get("ip_protocol") != "tcp"
+        or rule.get("security_group_id") != security_group_id
+        or rule.get("cidr_ipv4") not in (None, "")
+        or rule.get("cidr_ipv6") not in (None, "")
+        or rule.get("referenced_security_group_id") != referenced_security_group_id
+        or rule.get("prefix_list_id") != prefix_list_id
+    ):
+        raise ContractError(f"{address} is not the exact reviewed standalone SG rule")
+
+
 def check_state(state: Any) -> dict[str, Any]:
     # Accept both `terraform show -json` state and plan shapes so this contract
     # remains reusable for direct state evidence as well as refreshed plans.
@@ -5459,6 +7173,86 @@ def check_state(state: Any) -> dict[str, Any]:
         or values["module.control.aws_vpc.control"].get("cidr_block") != "10.102.0.0/16"
     ):
         raise ContractError("Control VPC identity/CIDR is invalid")
+
+    runtime_function_sg_id: str | None = None
+    if runtime_present:
+        function_sg = values[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS]
+        function_sg_id = function_sg.get("id")
+        interface_sg_id = values[AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS].get("id")
+        otp_redis_sg_id = values["module.control.aws_security_group.otp_redis"].get(
+            "id"
+        )
+        dynamodb_prefix_list_id = values[AUTHORITY_RUNTIME_DYNAMODB_ADDRESS].get(
+            "prefix_list_id"
+        )
+        for label, identifier in (
+            ("function", function_sg_id),
+            ("interface-endpoint", interface_sg_id),
+            ("OTP Redis", otp_redis_sg_id),
+        ):
+            if (
+                not isinstance(identifier, str)
+                or re.fullmatch(r"sg-[0-9a-f]+", identifier) is None
+            ):
+                raise ContractError(f"{label} SG identity is invalid")
+        if (
+            not isinstance(dynamodb_prefix_list_id, str)
+            or re.fullmatch(r"pl-[0-9a-f]+", dynamodb_prefix_list_id) is None
+        ):
+            raise ContractError("DynamoDB endpoint prefix-list identity is invalid")
+        if (
+            function_sg.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
+            or function_sg.get("description")
+            != (
+                "Connector Authority function ENIs; egress to Control dependency "
+                "endpoints only"
+            )
+            or function_sg.get("vpc_id") != vpc_id
+            or function_sg.get("ingress") not in ([], None)
+            or function_sg.get("egress") not in ([], None)
+        ):
+            raise ContractError(
+                "Authority function SG must be generation 2, in the Control VPC, "
+                "and carry no inline rules"
+            )
+        runtime_function_sg_id = function_sg_id
+        _require_exact_state_sg_rule(
+            values,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]",
+            description="HTTPS to Control interface endpoints",
+            port=443,
+            security_group_id=function_sg_id,
+            referenced_security_group_id=interface_sg_id,
+        )
+        _require_exact_state_sg_rule(
+            values,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_dynamodb[0]",
+            description="HTTPS to the DynamoDB gateway endpoint",
+            port=443,
+            security_group_id=function_sg_id,
+            prefix_list_id=dynamodb_prefix_list_id,
+        )
+        _require_exact_state_sg_rule(
+            values,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_otp_redis[0]",
+            description="TLS to Connector OTP Redis",
+            port=6379,
+            security_group_id=function_sg_id,
+            referenced_security_group_id=otp_redis_sg_id,
+        )
+        _require_exact_state_sg_rule(
+            values,
+            "module.control.aws_vpc_security_group_ingress_rule."
+            "otp_redis_authority[0]",
+            description="TLS from Connector Authority OTP functions",
+            port=6379,
+            security_group_id=otp_redis_sg_id,
+            referenced_security_group_id=function_sg_id,
+        )
+
     for address in (
         "module.control.aws_default_security_group.control",
         "module.control.aws_security_group.interface_endpoints",
@@ -5475,20 +7269,47 @@ def check_state(state: Any) -> dict[str, Any]:
             ingress = item.get("ingress")
             if item.get("egress") not in ([], None):
                 raise ContractError(f"interface-endpoint SG has egress rules: {address}")
-            expected_ingress = 2 if hub_worker_present else 1
-            if not isinstance(ingress, list) or len(ingress) != expected_ingress:
+            expected_sources: dict[str, str] = {}
+            if runtime_present:
+                assert runtime_function_sg_id is not None
+                expected_sources["HTTPS from Connector Authority function ENIs"] = (
+                    runtime_function_sg_id
+                )
+            if hub_worker_present:
+                hub_worker_sg_id = values[
+                    "module.control.aws_security_group.hub_worker[0]"
+                ].get("id")
+                if (
+                    not isinstance(hub_worker_sg_id, str)
+                    or re.fullmatch(r"sg-[0-9a-f]+", hub_worker_sg_id) is None
+                ):
+                    raise ContractError("Hub worker SG identity is invalid")
+                expected_sources["HTTPS from Hub worker ENIs"] = hub_worker_sg_id
+            if not isinstance(ingress, list) or len(ingress) != len(expected_sources):
                 raise ContractError(
                     "interface-endpoint SG must carry exactly "
-                    f"{expected_ingress} TLS/443 ingress rule(s): {address}"
+                    f"{len(expected_sources)} TLS/443 ingress rule(s): {address}"
                 )
-            for rule in ingress:
+            by_description = {
+                rule.get("description"): rule
+                for rule in ingress
+                if isinstance(rule, dict)
+            }
+            if set(by_description) != set(expected_sources):
+                raise ContractError(
+                    f"interface-endpoint SG ingress identities drifted: {address}"
+                )
+            for description, expected_source in expected_sources.items():
+                rule = by_description[description]
                 if (
-                    not isinstance(rule, dict)
-                    or rule.get("from_port") != 443
+                    rule.get("from_port") != 443
                     or rule.get("to_port") != 443
                     or rule.get("protocol") != "tcp"
                     or rule.get("cidr_blocks") not in (None, [])
-                    or len(rule.get("security_groups") or []) != 1
+                    or rule.get("ipv6_cidr_blocks") not in (None, [])
+                    or rule.get("prefix_list_ids") not in (None, [])
+                    or rule.get("self") not in (None, False)
+                    or rule.get("security_groups") != [expected_source]
                 ):
                     raise ContractError(
                         "interface-endpoint SG ingress is not exactly TLS/443 from "
@@ -5632,9 +7453,15 @@ def check_state(state: Any) -> dict[str, Any]:
         # interface endpoint stays deny-all.
         if runtime_present and service == "kms":
             _check_authority_kms_endpoint_policy(item, address)
+        elif runtime_present and service == "secretsmanager":
+            _check_authority_secrets_endpoint_policy(
+                item, address, hub_worker_mode=hub_worker_present
+            )
+        elif runtime_present and service == "email":
+            _check_authority_email_endpoint_policy(item, address)
         elif hub_worker_present and service == "lambda":
             _check_hub_lambda_endpoint_policy(item, address)
-        elif hub_worker_present and service == "secretsmanager":
+        elif hub_worker_present and not runtime_present and service == "secretsmanager":
             _check_hub_secretsmanager_endpoint_policy(item, address)
         elif hub_worker_present and service == "logs":
             _check_hub_logs_endpoint_policy(item, address)
@@ -5966,8 +7793,8 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             "Control state object is not versioned under the exact KMS key"
         )
 
-    # The Control/authority prefixes own no Lambda while dark; exactly the 3
-    # Hub-facing functions once the runtime slice is live; and additionally the
+    # The Control/authority prefixes own no Lambda while dark; exactly the 11
+    # complete functions once the runtime slice is live; and additionally the
     # Hub keygen function once the Hub worker slice (5b) is live (the keygen only
     # appears alongside the runtime). Any other function set fails closed.
     # `control-lambdas.json` is the reviewed `aws lambda list-functions`
@@ -5982,7 +7809,7 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         if not isinstance(name, str):
             raise ContractError("Control Lambda inventory evidence is malformed")
         live_lambda_names.add(name)
-    authority_functions = set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+    authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS)
     if live_lambda_names not in (
         set(),
         authority_functions,
@@ -5990,7 +7817,7 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
     ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "3 Hub-facing Authority functions (plus the Hub keygen once the worker "
+            "11 complete Authority functions (plus the Hub keygen once the worker "
             "slice is live) are admitted"
         )
     # The Hub public UDP edge (slice 5a) is the authority's only load balancer,

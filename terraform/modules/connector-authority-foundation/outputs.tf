@@ -189,6 +189,11 @@ output "hub_image_digest_parameter_name" {
   value       = aws_ssm_parameter.hub_image_digest.name
 }
 
+output "hub_public_key_parameter_name" {
+  description = "Public-only SSM parameter for the Hub X25519 identity (null while the worker is dark)."
+  value       = one(aws_ssm_parameter.hub_public_key[*].name)
+}
+
 output "hub_publisher_role_arn" {
   description = "Dedicated NHP GitHub Environment OIDC role for publishing the Hub image and digest pin."
   value       = aws_iam_role.hub_publisher.arn

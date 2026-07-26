@@ -63,6 +63,16 @@ EXPECTED_CELL_OPERATIONS = {
     "complete_registration",
     "complete_credential_recovery",
 }
+EXPECTED_CELLS = {
+    "cell0": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server",
+    "cell1": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server",
+}
+EXPECTED_CELL_OPERATION_SUFFIXES = {
+    "issue_registration_otp": "iro",
+    "activate_registration": "ar",
+    "complete_registration": "cr",
+    "complete_credential_recovery": "ccr",
+}
 TOP_KEYS = {"schema_version", "contract"}
 CONTRACT_KEYS = {
     "schema_version",
@@ -295,18 +305,15 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         fail("qat1_kid is malformed")
 
     cells = contract["provisioned_cells"]
-    if not isinstance(cells, dict) or set(cells) != {"cell0"}:
-        fail("initial sandbox basis must contain exactly canonical cell0")
+    if not isinstance(cells, dict) or set(cells) != set(EXPECTED_CELLS):
+        fail("sandbox basis must contain exactly canonical cell0 and cell1")
     for cell_id, cell in cells.items():
         if CELL_ID.fullmatch(cell_id) is None or len(cell_id) > 32:
             fail(f"invalid provisioned cell ID {cell_id!r}")
         cell = exact_keys(cell, {"caller_role_arn"}, f"provisioned_cells.{cell_id}")
-        expected_role = (
-            "arn:aws:iam::767397897469:"
-            "role/layerv-nhp-sandbox-server"
-        )
+        expected_role = EXPECTED_CELLS[cell_id]
         if cell["caller_role_arn"] != expected_role:
-            fail("cell0 caller role is not the canonical legacy role ARN")
+            fail(f"{cell_id} caller role is not the canonical role ARN")
 
     global_value = exact_keys(contract["global"], GLOBAL_KEYS, "global")
     expected_identity = {
@@ -381,9 +388,14 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         f"layerv-nhp-sandbox-ca-{suffix}": operation
         for operation, suffix in EXPECTED_HUB_OPERATIONS.items()
     }
+    expected_functions.update({
+        f"layerv-nhp-sandbox-ca-{suffix}-{cell_id}": operation
+        for cell_id in EXPECTED_CELLS
+        for operation, suffix in EXPECTED_CELL_OPERATION_SUFFIXES.items()
+    })
     functions = contract["functions"]
     if not isinstance(functions, dict) or set(functions) != set(expected_functions):
-        fail("measurement basis must contain the exact complete three-function Hub graph")
+        fail("measurement basis must contain the exact complete 3 + 4N Authority graph")
     for function_name, operation in expected_functions.items():
         function = exact_keys(
             functions[function_name], FUNCTION_KEYS, f"functions.{function_name}"
@@ -397,9 +409,18 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             )
             for key in FUNCTION_KEYS
         }
-        expected_in_flight = hub["max_replicas"] * hub["preinvoke_limits"][operation]
-        rate = hub["preinvoke_rate_limits"][operation]
-        expected_rps = hub["max_replicas"] * (
+        cell_id = next(
+            (
+                candidate
+                for candidate in EXPECTED_CELLS
+                if function_name.endswith(f"-{candidate}")
+            ),
+            None,
+        )
+        caller = hub if cell_id is None else cell_workers[cell_id]
+        expected_in_flight = caller["max_replicas"] * caller["preinvoke_limits"][operation]
+        rate = caller["preinvoke_rate_limits"][operation]
+        expected_rps = caller["max_replicas"] * (
             rate["burst"] + rate["refill_per_second"]
         )
         if values["steady_reserved_concurrency"] != values["steady_provisioned_concurrency"]:

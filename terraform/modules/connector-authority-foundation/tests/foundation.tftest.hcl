@@ -87,9 +87,7 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
     # delete the endpoint-policy and security-group contract wholesale.
     condition = (
       length(aws_security_group.interface_endpoints.ingress) == 0 &&
-      length(aws_security_group.interface_endpoints.egress) == 0 &&
-      length(aws_security_group.otp_redis.ingress) == 0 &&
-      length(aws_security_group.otp_redis.egress) == 0
+      length(aws_security_group.interface_endpoints.egress) == 0
     )
     error_message = "The foundation endpoint and Redis security groups must remain deny-all."
   }

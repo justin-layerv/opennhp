@@ -281,14 +281,15 @@ module "compute" {
   # namespace while placing this server in the same logical Authority
   # environment as cell0. Tickets bind {environment=sandbox, cell_id=cell1};
   # using sandbox-cell1 on the wire makes every strict Authority call fail.
-  environment          = var.environment
-  protocol_environment = var.protocol_environment
-  cell_id              = var.cell_id
-  server_ami_id        = var.server_ami_id # null -> reads /sandbox-cell1/nhp/server/ami-id
-  domain_name          = var.domain_name
-  multi_tenant         = true
-  min_capacity         = var.min_capacity
-  max_capacity         = var.max_capacity
+  environment                     = var.environment
+  protocol_environment            = var.protocol_environment
+  cell_id                         = var.cell_id
+  connector_authority_cell_config = var.connector_authority_cell_config
+  server_ami_id                   = var.server_ami_id # null -> reads /sandbox-cell1/nhp/server/ami-id
+  domain_name                     = var.domain_name
+  multi_tenant                    = true
+  min_capacity                    = var.min_capacity
+  max_capacity                    = var.max_capacity
 
   vpc_id             = module.networking.vpc_id
   vpc_cidr           = var.vpc_cidr

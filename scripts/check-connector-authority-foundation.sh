@@ -111,22 +111,69 @@ if [[ -n "$plan_json" ]]; then
     exit 1
   fi
 
-  # A tainted Connector Authority hub FUNCTION replan (delete+create) recreates
-  # the resource in place -- it is the authority-runtime-slice-retry recovery for
-  # a function left in a Failed state by an earlier partial apply, not a net
-  # teardown -- so it is not destructive. Everything else carrying a delete
-  # (a pure delete, or a replace of any other resource type) stays flagged.
+  # Two exact replacements are intentional:
+  #
+  # * a tainted Connector Authority FUNCTION replan recreates a function left
+  #   Failed by an earlier partial apply;
+  # * the one-time Authority function-SG generation change removes the live
+  #   predecessor's inline VPC-CIDR rule. Omitting that rule from configuration
+  #   would leave it unmanaged, so the clean SG must replace it.
+  #
+  # Keep the SG admission self-contained and exact here as well as in the
+  # first-apply checker. Any retained/substituted CIDR or any other delete stays
+  # destructive.
   destructive_resources="$(jq -r '
     (.resource_changes[]?, .resource_drift[]?)
     | select(.change.actions | index("delete"))
     | select(
-        (
+        ((
           (.address | startswith("module.control.aws_lambda_function.authority["))
           and (
             (.change.actions == ["delete", "create"])
             or (.change.actions == ["create", "delete"])
           )
-        ) | not
+        ) or (
+          .address == "module.control.aws_security_group.authority_lambda[0]"
+          and .type == "aws_security_group"
+          and .change.actions == ["create", "delete"]
+          and .change.replace_paths == [["name_prefix"]]
+          and .change.before.name_prefix == "layerv-nhp-sandbox-control-ca-fn-"
+          and .change.after.name_prefix == "layerv-nhp-sandbox-control-ca-fn-v2-"
+          and .change.before.vpc_id == .change.after.vpc_id
+          and ((.change.before.ingress // []) == [])
+          and ((.change.after.ingress // []) == [])
+          and ((.change.after.egress // []) == [])
+          and .change.after_unknown.ingress == true
+          and .change.after_unknown.egress == true
+          and (
+            [.change.before.egress[]? | select(
+              .description == "HTTPS to Control interface endpoints (KMS) in-VPC"
+              and .cidr_blocks == ["10.102.0.0/16"]
+              and .ipv6_cidr_blocks == []
+              and .prefix_list_ids == []
+              and .security_groups == []
+              and .self == false
+              and .protocol == "tcp"
+              and .from_port == 443
+              and .to_port == 443
+            )] | length
+          ) == 1
+          and (
+            [.change.before.egress[]? | select(
+              .description == "HTTPS to the DynamoDB gateway endpoint prefix list"
+              and .cidr_blocks == []
+              and .ipv6_cidr_blocks == []
+              and (.prefix_list_ids | length) == 1
+              and (.prefix_list_ids[0] | test("^pl-[0-9a-f]+$"))
+              and .security_groups == []
+              and .self == false
+              and .protocol == "tcp"
+              and .from_port == 443
+              and .to_port == 443
+            )] | length
+          ) == 1
+          and (.change.before.egress | length) == 2
+        )) | not
       )
     | "\(.address) [\(.change.actions | join(","))]"
   ' "$plan_json")"

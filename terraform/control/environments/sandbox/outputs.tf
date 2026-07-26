@@ -99,6 +99,11 @@ output "hub_image_digest_parameter_name" {
   value = module.control.hub_image_digest_parameter_name
 }
 
+output "hub_public_key_parameter_name" {
+  description = "Public-only Hub X25519 identity parameter; null while the worker is dark."
+  value       = module.control.hub_public_key_parameter_name
+}
+
 output "hub_publisher_role_arn" {
   value = module.control.hub_publisher_role_arn
 }

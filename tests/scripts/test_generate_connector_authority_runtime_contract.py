@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
-import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -44,6 +44,52 @@ def canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, indent=2) + "\n"
 
 
+def terraform_variable_block(path: Path, variable_name: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    marker = f'variable "{variable_name}" {{'
+    start = text.find(marker)
+    if start < 0:
+        raise AssertionError(f"{path}: missing {marker}")
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise AssertionError(f"{path}: unterminated {marker}")
+
+
+class CellActivationDefaultTests(unittest.TestCase):
+    def test_auto_deployed_sandbox_cell_roots_stay_dark_by_default(self) -> None:
+        for relative_path in (
+            "terraform/environments/sandbox/variables.tf",
+            "terraform/environments/sandbox-cell1/variables.tf",
+        ):
+            with self.subTest(root=relative_path):
+                block = terraform_variable_block(
+                    ROOT / relative_path, "connector_authority_cell_config"
+                )
+                self.assertEqual(
+                    re.findall(r"(?m)^\s*default\s*=\s*(.+?)\s*$", block),
+                    ["null"],
+                )
+
+    def test_sandbox_cell_roots_retain_explicit_activation_seam(self) -> None:
+        for relative_path in (
+            "terraform/environments/sandbox/main.tf",
+            "terraform/environments/sandbox-cell1/main.tf",
+        ):
+            with self.subTest(root=relative_path):
+                text = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn(
+                    "connector_authority_cell_config = "
+                    "var.connector_authority_cell_config",
+                    text,
+                )
+
+
 class ManifestValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -52,11 +98,16 @@ class ManifestValidationTests(unittest.TestCase):
         self.assertEqual(MANIFEST.read_text(encoding="utf-8"), canonical(self.manifest))
         contract = CHECKER.validate_manifest(self.manifest)
         self.assertEqual(contract["phase"], "measurement")
-        self.assertEqual(set(contract["functions"]), {
+        expected_functions = {
             "layerv-nhp-sandbox-ca-ia",
             "layerv-nhp-sandbox-ca-ra",
             "layerv-nhp-sandbox-ca-icr",
-        })
+        } | {
+            f"layerv-nhp-sandbox-ca-{suffix}-{cell_id}"
+            for cell_id in ("cell0", "cell1")
+            for suffix in ("iro", "ar", "cr", "ccr")
+        }
+        self.assertEqual(set(contract["functions"]), expected_functions)
 
     def assert_rejected(self, mutate) -> None:
         value = copy.deepcopy(self.manifest)
@@ -161,7 +212,7 @@ class ManifestValidationTests(unittest.TestCase):
             "cell mismatch": lambda value: value["contract"]["global"][
                 "caller_capacity"
             ]["cell_workers"].__setitem__(
-                "cell1",
+                "cell2",
                 copy.deepcopy(
                     value["contract"]["global"]["caller_capacity"]["cell_workers"][
                         "cell0"

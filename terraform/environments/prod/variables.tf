@@ -25,6 +25,30 @@ variable "cell_id" {
   # duplicate regex blocks.
 }
 
+variable "connector_authority_cell_config" {
+  description = "Prod Connector Authority cell caller graph. Must remain null until the prod runtime/cell catalog is provisioned and proven."
+  type = object({
+    environment                            = string
+    aws_account_id                         = string
+    aws_region                             = string
+    issue_registration_otp_alias_arn       = string
+    activate_registration_alias_arn        = string
+    complete_registration_alias_arn        = string
+    complete_credential_recovery_alias_arn = string
+    authority_lambda_timeout               = string
+    handler_budget                         = string
+    packet_budget                          = string
+    response_reserve                       = string
+    write_budget                           = string
+  })
+  default = null
+
+  validation {
+    condition     = var.connector_authority_cell_config == null
+    error_message = "Prod Connector Authority cell calls remain dark until the governed prod activation."
+  }
+}
+
 variable "aws_region" {
   type = string
 }

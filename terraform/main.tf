@@ -759,17 +759,18 @@ check "nhp_internal_auth_secret_populated" {
 module "compute" {
   source = "./modules/compute"
 
-  environment        = var.environment
-  cell_id            = var.cell_id
-  server_ami_id      = var.server_ami_id
-  domain_name        = var.domain_name
-  multi_tenant       = var.multi_tenant
-  min_capacity       = var.min_capacity
-  max_capacity       = var.max_capacity
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
+  environment                     = var.environment
+  cell_id                         = var.cell_id
+  connector_authority_cell_config = var.connector_authority_cell_config
+  server_ami_id                   = var.server_ami_id
+  domain_name                     = var.domain_name
+  multi_tenant                    = var.multi_tenant
+  min_capacity                    = var.min_capacity
+  max_capacity                    = var.max_capacity
+  vpc_id                          = module.networking.vpc_id
+  vpc_cidr                        = var.vpc_cidr
+  public_subnet_ids               = module.networking.public_subnet_ids
+  private_subnet_ids              = module.networking.private_subnet_ids
   additional_nhp_udp_ingress_cidrs = (
     var.deploy_relay ? module.relay_network[0].relay_subnet_cidr_blocks : []
   )

@@ -71,6 +71,26 @@ variable "cell_id" {
   default     = "cell0"
 }
 
+variable "connector_authority_cell_config" {
+  description = "Nullable assigned-cell Connector Authority target/config bundle. Null keeps all four cell operations, the Lambda VPC endpoint, and its IAM grant dark."
+  type = object({
+    environment                            = string
+    aws_account_id                         = string
+    aws_region                             = string
+    issue_registration_otp_alias_arn       = string
+    activate_registration_alias_arn        = string
+    complete_registration_alias_arn        = string
+    complete_credential_recovery_alias_arn = string
+    authority_lambda_timeout               = string
+    handler_budget                         = string
+    packet_budget                          = string
+    response_reserve                       = string
+    write_budget                           = string
+  })
+  default  = null
+  nullable = true
+}
+
 variable "domain_name" {
   description = "Domain name for NHP server"
   type        = string

@@ -10,10 +10,9 @@ locals {
 
   # Fail-closed baseline. Every endpoint starts here and stays here until an
   # exact caller/execution principal and its exact resources exist. The runtime
-  # slice below replaces this policy ONLY for the dependency endpoints the 3 hub
-  # functions provably reach (DynamoDB gateway + KMS interface) and ONLY for the
-  # constructed execution-role principals. Merely deploying an endpoint never
-  # creates a usable RPC surface.
+  # slice below replaces this policy ONLY for dependencies the complete
+  # Authority graph provably reaches and ONLY for the constructed execution-role
+  # principals. Merely deploying an endpoint never creates a usable RPC surface.
   deny_all_endpoint_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -25,16 +24,17 @@ locals {
     }]
   })
 
-  # DynamoDB gateway endpoint: allow exactly the 3 hub execution roles the union
-  # of the exact per-op actions (reads incl. DescribeTable; the replay Put and the
-  # recovery Update) on the three canonical BASE tables. Gateway VPC-endpoint
+  # DynamoDB gateway endpoint: allow exactly the complete runtime execution-role
+  # set the union of the exact per-op actions (reads incl. DescribeTable; replay
+  # and registration/recovery writes) on the four canonical BASE tables.
+  # Gateway VPC-endpoint
   # policies are TABLE-GRANULAR: DynamoDB rejects a /index/* sub-resource here
   # with InvalidPolicyDocument, and a Query against agent_keys' pubkey GSI is
   # authorized at this coarse network gate by the base-table ARN. So this lists
   # only the base-table ARNs (authority_runtime_table_arns), NOT the identity
   # resource sets. The per-operation identity policies in authority_runtime.tf
   # are the finer intersecting gate: they carry the /index/* grant IAM does
-  # accept, and e.g. UpdateItem is reachable only by IssueCredentialRecovery.
+  # accept, and each write is reachable only by the operations that compose it.
   authority_dynamodb_endpoint_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -54,7 +54,7 @@ locals {
         local.authority_runtime_ddb_recovery_write_actions,
       )
       Resource = [
-        for name in ["api_keys", "agent_keys", "connector_authority"] :
+        for name in ["api_keys", "agent_keys", "customers", "connector_authority"] :
         local.authority_runtime_table_arns[name]
       ]
       Condition = {
@@ -65,24 +65,62 @@ locals {
     }]
   })
 
-  # KMS interface endpoint: allow ONLY the IssueAssignment execution role the qat1
-  # assignment-ticket key, actions GetPublicKey + Sign. RefreshAssignment and
-  # IssueCredentialRecovery build no KMS client, and no op uses kms:Verify
-  # (verification is local p256), so both are excluded from principal and action.
+  # KMS interface endpoint: all three public-key consumers may GetPublicKey;
+  # IssueAssignment alone may Sign. No operation uses kms:Verify.
   authority_kms_endpoint_policy = jsonencode({
     Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AuthorityFunctionsQat1PublicKey"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = ["kms:GetPublicKey"]
+        Resource  = [aws_kms_key.qat1_signing.arn]
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalArn" = local.authority_runtime_public_key_role_arns
+          }
+        }
+      },
+      {
+        Sid       = "IssueAssignmentQat1Sign"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = ["kms:Sign"]
+        Resource  = [aws_kms_key.qat1_signing.arn]
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalArn" = local.authority_runtime_sign_role_arns
+          }
+        }
+      },
+    ]
+  })
+
+  authority_secretsmanager_statements = [{
+    Sid       = "AuthorityOTPSecret"
+    Effect    = "Allow"
+    Principal = "*"
+    Action    = "secretsmanager:GetSecretValue"
+    Resource  = [aws_secretsmanager_secret.otp_pepper.arn]
+    Condition = {
+      StringEquals = {
+        "aws:PrincipalArn" = local.authority_runtime_otp_role_arns
+      }
+    }
+  }]
+
+  authority_email_endpoint_policy = jsonencode({
+    Version = "2012-10-17"
     Statement = [{
-      Sid    = "AuthorityFunctionsQat1"
-      Effect = "Allow"
-      # Same VPC-endpoint principal-matching constraint as the DynamoDB gateway
-      # above: scope with Principal "*" + aws:PrincipalArn, not a role-ARN
-      # Principal, or IssueAssignment's cold-start kms:Sign is denied here.
+      Sid       = "AuthorityOTPSendEmail"
+      Effect    = "Allow"
       Principal = "*"
-      Action    = ["kms:GetPublicKey", "kms:Sign"]
-      Resource  = [aws_kms_key.qat1_signing.arn]
+      Action    = "ses:SendEmail"
+      Resource  = [local.authority_runtime_ses_identity_arn, local.authority_runtime_ses_config_set_arn]
       Condition = {
         StringEquals = {
-          "aws:PrincipalArn" = local.authority_runtime_sign_role_arns
+          "aws:PrincipalArn" = local.authority_runtime_ses_role_arns
         }
       }
     }]
@@ -179,20 +217,24 @@ locals {
   # decrypt of the CMK-encrypted secret happens server-side inside Secrets Manager
   # (checked against the exec role's IAM kms:Decrypt), NOT via the caller's KMS
   # endpoint, so the KMS interface endpoint needs no Hub opening.
-  hub_secretsmanager_endpoint_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "HubWorkerReadKeyMaterial"
-      Effect    = "Allow"
-      Principal = "*"
-      Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.hub_key_material[*].arn
-      Condition = {
-        StringEquals = {
-          "aws:PrincipalArn" = [local.hub_execution_role_arn]
-        }
+  hub_secretsmanager_statements = [{
+    Sid       = "HubWorkerReadKeyMaterial"
+    Effect    = "Allow"
+    Principal = "*"
+    Action    = "secretsmanager:GetSecretValue"
+    Resource  = aws_secretsmanager_secret.hub_key_material[*].arn
+    Condition = {
+      StringEquals = {
+        "aws:PrincipalArn" = [local.hub_execution_role_arn]
       }
-    }]
+    }
+  }]
+  authority_and_hub_secretsmanager_endpoint_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      local.authority_runtime_functions_deploy ? local.authority_secretsmanager_statements : [],
+      local.hub_worker_deploy ? local.hub_secretsmanager_statements : [],
+    )
   })
 
   # CloudWatch Logs interface endpoint: the Fargate EXECUTION role's awslogs
@@ -241,17 +283,18 @@ locals {
     }]
   })
 
-  # Per-service interface-endpoint policy. KMS opens with the authority runtime;
-  # the caller (lambda), secretsmanager, logs, and monitoring endpoints open with
-  # the Hub worker (slice 5b). Every other interface endpoint (email) stays
-  # deny-all. The ecr.api/ecr.dkr interface endpoints are separate resources
-  # (hub_worker.tf) and carry hub_ecr_endpoint_policy directly.
+  # Per-service interface-endpoint policy. KMS, Secrets Manager, and SES open
+  # with the Authority runtime; Lambda, Logs, and Monitoring open with the Hub
+  # worker (slice 5b). Secrets Manager composes both exact statements if both
+  # slices are live. The ecr.api/ecr.dkr interface endpoints are separate
+  # resources (hub_worker.tf) and carry hub_ecr_endpoint_policy directly.
   interface_endpoint_policies = {
     for service in keys(local.interface_endpoint_services) :
     service => (
       local.authority_runtime_functions_deploy && service == "kms" ? local.authority_kms_endpoint_policy
+      : (local.authority_runtime_functions_deploy || local.hub_worker_deploy) && service == "secretsmanager" ? local.authority_and_hub_secretsmanager_endpoint_policy
+      : local.authority_runtime_functions_deploy && service == "email" ? local.authority_email_endpoint_policy
       : local.hub_worker_deploy && service == "lambda" ? local.hub_lambda_endpoint_policy
-      : local.hub_worker_deploy && service == "secretsmanager" ? local.hub_secretsmanager_endpoint_policy
       : local.hub_worker_deploy && service == "logs" ? local.hub_logs_endpoint_policy
       : local.hub_worker_deploy && service == "monitoring" ? local.hub_monitoring_endpoint_policy
       : local.deny_all_endpoint_policy
@@ -269,8 +312,7 @@ locals {
   # Hub worker slice (5b) adds TLS/443 from the Hub worker SG (its egress reaches
   # the lambda/logs/secrets/kms/ecr interface endpoints on this SG). Each rule is
   # present only while its own gate is live, so the SG carries 0, 1, or 2 rules.
-  # The OTP Redis SG stays no-ingress in both slices: no Hub-facing operation
-  # touches Redis (that is the out-of-scope cell issuer/activator path).
+  # Redis uses a separate exact 6379 SG-to-SG path in authority_runtime.tf.
   interface_endpoint_ingress = concat(
     local.authority_runtime_functions_deploy ? [
       {

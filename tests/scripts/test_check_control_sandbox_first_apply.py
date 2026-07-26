@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import hashlib
 import importlib.util
 import json
@@ -402,11 +403,7 @@ def authority_runtime_input_fixture() -> dict:
             "basis_evidence": copy.deepcopy(evidence),
             "result_evidence": None,
         }
-        for name in (
-            "layerv-nhp-sandbox-ca-ia",
-            "layerv-nhp-sandbox-ca-ra",
-            "layerv-nhp-sandbox-ca-icr",
-        )
+        for name in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS
     }
     return {
         "account_id": CHECKER.ACCOUNT_ID,
@@ -417,13 +414,23 @@ def authority_runtime_input_fixture() -> dict:
             "schema_version": 1,
             "phase": "measurement",
             "selected_authority_color": "blue",
-            "provisioned_cells": {"cell0": {"caller_role_arn": "fixture"}},
+            "provisioned_cells": {
+                "cell0": {"caller_role_arn": "fixture-cell0"},
+                "cell1": {"caller_role_arn": "fixture-cell1"},
+            },
             "provisioned_cells_evidence": copy.deepcopy(evidence),
             "global": {
                 "authority_repository_url": repository,
                 "authority_image_digest": digest,
                 "basis_evidence": copy.deepcopy(evidence),
                 "result_evidence": None,
+                "caller_capacity": {
+                    "cell_workers": {
+                        "cell0": {"max_replicas": 2},
+                        "cell1": {"max_replicas": 2},
+                    },
+                    "hub_workers": {"max_replicas": 2},
+                },
             },
             "functions": functions,
         },
@@ -512,6 +519,11 @@ def configuration_fixture() -> dict:
             )
     for address, paths in CHECKER.CONFIG_CONSTANT_CONTRACT.items():
         for path, constant in paths.items():
+            if (
+                address in CHECKER.STANDALONE_RULE_SECURITY_GROUPS
+                and path in CHECKER.STANDALONE_RULE_EMPTY_PATHS
+            ):
+                continue
             set_expression_path(
                 by_address[address]["expressions"],
                 path,
@@ -678,6 +690,26 @@ def provisioned_cell_catalog_transition_fixture() -> dict:
             "after_sensitive": False,
         }
     }
+    return result
+
+
+def with_provisioned_cell_catalog_transition(candidate: dict) -> dict:
+    """Overlay the exact two-row catalog create onto another reviewed plan."""
+    result = copy.deepcopy(candidate)
+    catalog = provisioned_cell_catalog_transition_fixture()
+    by_address = {
+        item["address"]: item for item in result["resource_changes"]
+    }
+    catalog_by_address = {
+        item["address"]: item for item in catalog["resource_changes"]
+    }
+    for address in CHECKER.PROVISIONED_CELL_RESOURCES:
+        by_address[address]["change"] = copy.deepcopy(
+            catalog_by_address[address]["change"]
+        )
+    result["planned_values"] = copy.deepcopy(catalog["planned_values"])
+    result["output_changes"] = copy.deepcopy(catalog["output_changes"])
+    result["applyable"] = True
     return result
 
 
@@ -909,7 +941,18 @@ RUNTIME_QAT1_KEY_ARN = (
     f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
     "key/00000000-0000-0000-0000-000000000001"
 )
-RUNTIME_LAMBDA_SG_ID = "sg-runtimefn0000000"
+RUNTIME_AUTHORITY_DATA_KEY_ARN = (
+    f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+    "key/00000000-0000-0000-0000-000000000002"
+)
+RUNTIME_OTP_SECRET_ARN = (
+    f"arn:aws:secretsmanager:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+    f"secret:{CHECKER.CONTROL_PREFIX}-otp-pepper-ABCDEF"
+)
+RUNTIME_LAMBDA_SG_ID = "sg-0a110000000000000"
+RUNTIME_INTERFACE_SG_ID = "sg-1face00000000000"
+RUNTIME_OTP_REDIS_SG_ID = "sg-0a7ed150000000000"
+RUNTIME_DYNAMODB_PREFIX_LIST_ID = "pl-0123456789abcdef0"
 
 
 def authority_runtime_input_with_concurrency() -> dict:
@@ -930,7 +973,7 @@ def authority_runtime_input_with_concurrency() -> dict:
     return payload
 
 
-def runtime_scoped_endpoint_policies() -> tuple[str, str]:
+def runtime_scoped_endpoint_policies() -> tuple[str, str, str, str]:
     # VPC endpoint policies do not match an assumed-role session against a
     # role-ARN Principal, so the runtime grants use Principal "*" scoped by an
     # exact aws:PrincipalArn condition. Keep this fixture in that shape.
@@ -955,10 +998,24 @@ def runtime_scoped_endpoint_policies() -> tuple[str, str]:
             "Version": "2012-10-17",
             "Statement": [
                 {
-                    "Sid": "AuthorityFunctionsQat1",
+                    "Sid": "AuthorityFunctionsQat1PublicKey",
                     "Effect": "Allow",
                     "Principal": "*",
-                    "Action": ["kms:GetPublicKey", "kms:Sign"],
+                    "Action": ["kms:GetPublicKey"],
+                    "Resource": [RUNTIME_QAT1_KEY_ARN],
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_RUNTIME_PUBLIC_KEY_ROLE_ARNS
+                            )
+                        }
+                    },
+                },
+                {
+                    "Sid": "IssueAssignmentQat1Sign",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["kms:Sign"],
                     "Resource": [RUNTIME_QAT1_KEY_ARN],
                     "Condition": {
                         "StringEquals": {
@@ -967,11 +1024,53 @@ def runtime_scoped_endpoint_policies() -> tuple[str, str]:
                             )
                         }
                     },
+                },
+            ],
+        }
+    )
+    secrets = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AuthorityOTPSecret",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": [RUNTIME_OTP_SECRET_ARN],
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_RUNTIME_OTP_ROLE_ARNS
+                            )
+                        }
+                    },
                 }
             ],
         }
     )
-    return dynamodb, kms
+    email = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AuthorityOTPSendEmail",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "ses:SendEmail",
+                    "Resource": sorted(CHECKER.AUTHORITY_RUNTIME_SES_RESOURCES),
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_RUNTIME_SES_ROLE_ARNS
+                            )
+                        }
+                    },
+                }
+            ],
+        }
+    )
+    return dynamodb, kms, secrets, email
 
 
 def runtime_exec_policy(fn: str, operation: str) -> str:
@@ -980,7 +1079,10 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
     Derived from the checker constants so the fixture stays in lockstep with the
     reviewed IAM; every referenced ARN is a known literal.
     """
-    spec = CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM[operation]
+    spec = (
+        CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM.get(operation)
+        or CHECKER.AUTHORITY_RUNTIME_CELL_OPERATION_IAM[operation]
+    )
     read_resources = sorted(
         set().union(
             *(
@@ -1011,22 +1113,90 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
             "Action": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS),
             "Resource": read_resources,
         },
-        {
-            "Sid": spec["write_sid"],
-            "Effect": "Allow",
-            "Action": sorted(spec["write_actions"]),
-            "Resource": sorted(
-                CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
-            ),
-        },
     ]
-    if spec["signs"]:
+    if operation in CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM:
+        statements.append(
+            {
+                "Sid": spec["write_sid"],
+                "Effect": "Allow",
+                "Action": sorted(spec["write_actions"]),
+                "Resource": sorted(
+                    CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES[
+                        "connector_authority"
+                    ]
+                ),
+            }
+        )
+    else:
+        for sid, (actions, resources) in spec["writes"].items():
+            statements.append(
+                {
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": sorted(actions),
+                    "Resource": sorted(resources),
+                }
+            )
+    if spec.get("signs"):
         statements.append(
             {
                 "Sid": "Qat1Sign",
                 "Effect": "Allow",
                 "Action": ["kms:GetPublicKey", "kms:Sign"],
                 "Resource": [RUNTIME_QAT1_KEY_ARN],
+            }
+        )
+    if spec.get("public_key"):
+        statements.append(
+            {
+                "Sid": "Qat1PublicKey",
+                "Effect": "Allow",
+                "Action": ["kms:GetPublicKey"],
+                "Resource": [RUNTIME_QAT1_KEY_ARN],
+            }
+        )
+    otp_user = spec.get("otp_user")
+    if otp_user is not None:
+        statements.extend(
+            [
+                {
+                    "Sid": "OTPSecretRead",
+                    "Effect": "Allow",
+                    "Action": ["secretsmanager:GetSecretValue"],
+                    "Resource": [RUNTIME_OTP_SECRET_ARN],
+                },
+                {
+                    "Sid": "OTPSecretDecrypt",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": [RUNTIME_AUTHORITY_DATA_KEY_ARN],
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": (
+                                f"secretsmanager.{CHECKER.AWS_REGION}.amazonaws.com"
+                            ),
+                            "kms:EncryptionContext:SecretARN": RUNTIME_OTP_SECRET_ARN,
+                        }
+                    },
+                },
+                {
+                    "Sid": "OTPRedisConnect",
+                    "Effect": "Allow",
+                    "Action": ["elasticache:Connect"],
+                    "Resource": [
+                        CHECKER.AUTHORITY_RUNTIME_REDIS_CACHE_ARN,
+                        CHECKER.AUTHORITY_RUNTIME_REDIS_USER_ARNS[otp_user],
+                    ],
+                },
+            ]
+        )
+    if spec.get("sends_email"):
+        statements.append(
+            {
+                "Sid": "OTPSendEmail",
+                "Effect": "Allow",
+                "Action": ["ses:SendEmail"],
+                "Resource": sorted(CHECKER.AUTHORITY_RUNTIME_SES_RESOURCES),
             }
         )
     return json.dumps({"Version": "2012-10-17", "Statement": statements})
@@ -1141,7 +1311,7 @@ def _runtime_resource_changes() -> list[dict]:
                 ),
             }
         )
-        operation = CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS[fn]
+        operation = CHECKER.AUTHORITY_RUNTIME_FUNCTIONS[fn]
         changes.append(
             {
                 "address": (
@@ -1186,15 +1356,94 @@ def _runtime_resource_changes() -> list[dict]:
             "mode": "managed",
             "type": "aws_security_group",
             "change": _runtime_create(
-                {"ingress": [], "egress": [{"from_port": 443, "to_port": 443}]}
+                {
+                    "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-",
+                    "description": (
+                        "Connector Authority function ENIs; egress to Control "
+                        "dependency endpoints only"
+                    ),
+                    "vpc_id": "vpc-abc123",
+                    "id": RUNTIME_LAMBDA_SG_ID,
+                    "ingress": [],
+                    "egress": [],
+                }
             ),
         }
     )
+    for address, destination in (
+        (
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]",
+            {
+                "description": "HTTPS to Control interface endpoints",
+                "referenced_security_group_id": RUNTIME_INTERFACE_SG_ID,
+            },
+        ),
+        (
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_dynamodb[0]",
+            {
+                "description": "HTTPS to the DynamoDB gateway endpoint",
+                "prefix_list_id": RUNTIME_DYNAMODB_PREFIX_LIST_ID,
+            },
+        ),
+    ):
+        changes.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": "aws_vpc_security_group_egress_rule",
+                "change": _runtime_create(
+                    {
+                        "from_port": 443,
+                        "to_port": 443,
+                        "ip_protocol": "tcp",
+                        "security_group_id": RUNTIME_LAMBDA_SG_ID,
+                        **destination,
+                    }
+                ),
+            }
+        )
+    for address, resource_type, security_group_id, referenced_security_group_id in (
+        (
+            "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]",
+            "aws_vpc_security_group_egress_rule",
+            RUNTIME_LAMBDA_SG_ID,
+            RUNTIME_OTP_REDIS_SG_ID,
+        ),
+        (
+            "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]",
+            "aws_vpc_security_group_ingress_rule",
+            RUNTIME_OTP_REDIS_SG_ID,
+            RUNTIME_LAMBDA_SG_ID,
+        ),
+    ):
+        changes.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": resource_type,
+                "change": _runtime_create(
+                    {
+                        "description": (
+                            "TLS to Connector OTP Redis"
+                            if resource_type == "aws_vpc_security_group_egress_rule"
+                            else "TLS from Connector Authority OTP functions"
+                        ),
+                        "from_port": 6379,
+                        "to_port": 6379,
+                        "ip_protocol": "tcp",
+                        "security_group_id": security_group_id,
+                        "referenced_security_group_id": referenced_security_group_id,
+                    }
+                ),
+            }
+        )
     return changes
 
 
 def authority_runtime_transition_fixture() -> dict:
-    """The runtime slice: 25 pure creates plus the exact three endpoint/SG opens."""
+    """The full runtime graph plus its exact dependency endpoint/SG opens."""
     result = plan_fixture()
     result["applyable"] = True
     changes = {item["address"]: item for item in result["resource_changes"]}
@@ -1206,22 +1455,234 @@ def authority_runtime_transition_fixture() -> dict:
     foundation["after"] = {"input": payload, "output": payload}
     foundation["after_unknown"] = {}
 
-    dynamodb_policy, kms_policy = runtime_scoped_endpoint_policies()
+    dynamodb_policy, kms_policy, secrets_policy, email_policy = (
+        runtime_scoped_endpoint_policies()
+    )
     ddb = changes[CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS]["change"]
     ddb["actions"] = ["update"]
     ddb["after"] = {**ddb["after"], "policy": dynamodb_policy}
     kms = changes[CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS]["change"]
     kms["actions"] = ["update"]
     kms["after"] = {**kms["after"], "policy": kms_policy}
+    secrets = changes[CHECKER.AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS]["change"]
+    secrets["actions"] = ["update"]
+    secrets["after"] = {**secrets["after"], "policy": secrets_policy}
+    email = changes[CHECKER.AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS]["change"]
+    email["actions"] = ["update"]
+    email["after"] = {**email["after"], "policy": email_policy}
     sg = changes[CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS]["change"]
     sg["actions"] = ["update"]
     sg["after"] = {
         **sg["after"],
+        "id": RUNTIME_INTERFACE_SG_ID,
         "ingress": [runtime_interface_ingress_rule()],
         "egress": [],
     }
+    otp_sg = changes["module.control.aws_security_group.otp_redis"]["change"]
+    otp_sg["after"] = {
+        **otp_sg["after"],
+        "id": RUNTIME_OTP_REDIS_SG_ID,
+    }
+    otp_sg["before"] = copy.deepcopy(otp_sg["after"])
 
     result["resource_changes"].extend(_runtime_resource_changes())
+    return result
+
+
+def legacy_authority_runtime_payload() -> dict:
+    payload = copy.deepcopy(authority_runtime_input_with_concurrency())
+    contract = payload["authority_runtime_contract"]
+    evidence = copy.deepcopy(CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE)
+    contract["global"]["basis_evidence"] = evidence
+    contract["global"]["caller_capacity"]["cell_workers"].pop("cell1")
+    contract["functions"] = {
+        function_name: {
+            **contract["functions"][function_name],
+            "basis_evidence": copy.deepcopy(evidence),
+        }
+        for function_name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS
+    }
+    contract["provisioned_cells"].pop("cell1")
+    contract["provisioned_cells_evidence"] = copy.deepcopy(evidence)
+    return payload
+
+
+def legacy_authority_lambda_sg_before() -> dict:
+    return {
+        "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-",
+        "description": (
+            "Connector Authority function ENIs; egress to Control dependency "
+            "endpoints only"
+        ),
+        "vpc_id": "vpc-abc123",
+        "ingress": [],
+        "egress": [
+            {
+                "cidr_blocks": [CHECKER.CONTROL_VPC_CIDR],
+                "description": ("HTTPS to Control interface endpoints (KMS) in-VPC"),
+                "from_port": 443,
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [],
+                "protocol": "tcp",
+                "security_groups": [],
+                "self": False,
+                "to_port": 443,
+            },
+            {
+                "cidr_blocks": [],
+                "description": ("HTTPS to the DynamoDB gateway endpoint prefix list"),
+                "from_port": 443,
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [RUNTIME_DYNAMODB_PREFIX_LIST_ID],
+                "protocol": "tcp",
+                "security_groups": [],
+                "self": False,
+                "to_port": 443,
+            },
+        ],
+    }
+
+
+def authority_runtime_legacy_expansion_fixture(
+    applied_addresses: set[str] | None = None,
+) -> dict:
+    """Observed live three-Hub-function -> complete two-cell transition."""
+    applied = applied_addresses or set()
+    result = authority_runtime_transition_fixture()
+    changes = {item["address"]: item for item in result["resource_changes"]}
+    full_payload = authority_runtime_input_with_concurrency()
+    foundation_address = "module.control.terraform_data.foundation_contract"
+
+    for address in CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES:
+        change = changes[address]["change"]
+        change["actions"] = ["no-op"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+
+    for address in CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES:
+        change = changes[address]["change"]
+        change["actions"] = ["update"]
+        change["before"] = copy.deepcopy(change["after"])
+
+    foundation = changes[foundation_address]["change"]
+    legacy_payload = legacy_authority_runtime_payload()
+    foundation["before"] = {"input": legacy_payload, "output": legacy_payload}
+    foundation["after"] = {"input": full_payload, "output": full_payload}
+    foundation["after_unknown"] = {}
+
+    lambda_sg = changes[CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS]["change"]
+    lambda_sg["actions"] = ["create", "delete"]
+    lambda_sg["before"] = legacy_authority_lambda_sg_before()
+    lambda_sg["after"] = {
+        "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-",
+        "description": lambda_sg["before"]["description"],
+        "vpc_id": lambda_sg["before"]["vpc_id"],
+    }
+    lambda_sg["after_unknown"] = {
+        "arn": True,
+        "egress": True,
+        "id": True,
+        "ingress": True,
+        "name": True,
+        "owner_id": True,
+    }
+    lambda_sg["replace_paths"] = [["name_prefix"]]
+
+    # The replacement SG id is create-time unknown. Every dependent standalone
+    # rule and the interface-endpoint SG ingress must carry the same unknown
+    # projection; configuration-reference checks bind each field to the exact
+    # SG resource expression.
+    for address in (
+        "module.control.aws_vpc_security_group_egress_rule."
+        "authority_interface_endpoints[0]",
+        "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb[0]",
+        "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]",
+    ):
+        change = changes[address]["change"]
+        change["after"].pop("security_group_id")
+        change["after_unknown"] = {"security_group_id": True}
+    redis_ingress = changes[
+        "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]"
+    ]["change"]
+    redis_ingress["after"].pop("referenced_security_group_id")
+    redis_ingress["after_unknown"] = {"referenced_security_group_id": True}
+    interface_sg = changes[CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS]["change"]
+    interface_sg["after"]["ingress"][0].pop("security_groups")
+    interface_sg["after_unknown"] = {
+        "ingress": [
+            {
+                "cidr_blocks": [],
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [],
+                "security_groups": True,
+            }
+        ]
+    }
+
+    for address in applied:
+        change = changes[address]["change"]
+        if address == CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS:
+            change["after"] = {
+                "id": RUNTIME_LAMBDA_SG_ID,
+                "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-",
+                "description": (
+                    "Connector Authority function ENIs; egress to Control "
+                    "dependency endpoints only"
+                ),
+                "vpc_id": "vpc-abc123",
+                "ingress": [],
+                "egress": [],
+            }
+        change["actions"] = ["no-op"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+
+    if CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS in applied:
+        for address in (
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]",
+            "module.control.aws_vpc_security_group_egress_rule.authority_dynamodb[0]",
+            "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]",
+        ):
+            change = changes[address]["change"]
+            change["after"]["security_group_id"] = RUNTIME_LAMBDA_SG_ID
+            change["after_unknown"].pop("security_group_id", None)
+        redis_ingress["after"]["referenced_security_group_id"] = RUNTIME_LAMBDA_SG_ID
+        redis_ingress["after_unknown"].pop("referenced_security_group_id", None)
+        interface_sg["after"]["ingress"][0]["security_groups"] = [RUNTIME_LAMBDA_SG_ID]
+        interface_sg["after_unknown"] = {}
+
+    # The known replacement id may have changed pending dependent values above;
+    # re-synchronize every already-applied address to its exact no-op state.
+    for address in applied:
+        change = changes[address]["change"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+
+    return result
+
+
+def with_legacy_authority_digest_roll(candidate: dict) -> dict:
+    """Model an exact-main Authority publish racing the one-time expansion."""
+    result = copy.deepcopy(candidate)
+    changes = {item["address"]: item for item in result["resource_changes"]}
+    foundation = changes[
+        "module.control.terraform_data.foundation_contract"
+    ]["change"]
+    previous_digest = "sha256:" + "2" * 64
+    repository = foundation["after"]["input"]["authority_runtime_contract"][
+        "global"
+    ]["authority_repository_url"]
+    previous_uri = f"{repository}@{previous_digest}"
+    for projection in ("input", "output"):
+        foundation["before"][projection]["authority_image_uri"] = previous_uri
+        foundation["before"][projection]["authority_runtime_contract"]["global"][
+            "authority_image_digest"
+        ] = previous_digest
+    for function_name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+        changes[
+            f'module.control.aws_lambda_function.authority["{function_name}"]'
+        ]["change"]["before"]["image_uri"] = previous_uri
     return result
 
 
@@ -1349,7 +1810,15 @@ def authority_image_update_fixture(
             }
         )
 
-    for fn in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+    # Every function the contract carries must sit at the contract-pinned image
+    # (_check_authority_runtime_resources enforces that across all of
+    # AUTHORITY_RUNTIME_FUNCTIONS), so normalize the whole graph to the target
+    # here. Only the Hub addresses can appear in ``pending_addresses`` -- they
+    # are the sole members of AUTHORITY_IMAGE_UPDATE_RESOURCES -- so the per-cell
+    # functions always land as exact no-ops already at the new image. That models
+    # the reachable recovery state where an expansion apply created the per-cell
+    # functions at the new digest but the Hub retag had not yet landed.
+    for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
         function_address = (
             f'module.control.aws_lambda_function.authority["{fn}"]'
         )
@@ -1537,6 +2006,245 @@ def _hub_edge_resource_changes() -> list[dict]:
         }
         for address, resource_type in CHECKER.HUB_EDGE_RESOURCES.items()
     ]
+
+
+def hub_identity_migration_fixture(*, converged: bool = False) -> dict[str, dict]:
+    secret_arn = (
+        f"arn:aws:secretsmanager:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+        f"secret:{CHECKER.CONTROL_PREFIX}-hub-key-material-Ab3xYz"
+    )
+    key_arn = (
+        f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+        "key/00000000-0000-0000-0000-000000000002"
+    )
+    source_hash = base64.b64encode(hashlib.sha256(b"hub-keygen").digest()).decode()
+    public_key = base64.b64encode(bytes(range(1, 33))).decode()
+    kms_condition = {
+        "StringEquals": {
+            "kms:EncryptionContext:SecretARN": secret_arn,
+            "kms:ViaService": CHECKER.HUB_SECRETSMANAGER_KMS_VIA_SERVICE,
+        }
+    }
+    keygen_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": [
+                    "secretsmanager:DescribeSecret",
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:PutSecretValue",
+                ],
+                "Effect": "Allow",
+                "Resource": secret_arn,
+                "Sid": "SeedHubKeyMaterial",
+            },
+            {
+                "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+                "Effect": "Allow",
+                "Resource": CHECKER.HUB_PUBLIC_KEY_PARAMETER_ARN,
+                "Sid": "PublishHubPublicIdentity",
+            },
+            {
+                "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                "Condition": copy.deepcopy(kms_condition),
+                "Effect": "Allow",
+                "Resource": key_arn,
+                "Sid": "WrapHubKeyMaterial",
+            },
+            {
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Effect": "Allow",
+                "Resource": CHECKER.HUB_KEYGEN_LOG_GROUP_ARN,
+                "Sid": "OwnLogStream",
+            },
+        ],
+    }
+    execution_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "secretsmanager:GetSecretValue",
+                "Effect": "Allow",
+                "Resource": secret_arn,
+                "Sid": "ReadHubKeyMaterial",
+            },
+            {
+                "Action": "kms:Decrypt",
+                "Condition": copy.deepcopy(kms_condition),
+                "Effect": "Allow",
+                "Resource": key_arn,
+                "Sid": "DecryptHubKeyMaterial",
+            },
+        ],
+    }
+
+    def item(
+        after: dict,
+        *,
+        actions: list[str] | None = None,
+        unknown: dict | None = None,
+        replace_paths: list[list[str]] | None = None,
+    ) -> dict:
+        selected_actions = actions or ["no-op"]
+        change = {
+            "actions": selected_actions,
+            "before": (
+                None if selected_actions == ["create"] else copy.deepcopy(after)
+            ),
+            "after": after,
+            "after_unknown": unknown or {},
+        }
+        if replace_paths is not None:
+            change["replace_paths"] = replace_paths
+        return {"change": change}
+
+    publication_invocation = {
+        "function_name": CHECKER.HUB_KEYGEN_FUNCTION_NAME,
+        "input": "{}",
+        "lifecycle_scope": "CREATE_ONLY",
+        "qualifier": "$LATEST",
+        "region": CHECKER.AWS_REGION,
+        "tenant_id": None,
+        "terraform_key": "tf",
+        "triggers": None,
+    }
+    public = {
+        "description": (
+            "Connector Hub X25519 public identity; private key remains in "
+            "Secrets Manager"
+        ),
+        "name": CHECKER.HUB_PUBLIC_KEY_PARAMETER_NAME,
+        "region": CHECKER.AWS_REGION,
+        "type": "String",
+        "value": public_key if converged else "pending-keygen",
+        "value_wo": None,
+        "value_wo_version": None,
+    }
+    if converged:
+        publication_invocation["result"] = '{"seeded": true}'
+        invocation_actions = ["no-op"]
+        invocation_unknown = {}
+        public_actions = ["no-op"]
+    else:
+        invocation_actions = ["create"]
+        invocation_unknown = {"id": True, "result": True}
+        public_actions = ["create"]
+
+    return {
+        "module.control.aws_kms_key.authority_data": item({"arn": key_arn}),
+        "module.control.aws_secretsmanager_secret.hub_key_material[0]": item(
+            {
+                "arn": secret_arn,
+                "description": (
+                    "Connector Hub private key and cookie keys; seeded once by "
+                    "the keygen Lambda, never via Terraform state"
+                ),
+                "kms_key_id": key_arn,
+                "name": CHECKER.HUB_KEY_MATERIAL_SECRET_NAME,
+                "policy": "",
+                "recovery_window_in_days": 7,
+                "region": CHECKER.AWS_REGION,
+            }
+        ),
+        "module.control.aws_iam_role.hub_keygen[0]": item(
+            {
+                "arn": CHECKER.HUB_KEYGEN_ROLE_ARN,
+                "assume_role_policy": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Action": "sts:AssumeRole",
+                                "Effect": "Allow",
+                                "Principal": {"Service": "lambda.amazonaws.com"},
+                                "Sid": "LambdaAssume",
+                            }
+                        ],
+                    }
+                ),
+                "managed_policy_arns": [],
+                "max_session_duration": 3600,
+                "name": f"{CHECKER.CONTROL_PREFIX}-hub-keygen",
+                "path": "/",
+                "permissions_boundary": "",
+            }
+        ),
+        "module.control.aws_iam_role_policy.hub_keygen[0]": item(
+            {
+                "name": "hub-keygen",
+                "policy": json.dumps(keygen_policy),
+                "role": f"{CHECKER.CONTROL_PREFIX}-hub-keygen",
+            },
+            actions=["no-op"] if converged else ["update"],
+        ),
+        "module.control.aws_iam_role_policy.hub_execution[0]": item(
+            {
+                "name": "hub-execution",
+                "policy": json.dumps(execution_policy),
+                "role": f"{CHECKER.CONTROL_PREFIX}-hub-exec",
+            },
+            actions=["no-op"] if converged else ["update"],
+        ),
+        "module.control.aws_ssm_parameter.hub_public_key[0]": item(
+            public,
+            actions=public_actions,
+        ),
+        "module.control.aws_lambda_function.hub_keygen[0]": item(
+            {
+                "description": (
+                    "Seeds or repairs the Connector Hub identity and publishes "
+                    "its public key at worker create (sandbox)"
+                ),
+                "environment": [
+                    {
+                        "variables": {
+                            "ENVIRONMENT": "sandbox",
+                            "PUBLIC_KEY_PARAMETER": (
+                                CHECKER.HUB_PUBLIC_KEY_PARAMETER_NAME
+                            ),
+                            "SECRET_ID": secret_arn,
+                        }
+                    }
+                ],
+                "filename": (
+                    "../../../modules/connector-authority-foundation/lambda/"
+                    "hub-keygen.zip"
+                ),
+                "function_name": CHECKER.HUB_KEYGEN_FUNCTION_NAME,
+                "handler": "keygen.handler",
+                "package_type": "Zip",
+                "reserved_concurrent_executions": 1,
+                "role": CHECKER.HUB_KEYGEN_ROLE_ARN,
+                "runtime": "nodejs22.x",
+                "source_code_hash": source_hash,
+                "timeout": 30,
+                "vpc_config": [],
+            },
+            actions=["no-op"] if converged else ["update"],
+            unknown=(
+                {}
+                if converged
+                else {"environment": [{"variables": {}}], "vpc_config": []}
+            ),
+        ),
+        "module.control.aws_lambda_invocation.hub_keygen[0]": item(
+            {
+                "function_name": CHECKER.HUB_KEYGEN_FUNCTION_NAME,
+                "input": "{}",
+                "lifecycle_scope": "CREATE_ONLY",
+                "qualifier": "$LATEST",
+                "region": CHECKER.AWS_REGION,
+                "tenant_id": None,
+                "terraform_key": "tf",
+                "triggers": None,
+            },
+        ),
+        "module.control.aws_lambda_invocation.hub_identity_publication[0]": item(
+            publication_invocation,
+            actions=invocation_actions,
+            unknown=invocation_unknown,
+        ),
+    }
 
 
 def hub_edge_transition_fixture() -> dict:
@@ -3881,6 +4589,235 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assertEqual(summary["bootstrap_create_count"], 0)
 
+    def test_exact_legacy_hub_runtime_expansion_passes(self) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(
+            summary["plan_mode"], "authority-runtime-legacy-expansion"
+        )
+        changed = {
+            item["address"]
+            for item in candidate["resource_changes"]
+            if item["change"]["actions"] != ["no-op"]
+        }
+        self.assertEqual(
+            changed,
+            set(CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES)
+            | set(CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES)
+            | set(CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES),
+        )
+
+    def test_legacy_expansion_may_roll_only_the_exact_authority_digest(
+        self,
+    ) -> None:
+        candidate = with_legacy_authority_digest_roll(
+            authority_runtime_legacy_expansion_fixture()
+        )
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(
+            summary["plan_mode"], "authority-runtime-legacy-expansion"
+        )
+
+        for mutation in (
+            lambda before: before.__setitem__(
+                "authority_image_uri", "repository.example/authority:latest"
+            ),
+            lambda before: before["authority_runtime_contract"]["global"].__setitem__(
+                "authority_image_digest", "sha256:" + "3" * 64
+            ),
+            lambda before: before["authority_runtime_contract"]["global"].__setitem__(
+                "authority_repository_url", "public.ecr.aws/attacker/authority"
+            ),
+        ):
+            malformed = copy.deepcopy(candidate)
+            foundation = self.change(
+                malformed, "module.control.terraform_data.foundation_contract"
+            )
+            mutation(foundation["before"]["input"])
+            self.assert_rejected(malformed)
+
+        mixed_predecessor = copy.deepcopy(candidate)
+        first_hub_function = next(
+            iter(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+        )
+        self.change(
+            mixed_predecessor,
+            (
+                'module.control.aws_lambda_function.authority["'
+                f'{first_hub_function}"]'
+            ),
+        )["before"]["image_uri"] = (
+            "public.ecr.aws/attacker/authority@sha256:" + "4" * 64
+        )
+        self.assert_rejected(mixed_predecessor)
+
+    def test_legacy_hub_runtime_expansion_partial_retry_passes(self) -> None:
+        applied = {
+            "module.control.terraform_data.foundation_contract",
+            CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS,
+            CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS,
+            next(
+                iter(CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES)
+            ),
+            CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS,
+        }
+        summary = CHECKER.check_plan(
+            authority_runtime_legacy_expansion_fixture(applied)
+        )
+        self.assertEqual(
+            summary["plan_mode"], "authority-runtime-legacy-expansion"
+        )
+
+    def test_legacy_expansion_may_carry_only_the_complete_cell_catalog(
+        self,
+    ) -> None:
+        candidate = with_provisioned_cell_catalog_transition(
+            authority_runtime_legacy_expansion_fixture()
+        )
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(
+            summary["plan_mode"],
+            (
+                "authority-runtime-legacy-expansion-"
+                "provisioned-cell-catalog"
+            ),
+        )
+
+        partial = copy.deepcopy(candidate)
+        cell1 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+        partial_change = self.change(partial, cell1)
+        partial_change["actions"] = ["no-op"]
+        partial_change["before"] = copy.deepcopy(partial_change["after"])
+        partial_change["after_unknown"] = {}
+        self.assert_rejected(partial)
+
+        wrong_output = copy.deepcopy(candidate)
+        wrong_output["planned_values"]["outputs"]["provisioned_cells"]["value"][
+            "cell0"
+        ]["nhp_host"] = "attacker.example"
+        self.assert_rejected(wrong_output)
+
+    def test_legacy_hub_runtime_expansion_rejects_predecessor_drift(self) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        foundation = self.change(
+            candidate, "module.control.terraform_data.foundation_contract"
+        )
+        foundation["before"]["input"]["authority_runtime_contract"]["global"][
+            "basis_evidence"
+        ]["sha256"] = "f" * 64
+        self.assert_rejected(candidate)
+
+    def test_legacy_hub_runtime_expansion_rejects_caller_catalog_drift(
+        self,
+    ) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        foundation = self.change(
+            candidate, "module.control.terraform_data.foundation_contract"
+        )
+        foundation["after"]["input"]["authority_runtime_contract"]["global"][
+            "caller_capacity"
+        ]["cell_workers"]["cell2"] = {"max_replicas": 2}
+        self.assert_rejected(candidate)
+
+    def test_legacy_hub_runtime_expansion_rejects_extra_update(self) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        ia_role = (
+            'module.control.aws_iam_role.authority_exec["'
+            f'{CHECKER.CONTROL_PREFIX.removesuffix("-control")}-ca-ia"]'
+        )
+        self.change(candidate, ia_role)["actions"] = ["update"]
+        self.assert_rejected(candidate)
+
+    def test_legacy_hub_runtime_expansion_rejects_retained_sg_cidr(
+        self,
+    ) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        lambda_sg = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS)
+        lambda_sg["after"]["egress"] = copy.deepcopy(lambda_sg["before"]["egress"])
+        self.assert_rejected(candidate)
+
+    def test_legacy_hub_runtime_expansion_rejects_wrong_sg_predecessor(
+        self,
+    ) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        lambda_sg = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS)
+        lambda_sg["before"]["egress"][0]["cidr_blocks"] = ["0.0.0.0/0"]
+        self.assert_rejected(candidate)
+
+    def test_legacy_hub_runtime_expansion_rejects_noncreate_cell_resource(
+        self,
+    ) -> None:
+        candidate = authority_runtime_legacy_expansion_fixture()
+        address = next(
+            iter(CHECKER.AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES)
+        )
+        self.change(candidate, address)["actions"] = ["update"]
+        self.assert_rejected(candidate)
+    def test_authority_image_update_admits_exactly_the_live_hub_lambdas(
+        self,
+    ) -> None:
+        """Pin the admitted image-update action set to the reviewed nine.
+
+        The migration retags resources that already exist live, and both pinned
+        endpoints of the transition publish the Hub-only graph. Deriving the set
+        from the full runtime inventory instead silently grows it with every
+        added cell/operation, so assert the exact membership rather than a count
+        so a re-widening cannot pass as a refactor.
+        """
+        hub_functions = set(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+        expected = {
+            f'module.control.aws_lambda_function.authority["{fn}"]':
+                "aws_lambda_function"
+            for fn in hub_functions
+        }
+        expected.update({
+            f'module.control.aws_lambda_alias.authority["{fn}:{color}"]':
+                "aws_lambda_alias"
+            for fn in hub_functions
+            for color in ("blue", "green")
+        })
+        self.assertEqual(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES, expected)
+        self.assertEqual(len(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES), 9)
+        # No per-cell function may appear in the admitted set: those are pending
+        # creates in the expansion, and a resource that does not exist cannot be
+        # retagged from FROM_URI to TO_URI.
+        self.assertTrue(CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS)
+        for fn in CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS:
+            for address in (
+                f'module.control.aws_lambda_function.authority["{fn}"]',
+                f'module.control.aws_lambda_alias.authority["{fn}:blue"]',
+                f'module.control.aws_lambda_alias.authority["{fn}:green"]',
+            ):
+                self.assertIn(address, CHECKER.AUTHORITY_RUNTIME_RESOURCES)
+                self.assertNotIn(
+                    address, CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES
+                )
+
+    def test_authority_image_update_rejects_per_cell_lambda_movement(
+        self,
+    ) -> None:
+        """A per-cell lambda may not ride the Hub image-update envelope."""
+        cell_function = next(iter(CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS))
+        for address in (
+            f'module.control.aws_lambda_function.authority["{cell_function}"]',
+            f'module.control.aws_lambda_alias.authority["{cell_function}:blue"]',
+        ):
+            with self.subTest(address=address):
+                candidate = authority_image_update_fixture()
+                self.change(candidate, address)["actions"] = ["update"]
+                self.assert_rejected(candidate)
+
+        # The per-cell complements stay bound to the contract-pinned image even
+        # though they are outside the admitted action set.
+        drifted = authority_image_update_fixture()
+        self.change(
+            drifted,
+            f'module.control.aws_lambda_function.authority["{cell_function}"]',
+        )["after"]["image_uri"] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
+        self.assert_rejected(drifted)
+
     def test_exact_authority_image_update_and_partial_completion_pass(self) -> None:
         exact = authority_image_update_fixture()
         summary = CHECKER.check_plan(exact)
@@ -4116,9 +5053,9 @@ class PlanContractTests(unittest.TestCase):
     def test_authority_runtime_slice_partial_retry_passes(self) -> None:
         """After a partial apply (e.g. the DynamoDB gateway open was rejected
         mid-run) the already-created slice resources replan as no-ops and only
-        the remaining creates plus the three opens stay pending. The slice
+        the remaining creates plus the dependency opens stay pending. The slice
         transition must still be accepted across the full-slice (``set()``),
-        one-applied, and real 12-applied boundaries."""
+        one-applied, and complete early-resource boundaries."""
         full = authority_runtime_transition_fixture()
         early_applied = {
             item["address"]
@@ -4132,8 +5069,10 @@ class PlanContractTests(unittest.TestCase):
                 "aws_cloudwatch_log_group",
             }
         }
-        # 3 hub functions x {exec role, exec policy, spillover alarm, log group}.
-        self.assertEqual(len(early_applied), 12)
+        # 11 functions x {exec role, exec policy, spillover alarm, log group}.
+        self.assertEqual(
+            len(early_applied), 4 * len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
+        )
         for applied in (set(), {next(iter(early_applied))}, early_applied):
             with self.subTest(applied=len(applied)):
                 summary = CHECKER.check_plan(
@@ -4273,7 +5212,17 @@ class PlanContractTests(unittest.TestCase):
         policy = json.loads(ddb["after"]["policy"])
         policy["Statement"][0]["Resource"].append(
             f"arn:aws:dynamodb:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:table/"
-            f"{CHECKER.CONTROL_PREFIX}-qurl-customers"
+            f"{CHECKER.CONTROL_PREFIX}-qurl-apikey-idempotency"
+        )
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_missing_dynamodb_resource(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        policy["Statement"][0]["Resource"].remove(
+            CHECKER.AUTHORITY_RUNTIME_TABLE_ARNS["customers"]
         )
         ddb["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
@@ -4316,6 +5265,54 @@ class PlanContractTests(unittest.TestCase):
             **redis_sg["after"],
             "ingress": [runtime_interface_ingress_rule()],
         }
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_world_interface_endpoint_egress(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        egress = self.change(
+            candidate,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]",
+        )
+        egress["after"]["referenced_security_group_id"] = None
+        egress["after"]["cidr_ipv4"] = "0.0.0.0/0"
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_wrong_function_sg_source(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        egress = self.change(
+            candidate,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]",
+        )
+        egress["after"]["security_group_id"] = "sg-0bad0000000000000"
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_standalone_rule_reference_rewire(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        resource = self.configuration_resource(
+            candidate,
+            "module.control.aws_vpc_security_group_egress_rule.authority_otp_redis",
+        )
+        resource["expressions"]["referenced_security_group_id"] = {
+            "references": [
+                "aws_security_group.interface_endpoints.id",
+                "aws_security_group.interface_endpoints",
+            ]
+        }
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_world_dynamodb_egress(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        egress = self.change(
+            candidate,
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_dynamodb[0]",
+        )
+        egress["after"]["prefix_list_id"] = None
+        egress["after"]["cidr_ipv4"] = "0.0.0.0/0"
         self.assert_rejected(candidate)
 
     def test_authority_runtime_rejects_world_interface_ingress(self) -> None:
@@ -4912,6 +5909,45 @@ class PlanContractTests(unittest.TestCase):
         ] = True
         self.assert_rejected(public_subnet)
 
+    def test_standalone_security_groups_omit_inline_rule_configuration(self) -> None:
+        candidate = plan_fixture()
+        for address in CHECKER.STANDALONE_RULE_SECURITY_GROUPS:
+            expressions = self.configuration_resource(candidate, address)[
+                "expressions"
+            ]
+            self.assertNotIn("ingress", expressions)
+            self.assertNotIn("egress", expressions)
+        CHECKER.check_plan(candidate)
+
+    def test_standalone_security_groups_reject_nonempty_inline_rules(self) -> None:
+        inline_rule = {
+            "constant_value": [
+                {
+                    "cidr_blocks": ["10.102.0.0/16"],
+                    "from_port": 443,
+                    "protocol": "tcp",
+                    "to_port": 443,
+                }
+            ]
+        }
+        for address in CHECKER.STANDALONE_RULE_SECURITY_GROUPS:
+            for field in ("ingress", "egress"):
+                with self.subTest(address=address, field=field):
+                    candidate = plan_fixture()
+                    expressions = self.configuration_resource(candidate, address)[
+                        "expressions"
+                    ]
+                    expressions[field] = copy.deepcopy(inline_rule)
+                    self.assert_rejected(candidate)
+
+    def test_missing_inline_rule_constant_remains_strict_for_other_sgs(self) -> None:
+        candidate = plan_fixture()
+        expressions = self.configuration_resource(
+            candidate, "module.control.aws_default_security_group.control"
+        )["expressions"]
+        del expressions["egress"]
+        self.assert_rejected(candidate)
+
     def test_kms_endpoint_and_redis_policy_drift_fail(self) -> None:
         mutations = (
             ("module.control.aws_vpc.control", "enable_dns_support", False),
@@ -5017,7 +6053,13 @@ class StateListTests(unittest.TestCase):
         runtime = [*self.expected_addresses(), *CHECKER.AUTHORITY_RUNTIME_RESOURCES]
         self.assertEqual(
             self.check(runtime),
-            {"data_resource_count": 5, "managed_resource_count": 77},
+            {
+                "data_resource_count": 5,
+                "managed_resource_count": (
+                    len(CHECKER.EXPECTED_RESOURCES)
+                    + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
+                ),
+            },
         )
         # A partial runtime inventory (missing one runtime resource) fails closed.
         partial = [
@@ -5098,8 +6140,12 @@ def state_fixture() -> dict:
         "module.control.aws_security_group.otp_redis",
     ):
         by_address[address].update({"ingress": [], "egress": []})
-    by_address["module.control.aws_security_group.interface_endpoints"]["id"] = "sg-111"
-    by_address["module.control.aws_security_group.otp_redis"]["id"] = "sg-222"
+    by_address["module.control.aws_security_group.interface_endpoints"]["id"] = (
+        RUNTIME_INTERFACE_SG_ID
+    )
+    by_address["module.control.aws_security_group.otp_redis"]["id"] = (
+        RUNTIME_OTP_REDIS_SG_ID
+    )
     data_key_arn = f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:key/data123"
     by_address["module.control.aws_kms_key.authority_data"].update(
         {
@@ -5244,7 +6290,7 @@ def state_fixture() -> dict:
                 "private_dns_enabled": True,
                 "vpc_id": "vpc-abc123",
                 "subnet_ids": subnet_ids,
-                "security_group_ids": ["sg-111"],
+                "security_group_ids": [RUNTIME_INTERFACE_SG_ID],
                 "policy": deny_policy,
             }
         )
@@ -5255,6 +6301,7 @@ def state_fixture() -> dict:
             "service_name": f"com.amazonaws.{CHECKER.AWS_REGION}.dynamodb",
             "vpc_id": "vpc-abc123",
             "route_table_ids": route_table_ids,
+            "prefix_list_id": RUNTIME_DYNAMODB_PREFIX_LIST_ID,
             "policy": deny_policy,
         }
     )
@@ -5266,7 +6313,7 @@ def state_fixture() -> dict:
             "user_group_id": f"{CHECKER.CONTROL_PREFIX}-otp-users",
             "kms_key_id": data_key_arn,
             "snapshot_retention_limit": 0,
-            "security_group_ids": ["sg-222"],
+            "security_group_ids": [RUNTIME_OTP_REDIS_SG_ID],
             "subnet_ids": subnet_ids,
         }
     )
@@ -5334,24 +6381,93 @@ def state_fixture() -> dict:
 
 
 def state_fixture_runtime() -> dict:
-    """The dark state plus the applied runtime slice (scoped endpoints, function SG
-    ingress, and the 25 runtime resources)."""
+    """The dark state plus the applied complete runtime graph."""
     state = state_fixture()
     resources = state["values"]["root_module"]["resources"]
     by_address = {item["address"]: item["values"] for item in resources}
-    dynamodb_policy, kms_policy = runtime_scoped_endpoint_policies()
+    dynamodb_policy, kms_policy, secrets_policy, email_policy = (
+        runtime_scoped_endpoint_policies()
+    )
     by_address["module.control.aws_vpc_endpoint.dynamodb"]["policy"] = dynamodb_policy
     by_address['module.control.aws_vpc_endpoint.interface["kms"]']["policy"] = kms_policy
+    by_address['module.control.aws_vpc_endpoint.interface["secretsmanager"]'][
+        "policy"
+    ] = secrets_policy
+    by_address['module.control.aws_vpc_endpoint.interface["email"]'][
+        "policy"
+    ] = email_policy
     interface_sg = by_address["module.control.aws_security_group.interface_endpoints"]
     interface_sg["ingress"] = [runtime_interface_ingress_rule()]
     interface_sg["egress"] = []
+    runtime_security_values = {
+        CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS: {
+            "id": RUNTIME_LAMBDA_SG_ID,
+            "name_prefix": f"{CHECKER.CONTROL_PREFIX}-ca-fn-v2-",
+            "description": (
+                "Connector Authority function ENIs; egress to Control dependency "
+                "endpoints only"
+            ),
+            "vpc_id": "vpc-abc123",
+            "ingress": [],
+            "egress": [],
+        },
+        (
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]"
+        ): {
+            "description": "HTTPS to Control interface endpoints",
+            "from_port": 443,
+            "to_port": 443,
+            "ip_protocol": "tcp",
+            "security_group_id": RUNTIME_LAMBDA_SG_ID,
+            "referenced_security_group_id": RUNTIME_INTERFACE_SG_ID,
+            "cidr_ipv4": None,
+            "cidr_ipv6": None,
+            "prefix_list_id": None,
+        },
+        ("module.control.aws_vpc_security_group_egress_rule.authority_dynamodb[0]"): {
+            "description": "HTTPS to the DynamoDB gateway endpoint",
+            "from_port": 443,
+            "to_port": 443,
+            "ip_protocol": "tcp",
+            "security_group_id": RUNTIME_LAMBDA_SG_ID,
+            "referenced_security_group_id": None,
+            "cidr_ipv4": None,
+            "cidr_ipv6": None,
+            "prefix_list_id": RUNTIME_DYNAMODB_PREFIX_LIST_ID,
+        },
+        ("module.control.aws_vpc_security_group_egress_rule.authority_otp_redis[0]"): {
+            "description": "TLS to Connector OTP Redis",
+            "from_port": 6379,
+            "to_port": 6379,
+            "ip_protocol": "tcp",
+            "security_group_id": RUNTIME_LAMBDA_SG_ID,
+            "referenced_security_group_id": RUNTIME_OTP_REDIS_SG_ID,
+            "cidr_ipv4": None,
+            "cidr_ipv6": None,
+            "prefix_list_id": None,
+        },
+        ("module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]"): {
+            "description": "TLS from Connector Authority OTP functions",
+            "from_port": 6379,
+            "to_port": 6379,
+            "ip_protocol": "tcp",
+            "security_group_id": RUNTIME_OTP_REDIS_SG_ID,
+            "referenced_security_group_id": RUNTIME_LAMBDA_SG_ID,
+            "cidr_ipv4": None,
+            "cidr_ipv6": None,
+            "prefix_list_id": None,
+        },
+    }
     for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items():
         resources.append(
             {
                 "address": address,
                 "mode": "managed",
                 "type": resource_type,
-                "values": {"id": "runtime-placeholder"},
+                "values": copy.deepcopy(
+                    runtime_security_values.get(address, {"id": "runtime-placeholder"})
+                ),
             }
         )
     return state
@@ -5439,7 +6555,8 @@ class StateContractTests(unittest.TestCase):
 
     def test_exact_runtime_state_passes(self) -> None:
         self.assertEqual(
-            CHECKER.check_state(state_fixture_runtime())["resource_count"], 77
+            CHECKER.check_state(state_fixture_runtime())["resource_count"],
+            len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
 
     def test_runtime_state_rejects_still_dark_dependency_endpoint(self) -> None:
@@ -5459,6 +6576,51 @@ class StateContractTests(unittest.TestCase):
         by_address['module.control.aws_vpc_endpoint.interface["lambda"]']["policy"] = (
             runtime_scoped_endpoint_policies()[1]
         )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
+
+    def test_runtime_state_rejects_function_sg_inline_cidr(self) -> None:
+        state = state_fixture_runtime()
+        function_sg = next(
+            item["values"]
+            for item in state["values"]["root_module"]["resources"]
+            if item["address"] == CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
+        )
+        function_sg["egress"] = [
+            {
+                "cidr_blocks": ["10.102.0.0/16"],
+                "from_port": 443,
+                "to_port": 443,
+                "protocol": "tcp",
+            }
+        ]
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
+
+    def test_runtime_state_rejects_cidr_substitute_for_sg_edge(self) -> None:
+        state = state_fixture_runtime()
+        address = (
+            "module.control.aws_vpc_security_group_egress_rule."
+            "authority_interface_endpoints[0]"
+        )
+        rule = next(
+            item["values"]
+            for item in state["values"]["root_module"]["resources"]
+            if item["address"] == address
+        )
+        rule["referenced_security_group_id"] = None
+        rule["cidr_ipv4"] = "10.102.0.0/16"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
+
+    def test_runtime_state_rejects_wrong_inline_ingress_source(self) -> None:
+        state = state_fixture_runtime()
+        interface_sg = next(
+            item["values"]
+            for item in state["values"]["root_module"]["resources"]
+            if item["address"] == CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS
+        )
+        interface_sg["ingress"][0]["security_groups"] = ["sg-0bad0000000000000"]
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_state(state)
 
@@ -5991,7 +7153,7 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
                 [
                     {"FunctionName": name}
                     for name in [
-                        *CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+                        *CHECKER.AUTHORITY_RUNTIME_FUNCTIONS,
                         CHECKER.HUB_KEYGEN_FUNCTION_NAME,
                     ]
                 ],
@@ -6007,7 +7169,7 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
                 [
                     {"FunctionName": name}
                     for name in [
-                        *CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS,
+                        *CHECKER.AUTHORITY_RUNTIME_FUNCTIONS,
                         CHECKER.HUB_KEYGEN_FUNCTION_NAME,
                         "layerv-nhp-sandbox-control-rogue",
                     ]
@@ -6015,6 +7177,146 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             )
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.check_live(root)
+
+
+class HubIdentityMigrationTests(unittest.TestCase):
+    def test_exact_migration_and_converged_identity_pass(self) -> None:
+        CHECKER._check_hub_identity_resources(hub_identity_migration_fixture())
+        CHECKER._check_hub_identity_resources(
+            hub_identity_migration_fixture(converged=True)
+        )
+
+    def test_transition_action_boundary_is_exact(self) -> None:
+        actions = {
+            **{
+                address: ["create"]
+                for address in CHECKER.HUB_IDENTITY_CREATE_ADDRESSES
+            },
+            **{
+                address: ["update"]
+                for address in CHECKER.HUB_IDENTITY_UPDATE_ADDRESSES
+            },
+        }
+        exact, creates, updates = (
+            CHECKER._hub_identity_transition_pending(actions)
+        )
+        self.assertTrue(exact)
+        self.assertEqual(creates, set(CHECKER.HUB_IDENTITY_CREATE_ADDRESSES))
+        self.assertEqual(updates, set(CHECKER.HUB_IDENTITY_UPDATE_ADDRESSES))
+
+        publication_address = (
+            "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+        )
+        partial, partial_creates, _ = (
+            CHECKER._hub_identity_transition_pending(
+                {publication_address: ["create"]}
+            )
+        )
+        self.assertTrue(partial)
+        self.assertEqual(partial_creates, {publication_address})
+
+        wrong = copy.deepcopy(actions)
+        wrong[publication_address] = ["delete", "create"]
+        self.assertFalse(CHECKER._hub_identity_transition_pending(wrong)[0])
+
+    def test_kms_conditions_are_required_on_both_consumers(self) -> None:
+        for address in (
+            "module.control.aws_iam_role_policy.hub_keygen[0]",
+            "module.control.aws_iam_role_policy.hub_execution[0]",
+        ):
+            candidate = hub_identity_migration_fixture()
+            policy = json.loads(candidate[address]["change"]["after"]["policy"])
+            kms_statement = next(
+                statement
+                for statement in policy["Statement"]
+                if statement["Sid"]
+                in {"WrapHubKeyMaterial", "DecryptHubKeyMaterial"}
+            )
+            del kms_statement["Condition"]
+            candidate[address]["change"]["after"]["policy"] = json.dumps(policy)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_hub_identity_resources(candidate)
+
+    def test_public_parameter_permission_cannot_broaden(self) -> None:
+        candidate = hub_identity_migration_fixture()
+        address = "module.control.aws_iam_role_policy.hub_keygen[0]"
+        policy = json.loads(candidate[address]["change"]["after"]["policy"])
+        publish = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "PublishHubPublicIdentity"
+        )
+        publish["Resource"] = "*"
+        candidate[address]["change"]["after"]["policy"] = json.dumps(policy)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_identity_resources(candidate)
+
+    def test_keygen_runtime_and_serialization_are_exact(self) -> None:
+        for field, value in (
+            ("runtime", "python3.13"),
+            ("reserved_concurrent_executions", -1),
+            ("vpc_config", [{"subnet_ids": ["subnet-bypass"]}]),
+        ):
+            candidate = hub_identity_migration_fixture()
+            candidate[
+                "module.control.aws_lambda_function.hub_keygen[0]"
+            ]["change"]["after"][field] = value
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_hub_identity_resources(candidate)
+
+    def test_publication_invocation_is_additive_and_triggerless(self) -> None:
+        address = (
+            "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+        )
+        for mutation in ("trigger", "replacement", "replace_path"):
+            candidate = hub_identity_migration_fixture()
+            change = candidate[address]["change"]
+            if mutation == "trigger":
+                change["after"]["triggers"] = {"rerun": "unsafe"}
+            elif mutation == "replacement":
+                change["actions"] = ["delete", "create"]
+                change["before"] = copy.deepcopy(change["after"])
+            else:
+                change["replace_paths"] = [["function_name"]]
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_hub_identity_resources(candidate)
+
+    def test_invocation_create_retry_is_exact(self) -> None:
+        candidate = hub_identity_migration_fixture()
+        CHECKER._check_hub_identity_resources(candidate)
+
+        for mutation in ("unexpected-before", "replacement-path"):
+            malformed = copy.deepcopy(candidate)
+            malformed_change = malformed[
+                "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+            ]["change"]
+            if mutation == "unexpected-before":
+                malformed_change["before"] = {}
+            else:
+                malformed_change["replace_paths"] = [["triggers"]]
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_hub_identity_resources(malformed)
+
+    def test_placeholder_cannot_be_a_converged_noop(self) -> None:
+        candidate = hub_identity_migration_fixture(converged=True)
+        candidate[
+            "module.control.aws_ssm_parameter.hub_public_key[0]"
+        ]["change"]["after"]["value"] = "pending-keygen"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_identity_resources(candidate)
+
+    def test_noncanonical_or_zero_public_key_fails(self) -> None:
+        for value in (
+            base64.b64encode(b"\x00" * 32).decode(),
+            base64.b64encode(b"x" * 31).decode(),
+            base64.b64encode(b"x" * 32).decode().rstrip("="),
+        ):
+            candidate = hub_identity_migration_fixture(converged=True)
+            candidate[
+                "module.control.aws_ssm_parameter.hub_public_key[0]"
+            ]["change"]["after"]["value"] = value
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_hub_identity_resources(candidate)
 
 
 class HubSecretsmanagerEndpointPolicyTests(unittest.TestCase):
@@ -6247,7 +7549,7 @@ class LiveContractTests(unittest.TestCase):
                 with self.assertRaises(CHECKER.ContractError):
                     CHECKER.check_live(root)
 
-    def test_live_boundary_admits_exactly_the_three_authority_functions(self) -> None:
+    def test_live_boundary_admits_exact_complete_authority_graph(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             live_fixture(root)
@@ -6255,17 +7557,18 @@ class LiveContractTests(unittest.TestCase):
                 root / "control-lambdas.json",
                 [
                     {"FunctionName": name, "Runtime": None}
-                    for name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS
+                    for name in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS
                 ],
             )
             self.assertEqual(
-                CHECKER.check_live(root)["authority_function_count"], 3
+                CHECKER.check_live(root)["authority_function_count"],
+                len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS),
             )
 
     def test_live_boundary_rejects_unexpected_or_malformed_lambdas(self) -> None:
         for payload in (
             [{"FunctionName": "layerv-nhp-sandbox-ca-rogue"}],
-            [{"FunctionName": name} for name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS]
+            [{"FunctionName": name} for name in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS]
             + [{"FunctionName": "layerv-nhp-sandbox-ca-ia-extra"}],
             ["layerv-nhp-sandbox-ca-ia"],
         ):

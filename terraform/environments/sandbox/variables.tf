@@ -13,6 +13,25 @@ variable "cell_id" {
   # duplicate regex blocks.
 }
 
+variable "connector_authority_cell_config" {
+  description = "Optional exact cell0 Connector Authority caller graph. Dark by default; activate only after the Control runtime has been applied and verified."
+  type = object({
+    environment                            = string
+    aws_account_id                         = string
+    aws_region                             = string
+    issue_registration_otp_alias_arn       = string
+    activate_registration_alias_arn        = string
+    complete_registration_alias_arn        = string
+    complete_credential_recovery_alias_arn = string
+    authority_lambda_timeout               = string
+    handler_budget                         = string
+    packet_budget                          = string
+    response_reserve                       = string
+    write_budget                           = string
+  })
+  default = null
+}
+
 variable "aws_region" {
   type = string
 }

@@ -11,30 +11,31 @@ module "nhp" {
     aws.billing_mgmt = aws.billing_mgmt
   }
 
-  environment            = var.environment
-  cell_id                = var.cell_id
-  aws_region             = var.aws_region
-  aws_account_id         = var.aws_account_id
-  server_ami_id          = var.server_ami_id
-  ac_ami_id              = var.ac_ami_id
-  domain_name            = var.domain_name
-  hosted_zone            = var.hosted_zone
-  multi_tenant           = var.multi_tenant
-  deploy_etcd            = var.deploy_etcd
-  min_capacity           = var.min_capacity
-  max_capacity           = var.max_capacity
-  vpc_cidr               = var.vpc_cidr
-  tags                   = var.tags
-  is_primary_account     = var.is_primary_account
-  primary_account_id     = var.primary_account_id
-  secondary_account_ids  = var.secondary_account_ids
-  enable_replication     = var.enable_replication
-  github_org             = var.github_org
-  github_repo            = var.github_repo
-  deploy_ac              = var.deploy_ac
-  acme_email             = var.acme_email
-  terraform_state_bucket = var.terraform_state_bucket
-  terraform_lock_table   = var.terraform_lock_table
+  environment                     = var.environment
+  cell_id                         = var.cell_id
+  connector_authority_cell_config = var.connector_authority_cell_config
+  aws_region                      = var.aws_region
+  aws_account_id                  = var.aws_account_id
+  server_ami_id                   = var.server_ami_id
+  ac_ami_id                       = var.ac_ami_id
+  domain_name                     = var.domain_name
+  hosted_zone                     = var.hosted_zone
+  multi_tenant                    = var.multi_tenant
+  deploy_etcd                     = var.deploy_etcd
+  min_capacity                    = var.min_capacity
+  max_capacity                    = var.max_capacity
+  vpc_cidr                        = var.vpc_cidr
+  tags                            = var.tags
+  is_primary_account              = var.is_primary_account
+  primary_account_id              = var.primary_account_id
+  secondary_account_ids           = var.secondary_account_ids
+  enable_replication              = var.enable_replication
+  github_org                      = var.github_org
+  github_repo                     = var.github_repo
+  deploy_ac                       = var.deploy_ac
+  acme_email                      = var.acme_email
+  terraform_state_bucket          = var.terraform_state_bucket
+  terraform_lock_table            = var.terraform_lock_table
 
   # AC configuration
   ac_auth_service_id           = var.ac_auth_service_id

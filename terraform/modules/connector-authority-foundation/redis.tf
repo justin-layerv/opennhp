@@ -4,9 +4,9 @@ resource "aws_security_group" "otp_redis" {
   vpc_id      = aws_vpc.control.id
 
   # No traffic until the cell-scoped OTP functions exist. The authority-runtime
-  # slice adds only SG-to-SG TLS/6379 ingress.
-  ingress = []
-  egress  = []
+  # slice adds only a standalone SG-to-SG TLS/6379 ingress rule. Keep all rules
+  # standalone; mixing inline and standalone security-group rules can overwrite
+  # rules or cause perpetual Terraform drift.
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-otp-redis"
@@ -74,7 +74,7 @@ resource "aws_elasticache_user" "otp_disabled_default" {
 
 # Retain the original IAM user for a non-destructive rollout, but detach it from
 # the active user group below. No runtime role may receive elasticache:Connect
-# to this ARN. A follow-up removes it after the split users are live-proven.
+# to this ARN. NHP #3362 removes it after the split users are live-proven.
 resource "aws_elasticache_user" "otp_authority" {
   user_id   = local.otp_redis_legacy_authority_user_id
   user_name = local.otp_redis_legacy_authority_user_id

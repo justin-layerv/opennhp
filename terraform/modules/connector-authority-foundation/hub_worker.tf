@@ -94,10 +94,11 @@ data "aws_ssm_parameter" "hub_image_digest" {
 # Seeded key material secret.
 # --------------------------------------------------------------------------
 # The Hub's long-lived private key plus the active/previous cookie keys. Created
-# empty here and seeded exactly once by the keygen Lambda (hub_keygen.tf) so no
-# key byte ever transits Terraform state; the execution role reads it and the
-# init container maps its JSON fields into the worker's env. Encrypted with the
-# shared Control data CMK like every other Authority secret.
+# empty here, then seeded or retry-repaired by the CREATE_ONLY keygen Lambda
+# (hub_keygen.tf) so no private or cookie key byte ever transits Terraform
+# state; the execution role reads it and the init container maps its JSON
+# fields into the worker's env. Encrypted with the shared Control data CMK like
+# every other Authority secret.
 resource "aws_secretsmanager_secret" "hub_key_material" {
   count = local.hub_worker_count
 
@@ -178,6 +179,12 @@ resource "aws_iam_role_policy" "hub_execution" {
         Effect   = "Allow"
         Action   = "kms:Decrypt"
         Resource = aws_kms_key.authority_data.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                  = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            "kms:EncryptionContext:SecretARN" = aws_secretsmanager_secret.hub_key_material[0].arn
+          }
+        }
       },
     ]
   })
@@ -498,9 +505,10 @@ resource "aws_ecs_task_definition" "hub" {
 # Fargate service fronting the 5a NLB target group. desired_count and
 # task_definition are co-owned with the deploy pipeline (rolling updates), so
 # both are ignored after create. The circuit breaker rolls back a failed
-# deployment automatically. It waits on the keygen seed (the secret must hold
-# real key material before a task starts) and on the 5a listener (the target
-# group must be wired to a listener before registration).
+# deployment automatically. It waits on the retry-safe keygen transaction (the
+# secret must hold real key material and its exact public identity must be
+# published before a task starts) and on the 5a listener (the target group must
+# be wired to a listener before registration).
 resource "aws_ecs_service" "hub" {
   count = local.hub_worker_count
 
@@ -542,6 +550,7 @@ resource "aws_ecs_service" "hub" {
 
   depends_on = [
     aws_lambda_invocation.hub_keygen,
+    aws_lambda_invocation.hub_identity_publication,
     aws_lb_listener.hub,
   ]
 

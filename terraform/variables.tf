@@ -30,6 +30,26 @@ variable "cell_id" {
   }
 }
 
+variable "connector_authority_cell_config" {
+  description = "Nullable complete assigned-cell Connector Authority caller bundle. Sandbox supplies the exact two-cell blue graph; prod remains null/dark."
+  type = object({
+    environment                            = string
+    aws_account_id                         = string
+    aws_region                             = string
+    issue_registration_otp_alias_arn       = string
+    activate_registration_alias_arn        = string
+    complete_registration_alias_arn        = string
+    complete_credential_recovery_alias_arn = string
+    authority_lambda_timeout               = string
+    handler_budget                         = string
+    packet_budget                          = string
+    response_reserve                       = string
+    write_budget                           = string
+  })
+  default  = null
+  nullable = true
+}
+
 # ==================== AWS Configuration ====================
 
 variable "aws_region" {

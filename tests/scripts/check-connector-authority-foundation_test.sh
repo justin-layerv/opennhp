@@ -147,6 +147,17 @@ expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_r
 printf '%s\n' '{"resource_changes":[{"address":"aws_vpc.replaced","type":"aws_vpc","change":{"actions":["delete","create"],"after":{"cidr_block":"10.102.0.0/16"}}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# The one-time generation-2 Authority SG replacement is admitted only for the
+# exact observed legacy predecessor and an empty replacement. This is the
+# deliberate revocation path for the predecessor's VPC-CIDR inline rule.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_security_group.authority_lambda[0]","type":"aws_security_group","change":{"actions":["create","delete"],"before":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-","vpc_id":"vpc-abc123","ingress":[],"egress":[{"description":"HTTPS to Control interface endpoints (KMS) in-VPC","cidr_blocks":["10.102.0.0/16"],"ipv6_cidr_blocks":[],"prefix_list_ids":[],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443},{"description":"HTTPS to the DynamoDB gateway endpoint prefix list","cidr_blocks":[],"ipv6_cidr_blocks":[],"prefix_list_ids":["pl-abc123"],"security_groups":[],"self":false,"protocol":"tcp","from_port":443,"to_port":443}]},"after":{"name_prefix":"layerv-nhp-sandbox-control-ca-fn-v2-","vpc_id":"vpc-abc123"},"after_unknown":{"ingress":true,"egress":true},"replace_paths":[["name_prefix"]]}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+jq '.resource_changes[0].change.before.egress[0].cidr_blocks = ["0.0.0.0/0"]' \
+  "$plan_json" >"${plan_json}.tmp"
+mv "${plan_json}.tmp" "$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 # A tainted Connector Authority hub FUNCTION replace (delete+create) is the
 # authority-runtime-slice-retry recovery for a Failed function, not a teardown.
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["delete","create"],"after":{"function_name":"layerv-nhp-sandbox-ca-ia"}}}]}' >"$plan_json"

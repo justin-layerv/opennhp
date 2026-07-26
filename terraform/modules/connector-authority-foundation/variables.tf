@@ -221,9 +221,10 @@ variable "hub_worker_enabled" {
   description = <<-EOT
     Dark-first enable gate for the Connector Hub Fargate worker (Step 5, slice
     5b): the ECS cluster/task/service, the execution and task roles, the seeded
-    key-material secret plus its one-shot keygen Lambda, the dedicated worker
-    security group, the Hub log group, and the ECR/S3 image-pull endpoints. It
-    also opens the caller (Lambda) interface endpoint to the Hub task role.
+    key-material secret plus its retry-safe CREATE_ONLY keygen Lambda and
+    public-only identity parameter, the dedicated worker security group, the
+    Hub log group, and the ECR/S3 image-pull endpoints. It also opens the caller
+    (Lambda) interface endpoint to the Hub task role.
 
     It requires BOTH hub_edge_enabled AND a live authority runtime
     (authority_runtime_functions_enabled on a bound contract): the worker fronts

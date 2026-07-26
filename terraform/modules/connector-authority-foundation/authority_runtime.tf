@@ -1,16 +1,12 @@
-# Connector Authority Lambda runtime slice (Step 4 of the two-cell UDP
-# substrate). This file is INERT until BOTH the runtime contract is bound
+# Connector Authority Lambda runtime (Step 4 of the two-cell UDP substrate).
+# This file is INERT until BOTH the runtime contract is bound
 # (Step 3 sets authority_runtime_contract non-null) AND the separate runtime
 # gate is flipped (var.authority_runtime_functions_enabled). Until then every
 # resource below is count/for_each empty and the foundation stays dark.
 #
-# SCOPE (matches the merged measurement basis exactly): the 3 Hub-facing
-# functions layerv-nhp-<env>-ca-{ia,ra,icr}. The measurement contract's
-# functions map is exactly {ia,ra,icr} and provisioned_cells is {cell0} as a
-# FROZEN caller catalog only; it declares no cell function. The first-apply
-# checker's _require_authority_runtime_binding independently hard-requires that
-# exact set. The 4-per-cell functions (iro/ar/cr/ccr-<cell>) therefore belong
-# to a LATER contract revision, not this slice; see the PR body.
+# SCOPE: the exact complete contract graph: 3 Hub functions plus 4 functions
+# for every provisioned cell. A ready two-cell sandbox therefore deploys 11
+# functions. Partial cell groups are rejected by authority_runtime_contract.tf.
 #
 # DARK-FIRST: functions, both closed blue/green aliases, operation-specific
 # execution roles, steady provisioned/reserved concurrency, and spillover
@@ -19,8 +15,8 @@
 # the caller identity policy; the plan forbids it), and NO opening of the Lambda
 # caller interface endpoint (the Hub role/runtime does not exist yet — Step 5).
 # The lockstep opening in endpoints.tf opens ONLY the dependency endpoints these
-# hub functions provably reach (DynamoDB gateway + KMS interface), to exactly the
-# constructed execution-role principals.
+# functions provably reach (DynamoDB, KMS, Secrets Manager, and SES), to exactly
+# the constructed execution-role principals.
 
 locals {
   # Second, independent gate. Requires a bound contract; the precondition below
@@ -29,12 +25,12 @@ locals {
     local.authority_runtime_contract_enabled && var.authority_runtime_functions_enabled
   )
 
-  # Hub functions to deploy = the Hub-group functions actually present in the
-  # bound contract's functions map. In the measurement basis this is all three.
-  authority_runtime_hub_functions = local.authority_runtime_functions_deploy ? {
-    for function_name, spec in local.authority_expected_hub_functions :
+  # Deploy exactly the complete function graph admitted by the contract.
+  authority_runtime_functions = local.authority_runtime_functions_deploy ? {
+    for function_name, spec in local.authority_expected_functions :
     function_name => {
       operation = spec.operation
+      cell_id   = spec.cell_id
       spec      = local.authority_contract_functions[function_name]
     }
     if contains(local.authority_actual_function_names, function_name)
@@ -42,12 +38,14 @@ locals {
 
   authority_runtime_selected_color = local.authority_runtime_functions_deploy ? var.authority_runtime_contract.selected_authority_color : null
 
-  # Both closed deployment qualifiers are published up front (plan: "First
-  # create functions, versions, the closed blue/green aliases ..."). Only the
-  # selected color receives steady provisioned concurrency below.
+  # Both closed deployment qualifiers are published up front. For this initial
+  # dark bootstrap they intentionally target the same first published version;
+  # only the selected color receives steady provisioned concurrency below.
+  # This is not a working blue/green rollout or rollback controller. NHP #3456
+  # must land before the first post-bootstrap Authority image roll.
   authority_runtime_alias_colors = ["blue", "green"]
   authority_runtime_aliases = merge([
-    for function_name, fn in local.authority_runtime_hub_functions : {
+    for function_name, fn in local.authority_runtime_functions : {
       for color in local.authority_runtime_alias_colors :
       "${function_name}:${color}" => {
         function_name = function_name
@@ -61,11 +59,11 @@ locals {
   # time and independently checkable, and so no dependency cycle forms between
   # the function, its role, and the endpoint policy.
   authority_runtime_exec_role_name = {
-    for function_name, fn in local.authority_runtime_hub_functions :
+    for function_name, fn in local.authority_runtime_functions :
     function_name => "${function_name}-exec"
   }
   authority_runtime_exec_role_arn = {
-    for function_name, fn in local.authority_runtime_hub_functions :
+    for function_name, fn in local.authority_runtime_functions :
     function_name => "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${function_name}-exec"
   }
 
@@ -78,26 +76,54 @@ locals {
   # per-operation execution policy fully known at plan time, so its scoped
   # actions/resources are independently checkable by the first-apply checker.
   authority_runtime_log_group_arn = {
-    for function_name, fn in local.authority_runtime_hub_functions :
+    for function_name, fn in local.authority_runtime_functions :
     function_name => "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${function_name}"
   }
 
-  # Only IssueAssignment (ca-ia) constructs a KMS client: it loads the assignment
-  # verification key (kms:GetPublicKey) and signs the ticket (kms:Sign) at cold
-  # start. RefreshAssignment and IssueCredentialRecovery build NO KMS client
-  # (verified against layervai/qurl-service connectorauthorityruntime/wiring.go:
-  # their factories never call newKMSClient), so the qat1 key opens to ca-ia
-  # alone and no operation uses kms:Verify (ticket verification is local p256).
+  # IssueAssignment signs; IssueRegistrationOTP and ActivateRegistration load
+  # the public key to authenticate qat1 locally. No operation uses kms:Verify.
   authority_runtime_sign_function = "${local.authority_function_prefix}-ia"
   authority_runtime_sign_role_arns = local.authority_runtime_functions_deploy ? [
     local.authority_runtime_exec_role_arn[local.authority_runtime_sign_function],
   ] : []
 
+  # Operation → capability classification. Each list is the single source of
+  # truth for the matching Lambda environment block (and, for the first three,
+  # the IAM/endpoint principal grant via the *_role_arns locals below); keep
+  # them here so a grant and its env var cannot drift apart, and so every
+  # capability axis is stated once in one place.
+  authority_public_key_operations = ["issue_assignment", "issue_registration_otp", "activate_registration"]
+  authority_otp_operations        = ["issue_registration_otp", "activate_registration"]
+  authority_ses_operations        = ["issue_registration_otp"]
+  # Env-only axes (no principal grant): operations that consume the cell DNS
+  # suffix (every op that mints or refreshes assignment endpoint data;
+  # IssueRegistrationOTP intentionally excluded) and the admission-gated ops.
+  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery"]
+  authority_admission_operations = ["activate_registration", "complete_registration"]
+
+  authority_runtime_public_key_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if contains(local.authority_public_key_operations, fn.operation)
+  ]) : []
+
+  authority_runtime_otp_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if contains(local.authority_otp_operations, fn.operation)
+  ]) : []
+  authority_runtime_ses_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if contains(local.authority_ses_operations, fn.operation)
+  ]) : []
+
   # Environment-owned public cell DNS suffix (LayerV-owned; leading dot). It
   # matches the live native-UDP cell endpoints (e.g. cell0.nhp.layerv.xyz) and
-  # is required by the handler for every hub op (domain.ValidateProvisionedCellDNSSuffix
-  # in connectorauthorityruntime/config.go loadDNSSuffix). The runtime contract
-  # does not carry it, so it is derived from the environment domain here.
+  # is required by every operation that mints or refreshes assignment endpoint
+  # data. IssueRegistrationOTP verifies an existing assignment ticket but
+  # intentionally does not consume the suffix. The runtime contract does not
+  # carry it, so it is derived from the environment domain here.
   authority_cell_dns_suffix = local.is_prod ? ".nhp.layerv.ai" : ".nhp.layerv.xyz"
 
   authority_runtime_log_retention_days = local.is_prod ? 365 : 30
@@ -132,22 +158,22 @@ locals {
     },
   ] : []
 
-  # The 3 canonical tables the Hub-facing operations reach. customers and
-  # api_key_idempotency are intentionally excluded: they are read by the
-  # (out-of-scope) cell OTP/mint paths, not by ia/ra/icr. Ungated so the
-  # dependency-endpoint policy locals in endpoints.tf can reference them even
-  # while the runtime is dark; they are only ever selected when deploying.
+  # The 4 canonical tables reached by the complete runtime. api_key_idempotency
+  # is intentionally excluded: no Authority constructor reaches it. Ungated so
+  # the dependency-endpoint policy locals in endpoints.tf can reference them
+  # even while the runtime is dark; they are only ever selected when deploying.
   authority_runtime_table_arns = {
     api_keys            = aws_dynamodb_table.api_keys.arn
     agent_keys          = aws_dynamodb_table.agent_keys.arn
+    customers           = aws_dynamodb_table.customers.arn
     connector_authority = aws_dynamodb_table.connector_authority.arn
   }
 
   # Read = strongly consistent GetItem/Query plus the transaction ConditionCheck
-  # verb, plus DescribeTable: EVERY hub op verifies its selected Control tables'
+  # verb, plus DescribeTable: EVERY operation verifies its selected Control tables'
   # SSE-KMS key at cold start before it can reach READY
   # (connectorauthorityruntime/dynamodb_sse.go verifySelectedControlTableEncryption).
-  # BatchGetItem/TransactGetItems are dropped: no hub op composes them, and a
+  # BatchGetItem/TransactGetItems are dropped: no operation composes them, and a
   # read inside a transaction is authorized by GetItem, not a Transact* action.
   authority_runtime_ddb_read_actions = [
     "dynamodb:ConditionCheckItem",
@@ -155,7 +181,7 @@ locals {
     "dynamodb:GetItem",
     "dynamodb:Query",
   ]
-  # The single-item replay tombstone both hub-request ops (issue/refresh) compose
+  # The single-item replay tombstone both Hub request ops (issue/refresh) compose
   # as a TransactWriteItems{Put} on connector_authority
   # (repository/dynamodb/hub_request_replay_repo.go). A Put inside a transaction
   # is authorized by dynamodb:PutItem, not a Transact* action.
@@ -163,7 +189,7 @@ locals {
   # IssueCredentialRecovery additionally UPDATEs the device-credential head anchor
   # on the first grant (agent_credential_recovery_repo.go recoveryHeadTransactionItem),
   # so it needs UpdateItem beyond the replay/grant Puts. DeleteItem is unused by
-  # every hub op and dropped.
+  # every operation and dropped.
   authority_runtime_ddb_recovery_write_actions = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
 
   # Table resources. Only agent_keys is read through a GSI (the pubkey index in
@@ -173,13 +199,45 @@ locals {
   authority_runtime_table_resources = {
     api_keys            = [local.authority_runtime_table_arns.api_keys]
     agent_keys          = [local.authority_runtime_table_arns.agent_keys, "${local.authority_runtime_table_arns.agent_keys}/index/*"]
+    customers           = [local.authority_runtime_table_arns.customers]
     connector_authority = [local.authority_runtime_table_arns.connector_authority]
   }
+
+  authority_runtime_ses_identity_arn   = "arn:${data.aws_partition.current.partition}:ses:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:identity/${local.otp_sender_domain}"
+  authority_runtime_ses_config_set_arn = "arn:${data.aws_partition.current.partition}:ses:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:configuration-set/${var.ses_configuration_set_name}"
+  authority_runtime_redis_cache_arn    = "arn:${data.aws_partition.current.partition}:elasticache:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:serverlesscache:${aws_elasticache_serverless_cache.otp.name}"
+
+  authority_runtime_qat1_public_key_statement = {
+    Sid      = "Qat1PublicKey"
+    Effect   = "Allow"
+    Action   = ["kms:GetPublicKey"]
+    Resource = [aws_kms_key.qat1_signing.arn]
+  }
+  authority_runtime_otp_secret_statements = [
+    {
+      Sid      = "OTPSecretRead"
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = [aws_secretsmanager_secret.otp_pepper.arn]
+    },
+    {
+      Sid      = "OTPSecretDecrypt"
+      Effect   = "Allow"
+      Action   = ["kms:Decrypt"]
+      Resource = [aws_kms_key.authority_data.arn]
+      Condition = {
+        StringEquals = {
+          "kms:ViaService"                  = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+          "kms:EncryptionContext:SecretARN" = aws_secretsmanager_secret.otp_pepper.arn
+        }
+      }
+    },
+  ]
 
   # Per-operation statement lists. Every operation gets the common ENI statement,
   # a scoped CloudWatch Logs write to its own log group, and its exact — handler-
   # verified — data dependencies. Every resource is a concrete ARN (no wildcard).
-  authority_runtime_operation_statements = local.authority_runtime_functions_deploy ? {
+  authority_runtime_operation_statements = {
     # IssueAssignment: reads the credential (api_keys) + authority placement rows
     # (connector_authority); writes only its single-item replay tombstone (Put)
     # to connector_authority; signs the assignment ticket with qat1.
@@ -243,54 +301,165 @@ locals {
         Resource = local.authority_runtime_table_resources.connector_authority
       },
     ]
+    issue_registration_otp = concat(
+      [
+        {
+          Sid      = "AuthorityReads"
+          Effect   = "Allow"
+          Action   = local.authority_runtime_ddb_read_actions
+          Resource = concat(local.authority_runtime_table_resources.api_keys, local.authority_runtime_table_resources.customers)
+        },
+        local.authority_runtime_qat1_public_key_statement,
+      ],
+      local.authority_runtime_otp_secret_statements,
+      [
+        {
+          Sid      = "OTPRedisConnect"
+          Effect   = "Allow"
+          Action   = ["elasticache:Connect"]
+          Resource = [local.authority_runtime_redis_cache_arn, aws_elasticache_user.otp_issuer.arn]
+        },
+        {
+          Sid      = "OTPSendEmail"
+          Effect   = "Allow"
+          Action   = ["ses:SendEmail"]
+          Resource = [local.authority_runtime_ses_identity_arn, local.authority_runtime_ses_config_set_arn]
+        },
+      ],
+    )
+    activate_registration = concat(
+      [
+        {
+          Sid      = "AuthorityReads"
+          Effect   = "Allow"
+          Action   = local.authority_runtime_ddb_read_actions
+          Resource = concat(local.authority_runtime_table_resources.api_keys, local.authority_runtime_table_resources.agent_keys, local.authority_runtime_table_resources.connector_authority)
+        },
+        {
+          Sid      = "RegistrationCredentialWrite"
+          Effect   = "Allow"
+          Action   = ["dynamodb:UpdateItem"]
+          Resource = local.authority_runtime_table_resources.api_keys
+        },
+        {
+          Sid      = "RegistrationIdentityWrite"
+          Effect   = "Allow"
+          Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+          Resource = [local.authority_runtime_table_arns.agent_keys]
+        },
+        {
+          Sid      = "RegistrationAuthorityWrite"
+          Effect   = "Allow"
+          Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+          Resource = local.authority_runtime_table_resources.connector_authority
+        },
+        local.authority_runtime_qat1_public_key_statement,
+      ],
+      local.authority_runtime_otp_secret_statements,
+      [{
+        Sid      = "OTPRedisConnect"
+        Effect   = "Allow"
+        Action   = ["elasticache:Connect"]
+        Resource = [local.authority_runtime_redis_cache_arn, aws_elasticache_user.otp_activator.arn]
+      }],
+    )
+    complete_registration = [
+      {
+        Sid      = "AuthorityReads"
+        Effect   = "Allow"
+        Action   = local.authority_runtime_ddb_read_actions
+        Resource = concat(local.authority_runtime_table_resources.api_keys, local.authority_runtime_table_resources.agent_keys, local.authority_runtime_table_resources.connector_authority)
+      },
+      {
+        Sid      = "RegistrationCredentialWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = local.authority_runtime_table_resources.api_keys
+      },
+      {
+        Sid      = "RegistrationAuthorityWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+      },
+    ]
+    complete_credential_recovery = [
+      {
+        Sid      = "AuthorityReads"
+        Effect   = "Allow"
+        Action   = local.authority_runtime_ddb_read_actions
+        Resource = concat(local.authority_runtime_table_resources.api_keys, local.authority_runtime_table_resources.agent_keys, local.authority_runtime_table_resources.connector_authority)
+      },
+      {
+        Sid      = "RecoveryCredentialWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = local.authority_runtime_table_resources.api_keys
+      },
+      {
+        Sid      = "RecoveryAuthorityWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+      },
+    ]
+  }
+
+  authority_runtime_environment = local.authority_runtime_functions_deploy ? {
+    for function_name, fn in local.authority_runtime_functions :
+    function_name => merge(
+      {
+        CONNECTOR_AUTHORITY_OPERATION        = local.authority_operation_conformance_name[fn.operation]
+        CONNECTOR_AUTHORITY_ENVIRONMENT_ID   = var.environment
+        CONNECTOR_AUTHORITY_ACCOUNT_ID       = data.aws_caller_identity.current.account_id
+        CONNECTOR_AUTHORITY_HOME_REGION      = data.aws_region.current.region
+        CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN = aws_kms_key.authority_data.arn
+      },
+      fn.cell_id == "" ? {} : {
+        CONNECTOR_AUTHORITY_CELL_ID = fn.cell_id
+      },
+      contains(local.authority_cell_dns_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX = local.authority_cell_dns_suffix
+      } : {},
+      contains(local.authority_public_key_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_ALIAS_ARN = aws_kms_alias.qat1_signing.arn
+        CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_KID       = tostring(var.authority_runtime_contract.qat1_kid)
+      } : {},
+      contains(local.authority_otp_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_REDIS_ENDPOINT        = "${aws_elasticache_serverless_cache.otp.endpoint[0].address}:6379"
+        CONNECTOR_AUTHORITY_REDIS_CACHE_NAME      = aws_elasticache_serverless_cache.otp.name
+        CONNECTOR_AUTHORITY_REDIS_USER_ID         = fn.operation == "issue_registration_otp" ? aws_elasticache_user.otp_issuer.user_id : aws_elasticache_user.otp_activator.user_id
+        CONNECTOR_AUTHORITY_OTP_PEPPER_SECRET_ARN = aws_secretsmanager_secret.otp_pepper.arn
+      } : {},
+      contains(local.authority_ses_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_OTP_EMAIL_FROM            = var.otp_email_from
+        CONNECTOR_AUTHORITY_OTP_SES_CONFIGURATION_SET = var.ses_configuration_set_name
+      } : {},
+      contains(local.authority_admission_operations, fn.operation) ? {
+        CONNECTOR_AUTHORITY_ADMISSION_REQUESTS_PER_SECOND = tostring(local.authority_contract_cell_workers[fn.cell_id].preinvoke_rate_limits[fn.operation].refill_per_second)
+        CONNECTOR_AUTHORITY_ADMISSION_BURST               = tostring(local.authority_contract_cell_workers[fn.cell_id].preinvoke_rate_limits[fn.operation].burst)
+        CONNECTOR_AUTHORITY_ADMISSION_MAX_IN_FLIGHT       = tostring(local.authority_contract_cell_workers[fn.cell_id].preinvoke_limits[fn.operation])
+      } : {},
+    )
   } : {}
 }
 
 # One dedicated security group for every Authority function ENI. Egress is
-# limited to HTTPS toward the interface endpoints (KMS) and the DynamoDB
+# limited to HTTPS toward the interface endpoints and the DynamoDB
 # gateway prefix list; the endpoint policies are the finer, principal-scoped
 # gate. No ingress: nothing dials the functions on the network path — callers
 # reach them only through the Lambda service's private Invoke transport.
 resource "aws_security_group" "authority_lambda" {
   count = local.authority_runtime_functions_deploy ? 1 : 0
 
-  name_prefix = "${local.name_prefix}-ca-fn-"
+  # Generation 2 deliberately replaces the legacy inline-rule-owned sandbox
+  # group. Merely omitting those inline rules would leave its VPC-CIDR egress
+  # unmanaged alongside the standalone rules below. The replacement starts
+  # with no implicit rules, after which Terraform owns every allowed path as an
+  # exact standalone rule.
+  name_prefix = "${local.name_prefix}-ca-fn-v2-"
   description = "Connector Authority function ENIs; egress to Control dependency endpoints only"
   vpc_id      = aws_vpc.control.id
-
-  ingress = []
-
-  # Egress is HTTPS only. The interface endpoints are reached via the VPC CIDR
-  # rather than an SG-to-SG reference: the tight direction (interface-endpoint
-  # SG ingress) IS scoped to this function SG, and a reciprocal SG-to-SG egress
-  # here would form an inline-rule dependency cycle between the two groups. The
-  # isolated subnets expose no other :443 listener than these endpoints, and the
-  # endpoint policies are the finer principal/resource gate. DynamoDB is the
-  # gateway endpoint's managed prefix list.
-  egress = [
-    {
-      description      = "HTTPS to Control interface endpoints (KMS) in-VPC"
-      from_port        = 443
-      to_port          = 443
-      protocol         = "tcp"
-      cidr_blocks      = [var.vpc_cidr]
-      ipv6_cidr_blocks = []
-      prefix_list_ids  = []
-      security_groups  = []
-      self             = false
-    },
-    {
-      description      = "HTTPS to the DynamoDB gateway endpoint prefix list"
-      from_port        = 443
-      to_port          = 443
-      protocol         = "tcp"
-      prefix_list_ids  = [aws_vpc_endpoint.dynamodb.prefix_list_id]
-      cidr_blocks      = []
-      ipv6_cidr_blocks = []
-      security_groups  = []
-      self             = false
-    },
-  ]
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-ca-fn"
@@ -301,17 +470,69 @@ resource "aws_security_group" "authority_lambda" {
   }
 }
 
+# Egress is HTTPS only. The interface endpoints are reached through an exact
+# SG-to-SG rule; their ingress is scoped back to this function SG and endpoint
+# policies are the finer principal/resource gate. DynamoDB uses the gateway
+# endpoint's managed prefix list.
+resource "aws_vpc_security_group_egress_rule" "authority_interface_endpoints" {
+  count = local.authority_runtime_functions_deploy ? 1 : 0
+
+  security_group_id            = aws_security_group.authority_lambda[0].id
+  referenced_security_group_id = aws_security_group.interface_endpoints.id
+  description                  = "HTTPS to Control interface endpoints"
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "authority_dynamodb" {
+  count = local.authority_runtime_functions_deploy ? 1 : 0
+
+  security_group_id = aws_security_group.authority_lambda[0].id
+  prefix_list_id    = aws_vpc_endpoint.dynamodb.prefix_list_id
+  description       = "HTTPS to the DynamoDB gateway endpoint"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+# Only the OTP issuer/activator functions have IAM permission to connect. The
+# shared function SG opens the network path solely to the Redis SG on TLS/6379;
+# Redis IAM users remain the per-operation authorization boundary.
+resource "aws_vpc_security_group_egress_rule" "authority_otp_redis" {
+  count = local.authority_runtime_functions_deploy ? 1 : 0
+
+  security_group_id            = aws_security_group.authority_lambda[0].id
+  referenced_security_group_id = aws_security_group.otp_redis.id
+  description                  = "TLS to Connector OTP Redis"
+  from_port                    = 6379
+  to_port                      = 6379
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "otp_redis_authority" {
+  count = local.authority_runtime_functions_deploy ? 1 : 0
+
+  security_group_id            = aws_security_group.otp_redis.id
+  referenced_security_group_id = aws_security_group.authority_lambda[0].id
+  description                  = "TLS from Connector Authority OTP functions"
+  from_port                    = 6379
+  to_port                      = 6379
+  ip_protocol                  = "tcp"
+}
+
 resource "aws_cloudwatch_log_group" "authority" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   name              = "/aws/lambda/${each.key}"
   retention_in_days = local.authority_runtime_log_retention_days
 
-  # NOTE: default (AWS-managed) log encryption. CMK-encrypting these groups with
-  # authority_data would require extending that key's byte-reviewed policy to
-  # allow the CloudWatch Logs service for the Lambda log-group ARNs (today it is
-  # scoped to the flow-log group only). Deferred to a follow-up so this slice
-  # does not mutate the KMS key policy. Payloads are already forbidden from logs.
+  # Default AWS-managed log encryption is intentional for this substrate:
+  # payloads are forbidden from logs, and reusing authority_data would require
+  # broadening its byte-reviewed policy to the CloudWatch Logs service. If a
+  # customer-managed log key becomes a requirement, use a dedicated logs key
+  # and exact Lambda log-group encryption context instead of widening the
+  # Authority data-key boundary.
 
   tags = merge(local.common_tags, {
     Name      = "/aws/lambda/${each.key}"
@@ -320,7 +541,7 @@ resource "aws_cloudwatch_log_group" "authority" {
 }
 
 resource "aws_iam_role" "authority_exec" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   name                 = local.authority_runtime_exec_role_name[each.key]
   max_session_duration = 3600
@@ -352,7 +573,7 @@ resource "aws_iam_role" "authority_exec" {
 }
 
 resource "aws_iam_role_policy" "authority_exec" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   name = "connector-authority-${each.value.operation}"
   role = aws_iam_role.authority_exec[each.key].id
@@ -378,7 +599,7 @@ resource "aws_iam_role_policy" "authority_exec" {
 }
 
 resource "aws_lambda_function" "authority" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   function_name = each.key
   description   = "Connector Authority ${each.value.operation} (${var.environment})"
@@ -418,16 +639,7 @@ resource "aws_lambda_function" "authority" {
   # published uniformly (the handler ignores unread keys); the DATA CMK ARN is
   # the SSE key each op verifies at cold start via DescribeTable.
   environment {
-    variables = {
-      CONNECTOR_AUTHORITY_OPERATION                = local.authority_operation_conformance_name[each.value.operation]
-      CONNECTOR_AUTHORITY_ENVIRONMENT_ID           = var.environment
-      CONNECTOR_AUTHORITY_ACCOUNT_ID               = data.aws_caller_identity.current.account_id
-      CONNECTOR_AUTHORITY_HOME_REGION              = data.aws_region.current.region
-      CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX          = local.authority_cell_dns_suffix
-      CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN         = aws_kms_key.authority_data.arn
-      CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_ALIAS_ARN = aws_kms_alias.qat1_signing.arn
-      CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_KID       = tostring(var.authority_runtime_contract.qat1_kid)
-    }
+    variables = local.authority_runtime_environment[each.key]
   }
 
   depends_on = [
@@ -450,13 +662,15 @@ resource "aws_lambda_alias" "authority" {
   function_version = aws_lambda_function.authority[each.value.function_name].version
 }
 
-# Steady state: only the caller-selected color retains provisioned capacity
-# (plan). The standby color's provisioned pool is a later rollout transition.
+# Initial-bootstrap steady state: only the caller-selected color receives
+# provisioned capacity. The contract's rollout active/standby allocation and
+# rollback-retention fields are validation-only in this slice; NHP #3456 tracks
+# consuming them in the governed version-roll/alias-switch/rollback lifecycle.
 # The startup graph cannot fit inside the request path, so unprovisioned
 # authority work is forbidden; the handler additionally rejects any non
 # provisioned-concurrency initialization type.
 resource "aws_lambda_provisioned_concurrency_config" "authority" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   function_name                     = aws_lambda_function.authority[each.key].function_name
   qualifier                         = aws_lambda_alias.authority["${each.key}:${local.authority_runtime_selected_color}"].name
@@ -476,11 +690,12 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
 }
 
 # The rollout-aborting invariant: provisioned-concurrency spillover must remain
-# exactly zero. FLAG: alarm_actions (SNS) wiring plus the Throttles/Errors/
-# Duration and custom admission/initialization-type alarms are an immediate
-# follow-up; this slice lands the security-critical spillover guard.
+# exactly zero. NHP #3455 tracks operator alarm_actions (SNS) wiring plus the
+# Throttles/Errors/Duration and custom admission/initialization-type alarms;
+# this slice lands the security-critical spillover guard without inventing an
+# unowned notification destination in the new Control root.
 resource "aws_cloudwatch_metric_alarm" "authority_spillover" {
-  for_each = local.authority_runtime_hub_functions
+  for_each = local.authority_runtime_functions
 
   alarm_name          = "${each.key}-provisioned-concurrency-spillover"
   alarm_description   = "Connector Authority ${each.value.operation} spilled to an on-demand environment; a nonzero value aborts the rollout."
@@ -493,6 +708,8 @@ resource "aws_cloudwatch_metric_alarm" "authority_spillover" {
   evaluation_periods  = 1
   treat_missing_data  = "notBreaching"
 
+  # Aggregate across both aliases deliberately: any active or standby
+  # spillover violates the function-wide zero-spillover invariant.
   dimensions = {
     FunctionName = each.key
   }

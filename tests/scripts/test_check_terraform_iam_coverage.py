@@ -257,6 +257,11 @@ class TerraformHelperInvokeScope(unittest.TestCase):
                     "hub_keygen",
                     hub_keygen,
                 ),
+                (
+                    "modules/connector-authority-foundation/hub_keygen.tf",
+                    "hub_identity_publication",
+                    hub_keygen,
+                ),
             },
         )
 

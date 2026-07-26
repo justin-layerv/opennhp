@@ -1,6 +1,66 @@
 {
   "contract": {
     "functions": {
+      "layerv-nhp-sandbox-ca-ar-cell0": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-ar-cell1": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-ccr-cell0": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-ccr-cell1": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-cr-cell0": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-cr-cell1": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
       "layerv-nhp-sandbox-ca-ia": {
         "max_caller_in_flight": 2,
         "max_caller_requests_per_second": 4,
@@ -12,6 +72,26 @@
         "steady_reserved_concurrency": 2
       },
       "layerv-nhp-sandbox-ca-icr": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-iro-cell0": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 2
+      },
+      "layerv-nhp-sandbox-ca-iro-cell1": {
         "max_caller_in_flight": 2,
         "max_caller_requests_per_second": 4,
         "rollback_retention_seconds": 3600,
@@ -42,6 +122,33 @@
       "caller_capacity": {
         "cell_workers": {
           "cell0": {
+            "max_replicas": 2,
+            "preinvoke_limits": {
+              "activate_registration": 1,
+              "complete_credential_recovery": 1,
+              "complete_registration": 1,
+              "issue_registration_otp": 1
+            },
+            "preinvoke_rate_limits": {
+              "activate_registration": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "complete_credential_recovery": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "complete_registration": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "issue_registration_otp": {
+                "burst": 1,
+                "refill_per_second": 1
+              }
+            }
+          },
+          "cell1": {
             "max_replicas": 2,
             "preinvoke_limits": {
               "activate_registration": 1,
@@ -111,6 +218,9 @@
     "provisioned_cells": {
       "cell0": {
         "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+      },
+      "cell1": {
+        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
       }
     },
     "qat1_kid": "sandbox-qat1-2026-07-v1",

@@ -977,6 +977,23 @@ NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
 NHP_ENVIRONMENT=${protocol_environment}
 NHP_CELL_ID=${cell_id}
+%{ if connector_authority_cell_config != null ~}
+# Complete assigned-cell Connector Authority graph. Lambda private DNS resolves
+# through the cell's exact-policy interface endpoint; no public/NAT path is used.
+NHP_CONNECTOR_REGISTRATION_AWS_REGION=${connector_authority_cell_config.aws_region}
+NHP_CONNECTOR_REGISTRATION_AWS_ACCOUNT_ID=${connector_authority_cell_config.aws_account_id}
+NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN=${connector_authority_cell_config.issue_registration_otp_alias_arn}
+NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN=${connector_authority_cell_config.activate_registration_alias_arn}
+NHP_CONNECTOR_REGISTRATION_COMPLETE_ALIAS_ARN=${connector_authority_cell_config.complete_registration_alias_arn}
+NHP_CONNECTOR_REGISTRATION_AUTHORITY_LAMBDA_TIMEOUT=${connector_authority_cell_config.authority_lambda_timeout}
+NHP_CONNECTOR_REGISTRATION_HANDLER_BUDGET=${connector_authority_cell_config.handler_budget}
+NHP_CONNECTOR_REGISTRATION_PACKET_BUDGET=${connector_authority_cell_config.packet_budget}
+NHP_CONNECTOR_REGISTRATION_RESPONSE_RESERVE=${connector_authority_cell_config.response_reserve}
+NHP_CONNECTOR_REGISTRATION_WRITE_BUDGET=${connector_authority_cell_config.write_budget}
+NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_REGION=${connector_authority_cell_config.aws_region}
+NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_ACCOUNT_ID=${connector_authority_cell_config.aws_account_id}
+NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN=${connector_authority_cell_config.complete_credential_recovery_alias_arn}
+%{ endif ~}
 # Instance identity and stderr log target for the docker awslogs driver.
 # The docker --log-driver=awslogs flags in the systemd unit (below)
 # reference these at container start so runtime panics written to
