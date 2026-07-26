@@ -42,6 +42,9 @@ HUB_ROLLOUT_LEDGER_PATH = (
 CONTROL_LOCKFILE_PATH = (
     ROOT / "terraform/control/environments/sandbox/.terraform.lock.hcl"
 )
+PROD_CONTROL_VARIABLES_PATH = (
+    ROOT / "terraform/control/environments/prod/variables.tf"
+)
 EXPECTED_AWS_PROVIDER_VERSION = "6.55.0"
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
@@ -357,6 +360,24 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
         if service != "dynamodb":
             after["private_dns_enabled"] = True
         result[address] = (after, {})
+    for address in CHECKER.PROVISIONED_CELL_RESOURCES:
+        cell_id = address.rsplit('"', 2)[1]
+        result[address] = (
+            {
+                "hash_key": "pk",
+                "hash_key_value": "REGISTRY",
+                "id": (
+                    f"{CHECKER.PROVISIONED_CELL_TABLE_NAME}"
+                    f"|REGISTRY|CELL#{cell_id}"
+                ),
+                "item": CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id],
+                "range_key": "sk",
+                "range_key_value": f"CELL#{cell_id}",
+                "region": CHECKER.AWS_REGION,
+                "table_name": CHECKER.PROVISIONED_CELL_TABLE_NAME,
+            },
+            {},
+        )
     return result
 
 
@@ -479,6 +500,11 @@ def configuration_fixture() -> dict:
                     "references": references
                 }
                 continue
+            if path == ("for_each",):
+                by_address[address]["for_each_expression"] = {
+                    "references": references
+                }
+                continue
             set_expression_path(
                 by_address[address]["expressions"],
                 path,
@@ -575,6 +601,64 @@ def plan_fixture() -> dict:
         "resource_drift": [],
         "resource_changes": changes,
     }
+
+
+def provisioned_cell_catalog_transition_fixture() -> dict:
+    result = plan_fixture()
+    result["applyable"] = True
+    by_address = {
+        item["address"]: item["change"] for item in result["resource_changes"]
+    }
+    for address in CHECKER.PROVISIONED_CELL_RESOURCES:
+        cell_id = address.rsplit('"', 2)[1]
+        change = by_address[address]
+        change.update(
+            {
+                "actions": ["create"],
+                "before": None,
+                "after": {
+                    "hash_key": "pk",
+                    "item": CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id],
+                    "range_key": "sk",
+                    "region": CHECKER.AWS_REGION,
+                    "table_name": CHECKER.PROVISIONED_CELL_TABLE_NAME,
+                },
+                "after_unknown": {
+                    "hash_key_value": True,
+                    "id": True,
+                    "range_key_value": True,
+                },
+                "before_sensitive": False,
+                "after_sensitive": {},
+                "after_identity": {
+                    "account_id": None,
+                    "hash_key_value": None,
+                    "range_key_value": None,
+                    "region": None,
+                    "table_name": None,
+                },
+            }
+        )
+    result["planned_values"] = {
+        "outputs": {
+            "provisioned_cells": {
+                "sensitive": False,
+                "type": ["object", {}],
+                "value": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
+            }
+        }
+    }
+    result["output_changes"] = {
+        "provisioned_cells": {
+            "actions": ["create"],
+            "before": None,
+            "after": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
+            "after_unknown": False,
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+    }
+    return result
 
 
 def authority_enablement_drift_pair(candidate: dict) -> list[dict]:
@@ -1494,6 +1578,25 @@ def authority_enablement_refresh_candidate() -> tuple[dict, dict]:
 
 
 class PlanContractTests(unittest.TestCase):
+    def test_prod_catalog_remains_hard_locked_empty(self) -> None:
+        variables = PROD_CONTROL_VARIABLES_PATH.read_text(encoding="utf-8")
+        start = variables.index('variable "provisioned_cells" {')
+        end = variables.index(
+            'variable "authority_runtime_contract" {',
+            start,
+        )
+        catalog_block = variables[start:end]
+        self.assertIn("default = {}", catalog_block)
+        self.assertIn(
+            "condition     = length(var.provisioned_cells) == 0",
+            catalog_block,
+        )
+        self.assertIn(
+            "Production provisioned_cells must remain empty throughout "
+            "sandbox proof.",
+            catalog_block,
+        )
+
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(
             REAL_TERRAFORM_NOOP_FIXTURE_PATH.read_text(encoding="utf-8")
@@ -1503,11 +1606,11 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 50)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 52)
 
     def test_exact_noop_passes(self) -> None:
         summary = CHECKER.check_plan(plan_fixture())
-        self.assertEqual(summary["resource_count"], 50)
+        self.assertEqual(summary["resource_count"], 52)
         self.assertEqual(summary["plan_mode"], "no-op")
         unrefreshed = plan_fixture()
         unrefreshed_role = self.change(
@@ -1515,7 +1618,59 @@ class PlanContractTests(unittest.TestCase):
         )
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
-        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 50)
+        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 52)
+
+    def test_provisioned_cell_catalog_transition_is_exact_and_atomic(self) -> None:
+        exact = provisioned_cell_catalog_transition_fixture()
+        summary = CHECKER.check_plan(exact)
+        self.assertEqual(summary["plan_mode"], "provisioned-cell-catalog")
+        self.assertEqual(summary["resource_count"], 52)
+
+        cell0 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        )
+        cell1 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+
+        partial = provisioned_cell_catalog_transition_fixture()
+        partial_change = self.change(partial, cell1)
+        partial_change["actions"] = ["no-op"]
+        partial_change["after"] = copy.deepcopy(
+            planned_security_fixture()[cell1][0]
+        )
+        partial_change["before"] = copy.deepcopy(partial_change["after"])
+        partial_change["after_unknown"] = {}
+        self.assert_rejected(partial)
+
+        wrong_endpoint = provisioned_cell_catalog_transition_fixture()
+        wrong_item = json.loads(self.change(wrong_endpoint, cell0)["after"]["item"])
+        wrong_item["nhp_host"] = {"S": "attacker.example"}
+        self.change(wrong_endpoint, cell0)["after"]["item"] = json.dumps(
+            wrong_item, separators=(",", ":"), sort_keys=True
+        )
+        self.assert_rejected(wrong_endpoint)
+
+        unknown_key = provisioned_cell_catalog_transition_fixture()
+        self.change(unknown_key, cell0)["after_unknown"]["item"] = True
+        self.assert_rejected(unknown_key)
+
+        wrong_output = provisioned_cell_catalog_transition_fixture()
+        wrong_output["planned_values"]["outputs"]["provisioned_cells"]["value"][
+            "cell0"
+        ]["nhp_port"] = 443
+        self.assert_rejected(wrong_output)
+
+        combined = provisioned_cell_catalog_transition_fixture()
+        vpc = self.change(combined, "module.control.aws_vpc.control")
+        vpc["actions"] = ["update"]
+        vpc["before"] = copy.deepcopy(vpc["after"])
+        vpc["after"]["enable_dns_support"] = False
+        self.assert_rejected(combined)
+
+        destructive = provisioned_cell_catalog_transition_fixture()
+        self.change(destructive, cell0)["actions"] = ["delete"]
+        self.assert_rejected(destructive)
 
     def test_foundation_input_jsondecode_unknown_tolerance_boundary(self) -> None:
         # The enablement fixture carries the real after_unknown.input jsondecode
@@ -1604,7 +1759,7 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 50)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 52)
 
     def test_authority_enablement_benign_drift_pair_passes(self) -> None:
         # The REAL Step-3 enablement plan carries exactly two benign refresh-phase
@@ -1808,7 +1963,7 @@ class PlanContractTests(unittest.TestCase):
                 del change[side]["authentication_mode"][0]["passwords"]
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 50)
+        self.assertEqual(summary["resource_count"], 52)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_exact_refresh_disabled_password_null_passes(self) -> None:
@@ -1822,7 +1977,7 @@ class PlanContractTests(unittest.TestCase):
                 change[side]["authentication_mode"][0]["passwords"] = None
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 50)
+        self.assertEqual(summary["resource_count"], 52)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_passwordless_authentication_mode_boundary_is_exact(self) -> None:
@@ -3155,7 +3310,7 @@ class PlanContractTests(unittest.TestCase):
                 result = CHECKER.check_plan(
                     redis_split_transition_fixture(create_addresses)
                 )
-                self.assertEqual(result["resource_count"], 50)
+                self.assertEqual(result["resource_count"], 52)
                 self.assertEqual(result["plan_mode"], "redis-split-transition")
 
     def test_redis_iam_create_authentication_mode_matches_real_golden(self) -> None:
@@ -4007,6 +4162,26 @@ class PlanContractTests(unittest.TestCase):
         ]
         self.assert_rejected(local_exec)
 
+        external_catalog = plan_fixture()
+        catalog_resource = self.configuration_resource(
+            external_catalog,
+            "module.control.aws_dynamodb_table_item.provisioned_cell",
+        )
+        catalog_resource["for_each_expression"] = {
+            "references": ["var.unreviewed_cells"]
+        }
+        self.assert_rejected(external_catalog)
+
+        derived_item = plan_fixture()
+        catalog_resource = self.configuration_resource(
+            derived_item,
+            "module.control.aws_dynamodb_table_item.provisioned_cell",
+        )
+        catalog_resource["expressions"]["item"] = {
+            "references": ["local.derived_endpoint"]
+        }
+        self.assert_rejected(derived_item)
+
     def test_external_topology_and_key_reference_substitutions_fail(self) -> None:
         mutations = (
             (
@@ -4286,7 +4461,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 6, "managed_resource_count": 50},
+            {"data_resource_count": 6, "managed_resource_count": 52},
         )
 
     def test_missing_managed_or_data_address_fails(self) -> None:
@@ -4313,7 +4488,7 @@ class StateListTests(unittest.TestCase):
         runtime = [*self.expected_addresses(), *CHECKER.AUTHORITY_RUNTIME_RESOURCES]
         self.assertEqual(
             self.check(runtime),
-            {"data_resource_count": 6, "managed_resource_count": 75},
+            {"data_resource_count": 6, "managed_resource_count": 77},
         )
         # A partial runtime inventory (missing one runtime resource) fails closed.
         partial = [
@@ -4339,7 +4514,7 @@ class StateListTests(unittest.TestCase):
             {
                 "data_resource_count": 6 + len(worker_data),
                 "managed_resource_count": (
-                    50
+                    52
                     + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
                     + len(CHECKER.HUB_EDGE_RESOURCES)
                     + len(worker_managed)
@@ -4373,6 +4548,10 @@ def state_fixture() -> dict:
         for address, resource_type in CHECKER.EXPECTED_RESOURCES.items()
     ]
     by_address = {item["address"]: item["values"] for item in resources}
+    planned_security = planned_security_fixture()
+    for address in CHECKER.PROVISIONED_CELL_RESOURCES:
+        by_address[address].clear()
+        by_address[address].update(copy.deepcopy(planned_security[address][0]))
     runtime_input = authority_runtime_input_fixture()
     by_address["module.control.terraform_data.foundation_contract"].clear()
     by_address["module.control.terraform_data.foundation_contract"].update(
@@ -4613,7 +4792,12 @@ def state_fixture() -> dict:
                     "sensitive": False,
                     "type": "string",
                     "value": runtime_input["authority_image_uri"],
-                }
+                },
+                "provisioned_cells": {
+                    "sensitive": False,
+                    "type": ["object", {}],
+                    "value": copy.deepcopy(CHECKER.PROVISIONED_CELL_CATALOG),
+                },
             },
             "root_module": {"resources": resources},
         }
@@ -4649,15 +4833,60 @@ class StateContractTests(unittest.TestCase):
         # Update only with an intentional, reviewed address/type inventory change.
         self.assertEqual(
             CHECKER.contract_sha256(),
-            "193c698ff4ff5a1c8192c87581493021b015e1d84630d0b7af0defec261507ac",
+            "95e23d7d3b27622823f59bd6a546f8cc0f5a7a64a7222715490462c2e56c4705",
         )
 
     def test_exact_state_passes(self) -> None:
-        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 50)
+        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 52)
+
+    def test_state_rejects_catalog_row_or_public_output_drift(self) -> None:
+        missing_row = state_fixture()
+        missing_row["values"]["root_module"]["resources"] = [
+            item
+            for item in missing_row["values"]["root_module"]["resources"]
+            if item["address"]
+            != 'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        ]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "refreshed state inventory mismatch"
+        ):
+            CHECKER.check_state(missing_row)
+
+        row_drift = state_fixture()
+        resources = row_drift["values"]["root_module"]["resources"]
+        by_address = {item["address"]: item["values"] for item in resources}
+        cell0 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        )
+        item = json.loads(by_address[cell0]["item"])
+        item["server_public_key_b64"] = {
+            "S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }
+        by_address[cell0]["item"] = json.dumps(
+            item, separators=(",", ":"), sort_keys=True
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(row_drift)
+
+        output_drift = state_fixture()
+        output_drift["values"]["outputs"]["provisioned_cells"]["value"]["cell1"][
+            "nhp_host"
+        ] = "cell0.nhp.layerv.xyz"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(output_drift)
+
+        identity_drift = state_fixture()
+        resources = identity_drift["values"]["root_module"]["resources"]
+        by_address = {item["address"]: item["values"] for item in resources}
+        by_address[cell0]["id"] = (
+            f"{CHECKER.PROVISIONED_CELL_TABLE_NAME}|REGISTRY|CELL#cell1"
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(identity_drift)
 
     def test_exact_runtime_state_passes(self) -> None:
         self.assertEqual(
-            CHECKER.check_state(state_fixture_runtime())["resource_count"], 75
+            CHECKER.check_state(state_fixture_runtime())["resource_count"], 77
         )
 
     def test_runtime_state_rejects_still_dark_dependency_endpoint(self) -> None:

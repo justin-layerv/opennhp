@@ -6,6 +6,34 @@ locals {
     api_key_idempotency = "${local.control_table_prefix}-qurl-apikey-idempotency"
     connector_authority = "${local.control_table_prefix}-connector-authority"
   }
+
+  provisioned_cell_catalog = {
+    for cell_id, cell in var.provisioned_cells : cell_id => {
+      cell_id               = cell.cell_id
+      status                = cell.status
+      endpoint_revision     = cell.endpoint_revision
+      nhp_host              = cell.nhp_host
+      nhp_port              = cell.nhp_port
+      server_public_key_b64 = cell.server_public_key_b64
+      selection_weight      = tostring(tonumber(cell.selection_weight))
+      updated_at            = cell.updated_at
+    }
+  }
+
+  provisioned_cell_dynamodb_items = {
+    for cell_id, cell in local.provisioned_cell_catalog : cell_id => {
+      pk                    = { S = "REGISTRY" }
+      sk                    = { S = "CELL#${cell_id}" }
+      cell_id               = { S = cell.cell_id }
+      status                = { S = cell.status }
+      endpoint_revision     = { N = tostring(cell.endpoint_revision) }
+      nhp_host              = { S = cell.nhp_host }
+      nhp_port              = { N = tostring(cell.nhp_port) }
+      server_public_key_b64 = { S = cell.server_public_key_b64 }
+      selection_weight      = { N = cell.selection_weight }
+      updated_at            = { S = cell.updated_at }
+    }
+  }
 }
 
 resource "aws_dynamodb_table" "api_keys" {
@@ -216,4 +244,23 @@ resource "aws_dynamodb_table" "connector_authority" {
     Name    = local.control_table_names.connector_authority
     Purpose = "Global Connector cell registry and assignment authority"
   })
+}
+
+# Terraform owns only the low-churn provisioned-cell registry partition.
+# Authority runtimes own assignments, claims, counters, and replay rows. The
+# explicit AttributeValue projection is the exact qurl-service repository
+# contract; no SDK or Hub derives an endpoint from cell_id.
+resource "aws_dynamodb_table_item" "provisioned_cell" {
+  for_each = local.provisioned_cell_dynamodb_items
+
+  table_name = aws_dynamodb_table.connector_authority.name
+  hash_key   = aws_dynamodb_table.connector_authority.hash_key
+  range_key  = aws_dynamodb_table.connector_authority.range_key
+  item       = jsonencode(each.value)
+
+  lifecycle {
+    # Removing a catalog entry must first drain and explicitly migrate durable
+    # assignments. A normal Terraform edit may never delete the row.
+    prevent_destroy = true
+  }
 }

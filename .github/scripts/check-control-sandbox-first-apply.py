@@ -234,6 +234,7 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "otp_redis_issuer_user_arn",
         "otp_redis_issuer_user_id",
         "otp_redis_user_group_id",
+        "provisioned_cells",
         "qat1_signing_kms_key_arn",
         "ses_identity_arn",
         "vpc_id",
@@ -309,6 +310,73 @@ _DRIFT_IDENTITY_FIELD_MAX_JSON_CHARS = 2_048
 _DRIFT_DIAGNOSTIC_MAX_CHARS = 7_500
 _DRIFT_IDENTITY_FIELDS = ("address", "mode", "type")
 
+# The public identities below were read back from each live cell producer:
+# cell1's Terraform 1.14.3 output and a readback emitting only the server
+# secret's publicKey field agree on the exact key and FQDN; cell0's equivalent
+# public-key readback agrees with its
+# previously recorded fleet invariant. cell1 is deliberately non-assignable.
+#
+# updated_at is a deterministic mutation revision included in qurl-service's
+# optimistic cell fence. Change it with every reviewed row mutation; never
+# derive it from wall-clock plan/apply time.
+# selection_weight mirrors Terraform's tostring(tonumber(...)) stored spelling,
+# not a noncanonical form accepted only at the module input.
+PROVISIONED_CELL_CATALOG = {
+    "cell0": {
+        "cell_id": "cell0",
+        "status": "active",
+        "endpoint_revision": 1,
+        "nhp_host": "cell0.nhp.layerv.xyz",
+        "nhp_port": 62206,
+        "server_public_key_b64": "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8=",
+        "selection_weight": "1",
+        "updated_at": "2026-07-25T00:00:00Z",
+    },
+    "cell1": {
+        "cell_id": "cell1",
+        "status": "disabled",
+        "endpoint_revision": 1,
+        "nhp_host": "cell1.nhp.layerv.xyz",
+        "nhp_port": 62206,
+        "server_public_key_b64": "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=",
+        "selection_weight": "1",
+        "updated_at": "2026-07-25T00:00:00Z",
+    },
+}
+PROVISIONED_CELL_DYNAMODB_ITEMS = {
+    cell_id: {
+        "pk": {"S": "REGISTRY"},
+        "sk": {"S": f"CELL#{cell_id}"},
+        "cell_id": {"S": cell["cell_id"]},
+        "status": {"S": cell["status"]},
+        "endpoint_revision": {"N": str(cell["endpoint_revision"])},
+        "nhp_host": {"S": cell["nhp_host"]},
+        "nhp_port": {"N": str(cell["nhp_port"])},
+        "server_public_key_b64": {"S": cell["server_public_key_b64"]},
+        "selection_weight": {"N": cell["selection_weight"]},
+        "updated_at": {"S": cell["updated_at"]},
+    }
+    for cell_id, cell in PROVISIONED_CELL_CATALOG.items()
+}
+PROVISIONED_CELL_ADDRESSES = {
+    cell_id: f'module.control.aws_dynamodb_table_item.provisioned_cell["{cell_id}"]'
+    for cell_id in PROVISIONED_CELL_CATALOG
+}
+PROVISIONED_CELL_RESOURCES = {
+    address: "aws_dynamodb_table_item"
+    for address in PROVISIONED_CELL_ADDRESSES.values()
+}
+PROVISIONED_CELL_ID_BY_ADDRESS = {
+    address: cell_id for cell_id, address in PROVISIONED_CELL_ADDRESSES.items()
+}
+# Canonical serialized item is fixed per cell; serialize once at import rather
+# than on every plan/state validation call.
+PROVISIONED_CELL_EXPECTED_ITEM_JSON = {
+    cell_id: json.dumps(item, separators=(",", ":"), sort_keys=True)
+    for cell_id, item in PROVISIONED_CELL_DYNAMODB_ITEMS.items()
+}
+PROVISIONED_CELL_TABLE_NAME = f"{CONTROL_PREFIX}-connector-authority"
+
 EXPECTED_RESOURCES = {
     "module.control.aws_cloudwatch_log_group.flow_logs": "aws_cloudwatch_log_group",
     "module.control.aws_default_security_group.control": "aws_default_security_group",
@@ -317,6 +385,7 @@ EXPECTED_RESOURCES = {
     "module.control.aws_dynamodb_table.api_keys": "aws_dynamodb_table",
     "module.control.aws_dynamodb_table.connector_authority": "aws_dynamodb_table",
     "module.control.aws_dynamodb_table.customers": "aws_dynamodb_table",
+    **PROVISIONED_CELL_RESOURCES,
     "module.control.aws_ecr_lifecycle_policy.hub": "aws_ecr_lifecycle_policy",
     "module.control.aws_ecr_repository.authority": "aws_ecr_repository",
     "module.control.aws_ecr_repository.hub": "aws_ecr_repository",
@@ -1094,6 +1163,22 @@ EXPECTED_CONFIGURATION_RESOURCES.update(HUB_WORKER_CONFIGURATION_RESOURCES)
 
 ExpressionPath = tuple[str | int, ...]
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
+    "module.control.aws_dynamodb_table_item.provisioned_cell": {
+        ("for_each",): ["local.provisioned_cell_dynamodb_items"],
+        ("table_name",): [
+            "aws_dynamodb_table.connector_authority.name",
+            "aws_dynamodb_table.connector_authority",
+        ],
+        ("hash_key",): [
+            "aws_dynamodb_table.connector_authority.hash_key",
+            "aws_dynamodb_table.connector_authority",
+        ],
+        ("range_key",): [
+            "aws_dynamodb_table.connector_authority.range_key",
+            "aws_dynamodb_table.connector_authority",
+        ],
+        ("item",): ["each.value"],
+    },
     "module.control.data.aws_ssm_parameter.authority_runtime_digest": {
         ("count",): ["local.authority_runtime_contract_enabled"],
         ("name",): [
@@ -1715,6 +1800,11 @@ def _check_configuration_security(
         count_expression = resources[address].get("count_expression", _MISSING)
         if count_expression is not _MISSING:
             normalized["count"] = count_expression
+        for_each_expression = resources[address].get(
+            "for_each_expression", _MISSING
+        )
+        if for_each_expression is not _MISSING:
+            normalized["for_each"] = for_each_expression
         return normalized
 
     for address, paths in CONFIG_REFERENCE_CONTRACT.items():
@@ -1758,6 +1848,101 @@ def _require_fields(
     if mismatches:
         raise ContractError(
             f"{address} {label} security fields differ: {sorted(mismatches)}"
+        )
+
+
+def _require_provisioned_cell_values(
+    values: Any,
+    unknown: Any,
+    address: str,
+    *,
+    create: bool,
+) -> None:
+    """Pin every catalog row to its exact producer-owned UDP endpoint contract."""
+    cell_id = PROVISIONED_CELL_ID_BY_ADDRESS.get(address)
+    if cell_id is None or not isinstance(values, dict) or not isinstance(unknown, dict):
+        raise ContractError(f"{address} provisioned-cell values are malformed")
+
+    expected_item = PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id]
+    expected = {
+        "hash_key": "pk",
+        "item": expected_item,
+        "range_key": "sk",
+        "region": AWS_REGION,
+        "table_name": PROVISIONED_CELL_TABLE_NAME,
+    }
+    _require_fields(values, expected, address)
+
+    if create:
+        # The sandbox Control root currently pins hashicorp/aws 6.55.0. A
+        # provider upgrade must re-prove this exact create envelope from a real
+        # reviewed plan before changing the trusted checker.
+        if set(values) != set(expected):
+            raise ContractError(
+                f"{address} create values contain an unexpected field set"
+            )
+        if unknown != {
+            "hash_key_value": True,
+            "id": True,
+            "range_key_value": True,
+        }:
+            raise ContractError(
+                f"{address} create unknown-value envelope is not exact"
+            )
+        return
+
+    if set(values) != {
+        *expected,
+        "hash_key_value",
+        "id",
+        "range_key_value",
+    }:
+        raise ContractError(f"{address} steady values contain an unexpected field set")
+    if (
+        values.get("hash_key_value") != "REGISTRY"
+        or values.get("range_key_value") != f"CELL#{cell_id}"
+        or values.get("id")
+        != f"{PROVISIONED_CELL_TABLE_NAME}|REGISTRY|CELL#{cell_id}"
+        or unknown != {}
+    ):
+        raise ContractError(f"{address} steady key identity is not exact")
+
+
+def _require_provisioned_cell_create_output(plan: dict[str, Any]) -> None:
+    """Bind the catalog-row create to the exact public Control output."""
+    planned_values = plan.get("planned_values")
+    outputs = (
+        planned_values.get("outputs")
+        if isinstance(planned_values, dict)
+        else None
+    )
+    output = outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
+    if (
+        not _is_exact_nonsensitive_output_entry(output)
+        or output.get("value") != PROVISIONED_CELL_CATALOG
+    ):
+        raise ContractError(
+            "provisioned-cell create must expose the exact nonsensitive catalog output"
+        )
+
+    output_changes = plan.get("output_changes")
+    change = (
+        output_changes.get("provisioned_cells")
+        if isinstance(output_changes, dict)
+        else None
+    )
+    if (
+        not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["create"]
+        or change.get("before") is not None
+        or change.get("after") != PROVISIONED_CELL_CATALOG
+        or change.get("after_unknown") is not False
+        or change.get("before_sensitive") is not False
+        or change.get("after_sensitive") is not False
+    ):
+        raise ContractError(
+            "provisioned-cell create output change is not the exact public contract"
         )
 
 
@@ -2038,6 +2223,31 @@ def _check_planned_security(
     )
     enabled = _require_authority_runtime_binding(foundation)
     _require_foundation_input_known(foundation_unknown, enabled=enabled)
+    for address in PROVISIONED_CELL_RESOURCES:
+        item, item_unknown = values(address)
+        change = by_address[address]["change"]
+        create = change.get("actions") == ["create"]
+        _require_provisioned_cell_values(
+            item,
+            item_unknown,
+            address,
+            create=create,
+        )
+        if create and (
+            change.get("before_sensitive") is not False
+            or change.get("after_sensitive") != {}
+            or change.get("after_identity")
+            != {
+                "account_id": None,
+                "hash_key_value": None,
+                "range_key_value": None,
+                "region": None,
+                "table_name": None,
+            }
+        ):
+            raise ContractError(
+                f"{address} create metadata envelope is not exact"
+            )
     # Keep the complete provider-version-specific no-op shape visible here as
     # literals rather than deriving its dimensions independently. The empty-
     # string / zero IPv6 values below are the exact no-op shape emitted by the
@@ -3944,6 +4154,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             by_address[authority_contract_address]["change"].get("after", {})
         )
     )
+    provisioned_cell_catalog_transition = (
+        changed == set(PROVISIONED_CELL_RESOURCES)
+        and all(
+            actual_non_noop.get(address) == ["create"]
+            for address in PROVISIONED_CELL_RESOURCES
+        )
+    )
     # The runtime slice: every runtime resource is created and exactly the three
     # dependency-endpoint/SG opens are updated. This admits BOTH the clean full
     # slice AND a partial-apply RETRY. A create that already succeeded on an
@@ -4155,6 +4372,10 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             )
     elif authority_contract_transition:
         plan_mode = "authority-contract-binding"
+    elif provisioned_cell_catalog_transition:
+        plan_mode = "provisioned-cell-catalog"
+        _require_create_shapes(changed, by_address)
+        _require_provisioned_cell_create_output(plan)
     elif authority_runtime_transition:
         plan_mode = "authority-runtime-slice"
         # Only the still-pending creates must present a pure-create shape; any
@@ -4187,7 +4408,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
-            "contract binding, the exact Authority runtime slice, the exact "
+            "contract binding, the exact provisioned-cell catalog create, the exact "
+            "Authority runtime slice, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction; "
             f"got {actual_non_noop}"
@@ -4609,6 +4831,13 @@ def check_state(state: Any) -> dict[str, Any]:
     foundation = values["module.control.terraform_data.foundation_contract"]
     if not _require_authority_runtime_binding(foundation):
         raise ContractError("refreshed state is missing the Authority runtime binding")
+    for address in PROVISIONED_CELL_RESOURCES:
+        _require_provisioned_cell_values(
+            values[address],
+            {},
+            address,
+            create=False,
+        )
     outputs = values_root.get("outputs")
     authority_image_output = (
         outputs.get("authority_image_uri") if isinstance(outputs, dict) else None
@@ -4619,6 +4848,16 @@ def check_state(state: Any) -> dict[str, Any]:
         != foundation["input"]["authority_image_uri"]
     ):
         raise ContractError("refreshed state Authority image URI output is not exact")
+    catalog_output = (
+        outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
+    )
+    if (
+        not _is_exact_nonsensitive_output_entry(catalog_output)
+        or catalog_output.get("value") != PROVISIONED_CELL_CATALOG
+    ):
+        raise ContractError(
+            "refreshed state provisioned-cell catalog output is not exact"
+        )
     vpc_id = values["module.control.aws_vpc.control"].get("id")
     if (
         not re.fullmatch(r"vpc-[0-9a-f]+", str(vpc_id))

@@ -24,6 +24,11 @@ output "control_table_arns" {
   }
 }
 
+output "provisioned_cells" {
+  description = "Validated public native-UDP cell catalog projection. Consumers must use nhp_host/nhp_port verbatim and authenticate server_public_key_b64."
+  value       = local.provisioned_cell_catalog
+}
+
 output "authority_runtime_contract" {
   description = "Validated nullable version-1 Authority runtime contract. The exact-main generator is the only supported non-null sandbox caller."
   value       = var.authority_runtime_contract

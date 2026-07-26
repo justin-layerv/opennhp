@@ -51,6 +51,127 @@ variable "ses_configuration_set_name" {
   }
 }
 
+variable "provisioned_cells" {
+  description = <<-EOT
+    Canonical environment-global native-UDP cell catalog. The map key is the
+    public cell_id and must match the embedded cell_id. Terraform owns these
+    low-churn registry rows; runtime assignment state remains Authority-owned.
+    qurl-service's placement repository exposes only GetItem/Query for catalog
+    rows, while registration and recovery transactions bind them with
+    ConditionCheck rather than writing them. Adding any runtime catalog writer
+    requires an ownership redesign before rollout.
+    Public NHP endpoints are opaque authority data and must never be derived
+    from cell_id by an SDK, Hub, or caller.
+
+    updated_at is a deterministic, checked-in mutation revision, not wall-clock
+    apply time. Change it in the same review as every row mutation. It is part
+    of qurl-service's optimistic cell fence, so timestamp() or another
+    per-plan value would create perpetual drift and invalidate in-flight work.
+
+    Terraform verifies the server key's canonical padded-base64 wire shape and
+    rejects the all-zero placeholder. The cell producer remains authoritative
+    for the actual X25519 identity; qurl-service independently performs
+    canonical-field and low-order X25519 validation on every registry read.
+  EOT
+  type = map(object({
+    cell_id               = string
+    status                = string
+    endpoint_revision     = number
+    nhp_host              = string
+    nhp_port              = number
+    server_public_key_b64 = string
+    selection_weight      = string
+    updated_at            = string
+  }))
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for cell_id, cell in var.provisioned_cells :
+      cell.cell_id == cell_id &&
+      length(cell_id) <= 32 &&
+      can(regex("^[a-z0-9]+(?:-[a-z0-9]+)*$", cell_id))
+    ])
+    error_message = "Each provisioned_cells key must equal its embedded cell_id and use the canonical 1-32 byte lowercase alphanumeric/hyphen grammar."
+  }
+
+  validation {
+    condition = alltrue([
+      for cell in values(var.provisioned_cells) :
+      contains(["active", "draining", "disabled"], cell.status) &&
+      cell.endpoint_revision >= 1 &&
+      floor(cell.endpoint_revision) == cell.endpoint_revision &&
+      cell.endpoint_revision <= 9223372036854775807
+    ])
+    error_message = "Each provisioned cell needs an active, draining, or disabled status and a positive integer endpoint_revision that fits qurl-service's signed int64 runtime contract."
+  }
+
+  validation {
+    condition = alltrue([
+      for cell in values(var.provisioned_cells) :
+      cell.nhp_host == lower(trimspace(cell.nhp_host)) &&
+      length(cell.nhp_host) <= 253 &&
+      can(regex("^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+nhp\\.layerv\\.(ai|xyz)$", cell.nhp_host)) &&
+      !contains(["internal", "localhost", "metadata", "private"], split(".", cell.nhp_host)[0]) &&
+      cell.nhp_port == 62206
+    ])
+    error_message = "Each nhp_host must be a canonical LayerV-owned public DNS name under nhp.layerv.ai or nhp.layerv.xyz, must not use a private or metadata first label, and nhp_port must be UDP 62206."
+  }
+
+  validation {
+    condition = (
+      length(distinct([
+        for cell in values(var.provisioned_cells) :
+        "${cell.nhp_host}:${cell.nhp_port}"
+      ])) == length(var.provisioned_cells) &&
+      length(distinct([
+        for cell in values(var.provisioned_cells) :
+        cell.server_public_key_b64
+      ])) == length(var.provisioned_cells)
+    )
+    error_message = "Provisioned cells must not duplicate a public UDP endpoint or server public key."
+  }
+
+  validation {
+    condition = alltrue([
+      for cell in values(var.provisioned_cells) :
+      can(regex("^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", cell.server_public_key_b64)) &&
+      cell.server_public_key_b64 != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    ])
+    error_message = "Each server_public_key_b64 must have the canonical padded standard-base64 shape of a 32-byte producer key and must not be the all-zero placeholder; qurl-service performs the cryptographic X25519 validation at runtime."
+  }
+
+  validation {
+    # The Control roots pin Terraform 1.14.x: this relies on that toolchain's
+    # tonumber/tostring expansion of exponents into canonical decimal values.
+    # Re-prove the exponent-boundary fixtures before changing the version pin.
+    # DynamoDB trims leading and trailing zeros, so trim both before enforcing
+    # its 38-significant-digit ceiling.
+    condition = alltrue([
+      for cell in values(var.provisioned_cells) :
+      length(cell.selection_weight) <= 256 &&
+      can(regex("^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$", cell.selection_weight)) &&
+      try(tonumber(cell.selection_weight) >= tonumber("1E-130"), false) &&
+      try(tonumber(cell.selection_weight) <= tonumber("9.9999999999999999999999999999999999999E+125"), false) &&
+      try(length(regexall("[eE]", tostring(tonumber(cell.selection_weight)))) == 0, false) &&
+      try(
+        length(trim(replace(tostring(tonumber(cell.selection_weight)), ".", ""), "0")) <= 38,
+        false,
+      )
+    ])
+    error_message = "Each selection_weight must be a positive DynamoDB Number with at most 38 significant digits and an adjusted exponent from -130 through +125."
+  }
+
+  validation {
+    condition = alltrue([
+      for cell in values(var.provisioned_cells) :
+      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$", cell.updated_at)) &&
+      try(timecmp(cell.updated_at, cell.updated_at) == 0, false)
+    ])
+    error_message = "Each updated_at must be a valid canonical UTC RFC3339 timestamp."
+  }
+}
+
 variable "authority_runtime_functions_enabled" {
   description = <<-EOT
     Second, independent enable gate for the Connector Authority Lambda runtime

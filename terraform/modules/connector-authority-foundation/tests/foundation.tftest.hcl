@@ -358,6 +358,425 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
   }
 }
 
+run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "disabled"
+        endpoint_revision     = 1
+        nhp_host              = "cell1.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  assert {
+    condition     = toset(keys(aws_dynamodb_table_item.provisioned_cell)) == toset(["cell0", "cell1"])
+    error_message = "The catalog must project exactly one Terraform-owned row for cell0 and cell1."
+  }
+
+  assert {
+    condition = jsondecode(aws_dynamodb_table_item.provisioned_cell["cell0"].item) == {
+      pk                    = { S = "REGISTRY" }
+      sk                    = { S = "CELL#cell0" }
+      cell_id               = { S = "cell0" }
+      status                = { S = "active" }
+      endpoint_revision     = { N = "1" }
+      nhp_host              = { S = "cell0.nhp.layerv.xyz" }
+      nhp_port              = { N = "62206" }
+      server_public_key_b64 = { S = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8=" }
+      selection_weight      = { N = "1" }
+      updated_at            = { S = "2026-07-25T00:00:00Z" }
+    }
+    error_message = "cell0 must use the exact qurl-service DynamoDB AttributeValue schema and reviewed producer values."
+  }
+
+  assert {
+    condition = jsondecode(aws_dynamodb_table_item.provisioned_cell["cell1"].item) == {
+      pk                    = { S = "REGISTRY" }
+      sk                    = { S = "CELL#cell1" }
+      cell_id               = { S = "cell1" }
+      status                = { S = "disabled" }
+      endpoint_revision     = { N = "1" }
+      nhp_host              = { S = "cell1.nhp.layerv.xyz" }
+      nhp_port              = { N = "62206" }
+      server_public_key_b64 = { S = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=" }
+      selection_weight      = { N = "1" }
+      updated_at            = { S = "2026-07-25T00:00:00Z" }
+    }
+    error_message = "cell1 must use the exact qurl-service DynamoDB AttributeValue schema, remain disabled, and preserve the reviewed producer endpoint values."
+  }
+
+  assert {
+    condition = output.provisioned_cells == {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "disabled"
+        endpoint_revision     = 1
+        nhp_host              = "cell1.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+    error_message = "The public catalog projection must preserve the reviewed opaque endpoint and responder identity values."
+  }
+}
+
+run "catalog_rejects_mismatched_cell_identity" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell1"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_accepts_draining_status" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "draining"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  assert {
+    condition = (
+      output.provisioned_cells.cell0.status == "draining" &&
+      jsondecode(aws_dynamodb_table_item.provisioned_cell["cell0"].item).status.S == "draining"
+    )
+    error_message = "A draining cell must remain a valid persisted lifecycle state."
+  }
+}
+
+run "catalog_rejects_unknown_status" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "enabled"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_endpoint_revision_outside_runtime_int64" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 9223372036854775808
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_semantically_invalid_timestamp" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-13-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_reserved_private_host_label" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "metadata.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_duplicate_endpoint_and_server_identity" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_cloud_endpoint_zero_key_and_bad_timestamp" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "internal-nlb.elb.us-east-2.amazonaws.com"
+        nhp_port              = 62206
+        server_public_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        selection_weight      = "1"
+        updated_at            = "not-a-timestamp"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_accepts_and_canonicalizes_dynamodb_number_boundaries" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1E-130"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "disabled"
+        endpoint_revision     = 1
+        nhp_host              = "cell1.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+        selection_weight      = "9.9999999999999999999999999999999999999E+125"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  assert {
+    condition = (
+      !can(regex("[eE]", output.provisioned_cells.cell0.selection_weight)) &&
+      !can(regex("[eE]", output.provisioned_cells.cell1.selection_weight)) &&
+      output.provisioned_cells.cell0.selection_weight == tostring(tonumber("1E-130")) &&
+      jsondecode(aws_dynamodb_table_item.provisioned_cell["cell0"].item).selection_weight.N == tostring(tonumber("1E-130")) &&
+      output.provisioned_cells.cell1.selection_weight == tostring(tonumber("9.9999999999999999999999999999999999999E+125")) &&
+      jsondecode(aws_dynamodb_table_item.provisioned_cell["cell1"].item).selection_weight.N == tostring(tonumber("9.9999999999999999999999999999999999999E+125"))
+    )
+    error_message = "DynamoDB boundary weights must be accepted and emitted in Terraform's canonical fixed spelling."
+  }
+}
+
+run "catalog_rejects_dynamodb_number_overprecision" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "12345678901234567890123456789012345678.1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
+run "catalog_rejects_dynamodb_number_exponent_outside_domain" {
+  command = plan
+
+  variables {
+    environment                = "sandbox"
+    aws_account_id             = "767397897469"
+    vpc_cidr                   = "10.102.0.0/16"
+    otp_email_from             = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1E-131"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    }
+  }
+
+  expect_failures = [var.provisioned_cells]
+}
+
 run "production_tables_are_deletion_protected" {
   command = plan
 

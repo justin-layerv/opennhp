@@ -48,6 +48,26 @@ variable "ses_configuration_set_name" {
   default = "layerv-nhp-prod-agent-otp"
 }
 
+variable "provisioned_cells" {
+  description = "Production cell catalog remains empty throughout sandbox proof."
+  type = map(object({
+    cell_id               = string
+    status                = string
+    endpoint_revision     = number
+    nhp_host              = string
+    nhp_port              = number
+    server_public_key_b64 = string
+    selection_weight      = string
+    updated_at            = string
+  }))
+  default = {}
+
+  validation {
+    condition     = length(var.provisioned_cells) == 0
+    error_message = "Production provisioned_cells must remain empty throughout sandbox proof."
+  }
+}
+
 variable "authority_runtime_contract" {
   description = "Production Connector Authority runtime contract. It remains unconditionally null throughout sandbox measurement."
   type        = any

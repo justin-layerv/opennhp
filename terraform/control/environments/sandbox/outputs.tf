@@ -6,6 +6,10 @@ output "control_table_names" {
   value = module.control.control_table_names
 }
 
+output "provisioned_cells" {
+  value = module.control.provisioned_cells
+}
+
 output "vpc_id" {
   value = module.control.vpc_id
 }

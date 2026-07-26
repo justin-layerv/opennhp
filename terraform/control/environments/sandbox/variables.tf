@@ -48,6 +48,68 @@ variable "ses_configuration_set_name" {
   default = "layerv-nhp-sandbox-agent-otp"
 }
 
+variable "provisioned_cells" {
+  description = "Exact reviewed sandbox native-UDP cell catalog. cell0 is assignable; cell1 remains disabled until its attended readiness gate. Endpoint identities are pinned from live cell producer output/readback; no Control caller derives them. updated_at is the deterministic catalog mutation revision and must change in the same review as every row mutation."
+  type = map(object({
+    cell_id               = string
+    status                = string
+    endpoint_revision     = number
+    nhp_host              = string
+    nhp_port              = number
+    server_public_key_b64 = string
+    selection_weight      = string
+    updated_at            = string
+  }))
+  default = {
+    cell0 = {
+      cell_id               = "cell0"
+      status                = "active"
+      endpoint_revision     = 1
+      nhp_host              = "cell0.nhp.layerv.xyz"
+      nhp_port              = 62206
+      server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+      selection_weight      = "1"
+      updated_at            = "2026-07-25T00:00:00Z"
+    }
+    cell1 = {
+      cell_id               = "cell1"
+      status                = "disabled"
+      endpoint_revision     = 1
+      nhp_host              = "cell1.nhp.layerv.xyz"
+      nhp_port              = 62206
+      server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+      selection_weight      = "1"
+      updated_at            = "2026-07-25T00:00:00Z"
+    }
+  }
+
+  validation {
+    condition = jsonencode(var.provisioned_cells) == jsonencode({
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "disabled"
+        endpoint_revision     = 1
+        nhp_host              = "cell1.nhp.layerv.xyz"
+        nhp_port              = 62206
+        server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+    })
+    error_message = "The sandbox catalog must contain exactly active cell0 and disabled cell1 with the reviewed producer values; update this validation in the same review as any attended lifecycle or endpoint revision."
+  }
+}
+
 variable "authority_runtime_contract" {
   description = "Nullable closed Connector Authority runtime contract. The permanent workflow supplies the only supported non-null value through its exact-main byte-verifying generator."
   type        = any
