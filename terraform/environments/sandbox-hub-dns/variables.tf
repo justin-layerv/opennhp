@@ -29,7 +29,12 @@ variable "hosted_zone_id" {
 variable "hub_nlb_name" {
   description = "Name of the Connector Hub public UDP NLB to alias (discovered by data source)."
   type        = string
-  default     = "layerv-nhp-sandbox-control-hub"
+  default     = "layerv-nhp-sandbox-hub-edge"
+
+  validation {
+    condition     = var.hub_nlb_name == "layerv-nhp-sandbox-hub-edge"
+    error_message = "Sandbox proof DNS must target exactly the source-fenced Hub NLB."
+  }
 }
 
 variable "cell0_dns_name" {
@@ -41,7 +46,12 @@ variable "cell0_dns_name" {
 variable "cell0_nlb_name" {
   description = "Name of the cell0 public UDP:62206 server NLB to alias (discovered by data source)."
   type        = string
-  default     = "layerv-nhp-sandbox-nlb"
+  default     = "layerv-nhp-sandbox-edge"
+
+  validation {
+    condition     = var.cell0_nlb_name == "layerv-nhp-sandbox-edge"
+    error_message = "Sandbox proof DNS must target exactly the source-fenced cell0 NLB."
+  }
 }
 
 variable "tags" {

@@ -1,5 +1,5 @@
 output "stable_source_cidr" {
-  description = "The runner's persistent EIP as a /32 — the reviewable source for Hub/cell UDP-62206 ingress (currently a no-op: those edges are 0.0.0.0/0)."
+  description = "The runner's persistent EIP as a /32 — the sole public source admitted by the Hub/cell UDP-62206 NLB security groups."
   value       = module.udp_proof_runner.stable_source_cidr
 }
 

@@ -269,6 +269,7 @@ run "hub_worker_dark_creates_nothing" {
   # the worker gate is off: the module must still create ZERO worker resources.
   variables {
     hub_edge_enabled                    = true
+    hub_public_udp_ingress_cidrs        = ["3.141.109.76/32"]
     authority_runtime_functions_enabled = true
     hub_worker_enabled                  = false
   }
@@ -315,6 +316,7 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
 
   variables {
     hub_edge_enabled                    = true
+    hub_public_udp_ingress_cidrs        = ["3.141.109.76/32"]
     authority_runtime_functions_enabled = true
     hub_worker_enabled                  = true
   }
@@ -356,6 +358,13 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
     }
   }
   override_resource {
+    target          = aws_security_group.hub_nlb[0]
+    override_during = plan
+    values = {
+      id = "sg-0ccccccccccccccc3"
+    }
+  }
+  override_resource {
     target          = aws_security_group.authority_lambda[0]
     override_during = plan
     values = {
@@ -391,9 +400,31 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
       length(aws_ecs_service.hub) == 1 &&
       length(aws_vpc_endpoint.hub_ecr_api) == 1 &&
       length(aws_vpc_endpoint.hub_ecr_dkr) == 1 &&
-      length(aws_vpc_endpoint.hub_s3) == 1
+      length(aws_vpc_endpoint.hub_s3) == 1 &&
+      length(aws_vpc_security_group_egress_rule.hub_nlb_udp) == 1 &&
+      length(aws_vpc_security_group_egress_rule.hub_nlb_health) == 1
     )
-    error_message = "Enabling the Hub worker must plan exactly the 20-resource worker inventory."
+    error_message = "Enabling the Hub worker must plan the 20 worker resources plus the exact NLB UDP and health egress rules."
+  }
+
+  assert {
+    condition = (
+      alltrue([
+        for rule in aws_security_group.hub_worker[0].ingress :
+        length(rule.cidr_blocks) == 0 &&
+        length(rule.ipv6_cidr_blocks) == 0 &&
+        length(rule.prefix_list_ids) == 0 &&
+        toset(rule.security_groups) == toset(["sg-0ccccccccccccccc3"]) &&
+        rule.self == false
+      ]) &&
+      aws_vpc_security_group_egress_rule.hub_nlb_udp[0].ip_protocol == "udp" &&
+      aws_vpc_security_group_egress_rule.hub_nlb_udp[0].from_port == 62206 &&
+      aws_vpc_security_group_egress_rule.hub_nlb_udp[0].to_port == 62206 &&
+      aws_vpc_security_group_egress_rule.hub_nlb_health[0].ip_protocol == "tcp" &&
+      aws_vpc_security_group_egress_rule.hub_nlb_health[0].from_port == 62207 &&
+      aws_vpc_security_group_egress_rule.hub_nlb_health[0].to_port == 62207
+    )
+    error_message = "Hub workers must trust only the NLB SG on UDP/62206 and TCP/62207, and the NLB must egress only those two target ports."
   }
 
   assert {

@@ -299,6 +299,12 @@ variable "nhp_udp_recv_buffer_bytes" {
   default     = 8388608
 }
 
+variable "public_nhp_udp_ingress_cidrs" {
+  description = "Optional exact public /32 sources for the assigned-cell UDP NLB security group. null preserves the legacy production edge; sandbox proof cells set the persistent proof-runner EIP."
+  type        = list(string)
+  default     = null
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' uses config files, 'api' uses external auth service"
   type        = string

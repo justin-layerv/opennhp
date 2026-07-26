@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
+import hashlib
 import json
 import re
 import sys
@@ -81,6 +83,20 @@ EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
 EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
 EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
 EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
+UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "tests/fixtures/cell0-udp-source-fence/"
+    "active-green-replacement-terraform-1.14.3-aws-6.54.0.json"
+)
+UDP_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256 = (
+    "966147e606d2a38b257b6e484f8a434f6f5243f16163533ffe3a4143060a143c"
+)
+UDP_SOURCE_FENCE_SOURCE_PLAN_SHA256 = (
+    "ad2225486ab874d1527cebee1f3c6406d27b69ed276157cf2c86bbc09f1a7102"
+)
+UDP_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256 = (
+    "665f61e5c436697fca58110c0a191e15b25aa36ad0d358131a439edaef4fd185"
+)
 # Exact Terraform expression graph for the managed blue/green selector. Refresh
 # this reviewed set from plan JSON when Terraform/provider rendering changes.
 EXPECTED_PUBLIC_UDP_MANAGED_TARGET_REFS = frozenset(
@@ -410,6 +426,22 @@ UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE = (
 )
 
 
+def _build_udp_source_fence_change_key_sets() -> "frozenset[frozenset[str]]":
+    """The exact change-key envelopes a no-op/deposed replacement participant may
+    carry: the base keys, optionally paired with the sensitive and/or identity
+    key pairs. Used by both the target-no-op and deposed-delete recovery checks."""
+    allowed = {frozenset({"actions", "before", "after", "after_unknown"})}
+    for pair in (
+        {"before_sensitive", "after_sensitive"},
+        {"before_identity", "after_identity"},
+    ):
+        allowed |= {frozenset(keys | pair) for keys in allowed}
+    return frozenset(allowed)
+
+
+UDP_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS = _build_udp_source_fence_change_key_sets()
+
+
 def _udp_source_fence_compute_re(suffix: str) -> "re.Pattern[str]":
     """Anchor a reviewed migration address under the compute module prefix."""
     return re.compile(
@@ -498,10 +530,131 @@ def udp_source_fence_migration_action_key(
     return matches[0] if len(matches) == 1 else None
 
 
+def udp_source_fence_migration_address_key(address: str) -> str | None:
+    """Return the unique reviewed migration step matched by an address."""
+    matches = [
+        key
+        for key, pattern, _ in UDP_SOURCE_FENCE_MIGRATION_ACTIONS
+        if pattern.search(address)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_exact_udp_source_fence_target_noop(raw: dict[str, Any]) -> bool:
+    """Prove an already-applied migration participant is an exact no-op."""
+    change = raw.get("change")
+    if not isinstance(change, dict):
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        raw.get("mode", "managed") != "managed"
+        or raw.get("deposed") is not None
+        or frozenset(change) not in UDP_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS
+        or change.get("actions") != ["no-op"]
+        or not isinstance(before, dict)
+        or before != after
+        or change.get("after_unknown") != {}
+    ):
+        return False
+    for before_key, after_key in (
+        ("before_sensitive", "after_sensitive"),
+        ("before_identity", "after_identity"),
+    ):
+        if (before_key in change) != (after_key in change) or (
+            before_key in change and change[before_key] != change[after_key]
+        ):
+            return False
+    return True
+
+
+def _load_udp_source_fence_provider_fixture() -> dict[str, Any]:
+    """Load exact provider envelopes proving the active-green replacement."""
+    try:
+        payload = UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH.read_bytes()
+    except OSError as exc:
+        raise ValueError("UDP source-fence provider fixture is unavailable") from exc
+    if (
+        hashlib.sha256(payload).hexdigest()
+        != UDP_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256
+    ):
+        raise ValueError("UDP source-fence provider fixture digest changed")
+    try:
+        fixture = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("UDP source-fence provider fixture is malformed") from exc
+
+    expected_fields = {
+        "terraform_version",
+        "format_version",
+        "source_plan_complete",
+        "source_plan_errored",
+        "source_plan_targeted",
+        "aws_provider_version",
+        "source_plan_sha256",
+        "source_plan_json_sha256",
+        "evidence_scope",
+        "active_color",
+        "selected_participant_addresses",
+        "listener_default_action_references",
+        "changes",
+    }
+    addresses = [
+        f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb.server[0]",
+        f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb_listener.udp[0]",
+    ]
+    expected_references = [
+        "var.enable_blue_green",
+        "aws_ssm_parameter.active_color[0].value",
+        "aws_ssm_parameter.active_color[0]",
+        "aws_ssm_parameter.active_color",
+        "aws_lb_target_group.udp_green[0].arn",
+        "aws_lb_target_group.udp_green[0]",
+        "aws_lb_target_group.udp_green",
+        "aws_lb_target_group.udp[0].arn",
+        "aws_lb_target_group.udp[0]",
+        "aws_lb_target_group.udp",
+    ]
+    expected_scope = (
+        "Exact Terraform 1.14.3/AWS provider 6.54.0 cell0 public NLB and "
+        "UDP listener envelopes from a fresh read-only, refresh-disabled "
+        "compute-targeted plan; selector evidence only, not deployable apply "
+        "evidence."
+    )
+    if (
+        not isinstance(fixture, dict)
+        or set(fixture) != expected_fields
+        or fixture.get("terraform_version") != "1.14.3"
+        or fixture.get("format_version") != "1.2"
+        or fixture.get("source_plan_complete") is not False
+        or fixture.get("source_plan_errored") is not False
+        or fixture.get("source_plan_targeted") is not True
+        or fixture.get("aws_provider_version") != "6.54.0"
+        or fixture.get("source_plan_sha256")
+        != UDP_SOURCE_FENCE_SOURCE_PLAN_SHA256
+        or fixture.get("source_plan_json_sha256")
+        != UDP_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256
+        or fixture.get("evidence_scope") != expected_scope
+        or fixture.get("active_color") != "green"
+        or fixture.get("selected_participant_addresses") != addresses
+        or fixture.get("listener_default_action_references")
+        != expected_references
+    ):
+        raise ValueError("UDP source-fence provider fixture provenance is not exact")
+    changes = fixture.get("changes")
+    if (
+        not isinstance(changes, dict)
+        or list(changes) != addresses
+        or any(not isinstance(changes[address], dict) for address in addresses)
+    ):
+        raise ValueError("UDP source-fence provider fixture inventory is not exact")
+    return fixture
+
+
 def validate_udp_source_fence_transition(
     steps_by_key: dict[str, dict[str, Any]],
 ) -> list[str]:
-    """Pin the reviewed legacy before-state and fenced after-state."""
+    """Pin every still-pending legacy before-state and fenced after-state."""
     errors: list[str] = []
 
     def require(condition: bool, message: str) -> None:
@@ -509,112 +662,195 @@ def validate_udp_source_fence_transition(
             errors.append(message)
 
     def side(key: str, name: str) -> dict[str, Any] | None:
-        value = (steps_by_key[key].get("change") or {}).get(name)
+        value = (steps_by_key.get(key, {}).get("change") or {}).get(name)
         return value if isinstance(value, dict) else None
 
-    nlb_before = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "before")
-    nlb_after = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "after")
-    for values, expected_name, label in (
-        (nlb_before, EXPECTED_SANDBOX_SERVER_NLB_NAME, "legacy before-state"),
-        (
-            nlb_after,
-            EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME,
-            "fenced after-state",
-        ),
-    ):
-        tags = (values or {}).get("tags")
-        require(
-            values is not None
-            and values.get("name") == expected_name
-            and values.get("internal") is False
-            and values.get("load_balancer_type") == "network"
-            and isinstance(tags, dict)
-            and tags.get("Environment") == "sandbox"
-            and tags.get("Component") == "compute"
-            and tags.get("Cell") == EXPECTED_SANDBOX_CELL_ID
-            and tags.get("Name") == expected_name,
-            f"UDP source-fence public NLB {label} is not the exact reviewed identity",
-        )
-    require(
-        nlb_before is not None and nlb_before.get("security_groups") == [],
-        "UDP source-fence public NLB legacy before-state must have no attached security groups",
-    )
+    try:
+        provider_fixture = _load_udp_source_fence_provider_fixture()
+    except ValueError as exc:
+        return [str(exc)]
+    provider_changes = provider_fixture["changes"]
 
-    listener_before = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "before")
-    listener_after = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after")
-    listener_after_unknown = (
-        side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after_unknown") or {}
-    )
-    listener_target_group_arns: list[str] = []
-    for values, label in (
-        (listener_before, "legacy before-state"),
-        (listener_after, "fenced after-state"),
-    ):
+    if UDP_SOURCE_FENCE_NLB_REPLACEMENT in steps_by_key:
+        nlb_change = steps_by_key[UDP_SOURCE_FENCE_NLB_REPLACEMENT].get("change")
+        nlb_before = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "before")
+        nlb_after = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "after")
+        expected_nlb_change = provider_changes[
+            f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb.server[0]"
+        ]
+        normalized_nlb_change = copy.deepcopy(nlb_change)
+        if (
+            isinstance(normalized_nlb_change, dict)
+            and normalized_nlb_change != expected_nlb_change
+        ):
+            normalized_after = normalized_nlb_change.get("after")
+            normalized_unknown = normalized_nlb_change.get("after_unknown")
+            security_groups = (
+                normalized_after.get("security_groups")
+                if isinstance(normalized_after, dict)
+                else None
+            )
+            if (
+                isinstance(normalized_after, dict)
+                and isinstance(normalized_unknown, dict)
+                and isinstance(security_groups, list)
+                and len(security_groups) == 1
+                and isinstance(security_groups[0], str)
+                and security_groups[0]
+                and normalized_unknown.get("security_groups") in (None, False)
+            ):
+                normalized_after.pop("security_groups")
+                normalized_unknown["security_groups"] = True
         require(
-            values is not None
-            and values.get("protocol") == "UDP"
-            and values.get("port") == EXPECTED_NHP_SERVER_PORT,
-            f"UDP source-fence listener {label} must remain UDP 62206",
+            normalized_nlb_change == expected_nlb_change,
+            "UDP source-fence public NLB replacement is not the exact "
+            "Terraform 1.14.3/AWS provider 6.54.0 envelope",
         )
-        default_actions = (values or {}).get("default_action")
-        target_group_arn = (
-            default_actions[0].get("target_group_arn")
-            if isinstance(default_actions, list)
-            and len(default_actions) == 1
-            and isinstance(default_actions[0], dict)
-            else None
-        )
-        require(
-            isinstance(target_group_arn, str)
-            and any(
-                target_group_arn.startswith(
-                    f"arn:aws:elasticloadbalancing:{EXPECTED_SANDBOX_REGION}:"
-                    f"{EXPECTED_SANDBOX_ACCOUNT_ID}:targetgroup/"
-                    f"{target_group_name}/"
-                )
-                and bool(target_group_arn.rsplit("/", 1)[-1])
-                for target_group_name in (
-                    EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
-                    EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
-                )
+        for values, expected_name, label in (
+            (nlb_before, EXPECTED_SANDBOX_SERVER_NLB_NAME, "legacy before-state"),
+            (
+                nlb_after,
+                EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME,
+                "fenced after-state",
             ),
-            f"UDP source-fence listener {label} must retain a canonical blue or green public UDP target group",
+        ):
+            tags = (values or {}).get("tags")
+            require(
+                values is not None
+                and values.get("name") == expected_name
+                and values.get("internal") is False
+                and values.get("load_balancer_type") == "network"
+                and isinstance(tags, dict)
+                and tags.get("Environment") == "sandbox"
+                and tags.get("Component") == "compute"
+                and tags.get("Cell") == EXPECTED_SANDBOX_CELL_ID
+                and tags.get("Name") == expected_name,
+                f"UDP source-fence public NLB {label} is not the exact reviewed identity",
+            )
+        require(
+            nlb_before is not None and nlb_before.get("security_groups") == [],
+            "UDP source-fence public NLB legacy before-state must have no attached security groups",
         )
-        if isinstance(target_group_arn, str):
-            listener_target_group_arns.append(target_group_arn)
-    require(
-        len(listener_target_group_arns) == 2
-        and len(set(listener_target_group_arns)) == 1,
-        "UDP source-fence listener replacement must preserve the exact active "
-        "public UDP target group",
-    )
-    legacy_listener_nlb_arn = (listener_before or {}).get("load_balancer_arn")
-    require(
-        isinstance(legacy_listener_nlb_arn, str)
-        and f"/{EXPECTED_SANDBOX_SERVER_NLB_NAME}/" in legacy_listener_nlb_arn,
-        "UDP source-fence listener before-state must target the canonical legacy public NLB",
-    )
-    require(
-        (listener_after or {}).get("load_balancer_arn") in (None, "")
-        and listener_after_unknown.get("load_balancer_arn") is True,
-        "UDP source-fence listener after-state must explicitly depend on the newly-created public NLB",
-    )
 
-    legacy_ingress = steps_by_key[UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE]
-    legacy_ingress_before = side(
-        UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE, "before"
-    )
-    require(
-        legacy_ingress.get("type") == "aws_vpc_security_group_ingress_rule"
-        and legacy_ingress.get("name") == "server_nhp_udp"
-        and legacy_ingress_before is not None
-        and legacy_ingress_before.get("ip_protocol") == "udp"
-        and legacy_ingress_before.get("from_port") == EXPECTED_NHP_SERVER_PORT
-        and legacy_ingress_before.get("to_port") == EXPECTED_NHP_SERVER_PORT
-        and legacy_ingress_before.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR
-        and (legacy_ingress.get("change") or {}).get("after") is None,
-        "UDP source-fence legacy server ingress deletion must remove exactly public UDP 62206",
-    )
+    if UDP_SOURCE_FENCE_LISTENER_REPLACEMENT in steps_by_key:
+        listener_step = steps_by_key[UDP_SOURCE_FENCE_LISTENER_REPLACEMENT]
+        listener_actions = tuple(
+            (listener_step.get("change") or {}).get("actions") or ()
+        )
+        listener_before = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "before")
+        listener_after = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after")
+        listener_after_unknown = (
+            side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after_unknown") or {}
+        )
+        if listener_actions == ("delete", "create"):
+            require(
+                listener_step.get("change")
+                == provider_changes[
+                    f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}."
+                    "aws_lb_listener.udp[0]"
+                ],
+                "UDP source-fence listener replacement is not the exact "
+                "Terraform 1.14.3/AWS provider 6.54.0 envelope",
+            )
+        checked_sides = (
+            ((listener_after, "fenced after-state"),)
+            if listener_actions == ("create",)
+            else (
+                (listener_before, "legacy before-state"),
+                (listener_after, "fenced after-state"),
+            )
+        )
+        listener_target_group_arns: list[str] = []
+        for values, label in checked_sides:
+            require(
+                values is not None
+                and values.get("protocol") == "UDP"
+                and values.get("port") == EXPECTED_NHP_SERVER_PORT,
+                f"UDP source-fence listener {label} must remain UDP 62206",
+            )
+            default_actions = (values or {}).get("default_action")
+            target_group_arn = (
+                default_actions[0].get("target_group_arn")
+                if isinstance(default_actions, list)
+                and len(default_actions) == 1
+                and isinstance(default_actions[0], dict)
+                else None
+            )
+            require(
+                isinstance(target_group_arn, str)
+                and any(
+                    target_group_arn.startswith(
+                        f"arn:aws:elasticloadbalancing:{EXPECTED_SANDBOX_REGION}:"
+                        f"{EXPECTED_SANDBOX_ACCOUNT_ID}:targetgroup/"
+                        f"{target_group_name}/"
+                    )
+                    and bool(target_group_arn.rsplit("/", 1)[-1])
+                    for target_group_name in (
+                        EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+                        EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+                    )
+                ),
+                f"UDP source-fence listener {label} must retain a canonical blue or green public UDP target group",
+            )
+            if isinstance(target_group_arn, str):
+                listener_target_group_arns.append(target_group_arn)
+        # The delete+create replacement must present BOTH sides pinned to the
+        # same active-color target group (#3466). The create-only recovery has
+        # no before-state, so only the single after-state side is checked.
+        require(
+            len(listener_target_group_arns)
+            == (1 if listener_actions == ("create",) else 2)
+            and len(set(listener_target_group_arns)) == 1,
+            "UDP source-fence listener replacement must preserve the exact "
+            "active public UDP target group",
+        )
+        if listener_actions == ("create",):
+            target_listener_nlb_arn = (listener_after or {}).get(
+                "load_balancer_arn"
+            )
+            require(
+                listener_before is None
+                and isinstance(target_listener_nlb_arn, str)
+                and f"/{EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME}/"
+                in target_listener_nlb_arn
+                and listener_after_unknown.get("load_balancer_arn")
+                in (None, False),
+                "UDP source-fence listener create recovery must target the "
+                "canonical fenced public NLB",
+            )
+        else:
+            legacy_listener_nlb_arn = (listener_before or {}).get(
+                "load_balancer_arn"
+            )
+            require(
+                isinstance(legacy_listener_nlb_arn, str)
+                and f"/{EXPECTED_SANDBOX_SERVER_NLB_NAME}/"
+                in legacy_listener_nlb_arn,
+                "UDP source-fence listener before-state must target the canonical legacy public NLB",
+            )
+            require(
+                (listener_after or {}).get("load_balancer_arn") in (None, "")
+                and listener_after_unknown.get("load_balancer_arn") is True,
+                "UDP source-fence listener after-state must explicitly depend on the newly-created public NLB",
+            )
+
+    if UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE in steps_by_key:
+        legacy_ingress = steps_by_key[UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE]
+        legacy_ingress_before = side(
+            UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE, "before"
+        )
+        require(
+            legacy_ingress.get("type") == "aws_vpc_security_group_ingress_rule"
+            and legacy_ingress.get("name") == "server_nhp_udp"
+            and legacy_ingress_before is not None
+            and legacy_ingress_before.get("ip_protocol") == "udp"
+            and legacy_ingress_before.get("from_port") == EXPECTED_NHP_SERVER_PORT
+            and legacy_ingress_before.get("to_port") == EXPECTED_NHP_SERVER_PORT
+            and legacy_ingress_before.get("cidr_ipv4")
+            == EXPECTED_IPV4_DEFAULT_CIDR
+            and (legacy_ingress.get("change") or {}).get("after") is None,
+            "UDP source-fence legacy server ingress deletion must remove exactly public UDP 62206",
+        )
 
     for key in (
         UDP_SOURCE_FENCE_NLB_SG_CREATE,
@@ -624,6 +860,8 @@ def validate_udp_source_fence_transition(
         UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE,
         UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE,
     ):
+        if key not in steps_by_key:
+            continue
         change = steps_by_key[key].get("change") or {}
         require(
             change.get("before") is None and isinstance(change.get("after"), dict),
@@ -637,78 +875,222 @@ def validate_dmz_boundary_noop(
 ) -> list[str]:
     """Reject automatic boundary mutations outside the exact reviewed migration."""
     errors: list[str] = []
-    migration_steps: list[
-        tuple[dict[str, Any], str, tuple[str, ...], str | None]
-    ] = []
+    boundary_changes: list[dict[str, Any]] = []
     for raw in plan.get("resource_changes", []):
         if raw.get("mode", "managed") != "managed":
             continue
         address = str(raw.get("address", ""))
         if not is_dmz_boundary_address(address):
             continue
+        boundary_changes.append(raw)
         actions = tuple((raw.get("change") or {}).get("actions") or ())
         if actions != ("no-op",):
-            if allow_udp_source_fence_replacement:
-                migration_steps.append(
-                    (
-                        raw,
-                        address,
-                        actions,
-                        udp_source_fence_migration_action_key(address, actions),
-                    )
+            if not allow_udp_source_fence_replacement:
+                errors.append(
+                    "automatic apply refuses relay-DMZ boundary change "
+                    f"{address} ({', '.join(actions) or 'missing actions'}); "
+                    "ordinary deployments require a no-op boundary; introduce a "
+                    "newly reviewed temporary migration path before changing it"
                 )
-                continue
-            errors.append(
-                "automatic apply refuses relay-DMZ boundary change "
-                f"{address} ({', '.join(actions) or 'missing actions'}); "
-                "ordinary deployments require a no-op boundary; introduce a "
-                "newly reviewed temporary migration path before changing it"
-            )
-    if not migration_steps:
+    if not allow_udp_source_fence_replacement:
         return errors
 
-    invalid_steps = [
-        (address, actions)
-        for _, address, actions, matched_key in migration_steps
-        if matched_key is None
+    mutations = [
+        raw
+        for raw in boundary_changes
+        if tuple((raw.get("change") or {}).get("actions") or ()) != ("no-op",)
     ]
+    if not mutations:
+        return errors
+
+    pending_by_key: dict[str, dict[str, Any]] = {}
+    target_noops_by_key: dict[str, list[dict[str, Any]]] = {}
+    nlb_deposed_delete: dict[str, Any] | None = None
+    invalid_steps: list[tuple[str, tuple[str, ...]]] = []
+
+    for raw in boundary_changes:
+        address = str(raw.get("address", ""))
+        actions = tuple((raw.get("change") or {}).get("actions") or ())
+        key = udp_source_fence_migration_address_key(address)
+        if actions == ("no-op",):
+            if key is not None:
+                target_noops_by_key.setdefault(key, []).append(raw)
+            continue
+        matched_key = udp_source_fence_migration_action_key(address, actions)
+        if matched_key is not None:
+            if matched_key in pending_by_key:
+                invalid_steps.append((address, actions))
+            else:
+                pending_by_key[matched_key] = raw
+            continue
+        if (
+            key == UDP_SOURCE_FENCE_NLB_REPLACEMENT
+            and actions == ("delete",)
+            and isinstance(raw.get("deposed"), str)
+            and re.fullmatch(r"[0-9a-f]{8}", raw["deposed"])
+        ):
+            if nlb_deposed_delete is not None:
+                invalid_steps.append((address, actions))
+            else:
+                nlb_deposed_delete = raw
+            continue
+        if (
+            key == UDP_SOURCE_FENCE_LISTENER_REPLACEMENT
+            and actions == ("create",)
+            and raw.get("deposed") is None
+        ):
+            if key in pending_by_key:
+                invalid_steps.append((address, actions))
+            else:
+                pending_by_key[key] = raw
+            continue
+        invalid_steps.append((address, actions))
+
     for address, actions in invalid_steps:
         errors.append(
             "automatic apply refuses unreviewed UDP source-fence boundary change "
             f"{address} ({', '.join(actions) or 'missing actions'})"
         )
 
-    matched_key_counts = Counter(
-        matched_key
-        for _, _, _, matched_key in migration_steps
-        if matched_key is not None
+    duplicate_noops = sorted(
+        key for key, values in target_noops_by_key.items() if len(values) != 1
     )
-    duplicate_keys = sorted(
-        key for key, count in matched_key_counts.items() if count != 1
-    )
-    missing_keys = sorted(
-        set(UDP_SOURCE_FENCE_MIGRATION_KEYS) - matched_key_counts.keys()
-    )
-    if invalid_steps or duplicate_keys or missing_keys:
+    for key, values in target_noops_by_key.items():
+        if len(values) == 1 and not _is_exact_udp_source_fence_target_noop(values[0]):
+            errors.append(
+                f"UDP source-fence already-applied target {key} is not an exact no-op"
+            )
+    if duplicate_noops:
         errors.append(
-            "UDP source-fence migration must contain the exact reviewed nine-step "
-            "boundary action graph"
-            + (f"; missing: {', '.join(missing_keys)}" if missing_keys else "")
+            "UDP source-fence recovery has duplicate target no-op participants: "
+            + ", ".join(duplicate_noops)
+        )
+
+    missing_complements: list[str] = []
+    for key in UDP_SOURCE_FENCE_MIGRATION_KEYS:
+        if key == UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE:
+            # A successfully deleted legacy ingress is absent from the retry plan.
+            # A no-op at that address would prove the public rule still exists.
+            if key not in pending_by_key and target_noops_by_key.get(key):
+                errors.append(
+                    "UDP source-fence recovery must not retain the legacy public "
+                    "target ingress as a no-op"
+                )
+            continue
+        needs_target_noop = key not in pending_by_key
+        if key == UDP_SOURCE_FENCE_NLB_REPLACEMENT and nlb_deposed_delete is not None:
+            needs_target_noop = True
+        if needs_target_noop and len(target_noops_by_key.get(key, [])) != 1:
+            missing_complements.append(key)
+        if (
+            key in pending_by_key
+            and key != UDP_SOURCE_FENCE_NLB_REPLACEMENT
+            and target_noops_by_key.get(key)
+        ):
+            errors.append(
+                f"UDP source-fence participant {key} cannot be both pending and no-op"
+            )
+
+    nlb_pending = pending_by_key.get(UDP_SOURCE_FENCE_NLB_REPLACEMENT)
+    listener_pending = pending_by_key.get(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT)
+    nlb_initial = (
+        tuple((nlb_pending or {}).get("change", {}).get("actions") or ())
+        == ("create", "delete")
+    )
+    listener_actions = tuple(
+        (listener_pending or {}).get("change", {}).get("actions") or ()
+    )
+    if nlb_initial and listener_actions != ("delete", "create"):
+        errors.append(
+            "UDP source-fence initial NLB replacement requires the exact "
+            "destroy-before-create listener replacement"
+        )
+    if (
+        listener_actions == ("delete", "create")
+        and not nlb_initial
+        and nlb_deposed_delete is None
+    ):
+        errors.append(
+            "UDP source-fence legacy listener replacement requires the initial "
+            "NLB replacement or its exact deposed-delete recovery"
+        )
+    if listener_actions == ("create",) and len(
+        target_noops_by_key.get(UDP_SOURCE_FENCE_NLB_REPLACEMENT, [])
+    ) != 1:
+        errors.append(
+            "UDP source-fence listener create recovery requires the fenced NLB "
+            "target no-op"
+        )
+    if (
+        UDP_SOURCE_FENCE_LISTENER_REPLACEMENT
+        in target_noops_by_key
+        and UDP_SOURCE_FENCE_NLB_REPLACEMENT not in target_noops_by_key
+    ):
+        errors.append(
+            "UDP source-fence listener target no-op requires the fenced NLB "
+            "target no-op"
+        )
+
+    if nlb_deposed_delete is not None:
+        deposed_change = nlb_deposed_delete.get("change") or {}
+        legacy_before = deposed_change.get("before")
+        try:
+            provider_nlb_change = _load_udp_source_fence_provider_fixture()["changes"][
+                f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb.server[0]"
+            ]
+        except ValueError as exc:
+            errors.append(str(exc))
+            provider_nlb_change = {}
+        if (
+            not isinstance(legacy_before, dict)
+            or legacy_before != provider_nlb_change.get("before")
+            or frozenset(deposed_change) not in UDP_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS
+            or deposed_change.get("after") is not None
+            or deposed_change.get("after_unknown") != {}
+            or (
+                "before_sensitive" in deposed_change
+                and (
+                    deposed_change.get("before_sensitive")
+                    != provider_nlb_change.get("before_sensitive")
+                    or deposed_change.get("after_sensitive") not in (None, False)
+                )
+            )
+            or (
+                "before_identity" in deposed_change
+                and (
+                    deposed_change.get("before_identity")
+                    != provider_nlb_change.get("before_identity")
+                    or deposed_change.get("after_identity") is not None
+                )
+            )
+        ):
+            errors.append(
+                "UDP source-fence deposed NLB delete is not the exact SG-less "
+                "Terraform 1.14.3/AWS provider 6.54.0 legacy NLB"
+            )
+
+    if invalid_steps or duplicate_noops or missing_complements:
+        errors.append(
+            "UDP source-fence migration must contain the exact reviewed initial "
+            "graph or a bounded remaining subset with exact already-applied "
+            "target no-ops"
             + (
-                f"; duplicated: {', '.join(duplicate_keys)}"
-                if duplicate_keys
+                f"; missing complements: {', '.join(missing_complements)}"
+                if missing_complements
                 else ""
             )
         )
-    else:
-        errors.extend(
-            validate_udp_source_fence_transition(
-                {
-                    matched_key: raw
-                    for raw, _, _, matched_key in migration_steps
-                    if matched_key is not None
-                }
-            )
+    errors.extend(validate_udp_source_fence_transition(pending_by_key))
+    if (
+        not invalid_steps
+        and not duplicate_noops
+        and not missing_complements
+        and not pending_by_key
+        and nlb_deposed_delete is None
+    ):
+        errors.append(
+            "UDP source-fence recovery must retain at least one exact pending "
+            "mutation"
         )
     return errors
 
@@ -3809,6 +4191,10 @@ def validate_plan(
             expression_refs(public_listener_config, "load_balancer_arn"),
             {"aws_lb.server"},
         )
+        # Under a source-fenced topology only the exact managed active-color
+        # selector graph is admitted, which is the branch's "derive blue/green
+        # only from the managed active-color record" requirement. The legacy
+        # blue-only shape stays available solely for cells not yet fenced.
         and (
             (public_listener_has_legacy_target and not source_fenced_topology)
             or public_listener_has_managed_active_target

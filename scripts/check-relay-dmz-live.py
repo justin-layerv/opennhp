@@ -169,6 +169,18 @@ RELAY_BACKEND_PORT = 8080
 RELAY_SERVER_UDP_PORT = 62206
 RELAY_ACK_UDP_PORT = 62207
 RELAY_HEALTH_PATH = "/health/live"
+# Proof-runner EIP admitted to the source-fenced sandbox server NLB. Matches the
+# EXPECTED_SANDBOX_PROOF_SOURCE_CIDR pin in the sibling plan checker; re-homing
+# both to the proof-runner remote-state output is a tracked follow-up.
+SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+
+
+def _expected_server_lb_name(environment: str) -> str:
+    """Public server NLB name: sandbox is source-fenced (`-edge`); the legacy
+    prod edge keeps `-nlb`. Single source of truth for both collector and
+    validator so the sandbox special-case cannot drift."""
+    suffix = "edge" if environment == "sandbox" else "nlb"
+    return f"layerv-nhp-{environment}-{suffix}"
 RELAY_TLS_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 RELAY_TG_NAME_PREFIX = "rlytls"
 
@@ -1088,7 +1100,7 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
     # cell. Inventory every public NLB in the peered main VPC, but classify only
     # canonical or NHP-owned edges so an unrelated product NLB remains out of
     # scope while a second compute/cell NHP edge fails closed.
-    expected_server_lb_name = f"layerv-nhp-{environment}-nlb"
+    expected_server_lb_name = _expected_server_lb_name(environment)
     canonical_server_lbs = [
         candidate
         for candidate in lbs
@@ -1302,6 +1314,11 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
                     {
                         "load_balancer_arn": load_balancer_arn,
                         "load_balancer_name": candidate.get("LoadBalancerName"),
+                        "load_balancer_security_group_ids": sorted(
+                            str(group_id)
+                            for group_id in candidate.get("SecurityGroups", [])
+                            if group_id
+                        ),
                         "load_balancer_tags": load_balancer_tags,
                         "canonical": load_balancer_arn == canonical_server_lb_arn,
                         "listener_arn": listener.get("ListenerArn"),
@@ -1436,6 +1453,22 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
         ).get("SecurityGroups", [])
         normalized_groups.update(
             {group["GroupId"]: _normalize_sg(group) for group in server_groups}
+        )
+    server_nlb_sg_ids = {
+        str(group_id)
+        for edge in assigned_cell_nhp_listeners
+        for group_id in edge.get("load_balancer_security_group_ids", [])
+        if group_id
+    }
+    if server_nlb_sg_ids:
+        server_nlb_groups = aws.call(
+            "ec2",
+            "describe-security-groups",
+            "--group-ids",
+            *sorted(server_nlb_sg_ids),
+        ).get("SecurityGroups", [])
+        normalized_groups.update(
+            {group["GroupId"]: _normalize_sg(group) for group in server_nlb_groups}
         )
 
     listeners_raw = aws.call(
@@ -1746,6 +1779,7 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             "endpoint_ids": sorted(endpoint_sg_ids),
             "alb_ids": sorted(alb_sg_ids),
             "server_ids": sorted(server_sg_ids),
+            "server_nlb_ids": sorted(server_nlb_sg_ids),
             "by_id": normalized_groups,
         },
         "endpoints": endpoints,
@@ -2195,7 +2229,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
         )
     else:
         cell_edge = assigned_cell_nhp_listeners[0]
-        expected_lb_name = f"layerv-nhp-{environment}-nlb"
+        expected_lb_name = _expected_server_lb_name(environment)
         expected_lb_tags = {
             "Environment": str(environment),
             "Component": "compute",
@@ -2210,6 +2244,10 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             or not cell_edge.get("listener_arn")
             or cell_edge.get("protocol") != "UDP"
             or cell_edge.get("port") != RELAY_SERVER_UDP_PORT
+            or (
+                environment == "sandbox"
+                and len(cell_edge.get("load_balancer_security_group_ids") or []) != 1
+            )
             or any(
                 cell_edge.get("load_balancer_tags", {}).get(key) != value
                 for key, value in expected_lb_tags.items()
@@ -2714,11 +2752,13 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
     relay_ids = security.get("relay_ids", [])
     alb_ids = security.get("alb_ids", [])
     server_ids = security.get("server_ids", [])
+    server_nlb_ids = security.get("server_nlb_ids", [])
     if not (
         len(relay_ids) == len(alb_ids) == len(endpoint_sg_ids) == len(server_ids) == 1
+        and (environment != "sandbox" or len(server_nlb_ids) == 1)
     ):
         errors.append(
-            "relay, ALB, endpoint, and server SG identities must each be singular"
+            "relay, ALB, endpoint, server, and sandbox server-NLB SG identities must each be singular"
         )
     else:
         relay_id, alb_id, endpoint_id, server_id = (
@@ -2845,7 +2885,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             errors.append("endpoint SG ingress is not exactly relay TCP 443")
         if endpoint_sg.get("outbound", []):
             errors.append("endpoint SG must have no egress rules")
-        allowed_server_sources = relay_cidrs | {"0.0.0.0/0"}
+        allowed_server_sources = relay_cidrs
         expected_server_nhp_rules = [
             {
                 "protocol": "udp",
@@ -2856,6 +2896,74 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             }
             for source in sorted(allowed_server_sources)
         ]
+        if environment == "sandbox":
+            nlb_id = server_nlb_ids[0]
+            expected_server_nhp_rules.append(
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "security_group",
+                    "source": nlb_id,
+                }
+            )
+            nlb_group = by_id.get(nlb_id, {})
+            expected_nlb_in = [
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "cidr_ipv4",
+                    "source": SANDBOX_PROOF_SOURCE_CIDR,
+                }
+            ]
+            expected_nlb_out = [
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "security_group",
+                    "source": server_id,
+                },
+                {
+                    "protocol": "tcp",
+                    "from": 8888,
+                    "to": 8888,
+                    "source_type": "security_group",
+                    "source": server_id,
+                },
+            ]
+            if not _rules_equal(nlb_group.get("inbound", []), expected_nlb_in):
+                errors.append(
+                    "server NLB SG ingress is not exactly proof-runner /32 UDP 62206"
+                )
+            if not _rules_equal(nlb_group.get("outbound", []), expected_nlb_out):
+                errors.append(
+                    "server NLB SG egress is not exactly server-SG UDP 62206 plus TCP 8888 health"
+                )
+            server_nlb_health_rules = [
+                rule
+                for rule in by_id.get(server_id, {}).get("inbound", [])
+                if rule.get("protocol") == "tcp"
+                and rule.get("from") == 8888
+                and rule.get("to") == 8888
+                and rule.get("source_type") == "security_group"
+                and rule.get("source") == nlb_id
+            ]
+            if len(server_nlb_health_rules) != 1:
+                errors.append(
+                    "server SG must accept TCP 8888 health from exactly the server NLB SG"
+                )
+        else:
+            expected_server_nhp_rules.append(
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "cidr_ipv4",
+                    "source": "0.0.0.0/0",
+                }
+            )
         actual_server_nhp_rules = [
             rule
             for rule in by_id.get(server_id, {}).get("inbound", [])
@@ -2863,7 +2971,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
         ]
         if not _rules_equal(actual_server_nhp_rules, expected_server_nhp_rules):
             errors.append(
-                "server SG rules covering UDP 62206 are not exactly public internet plus relay /24s"
+                "server SG rules covering UDP 62206 are not exactly the reviewed NLB/legacy edge plus relay /24s"
             )
         public_udp_capable_rules = [
             rule
@@ -2872,18 +2980,22 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             and rule.get("source") in {"0.0.0.0/0", "::/0"}
             and str(rule.get("protocol", "")).lower() in {"udp", "-1", "all"}
         ]
-        expected_public_udp_rule = [
-            {
-                "protocol": "udp",
-                "from": RELAY_SERVER_UDP_PORT,
-                "to": RELAY_SERVER_UDP_PORT,
-                "source_type": "cidr_ipv4",
-                "source": "0.0.0.0/0",
-            }
-        ]
+        expected_public_udp_rule = (
+            []
+            if environment == "sandbox"
+            else [
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "cidr_ipv4",
+                    "source": "0.0.0.0/0",
+                }
+            ]
+        )
         if not _rules_equal(public_udp_capable_rules, expected_public_udp_rule):
             errors.append(
-                "server SG public UDP-capable ingress must be exactly IPv4 UDP 62206"
+                "server SG internet-wide UDP ingress does not match the environment contract"
             )
 
     flow_logs = snapshot.get("flow_logs", [])

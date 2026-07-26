@@ -40,12 +40,21 @@ Production is unaffected because `deploy_relay=false` and has no relay fleet.
 
 The initial sandbox relay-DMZ cutover is complete. Every push-to-main and manual
 Terraform deployment now uses `--require-dmz-boundary-noop` before any
-state/taint/relay-refresh recovery and again before apply. The job fails if the
+state/taint/relay-refresh recovery and again before apply. The current
+sandbox-only migration adds `--allow-udp-source-fence-replacement`, which
+admits only the exact create-before-destroy public cell0 NLB replacement,
+bounded listener handoff, creation of its SG rules, and deletion of the legacy
+public server-SG rule. The listener itself deliberately uses Terraform's
+destroy-before-create replacement order because AWS forbids one target group
+from serving listeners on two different load balancers. The ordinary
+post-apply convergence plan does not carry that allowance; it instead uses
+`--require-udp-source-fenced-topology` and must prove both the complete fenced
+topology and DMZ boundary are back to no-op. The job otherwise fails if the
 dedicated network/fleet, main-private route-table ownership, server return
 rule, assigned-cell public NHP edge, sandbox CI IAM, or durable ASG handoff
 would change. A future boundary migration must introduce a newly reviewed,
-temporary authorization path; there is no standing workflow input that can
-bypass this steady-state fence. The
+exact authorization path; there is no workflow input that can broadly bypass
+this steady-state fence. The
 [sandbox relay DMZ runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
 documents normal deployment and verification.
 

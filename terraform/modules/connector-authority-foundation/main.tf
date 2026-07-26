@@ -118,6 +118,17 @@ resource "terraform_data" "foundation_contract" {
     }
 
     precondition {
+      condition = (
+        !var.hub_edge_enabled ||
+        (
+          var.hub_public_udp_ingress_cidrs != null &&
+          length(var.hub_public_udp_ingress_cidrs) > 0
+        )
+      )
+      error_message = "hub_edge_enabled requires at least one exact public IPv4 /32 in hub_public_udp_ingress_cidrs."
+    }
+
+    precondition {
       # The Hub worker slice (5b) fronts the 5a public UDP NLB target group and
       # invokes the 3 live authority aliases, so it may deploy only on top of
       # BOTH a live public edge and a live authority runtime. Setting the gate

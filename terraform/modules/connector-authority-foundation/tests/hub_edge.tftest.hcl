@@ -254,6 +254,8 @@ run "hub_edge_dark_creates_nothing" {
       length(aws_route_table.hub_public) == 0 &&
       length(aws_route.hub_public_default) == 0 &&
       length(aws_route_table_association.hub_public) == 0 &&
+      length(aws_security_group.hub_nlb) == 0 &&
+      length(aws_vpc_security_group_ingress_rule.hub_nlb_udp) == 0 &&
       length(aws_lb.hub) == 0 &&
       length(aws_lb_target_group.hub) == 0 &&
       length(aws_lb_listener.hub) == 0 &&
@@ -268,11 +270,23 @@ run "hub_edge_dark_creates_nothing" {
   }
 }
 
+run "hub_edge_enabled_without_source_fence_fails_closed" {
+  command = plan
+
+  variables {
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = null
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
 run "hub_edge_on_opens_only_the_public_udp_edge" {
   command = plan
 
   variables {
-    hub_edge_enabled = true
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = ["3.141.109.76/32"]
   }
 
   assert {
@@ -282,16 +296,24 @@ run "hub_edge_on_opens_only_the_public_udp_edge" {
       length(aws_route_table.hub_public) == 1 &&
       length(aws_route.hub_public_default) == 1 &&
       aws_route.hub_public_default[0].destination_cidr_block == "0.0.0.0/0" &&
+      length(aws_security_group.hub_nlb) == 1 &&
+      length(aws_vpc_security_group_ingress_rule.hub_nlb_udp) == 1 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].cidr_ipv4 == "3.141.109.76/32" &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].ip_protocol == "udp" &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].from_port == 62206 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].to_port == 62206 &&
       length(aws_lb.hub) == 1 &&
       aws_lb.hub[0].internal == false &&
       aws_lb.hub[0].load_balancer_type == "network" &&
+      length(aws_lb.hub[0].security_groups) == 1 &&
+      aws_lb.hub[0].name == "layerv-nhp-sandbox-hub-edge" &&
       length(aws_lb_listener.hub) == 1 &&
       aws_lb_listener.hub[0].port == 62206 &&
       aws_lb_listener.hub[0].protocol == "UDP" &&
       aws_lb_target_group.hub[0].target_type == "ip" &&
       aws_lb_target_group.hub[0].port == 62206
     )
-    error_message = "Enabling the Hub edge must open exactly the public UDP-62206 edge: three public subnets, one internet gateway, one public route table with a single 0.0.0.0/0 default route, and one internet-facing network NLB with a UDP-62206 listener forwarding to an IP target group on 62206."
+    error_message = "Enabling the Hub edge must open exactly the proof-/32-fenced public UDP-62206 edge with its NLB security group attached at creation."
   }
 
   assert {

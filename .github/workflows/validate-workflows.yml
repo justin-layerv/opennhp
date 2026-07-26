@@ -160,6 +160,12 @@ on:
       # The relay plan checker imports this real-plan schema slice directly;
       # a fixture-only recapture must run the same contract tests.
       - "tests/fixtures/relay-dmz-plan/**"
+      # The cell0 source-fence checker imports the exact Terraform 1.14.3
+      # NLB/listener provider envelope; a fixture-only recapture must rerun it.
+      - "tests/fixtures/cell0-udp-source-fence/**"
+      # The Control source-fence checker imports the exact Terraform 1.14.3
+      # NLB/listener provider envelope; a fixture-only recapture must rerun it.
+      - "tests/fixtures/control-hub-source-fence/**"
       # Globs, not an enumerated list, so a brand-new Dockerfile fires
       # validate-workflows on the PR that introduces it — matching the recursive
       # discovery model of check-base-image-pebble-purge.sh and

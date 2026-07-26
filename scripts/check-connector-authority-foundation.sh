@@ -111,13 +111,20 @@ if [[ -n "$plan_json" ]]; then
     exit 1
   fi
 
-  # Two exact replacements are intentional:
+  # Three exact replacements are intentional:
   #
   # * a tainted Connector Authority FUNCTION replan recreates a function left
   #   Failed by an earlier partial apply;
   # * the one-time Authority function-SG generation change removes the live
   #   predecessor's inline VPC-CIDR rule. Omitting that rule from configuration
-  #   would leave it unmanaged, so the clean SG must replace it.
+  #   would leave it unmanaged, so the clean SG must replace it;
+  # * the one-time Hub NLB source-fence migration MUST replace the NLB and its
+  #   listener: AWS cannot add a security group to an NLB created without one.
+  #   The NLB is create-before-destroy, but the listener must be
+  #   destroy-before-create because AWS forbids one target group from serving
+  #   listeners on two load balancers, so each address is admitted only in its
+  #   exact action order; the Python convergence checker proves the new
+  #   NLB/SG/worker graph.
   #
   # Keep the SG admission self-contained and exact here as well as in the
   # first-apply checker. Any retained/substituted CIDR or any other delete stays
@@ -173,6 +180,12 @@ if [[ -n "$plan_json" ]]; then
             )] | length
           ) == 1
           and (.change.before.egress | length) == 2
+        ) or (
+          .address == "module.control.aws_lb.hub[0]"
+          and .change.actions == ["create", "delete"]
+        ) or (
+          .address == "module.control.aws_lb_listener.hub[0]"
+          and .change.actions == ["delete", "create"]
         )) | not
       )
     | "\(.address) [\(.change.actions | join(","))]"

@@ -290,10 +290,11 @@ module "compute" {
   min_capacity                    = var.min_capacity
   max_capacity                    = var.max_capacity
 
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
+  vpc_id                       = module.networking.vpc_id
+  vpc_cidr                     = var.vpc_cidr
+  public_subnet_ids            = module.networking.public_subnet_ids
+  private_subnet_ids           = module.networking.private_subnet_ids
+  public_nhp_udp_ingress_cidrs = var.public_nhp_udp_ingress_cidrs
 
   # Reference the shared, account-global server image repo.
   server_repo_url = data.aws_ecr_repository.server.repository_url

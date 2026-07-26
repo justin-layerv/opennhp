@@ -60,6 +60,11 @@ REAL_REDIS_PASSWORD_REFRESH_FIXTURE_PATH = (
     / "tests/fixtures/control-elasticache-user/"
     "refresh-passwords-null-to-empty-terraform-1.14.3-aws-6.55.0.json"
 )
+REAL_HUB_SOURCE_FENCE_ENVELOPES_PATH = (
+    ROOT
+    / "tests/fixtures/control-hub-source-fence/"
+    "hub-replacement-terraform-1.14.3-aws-6.55.0.json"
+)
 SPEC = importlib.util.spec_from_file_location("control_first_apply", CHECKER_PATH)
 assert SPEC and SPEC.loader
 CHECKER = importlib.util.module_from_spec(SPEC)
@@ -2038,15 +2043,41 @@ def authority_runtime_retry_fixture() -> dict:
 
 
 def _hub_edge_resource_changes() -> list[dict]:
-    return [
-        {
-            "address": address,
-            "mode": "managed",
-            "type": resource_type,
-            "change": _runtime_create({"id": address}),
-        }
-        for address, resource_type in CHECKER.HUB_EDGE_RESOURCES.items()
-    ]
+    changes = []
+    for address, resource_type in CHECKER.HUB_EDGE_RESOURCES.items():
+        after = {"id": address}
+        if address == "module.control.aws_security_group.hub_nlb[0]":
+            after.update({"ingress": [], "egress": []})
+        elif address.endswith(
+            'aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]'
+        ):
+            after.update(
+                {
+                    "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                    "cidr_ipv6": None,
+                    "from_port": 62206,
+                    "ip_protocol": "udp",
+                    "to_port": 62206,
+                }
+            )
+        elif address == "module.control.aws_lb.hub[0]":
+            after.update(
+                {
+                    "internal": False,
+                    "load_balancer_type": "network",
+                    "name": CHECKER.HUB_EDGE_LOAD_BALANCER_NAME,
+                    "security_groups": ["sg-hub-nlb"],
+                }
+            )
+        changes.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": resource_type,
+                "change": _runtime_create(after),
+            }
+        )
+    return changes
 
 
 def hub_identity_migration_fixture(*, converged: bool = False) -> dict[str, dict]:
@@ -2294,6 +2325,176 @@ def hub_edge_transition_fixture() -> dict:
     result["applyable"] = True
     result["resource_changes"].extend(_hub_edge_resource_changes())
     return result
+
+
+def hub_source_fence_transition_changes_fixture() -> dict[str, dict]:
+    """Exact carrier graph from the reviewed Terraform 1.14.3 plan envelope."""
+
+    payload = REAL_HUB_SOURCE_FENCE_ENVELOPES_PATH.read_bytes()
+    if (
+        hashlib.sha256(payload).hexdigest()
+        != CHECKER.HUB_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256
+    ):
+        raise AssertionError("Hub source-fence provider fixture digest drift")
+    provider_changes = CHECKER._load_hub_source_fence_provider_changes()
+    by_address: dict[str, dict] = {
+        address: {
+            "address": address,
+            "mode": "managed",
+            "type": "fixture",
+            "change": {
+                "actions": copy.deepcopy(actions),
+                "before": None,
+                "after": {"id": address},
+                "after_unknown": {},
+            },
+        }
+        for address, actions in CHECKER.HUB_SOURCE_FENCE_ACTIONS.items()
+    }
+    captured_types = {
+        "module.control.aws_lb.hub[0]": "aws_lb",
+        "module.control.aws_lb_listener.hub[0]": "aws_lb_listener",
+        "module.control.aws_lb_target_group.hub[0]": "aws_lb_target_group",
+        "module.control.aws_security_group.hub_worker[0]": "aws_security_group",
+        "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": (
+            "aws_ssm_parameter"
+        ),
+    }
+    for address, captured_change in provider_changes.items():
+        by_address[address] = {
+            "address": address,
+            "mode": "managed",
+            "type": captured_types[address],
+            "change": copy.deepcopy(captured_change),
+        }
+    return by_address
+
+
+def _make_exact_noop(item: dict, after: dict) -> None:
+    item["change"] = {
+        "actions": ["no-op"],
+        "before": copy.deepcopy(after),
+        "after": copy.deepcopy(after),
+        "after_unknown": {},
+    }
+
+
+def hub_source_fence_partial_retry_fixture() -> dict[str, dict]:
+    """Retry after the NLB SG and one proof rule already applied."""
+
+    candidate = hub_source_fence_transition_changes_fixture()
+    sg_id = "sg-0123456789abcdef0"
+    sg_address = "module.control.aws_security_group.hub_nlb[0]"
+    rule_address = (
+        'module.control.aws_vpc_security_group_ingress_rule.'
+        'hub_nlb_udp["3.141.109.76/32"]'
+    )
+    _make_exact_noop(candidate[sg_address], {"id": sg_id})
+    _make_exact_noop(
+        candidate[rule_address],
+        {
+            "id": "sgr-0123456789abcdef0",
+            "security_group_id": sg_id,
+            "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+            "ip_protocol": "udp",
+            "from_port": 62206,
+            "to_port": 62206,
+        },
+    )
+    nlb_change = candidate["module.control.aws_lb.hub[0]"]["change"]
+    nlb_change["after"]["security_groups"] = [sg_id]
+    nlb_change["after_unknown"]["security_groups"] = False
+    worker_change = candidate[
+        "module.control.aws_security_group.hub_worker[0]"
+    ]["change"]
+    for rule, unknown in zip(
+        worker_change["after"]["ingress"],
+        worker_change["after_unknown"]["ingress"],
+        strict=True,
+    ):
+        rule["security_groups"] = [sg_id]
+        unknown["security_groups"] = False
+    return candidate
+
+
+def hub_source_fence_deposed_retry_fixture(
+    *, listener_create: bool,
+) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """Retry after the fenced NLB exists and its legacy instance is deposed."""
+
+    candidate = hub_source_fence_transition_changes_fixture()
+    provider = CHECKER._load_hub_source_fence_provider_changes()
+    lb_address = "module.control.aws_lb.hub[0]"
+    listener_address = "module.control.aws_lb_listener.hub[0]"
+    target_address = "module.control.aws_lb_target_group.hub[0]"
+    sg_address = "module.control.aws_security_group.hub_nlb[0]"
+    sg_id = "sg-0123456789abcdef0"
+    target_lb_arn = (
+        "arn:aws:elasticloadbalancing:us-east-2:767397897469:"
+        "loadbalancer/net/layerv-nhp-sandbox-hub-edge/0123456789abcdef"
+    )
+
+    target_lb = copy.deepcopy(provider[lb_address]["before"])
+    target_lb.update(
+        {
+            "arn": target_lb_arn,
+            "id": target_lb_arn,
+            "arn_suffix": (
+                "net/layerv-nhp-sandbox-hub-edge/0123456789abcdef"
+            ),
+            "dns_name": (
+                "layerv-nhp-sandbox-hub-edge-0123456789abcdef."
+                "elb.us-east-2.amazonaws.com"
+            ),
+            "name": CHECKER.HUB_EDGE_LOAD_BALANCER_NAME,
+            "security_groups": [sg_id],
+        }
+    )
+    target_lb["tags"]["Name"] = CHECKER.HUB_EDGE_LOAD_BALANCER_NAME
+    target_lb["tags_all"]["Name"] = CHECKER.HUB_EDGE_LOAD_BALANCER_NAME
+    _make_exact_noop(candidate[lb_address], target_lb)
+    _make_exact_noop(candidate[sg_address], {"id": sg_id})
+
+    target_group = copy.deepcopy(provider[target_address]["after"])
+    target_group["load_balancer_arns"] = [target_lb_arn]
+    _make_exact_noop(candidate[target_address], target_group)
+
+    listener = candidate[listener_address]["change"]
+    listener["after"]["load_balancer_arn"] = target_lb_arn
+    listener["after_unknown"]["load_balancer_arn"] = False
+    if listener_create:
+        listener["actions"] = ["create"]
+        listener["before"] = None
+        listener.pop("replace_paths", None)
+        listener.pop("before_sensitive", None)
+        listener.pop("before_identity", None)
+        listener["after_identity"] = {}
+
+    worker = candidate["module.control.aws_security_group.hub_worker[0]"][
+        "change"
+    ]
+    for rule, unknown in zip(
+        worker["after"]["ingress"],
+        worker["after_unknown"]["ingress"],
+        strict=True,
+    ):
+        rule["security_groups"] = [sg_id]
+        unknown["security_groups"] = False
+
+    deposed = {
+        "address": lb_address,
+        "deposed": "deadbeef",
+        "mode": "managed",
+        "type": "aws_lb",
+        "name": "hub",
+        "change": {
+            "actions": ["delete"],
+            "before": copy.deepcopy(provider[lb_address]["before"]),
+            "after": None,
+            "after_unknown": {},
+        },
+    }
+    return candidate, {lb_address: [deposed]}
 
 
 def write_json(path: Path, value: object) -> None:
@@ -5902,6 +6103,19 @@ class PlanContractTests(unittest.TestCase):
                 ("target_key_id",),
                 ["data.aws_kms_key.external.key_id", "data.aws_kms_key.external"],
             ),
+            (
+                "hub-worker-ingress-security-group-substitution",
+                "module.control.aws_security_group.hub_worker",
+                ("ingress",),
+                [
+                    "local.hub_edge_enabled",
+                    "aws_security_group.external.id",
+                    "aws_security_group.external",
+                    "local.hub_edge_enabled",
+                    "aws_security_group.external.id",
+                    "aws_security_group.external",
+                ],
+            ),
         )
         for label, address, path, references in mutations:
             with self.subTest(label=label):
@@ -7178,6 +7392,7 @@ def live_fixture(root: Path) -> None:
         },
         "control-lambdas.json": [],
         "control-load-balancers.json": [],
+        "control-security-groups.json": {"SecurityGroups": []},
     }
     for filename, value in fixtures.items():
         write_json(root / filename, value)
@@ -7190,6 +7405,7 @@ def hub_nlb_evidence() -> dict:
         "Scheme": "internet-facing",
         "VpcId": "vpc-abc123",
         "State": {"Code": "active"},
+        "SecurityGroups": ["sg-a1b2c3"],
     }
 
 
@@ -7224,6 +7440,32 @@ def live_edge_fixture(root: Path) -> None:
         {"InternetGateways": [{"InternetGatewayId": "igw-abc123"}]},
     )
     write_json(root / "control-load-balancers.json", [hub_nlb_evidence()])
+    write_json(
+        root / "control-security-groups.json",
+        {
+            "SecurityGroups": [
+                {
+                    "GroupId": "sg-a1b2c3",
+                    "Tags": [
+                        {"Key": "Component", "Value": "connector-hub-edge"},
+                        {
+                            "Key": "Name",
+                            "Value": f"{CHECKER.CONTROL_PREFIX}-hub-nlb",
+                        },
+                    ],
+                    "IpPermissions": [
+                        {
+                            "IpProtocol": "udp",
+                            "FromPort": 62206,
+                            "ToPort": 62206,
+                            "IpRanges": [{"CidrIp": CHECKER.PROOF_SOURCE_CIDR}],
+                        }
+                    ],
+                    "IpPermissionsEgress": [],
+                }
+            ]
+        },
+    )
 
 
 def live_worker_fixture(root: Path) -> None:
@@ -7246,6 +7488,49 @@ def live_worker_fixture(root: Path) -> None:
                 }
             )
     write_json(root / "route-tables.json", route_payload)
+    security = json.loads((root / "control-security-groups.json").read_text())
+    nlb_group = security["SecurityGroups"][0]
+    nlb_group["IpPermissionsEgress"] = [
+        {
+            "IpProtocol": "udp",
+            "FromPort": 62206,
+            "ToPort": 62206,
+            "UserIdGroupPairs": [{"GroupId": "sg-d4e5f6"}],
+        },
+        {
+            "IpProtocol": "tcp",
+            "FromPort": 62207,
+            "ToPort": 62207,
+            "UserIdGroupPairs": [{"GroupId": "sg-d4e5f6"}],
+        },
+    ]
+    security["SecurityGroups"].append(
+        {
+            "GroupId": "sg-d4e5f6",
+            "Tags": [
+                {"Key": "Component", "Value": "connector-hub"},
+                {"Key": "Name", "Value": f"{CHECKER.CONTROL_PREFIX}-hub"},
+            ],
+            "IpPermissions": [
+                {
+                    "IpProtocol": "udp",
+                    "FromPort": 62206,
+                    "ToPort": 62206,
+                    "UserIdGroupPairs": [{"GroupId": "sg-a1b2c3"}],
+                },
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 62207,
+                    "ToPort": 62207,
+                    "UserIdGroupPairs": [{"GroupId": "sg-a1b2c3"}],
+                },
+            ],
+            # Worker HTTPS egress is validated by Terraform state/plan; live
+            # edge validation only normalizes ingress and the NLB's inverse.
+            "IpPermissionsEgress": [],
+        }
+    )
+    write_json(root / "control-security-groups.json", security)
 
 
 class LiveHubWorkerBoundaryTests(unittest.TestCase):
@@ -7254,6 +7539,54 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             root = Path(directory)
             live_worker_fixture(root)
             self.assertEqual(CHECKER.check_live(root)["vpc_id"], "vpc-abc123")
+
+    def test_live_edge_rejects_global_udp_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            payload = json.loads(
+                (root / "control-security-groups.json").read_text()
+            )
+            payload["SecurityGroups"][0]["IpPermissions"][0]["IpRanges"][0][
+                "CidrIp"
+            ] = "0.0.0.0/0"
+            write_json(root / "control-security-groups.json", payload)
+            with self.assertRaisesRegex(
+                CHECKER.ContractError, "proof-runner /32 UDP 62206"
+            ):
+                CHECKER.check_live(root)
+
+    def test_live_edge_rejects_nlb_without_attached_sg(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            payload = json.loads((root / "control-load-balancers.json").read_text())
+            payload[0]["SecurityGroups"] = []
+            write_json(root / "control-load-balancers.json", payload)
+            with self.assertRaisesRegex(
+                CHECKER.ContractError, "attach exactly the reviewed NLB SG"
+            ):
+                CHECKER.check_live(root)
+
+    def test_live_worker_rejects_cidr_target_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_worker_fixture(root)
+            payload = json.loads(
+                (root / "control-security-groups.json").read_text()
+            )
+            worker = next(
+                group
+                for group in payload["SecurityGroups"]
+                if group["GroupId"] == "sg-d4e5f6"
+            )
+            worker["IpPermissions"][0].pop("UserIdGroupPairs")
+            worker["IpPermissions"][0]["IpRanges"] = [{"CidrIp": "0.0.0.0/0"}]
+            write_json(root / "control-security-groups.json", payload)
+            with self.assertRaisesRegex(
+                CHECKER.ContractError, "exactly from the Hub NLB SG"
+            ):
+                CHECKER.check_live(root)
 
     def test_live_worker_missing_s3_route_on_an_isolated_table_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8029,6 +8362,10 @@ class WorkflowContractTests(unittest.TestCase):
             '- "tests/scripts/**"',
             validate_workflow,
         )
+        self.assertIn(
+            '- "tests/fixtures/control-hub-source-fence/**"',
+            validate_workflow,
+        )
 
     def test_real_pr_plan_runs_convergence_contract(self) -> None:
         plan_workflow = TERRAFORM_PLAN_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -8056,11 +8393,321 @@ class WorkflowContractTests(unittest.TestCase):
         )
 
 
+class HubSourceFenceTransitionTests(unittest.TestCase):
+    """One-time Hub carrier replacement must bind its exact legacy state."""
+
+    def test_exact_hub_source_fence_transition_passes(self) -> None:
+        CHECKER._check_hub_source_fence_transition(
+            hub_source_fence_transition_changes_fixture()
+        )
+
+    def test_exact_partial_retry_with_target_noops_passes(self) -> None:
+        CHECKER._check_hub_source_fence_transition(
+            hub_source_fence_partial_retry_fixture()
+        )
+
+    def test_exact_deposed_nlb_retry_phases_pass(self) -> None:
+        for listener_create in (False, True):
+            candidate, deposed = hub_source_fence_deposed_retry_fixture(
+                listener_create=listener_create
+            )
+            with self.subTest(listener_create=listener_create):
+                CHECKER._check_hub_source_fence_transition(candidate, deposed)
+
+    def test_partial_retry_rejects_unsafe_target_noop(self) -> None:
+        candidate = hub_source_fence_partial_retry_fixture()
+        sg_address = "module.control.aws_security_group.hub_nlb[0]"
+        candidate[sg_address]["change"]["after"]["id"] = "sg-attacker"
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exact target no-op"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_deposed_retry_rejects_legacy_envelope_drift(self) -> None:
+        candidate, deposed = hub_source_fence_deposed_retry_fixture(
+            listener_create=False
+        )
+        deposed["module.control.aws_lb.hub[0]"][0]["change"]["before"][
+            "dns_record_client_routing_policy"
+        ] = "availability_zone_affinity"
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exact captured SG-less legacy"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate, deposed)
+
+    def test_unrelated_drift_is_rejected(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_vpc.control"] = {
+            "change": {
+                "actions": ["update"],
+                "before": {"enable_dns_support": True},
+                "after": {"enable_dns_support": False},
+            }
+        }
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exact reviewed remaining action subset"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_wrong_legacy_source_fence_is_rejected(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_lb.hub[0]"]["change"]["before"][
+            "security_groups"
+        ] = ["sg-unreviewed"]
+        with self.assertRaisesRegex(CHECKER.ContractError, "replacement before"):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_nlb_dns_routing_policy_injection_is_rejected(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_lb.hub[0]"]["change"]["after"][
+            "dns_record_client_routing_policy"
+        ] = "availability_zone_affinity"
+        with self.assertRaisesRegex(CHECKER.ContractError, "replacement after"):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_listener_certificate_injection_is_rejected(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_lb_listener.hub[0]"]["change"]["after"][
+            "certificate_arn"
+        ] = (
+            "arn:aws:acm:us-east-2:767397897469:"
+            "certificate/00000000-0000-0000-0000-000000000000"
+        )
+        with self.assertRaisesRegex(CHECKER.ContractError, "replacement after"):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_persisted_provider_envelope_drift_is_rejected(self) -> None:
+        cases = {
+            "nlb-before-derived-identity": (
+                "module.control.aws_lb.hub[0]",
+                "before",
+                lambda envelope: envelope.__setitem__(
+                    "dns_name", "unreviewed.elb.us-east-2.amazonaws.com"
+                ),
+            ),
+            "nlb-unknown-security-groups": (
+                "module.control.aws_lb.hub[0]",
+                "after_unknown",
+                lambda envelope: envelope.__setitem__("security_groups", False),
+            ),
+            "nlb-sensitive-subnet-shape": (
+                "module.control.aws_lb.hub[0]",
+                "after_sensitive",
+                lambda envelope: envelope["subnet_mapping"].append({}),
+            ),
+            "nlb-identity-drift": (
+                "module.control.aws_lb.hub[0]",
+                "after_identity",
+                lambda envelope: envelope.__setitem__(
+                    "arn", envelope["arn"].replace("651df21ec4f8f904", "0" * 16)
+                ),
+            ),
+            "listener-unknown-ssl-policy": (
+                "module.control.aws_lb_listener.hub[0]",
+                "after_unknown",
+                lambda envelope: envelope.__setitem__("ssl_policy", False),
+            ),
+            "listener-sensitive-tags-shape": (
+                "module.control.aws_lb_listener.hub[0]",
+                "before_sensitive",
+                lambda envelope: envelope.pop("tags"),
+            ),
+            "listener-identity-drift": (
+                "module.control.aws_lb_listener.hub[0]",
+                "after_identity",
+                lambda envelope: envelope.__setitem__(
+                    "arn", envelope["arn"].replace("b4f22dd284158770", "f" * 16)
+                ),
+            ),
+            "target-unknown-protocol": (
+                "module.control.aws_lb_target_group.hub[0]",
+                "after_unknown",
+                lambda envelope: envelope.__setitem__("protocol", True),
+            ),
+            "target-before-sensitive-health-check": (
+                "module.control.aws_lb_target_group.hub[0]",
+                "before_sensitive",
+                lambda envelope: envelope.__setitem__("health_check", True),
+            ),
+            "target-after-sensitive-health-check": (
+                "module.control.aws_lb_target_group.hub[0]",
+                "after_sensitive",
+                lambda envelope: envelope.__setitem__("health_check", True),
+            ),
+            "target-before-identity": (
+                "module.control.aws_lb_target_group.hub[0]",
+                "before_identity",
+                lambda envelope: envelope.__setitem__("arn", "target-attacker"),
+            ),
+            "target-after-identity": (
+                "module.control.aws_lb_target_group.hub[0]",
+                "after_identity",
+                lambda envelope: envelope.__setitem__("arn", "target-attacker"),
+            ),
+            "worker-unknown-ingress": (
+                "module.control.aws_security_group.hub_worker[0]",
+                "after_unknown",
+                lambda envelope: envelope.__setitem__("ingress", True),
+            ),
+            "worker-before-sensitive-ingress": (
+                "module.control.aws_security_group.hub_worker[0]",
+                "before_sensitive",
+                lambda envelope: envelope.__setitem__("ingress", True),
+            ),
+            "worker-after-sensitive-ingress": (
+                "module.control.aws_security_group.hub_worker[0]",
+                "after_sensitive",
+                lambda envelope: envelope.__setitem__("ingress", True),
+            ),
+            "worker-before-identity": (
+                "module.control.aws_security_group.hub_worker[0]",
+                "before_identity",
+                lambda envelope: envelope.__setitem__("id", "sg-attacker"),
+            ),
+            "worker-after-identity": (
+                "module.control.aws_security_group.hub_worker[0]",
+                "after_identity",
+                lambda envelope: envelope.__setitem__("id", "sg-attacker"),
+            ),
+            "parameter-unknown-version": (
+                "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+                "after_unknown",
+                lambda envelope: envelope.__setitem__("version", False),
+            ),
+            "parameter-before-sensitive-value": (
+                "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+                "before_sensitive",
+                lambda envelope: envelope.__setitem__("value", False),
+            ),
+            "parameter-after-sensitive-value": (
+                "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+                "after_sensitive",
+                lambda envelope: envelope.__setitem__("value", False),
+            ),
+            "parameter-before-identity": (
+                "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+                "before_identity",
+                lambda envelope: envelope.__setitem__("name", "/attacker"),
+            ),
+            "parameter-after-identity": (
+                "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+                "after_identity",
+                lambda envelope: envelope.__setitem__("name", "/attacker"),
+            ),
+        }
+        for name, (address, side, mutate) in cases.items():
+            candidate = hub_source_fence_transition_changes_fixture()
+            mutate(candidate[address]["change"][side])
+            with (
+                self.subTest(case=name),
+                self.assertRaisesRegex(
+                    CHECKER.ContractError, rf"replacement {side}"
+                ),
+            ):
+                CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_extra_provider_envelope_field_is_rejected(self) -> None:
+        for address in CHECKER.HUB_SOURCE_FENCE_PROVIDER_ADDRESSES:
+            candidate = hub_source_fence_transition_changes_fixture()
+            candidate[address]["change"]["generated_config"] = {}
+            with (
+                self.subTest(address=address),
+                self.assertRaisesRegex(
+                    CHECKER.ContractError, "replacement envelope fields"
+                ),
+            ):
+                CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_wrong_action_order_is_rejected(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_lb_listener.hub[0]"]["change"]["actions"] = [
+            "create",
+            "delete",
+        ]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exact reviewed remaining action subset"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_partial_and_mixed_replacement_are_rejected(self) -> None:
+        partial = hub_source_fence_transition_changes_fixture()
+        partial.pop(
+            "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health[0]"
+        )
+        mixed = hub_source_fence_transition_changes_fixture()
+        mixed["module.control.aws_lb_target_group.hub[0]"]["change"]["actions"] = [
+            "update"
+        ]
+        for candidate in (partial, mixed):
+            with (
+                self.subTest(candidate=candidate),
+                self.assertRaises(CHECKER.ContractError),
+            ):
+                CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_target_and_backend_sg_changes_are_bounded(self) -> None:
+        target_drift = hub_source_fence_transition_changes_fixture()
+        target_drift["module.control.aws_lb_target_group.hub[0]"]["change"]["after"][
+            "health_check"
+        ][0]["port"] = "443"
+        worker_drift = hub_source_fence_transition_changes_fixture()
+        worker_drift["module.control.aws_security_group.hub_worker[0]"]["change"][
+            "after"
+        ]["tags"]["Name"] = "unreviewed"
+        for candidate in (target_drift, worker_drift):
+            with (
+                self.subTest(candidate=candidate),
+                self.assertRaises(CHECKER.ContractError),
+            ):
+                CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_listener_parameter_change_is_value_only(self) -> None:
+        candidate = hub_source_fence_transition_changes_fixture()
+        candidate["module.control.aws_ssm_parameter.hub_udp_listener_arn[0]"]["change"][
+            "after"
+        ]["tier"] = "Advanced"
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "replacement after"
+        ):
+            CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_dns_root_pins_replacement_nlb_names(self) -> None:
+        variables = (
+            ROOT / "terraform" / "environments" / "sandbox-hub-dns" / "variables.tf"
+        ).read_text(encoding="utf-8")
+        for variable, expected in (
+            ("hub_nlb_name", "layerv-nhp-sandbox-hub-edge"),
+            ("cell0_nlb_name", "layerv-nhp-sandbox-edge"),
+        ):
+            marker = f'variable "{variable}" {{'
+            _, found, remainder = variables.partition(marker)
+            self.assertEqual(found, marker)
+            block = marker + remainder.split('\nvariable "', 1)[0]
+            self.assertIn(f'condition     = var.{variable} == "{expected}"', block)
+        self.assertNotIn("0.0.0.0/0", variables)
+
+
 class HubEdgeSliceTests(unittest.TestCase):
     """Step 5 slice 5a: the Hub public UDP edge admission + plan_mode."""
 
     def test_hub_edge_slice_admitted(self) -> None:
         summary = CHECKER.check_plan(hub_edge_transition_fixture())
+        self.assertEqual(summary["plan_mode"], "hub-edge-slice")
+
+    def test_hub_edge_new_sg_accepts_provider_unknown_empty_collections(
+        self,
+    ) -> None:
+        candidate = hub_edge_transition_fixture()
+        nlb_sg = next(
+            item
+            for item in candidate["resource_changes"]
+            if item["address"] == "module.control.aws_security_group.hub_nlb[0]"
+        )["change"]
+        del nlb_sg["after"]["ingress"]
+        del nlb_sg["after"]["egress"]
+        nlb_sg["after_unknown"].update({"ingress": True, "egress": True})
+
+        summary = CHECKER.check_plan(candidate)
         self.assertEqual(summary["plan_mode"], "hub-edge-slice")
 
     def test_hub_edge_partial_slice_rejected(self) -> None:

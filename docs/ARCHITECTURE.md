@@ -105,6 +105,9 @@ re-encrypts to relay HTTPS 8080. The relay owns no public UDP listener.
 
 Upcoming UDP SDKs connect directly to the public NHP server NLB for their
 assigned cell. That server NLB exposes exactly one public UDP listener, 62206.
+The sandbox proof edge admits only the persistent proof-runner EIP `/32`, and
+the server target SG trusts only the NLB SG identity; arbitrary internet hosts
+cannot reach the listener.
 Browser knocks remain opaque agent-to-server payloads and are wrapped in
 authenticated `NHP_RLY` messages. The relay sends those messages
 from its separate internal UDP 62207 socket to the server's internal UDP 62206
@@ -1214,7 +1217,8 @@ shared Logs key and relay-dark production policy unchanged.
 | Relay node SG | UDP 62206 to exact main private-subnet CIDRs | NHP_RLY to the internal server path |
 | Relay node SG | UDP 62207 from server SG | Private authenticated RelayReturn receive socket |
 | Relay node SG | TCP 443 to endpoint SG and regional S3 prefix list | Bounded AWS control-plane/bootstrap egress |
-| Server SG | UDP 62206 from `0.0.0.0/0` | Direct SDK ingress through the assigned-cell public NLB |
+| Sandbox proof public server NLB SG | UDP 62206 from the exact proof-runner EIP `/32` | Source-fenced direct SDK proof ingress |
+| Sandbox proof server SG | UDP 62206 from the public server NLB SG | Direct SDK traffic forwarded by the assigned-cell NLB |
 | Server SG | UDP 62206 from the DMZ relay subnet CIDRs | Peered browser-relay forwarding through the internal NLB |
 
 WAF does not inspect direct SDK UDP because that traffic bypasses the relay and

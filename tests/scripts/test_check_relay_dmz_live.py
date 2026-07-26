@@ -151,6 +151,7 @@ def good_snapshot() -> dict:
     alb_sg = "sg-alb"
     endpoint_sg = "sg-endpoint"
     server_sg = "sg-server"
+    server_nlb_sg = "sg-server-nlb"
     relay_cidrs = ["10.101.10.0/24", "10.101.11.0/24", "10.101.12.0/24"]
     main_cidrs = ["10.100.10.0/24", "10.100.11.0/24", "10.100.12.0/24"]
     local_route = route("10.101.0.0/16", "gateway", "local")
@@ -293,10 +294,22 @@ def good_snapshot() -> dict:
             "id": server_sg,
             "vpc_id": main_vpc,
             "inbound": [
-                rule("udp", 62206, 62206, "cidr_ipv4", "0.0.0.0/0"),
+                rule("udp", 62206, 62206, "security_group", server_nlb_sg),
+                rule("tcp", 8888, 8888, "security_group", server_nlb_sg),
                 *(rule("udp", 62206, 62206, "cidr_ipv4", cidr) for cidr in relay_cidrs),
             ],
             "outbound": [],
+        },
+        server_nlb_sg: {
+            "id": server_nlb_sg,
+            "vpc_id": main_vpc,
+            "inbound": [
+                rule("udp", 62206, 62206, "cidr_ipv4", "3.141.109.76/32"),
+            ],
+            "outbound": [
+                rule("udp", 62206, 62206, "security_group", server_sg),
+                rule("tcp", 8888, 8888, "security_group", server_sg),
+            ],
         },
     }
 
@@ -424,6 +437,7 @@ def good_snapshot() -> dict:
             "endpoint_ids": [endpoint_sg],
             "alb_ids": [alb_sg],
             "server_ids": [server_sg],
+            "server_nlb_ids": [server_nlb_sg],
             "by_id": by_id,
         },
         "endpoints": endpoints,
@@ -626,16 +640,17 @@ def good_snapshot() -> dict:
     }
     snapshot["assigned_cell_nhp_listeners"] = [
         {
-            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-nlb/cell0",
-            "load_balancer_name": "layerv-nhp-sandbox-nlb",
+            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-edge/cell0",
+            "load_balancer_name": "layerv-nhp-sandbox-edge",
+            "load_balancer_security_group_ids": [server_nlb_sg],
             "load_balancer_tags": {
                 "Environment": "sandbox",
                 "Component": "compute",
                 "Cell": "cell0",
-                "Name": "layerv-nhp-sandbox-nlb",
+                "Name": "layerv-nhp-sandbox-edge",
             },
             "canonical": True,
-            "listener_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-nlb/cell0/udp",
+            "listener_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-edge/cell0/udp",
             "protocol": "UDP",
             "port": checker.RELAY_SERVER_UDP_PORT,
             "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp/cell0",
@@ -728,6 +743,32 @@ def good_snapshot() -> dict:
 
 def good_prod_snapshot() -> dict:
     snapshot = json.loads(json.dumps(good_snapshot()).replace("sandbox", "prod"))
+    public_edge = snapshot["assigned_cell_nhp_listeners"][0]
+    public_edge["load_balancer_name"] = "layerv-nhp-prod-nlb"
+    public_edge["load_balancer_tags"]["Name"] = "layerv-nhp-prod-nlb"
+    public_edge["load_balancer_security_group_ids"] = []
+    public_edge["load_balancer_arn"] = public_edge["load_balancer_arn"].replace(
+        "layerv-nhp-prod-edge", "layerv-nhp-prod-nlb"
+    )
+    public_edge["listener_arn"] = public_edge["listener_arn"].replace(
+        "layerv-nhp-prod-edge", "layerv-nhp-prod-nlb"
+    )
+    server_id = snapshot["security_groups"]["server_ids"][0]
+    nlb_id = snapshot["security_groups"]["server_nlb_ids"][0]
+    server_inbound = snapshot["security_groups"]["by_id"][server_id]["inbound"]
+    snapshot["security_groups"]["by_id"][server_id]["inbound"] = [
+        rule("udp", 62206, 62206, "cidr_ipv4", "0.0.0.0/0"),
+        *[
+            item
+            for item in server_inbound
+            if not (
+                item.get("source_type") == "security_group"
+                and item.get("source") == nlb_id
+            )
+        ],
+    ]
+    del snapshot["security_groups"]["by_id"][nlb_id]
+    snapshot["security_groups"]["server_nlb_ids"] = []
     snapshot["server_deploy_mode"] = "canary"
     snapshot["server_active_color"] = "blue"
     snapshot["alb"]["deletion_protection_enabled"] = "true"
@@ -802,7 +843,7 @@ class RecordedStructuralAws:
         extra_untagged_dmz_lb: bool = False,
         missing_main_peer_vpc_id: bool = False,
         public_main_vpc_nhp_protocol: str | None = "UDP",
-        public_main_vpc_nhp_name: str = "layerv-nhp-sandbox-nlb",
+        public_main_vpc_nhp_name: str = "layerv-nhp-sandbox-edge",
         extra_public_main_vpc_nlb: str | None = None,
         waf_absent: bool = False,
     ):
@@ -1116,6 +1157,7 @@ class RecordedStructuralAws:
                                 "VpcId": main_vpc,
                                 "Type": "network",
                                 "Scheme": "internet-facing",
+                                "SecurityGroups": ["sg-server-nlb-recorded"],
                             }
                         ]
                         if self.public_main_vpc_nhp_protocol is not None
@@ -1231,7 +1273,7 @@ class RecordedStructuralAws:
                                     {"Key": "Cell", "Value": "cell0"},
                                     {
                                         "Key": "Name",
-                                        "Value": "layerv-nhp-sandbox-nlb",
+                                                        "Value": "layerv-nhp-sandbox-edge",
                                     },
                                 ]
                                 if "/net/public-main-nhp/" in arn
@@ -1373,20 +1415,65 @@ class RecordedStructuralAws:
                                         "IpProtocol": "udp",
                                         "FromPort": 62206,
                                         "ToPort": 62206,
-                                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                                        "UserIdGroupPairs": [
+                                            {"GroupId": "sg-server-nlb-recorded"}
+                                        ],
+                                    },
+                                    {
+                                        "IpProtocol": "tcp",
+                                        "FromPort": 8888,
+                                        "ToPort": 8888,
+                                        "UserIdGroupPairs": [
+                                            {"GroupId": "sg-server-nlb-recorded"}
+                                        ],
                                     }
                                 ]
                                 if group_id == "sg-server-recorded"
-                                else []
+                                else (
+                                    [
+                                        {
+                                            "IpProtocol": "udp",
+                                            "FromPort": 62206,
+                                            "ToPort": 62206,
+                                            "IpRanges": [
+                                                {"CidrIp": "3.141.109.76/32"}
+                                            ],
+                                        }
+                                    ]
+                                    if group_id == "sg-server-nlb-recorded"
+                                    else []
+                                )
                             )
                         ),
-                        "IpPermissionsEgress": [],
+                        "IpPermissionsEgress": (
+                            [
+                                {
+                                    "IpProtocol": "udp",
+                                    "FromPort": 62206,
+                                    "ToPort": 62206,
+                                    "UserIdGroupPairs": [
+                                        {"GroupId": "sg-server-recorded"}
+                                    ],
+                                },
+                                {
+                                    "IpProtocol": "tcp",
+                                    "FromPort": 8888,
+                                    "ToPort": 8888,
+                                    "UserIdGroupPairs": [
+                                        {"GroupId": "sg-server-recorded"}
+                                    ],
+                                },
+                            ]
+                            if group_id == "sg-server-nlb-recorded"
+                            else []
+                        ),
                     }
                     for group_id in (
                         "sg-relay-recorded",
                         "sg-endpoint-recorded",
                         "sg-alb-recorded",
                         "sg-server-recorded",
+                        "sg-server-nlb-recorded",
                     )
                     if group_id in args
                 ]
@@ -2241,12 +2328,15 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                     [
                         {
                             "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/public-main-nhp/legacy",
-                            "load_balancer_name": "layerv-nhp-sandbox-nlb",
+                            "load_balancer_name": "layerv-nhp-sandbox-edge",
+                            "load_balancer_security_group_ids": [
+                                "sg-server-nlb-recorded"
+                            ],
                             "load_balancer_tags": {
                                 "Environment": "sandbox",
                                 "Component": "compute",
                                 "Cell": "cell0",
-                                "Name": "layerv-nhp-sandbox-nlb",
+                                "Name": "layerv-nhp-sandbox-edge",
                             },
                             "canonical": True,
                             "listener_arn": "listener-public-main-nhp",
@@ -2497,7 +2587,11 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 result = super().call(service, operation, *args)
                 if parameter_name.endswith("/deploy/mode"):
                     result = {"Parameter": {"Value": "canary"}}
-                return json.loads(json.dumps(result).replace("sandbox", "prod"))
+                return json.loads(
+                    json.dumps(result)
+                    .replace("sandbox", "prod")
+                    .replace("layerv-nhp-prod-edge", "layerv-nhp-prod-nlb")
+                )
 
         aws = ProdCanaryAws(dmz_is_requester=True)
         snapshot = checker.collect_structural("prod", aws)
@@ -3469,7 +3563,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             "public target color differs from active marker": "canonical cell/color ownership",
             "wrong target ASG": "active-color server-ASG targets",
             "wrong target server SG": "canonical server SG",
-            "public server ACK SG rule": "public UDP-capable ingress must be exactly IPv4 UDP 62206",
+            "public server ACK SG rule": "server SG internet-wide UDP ingress",
             "second assigned-cell UDP edge": "exactly one public UDP listener on 62206",
             "missing internal relay edge": "exactly one canonical internal server UDP 62206 listener",
             "internal relay ACK port": "canonical tagged UDP 62206 NLB edge",
@@ -3607,11 +3701,29 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 lambda data: data["security_groups"]["by_id"]["sg-server"]["inbound"][
                     0
                 ].update({"source": "10.100.0.0/16"}),
-                "server SG rules covering UDP 62206 are not exactly public internet plus relay /24s",
+                "server SG rules covering UDP 62206 are not exactly the reviewed NLB/legacy edge plus relay /24s",
+            ),
+            "NLB public source": (
+                lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
+                    "inbound"
+                ][0].update({"source": "0.0.0.0/0"}),
+                "server NLB SG ingress is not exactly proof-runner /32 UDP 62206",
+            ),
+            "NLB target egress": (
+                lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
+                    "outbound"
+                ].pop(),
+                "server NLB SG egress is not exactly server-SG UDP 62206 plus TCP 8888 health",
+            ),
+            "target health source": (
+                lambda data: data["security_groups"]["by_id"]["sg-server"][
+                    "inbound"
+                ].pop(1),
+                "server SG must accept TCP 8888 health from exactly the server NLB SG",
             ),
             "non-singular identity": (
                 lambda data: data["security_groups"]["relay_ids"].append("sg-rogue"),
-                "relay, ALB, endpoint, and server SG identities must each be singular",
+                "relay, ALB, endpoint, server, and sandbox server-NLB SG identities must each be singular",
             ),
         }
         for name, (mutate, expected) in cases.items():

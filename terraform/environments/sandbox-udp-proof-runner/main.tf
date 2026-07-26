@@ -3,13 +3,11 @@
 # Composes terraform/modules/udp-proof-runner (the NHP-owned compute boundary for
 # the attended qurl-go + Connector UDP proof) in its own isolated root.
 #
-# The stable-source /32 (module output stable_source_cidr) is intentionally NOT
-# added to the Hub / cell0 / cell1 UDP:62206 ingress: all three edges are already
-# open to 0.0.0.0/0 on UDP 62206 (public SDK edges — see modules/compute
-# server_nhp_udp and connector-authority-foundation hub_worker SG), so a /32 grant
-# is a redundant subset and would, at the Hub, fight the fail-closed Control
-# convergence gate. The EIP still gives a stable, reviewable source for the
-# attended controller's records and any future tightening.
+# The stable-source /32 (module output stable_source_cidr) is the sole public
+# caller admitted by the Hub / cell0 / cell1 UDP:62206 NLB security groups.
+# Those SGs are attached when each NLB is created; target SGs trust only the NLB
+# SG identity. Keep this EIP stable across runner churn or every proof edge must
+# be deliberately replaced/reviewed with a new exact /32.
 # -----------------------------------------------------------------------------
 
 locals {

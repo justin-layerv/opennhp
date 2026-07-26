@@ -492,7 +492,11 @@ jobs:
       - name: Check relay DMZ plan contract
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code == '0'
         working-directory: terraform/environments/sandbox
-        run: python3 ../../../.github/scripts/check-relay-dmz-plan.py tfplan.json
+        run: |
+          python3 ../../../.github/scripts/check-relay-dmz-plan.py \
+            tfplan.json \
+            --require-dmz-boundary-noop \
+            --allow-udp-source-fence-replacement
 
       - name: Summarize Terraform Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != ''

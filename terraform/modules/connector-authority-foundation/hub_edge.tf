@@ -18,6 +18,10 @@ locals {
   hub_edge_count   = local.hub_edge_enabled ? 3 : 0
   hub_edge_toggle  = local.hub_edge_enabled ? 1 : 0
 
+  # NLB-to-worker egress rules exist only when both the edge and a worker target
+  # are live, so an edge-only deployment has no public path into the Control VPC.
+  hub_nlb_worker_egress_count = local.hub_worker_count > 0 && local.hub_edge_enabled ? 1 : 0
+
   # Public subnets take the /28 blocks immediately after the three isolated
   # subnets (indices 0-2), so the two subnet families never overlap.
   hub_public_subnet_cidrs = [
@@ -25,6 +29,12 @@ locals {
   ]
 
   hub_udp_listener_parameter_name = "/${var.environment}/nhp/control/hub/udp-listener-arn"
+
+  # Public Hub NLB name. Deliberately shortened (drops the `-control` segment
+  # carried by local.name_prefix) and distinct so a null -> SG-attached edge
+  # forces physical replacement. Defined once so `name` and its `Name` tag stay
+  # in lockstep.
+  hub_edge_lb_name = "layerv-nhp-${var.environment}-hub-edge"
 }
 
 # Public edge subnets. No auto-assigned public IP: only the NLB occupies these
@@ -83,21 +93,66 @@ resource "aws_route_table_association" "hub_public" {
   route_table_id = aws_route_table.hub_public[0].id
 }
 
+# Source fence for the only public Hub listener. AWS cannot add a security group
+# to an NLB that was created without one, so this group is attached in the
+# aws_lb create request. Its ingress is the proof runner's exact persistent
+# public /32; its target and health egress appear only when Hub workers are live.
+resource "aws_security_group" "hub_nlb" {
+  count = local.hub_edge_toggle
+
+  name_prefix            = "${local.name_prefix}-hub-nlb-"
+  description            = "Source-fenced Connector Hub public UDP NLB"
+  vpc_id                 = aws_vpc.control.id
+  revoke_rules_on_delete = true
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-hub-nlb"
+    Component = "connector-hub-edge"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "hub_nlb_udp" {
+  for_each = local.hub_edge_enabled ? toset(coalesce(var.hub_public_udp_ingress_cidrs, [])) : toset([])
+
+  security_group_id = aws_security_group.hub_nlb[0].id
+  description       = "Connector Hub UDP proof source ${each.value}"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = each.value
+
+  tags = {
+    Name = "${local.name_prefix}-hub-nlb-udp-${replace(each.value, "/", "-")}"
+  }
+}
+
 # Public UDP-62206 network load balancer. Internet-facing, in the edge subnets.
-# The authority has no other public listener; TLS/HTTP are never exposed.
+# The authority has no other public listener; TLS/HTTP are never exposed. The
+# shortened, distinct name deliberately forces physical replacement of the
+# already-created sandbox NLB: AWS rejects attaching an SG to an NLB that was
+# originally created without one.
 resource "aws_lb" "hub" {
   count = local.hub_edge_toggle
 
-  name                             = "${local.name_prefix}-hub"
+  name                             = local.hub_edge_lb_name
   internal                         = false
   load_balancer_type               = "network"
   subnets                          = aws_subnet.hub_public[*].id
+  security_groups                  = [aws_security_group.hub_nlb[0].id]
   enable_cross_zone_load_balancing = true
   enable_deletion_protection       = local.is_prod
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-hub"
+    Name = local.hub_edge_lb_name
   })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # IP-target group: Fargate Hub tasks (slice 5b) register their awsvpc IPs. UDP
@@ -139,6 +194,39 @@ resource "aws_lb_listener" "hub" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.hub[0].arn
+  }
+}
+
+# NLB-to-worker rules are worker-gated so an edge-only deployment has no route
+# from the public NLB to any Control-VPC workload. Client data is exactly UDP
+# 62206; health is exactly TCP 62207.
+resource "aws_vpc_security_group_egress_rule" "hub_nlb_udp" {
+  count = local.hub_nlb_worker_egress_count
+
+  security_group_id            = aws_security_group.hub_nlb[0].id
+  description                  = "Connector Hub UDP to worker targets"
+  from_port                    = 62206
+  to_port                      = 62206
+  ip_protocol                  = "udp"
+  referenced_security_group_id = aws_security_group.hub_worker[0].id
+
+  tags = {
+    Name = "${local.name_prefix}-hub-nlb-udp-target"
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "hub_nlb_health" {
+  count = local.hub_nlb_worker_egress_count
+
+  security_group_id            = aws_security_group.hub_nlb[0].id
+  description                  = "Connector Hub health checks to worker targets"
+  from_port                    = 62207
+  to_port                      = 62207
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.hub_worker[0].id
+
+  tags = {
+    Name = "${local.name_prefix}-hub-nlb-health-target"
   }
 }
 

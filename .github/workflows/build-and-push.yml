@@ -2271,6 +2271,7 @@ jobs:
             python3 ../../../.github/scripts/check-relay-dmz-plan.py \
               --require-pr0-applied \
               --require-dmz-boundary-noop \
+              --allow-udp-source-fence-replacement \
               plan-boundary-preflight.json
           }
 
@@ -2484,6 +2485,7 @@ jobs:
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
             --require-pr0-applied \
             --require-dmz-boundary-noop \
+            --allow-udp-source-fence-replacement \
             plan-show.json
 
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
@@ -2553,6 +2555,7 @@ jobs:
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
             --require-pr0-applied \
             --require-dmz-boundary-noop \
+            --require-udp-source-fenced-topology \
             relay-dmz-post-apply.json
 
       - name: Get Terraform Outputs

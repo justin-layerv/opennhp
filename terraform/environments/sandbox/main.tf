@@ -75,6 +75,7 @@ module "nhp" {
   nhp_knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
   nhp_knock_global_rate_limit_burst = var.nhp_knock_global_rate_limit_burst
   nhp_udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
+  public_nhp_udp_ingress_cidrs      = var.public_nhp_udp_ingress_cidrs
 
   # Monitoring
   enable_slack_notifications                  = var.enable_slack_notifications

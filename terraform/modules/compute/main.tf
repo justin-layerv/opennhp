@@ -84,6 +84,20 @@ data "aws_ssm_parameter" "server_ami" {
 locals {
   is_prod = var.environment == "prod"
 
+  # Source-fence toggle for the public UDP NLB. When set (non-null) the module
+  # builds the fenced-shape resources (dedicated NLB SG plus scoped ingress and
+  # egress); when null it keeps the legacy global-ingress shape. Named once so
+  # the count/name guards below cannot drift in polarity — mirrors the sibling
+  # connector-authority-foundation module's hub_edge toggle.
+  public_udp_source_fenced = var.public_nhp_udp_ingress_cidrs != null
+  public_udp_fence_count   = local.public_udp_source_fenced ? 1 : 0
+
+  # Public server NLB name. The `nlb` -> `edge` suffix flip on a non-null
+  # source-fence list is correctness-relevant (it forces physical replacement so
+  # AWS can attach an SG to the new NLB); keep it defined once so the physical
+  # `name` and its `Name` tag cannot drift.
+  server_nlb_name = "${var.name_prefix}-${local.public_udp_source_fenced ? "edge" : "nlb"}"
+
   # Preserve cell0's established role/profile identity exactly. Future cells
   # receive an explicit cell-qualified identity so the Connector Authority can
   # grant each assigned-cell worker only its own qualified aliases.
@@ -772,12 +786,13 @@ resource "aws_security_group" "server" {
 
 # --- Server SG Rules (separate resources to avoid inline/standalone conflicts) ---
 
-# NHP Protocol (UDP 62206) - knock packets.
-#
-# NLBs preserve the original client IP, so the required public SDK edge needs
-# 0.0.0.0/0 on exactly UDP 62206. Exact peered relay /24 rules below document the
-# internal relay path independently.
+# Legacy public NHP Protocol (UDP 62206) ingress. Existing production cells keep
+# this shape until their separately gated edge migration. New/proof cells set
+# public_nhp_udp_ingress_cidrs, which removes this rule and makes the target
+# trust only the NLB security group below.
 resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp" {
+  count = local.public_udp_source_fenced ? 0 : 1
+
   security_group_id = aws_security_group.server.id
   description       = "NHP Protocol from assigned-cell public NLB"
   from_port         = 62206
@@ -787,6 +802,42 @@ resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp" {
 
   tags = {
     Name = "${var.name_prefix}-server-nhp-udp"
+  }
+}
+
+# Fenced public NLB target ingress. AWS propagates the NLB security-group
+# identity to targets even when preserve_client_ip is enabled, so the target
+# never needs the proof runner's public CIDR or a global UDP rule.
+resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp_nlb" {
+  count = local.public_udp_fence_count
+
+  security_group_id            = aws_security_group.server.id
+  description                  = "NHP Protocol from the assigned-cell public NLB security group"
+  from_port                    = 62206
+  to_port                      = 62206
+  ip_protocol                  = "udp"
+  referenced_security_group_id = aws_security_group.server_nlb[0].id
+
+  tags = {
+    Name = "${var.name_prefix}-server-nhp-udp-nlb"
+  }
+}
+
+# The public NLB health check is likewise accepted only through the NLB
+# security-group identity. The existing VPC-scoped plugin rule remains for
+# legitimate in-VPC callers and does not broaden public ingress.
+resource "aws_vpc_security_group_ingress_rule" "server_nlb_health" {
+  count = local.public_udp_fence_count
+
+  security_group_id            = aws_security_group.server.id
+  description                  = "Health checks from the assigned-cell public NLB security group"
+  from_port                    = 8888
+  to_port                      = 8888
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.server_nlb[0].id
+
+  tags = {
+    Name = "${var.name_prefix}-server-nlb-health"
   }
 }
 
@@ -1447,30 +1498,116 @@ resource "aws_autoscaling_policy" "cpu" {
 
 # Network Load Balancer (PUBLIC native SDK knock surface). Constant count keeps
 # the indexed state address introduced by #2628.
-resource "aws_lb" "server" {
-  count              = 1
-  name               = replace("${var.name_prefix}-nlb", "_", "-")
-  internal           = false
-  load_balancer_type = "network"
-  subnets            = var.public_subnet_ids
+resource "aws_security_group" "server_nlb" {
+  count = local.public_udp_fence_count
 
-  enable_cross_zone_load_balancing = true
-  enable_deletion_protection       = local.is_prod
+  name_prefix            = "${var.name_prefix}-nlb-"
+  description            = "Source-fenced assigned-cell public UDP NLB"
+  vpc_id                 = var.vpc_id
+  revoke_rules_on_delete = true
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-nlb"
+    Name      = "${var.name_prefix}-sg-nlb"
     Component = "compute"
     Cell      = var.cell_id
   })
 
   lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "server_nlb_udp" {
+  for_each = toset(coalesce(var.public_nhp_udp_ingress_cidrs, []))
+
+  security_group_id = aws_security_group.server_nlb[0].id
+  description       = "NHP UDP proof source ${each.value}"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = each.value
+
+  tags = {
+    Name = "${var.name_prefix}-nlb-udp-${replace(each.value, "/", "-")}"
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "server_nlb_udp" {
+  count = local.public_udp_fence_count
+
+  security_group_id            = aws_security_group.server_nlb[0].id
+  description                  = "NHP UDP to assigned-cell server targets"
+  from_port                    = 62206
+  to_port                      = 62206
+  ip_protocol                  = "udp"
+  referenced_security_group_id = aws_security_group.server.id
+
+  tags = {
+    Name = "${var.name_prefix}-nlb-udp-target"
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "server_nlb_health" {
+  count = local.public_udp_fence_count
+
+  security_group_id            = aws_security_group.server_nlb[0].id
+  description                  = "HTTP health checks to assigned-cell server targets"
+  from_port                    = 8888
+  to_port                      = 8888
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.server.id
+
+  tags = {
+    Name = "${var.name_prefix}-nlb-health-target"
+  }
+}
+
+resource "aws_lb" "server" {
+  count = 1
+  # AWS cannot attach a security group to an NLB that was created without one.
+  # The distinct fenced name is therefore correctness-relevant: changing
+  # null -> a reviewed source list forces physical replacement and lets the old
+  # edge coexist until Terraform moves the listener/DNS-facing outputs.
+  name               = replace(local.server_nlb_name, "_", "-")
+  internal           = false
+  load_balancer_type = "network"
+  subnets            = var.public_subnet_ids
+  security_groups    = local.public_udp_source_fenced ? [aws_security_group.server_nlb[0].id] : null
+
+  enable_cross_zone_load_balancing = true
+  enable_deletion_protection       = local.is_prod
+
+  tags = merge(var.tags, {
+    Name      = local.server_nlb_name
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    # AWS cannot attach a security group to an existing NLB, so the
+    # source-fence transition (null -> a reviewed source list) has to stand up a
+    # new physical edge and hand the listener over before the SG-less NLB is
+    # retired. That ordering is only legal because the same transition also
+    # flips the physical name via local.server_nlb_name (`-nlb` -> `-edge`), so
+    # the old and new edges never contend for one ELBv2 name.
+    #
+    # The corollary is load-bearing: a replacement that does NOT change the name
+    # would fail with DuplicateLoadBalancerName. Every cell now reaches the fence
+    # through exactly that name-changing transition -- cell1's
+    # `10.102.0.0/16` -> `10.104.0.0/16` relocation is already applied, so no
+    # cell combines a VPC move with the fence (see
+    # docs/runbooks/sandbox-udp-source-fence-replacement.md). Any FUTURE VPC move
+    # of an already-fenced cell fires replace_triggered_by below WITHOUT changing
+    # the name, so it must carry an explicit name change in its reviewed saved
+    # plan.
+    create_before_destroy = true
+
     # ELBv2 cannot move an existing NLB to subnets in another VPC. Terraform's
     # AWS provider models `subnets` as an in-place update, so a VPC relocation
     # would otherwise reach apply and fail in SetSubnets. The server SG's vpc_id
     # changes exactly when the server VPC changes; key the trigger to that
     # attribute rather than the whole SG so an unrelated name/description
-    # replacement cannot cascade into NLB downtime. Static NLB names require
-    # destroy-before-create, so do not add create_before_destroy here.
+    # replacement cannot cascade into NLB downtime.
     replace_triggered_by = [aws_security_group.server.vpc_id]
   }
 }
@@ -1527,8 +1664,14 @@ resource "aws_lb_listener" "udp" {
   protocol          = "UDP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.udp[0].arn
+    type = "forward"
+    # A listener replacement must preserve the blue/green controller's
+    # authoritative active color. ignore_changes protects ordinary traffic
+    # switches, but Terraform still evaluates this create-time value when the
+    # listener itself is replaced (for example, while adding an NLB security
+    # group). Derive the target from the existing managed active-color record;
+    # do not expose an operator-supplied replacement target.
+    target_group_arn = var.enable_blue_green && aws_ssm_parameter.active_color[0].value == "green" ? aws_lb_target_group.udp_green[0].arn : aws_lb_target_group.udp[0].arn
   }
 
   tags = merge(var.tags, {
@@ -1550,6 +1693,14 @@ resource "aws_lb_listener" "udp" {
     # blue while SSM still said green → `Reconcile Listener and SSM
     # State` validation step failed on the next dispatched deploy.
     ignore_changes = [default_action]
+
+    precondition {
+      condition = (
+        !var.enable_blue_green ||
+        contains(["blue", "green"], aws_ssm_parameter.active_color[0].value)
+      )
+      error_message = "The managed active-color record must be exactly blue or green before creating the public UDP listener."
+    }
   }
 }
 

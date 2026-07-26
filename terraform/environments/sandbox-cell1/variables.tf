@@ -83,6 +83,20 @@ variable "vpc_cidr" {
   }
 }
 
+variable "public_nhp_udp_ingress_cidrs" {
+  description = "Exact proof-runner /32 allowed at the cell1 public UDP NLB. A non-null list creates the NLB with its security group attached."
+  type        = list(string)
+  default     = ["3.141.109.76/32"]
+
+  validation {
+    condition = (
+      length(var.public_nhp_udp_ingress_cidrs) == 1 &&
+      var.public_nhp_udp_ingress_cidrs[0] == "3.141.109.76/32"
+    )
+    error_message = "Sandbox cell1 UDP ingress must remain pinned to the proof runner EIP 3.141.109.76/32."
+  }
+}
+
 variable "domain_name" {
   description = <<-EOT
     NHP server hostname baked into the server identity/config (keygen Lambda

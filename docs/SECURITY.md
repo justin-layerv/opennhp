@@ -93,16 +93,19 @@ public UDP load balancer or UDP listener.
 
 Upcoming UDP SDKs bypass the relay. After control-plane assignment, an SDK
 connects directly to the public NHP server NLB for its assigned cell. That NLB
-has exactly one public UDP listener: 62206. UDP 62207 must never be exposed on
-the public NHP edge.
+has exactly one public UDP listener: 62206. During the sandbox proof it admits
+only the persistent proof-runner EIP `/32`; its target SG trusts only the NLB
+SG identity. UDP 62207 must never be exposed on the public NHP edge.
 
 For browser traffic, the relay authenticates and wraps opaque knocks in
 `NHP_RLY`, then sends them over the private peered path to server UDP 62206.
 The relay uses private UDP 62207 for this hop and for authenticated
 `RelayReturnMsg` responses. The relay SG accepts UDP 62207 only from the
 canonical server SG, and its UDP 62206 egress is limited to the exact main-VPC
-private-subnet CIDRs. The server SG keeps public UDP 62206 for direct SDKs and
-the explicit relay-subnet rules for the private relay hop.
+private-subnet CIDRs. In the sandbox proof, the server SG accepts direct-SDK
+UDP 62206 only from the public NLB SG and keeps explicit relay-subnet rules for
+the private relay hop. Production retains its legacy edge until a separate
+reviewed migration.
 
 AWS WAF protects only the HTTPS `/relay/*` path. Direct SDK UDP does not pass
 through WAF or the relay and relies on the NHP server protocol's authentication,
@@ -147,7 +150,8 @@ bounded. The live detector inventories the same topology: one relay HTTPS
 target group and exactly one UDP-capable public listener in the peered assigned
 cell, on UDP 62206. Functional relay validation covers only the HTTPS relay
 fleet. External UDP smoke must target the assigned cell's server NLB, not the
-relay, and must verify UDP 62207 is absent from the public listener inventory.
+relay, originate from the pinned proof-runner `/32`, and verify UDP 62207 is
+absent from the public listener inventory.
 
 ## Responding to GuardDuty Alerts
 

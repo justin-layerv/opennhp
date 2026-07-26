@@ -1,0 +1,1119 @@
+{
+  "terraform_version": "1.14.3",
+  "aws_provider_version": "6.55.0",
+  "source_plan_sha256": "53646f92eb2dc734f57a4a0500782411118ac985091d5dc9c1c5c10a7ab1265b",
+  "source_plan_json_sha256": "9aba1730bfe9f15e419626fa3e44ddf40e7faf6705c69e72250bda876a48e4ec",
+  "source_participant_envelope_sha256": "2820788513e5272b7bf2707e7c6828769221cdea3f249b2c90777477409bc04c",
+  "source_plan_complete": false,
+  "source_plan_errored": true,
+  "evidence_scope": "Exact Terraform 1.14.3/AWS provider 6.55.0 envelopes for the five persisted Hub replacement carriers selected from the fresh nine-participant plan; not deployable apply evidence.",
+  "changes": {
+    "module.control.aws_lb.hub[0]": {
+      "actions": [
+        "create",
+        "delete"
+      ],
+      "before": {
+        "access_logs": [
+          {
+            "bucket": "",
+            "enabled": false,
+            "prefix": ""
+          }
+        ],
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904",
+        "arn_suffix": "net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904",
+        "client_keep_alive": null,
+        "connection_logs": [],
+        "customer_owned_ipv4_pool": "",
+        "desync_mitigation_mode": null,
+        "dns_name": "layerv-nhp-sandbox-control-hub-651df21ec4f8f904.elb.us-east-2.amazonaws.com",
+        "dns_record_client_routing_policy": "any_availability_zone",
+        "drop_invalid_header_fields": null,
+        "enable_cross_zone_load_balancing": true,
+        "enable_deletion_protection": false,
+        "enable_http2": null,
+        "enable_prefix_for_ipv6_source_nat": "off",
+        "enable_tls_version_and_cipher_suite_headers": null,
+        "enable_waf_fail_open": null,
+        "enable_xff_client_port": null,
+        "enable_zonal_shift": false,
+        "enforce_security_group_inbound_rules_on_private_link_traffic": "",
+        "health_check_logs": [],
+        "id": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904",
+        "idle_timeout": null,
+        "internal": false,
+        "ip_address_type": "ipv4",
+        "ipam_pools": [],
+        "load_balancer_type": "network",
+        "minimum_load_balancer_capacity": [],
+        "name": "layerv-nhp-sandbox-control-hub",
+        "name_prefix": "",
+        "preserve_host_header": null,
+        "region": "us-east-2",
+        "secondary_ips_auto_assigned_per_subnet": 0,
+        "security_groups": [],
+        "subnet_mapping": [
+          {
+            "allocation_id": "",
+            "ipv6_address": "",
+            "outpost_id": "",
+            "private_ipv4_address": "",
+            "subnet_id": "subnet-035382cc2e26de8f1"
+          },
+          {
+            "allocation_id": "",
+            "ipv6_address": "",
+            "outpost_id": "",
+            "private_ipv4_address": "",
+            "subnet_id": "subnet-07ecc98733d4be419"
+          },
+          {
+            "allocation_id": "",
+            "ipv6_address": "",
+            "outpost_id": "",
+            "private_ipv4_address": "",
+            "subnet_id": "subnet-0de0695040ac424d7"
+          }
+        ],
+        "subnets": [
+          "subnet-035382cc2e26de8f1",
+          "subnet-07ecc98733d4be419",
+          "subnet-0de0695040ac424d7"
+        ],
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "timeouts": null,
+        "vpc_id": "vpc-0d911f0d4b6cb7176",
+        "xff_header_processing_mode": null,
+        "zone_id": "ZLMOA37VPKANP"
+      },
+      "after": {
+        "access_logs": [],
+        "client_keep_alive": null,
+        "connection_logs": [],
+        "customer_owned_ipv4_pool": null,
+        "desync_mitigation_mode": null,
+        "dns_record_client_routing_policy": "any_availability_zone",
+        "drop_invalid_header_fields": null,
+        "enable_cross_zone_load_balancing": true,
+        "enable_deletion_protection": false,
+        "enable_http2": null,
+        "enable_tls_version_and_cipher_suite_headers": null,
+        "enable_waf_fail_open": null,
+        "enable_xff_client_port": null,
+        "enable_zonal_shift": false,
+        "health_check_logs": [],
+        "idle_timeout": null,
+        "internal": false,
+        "ipam_pools": [],
+        "load_balancer_type": "network",
+        "minimum_load_balancer_capacity": [],
+        "name": "layerv-nhp-sandbox-hub-edge",
+        "preserve_host_header": null,
+        "region": "us-east-2",
+        "subnets": [
+          "subnet-035382cc2e26de8f1",
+          "subnet-07ecc98733d4be419",
+          "subnet-0de0695040ac424d7"
+        ],
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-hub-edge",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-hub-edge",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "timeouts": null,
+        "xff_header_processing_mode": null
+      },
+      "after_unknown": {
+        "access_logs": [],
+        "arn": true,
+        "arn_suffix": true,
+        "connection_logs": [],
+        "dns_name": true,
+        "enable_prefix_for_ipv6_source_nat": true,
+        "enforce_security_group_inbound_rules_on_private_link_traffic": true,
+        "health_check_logs": [],
+        "id": true,
+        "ip_address_type": true,
+        "ipam_pools": [],
+        "minimum_load_balancer_capacity": [],
+        "name_prefix": true,
+        "secondary_ips_auto_assigned_per_subnet": true,
+        "security_groups": true,
+        "subnet_mapping": true,
+        "subnets": [
+          false,
+          false,
+          false
+        ],
+        "tags": {},
+        "tags_all": {},
+        "vpc_id": true,
+        "zone_id": true
+      },
+      "before_sensitive": {
+        "access_logs": [
+          {}
+        ],
+        "connection_logs": [],
+        "health_check_logs": [],
+        "ipam_pools": [],
+        "minimum_load_balancer_capacity": [],
+        "security_groups": [],
+        "subnet_mapping": [
+          {},
+          {},
+          {}
+        ],
+        "subnets": [
+          false,
+          false,
+          false
+        ],
+        "tags": {},
+        "tags_all": {}
+      },
+      "after_sensitive": {
+        "access_logs": [],
+        "connection_logs": [],
+        "health_check_logs": [],
+        "ipam_pools": [],
+        "minimum_load_balancer_capacity": [],
+        "security_groups": [],
+        "subnet_mapping": [],
+        "subnets": [
+          false,
+          false,
+          false
+        ],
+        "tags": {},
+        "tags_all": {}
+      },
+      "replace_paths": [
+        [
+          "security_groups"
+        ],
+        [
+          "name"
+        ]
+      ],
+      "before_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904"
+      },
+      "after_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904"
+      }
+    },
+    "module.control.aws_lb_listener.hub[0]": {
+      "actions": [
+        "delete",
+        "create"
+      ],
+      "before": {
+        "alpn_policy": null,
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904/b4f22dd284158770",
+        "certificate_arn": null,
+        "default_action": [
+          {
+            "authenticate_cognito": [],
+            "authenticate_oidc": [],
+            "fixed_response": [],
+            "forward": [],
+            "jwt_validation": [],
+            "order": 1,
+            "redirect": [],
+            "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+            "type": "forward"
+          }
+        ],
+        "id": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904/b4f22dd284158770",
+        "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904",
+        "mutual_authentication": [],
+        "port": 62206,
+        "protocol": "UDP",
+        "region": "us-east-2",
+        "routing_http_request_x_amzn_mtls_clientcert_header_name": null,
+        "routing_http_request_x_amzn_mtls_clientcert_issuer_header_name": null,
+        "routing_http_request_x_amzn_mtls_clientcert_leaf_header_name": null,
+        "routing_http_request_x_amzn_mtls_clientcert_serial_number_header_name": null,
+        "routing_http_request_x_amzn_mtls_clientcert_subject_header_name": null,
+        "routing_http_request_x_amzn_mtls_clientcert_validity_header_name": null,
+        "routing_http_request_x_amzn_tls_cipher_suite_header_name": null,
+        "routing_http_request_x_amzn_tls_version_header_name": null,
+        "routing_http_response_access_control_allow_credentials_header_value": null,
+        "routing_http_response_access_control_allow_headers_header_value": null,
+        "routing_http_response_access_control_allow_methods_header_value": null,
+        "routing_http_response_access_control_allow_origin_header_value": null,
+        "routing_http_response_access_control_expose_headers_header_value": null,
+        "routing_http_response_access_control_max_age_header_value": null,
+        "routing_http_response_content_security_policy_header_value": null,
+        "routing_http_response_server_enabled": null,
+        "routing_http_response_strict_transport_security_header_value": null,
+        "routing_http_response_x_content_type_options_header_value": null,
+        "routing_http_response_x_frame_options_header_value": null,
+        "ssl_policy": "",
+        "tags": {},
+        "tags_all": {
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Project": "LayerV-NHP",
+          "Scope": "control"
+        },
+        "tcp_idle_timeout_seconds": null,
+        "timeouts": null
+      },
+      "after": {
+        "alpn_policy": null,
+        "certificate_arn": null,
+        "default_action": [
+          {
+            "authenticate_cognito": [],
+            "authenticate_oidc": [],
+            "fixed_response": [],
+            "forward": [],
+            "jwt_validation": [],
+            "redirect": [],
+            "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+            "type": "forward"
+          }
+        ],
+        "port": 62206,
+        "protocol": "UDP",
+        "region": "us-east-2",
+        "tags": null,
+        "tags_all": {
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Project": "LayerV-NHP",
+          "Scope": "control"
+        },
+        "timeouts": null
+      },
+      "after_unknown": {
+        "arn": true,
+        "default_action": [
+          {
+            "authenticate_cognito": [],
+            "authenticate_oidc": [],
+            "fixed_response": [],
+            "forward": [],
+            "jwt_validation": [],
+            "order": true,
+            "redirect": []
+          }
+        ],
+        "id": true,
+        "load_balancer_arn": true,
+        "mutual_authentication": true,
+        "routing_http_request_x_amzn_mtls_clientcert_header_name": true,
+        "routing_http_request_x_amzn_mtls_clientcert_issuer_header_name": true,
+        "routing_http_request_x_amzn_mtls_clientcert_leaf_header_name": true,
+        "routing_http_request_x_amzn_mtls_clientcert_serial_number_header_name": true,
+        "routing_http_request_x_amzn_mtls_clientcert_subject_header_name": true,
+        "routing_http_request_x_amzn_mtls_clientcert_validity_header_name": true,
+        "routing_http_request_x_amzn_tls_cipher_suite_header_name": true,
+        "routing_http_request_x_amzn_tls_version_header_name": true,
+        "routing_http_response_access_control_allow_credentials_header_value": true,
+        "routing_http_response_access_control_allow_headers_header_value": true,
+        "routing_http_response_access_control_allow_methods_header_value": true,
+        "routing_http_response_access_control_allow_origin_header_value": true,
+        "routing_http_response_access_control_expose_headers_header_value": true,
+        "routing_http_response_access_control_max_age_header_value": true,
+        "routing_http_response_content_security_policy_header_value": true,
+        "routing_http_response_server_enabled": true,
+        "routing_http_response_strict_transport_security_header_value": true,
+        "routing_http_response_x_content_type_options_header_value": true,
+        "routing_http_response_x_frame_options_header_value": true,
+        "ssl_policy": true,
+        "tags_all": {},
+        "tcp_idle_timeout_seconds": true
+      },
+      "before_sensitive": {
+        "default_action": [
+          {
+            "authenticate_cognito": [],
+            "authenticate_oidc": [],
+            "fixed_response": [],
+            "forward": [],
+            "jwt_validation": [],
+            "redirect": []
+          }
+        ],
+        "mutual_authentication": [],
+        "tags": {},
+        "tags_all": {}
+      },
+      "after_sensitive": {
+        "default_action": [
+          {
+            "authenticate_cognito": [],
+            "authenticate_oidc": [],
+            "fixed_response": [],
+            "forward": [],
+            "jwt_validation": [],
+            "redirect": []
+          }
+        ],
+        "mutual_authentication": [],
+        "tags_all": {}
+      },
+      "replace_paths": [
+        [
+          "load_balancer_arn"
+        ]
+      ],
+      "before_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904/b4f22dd284158770"
+      },
+      "after_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904/b4f22dd284158770"
+      }
+    },
+    "module.control.aws_lb_target_group.hub[0]": {
+      "actions": [
+        "no-op"
+      ],
+      "before": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "arn_suffix": "targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "connection_termination": true,
+        "deregistration_delay": "30",
+        "health_check": [
+          {
+            "enabled": true,
+            "healthy_threshold": 3,
+            "interval": 10,
+            "matcher": "",
+            "path": "",
+            "port": "62207",
+            "protocol": "TCP",
+            "timeout": 10,
+            "unhealthy_threshold": 3
+          }
+        ],
+        "id": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "ip_address_type": "ipv4",
+        "lambda_multi_value_headers_enabled": false,
+        "load_balancer_arns": [
+          "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904"
+        ],
+        "load_balancing_algorithm_type": null,
+        "load_balancing_anomaly_mitigation": null,
+        "load_balancing_cross_zone_enabled": "use_load_balancer_configuration",
+        "name": "layerv-nhp-sandbox-control-hub",
+        "name_prefix": "",
+        "port": 62206,
+        "preserve_client_ip": "true",
+        "protocol": "UDP",
+        "protocol_version": null,
+        "proxy_protocol_v2": false,
+        "region": "us-east-2",
+        "slow_start": 0,
+        "stickiness": [
+          {
+            "cookie_duration": 0,
+            "cookie_name": "",
+            "enabled": false,
+            "type": "source_ip"
+          }
+        ],
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "target_control_port": 0,
+        "target_failover": [
+          {
+            "on_deregistration": null,
+            "on_unhealthy": null
+          }
+        ],
+        "target_group_health": [
+          {
+            "dns_failover": [
+              {
+                "minimum_healthy_targets_count": "1",
+                "minimum_healthy_targets_percentage": "off"
+              }
+            ],
+            "unhealthy_state_routing": [
+              {
+                "minimum_healthy_targets_count": 1,
+                "minimum_healthy_targets_percentage": "off"
+              }
+            ]
+          }
+        ],
+        "target_health_state": [
+          {
+            "enable_unhealthy_connection_termination": null,
+            "unhealthy_draining_interval": null
+          }
+        ],
+        "target_type": "ip",
+        "vpc_id": "vpc-0d911f0d4b6cb7176"
+      },
+      "after": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "arn_suffix": "targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "connection_termination": true,
+        "deregistration_delay": "30",
+        "health_check": [
+          {
+            "enabled": true,
+            "healthy_threshold": 3,
+            "interval": 10,
+            "matcher": "",
+            "path": "",
+            "port": "62207",
+            "protocol": "TCP",
+            "timeout": 10,
+            "unhealthy_threshold": 3
+          }
+        ],
+        "id": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6",
+        "ip_address_type": "ipv4",
+        "lambda_multi_value_headers_enabled": false,
+        "load_balancer_arns": [
+          "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904"
+        ],
+        "load_balancing_algorithm_type": null,
+        "load_balancing_anomaly_mitigation": null,
+        "load_balancing_cross_zone_enabled": "use_load_balancer_configuration",
+        "name": "layerv-nhp-sandbox-control-hub",
+        "name_prefix": "",
+        "port": 62206,
+        "preserve_client_ip": "true",
+        "protocol": "UDP",
+        "protocol_version": null,
+        "proxy_protocol_v2": false,
+        "region": "us-east-2",
+        "slow_start": 0,
+        "stickiness": [
+          {
+            "cookie_duration": 0,
+            "cookie_name": "",
+            "enabled": false,
+            "type": "source_ip"
+          }
+        ],
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "target_control_port": 0,
+        "target_failover": [
+          {
+            "on_deregistration": null,
+            "on_unhealthy": null
+          }
+        ],
+        "target_group_health": [
+          {
+            "dns_failover": [
+              {
+                "minimum_healthy_targets_count": "1",
+                "minimum_healthy_targets_percentage": "off"
+              }
+            ],
+            "unhealthy_state_routing": [
+              {
+                "minimum_healthy_targets_count": 1,
+                "minimum_healthy_targets_percentage": "off"
+              }
+            ]
+          }
+        ],
+        "target_health_state": [
+          {
+            "enable_unhealthy_connection_termination": null,
+            "unhealthy_draining_interval": null
+          }
+        ],
+        "target_type": "ip",
+        "vpc_id": "vpc-0d911f0d4b6cb7176"
+      },
+      "after_unknown": {},
+      "before_sensitive": {
+        "health_check": [
+          {}
+        ],
+        "load_balancer_arns": [
+          false
+        ],
+        "stickiness": [
+          {}
+        ],
+        "tags": {},
+        "tags_all": {},
+        "target_failover": [
+          {}
+        ],
+        "target_group_health": [
+          {
+            "dns_failover": [
+              {}
+            ],
+            "unhealthy_state_routing": [
+              {}
+            ]
+          }
+        ],
+        "target_health_state": [
+          {}
+        ]
+      },
+      "after_sensitive": {
+        "health_check": [
+          {}
+        ],
+        "load_balancer_arns": [
+          false
+        ],
+        "stickiness": [
+          {}
+        ],
+        "tags": {},
+        "tags_all": {},
+        "target_failover": [
+          {}
+        ],
+        "target_group_health": [
+          {
+            "dns_failover": [
+              {}
+            ],
+            "unhealthy_state_routing": [
+              {}
+            ]
+          }
+        ],
+        "target_health_state": [
+          {}
+        ]
+      },
+      "before_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6"
+      },
+      "after_identity": {
+        "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-control-hub/8600bde8a1a862c6"
+      }
+    },
+    "module.control.aws_security_group.hub_worker[0]": {
+      "actions": [
+        "update"
+      ],
+      "before": {
+        "arn": "arn:aws:ec2:us-east-2:767397897469:security-group/sg-03198cd8d28c2f99f",
+        "description": "Connector Hub worker ENIs; UDP/62206 knock + NLB TCP/62207 health in, HTTPS out to Control endpoints",
+        "egress": [
+          {
+            "cidr_blocks": [
+              "10.102.0.0/16"
+            ],
+            "description": "HTTPS to Control interface endpoints (lambda/logs/secrets/kms/ecr) in-VPC",
+            "from_port": 443,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "tcp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 443
+          },
+          {
+            "cidr_blocks": [],
+            "description": "HTTPS to the S3 gateway endpoint prefix list (ECR layer blobs)",
+            "from_port": 443,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [
+              "pl-7ba54012"
+            ],
+            "protocol": "tcp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 443
+          }
+        ],
+        "id": "sg-03198cd8d28c2f99f",
+        "ingress": [
+          {
+            "cidr_blocks": [
+              "0.0.0.0/0"
+            ],
+            "description": "NHP UDP knock data (NLB preserve_client_ip: source is the client)",
+            "from_port": 62206,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "udp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 62206
+          },
+          {
+            "cidr_blocks": [
+              "10.102.0.0/16"
+            ],
+            "description": "NLB TCP health probe on 62207 (NLB-sourced, not client-preserved)",
+            "from_port": 62207,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "tcp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 62207
+          }
+        ],
+        "name": "layerv-nhp-sandbox-control-hub-7d3bc6c8a57c677b6e36f072b2",
+        "name_prefix": "layerv-nhp-sandbox-control-hub-",
+        "owner_id": "767397897469",
+        "region": "us-east-2",
+        "revoke_rules_on_delete": false,
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-hub",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-hub",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "timeouts": null,
+        "vpc_id": "vpc-0d911f0d4b6cb7176"
+      },
+      "after": {
+        "arn": "arn:aws:ec2:us-east-2:767397897469:security-group/sg-03198cd8d28c2f99f",
+        "description": "Connector Hub worker ENIs; UDP/62206 knock + NLB TCP/62207 health in, HTTPS out to Control endpoints",
+        "egress": [
+          {
+            "cidr_blocks": [
+              "10.102.0.0/16"
+            ],
+            "description": "HTTPS to Control interface endpoints (lambda/logs/secrets/kms/ecr) in-VPC",
+            "from_port": 443,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "tcp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 443
+          },
+          {
+            "cidr_blocks": [],
+            "description": "HTTPS to the S3 gateway endpoint prefix list (ECR layer blobs)",
+            "from_port": 443,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [
+              "pl-7ba54012"
+            ],
+            "protocol": "tcp",
+            "security_groups": [],
+            "self": false,
+            "to_port": 443
+          }
+        ],
+        "id": "sg-03198cd8d28c2f99f",
+        "ingress": [
+          {
+            "cidr_blocks": [],
+            "description": "NHP UDP knock data from the Hub NLB security group",
+            "from_port": 62206,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "udp",
+            "self": false,
+            "to_port": 62206
+          },
+          {
+            "cidr_blocks": [],
+            "description": "NLB TCP health probe on 62207",
+            "from_port": 62207,
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "protocol": "tcp",
+            "self": false,
+            "to_port": 62207
+          }
+        ],
+        "name": "layerv-nhp-sandbox-control-hub-7d3bc6c8a57c677b6e36f072b2",
+        "name_prefix": "layerv-nhp-sandbox-control-hub-",
+        "owner_id": "767397897469",
+        "region": "us-east-2",
+        "revoke_rules_on_delete": false,
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-hub",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-hub",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Name": "layerv-nhp-sandbox-control-hub",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "timeouts": null,
+        "vpc_id": "vpc-0d911f0d4b6cb7176"
+      },
+      "after_unknown": {
+        "egress": [
+          {
+            "cidr_blocks": [
+              false
+            ],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          },
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [
+              false
+            ],
+            "security_groups": []
+          }
+        ],
+        "ingress": [
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": true
+          },
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": true
+          }
+        ],
+        "tags": {},
+        "tags_all": {}
+      },
+      "before_sensitive": {
+        "egress": [
+          {
+            "cidr_blocks": [
+              false
+            ],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          },
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [
+              false
+            ],
+            "security_groups": []
+          }
+        ],
+        "ingress": [
+          {
+            "cidr_blocks": [
+              false
+            ],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          },
+          {
+            "cidr_blocks": [
+              false
+            ],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          }
+        ],
+        "tags": {},
+        "tags_all": {}
+      },
+      "after_sensitive": {
+        "egress": [
+          {
+            "cidr_blocks": [
+              false
+            ],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          },
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [
+              false
+            ],
+            "security_groups": []
+          }
+        ],
+        "ingress": [
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          },
+          {
+            "cidr_blocks": [],
+            "ipv6_cidr_blocks": [],
+            "prefix_list_ids": [],
+            "security_groups": []
+          }
+        ],
+        "tags": {},
+        "tags_all": {}
+      },
+      "before_identity": {
+        "account_id": "767397897469",
+        "id": "sg-03198cd8d28c2f99f",
+        "region": "us-east-2"
+      },
+      "after_identity": {
+        "account_id": "767397897469",
+        "id": "sg-03198cd8d28c2f99f",
+        "region": "us-east-2"
+      }
+    },
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": {
+      "actions": [
+        "update"
+      ],
+      "before": {
+        "allowed_pattern": "",
+        "arn": "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/udp-listener-arn",
+        "data_type": "text",
+        "description": "",
+        "has_value_wo": false,
+        "id": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "insecure_value": null,
+        "key_id": "",
+        "name": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "overwrite": null,
+        "region": "us-east-2",
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tier": "Standard",
+        "type": "String",
+        "value": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-control-hub/651df21ec4f8f904/b4f22dd284158770",
+        "value_wo": null,
+        "value_wo_version": null,
+        "version": 1
+      },
+      "after": {
+        "allowed_pattern": "",
+        "arn": "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/udp-listener-arn",
+        "data_type": "text",
+        "description": "",
+        "has_value_wo": false,
+        "id": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "insecure_value": null,
+        "key_id": "",
+        "name": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "overwrite": null,
+        "region": "us-east-2",
+        "tags": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tags_all": {
+          "Application": "nhp",
+          "Component": "connector-authority",
+          "CostCenter": "infrastructure",
+          "Environment": "sandbox",
+          "ManagedBy": "terraform",
+          "Organization": "LayerV",
+          "Owner": "platform-team",
+          "Project": "LayerV-NHP",
+          "Repository": "layervai/nhp",
+          "Scope": "control"
+        },
+        "tier": "Standard",
+        "type": "String",
+        "value_wo": null,
+        "value_wo_version": null
+      },
+      "after_unknown": {
+        "tags": {},
+        "tags_all": {},
+        "value": true,
+        "version": true
+      },
+      "before_sensitive": {
+        "tags": {},
+        "tags_all": {},
+        "value": true,
+        "value_wo": true
+      },
+      "after_sensitive": {
+        "tags": {},
+        "tags_all": {},
+        "value": true,
+        "value_wo": true
+      },
+      "before_identity": {
+        "account_id": "767397897469",
+        "name": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "region": "us-east-2"
+      },
+      "after_identity": {
+        "account_id": "767397897469",
+        "name": "/sandbox/nhp/control/hub/udp-listener-arn",
+        "region": "us-east-2"
+      }
+    }
+  },
+  "source_participant_count": 9,
+  "selected_participant_addresses": [
+    "module.control.aws_lb.hub[0]",
+    "module.control.aws_lb_listener.hub[0]",
+    "module.control.aws_lb_target_group.hub[0]",
+    "module.control.aws_security_group.hub_worker[0]",
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]"
+  ]
+}

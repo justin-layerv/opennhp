@@ -167,6 +167,21 @@ NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["delete"],"after":null}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# The source-fence migration creates the replacement NLB first, but must remove
+# the old listener before attaching the same target group to the new NLB.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lb.hub[0]","type":"aws_lb","change":{"actions":["create","delete"],"after":{"name":"layerv-nhp-sandbox-control-hub-edge"}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lb_listener.hub[0]","type":"aws_lb_listener","change":{"actions":["delete","create"],"after":{"port":62206,"protocol":"UDP"}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# Reversing either exact lifecycle order is not the reviewed migration.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lb.hub[0]","type":"aws_lb","change":{"actions":["delete","create"],"after":{"name":"layerv-nhp-sandbox-control-hub-edge"}}}]}' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lb_listener.hub[0]","type":"aws_lb_listener","change":{"actions":["create","delete"],"after":{"port":62206,"protocol":"UDP"}}}]}' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 printf '%s\n' '{"resource_changes":[{"address":"aws_route_table.isolated[0]","type":"aws_route_table","change":{"actions":["create"],"after":{"route":[]},"after_unknown":{"route":true}}}]}' >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 

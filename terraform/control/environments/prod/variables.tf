@@ -123,6 +123,17 @@ variable "hub_edge_enabled" {
   }
 }
 
+variable "hub_public_udp_ingress_cidrs" {
+  description = "Production Hub source fence remains unset while the production Hub edge is dark."
+  type        = list(string)
+  default     = null
+
+  validation {
+    condition     = var.hub_public_udp_ingress_cidrs == null
+    error_message = "Production Hub UDP ingress remains unset throughout sandbox measurement."
+  }
+}
+
 variable "hub_worker_enabled" {
   description = "Production Hub Fargate worker gate remains false throughout sandbox measurement."
   type        = bool

@@ -18,6 +18,7 @@ state_bucket="layerv-terraform-state-767397897469"
 state_key="nhp/sandbox/control/terraform.tfstate"
 control_prefix="layerv-nhp-sandbox-control"
 authority_prefix="layerv-nhp-sandbox-ca-"
+hub_edge_name="layerv-nhp-sandbox-hub-edge"
 checker="$repo_root/.github/scripts/check-control-sandbox-first-apply.py"
 
 if [[ ! -f "$plan_json" ]]; then
@@ -39,6 +40,7 @@ for output in \
   state-head.json \
   control-lambdas.json \
   control-load-balancers.json \
+  control-security-groups.json \
   live-boundary-summary.json; do
   if [[ -e "$evidence_dir/$output" ]]; then
     echo "ERROR: refusing to reuse live-boundary evidence file: $evidence_dir/$output" >&2
@@ -195,11 +197,17 @@ aws lambda list-functions --region "$region" --output json \
 aws elbv2 describe-load-balancers --region "$region" --output json \
   | jq --arg control_prefix "$control_prefix" \
     --arg authority_prefix "$authority_prefix" \
+    --arg hub_edge_name "$hub_edge_name" \
     '[.LoadBalancers[] | select(
       ((.LoadBalancerName // "") | startswith($control_prefix))
       or ((.LoadBalancerName // "") | startswith($authority_prefix))
+      or (.LoadBalancerName == $hub_edge_name)
     )]' \
     >"$evidence_dir/control-load-balancers.json"
+aws ec2 describe-security-groups \
+  --region "$region" \
+  --filters "Name=vpc-id,Values=$vpc_id" \
+  --output json >"$evidence_dir/control-security-groups.json"
 
 python3 "$checker" live "$evidence_dir" \
   | tee "$evidence_dir/live-boundary-summary.json"

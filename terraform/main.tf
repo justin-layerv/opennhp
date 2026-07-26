@@ -774,15 +774,16 @@ module "compute" {
   additional_nhp_udp_ingress_cidrs = (
     var.deploy_relay ? module.relay_network[0].relay_subnet_cidr_blocks : []
   )
-  server_repo_url     = module.ecr.server_repo_url
-  server_repo_arn     = module.ecr.server_repo_arn
-  etcd_endpoint       = module.data.etcd_endpoint
-  etcd_secret_arn     = module.data.etcd_secret_arn
-  etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
-  namespace_id        = module.data.namespace_id
-  namespace_name      = module.data.namespace_name
-  name_prefix         = local.name_prefix
-  tags                = merge(local.common_tags, { Service = "nhp-server" })
+  public_nhp_udp_ingress_cidrs = var.public_nhp_udp_ingress_cidrs
+  server_repo_url              = module.ecr.server_repo_url
+  server_repo_arn              = module.ecr.server_repo_arn
+  etcd_endpoint                = module.data.etcd_endpoint
+  etcd_secret_arn              = module.data.etcd_secret_arn
+  etcd_tls_secret_arn          = module.data.etcd_ca_cert_arn
+  namespace_id                 = module.data.namespace_id
+  namespace_name               = module.data.namespace_name
+  name_prefix                  = local.name_prefix
+  tags                         = merge(local.common_tags, { Service = "nhp-server" })
 
   # KMS encryption keys
   ebs_kms_key_arn     = module.kms.ebs_key_arn

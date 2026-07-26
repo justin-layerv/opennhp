@@ -217,6 +217,37 @@ variable "hub_edge_enabled" {
   default     = false
 }
 
+variable "hub_public_udp_ingress_cidrs" {
+  description = <<-EOT
+    Exact public IPv4 /32 sources admitted by the Hub UDP-62206 NLB security
+    group. A live Hub edge requires a non-empty, sorted, duplicate-free list;
+    sandbox pins this to the proof runner's persistent EIP. null is allowed only
+    while the edge is dark, which keeps production unchanged during sandbox
+    proof. Broad public CIDRs are never valid.
+  EOT
+  type        = list(string)
+  default     = null
+
+  validation {
+    condition = var.hub_public_udp_ingress_cidrs == null || (
+      length(var.hub_public_udp_ingress_cidrs) > 0 &&
+      alltrue([
+        for cidr in var.hub_public_udp_ingress_cidrs :
+        can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
+      ])
+    )
+    error_message = "hub_public_udp_ingress_cidrs must be null or a non-empty list of exact IPv4 /32 CIDRs."
+  }
+
+  validation {
+    condition = (
+      var.hub_public_udp_ingress_cidrs == null ||
+      var.hub_public_udp_ingress_cidrs == sort(distinct(var.hub_public_udp_ingress_cidrs))
+    )
+    error_message = "hub_public_udp_ingress_cidrs must be sorted and duplicate-free."
+  }
+}
+
 variable "hub_worker_enabled" {
   description = <<-EOT
     Dark-first enable gate for the Connector Hub Fargate worker (Step 5, slice

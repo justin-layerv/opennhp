@@ -5,12 +5,12 @@
 environment = "sandbox-hub-dns"
 aws_region  = "us-east-2"
 
-# hub.nhp.layerv.xyz -> layerv-nhp-sandbox-control-hub NLB, in the layerv.xyz zone.
+# hub.nhp.layerv.xyz -> source-fenced Hub NLB, in the layerv.xyz zone.
 hub_dns_name   = "hub.nhp.layerv.xyz"
 hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
-hub_nlb_name   = "layerv-nhp-sandbox-control-hub"
+hub_nlb_name   = "layerv-nhp-sandbox-hub-edge"
 
-# cell0.nhp.layerv.xyz -> layerv-nhp-sandbox-nlb (cell0 server UDP:62206 NLB),
+# cell0.nhp.layerv.xyz -> source-fenced cell0 server UDP:62206 NLB,
 # overriding the *.nhp.layerv.xyz wildcard (which points at the AC HTTPS NLB).
 cell0_dns_name = "cell0.nhp.layerv.xyz"
-cell0_nlb_name = "layerv-nhp-sandbox-nlb"
+cell0_nlb_name = "layerv-nhp-sandbox-edge"

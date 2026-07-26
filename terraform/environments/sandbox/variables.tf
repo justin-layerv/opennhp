@@ -338,6 +338,20 @@ variable "nhp_udp_recv_buffer_bytes" {
   default     = 8388608
 }
 
+variable "public_nhp_udp_ingress_cidrs" {
+  description = "Exact proof-runner /32 allowed at the sandbox cell0 public UDP NLB. This also enables the NLB security-group fence."
+  type        = list(string)
+  default     = ["3.141.109.76/32"]
+
+  validation {
+    condition = (
+      length(var.public_nhp_udp_ingress_cidrs) == 1 &&
+      var.public_nhp_udp_ingress_cidrs[0] == "3.141.109.76/32"
+    )
+    error_message = "Sandbox cell0 UDP ingress must remain pinned to the proof runner EIP 3.141.109.76/32."
+  }
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

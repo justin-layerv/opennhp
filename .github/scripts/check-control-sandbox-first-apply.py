@@ -24,6 +24,7 @@ STATE_KMS_KEY_ARN = (
 # Locked by the active no-op plan contract and permanent live-state verifier.
 TF_VERSION = "1.14.3"
 CONTROL_PREFIX = "layerv-nhp-sandbox-control"
+PROOF_SOURCE_CIDR = "3.141.109.76/32"
 AUTHORITY_PUBLISHER_ROLE_NAME = (
     "layerv-nhp-sandbox-control-connector-authority-publisher"
 )
@@ -678,17 +679,61 @@ HUB_EDGE_RESOURCES: dict[str, str] = {
     "module.control.aws_route_table_association.hub_public[0]": "aws_route_table_association",
     "module.control.aws_route_table_association.hub_public[1]": "aws_route_table_association",
     "module.control.aws_route_table_association.hub_public[2]": "aws_route_table_association",
+    "module.control.aws_security_group.hub_nlb[0]": "aws_security_group",
+    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]': "aws_vpc_security_group_ingress_rule",
     "module.control.aws_lb.hub[0]": "aws_lb",
     "module.control.aws_lb_target_group.hub[0]": "aws_lb_target_group",
     "module.control.aws_lb_listener.hub[0]": "aws_lb_listener",
     "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": "aws_ssm_parameter",
 }
 
-# The Hub public UDP edge's network load balancer name -- `${name_prefix}-hub`
-# in the module, where name_prefix == CONTROL_PREFIX for sandbox. check_live
-# admits exactly this one internet-facing NLB, and only once the tagged
-# public-edge route table proves the edge is live.
-HUB_EDGE_LOAD_BALANCER_NAME = f"{CONTROL_PREFIX}-hub"
+# The Hub public UDP edge's replacement network load balancer name. The
+# distinct `-hub-edge` suffix is correctness-relevant because AWS cannot attach
+# a security group to the already-created NLB. check_live admits exactly this
+# one internet-facing NLB, and only once the tagged public-edge route table
+# proves the edge is live.
+HUB_EDGE_LOAD_BALANCER_NAME = "layerv-nhp-sandbox-hub-edge"
+HUB_EDGE_LEGACY_LOAD_BALANCER_NAME = f"{CONTROL_PREFIX}-hub"
+HUB_EDGE_TARGET_GROUP_NAME = f"{CONTROL_PREFIX}-hub"
+HUB_SOURCE_FENCE_PROVIDER_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "tests/fixtures/control-hub-source-fence/"
+    "hub-replacement-terraform-1.14.3-aws-6.55.0.json"
+)
+HUB_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256 = (
+    "914cb030cf7563ad0302431d77065d939056c82ad501fa75a56cc257e19898e1"
+)
+HUB_SOURCE_FENCE_SOURCE_PLAN_SHA256 = (
+    "53646f92eb2dc734f57a4a0500782411118ac985091d5dc9c1c5c10a7ab1265b"
+)
+HUB_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256 = (
+    "9aba1730bfe9f15e419626fa3e44ddf40e7faf6705c69e72250bda876a48e4ec"
+)
+HUB_SOURCE_FENCE_SOURCE_ENVELOPE_SHA256 = (
+    "2820788513e5272b7bf2707e7c6828769221cdea3f249b2c90777477409bc04c"
+)
+HUB_SOURCE_FENCE_PROVIDER_ADDRESSES = (
+    "module.control.aws_lb.hub[0]",
+    "module.control.aws_lb_listener.hub[0]",
+    "module.control.aws_lb_target_group.hub[0]",
+    "module.control.aws_security_group.hub_worker[0]",
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]",
+)
+
+# Exact non-no-op graph for the one-time replacement of the already-live Hub
+# NLB. The target group remains a validated no-op and is intentionally absent.
+HUB_SOURCE_FENCE_ACTIONS: dict[str, list[str]] = {
+    "module.control.aws_security_group.hub_nlb[0]": ["create"],
+    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]': [
+        "create"
+    ],
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp[0]": ["create"],
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health[0]": ["create"],
+    "module.control.aws_lb.hub[0]": ["create", "delete"],
+    "module.control.aws_lb_listener.hub[0]": ["delete", "create"],
+    "module.control.aws_security_group.hub_worker[0]": ["update"],
+    "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]": ["update"],
+}
 
 # Configuration-block view of the Hub edge (un-indexed resource addresses). The
 # blocks are declared unconditionally, so -- exactly like the runtime blocks --
@@ -710,6 +755,16 @@ HUB_EDGE_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
     "module.control.aws_route_table_association.hub_public": (
         "managed",
         "aws_route_table_association",
+        "aws",
+    ),
+    "module.control.aws_security_group.hub_nlb": (
+        "managed",
+        "aws_security_group",
+        "aws",
+    ),
+    "module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp": (
+        "managed",
+        "aws_vpc_security_group_ingress_rule",
         "aws",
     ),
     "module.control.aws_lb.hub": ("managed", "aws_lb", "aws"),
@@ -758,6 +813,8 @@ HUB_WORKER_RESOURCES: dict[str, str] = {
     "module.control.aws_vpc_endpoint.hub_ecr_api[0]": "aws_vpc_endpoint",
     "module.control.aws_vpc_endpoint.hub_ecr_dkr[0]": "aws_vpc_endpoint",
     "module.control.aws_vpc_endpoint.hub_s3[0]": "aws_vpc_endpoint",
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp[0]": "aws_vpc_security_group_egress_rule",
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health[0]": "aws_vpc_security_group_egress_rule",
 }
 
 # Count-gated data sources the worker slice adds (the published image digest and
@@ -854,6 +911,16 @@ HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws",
     ),
     "module.control.aws_vpc_endpoint.hub_s3": ("managed", "aws_vpc_endpoint", "aws"),
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp": (
+        "managed",
+        "aws_vpc_security_group_egress_rule",
+        "aws",
+    ),
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health": (
+        "managed",
+        "aws_vpc_security_group_egress_rule",
+        "aws",
+    ),
     "module.control.data.aws_ssm_parameter.hub_image_digest": (
         "data",
         "aws_ssm_parameter",
@@ -1615,6 +1682,63 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
     "module.control.aws_route_table_association.isolated": {
         ("route_table_id",): ["aws_route_table.isolated", "count.index"],
         ("subnet_id",): ["aws_subnet.isolated", "count.index"],
+    },
+    "module.control.aws_security_group.hub_nlb": {
+        ("vpc_id",): ["aws_vpc.control.id", "aws_vpc.control"],
+    },
+    "module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp": {
+        ("security_group_id",): [
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+        ],
+    },
+    "module.control.aws_lb.hub": {
+        ("security_groups",): [
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+        ],
+        ("subnets",): ["aws_subnet.hub_public"],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp": {
+        ("security_group_id",): [
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+        ],
+        ("referenced_security_group_id",): [
+            "aws_security_group.hub_worker[0].id",
+            "aws_security_group.hub_worker[0]",
+            "aws_security_group.hub_worker",
+        ],
+    },
+    "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health": {
+        ("security_group_id",): [
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+        ],
+        ("referenced_security_group_id",): [
+            "aws_security_group.hub_worker[0].id",
+            "aws_security_group.hub_worker[0]",
+            "aws_security_group.hub_worker",
+        ],
+    },
+    "module.control.aws_security_group.hub_worker": {
+        # Both reviewed inline ingress rules use the same edge gate and Hub NLB
+        # SG. Keep the duplicate traversal sequence because Terraform 1.14 emits
+        # one copy per rule; this source-locks create-time-unknown SG IDs.
+        ("ingress",): [
+            "local.hub_edge_enabled",
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+            "local.hub_edge_enabled",
+            "aws_security_group.hub_nlb[0].id",
+            "aws_security_group.hub_nlb[0]",
+            "aws_security_group.hub_nlb",
+        ],
     },
     "module.control.aws_vpc_endpoint.dynamodb": {
         ("route_table_ids",): ["aws_route_table.isolated"],
@@ -3427,6 +3551,149 @@ def _check_planned_security(
         _require_fields(after, {"ingress": [], "egress": []}, address)
         if unknown.get("ingress", []) != [] or unknown.get("egress", []) != []:
             raise ContractError(f"{address} has unknown planned traffic rules")
+
+    # The public Hub edge is source-fenced at the NLB. Its SG has no inline
+    # rules, its sole public rule is the persistent proof-runner /32 on UDP
+    # 62206, and the NLB attaches exactly one SG in the create request.
+    hub_edge_mode = "module.control.aws_security_group.hub_nlb[0]" in by_address
+    if hub_edge_mode:
+        nlb_sg, nlb_sg_unknown = values(
+            "module.control.aws_security_group.hub_nlb[0]"
+        )
+        for field in ("ingress", "egress"):
+            planned_rules = nlb_sg.get(field)
+            unknown_rules = nlb_sg_unknown.get(field)
+            # A new standalone-rule-only SG has no concrete inline collection
+            # until AWS allocates it (after omits the field, after_unknown=true).
+            # A steady SG projects the same authored absence as an explicit
+            # empty collection. Any concrete rule or other unknown shape fails.
+            if planned_rules not in (None, []) or (
+                planned_rules is None
+                and unknown_rules is not True
+            ) or (
+                planned_rules == []
+                and unknown_rules not in (None, [], False)
+            ):
+                raise ContractError(
+                    f"Hub NLB SG must not declare inline {field} rules"
+                )
+
+        nlb_ingress, _ = values(
+            'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]'
+        )
+        _require_fields(
+            nlb_ingress,
+            {
+                "cidr_ipv4": PROOF_SOURCE_CIDR,
+                "from_port": 62206,
+                "ip_protocol": "udp",
+                "to_port": 62206,
+            },
+            "Hub NLB public ingress",
+        )
+        if nlb_ingress.get("cidr_ipv6") not in (None, ""):
+            raise ContractError("Hub NLB public ingress must not admit IPv6")
+
+        hub_lb, hub_lb_unknown = values("module.control.aws_lb.hub[0]")
+        _require_fields(
+            hub_lb,
+            {
+                "internal": False,
+                "load_balancer_type": "network",
+                "name": HUB_EDGE_LOAD_BALANCER_NAME,
+            },
+            "module.control.aws_lb.hub[0]",
+        )
+        lb_groups = hub_lb.get("security_groups")
+        if not (
+            (isinstance(lb_groups, list) and len(lb_groups) == 1)
+            or (
+                lb_groups in (None, [])
+                and bool(hub_lb_unknown.get("security_groups"))
+            )
+        ):
+            raise ContractError(
+                "Hub NLB must attach exactly one security group at creation"
+            )
+
+    # Worker targets trust only the Hub NLB SG on the data and health ports.
+    # NLB egress is the exact inverse SG-scoped pair; CIDR egress is forbidden.
+    if hub_worker_mode:
+        worker_sg, worker_unknown = values(
+            "module.control.aws_security_group.hub_worker[0]"
+        )
+        worker_ingress = worker_sg.get("ingress")
+        if not isinstance(worker_ingress, list) or len(worker_ingress) != 2:
+            raise ContractError(
+                "Hub worker SG must have exactly two NLB-SG ingress rules"
+            )
+        expected_worker_ports = {("udp", 62206), ("tcp", 62207)}
+        actual_worker_ports: set[tuple[str, int]] = set()
+        for rule in worker_ingress:
+            if not isinstance(rule, dict):
+                raise ContractError("Hub worker SG ingress is malformed")
+            protocol = rule.get("protocol")
+            from_port = rule.get("from_port")
+            if (
+                from_port != rule.get("to_port")
+                or (protocol, from_port) not in expected_worker_ports
+                or rule.get("cidr_blocks") not in (None, [])
+                or rule.get("ipv6_cidr_blocks") not in (None, [])
+                or rule.get("prefix_list_ids") not in (None, [])
+                or rule.get("self") not in (None, False)
+            ):
+                raise ContractError(
+                    "Hub worker SG ingress must be only NLB-SG UDP 62206 and TCP 62207"
+                )
+            groups = rule.get("security_groups")
+            if not (
+                (isinstance(groups, list) and len(groups) == 1)
+                or (
+                    groups in (None, [])
+                    and bool(worker_unknown.get("ingress"))
+                )
+            ):
+                raise ContractError(
+                    "Hub worker SG ingress must reference exactly the Hub NLB SG"
+                )
+            actual_worker_ports.add((str(protocol), int(from_port)))
+        if actual_worker_ports != expected_worker_ports:
+            raise ContractError(
+                "Hub worker SG ingress ports do not match the exact NLB contract"
+            )
+
+        for address, protocol, port in (
+            (
+                "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp[0]",
+                "udp",
+                62206,
+            ),
+            (
+                "module.control.aws_vpc_security_group_egress_rule.hub_nlb_health[0]",
+                "tcp",
+                62207,
+            ),
+        ):
+            after, unknown = values(address)
+            _require_fields(
+                after,
+                {
+                    "from_port": port,
+                    "ip_protocol": protocol,
+                    "to_port": port,
+                },
+                address,
+            )
+            if after.get("cidr_ipv4") not in (None, "") or after.get(
+                "cidr_ipv6"
+            ) not in (None, ""):
+                raise ContractError(f"{address} must be SG-scoped, never CIDR-scoped")
+            if after.get("referenced_security_group_id") in (None, "") and not (
+                unknown.get("referenced_security_group_id")
+            ):
+                raise ContractError(
+                    f"{address} must reference exactly the Hub worker SG"
+                )
 
     for index, availability_zone in enumerate(
         ("us-east-2a", "us-east-2b", "us-east-2c")
@@ -6077,6 +6344,657 @@ def _require_create_shapes(
             raise ContractError(message or f"{address} create shape is malformed")
 
 
+def _load_hub_source_fence_provider_changes() -> dict[str, dict[str, Any]]:
+    """Load the pinned provider envelopes for the one-time Hub replacement."""
+
+    try:
+        payload = HUB_SOURCE_FENCE_PROVIDER_FIXTURE_PATH.read_bytes()
+    except OSError as exc:
+        raise ContractError(
+            "Hub UDP source-fence provider fixture is unavailable"
+        ) from exc
+    if (
+        hashlib.sha256(payload).hexdigest()
+        != HUB_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256
+    ):
+        raise ContractError(
+            "Hub UDP source-fence provider fixture digest is not the reviewed value"
+        )
+    try:
+        fixture = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContractError(
+            "Hub UDP source-fence provider fixture is malformed"
+        ) from exc
+
+    expected_fixture_fields = {
+        "terraform_version",
+        "aws_provider_version",
+        "source_plan_sha256",
+        "source_plan_json_sha256",
+        "source_participant_envelope_sha256",
+        "source_plan_complete",
+        "source_plan_errored",
+        "evidence_scope",
+        "source_participant_count",
+        "selected_participant_addresses",
+        "changes",
+    }
+    expected_evidence_scope = (
+        "Exact Terraform 1.14.3/AWS provider 6.55.0 envelopes for the five "
+        "persisted Hub replacement carriers selected from the fresh "
+        "nine-participant plan; not deployable apply evidence."
+    )
+    if (
+        not isinstance(fixture, dict)
+        or set(fixture) != expected_fixture_fields
+        or fixture.get("terraform_version") != TF_VERSION
+        or fixture.get("aws_provider_version") != "6.55.0"
+        or fixture.get("source_plan_sha256")
+        != HUB_SOURCE_FENCE_SOURCE_PLAN_SHA256
+        or fixture.get("source_plan_json_sha256")
+        != HUB_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256
+        or fixture.get("source_participant_envelope_sha256")
+        != HUB_SOURCE_FENCE_SOURCE_ENVELOPE_SHA256
+        or fixture.get("source_plan_complete") is not False
+        or fixture.get("source_plan_errored") is not True
+        or fixture.get("evidence_scope") != expected_evidence_scope
+        or fixture.get("source_participant_count") != 9
+        or fixture.get("selected_participant_addresses")
+        != list(HUB_SOURCE_FENCE_PROVIDER_ADDRESSES)
+    ):
+        raise ContractError(
+            "Hub UDP source-fence provider fixture provenance is not exact"
+        )
+
+    changes = fixture.get("changes")
+    if (
+        not isinstance(changes, dict)
+        or tuple(changes) != HUB_SOURCE_FENCE_PROVIDER_ADDRESSES
+        or any(not isinstance(changes[address], dict) for address in changes)
+    ):
+        raise ContractError(
+            "Hub UDP source-fence provider fixture inventory is not exact"
+        )
+    return changes
+
+
+def _build_hub_source_fence_change_key_sets() -> "frozenset[frozenset[str]]":
+    """The exact change-key envelopes an already-applied Hub source-fence
+    participant may carry: the base keys, optionally paired with the sensitive
+    and/or identity key pairs. Mirrors the relay plan checker's
+    ``_build_udp_source_fence_change_key_sets``; derived once so the tolerated
+    envelope set is not rebuilt on every per-address call."""
+    allowed = {frozenset({"actions", "before", "after", "after_unknown"})}
+    for pair in (
+        {"before_sensitive", "after_sensitive"},
+        {"before_identity", "after_identity"},
+    ):
+        allowed |= {frozenset(keys | pair) for keys in allowed}
+    return frozenset(allowed)
+
+
+_HUB_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS = _build_hub_source_fence_change_key_sets()
+
+
+def _is_exact_hub_source_fence_target_noop(change: Any) -> bool:
+    """Prove an already-applied participant is an exact target no-op."""
+    if not isinstance(change, dict):
+        return False
+    if frozenset(change) not in _HUB_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS:
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        change.get("actions") != ["no-op"]
+        or not isinstance(before, dict)
+        or before != after
+        or change.get("after_unknown") != {}
+    ):
+        return False
+    if ("before_sensitive" in change) != ("after_sensitive" in change) or (
+        "before_sensitive" in change
+        and change["before_sensitive"] != change["after_sensitive"]
+    ):
+        return False
+    return not (
+        ("before_identity" in change) != ("after_identity" in change)
+        or (
+            "before_identity" in change
+            and change["before_identity"] != change["after_identity"]
+        )
+    )
+
+
+def _check_hub_source_fence_transition(
+    by_address: dict[str, dict[str, Any]],
+    deposed_by_address: dict[str, list[dict[str, Any]]] | None = None,
+) -> None:
+    """Bind a full or remaining Hub replacement to exact carrier state."""
+
+    deposed_by_address = deposed_by_address or {}
+    lb_address = "module.control.aws_lb.hub[0]"
+    listener_address = "module.control.aws_lb_listener.hub[0]"
+    target_address = "module.control.aws_lb_target_group.hub[0]"
+    worker_address = "module.control.aws_security_group.hub_worker[0]"
+    parameter_address = (
+        "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]"
+    )
+    unexpected_deposed = sorted(
+        address
+        for address, values in deposed_by_address.items()
+        if address != lb_address or len(values) != 1
+    )
+    if unexpected_deposed:
+        raise ContractError(
+            "Hub UDP source-fence recovery has unreviewed deposed resources: "
+            + ", ".join(unexpected_deposed)
+        )
+    deposed_lb = (
+        deposed_by_address.get(lb_address, [None])[0]
+        if deposed_by_address.get(lb_address)
+        else None
+    )
+    actual_non_noop = {
+        address: item.get("change", {}).get("actions")
+        for address, item in by_address.items()
+        if item.get("change", {}).get("actions") != ["no-op"]
+    }
+    allowed_actions = {
+        address: [expected]
+        for address, expected in HUB_SOURCE_FENCE_ACTIONS.items()
+    }
+    allowed_actions[listener_address].append(["create"])
+    if (
+        (not actual_non_noop and deposed_lb is None)
+        or not set(actual_non_noop).issubset(HUB_SOURCE_FENCE_ACTIONS)
+        or any(
+            actions not in allowed_actions[address]
+            for address, actions in actual_non_noop.items()
+        )
+    ):
+        raise ContractError(
+            "Hub UDP source-fence replacement must contain only an exact "
+            f"reviewed remaining action subset; got {actual_non_noop}"
+        )
+    pending = set(actual_non_noop)
+    listener_create_recovery = (
+        actual_non_noop.get(listener_address) == ["create"]
+    )
+    lb_initial_replacement = (
+        actual_non_noop.get(lb_address)
+        == HUB_SOURCE_FENCE_ACTIONS[lb_address]
+    )
+    listener_initial_replacement = (
+        actual_non_noop.get(listener_address)
+        == HUB_SOURCE_FENCE_ACTIONS[listener_address]
+    )
+    if lb_initial_replacement and not listener_initial_replacement:
+        raise ContractError(
+            "initial Hub NLB replacement requires the exact "
+            "destroy-before-create listener replacement"
+        )
+    if (
+        listener_initial_replacement
+        and not lb_initial_replacement
+        and deposed_lb is None
+    ):
+        raise ContractError(
+            "legacy Hub listener replacement requires the initial NLB "
+            "replacement or its exact deposed-delete recovery"
+        )
+    if listener_create_recovery and lb_address in pending:
+        raise ContractError(
+            "Hub listener create recovery requires the fenced NLB target no-op"
+        )
+
+    def change(address: str) -> dict[str, Any]:
+        value = by_address.get(address, {}).get("change")
+        if not isinstance(value, dict):
+            raise ContractError(f"{address} replacement change is malformed")
+        return value
+
+    def values(address: str, side: str) -> dict[str, Any]:
+        value = change(address).get(side)
+        if not isinstance(value, dict):
+            raise ContractError(f"{address} replacement {side} is malformed")
+        return value
+
+    for address in set(HUB_SOURCE_FENCE_ACTIONS) - pending:
+        if not _is_exact_hub_source_fence_target_noop(change(address)):
+            raise ContractError(
+                f"{address} already-applied complement is not an exact target no-op"
+            )
+
+    provider_changes = _load_hub_source_fence_provider_changes()
+    if deposed_lb is not None:
+        deposed_change = deposed_lb.get("change")
+        expected_before = provider_changes[lb_address]["before"]
+        if (
+            deposed_lb.get("mode") != "managed"
+            or deposed_lb.get("type") != "aws_lb"
+            or deposed_lb.get("name") != "hub"
+            or not isinstance(deposed_change, dict)
+            or deposed_change.get("actions") != ["delete"]
+            or deposed_change.get("before") != expected_before
+            or deposed_change.get("after") is not None
+            or deposed_change.get("after_unknown") != {}
+            or lb_address in pending
+        ):
+            raise ContractError(
+                "deposed Hub NLB delete is not the exact captured SG-less "
+                "legacy carrier"
+            )
+    nlb_sg_address = "module.control.aws_security_group.hub_nlb[0]"
+    nlb_sg_id: str | None = None
+    if nlb_sg_address not in pending:
+        nlb_sg_id = values(nlb_sg_address, "after").get("id")
+        if (
+            not isinstance(nlb_sg_id, str)
+            or re.fullmatch(r"sg-[0-9a-f]{17}", nlb_sg_id) is None
+        ):
+            raise ContractError(
+                "already-applied Hub NLB SG no-op identity is malformed"
+            )
+
+    def known_reference_mask_is_clear(value: Any) -> bool:
+        return value in (None, False, [], [False])
+
+    def normalized_pending_change(address: str) -> dict[str, Any]:
+        actual = copy.deepcopy(change(address))
+        expected = provider_changes[address]
+        if address == "module.control.aws_lb.hub[0]" and nlb_sg_id is not None:
+            actual_after = actual.get("after")
+            actual_unknown = actual.get("after_unknown")
+            if (
+                not isinstance(actual_after, dict)
+                or not isinstance(actual_unknown, dict)
+                or actual_after.get("security_groups") != [nlb_sg_id]
+                or not known_reference_mask_is_clear(
+                    actual_unknown.get("security_groups")
+                )
+            ):
+                raise ContractError(
+                    "pending Hub NLB must bind the already-applied NLB SG"
+                )
+            actual_after.pop("security_groups")
+            actual_unknown["security_groups"] = True
+
+        if (
+            address == "module.control.aws_security_group.hub_worker[0]"
+            and nlb_sg_id is not None
+        ):
+            actual_after = actual.get("after")
+            actual_unknown = actual.get("after_unknown")
+            ingress = (
+                actual_after.get("ingress")
+                if isinstance(actual_after, dict)
+                else None
+            )
+            ingress_unknown = (
+                actual_unknown.get("ingress")
+                if isinstance(actual_unknown, dict)
+                else None
+            )
+            if (
+                not isinstance(ingress, list)
+                or len(ingress) != 2
+                or not isinstance(ingress_unknown, list)
+                or len(ingress_unknown) != 2
+            ):
+                raise ContractError(
+                    "pending Hub worker SG known-reference envelope is malformed"
+                )
+            for rule, rule_unknown in zip(ingress, ingress_unknown, strict=True):
+                if (
+                    not isinstance(rule, dict)
+                    or not isinstance(rule_unknown, dict)
+                    or rule.get("security_groups") != [nlb_sg_id]
+                    or not known_reference_mask_is_clear(
+                        rule_unknown.get("security_groups")
+                    )
+                ):
+                    raise ContractError(
+                        "pending Hub worker SG must bind the already-applied NLB SG"
+                    )
+                rule.pop("security_groups")
+                rule_unknown.pop("security_groups", None)
+            expected_unknown = copy.deepcopy(expected["after_unknown"])
+            for rule_unknown in expected_unknown["ingress"]:
+                rule_unknown.pop("security_groups")
+            if actual_unknown != expected_unknown:
+                raise ContractError(
+                    "pending Hub worker SG known-reference metadata is not exact"
+                )
+            actual["after_unknown"] = copy.deepcopy(expected["after_unknown"])
+
+        if (
+            address == "module.control.aws_lb_listener.hub[0]"
+            and "module.control.aws_lb.hub[0]" not in pending
+        ):
+            nlb_arn = values("module.control.aws_lb.hub[0]", "after").get("arn")
+            actual_after = actual.get("after")
+            actual_unknown = actual.get("after_unknown")
+            if (
+                not isinstance(actual_after, dict)
+                or not isinstance(actual_unknown, dict)
+                or actual_after.get("load_balancer_arn") != nlb_arn
+                or not known_reference_mask_is_clear(
+                    actual_unknown.get("load_balancer_arn")
+                )
+            ):
+                raise ContractError(
+                    "pending Hub listener must bind the already-applied NLB"
+                )
+            actual_after.pop("load_balancer_arn")
+            actual_unknown["load_balancer_arn"] = True
+
+        if (
+            address
+            == "module.control.aws_ssm_parameter.hub_udp_listener_arn[0]"
+            and "module.control.aws_lb_listener.hub[0]" not in pending
+        ):
+            listener_arn = values(
+                "module.control.aws_lb_listener.hub[0]", "after"
+            ).get("arn")
+            actual_after = actual.get("after")
+            actual_unknown = actual.get("after_unknown")
+            if (
+                not isinstance(actual_after, dict)
+                or not isinstance(actual_unknown, dict)
+                or actual_after.get("value") != listener_arn
+                or not known_reference_mask_is_clear(actual_unknown.get("value"))
+            ):
+                raise ContractError(
+                    "pending listener parameter must bind the applied Hub listener"
+                )
+            actual_after.pop("value")
+            actual_unknown["value"] = True
+        return actual
+
+    def require_exact_provider_change(
+        address: str, actual: dict[str, Any]
+    ) -> None:
+        expected = provider_changes[address]
+        if set(actual) != set(expected):
+            raise ContractError(
+                f"{address} replacement envelope fields are not the exact "
+                "Terraform 1.14.3/AWS provider 6.55.0 shape"
+            )
+        for field, expected_value in expected.items():
+            if actual[field] != expected_value:
+                raise ContractError(
+                    f"{address} replacement {field} is not the exact "
+                    "Terraform 1.14.3/AWS provider 6.55.0 envelope"
+                )
+
+    for address in HUB_SOURCE_FENCE_PROVIDER_ADDRESSES:
+        if address in pending and not (
+            address == listener_address and listener_create_recovery
+        ):
+            require_exact_provider_change(
+                address, normalized_pending_change(address)
+            )
+
+    if lb_address in pending:
+        require_exact_provider_change(
+            target_address, copy.deepcopy(change(target_address))
+        )
+    elif not _is_exact_hub_source_fence_target_noop(change(target_address)):
+        raise ContractError(
+            "already-applied Hub target group is not an exact target no-op"
+        )
+
+    if listener_address not in pending and lb_address in pending:
+        raise ContractError(
+            "an applied Hub listener requires the replacement NLB target no-op"
+        )
+    if parameter_address not in pending and listener_address in pending:
+        raise ContractError(
+            "an applied listener parameter requires the Hub listener target no-op"
+        )
+    if lb_address not in pending and nlb_sg_address in pending:
+        raise ContractError(
+            "an applied Hub NLB requires the NLB SG target no-op"
+        )
+    if worker_address not in pending and nlb_sg_address in pending:
+        raise ContractError(
+            "an applied Hub worker SG fence requires the NLB SG target no-op"
+        )
+    applied_nlb_rule_addresses = (
+        {
+            address
+            for address, actions in HUB_SOURCE_FENCE_ACTIONS.items()
+            if actions == ["create"] and address != nlb_sg_address
+        }
+        - pending
+    )
+    if applied_nlb_rule_addresses and nlb_sg_address in pending:
+        raise ContractError(
+            "applied Hub NLB rules require the NLB SG target no-op"
+        )
+
+    legacy_lb_arn_re = re.compile(
+        rf"^arn:aws:elasticloadbalancing:{AWS_REGION}:{ACCOUNT_ID}:"
+        rf"loadbalancer/net/{re.escape(HUB_EDGE_LEGACY_LOAD_BALANCER_NAME)}/"
+        r"[0-9a-f]{16}$"
+    )
+    target_lb_arn_re = re.compile(
+        rf"^arn:aws:elasticloadbalancing:{AWS_REGION}:{ACCOUNT_ID}:"
+        rf"loadbalancer/net/{re.escape(HUB_EDGE_LOAD_BALANCER_NAME)}/"
+        r"[0-9a-f]{16}$"
+    )
+    legacy_listener_arn_re = re.compile(
+        rf"^arn:aws:elasticloadbalancing:{AWS_REGION}:{ACCOUNT_ID}:"
+        rf"listener/net/{re.escape(HUB_EDGE_LEGACY_LOAD_BALANCER_NAME)}/"
+        r"[0-9a-f]{16}/[0-9a-f]{16}$"
+    )
+    target_listener_arn_re = re.compile(
+        rf"^arn:aws:elasticloadbalancing:{AWS_REGION}:{ACCOUNT_ID}:"
+        rf"listener/net/{re.escape(HUB_EDGE_LOAD_BALANCER_NAME)}/"
+        r"[0-9a-f]{16}/[0-9a-f]{16}$"
+    )
+    target_group_arn_re = re.compile(
+        rf"^arn:aws:elasticloadbalancing:{AWS_REGION}:{ACCOUNT_ID}:"
+        rf"targetgroup/{re.escape(HUB_EDGE_TARGET_GROUP_NAME)}/[0-9a-f]{{16}}$"
+    )
+
+    lb_before = values(lb_address, "before")
+    lb_after = values(lb_address, "after")
+    if lb_address in pending:
+        legacy_lb_arn = lb_before.get("arn")
+        if (
+            not isinstance(legacy_lb_arn, str)
+            or legacy_lb_arn_re.fullmatch(legacy_lb_arn) is None
+            or lb_before.get("security_groups") != []
+        ):
+            raise ContractError(
+                "Hub replacement must start from the exact legacy SG-less NLB"
+            )
+        target_group_lb_arn = legacy_lb_arn
+    else:
+        target_group_lb_arn = lb_after.get("arn")
+        if (
+            not isinstance(target_group_lb_arn, str)
+            or target_lb_arn_re.fullmatch(target_group_lb_arn) is None
+            or lb_after.get("id") != target_group_lb_arn
+            or lb_after.get("security_groups") != [nlb_sg_id]
+        ):
+            raise ContractError(
+                "already-applied Hub NLB is not the exact fenced target"
+            )
+    if lb_after.get("name") != HUB_EDGE_LOAD_BALANCER_NAME:
+        raise ContractError("Hub replacement NLB name is not exact")
+
+    target_after = values(target_address, "after")
+    target_group_arn = target_after.get("arn")
+    if (
+        target_group_arn_re.fullmatch(str(target_group_arn or "")) is None
+        or target_after.get("id") != target_group_arn
+        or target_after.get("load_balancer_arns") != [target_group_lb_arn]
+        or target_after.get("name") != HUB_EDGE_TARGET_GROUP_NAME
+        or target_after.get("port") != 62206
+        or target_after.get("protocol") != "UDP"
+        or target_after.get("target_type") != "ip"
+        or target_after.get("preserve_client_ip") != "true"
+    ):
+        raise ContractError(
+            "Hub replacement must retain the exact target-group carrier state"
+        )
+
+    listener_change = change(listener_address)
+    listener_before_raw = listener_change.get("before")
+    listener_before = (
+        listener_before_raw if isinstance(listener_before_raw, dict) else None
+    )
+    listener_after = values(listener_address, "after")
+    before_action = (
+        listener_before.get("default_action")
+        if isinstance(listener_before, dict)
+        else None
+    )
+    after_action = listener_after.get("default_action")
+    if (
+        (
+            not listener_create_recovery
+            and (
+                not isinstance(before_action, list)
+                or len(before_action) != 1
+                or before_action[0].get("target_group_arn") != target_group_arn
+            )
+        )
+        or not isinstance(after_action, list)
+        or len(after_action) != 1
+        or after_action[0].get("target_group_arn") != target_group_arn
+    ):
+        raise ContractError("Hub listener target-group binding is not exact")
+    if listener_create_recovery:
+        load_balancer_arn = listener_after.get("load_balancer_arn")
+        if (
+            listener_before is not None
+            or listener_change.get("actions") != ["create"]
+            or listener_after.get("protocol") != "UDP"
+            or listener_after.get("port") != 62206
+            or load_balancer_arn != target_group_lb_arn
+            or listener_change.get("after_unknown", {}).get(
+                "load_balancer_arn"
+            )
+            not in (None, False)
+        ):
+            raise ContractError(
+                "Hub listener create recovery is not the exact fenced target"
+            )
+        current_listener_arn = None
+    elif listener_address in pending:
+        assert listener_before is not None
+        current_listener_arn = listener_before.get("arn")
+        if (
+            not isinstance(current_listener_arn, str)
+            or legacy_listener_arn_re.fullmatch(current_listener_arn) is None
+            or not current_listener_arn.startswith(
+                provider_changes[lb_address]["before"]["arn"].replace(
+                    "loadbalancer/", "listener/"
+                )
+                + "/"
+            )
+        ):
+            raise ContractError(
+                "Hub replacement must start from the exact legacy listener"
+            )
+    else:
+        current_listener_arn = listener_after.get("arn")
+        if (
+            not isinstance(current_listener_arn, str)
+            or target_listener_arn_re.fullmatch(current_listener_arn) is None
+            or listener_after.get("id") != current_listener_arn
+            or listener_after.get("load_balancer_arn") != target_group_lb_arn
+        ):
+            raise ContractError(
+                "already-applied Hub listener is not the exact fenced target"
+            )
+
+    worker_before = values(worker_address, "before")
+    worker_after = values(worker_address, "after")
+    if worker_address in pending:
+        before_without_ingress = {
+            key: value for key, value in worker_before.items() if key != "ingress"
+        }
+        after_without_ingress = {
+            key: value for key, value in worker_after.items() if key != "ingress"
+        }
+        legacy_worker_ingress = {
+            (
+                rule.get("protocol"),
+                rule.get("from_port"),
+                rule.get("to_port"),
+                tuple(rule.get("cidr_blocks", [])),
+            )
+            for rule in worker_before.get("ingress", [])
+            if isinstance(rule, dict)
+        }
+        if (
+            before_without_ingress != after_without_ingress
+            or legacy_worker_ingress
+            != {
+                ("udp", 62206, 62206, ("0.0.0.0/0",)),
+                ("tcp", 62207, 62207, ("10.102.0.0/16",)),
+            }
+            or len(worker_before.get("ingress", [])) != 2
+        ):
+            raise ContractError(
+                "Hub replacement must update only the exact legacy worker ingress"
+            )
+    else:
+        ingress = worker_after.get("ingress")
+        if (
+            not isinstance(ingress, list)
+            or len(ingress) != 2
+            or {
+                (
+                    rule.get("protocol"),
+                    rule.get("from_port"),
+                    rule.get("to_port"),
+                    tuple(rule.get("security_groups", [])),
+                    tuple(rule.get("cidr_blocks", [])),
+                )
+                for rule in ingress
+                if isinstance(rule, dict)
+            }
+            != {
+                ("udp", 62206, 62206, (nlb_sg_id,), ()),
+                ("tcp", 62207, 62207, (nlb_sg_id,), ()),
+            }
+        ):
+            raise ContractError(
+                "already-applied Hub worker SG is not the exact fenced target"
+            )
+
+    parameter_before = values(parameter_address, "before")
+    parameter_after = values(parameter_address, "after")
+    expected_parameter_name = "/sandbox/nhp/control/hub/udp-listener-arn"
+    if (
+        parameter_before.get("name") != expected_parameter_name
+        or parameter_before.get("id") != expected_parameter_name
+    ):
+        raise ContractError("Hub listener-ARN parameter identity is not exact")
+    if parameter_address in pending:
+        if (
+            parameter_before.get("value")
+            != provider_changes[listener_address]["before"]["arn"]
+            or "value" in parameter_after
+            and parameter_after.get("value") is not None
+        ):
+            raise ContractError(
+                "pending Hub listener parameter is not the exact value update"
+            )
+    elif current_listener_arn is None or parameter_after.get(
+        "value"
+    ) != current_listener_arn:
+        raise ContractError(
+            "already-applied Hub listener parameter is not the exact target no-op"
+        )
+
+
 def _hub_identity_transition_pending(
     actual_non_noop: dict[str, list[str]],
 ) -> tuple[bool, set[str], set[str]]:
@@ -6127,10 +7045,21 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
 
     changes = _plan_resource_changes(plan, drift, prior_state)
     by_address: dict[str, dict[str, Any]] = {}
+    deposed_by_address: dict[str, list[dict[str, Any]]] = {}
     for item in changes:
         if not isinstance(item, dict) or not isinstance(item.get("address"), str):
             raise ContractError("Terraform resource change is malformed")
         address = item["address"]
+        deposed = item.get("deposed")
+        if deposed is not None:
+            if not isinstance(deposed, str) or not re.fullmatch(
+                r"[0-9a-f]{8}", deposed
+            ):
+                raise ContractError(
+                    f"Terraform deposed resource key is malformed for {address}"
+                )
+            deposed_by_address.setdefault(address, []).append(item)
+            continue
         if address in by_address:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
@@ -6511,6 +7440,30 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and changed == hub_edge_creates_pending
     )
 
+    # One-time replacement of the already-live Hub NLB that was created without
+    # a security group. AWS cannot attach an SG to that NLB in place. The new
+    # source-fence resources must arrive together. The NLB uses
+    # create-before-destroy, but its listener must use destroy-before-create:
+    # AWS forbids one target group from being in use by listeners on two load
+    # balancers. Only the listener-ARN parameter plus the worker target SG may
+    # update in place. Any wider mutation fails closed.
+    hub_source_fence_creates = {
+        address
+        for address, actions in HUB_SOURCE_FENCE_ACTIONS.items()
+        if actions == ["create"]
+    }
+    hub_source_fence_transition = (
+        hub_edge_mode
+        and hub_worker_mode
+        and (
+            bool(deposed_by_address)
+            or (
+                bool(actual_non_noop)
+                and set(actual_non_noop).issubset(HUB_SOURCE_FENCE_ACTIONS)
+            )
+        )
+    )
+
     # The Hub Fargate worker slice (5b): every worker resource is a still-pending
     # pure create (or an already-applied no-op), the two opened base resources
     # UPDATE (the lambda endpoint policy deny->scoped, the interface-endpoints SG
@@ -6608,6 +7561,17 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         plan_mode = "provisioned-cell-catalog"
         _require_create_shapes(changed, by_address)
         _require_provisioned_cell_create_output(plan)
+    elif hub_source_fence_transition:
+        # Ordered ahead of the image-update branch (and therefore ahead of every
+        # branch it precedes) on purpose: deposed resources are validated ONLY
+        # here (or by the fail-closed fallback below), because deposed entries
+        # never enter ``by_address``/``changed``. The shapes cannot be confused
+        # -- the fence address set is disjoint from the image-update, legacy
+        # expansion, Hub identity, runtime, edge and worker sets, so any of those
+        # plans leaves this predicate false and falls through.
+        plan_mode = "hub-udp-source-fence-replacement"
+        _require_create_shapes(hub_source_fence_creates & changed, by_address)
+        _check_hub_source_fence_transition(by_address, deposed_by_address)
     # Precedence over the legacy expansion below is deliberate. The expansion's
     # update set (AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES) contains
     # the foundation plus the three Hub functions and their six aliases, so a
@@ -6693,7 +7657,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # A single in-place policy update on the already-created hub_s3 gateway
         # endpoint -- no create shape to assert. The corrected after-state is
         # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
-    elif changed:
+    elif changed or deposed_by_address:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
@@ -6701,7 +7665,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
-            "exact Hub S3 endpoint-policy correction; "
+            "exact Hub S3 endpoint-policy correction or Hub UDP source-fence "
+            "replacement; "
             f"got {actual_non_noop}"
         )
 
@@ -7913,11 +8878,125 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
                 "Control Hub load balancer is not the exact active internet-facing "
                 "network edge in the Control VPC"
             )
+
+    security_groups = load_json(evidence_dir / "control-security-groups.json").get(
+        "SecurityGroups"
+    )
+    if not isinstance(security_groups, list):
+        raise ContractError("Control security-group evidence is malformed")
+
+    def tag_value(row: dict[str, Any], key: str) -> str | None:
+        matches = [
+            tag.get("Value")
+            for tag in row.get("Tags", [])
+            if isinstance(tag, dict) and tag.get("Key") == key
+        ]
+        return matches[0] if len(matches) == 1 and isinstance(matches[0], str) else None
+
+    def normalized_permissions(
+        row: dict[str, Any], field: str
+    ) -> set[tuple[str, int | None, int | None, str, str]]:
+        result: set[tuple[str, int | None, int | None, str, str]] = set()
+        permissions = row.get(field)
+        if not isinstance(permissions, list):
+            raise ContractError(f"Control SG {field} evidence is malformed")
+        for permission in permissions:
+            if not isinstance(permission, dict):
+                raise ContractError(f"Control SG {field} rule is malformed")
+            protocol = str(permission.get("IpProtocol"))
+            start = permission.get("FromPort")
+            end = permission.get("ToPort")
+            for item in permission.get("IpRanges", []):
+                result.add(
+                    (protocol, start, end, "cidr_ipv4", str(item.get("CidrIp")))
+                )
+            for item in permission.get("Ipv6Ranges", []):
+                result.add(
+                    (protocol, start, end, "cidr_ipv6", str(item.get("CidrIpv6")))
+                )
+            for item in permission.get("PrefixListIds", []):
+                result.add(
+                    (
+                        protocol,
+                        start,
+                        end,
+                        "prefix_list",
+                        str(item.get("PrefixListId")),
+                    )
+                )
+            for item in permission.get("UserIdGroupPairs", []):
+                result.add(
+                    (protocol, start, end, "security_group", str(item.get("GroupId")))
+                )
+        return result
+
+    hub_nlb_groups = [
+        row
+        for row in security_groups
+        if isinstance(row, dict)
+        and tag_value(row, "Component") == "connector-hub-edge"
+        and tag_value(row, "Name") == f"{CONTROL_PREFIX}-hub-nlb"
+    ]
+    hub_worker_groups = [
+        row
+        for row in security_groups
+        if isinstance(row, dict)
+        and tag_value(row, "Component") == "connector-hub"
+        and tag_value(row, "Name") == f"{CONTROL_PREFIX}-hub"
+    ]
+    if not public_edge_ids:
+        if hub_nlb_groups:
+            raise ContractError("Control Hub NLB SG exists while the edge is dark")
+    else:
+        if len(hub_nlb_groups) != 1:
+            raise ContractError("Control Hub NLB SG is not singular")
+        nlb_group = hub_nlb_groups[0]
+        nlb_group_id = nlb_group.get("GroupId")
+        if (
+            not isinstance(nlb_group_id, str)
+            or not re.fullmatch(r"sg-[0-9a-f]+", nlb_group_id)
+            or live_load_balancers[0].get("SecurityGroups") != [nlb_group_id]
+        ):
+            raise ContractError(
+                "Control Hub NLB does not attach exactly the reviewed NLB SG"
+            )
+        if normalized_permissions(nlb_group, "IpPermissions") != {
+            ("udp", 62206, 62206, "cidr_ipv4", PROOF_SOURCE_CIDR)
+        }:
+            raise ContractError(
+                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP 62206"
+            )
+        if hub_worker_groups:
+            if len(hub_worker_groups) != 1:
+                raise ContractError("Control Hub worker SG is not singular")
+            worker_group = hub_worker_groups[0]
+            worker_group_id = worker_group.get("GroupId")
+            if not isinstance(worker_group_id, str) or not re.fullmatch(
+                r"sg-[0-9a-f]+", worker_group_id
+            ):
+                raise ContractError("Control Hub worker SG id is malformed")
+            if normalized_permissions(nlb_group, "IpPermissionsEgress") != {
+                ("udp", 62206, 62206, "security_group", worker_group_id),
+                ("tcp", 62207, 62207, "security_group", worker_group_id),
+            }:
+                raise ContractError(
+                    "Control Hub NLB SG egress is not exactly worker UDP 62206 plus TCP 62207"
+                )
+            if normalized_permissions(worker_group, "IpPermissions") != {
+                ("udp", 62206, 62206, "security_group", nlb_group_id),
+                ("tcp", 62207, 62207, "security_group", nlb_group_id),
+            }:
+                raise ContractError(
+                    "Control Hub worker SG ingress is not exactly from the Hub NLB SG"
+                )
+        elif normalized_permissions(nlb_group, "IpPermissionsEgress"):
+            raise ContractError("Control Hub NLB SG has egress while workers are dark")
     return {
         "flow_log_id": flow["FlowLogId"],
         "vpc_id": vpc_id,
         "authority_function_count": len(live_lambda_names),
         "hub_load_balancer_count": len(live_load_balancers),
+        "hub_nlb_security_group_count": len(hub_nlb_groups),
     }
 
 

@@ -259,12 +259,9 @@ resource "aws_iam_role_policy" "hub_task" {
 # --------------------------------------------------------------------------
 # Worker ENI security group (inline rules; no separate rule resources).
 # --------------------------------------------------------------------------
-# Ingress is exactly the two Hub ports. UDP/62206 is the knock data plane: the
-# 5a NLB has preserve_client_ip=true, so the packet source on the wire is the
-# CLIENT, not the NLB -- the rule therefore admits 0.0.0.0/0 (the caller
-# population is the internet; the NHP handshake itself is the authenticator).
-# TCP/62207 is the NLB's bare-connect health probe, which is NLB-sourced (not
-# client-preserved), so it is scoped to the VPC CIDR. Egress is HTTPS only:
+# Ingress is exactly the two Hub ports and trusts only the NLB security-group
+# identity. AWS applies that identity to NLB-to-target traffic even with client
+# IP preservation, so worker ENIs never need a public-CIDR rule. Egress is HTTPS:
 # in-VPC to reach the lambda/logs/secrets/kms/ecr interface endpoints (via CIDR,
 # not an SG ref, to avoid an inline-rule cycle with the endpoint SG), plus the
 # S3 gateway prefix list for the ECR layer blobs.
@@ -277,25 +274,25 @@ resource "aws_security_group" "hub_worker" {
 
   ingress = [
     {
-      description      = "NHP UDP knock data (NLB preserve_client_ip: source is the client)"
+      description      = "NHP UDP knock data from the Hub NLB security group"
       from_port        = 62206
       to_port          = 62206
       protocol         = "udp"
-      cidr_blocks      = ["0.0.0.0/0"]
+      cidr_blocks      = []
       ipv6_cidr_blocks = []
       prefix_list_ids  = []
-      security_groups  = []
+      security_groups  = local.hub_edge_enabled ? [aws_security_group.hub_nlb[0].id] : []
       self             = false
     },
     {
-      description      = "NLB TCP health probe on 62207 (NLB-sourced, not client-preserved)"
+      description      = "NLB TCP health probe on 62207"
       from_port        = 62207
       to_port          = 62207
       protocol         = "tcp"
-      cidr_blocks      = [var.vpc_cidr]
+      cidr_blocks      = []
       ipv6_cidr_blocks = []
       prefix_list_ids  = []
-      security_groups  = []
+      security_groups  = local.hub_edge_enabled ? [aws_security_group.hub_nlb[0].id] : []
       self             = false
     },
   ]

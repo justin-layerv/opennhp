@@ -349,6 +349,9 @@ else
     "recovery preflight requires a no-op DMZ boundary" \
     '--require-dmz-boundary-noop'
   assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "recovery preflight admits only the reviewed UDP source-fence replacement" \
+    '--allow-udp-source-fence-replacement'
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
     "recovery preflight checks its dedicated saved-plan JSON" \
     'plan-boundary-preflight\.json'
   if grep -Eq -- '--allow-disabled' <<< "$RECOVERY_STEP"; then
@@ -395,6 +398,10 @@ else
     '--require-dmz-boundary-noop'
   assert_step_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ plan contract before apply" \
+    "pre-apply gate admits only the reviewed UDP source-fence replacement" \
+    '--allow-udp-source-fence-replacement'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
     "pre-apply gate checks the final plan artifact after all strict modes" \
     'plan-show\.json'
   assert_step_in "$INFRA" deploy-sandbox-infra "Terraform Apply" \
@@ -416,6 +423,14 @@ else
     "Verify relay DMZ post-apply idempotency" \
     "post-apply validation fails closed on every fenced DMZ mutation" \
     '--require-dmz-boundary-noop'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply validation requires the converged UDP source-fenced topology" \
+    '--require-udp-source-fenced-topology'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply validation removes the UDP source-fence replacement allowance" \
+    '--allow-udp-source-fence-replacement'
   assert_step_not_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ post-apply idempotency" \
     "post-apply validation cannot use bootstrap tolerance" \
@@ -443,11 +458,23 @@ else
   assert_step_in "$PLAN_JOB" terraform-plan \
     "Check relay DMZ plan contract" \
     "PR plan invokes the relay DMZ checker" \
-    'check-relay-dmz-plan\.py tfplan\.json'
-  for strict_flag in --require-pr0-applied --require-dmz-boundary-noop --allow-disabled; do
+    'check-relay-dmz-plan\.py'
+  assert_step_in "$PLAN_JOB" terraform-plan \
+    "Check relay DMZ plan contract" \
+    "PR plan checks its saved plan artifact" \
+    'tfplan\.json'
+  assert_step_in "$PLAN_JOB" terraform-plan \
+    "Check relay DMZ plan contract" \
+    "PR plan fails closed outside the reviewed DMZ migration" \
+    '--require-dmz-boundary-noop'
+  assert_step_in "$PLAN_JOB" terraform-plan \
+    "Check relay DMZ plan contract" \
+    "PR plan admits only the reviewed UDP source-fence replacement" \
+    '--allow-udp-source-fence-replacement'
+  for strict_flag in --require-pr0-applied --allow-disabled; do
     assert_step_not_in "$PLAN_JOB" terraform-plan \
       "Check relay DMZ plan contract" \
-      "PR plan remains observation-only without $strict_flag" \
+      "PR plan does not use $strict_flag" \
       "$strict_flag"
   done
 fi

@@ -66,6 +66,13 @@ PROOF_SOURCE_RULE_SUFFIX = (
 PROOF_SOURCE_RULE_ADDRESS_SUFFIX = (
     "aws_vpc_security_group_ingress_rule" + PROOF_SOURCE_RULE_SUFFIX
 )
+UDP_SOURCE_FENCE_PROVIDER_FIXTURE = (
+    REPO_ROOT
+    / "tests"
+    / "fixtures"
+    / "cell0-udp-source-fence"
+    / "active-green-replacement-terraform-1.14.3-aws-6.54.0.json"
+)
 MANAGED_ACTIVE_COLOR_LISTENER_REFS = (
     "var.enable_blue_green",
     "aws_ssm_parameter.active_color[0].value",
@@ -1294,9 +1301,16 @@ def clean_plan() -> dict[str, Any]:
                         },
                         "default_action": {
                             "references": [
+                                "var.enable_blue_green",
+                                "aws_ssm_parameter.active_color[0].value",
+                                "aws_ssm_parameter.active_color[0]",
+                                "aws_ssm_parameter.active_color",
                                 "aws_lb_target_group.udp[0].arn",
                                 "aws_lb_target_group.udp[0]",
                                 "aws_lb_target_group.udp",
+                                "aws_lb_target_group.udp_green[0].arn",
+                                "aws_lb_target_group.udp_green[0]",
+                                "aws_lb_target_group.udp_green",
                             ]
                         },
                     },
@@ -2468,6 +2482,9 @@ def source_fenced_plan() -> dict[str, Any]:
 def source_fence_migration_plan() -> dict[str, Any]:
     """Return the exact one-time legacy-to-fenced boundary transition."""
     plan = source_fenced_plan()
+    provider_changes = json.loads(
+        UDP_SOURCE_FENCE_PROVIDER_FIXTURE.read_text(encoding="utf-8")
+    )["changes"]
     for change in plan["resource_changes"]:
         if not checker.is_dmz_boundary_address(str(change.get("address", ""))):
             continue
@@ -2492,44 +2509,47 @@ def source_fence_migration_plan() -> dict[str, Any]:
         change["change"]["actions"] = ["create"]
         change["change"]["before"] = None
 
+    # Match a real first-apply provider plan: the new NLB SG ID and every
+    # dependent SG reference are explicitly unknown until apply.
+    nlb_sg = resource(plan, ".aws_security_group.server_nlb[0]")
+    nlb_sg["change"]["after"]["id"] = None
+    nlb_sg["change"]["after_unknown"]["id"] = True
+    for suffix, field in (
+        (PROOF_SOURCE_RULE_SUFFIX, "security_group_id"),
+        (
+            ".aws_vpc_security_group_ingress_rule.server_nhp_udp_nlb[0]",
+            "referenced_security_group_id",
+        ),
+        (
+            ".aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+            "referenced_security_group_id",
+        ),
+        (".aws_vpc_security_group_egress_rule.server_nlb_udp[0]", "security_group_id"),
+        (
+            ".aws_vpc_security_group_egress_rule.server_nlb_health[0]",
+            "security_group_id",
+        ),
+    ):
+        dependent = resource(plan, suffix)
+        dependent["change"]["after"][field] = None
+        dependent["change"]["after_unknown"][field] = True
+
     public_nlb = next(
         item
         for item in plan["resource_changes"]
         if item["address"].endswith("aws_lb.server[0]")
     )
-    public_nlb["change"]["actions"] = ["create", "delete"]
-    public_nlb["change"]["before"] = {
-        **copy.deepcopy(public_nlb["change"]["after"]),
-        "name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
-        "security_groups": [],
-        "tags": {
-            **copy.deepcopy(public_nlb["change"]["after"]["tags"]),
-            "Name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
-        },
-    }
+    public_nlb["change"] = copy.deepcopy(provider_changes[public_nlb["address"]])
 
     udp_listener = next(
         item
         for item in plan["resource_changes"]
         if item["address"].endswith("aws_lb_listener.udp[0]")
     )
-    listener_target_group = sandbox_udp_target_group_arn(
-        checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME, "fixture"
-    )
-    udp_listener["change"]["after"]["default_action"] = [
-        {"target_group_arn": listener_target_group}
-    ]
-    udp_listener["change"]["actions"] = ["delete", "create"]
-    udp_listener["change"]["before"] = {
-        **copy.deepcopy(udp_listener["change"]["after"]),
-        "load_balancer_arn": (
-            f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
-            f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:"
-            "loadbalancer/net/layerv-nhp-sandbox-nlb/legacy"
-        ),
-    }
-    udp_listener["change"]["after"].pop("load_balancer_arn", None)
-    udp_listener["change"]["after_unknown"]["load_balancer_arn"] = True
+    # The captured provider envelope already carries the live green target on
+    # both sides with a canonical ARN, so it satisfies the active-color checks
+    # from #3466 while also meeting the exact-envelope comparison.
+    udp_listener["change"] = copy.deepcopy(provider_changes[udp_listener["address"]])
 
     plan["resource_changes"].append(
         {
@@ -2553,6 +2573,122 @@ def source_fence_migration_plan() -> dict[str, Any]:
             },
         }
     )
+    return plan
+
+
+def source_fence_partial_retry_plan(
+    pending_keys: set[str],
+) -> dict[str, Any]:
+    """Return a retry with pending actions plus exact fenced target no-ops."""
+    expected_keys = set(checker.UDP_SOURCE_FENCE_MIGRATION_KEYS)
+    if not pending_keys or not pending_keys.issubset(expected_keys):
+        raise AssertionError("partial retry requires a nonempty reviewed subset")
+    plan = source_fence_migration_plan()
+    target = source_fenced_plan()
+    target_by_key = {
+        key: item
+        for item in target["resource_changes"]
+        if (
+            key := checker.udp_source_fence_migration_address_key(item["address"])
+        )
+        is not None
+    }
+    for key in expected_keys - pending_keys:
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if checker.udp_source_fence_migration_address_key(item["address"]) != key
+        ]
+        if key == checker.UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE:
+            continue
+        target_item = copy.deepcopy(target_by_key[key])
+        target_after = copy.deepcopy(target_item["change"]["after"])
+        target_item["change"] = {
+            "actions": ["no-op"],
+            "before": copy.deepcopy(target_after),
+            "after": target_after,
+            "after_unknown": {},
+        }
+        plan["resource_changes"].append(target_item)
+
+    if checker.UDP_SOURCE_FENCE_NLB_SG_CREATE not in pending_keys:
+        nlb_sg_id = resource(plan, ".aws_security_group.server_nlb[0]")["change"][
+            "after"
+        ]["id"]
+        known_references = (
+            (
+                checker.UDP_SOURCE_FENCE_NLB_REPLACEMENT,
+                ".aws_lb.server[0]",
+                "security_groups",
+                [nlb_sg_id],
+            ),
+            (
+                checker.UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE,
+                PROOF_SOURCE_RULE_SUFFIX,
+                "security_group_id",
+                nlb_sg_id,
+            ),
+            (
+                checker.UDP_SOURCE_FENCE_TARGET_UDP_CREATE,
+                ".aws_vpc_security_group_ingress_rule.server_nhp_udp_nlb[0]",
+                "referenced_security_group_id",
+                nlb_sg_id,
+            ),
+            (
+                checker.UDP_SOURCE_FENCE_TARGET_HEALTH_CREATE,
+                ".aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+                "referenced_security_group_id",
+                nlb_sg_id,
+            ),
+            (
+                checker.UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE,
+                ".aws_vpc_security_group_egress_rule.server_nlb_udp[0]",
+                "security_group_id",
+                nlb_sg_id,
+            ),
+            (
+                checker.UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE,
+                ".aws_vpc_security_group_egress_rule.server_nlb_health[0]",
+                "security_group_id",
+                nlb_sg_id,
+            ),
+        )
+        for key, suffix, field, value in known_references:
+            if key not in pending_keys:
+                continue
+            pending = resource(plan, suffix)
+            pending["change"]["after"][field] = value
+            pending["change"]["after_unknown"].pop(field, None)
+    return plan
+
+
+def source_fence_deposed_retry_plan(*, listener_create: bool) -> dict[str, Any]:
+    """Return the provider's create-before-destroy interruption shape."""
+
+    plan = source_fence_partial_retry_plan(
+        {checker.UDP_SOURCE_FENCE_LISTENER_REPLACEMENT}
+    )
+    initial = source_fence_migration_plan()
+    legacy_nlb = copy.deepcopy(resource(initial, ".aws_lb.server[0]"))
+    legacy_nlb["deposed"] = "deadbeef"
+    legacy_nlb["change"] = {
+        "actions": ["delete"],
+        "before": copy.deepcopy(legacy_nlb["change"]["before"]),
+        "after": None,
+        "after_unknown": {},
+    }
+    plan["resource_changes"].append(legacy_nlb)
+
+    if listener_create:
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        listener["change"]["actions"] = ["create"]
+        listener["change"]["before"] = None
+        listener["change"]["after"]["load_balancer_arn"] = (
+            f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+            f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:loadbalancer/net/"
+            f"{checker.EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME}/target"
+        )
+        listener["change"]["after_unknown"].pop("load_balancer_arn", None)
     return plan
 
 
@@ -3038,7 +3174,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             errors,
         )
 
-    def test_source_fence_migration_requires_exact_nine_step_action_graph(
+    def test_source_fence_migration_requires_full_or_exact_remaining_graph(
         self,
     ) -> None:
         plan = source_fence_migration_plan()
@@ -3097,8 +3233,124 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 errors = checker.validate_dmz_boundary_noop(
                     candidate, allow_udp_source_fence_replacement=True
                 )
+                key = checker.udp_source_fence_migration_address_key(
+                    omitted["address"]
+                )
+                if key == checker.UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE:
+                    self.assertEqual([], errors)
+                else:
+                    self.assertTrue(
+                        any(
+                            "bounded remaining subset" in error for error in errors
+                        ),
+                        errors,
+                    )
+
+    def test_source_fence_partial_retry_accepts_only_exact_target_complement(
+        self,
+    ) -> None:
+        cases = (
+            {
+                checker.UDP_SOURCE_FENCE_NLB_REPLACEMENT,
+                checker.UDP_SOURCE_FENCE_LISTENER_REPLACEMENT,
+            },
+            {
+                checker.UDP_SOURCE_FENCE_NLB_REPLACEMENT,
+                checker.UDP_SOURCE_FENCE_LISTENER_REPLACEMENT,
+                checker.UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE,
+            },
+            {checker.UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE},
+        )
+        for pending in cases:
+            with self.subTest(pending=sorted(pending)):
+                self.assertEqual(
+                    [],
+                    checker.validate_plan(
+                        source_fence_partial_retry_plan(pending),
+                        require_dmz_boundary_noop=True,
+                        allow_udp_source_fence_replacement=True,
+                    ),
+                )
+
+    def test_source_fence_deposed_retry_phases_are_bounded(self) -> None:
+        for listener_create in (False, True):
+            with self.subTest(listener_create=listener_create):
+                self.assertEqual(
+                    [],
+                    checker.validate_plan(
+                        source_fence_deposed_retry_plan(
+                            listener_create=listener_create
+                        ),
+                        require_dmz_boundary_noop=True,
+                        allow_udp_source_fence_replacement=True,
+                    ),
+                )
+
+    def test_source_fence_deposed_retry_rejects_legacy_drift(self) -> None:
+        plan = source_fence_deposed_retry_plan(listener_create=False)
+        deposed = next(
+            item
+            for item in plan["resource_changes"]
+            if item.get("deposed") == "deadbeef"
+        )
+        deposed["change"]["before"]["security_groups"] = ["sg-attacker"]
+        errors = checker.validate_plan(
+            plan,
+            require_dmz_boundary_noop=True,
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertTrue(
+            any("deposed NLB delete" in error for error in errors),
+            errors,
+        )
+
+    def test_source_fence_partial_retry_rejects_unsafe_complement(
+        self,
+    ) -> None:
+        pending = {
+            checker.UDP_SOURCE_FENCE_NLB_REPLACEMENT,
+            checker.UDP_SOURCE_FENCE_LISTENER_REPLACEMENT,
+        }
+
+        unknown = source_fence_partial_retry_plan(pending)
+        proof = resource(unknown, PROOF_SOURCE_RULE_SUFFIX)
+        proof["change"]["after_unknown"] = {"cidr_ipv4": True}
+
+        mismatched = source_fence_partial_retry_plan(pending)
+        proof = resource(mismatched, PROOF_SOURCE_RULE_SUFFIX)
+        proof["change"]["before"]["cidr_ipv4"] = "10.0.0.0/8"
+
+        missing = source_fence_partial_retry_plan(pending)
+        missing["resource_changes"] = [
+            item
+            for item in missing["resource_changes"]
+            if not item["address"].endswith("aws_security_group.server_nlb[0]")
+        ]
+
+        legacy_present = source_fence_partial_retry_plan(pending)
+        legacy = resource(
+            source_fence_migration_plan(), ".server_nhp_udp[0]"
+        )
+        legacy["change"] = {
+            "actions": ["no-op"],
+            "before": copy.deepcopy(legacy["change"]["before"]),
+            "after": copy.deepcopy(legacy["change"]["before"]),
+            "after_unknown": {},
+        }
+        legacy_present["resource_changes"].append(legacy)
+
+        for candidate in (unknown, mismatched, missing, legacy_present):
+            with self.subTest(candidate=candidate):
+                errors = checker.validate_dmz_boundary_noop(
+                    candidate, allow_udp_source_fence_replacement=True
+                )
                 self.assertTrue(
-                    any("exact reviewed nine-step" in error for error in errors),
+                    any(
+                        "bounded remaining subset" in error
+                        or "already-applied" in error
+                        or "must not retain the legacy" in error
+                        for error in errors
+                    ),
                     errors,
                 )
 
@@ -3209,13 +3461,27 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
     def test_source_fence_migration_preserves_live_green_target(self) -> None:
         plan = source_fence_migration_plan()
         listener = resource(plan, ".aws_lb_listener.udp[0]")
-        green_target_group = sandbox_udp_target_group_arn(
-            checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME, "green"
+        # The captured provider envelope is itself the green-preserving shape:
+        # both sides already pin the same canonical live green target group.
+        # Assert that directly instead of overwriting default_action, which
+        # would break the exact-envelope comparison the checker also enforces.
+        green_target_prefix = (
+            f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+            f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:targetgroup/"
+            f"{checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME}/"
         )
+        green_targets = set()
         for side in ("before", "after"):
-            listener["change"][side]["default_action"] = [
-                {"target_group_arn": green_target_group}
+            target_group_arn = listener["change"][side]["default_action"][0][
+                "target_group_arn"
             ]
+            self.assertTrue(
+                target_group_arn.startswith(green_target_prefix)
+                and bool(target_group_arn.rsplit("/", 1)[-1]),
+                target_group_arn,
+            )
+            green_targets.add(target_group_arn)
+        self.assertEqual(1, len(green_targets), green_targets)
 
         self.assertEqual(
             [],
@@ -3935,9 +4201,29 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         self.assertIn("paths: *validate_paths", workflow)
         self.assertIn('- "tests/fixtures/relay-dmz-plan/**"', workflow)
         self.assertIn(
+            '- "tests/fixtures/cell0-udp-source-fence/**"',
+            workflow,
+        )
+        self.assertIn(
             "python3 -m py_compile .github/scripts/check-relay-dmz-plan.py",
             workflow,
         )
+
+    def test_udp_source_fence_provider_fixture_digest_fails_closed(self) -> None:
+        fixture_bytes = UDP_SOURCE_FENCE_PROVIDER_FIXTURE.read_bytes()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_path = Path(temp_dir) / UDP_SOURCE_FENCE_PROVIDER_FIXTURE.name
+            fixture_path.write_bytes(fixture_bytes + b"\n")
+            with mock.patch.object(
+                checker,
+                "UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH",
+                fixture_path,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "UDP source-fence provider fixture digest changed",
+                ):
+                    checker._load_udp_source_fence_provider_fixture()
 
     def test_pr_plan_restores_complete_trusted_checker_family(self) -> None:
         workflow = (
@@ -7172,7 +7458,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
         self.assertEqual(1, blocked.returncode, blocked.stderr)
         self.assertIn("unreviewed UDP source-fence", blocked.stderr)
-        self.assertIn("exact reviewed nine-step", blocked.stderr)
+        self.assertIn("bounded remaining subset", blocked.stderr)
 
 
 if __name__ == "__main__":

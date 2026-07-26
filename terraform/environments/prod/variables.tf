@@ -374,6 +374,17 @@ variable "nhp_udp_recv_buffer_bytes" {
   default     = 8388608
 }
 
+variable "public_nhp_udp_ingress_cidrs" {
+  description = "Optional exact /32 sources for a future reviewed production NHP public-edge migration. null preserves the existing production NLB until that separate gate."
+  type        = list(string)
+  default     = null
+
+  validation {
+    condition     = var.public_nhp_udp_ingress_cidrs == null
+    error_message = "Production public NHP edge migration is not part of the sandbox UDP proof and must remain null."
+  }
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

@@ -147,6 +147,38 @@ variable "additional_nhp_udp_ingress_cidrs" {
   }
 }
 
+variable "public_nhp_udp_ingress_cidrs" {
+  description = <<-EOT
+    Optional exact public IPv4 /32 sources allowed to reach the assigned-cell
+    UDP-62206 NLB. null preserves the legacy NLB-without-security-group shape;
+    a non-null list creates an NLB security group at NLB creation and makes the
+    server target security group trust only that NLB security group. Sandbox
+    proof cells must set the proof runner's persistent EIP /32. Do not use this
+    as a broad internet allowlist.
+  EOT
+  type        = list(string)
+  default     = null
+
+  validation {
+    condition = var.public_nhp_udp_ingress_cidrs == null || (
+      length(var.public_nhp_udp_ingress_cidrs) > 0 &&
+      alltrue([
+        for cidr in var.public_nhp_udp_ingress_cidrs :
+        can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
+      ])
+    )
+    error_message = "public_nhp_udp_ingress_cidrs must be null or a non-empty list of exact IPv4 /32 CIDRs."
+  }
+
+  validation {
+    condition = (
+      var.public_nhp_udp_ingress_cidrs == null ||
+      var.public_nhp_udp_ingress_cidrs == sort(distinct(var.public_nhp_udp_ingress_cidrs))
+    )
+    error_message = "public_nhp_udp_ingress_cidrs must be sorted and duplicate-free."
+  }
+}
+
 variable "server_repo_url" {
   description = "ECR repository URL for NHP server"
   type        = string
