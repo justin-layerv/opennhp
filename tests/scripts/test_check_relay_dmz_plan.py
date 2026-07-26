@@ -66,6 +66,25 @@ PROOF_SOURCE_RULE_SUFFIX = (
 PROOF_SOURCE_RULE_ADDRESS_SUFFIX = (
     "aws_vpc_security_group_ingress_rule" + PROOF_SOURCE_RULE_SUFFIX
 )
+MANAGED_ACTIVE_COLOR_LISTENER_REFS = (
+    "var.enable_blue_green",
+    "aws_ssm_parameter.active_color[0].value",
+    "aws_ssm_parameter.active_color[0]",
+    "aws_ssm_parameter.active_color",
+    "aws_lb_target_group.udp[0].arn",
+    "aws_lb_target_group.udp[0]",
+    "aws_lb_target_group.udp",
+    "aws_lb_target_group.udp_green[0].arn",
+    "aws_lb_target_group.udp_green[0]",
+    "aws_lb_target_group.udp_green",
+)
+
+
+def sandbox_udp_target_group_arn(name: str, suffix: str) -> str:
+    return (
+        f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+        f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:targetgroup/{name}/{suffix}"
+    )
 
 
 def endpoint_policy(key: str) -> str:
@@ -2143,6 +2162,12 @@ def clean_plan() -> dict[str, Any]:
 def source_fenced_plan() -> dict[str, Any]:
     """Return the future cell0 topology admitted only by the migration flag."""
     plan = clean_plan()
+    public_listener_config = configured_resource(
+        plan, "compute", "aws_lb_listener", "udp"
+    )
+    public_listener_config["expressions"]["default_action"]["references"] = list(
+        MANAGED_ACTIVE_COLOR_LISTENER_REFS
+    )
     compute_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
         "module"
     ]["module_calls"]["compute"]["module"]["resources"]
@@ -2488,10 +2513,8 @@ def source_fence_migration_plan() -> dict[str, Any]:
         for item in plan["resource_changes"]
         if item["address"].endswith("aws_lb_listener.udp[0]")
     )
-    listener_target_group = (
-        f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
-        f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:"
-        f"targetgroup/{checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME}/fixture"
+    listener_target_group = sandbox_udp_target_group_arn(
+        checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME, "fixture"
     )
     udp_listener["change"]["after"]["default_action"] = [
         {"target_group_arn": listener_target_group}
@@ -3100,14 +3123,78 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
 
         plan = source_fence_migration_plan()
         listener = resource(plan, ".aws_lb_listener.udp[0]")
-        listener["change"]["before"]["default_action"] = [
-            {"target_group_arn": "arn:aws:elasticloadbalancing:rogue"}
-        ]
+        wrong_account_target = (
+            f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+            "000000000000:targetgroup/"
+            f"{checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME}/rogue"
+        )
+        for side in ("before", "after"):
+            listener["change"][side]["default_action"] = [
+                {"target_group_arn": wrong_account_target}
+            ]
         errors = checker.validate_dmz_boundary_noop(
             plan, allow_udp_source_fence_replacement=True
         )
         self.assertTrue(
-            any("canonical public UDP target group" in error for error in errors),
+            any(
+                "canonical blue or green public UDP target group" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        for before_name, after_name in (
+            (
+                checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+                checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+            ),
+            (
+                checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+                checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+            ),
+        ):
+            with self.subTest(before_name=before_name, after_name=after_name):
+                plan = source_fence_migration_plan()
+                listener = resource(plan, ".aws_lb_listener.udp[0]")
+                for side, target_name in (
+                    ("before", before_name),
+                    ("after", after_name),
+                ):
+                    listener["change"][side]["default_action"] = [
+                        {
+                            "target_group_arn": sandbox_udp_target_group_arn(
+                                target_name, side
+                            )
+                        }
+                    ]
+                errors = checker.validate_dmz_boundary_noop(
+                    plan, allow_udp_source_fence_replacement=True
+                )
+                self.assertTrue(
+                    any(
+                        "preserve the exact active public UDP target group" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+        plan = source_fence_migration_plan()
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        empty_suffix_target = sandbox_udp_target_group_arn(
+            checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME, ""
+        )
+        for side in ("before", "after"):
+            listener["change"][side]["default_action"] = [
+                {"target_group_arn": empty_suffix_target}
+            ]
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any(
+                "canonical blue or green public UDP target group" in error
+                for error in errors
+            ),
             errors,
         )
 
@@ -3118,6 +3205,26 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             plan, allow_udp_source_fence_replacement=True
         )
         self.assertTrue(any("must be a pure create" in error for error in errors), errors)
+
+    def test_source_fence_migration_preserves_live_green_target(self) -> None:
+        plan = source_fence_migration_plan()
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        green_target_group = sandbox_udp_target_group_arn(
+            checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME, "green"
+        )
+        for side in ("before", "after"):
+            listener["change"][side]["default_action"] = [
+                {"target_group_arn": green_target_group}
+            ]
+
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                plan,
+                require_dmz_boundary_noop=True,
+                allow_udp_source_fence_replacement=True,
+            ),
+        )
 
     def test_source_fence_migration_rejects_cross_parent_substitution(self) -> None:
         plan = source_fence_migration_plan()
@@ -5004,7 +5111,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 "aws_lb.server_internal",
             ]
         }
-        self.assert_violation(plan, "public UDP listener must forward only")
+        self.assert_violation(plan, "public UDP listener must forward through")
 
     def test_assigned_cell_public_udp_listener_must_use_public_udp_tg(self) -> None:
         plan = clean_plan()
@@ -5016,7 +5123,72 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 "aws_lb_target_group.udp_internal",
             ]
         }
-        self.assert_violation(plan, "public UDP listener must forward only")
+        self.assert_violation(plan, "public UDP listener must forward through")
+
+    def test_assigned_cell_public_udp_listener_accepts_managed_active_color(
+        self,
+    ) -> None:
+        plan = clean_plan()
+        listener = configured_resource(plan, "compute", "aws_lb_listener", "udp")
+        listener["expressions"]["default_action"]["references"] = list(
+            MANAGED_ACTIVE_COLOR_LISTENER_REFS
+        )
+
+        self.assertEqual([], checker.validate_plan(plan))
+
+    def test_assigned_cell_public_udp_listener_managed_selector_is_exact(
+        self,
+    ) -> None:
+        cases = {
+            "missing blue-green gate": lambda references: [
+                reference
+                for reference in references
+                if reference != "var.enable_blue_green"
+            ],
+            "missing active-color record": lambda references: [
+                reference
+                for reference in references
+                if not reference.startswith("aws_ssm_parameter.active_color")
+            ],
+            "operator target override": lambda references: [
+                *references,
+                "var.public_udp_listener_target",
+            ],
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                plan = clean_plan()
+                listener = configured_resource(
+                    plan, "compute", "aws_lb_listener", "udp"
+                )
+                listener["expressions"]["default_action"]["references"] = mutate(
+                    list(MANAGED_ACTIVE_COLOR_LISTENER_REFS)
+                )
+                self.assert_violation(
+                    plan, "exact managed active-color blue/green selector"
+                )
+
+    def test_source_fenced_topology_requires_managed_active_color(
+        self,
+    ) -> None:
+        plan = source_fenced_plan()
+        listener = configured_resource(plan, "compute", "aws_lb_listener", "udp")
+        listener["expressions"]["default_action"]["references"] = [
+            "aws_lb_target_group.udp[0].arn",
+            "aws_lb_target_group.udp[0]",
+            "aws_lb_target_group.udp",
+        ]
+
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "exact managed active-color blue/green selector" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_assigned_cell_public_udp_tg_must_attach_to_server_asg(self) -> None:
         plan = clean_plan()

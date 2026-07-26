@@ -81,6 +81,22 @@ EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
 EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
 EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
 EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
+# Exact Terraform expression graph for the managed blue/green selector. Refresh
+# this reviewed set from plan JSON when Terraform/provider rendering changes.
+EXPECTED_PUBLIC_UDP_MANAGED_TARGET_REFS = frozenset(
+    {
+        "var.enable_blue_green",
+        "aws_ssm_parameter.active_color[0].value",
+        "aws_ssm_parameter.active_color[0]",
+        "aws_ssm_parameter.active_color",
+        "aws_lb_target_group.udp[0].arn",
+        "aws_lb_target_group.udp[0]",
+        "aws_lb_target_group.udp",
+        "aws_lb_target_group.udp_green[0].arn",
+        "aws_lb_target_group.udp_green[0]",
+        "aws_lb_target_group.udp_green",
+    }
+)
 EXPECTED_SANDBOX_INTERNAL_UDP_TG_NAME = "layerv-nhp-sandbox-srv-int-udp"
 EXPECTED_SANDBOX_INTERNAL_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-srv-int-grn"
 EXPECTED_SANDBOX_RELAY_SUBNET_CIDRS = {
@@ -529,6 +545,7 @@ def validate_udp_source_fence_transition(
     listener_after_unknown = (
         side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after_unknown") or {}
     )
+    listener_target_group_arns: list[str] = []
     for values, label in (
         (listener_before, "legacy before-state"),
         (listener_after, "fenced after-state"),
@@ -549,9 +566,28 @@ def validate_udp_source_fence_transition(
         )
         require(
             isinstance(target_group_arn, str)
-            and f"/{EXPECTED_SANDBOX_SERVER_UDP_TG_NAME}/" in target_group_arn,
-            f"UDP source-fence listener {label} must retain the canonical public UDP target group",
+            and any(
+                target_group_arn.startswith(
+                    f"arn:aws:elasticloadbalancing:{EXPECTED_SANDBOX_REGION}:"
+                    f"{EXPECTED_SANDBOX_ACCOUNT_ID}:targetgroup/"
+                    f"{target_group_name}/"
+                )
+                and bool(target_group_arn.rsplit("/", 1)[-1])
+                for target_group_name in (
+                    EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+                    EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+                )
+            ),
+            f"UDP source-fence listener {label} must retain a canonical blue or green public UDP target group",
         )
+        if isinstance(target_group_arn, str):
+            listener_target_group_arns.append(target_group_arn)
+    require(
+        len(listener_target_group_arns) == 2
+        and len(set(listener_target_group_arns)) == 1,
+        "UDP source-fence listener replacement must preserve the exact active "
+        "public UDP target group",
+    )
     legacy_listener_nlb_arn = (listener_before or {}).get("load_balancer_arn")
     require(
         isinstance(legacy_listener_nlb_arn, str)
@@ -3758,16 +3794,28 @@ def validate_plan(
     public_listener_config = config_resource(
         v, compute_config, "aws_lb_listener", "udp"
     )
+    public_listener_target_refs = expression_refs(
+        public_listener_config, "default_action"
+    )
+    public_listener_has_legacy_target = references_exact_resources(
+        public_listener_target_refs,
+        {"aws_lb_target_group.udp"},
+    )
+    public_listener_has_managed_active_target = (
+        public_listener_target_refs == EXPECTED_PUBLIC_UDP_MANAGED_TARGET_REFS
+    )
     v.require(
         references_exact_resources(
             expression_refs(public_listener_config, "load_balancer_arn"),
             {"aws_lb.server"},
         )
-        and references_exact_resources(
-            expression_refs(public_listener_config, "default_action"),
-            {"aws_lb_target_group.udp"},
+        and (
+            (public_listener_has_legacy_target and not source_fenced_topology)
+            or public_listener_has_managed_active_target
         ),
-        "assigned-cell public UDP listener must forward only aws_lb.server to aws_lb_target_group.udp",
+        "assigned-cell public UDP listener must forward through aws_lb.server "
+        "and use either the canonical blue target or the exact managed "
+        "active-color blue/green selector",
     )
     public_attachment = v.one(
         resources_named(compute, "aws_autoscaling_attachment", "server"),
