@@ -871,15 +871,17 @@ resource "aws_vpc_security_group_egress_rule" "server_all" {
 
 # User Data script - using templatefile for proper interpolation
 locals {
+  protocol_environment = coalesce(var.protocol_environment, var.environment)
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    secret_arn          = aws_secretsmanager_secret.server.arn
-    region              = data.aws_region.current.id
-    account_id          = data.aws_caller_identity.current.account_id
-    cloudmap_service_id = aws_service_discovery_service.server.id
-    server_repo_url     = var.server_repo_url
-    environment         = var.environment
-    cell_id             = var.cell_id
-    multi_tenant        = var.multi_tenant
+    secret_arn           = aws_secretsmanager_secret.server.arn
+    region               = data.aws_region.current.id
+    account_id           = data.aws_caller_identity.current.account_id
+    cloudmap_service_id  = aws_service_discovery_service.server.id
+    server_repo_url      = var.server_repo_url
+    environment          = var.environment
+    protocol_environment = local.protocol_environment
+    cell_id              = var.cell_id
+    multi_tenant         = var.multi_tenant
     # Non-root container service account (#1090) — same numerics in --user and useradd.
     nhp_server_uid      = local.nhp_server_uid
     nhp_server_gid      = local.nhp_server_gid

@@ -6,10 +6,11 @@
 # knob change is a tfvars edit, not a code edit.
 
 # --- Cell identity (MUST stay distinct from cell0) ---------------------------
-environment    = "sandbox-cell1" # drives name_prefix (layerv-nhp-sandbox-cell1) AND /sandbox-cell1/nhp/server/* SSM paths
-cell_id        = "cell1"
-aws_region     = "us-east-2"
-aws_account_id = "767397897469" # sandbox account, shared with cell0
+environment          = "sandbox-cell1" # infrastructure namespace: names and /sandbox-cell1/... SSM paths
+protocol_environment = "sandbox"       # ticket/Authority environment shared with cell0
+cell_id              = "cell1"
+aws_region           = "us-east-2"
+aws_account_id       = "767397897469" # sandbox account, shared with cell0
 
 # --- Network isolation -------------------------------------------------------
 # cell0 VPC        = 10.100.0.0/16

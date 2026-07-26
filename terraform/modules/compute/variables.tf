@@ -1,6 +1,17 @@
 variable "environment" {
-  description = "Environment name"
+  description = "Infrastructure namespace used for resource names, tags, logs, and SSM paths."
   type        = string
+}
+
+variable "protocol_environment" {
+  description = "Logical NHP/Authority environment placed in NHP_ENVIRONMENT. null inherits environment; a secondary sandbox cell sets sandbox while retaining a distinct infrastructure namespace."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.protocol_environment == null || contains(["sandbox", "prod"], var.protocol_environment)
+    error_message = "protocol_environment must be null, sandbox, or prod."
+  }
 }
 
 # =============================================================================

@@ -3,13 +3,10 @@
 
 variable "environment" {
   description = <<-EOT
-    Environment identifier for this cell. MUST be distinct from cell0's
-    "sandbox" because modules/compute keys BOTH its resource name_prefix
-    (layerv-nhp-$${environment}) AND all its SSM parameter paths
-    (/$${environment}/nhp/server/...) on this value. Using "sandbox-cell1"
-    is what guarantees cell1's ASG/NLB/target-groups/security-group/secrets
-    and its /sandbox-cell1/nhp/server/udp-listener-arn do not collide with
-    cell0's layerv-nhp-sandbox-* / /sandbox/nhp/server/* resources.
+    Infrastructure namespace for this cell. It MUST remain distinct from
+    cell0's "sandbox" so resource names and /sandbox-cell1/... SSM paths do not
+    collide. It is deliberately not the NHP/Authority protocol environment;
+    protocol_environment below supplies that separate identity.
   EOT
   type        = string
   default     = "sandbox-cell1"
@@ -17,6 +14,17 @@ variable "environment" {
   validation {
     condition     = var.environment != "sandbox" && var.environment != "prod"
     error_message = "environment must be distinct from cell0 (\"sandbox\") and prod to avoid name/SSM collisions."
+  }
+}
+
+variable "protocol_environment" {
+  description = "Logical NHP/Authority environment. Both sandbox cells use sandbox; cell identity is carried independently as cell1."
+  type        = string
+  default     = "sandbox"
+
+  validation {
+    condition     = var.protocol_environment == "sandbox"
+    error_message = "sandbox cell1 must use logical protocol environment sandbox."
   }
 }
 

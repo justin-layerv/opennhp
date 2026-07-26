@@ -1617,6 +1617,18 @@ jobs:
         working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
 
+      - name: Terraform cell1 init (no backend)
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/environments/sandbox-cell1
+        run: |
+          export TF_PLUGIN_CACHE_DIR="${HOME}/.terraform.d/plugin-cache"
+          terraform init -backend=false
+
+      - name: Terraform cell1 validate
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/environments/sandbox-cell1
+        run: terraform validate
+
       - name: Terraform Control Init (no backend)
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/control/environments/${{ matrix.environment }}

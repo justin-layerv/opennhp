@@ -975,7 +975,7 @@ CF_CIDRS=$(aws ssm get-parameter \
 cat > /opt/layerv/nhp-server/etc/env << ENVEOF
 NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
-NHP_ENVIRONMENT=${environment}
+NHP_ENVIRONMENT=${protocol_environment}
 NHP_CELL_ID=${cell_id}
 # Instance identity and stderr log target for the docker awslogs driver.
 # The docker --log-driver=awslogs flags in the systemd unit (below)
@@ -1441,7 +1441,7 @@ After=network-online.target amazon-cloudwatch-agent.service
 
 [Service]
 Type=oneshot
-Environment=NHP_ENVIRONMENT=${environment}
+Environment=NHP_ENVIRONMENT=${protocol_environment}
 Environment=NHP_CELL_ID=${cell_id}
 Environment=INSTANCE_ID=$INSTANCE_ID
 Environment=NHP_GLOBAL_RATE_LIMIT_ENABLED=${knock_global_rate_limit_pps > 0}
