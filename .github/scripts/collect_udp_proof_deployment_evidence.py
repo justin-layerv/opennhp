@@ -712,7 +712,17 @@ def _validate_canary_provenance(
         raise EvidenceError("Connector canary must be linux/amd64")
     contract._timestamp(build["date"], "canary build date")
     contract._sha256(build["source_sha256"], "canary source sha256")
-    contract._digest(build["source_artifact_digest"], "canary source artifact digest")
+    # Bare lowercase SHA-256, not an OCI "sha256:"-prefixed descriptor. This is
+    # the content hash of the canary's source artifact archive, exactly like its
+    # sibling source_sha256 and definition_sha256 in the same build block; the
+    # OCI form belongs to image and layer descriptors. The canary has always
+    # emitted the bare form -- verified against the published provenance of runs
+    # 29994779471 (2026-07-23) and 30216718538 (2026-07-26) -- so _digest here
+    # could never have matched a real canary, and this step had simply never
+    # been reached before.
+    contract._sha256(
+        build["source_artifact_digest"], "canary source artifact digest"
+    )
     contract._sha256(build["definition_sha256"], "canary definition sha256")
 
     modules = _exact(

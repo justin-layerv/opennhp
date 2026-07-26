@@ -1349,5 +1349,44 @@ class InstanceRefreshConvergenceTest(unittest.TestCase):
         self.assertNotEqual(len(group["Instances"]), len(in_service))
 
 
+class CanarySourceArtifactDigestTest(unittest.TestCase):
+    """The canary build block carries bare SHA-256s, not OCI descriptors.
+
+    source_artifact_digest hashes the canary's source archive, exactly like its
+    siblings source_sha256 and definition_sha256. Validating it as an OCI
+    "sha256:"-prefixed digest could never match a real canary; the values below
+    are the ones actually published by qurl-connector runs 29994779471
+    (2026-07-23) and 30216718538 (2026-07-26).
+    """
+
+    PUBLISHED = (
+        "507cf7986dea7dd111f80272576d1152a941b613dee6945d6ed3334feb9d8033",
+        "ebd9a95d3a38801dbeae83ae6b1842b0e0d5253e0bed7b95440751f408180225",
+    )
+
+    def test_real_published_digests_are_accepted(self) -> None:
+        for value in self.PUBLISHED:
+            with self.subTest(digest=value):
+                self.assertEqual(
+                    contract._sha256(value, "canary source artifact digest"), value
+                )
+
+    def test_oci_prefixed_form_is_rejected(self) -> None:
+        # Guards the reverse regression: re-tightening this to the OCI form
+        # would silently break every real canary again.
+        for value in self.PUBLISHED:
+            with self.subTest(digest=value):
+                with self.assertRaises(contract.ContractError):
+                    contract._sha256(
+                        f"sha256:{value}", "canary source artifact digest"
+                    )
+
+    def test_malformed_digests_still_fail_closed(self) -> None:
+        for value in ("", "not-a-hash", "A" * 64, "0" * 63, "0" * 65, None, 5):
+            with self.subTest(digest=value):
+                with self.assertRaises(contract.ContractError):
+                    contract._sha256(value, "canary source artifact digest")
+
+
 if __name__ == "__main__":
     unittest.main()
