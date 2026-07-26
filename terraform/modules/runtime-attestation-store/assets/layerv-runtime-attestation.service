@@ -1,0 +1,31 @@
+[Unit]
+Description=Publish this node's canonical LayerV runtime attestation
+Documentation=https://github.com/layervai/nhp/tree/main/terraform/modules/runtime-attestation-store
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Written by layerv-nhp-sandbox-runtime-attestation-repair. The unit bytes stay
+# identical on every node so their SHA-256 is one reviewable in-repo constant;
+# only the store's identity varies, and it carries no integrity weight (the
+# producer reads exactly one canonical bucket).
+EnvironmentFile=/etc/layerv/runtime-attestation.env
+ExecStart=/usr/bin/python3 /usr/local/bin/layerv-collect-runtime-attestation.py
+TimeoutStartSec=180
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictSUIDSGID=yes
+# The collector reads only /proc, the pinned unit/collector bytes, the qRTS
+# boot capture, and the Docker socket; it writes nothing to disk outside /tmp.
+ReadOnlyPaths=/var/lib/layerv/runtime-attestation
+
+[Install]
+WantedBy=multi-user.target

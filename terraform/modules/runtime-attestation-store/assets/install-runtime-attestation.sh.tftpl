@@ -1,0 +1,76 @@
+# Installed and re-verified only by ${repair_document_name}.
+#
+# Strict POSIX sh, no bashisms: SSM's aws:runShellScript hands this body to
+# /bin/sh, which is dash on Ubuntu — `pipefail`, `local`, and RETURN traps are
+# all unavailable there and would fail open if assumed.
+#
+# Every byte below is pinned. The collector and both systemd units are written
+# only from payloads whose SHA-256 equals the digest published in the canonical
+# collector contract, and this script refuses to install anything else.
+set -eu
+umask 022
+
+install -d -m 0755 -o root -g root /etc/layerv
+install -d -m 0755 -o root -g root /var/lib/layerv/runtime-attestation
+
+install_pinned_file() {
+  pinned_target="$1"
+  pinned_mode="$2"
+  pinned_expected="$3"
+  pinned_payload="$4"
+  pinned_staged="$(mktemp)"
+  printf '%s' "$pinned_payload" | base64 -d >"$pinned_staged"
+  # sha256sum is not the rightmost command, so a failure surfaces as an empty
+  # digest — which can only mismatch, never match. Fail-closed either way.
+  pinned_actual="$(sha256sum "$pinned_staged" | cut -d' ' -f1)"
+  if [ "$pinned_actual" != "$pinned_expected" ]; then
+    rm -f "$pinned_staged"
+    echo "refusing to install $pinned_target: expected $pinned_expected, got $pinned_actual" >&2
+    return 1
+  fi
+  install -m "$pinned_mode" -o root -g root "$pinned_staged" "$pinned_target"
+  rm -f "$pinned_staged"
+}
+
+install_pinned_file \
+  /usr/local/bin/layerv-collect-runtime-attestation.py \
+  0755 \
+  ${collector_sha256} \
+  '${collector_b64}'
+
+install_pinned_file \
+  /etc/systemd/system/layerv-runtime-attestation.service \
+  0644 \
+  ${service_unit_sha256} \
+  '${service_unit_b64}'
+
+install_pinned_file \
+  /etc/systemd/system/layerv-runtime-attestation.timer \
+  0644 \
+  ${timer_unit_sha256} \
+  '${timer_unit_b64}'
+
+# Store identity only. It carries no integrity weight: the producer reads
+# exactly one canonical bucket, so pointing a node elsewhere makes its evidence
+# missing, never forged.
+staged_env="$(mktemp)"
+cat >"$staged_env" <<'LAYERV_ENV'
+LAYERV_ATTESTATION_BUCKET=${bucket_name}
+LAYERV_ATTESTATION_KMS_KEY_ARN=${kms_key_arn}
+LAYERV_ATTESTATION_REPAIR_DOCUMENT=${repair_document_name}
+LAYERV_ENV
+install -m 0640 -o root -g root "$staged_env" /etc/layerv/runtime-attestation.env
+rm -f "$staged_env"
+
+systemctl daemon-reload
+systemctl enable --now layerv-runtime-attestation.timer
+systemctl is-enabled --quiet layerv-runtime-attestation.timer
+systemctl is-active --quiet layerv-runtime-attestation.timer
+
+# One best-effort publication so a newly discovered node has evidence without
+# waiting for the next tick. Deliberately non-fatal: the timer is the freshness
+# clock and the producer independently rejects any object older than ten
+# minutes, so a failure here can only withhold evidence, never fabricate it.
+systemctl start --no-block layerv-runtime-attestation.service || true
+
+echo "runtime-attestation collector verified and active"

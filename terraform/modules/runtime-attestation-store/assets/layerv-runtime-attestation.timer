@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish this node's canonical LayerV runtime attestation every five minutes
+Documentation=https://github.com/layervai/nhp/tree/main/terraform/modules/runtime-attestation-store
+
+[Timer]
+# The deployment-manifest producer rejects any object older than ten minutes,
+# so this timer — not State Manager's 30-minute repair association — is the
+# freshness clock. Two publications must fit inside the producer's window.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+Unit=layerv-runtime-attestation.service
+
+[Install]
+WantedBy=timers.target

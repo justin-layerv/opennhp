@@ -675,10 +675,22 @@ def require_alarm_registry(
 #   proof. It instantiates no compute/AC/relay/security and no `module "nhp"`;
 #   the servers it exercises (cell0/cell1) + their alarms live in roots this lint
 #   already checks. Removing the runner root should drop this entry too.
+#
+#   sandbox-runtime-attestation: a sandbox-only root composing
+#   modules/runtime-attestation-store — the immutable per-node runtime evidence
+#   channel (one KMS-encrypted, versioned, public-blocked S3 bucket, its
+#   self-binding policy, the canonical collector + pinned State Manager repair
+#   document, and the two public SSM parameters the UDP-proof manifest producer
+#   reads). It instantiates no compute/AC/relay/security and no `module "nhp"`;
+#   the fleets it attests (cell0/cell1/qRTS) + their alarms live in roots this
+#   lint already checks, and a failure here surfaces as the producer failing
+#   closed, not as an unalarmed data plane. Removing the store root should drop
+#   this entry too.
 OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS: frozenset[str] = frozenset(
     {
         "sandbox-cell1",
         "sandbox-hub-dns",
+        "sandbox-runtime-attestation",
         "sandbox-udp-proof-runner",
     }
 )
