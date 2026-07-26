@@ -255,6 +255,33 @@ jobs:
               exit 1
             }
 
+      # NHP-side per-scenario evidence for the orchestrator-owned rows of
+      # qurl-go's pre-retirement inventory. It reads the *deployed* source
+      # revisions the manifest just pinned -- never this checkout -- using the
+      # evidence App's existing contents:read grant, so it needs no AWS call and
+      # no new IAM permission. It rides in this artifact so one authenticated
+      # artifact id and digest covers it and the deployment triplet together.
+      - name: Observe the orchestrator-owned scenario evidence
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/collect_udp_proof_orchestrator_evidence.py \
+            --snapshot evidence/snapshot.json \
+            --output artifact/orchestrator-evidence.json \
+            --proof-phase "${PROOF_PHASE}" \
+            --producer-run-id "${GITHUB_RUN_ID}" \
+            --producer-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --producer-head-sha "${GITHUB_SHA}"
+          count="$(find artifact -mindepth 1 -maxdepth 1 -type f -print | wc -l)"
+          nonfiles="$(find artifact -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          [[ "${count}" = "4" && -z "${nonfiles}" ]] ||
+            {
+              echo "::error::Artifact output is not exactly four regular files."
+              exit 1
+            }
+
       - name: Upload the immutable deployment manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

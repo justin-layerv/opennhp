@@ -90,6 +90,33 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         self.assertIn("commit.verification.verified == true", self.raw)
         self.assertIn('python-version: "3.12"', self.raw)
 
+    def test_orchestrator_evidence_is_observed_into_the_same_artifact(self) -> None:
+        steps = self.workflow["jobs"]["produce"]["steps"]
+        names = [step.get("name") for step in steps]
+        render = names.index("Render exactly three canonical proof inputs")
+        observe = names.index("Observe the orchestrator-owned scenario evidence")
+        upload = next(
+            index
+            for index, step in enumerate(steps)
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        # The fourth file must land in the same artifact directory, after the
+        # triplet exists and before the single upload.
+        self.assertLess(render, observe)
+        self.assertLess(observe, upload)
+        step = steps[observe]
+        self.assertEqual(
+            set(step["env"]), {"GH_TOKEN", "PROOF_PHASE"}
+        )
+        self.assertIn(
+            "collect_udp_proof_orchestrator_evidence.py", step["run"]
+        )
+        self.assertIn("--output artifact/orchestrator-evidence.json", step["run"])
+        # The producer reads only the deployed revisions, so it needs no AWS
+        # credential and must not acquire one.
+        self.assertNotIn("aws ", step["run"])
+        self.assertIn('[[ "${count}" = "4" && -z "${nonfiles}" ]]', self.raw)
+
     def test_artifact_is_one_exact_three_file_handoff(self) -> None:
         steps = self.workflow["jobs"]["produce"]["steps"]
         uploads = [

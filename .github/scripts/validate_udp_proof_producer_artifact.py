@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import udp_proof_deployment_contract as deployment
+import udp_proof_orchestrator_contract as orchestrator
 import validate_udp_proof_controller_inputs as controller
 
 
@@ -204,6 +205,7 @@ def validate_files(
 
     run_id = _positive_int_string(producer_run_id, "producer run ID")
     run_attempt = _positive_int_string(producer_run_attempt, "producer run attempt")
+    now = validation_time or datetime.now(timezone.utc)
     try:
         manifest, runtime, provenance = deployment.load_triplet_directory(directory)
         manifest_raw, runtime_raw, _ = deployment.validate_triplet(
@@ -214,7 +216,22 @@ def validate_files(
             producer_run_id=run_id,
             producer_run_attempt=run_attempt,
             producer_head_sha=producer_head_sha,
-            validation_time=validation_time or datetime.now(timezone.utc),
+            validation_time=now,
+        )
+        # The orchestrator evidence rides in the same artifact, so validating it
+        # here binds NHP's per-scenario rows to this exact deployment
+        # observation before any client dispatch input is derived.
+        orchestrator_raw = deployment.load_orchestrator_file(directory)
+        orchestrator.validate_orchestrator_bytes(
+            orchestrator_raw,
+            manifest=manifest,
+            manifest_bytes=manifest_raw,
+            runtime_bytes=runtime_raw,
+            proof_phase=proof_phase,
+            producer_run_id=run_id,
+            producer_run_attempt=run_attempt,
+            producer_head_sha=producer_head_sha,
+            validation_time=now,
         )
     except deployment.ContractError as exc:
         raise ArtifactValidationError(str(exc)) from exc
@@ -241,6 +258,9 @@ def validate_files(
             "deployment_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
             "deployment_runtime_inputs_sha256": hashlib.sha256(
                 runtime_raw
+            ).hexdigest(),
+            "orchestrator_evidence_sha256": hashlib.sha256(
+                orchestrator_raw
             ).hexdigest(),
         }
     )

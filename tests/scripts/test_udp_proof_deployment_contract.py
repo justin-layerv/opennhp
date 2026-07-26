@@ -903,6 +903,12 @@ class ProducerTest(unittest.TestCase):
             self.assertEqual(
                 {path.name for path in output.iterdir()}, producer.OUTPUT_FILES
             )
+            # The renderer owns exactly the deployment triplet; the orchestrator
+            # evidence file is added by its own collector before upload, so the
+            # loader is only exercised once the artifact is complete.
+            with self.assertRaises(contract.ContractError):
+                contract.load_triplet_directory(output)
+            (output / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(b"{}")
             loaded_manifest, loaded_runtime, loaded_provenance = (
                 contract.load_triplet_directory(output)
             )

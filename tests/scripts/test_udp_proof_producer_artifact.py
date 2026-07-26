@@ -21,7 +21,9 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(TESTS))
 
 import test_udp_proof_deployment_contract as producer_fixture  # noqa: E402
+import test_udp_proof_orchestrator_contract as orchestrator_fixture  # noqa: E402
 import udp_proof_deployment_contract as contract  # noqa: E402
+import udp_proof_orchestrator_contract as orchestrator  # noqa: E402
 
 
 VALIDATOR_PATH = SCRIPTS / "validate_udp_proof_producer_artifact.py"
@@ -115,7 +117,17 @@ def write_valid_triplet(directory: Path) -> dict[str, object]:
         ("deployment-provenance.json", provenance_raw),
     ):
         (directory / name).write_bytes(raw)
+    write_orchestrator_evidence(directory)
     return snapshot
+
+
+def write_orchestrator_evidence(directory: Path) -> None:
+    """Add the fourth canonical file the producer artifact must now carry."""
+
+    document, _, _, _ = orchestrator_fixture.build_document()
+    (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(
+        orchestrator.canonical_bytes(document)
+    )
 
 
 def rewrite_snapshot(directory: Path, snapshot: dict[str, object]) -> None:
@@ -391,6 +403,36 @@ class FilesTest(unittest.TestCase):
                     directory,
                     validation_time=datetime(2026, 7, 25, 12, 20, tzinfo=timezone.utc),
                 )
+
+    def test_requires_valid_orchestrator_evidence_in_the_same_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_valid_triplet(directory)
+            outputs = self.validate(directory)
+            self.assertEqual(
+                outputs["orchestrator_evidence_sha256"],
+                hashlib.sha256(
+                    (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).read_bytes()
+                ).hexdigest(),
+            )
+        # Missing entirely.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_valid_triplet(directory)
+            (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).unlink()
+            with self.assertRaises(validator.ArtifactValidationError):
+                self.validate(directory)
+        # Present but bound to a different deployment observation.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_valid_triplet(directory)
+            document, _, _, _ = orchestrator_fixture.build_document()
+            document["bindings"]["deployment_manifest_sha256"] = "0" * 64
+            (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(
+                orchestrator.canonical_bytes(document)
+            )
+            with self.assertRaises(validator.ArtifactValidationError):
+                self.validate(directory)
 
     def test_rejects_phase_or_authenticated_producer_mismatch(self) -> None:
         for overrides in (

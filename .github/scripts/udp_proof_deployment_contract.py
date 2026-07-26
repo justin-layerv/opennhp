@@ -40,10 +40,22 @@ MAX_CLOCK_SKEW = timedelta(seconds=30)
 MAX_PROVENANCE_AGE = timedelta(minutes=10)
 MAX_ATTESTATION_AGE = timedelta(minutes=10)
 MAX_REPAIR_AGE = timedelta(minutes=40)
+MAX_ORCHESTRATOR_EVIDENCE_BYTES = 64 * 1024
 ARTIFACT_FILE_LIMITS = {
     "deployment-manifest.json": MAX_MANIFEST_BYTES,
     "deployment-runtime-inputs.json": MAX_RUNTIME_BYTES,
     "deployment-provenance.json": MAX_PROVENANCE_BYTES,
+}
+# The orchestrator evidence file rides in the same immutable producer artifact
+# as the triplet, so one authenticated artifact id and digest covers all four
+# files and the NHP-side scenario evidence cannot be paired with a different
+# deployment observation.  Its schema lives in `udp_proof_orchestrator_contract`,
+# which imports this module; keeping only the name and byte bound here avoids a
+# circular import.
+ORCHESTRATOR_EVIDENCE_FILE = "orchestrator-evidence.json"
+ARTIFACT_FILES = {
+    **ARTIFACT_FILE_LIMITS,
+    ORCHESTRATOR_EVIDENCE_FILE: MAX_ORCHESTRATOR_EVIDENCE_BYTES,
 }
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -229,9 +241,7 @@ def load_canonical_file(path: Path, *, maximum: int, name: str) -> dict[str, Any
     return parse_canonical_bytes(raw, maximum=maximum, name=name)
 
 
-def load_triplet_directory(path: Path) -> tuple[dict[str, Any], ...]:
-    """Load only the exact three regular canonical files from an artifact."""
-
+def _require_artifact_directory(path: Path) -> None:
     try:
         metadata = path.lstat()
         entries = {entry.name for entry in path.iterdir()}
@@ -240,15 +250,46 @@ def load_triplet_directory(path: Path) -> tuple[dict[str, Any], ...]:
     if (
         path.is_symlink()
         or not stat.S_ISDIR(metadata.st_mode)
-        or entries != set(ARTIFACT_FILE_LIMITS)
+        or entries != set(ARTIFACT_FILES)
     ):
         raise ContractError(
-            "deployment artifact must contain exactly the three canonical files"
+            "deployment artifact must contain exactly the four canonical files"
         )
+
+
+def load_triplet_directory(path: Path) -> tuple[dict[str, Any], ...]:
+    """Load only the exact three canonical deployment files from an artifact.
+
+    The directory must hold exactly the four canonical files; this loader
+    returns the deployment triplet, and `load_orchestrator_file` returns the
+    fourth so its own contract module can validate it.
+    """
+
+    _require_artifact_directory(path)
     return tuple(
         load_canonical_file(path / name, maximum=maximum, name=name)
         for name, maximum in ARTIFACT_FILE_LIMITS.items()
     )
+
+
+def load_orchestrator_file(path: Path) -> bytes:
+    """Return the exact canonical bytes of the artifact's orchestrator file."""
+
+    _require_artifact_directory(path)
+    target = path / ORCHESTRATOR_EVIDENCE_FILE
+    try:
+        metadata = target.lstat()
+        if target.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise ContractError(f"{ORCHESTRATOR_EVIDENCE_FILE} must be a regular file")
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"cannot read {ORCHESTRATOR_EVIDENCE_FILE}") from exc
+    if not raw or len(raw) > MAX_ORCHESTRATOR_EVIDENCE_BYTES:
+        raise ContractError(
+            f"{ORCHESTRATOR_EVIDENCE_FILE} must contain "
+            f"1..{MAX_ORCHESTRATOR_EVIDENCE_BYTES} canonical JSON bytes"
+        )
+    return raw
 
 
 def _exact(value: Any, keys: set[str], name: str) -> dict[str, Any]:
