@@ -3940,11 +3940,12 @@ class PlanContractTests(unittest.TestCase):
                 self.assert_rejected(candidate)
 
         alternate_target = authority_image_update_fixture()
+        # Derive the alternate digest from the pinned URI itself. Hardcoding the
+        # reviewed digest here turned this into a silent no-op assertion the
+        # moment the pin advanced.
         self.change(alternate_target, function_address)["after"]["image_uri"] = (
-            CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI.replace(
-                "97d3822c1ebaa2304ec4189eca45264245c6c2d87a70f9122ff742b66a085d00",
-                "f" * 64,
-            )
+            f"{CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit('@', 1)[0]}@sha256:"
+            + "f" * 64
         )
         self.assert_rejected(alternate_target)
 
