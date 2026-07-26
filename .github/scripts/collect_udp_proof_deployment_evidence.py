@@ -753,7 +753,11 @@ def _validate_canary_provenance(
         raise EvidenceError("canary FRP module contract drift")
     frp_sha = contract._sha(frp["sha"], "canary FRP SHA")
     contract._sha256(frp["archive_sha256"], "canary FRP archive sha256")
-    contract._digest(frp["artifact_digest"], "canary FRP artifact digest")
+    # Bare lowercase SHA-256, matching build.source_artifact_digest. Across the
+    # canary's whole evidence document exactly one value is an OCI descriptor --
+    # image.digest, validated with _digest below. Every other hash, including
+    # both *_artifact_digest fields, is a plain content hash of an archive.
+    contract._sha256(frp["artifact_digest"], "canary FRP artifact digest")
     qurl_go = _exact(
         modules["qurl_go"],
         {"version", "sha", "sum", "go_mod_sum", "replaced"},

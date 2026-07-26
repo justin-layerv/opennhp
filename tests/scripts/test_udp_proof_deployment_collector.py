@@ -1349,6 +1349,47 @@ class InstanceRefreshConvergenceTest(unittest.TestCase):
         self.assertNotEqual(len(group["Instances"]), len(in_service))
 
 
+class CanaryEvidenceHashFormsTest(unittest.TestCase):
+    """Exactly one value in the canary evidence document is an OCI descriptor.
+
+    Observed across the real published evidence of qurl-connector runs
+    29994779471 and 30216718538: image.digest carries the "sha256:" prefix and
+    every other hash -- including BOTH *_artifact_digest fields -- is a bare
+    content hash of an archive. Validating a bare field as an OCI digest
+    rejects every genuine canary, which is how the FRP and source artifact
+    fields each blocked the producer in turn.
+    """
+
+    BARE_FIELDS = (
+        "build.definition_sha256",
+        "build.source_artifact_digest",
+        "build.source_sha256",
+        "connector_modules.frp.archive_sha256",
+        "connector_modules.frp.artifact_digest",
+        "image.archive_sha256",
+        "image.buildkit_metadata_sha256",
+        "image.go_version_m_sha256",
+        "image.version_output_sha256",
+    )
+    OCI_FIELDS = ("image.digest",)
+    SAMPLE = "ebd9a95d3a38801dbeae83ae6b1842b0e0d5253e0bed7b95440751f408180225"
+
+    def test_bare_fields_accept_bare_and_reject_prefixed(self) -> None:
+        for field in self.BARE_FIELDS:
+            with self.subTest(field=field):
+                self.assertEqual(contract._sha256(self.SAMPLE, field), self.SAMPLE)
+                with self.assertRaises(contract.ContractError):
+                    contract._sha256(f"sha256:{self.SAMPLE}", field)
+
+    def test_oci_field_accepts_prefixed_and_rejects_bare(self) -> None:
+        for field in self.OCI_FIELDS:
+            with self.subTest(field=field):
+                value = f"sha256:{self.SAMPLE}"
+                self.assertEqual(contract._digest(value, field), value)
+                with self.assertRaises(contract.ContractError):
+                    contract._digest(self.SAMPLE, field)
+
+
 class CanarySourceArtifactDigestTest(unittest.TestCase):
     """The canary build block carries bare SHA-256s, not OCI descriptors.
 
