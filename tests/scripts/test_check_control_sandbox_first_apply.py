@@ -1686,6 +1686,47 @@ def with_legacy_authority_digest_roll(candidate: dict) -> dict:
     return result
 
 
+def legacy_expansion_evidence_slots(candidate: dict) -> list[dict]:
+    """Every basis-evidence object in the expansion's live predecessor.
+
+    The predecessor binds its basis in four independent places -- the global
+    contract, the provisioned-cell catalog, and each retained Hub function -- so
+    a test can advance them together or leave a subset behind to prove a mixed
+    predecessor is still rejected.
+    """
+    foundation = next(
+        item["change"]
+        for item in candidate["resource_changes"]
+        if item["address"] == "module.control.terraform_data.foundation_contract"
+    )
+    slots = []
+    for projection in ("input", "output"):
+        contract = foundation["before"][projection]["authority_runtime_contract"]
+        slots.append(contract["global"]["basis_evidence"])
+        slots.append(contract["provisioned_cells_evidence"])
+        slots.extend(
+            contract["functions"][function_name]["basis_evidence"]
+            for function_name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS
+        )
+    return slots
+
+
+def with_legacy_predecessor_at_image_update_basis(candidate: dict) -> dict:
+    """Model the reviewed image update having ALREADY applied its contract.
+
+    The observed sandbox state: the admitted ``authority-image-update`` apply
+    converged the foundation contract and every Hub function's $LATEST, then
+    failed on ``lambda:PublishVersion``. The live predecessor the expansion now
+    plans from therefore sits at that transition's reviewed TO basis, not at its
+    FROM basis.
+    """
+    result = copy.deepcopy(candidate)
+    for evidence in legacy_expansion_evidence_slots(result):
+        evidence["sha256"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+        evidence["source_commit"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+    return result
+
+
 def authority_runtime_steady_fixture() -> dict:
     """Runtime inventory, every change a no-op: the steady post-slice state."""
     result = authority_runtime_transition_fixture()
@@ -4707,6 +4748,128 @@ class PlanContractTests(unittest.TestCase):
         foundation["before"]["input"]["authority_runtime_contract"]["global"][
             "basis_evidence"
         ]["sha256"] = "f" * 64
+        self.assert_rejected(candidate)
+
+    def test_legacy_expansion_predecessor_bases_are_exactly_two_reviewed(
+        self,
+    ) -> None:
+        """Pin the admitted predecessor set to the image transition's endpoints.
+
+        The live legacy Hub predecessor is either the basis the expansion was
+        reviewed against or -- once the reviewed image update applied its
+        contract -- that transition's own after-basis. Enumerating a third entry
+        would admit a predecessor no reviewed transition produces.
+        """
+        candidates = CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES
+        self.assertEqual(len(candidates), 2)
+        shared = {
+            "path": "docs/evidence/connector-authority/v1/"
+            "sandbox-measurement-basis.json",
+            "repository": "layervai/nhp",
+            "schema_version": 1,
+        }
+        self.assertEqual(
+            list(candidates),
+            [
+                {
+                    **shared,
+                    "sha256": CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256,
+                    "source_commit": (
+                        CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
+                    ),
+                },
+                {
+                    **shared,
+                    "sha256": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256,
+                    "source_commit": (
+                        CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+                    ),
+                },
+            ],
+        )
+
+    def test_legacy_expansion_accepts_the_applied_image_update_predecessor(
+        self,
+    ) -> None:
+        """The expansion may plan from the already-applied image-update basis.
+
+        The reviewed image update converged the foundation contract and each Hub
+        function's $LATEST before failing on ``lambda:PublishVersion``, so the
+        expansion's live predecessor now carries that transition's TO basis while
+        the pending alias rebind remains in the expansion's update envelope.
+        """
+        candidate = with_legacy_predecessor_at_image_update_basis(
+            authority_runtime_legacy_expansion_fixture()
+        )
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-runtime-legacy-expansion")
+
+    def test_legacy_expansion_rejects_unreviewed_or_mixed_predecessor_bases(
+        self,
+    ) -> None:
+        """Neither endpoint may be forged, blended, or partially applied."""
+        from_sha = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256
+        from_source = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
+        to_sha = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
+        to_source = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+
+        def unreviewed_third_basis(candidate: dict) -> None:
+            for evidence in legacy_expansion_evidence_slots(candidate):
+                evidence["sha256"] = "f" * 64
+                evidence["source_commit"] = "a" * 40
+
+        def blended_sha_and_commit(candidate: dict) -> None:
+            for evidence in legacy_expansion_evidence_slots(candidate):
+                evidence["sha256"] = to_sha
+                evidence["source_commit"] = from_source
+
+        def only_global_advanced(candidate: dict) -> None:
+            for evidence in legacy_expansion_evidence_slots(candidate)[:1]:
+                evidence["sha256"] = to_sha
+                evidence["source_commit"] = to_source
+
+        def catalog_left_behind(candidate: dict) -> None:
+            slots = legacy_expansion_evidence_slots(candidate)
+            for evidence in slots:
+                evidence["sha256"] = to_sha
+                evidence["source_commit"] = to_source
+            for evidence in slots[1::5]:
+                evidence["sha256"] = from_sha
+                evidence["source_commit"] = from_source
+
+        def tampered_repository(candidate: dict) -> None:
+            for evidence in legacy_expansion_evidence_slots(candidate):
+                evidence["sha256"] = to_sha
+                evidence["source_commit"] = to_source
+                evidence["repository"] = "attacker/nhp"
+
+        for mutation in (
+            unreviewed_third_basis,
+            blended_sha_and_commit,
+            only_global_advanced,
+            catalog_left_behind,
+            tampered_repository,
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                candidate = authority_runtime_legacy_expansion_fixture()
+                mutation(candidate)
+                self.assert_rejected(candidate)
+
+    def test_runtime_slice_may_not_absorb_the_provisioned_cell_catalog(
+        self,
+    ) -> None:
+        """The narrowing subtractions must not shrink the global change set.
+
+        Only the legacy expansion composes with the two-row catalog, and only
+        under a plan_mode that names it. Aliasing the candidate set to ``changed``
+        instead of copying it let the catalog rows be subtracted out from under
+        every later transition test, admitting this pair as a bare
+        ``authority-runtime-slice`` -- and, when a subtraction emptied the set
+        entirely, as plan_mode "no-op".
+        """
+        candidate = with_provisioned_cell_catalog_transition(
+            authority_runtime_transition_fixture()
+        )
         self.assert_rejected(candidate)
 
     def test_legacy_hub_runtime_expansion_rejects_caller_catalog_drift(

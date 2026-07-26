@@ -625,6 +625,39 @@ AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256 = (
 AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE = (
     "38c11ec130f7443339581eb42692f3577812f904"
 )
+# The live legacy Hub predecessor sits at ONE of the two reviewed endpoints of
+# the Authority image transition, and at no other basis:
+#   * FROM (d535970977.../388a22f7a) -- the expansion plans before the reviewed
+#     image update applies. This IS AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE.
+#   * TO   (b44ee0ca10.../38c11ec13) -- the reviewed image update ALREADY applied
+#     its foundation contract, so the live predecessor advanced to the exact
+#     basis _check_authority_image_update itself pins as that transition's
+#     after-state. This is the observed sandbox state: the image apply converged
+#     the contract and every function's $LATEST, then failed on
+#     lambda:PublishVersion, leaving the alias rebind pending.
+# Both endpoints are already reviewed, pinned constants in this file, and the
+# sha/commit pair of each is taken from those constants rather than restated, so
+# the endpoints cannot silently drift apart. Enumerating exactly these two keeps
+# the admitted predecessor set closed: a basis that is neither -- including any
+# mixture of the two across the four evidence slots -- still fails, because each
+# candidate is reconstructed and compared whole.
+AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES = tuple(
+    {
+        **AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE,
+        "sha256": sha256,
+        "source_commit": source_commit,
+    }
+    for sha256, source_commit in (
+        (
+            AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256,
+            AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE,
+        ),
+        (
+            AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256,
+            AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE,
+        ),
+    )
+)
 _AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS = frozenset(
     {"last_modified", "qualified_arn", "qualified_invoke_arn", "version"}
 )
@@ -2739,10 +2772,11 @@ def _is_exact_legacy_hub_runtime_expansion(
     """Prove the one-time live three-Hub-function -> two-cell expansion.
 
     The prior sandbox slice is already live. Its contract has exactly the three
-    Hub functions and cell0 caller-capacity/catalog metadata, all bound to the
-    immutable predecessor evidence. Build that exact predecessor from the fully
-    validated after-contract so every unchanged field is compared rather than
-    duplicated here.
+    Hub functions and cell0 caller-capacity/catalog metadata, all bound to one of
+    the two reviewed predecessor bases
+    (AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES). Build that exact
+    predecessor from the fully validated after-contract so every unchanged field
+    is compared rather than duplicated here.
     """
     if not _require_authority_runtime_binding(after_values):
         return False
@@ -2751,12 +2785,11 @@ def _is_exact_legacy_hub_runtime_expansion(
     if not isinstance(before_payload, dict) or not isinstance(after_payload, dict):
         return False
 
-    expected_before = json.loads(json.dumps(after_payload))
-    contract = expected_before.get("authority_runtime_contract")
-    if not isinstance(contract, dict):
+    after_contract = after_payload.get("authority_runtime_contract")
+    if not isinstance(after_contract, dict):
         return False
-    global_contract = contract.get("global")
-    if not isinstance(global_contract, dict):
+    after_global = after_contract.get("global")
+    if not isinstance(after_global, dict):
         return False
     before_contract = before_payload.get("authority_runtime_contract")
     before_global = (
@@ -2769,7 +2802,7 @@ def _is_exact_legacy_hub_runtime_expansion(
         if isinstance(before_global, dict)
         else None
     )
-    repository = global_contract.get("authority_repository_url")
+    repository = after_global.get("authority_repository_url")
     # qurl-service publishes a new immutable exact-main image independently of
     # this one-time infrastructure expansion. If that happens before apply, the
     # live predecessor is still bound to the previous digest while the reviewed
@@ -2786,8 +2819,6 @@ def _is_exact_legacy_hub_runtime_expansion(
     ):
         return False
     before_image_uri = f"{repository}@{before_digest}"
-    expected_before["authority_image_uri"] = before_image_uri
-    global_contract["authority_image_digest"] = before_digest
     for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
         function = by_address.get(
             f'module.control.aws_lambda_function.authority["{function_name}"]'
@@ -2801,32 +2832,41 @@ def _is_exact_legacy_hub_runtime_expansion(
             or function_before.get("image_uri") != before_image_uri
         ):
             return False
-    caller_capacity = global_contract.get("caller_capacity")
-    cell_workers = (
-        caller_capacity.get("cell_workers")
-        if isinstance(caller_capacity, dict)
+    after_caller_capacity = after_global.get("caller_capacity")
+    after_cell_workers = (
+        after_caller_capacity.get("cell_workers")
+        if isinstance(after_caller_capacity, dict)
         else None
     )
-    if not isinstance(cell_workers, dict) or set(cell_workers) != set(
+    if not isinstance(after_cell_workers, dict) or set(after_cell_workers) != set(
         AUTHORITY_CELLS
     ):
         return False
-    global_contract["basis_evidence"] = dict(
-        AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE
-    )
-    cell_workers.pop("cell1")
-    contract["functions"] = {
-        function_name: {
-            **contract["functions"][function_name],
-            "basis_evidence": dict(AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE),
+    # Reconstruct the WHOLE predecessor payload once per reviewed basis and
+    # compare it entire. Nothing is matched field-by-field or by pattern: a
+    # predecessor is admitted only when it is byte-equal to one of the exactly
+    # two enumerated reconstructions, so a third basis -- or the same basis in
+    # only some of the four evidence slots -- still fails closed.
+    for evidence in AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES:
+        expected_before = json.loads(json.dumps(after_payload))
+        contract = expected_before["authority_runtime_contract"]
+        global_contract = contract["global"]
+        expected_before["authority_image_uri"] = before_image_uri
+        global_contract["authority_image_digest"] = before_digest
+        global_contract["basis_evidence"] = dict(evidence)
+        global_contract["caller_capacity"]["cell_workers"].pop("cell1")
+        contract["functions"] = {
+            function_name: {
+                **contract["functions"][function_name],
+                "basis_evidence": dict(evidence),
+            }
+            for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
         }
-        for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
-    }
-    contract["provisioned_cells"].pop("cell1")
-    contract["provisioned_cells_evidence"] = dict(
-        AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE
-    )
-    return before_payload == expected_before
+        contract["provisioned_cells"].pop("cell1")
+        contract["provisioned_cells_evidence"] = dict(evidence)
+        if before_payload == expected_before:
+            return True
+    return False
 
 
 def _is_exact_legacy_authority_sg_replacement(change: dict[str, Any]) -> bool:
@@ -6246,7 +6286,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         hub_identity_updates_pending,
     ) = _hub_identity_transition_pending(actual_non_noop)
     hub_identity_changed = hub_identity_creates_pending | hub_identity_updates_pending
-    legacy_candidate_changed = changed
+    # COPY: the subtractions below narrow the candidate set for the legacy
+    # expansion only. Aliasing ``changed`` here instead would mutate it in place
+    # and silently shrink every later transition test AND the final
+    # ``elif changed:`` rejection guard -- a plan whose whole content was
+    # subtracted away would fall through as plan_mode "no-op", skipping the
+    # create-shape proofs and relaxing the drift gates that key on "no-op".
+    legacy_candidate_changed = set(changed)
     if hub_identity_transition:
         legacy_candidate_changed -= hub_identity_changed
     if provisioned_cell_catalog_full_create:
