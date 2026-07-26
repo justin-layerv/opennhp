@@ -1,20 +1,18 @@
-# NHP UDP-proof controller (Step 10).
+# Attended, dispatch-only controller for one native-UDP client proof.
 #
-# Attended, dispatch-only orchestrator for the two-cell UDP proof — the sole
-# OIDC/AWS controller. Connector first, qurl-go second, under ONE non-canceling
-# concurrency group. Each run: mint an org JIT runner config against the
-# udp-proof-sandbox runner group (reading back its 4 controls first), write the
-# one-use JIT secret, start the serialized broker (which launches one EIP-pinned
-# runner), dispatch the exact client proof workflow with the controller identity,
-# verify the external run, and always stop the broker. See
-# terraform/modules/udp-proof-runner/README.md composition contract (points 7-9).
+# One controller run mints one JIT configuration, launches one EIP-pinned
+# one-job runner, dispatches one exact client candidate, verifies that external
+# run, and always asks the broker to reap the runner. Run Connector first, then
+# start a distinct attended qurl-go controller run with the verified Connector
+# run ID. This preserves the one-secret/one-runner contract and gives each
+# client independent controller provenance.
 #
-# Requires (provisioned by Step 9):
-#   * secrets.UDP_PROOF_JIT_APP_ID / UDP_PROOF_JIT_APP_PRIVATE_KEY — the narrow
-#     JIT GitHub App (org self-hosted-runners write + Actions dispatch/read in
-#     qurl-connector + qurl-go only). Store in the udp-proof-sandbox environment.
-#   * vars.UDP_PROOF_RUNNER_GROUP_ID — the udp-proof-sandbox org runner group id.
-# The App is the ONLY remaining input; everything else is wired.
+# The deployment manifest is an explicit canonical input. This workflow does
+# not derive topology, keys, image digests, or repository SHAs. The gate fails
+# closed on its complete public schema; the controller then binds each candidate
+# branch to the exact manifest commit through runner-group pinning and the
+# external run's head SHA. A reviewed live-manifest producer is a separate
+# prerequisite; operators must not hand-invent its values.
 
 name: UDP proof controller (sandbox, attended)
 
@@ -22,8 +20,42 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type RUN_UDP_PROOF to launch the attended two-client proof.'
+        description: 'Type RUN_UDP_PROOF to launch the attended proof.'
         required: true
+        type: string
+      client:
+        description: Client whose single JIT proof job this run controls
+        required: true
+        type: choice
+        options:
+          - connector
+          - qurl_go
+      proof_phase:
+        description: Exact HTTP-lifecycle retirement phase
+        required: true
+        type: choice
+        options:
+          - pre_removal
+          - post_removal
+      deployment_manifest_b64:
+        description: Base64 of the canonical, non-secret live deployment manifest
+        required: true
+        type: string
+      connector_ref:
+        description: Exact Connector candidate branch (SHA is bound by the manifest)
+        required: true
+        type: string
+      qurl_go_ref:
+        description: Exact qurl-go candidate branch (SHA is bound by the manifest)
+        required: true
+        type: string
+      connector_proof_run_id:
+        description: Required for qurl_go; successful same-phase Connector proof run ID
+        required: false
+        type: string
+      pre_removal_run_id:
+        description: Required for post_removal; selected client's successful pre-removal run ID
+        required: false
         type: string
 
 concurrency:
@@ -40,138 +72,60 @@ env:
   BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
   JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
   JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
-  # Exact SHAs the runner group pins; the read-back fails closed on any drift.
-  CONNECTOR_WORKFLOW: layervai/qurl-connector/.github/workflows/sandbox-smoke.yml@272a940b13b535a3911cb9bc648d3cb417f1de52
-  QURLGO_WORKFLOW: layervai/qurl-go/.github/workflows/native-udp-sandbox.yml@29e22ade0d03eea6cc26981bf2748a51dff214d2
 
 jobs:
   gate:
     runs-on: ubuntu-latest
-    steps:
-      - name: Validate the attended confirmation
-        run: |
-          [ "${{ inputs.confirm }}" = "RUN_UDP_PROOF" ] || { echo "::error::confirmation phrase not exact"; exit 1; }
-
-  # ── Connector first ─────────────────────────────────────────────────────────
-  connector:
-    needs: gate
-    runs-on: ubuntu-latest
-    environment: udp-proof-sandbox
     outputs:
-      client_run_id: ${{ steps.dispatch.outputs.client_run_id }}
+      connector_workflow_identity: ${{ steps.inputs.outputs.connector_workflow_identity }}
+      qurl_go_workflow_identity: ${{ steps.inputs.outputs.qurl_go_workflow_identity }}
+      client_repository: ${{ steps.inputs.outputs.client_repository }}
+      client_workflow: ${{ steps.inputs.outputs.client_workflow }}
+      client_ref: ${{ steps.inputs.outputs.client_ref }}
+      client_sha: ${{ steps.inputs.outputs.client_sha }}
     steps:
-      - name: Mint the narrow JIT App installation token
-        id: app
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
-          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
-          owner: layervai
-          repositories: |
-            qurl-connector
-            qurl-go
-      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
-        with:
-          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      - name: Read back the runner group's 4 controls (fail closed on drift)
+          persist-credentials: false
+      - name: Validate attended confirmation and exact proof inputs
+        id: inputs
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          DEPLOYMENT_MANIFEST_B64: ${{ inputs.deployment_manifest_b64 }}
+          CONFIRM: ${{ inputs.confirm }}
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+          CONNECTOR_REF: ${{ inputs.connector_ref }}
+          QURL_GO_REF: ${{ inputs.qurl_go_ref }}
+          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
+          PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
         run: |
           set -euo pipefail
-          g=$(gh api "orgs/layervai/actions/runner-groups/${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}")
-          echo "$g" | jq -e '.visibility=="selected" and .allows_public_repositories==true and .restricted_to_workflows==true' >/dev/null \
-            || { echo "::error::runner-group visibility/public/restricted control drift"; exit 1; }
-          echo "$g" | jq -e --arg c "$CONNECTOR_WORKFLOW" --arg q "$QURLGO_WORKFLOW" \
-            '(.selected_workflows|sort) == ([$c,$q]|sort)' >/dev/null \
-            || { echo "::error::runner-group selected_workflows are not the exact pinned SHAs"; exit 1; }
-          reposn=$(gh api "orgs/layervai/actions/runner-groups/${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}/repositories" --jq '.repositories|length')
-          [ "$reposn" = "2" ] || { echo "::error::runner-group repo access is not exactly the two clients"; exit 1; }
-      - name: Mint the one-use JIT config (labels = required + derived per-run)
-        id: jit
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          LABEL="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
-          cfg=$(gh api -X POST "orgs/layervai/actions/runners/generate-jitconfig" \
-            -f "name=udp-proof-${{ github.run_id }}-${{ github.run_attempt }}" \
-            -F "runner_group_id=${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}" \
-            -f "labels[]=self-hosted" -f "labels[]=Linux" -f "labels[]=X64" \
-            -f "labels[]=udp-proof" -f "labels[]=sandbox" -f "labels[]=$LABEL" \
-            -f "work_folder=_work" --jq '.encoded_jit_config')
-          echo "::add-mask::$cfg"
-          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
-      - name: Write the one-use JIT secret (runner consumes + deletes it)
-        run: |
-          set -euo pipefail
-          aws secretsmanager create-secret \
-            --name "${JIT_SECRET_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}" \
-            --kms-key-id "$JIT_KMS_KEY_ARN" \
-            --secret-string "${{ steps.jit.outputs.cfg }}" \
-            --tags Key=Environment,Value=sandbox Key=Purpose,Value=udp-proof \
-                   Key=GitHubRunId,Value=${{ github.run_id }} Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
-            --region "$AWS_REGION" >/dev/null
-      - name: Start the broker (synchronous, bounded retry on throttle)
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3 4 5; do
-            if aws lambda invoke --function-name "$BROKER_FUNCTION" \
-                 --cli-binary-format raw-in-base64-out \
-                 --payload "{\"action\":\"start\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
-                 --region "$AWS_REGION" /tmp/broker.json >/dev/null 2>&1; then
-              cat /tmp/broker.json; grep -q '"status"' /tmp/broker.json && break
-            fi
-            echo "broker throttled/failed (attempt $attempt); retrying"; sleep $((attempt*10))
-          done
-          grep -q '"status"' /tmp/broker.json || { echo "::error::broker did not confirm a ready runner"; exit 1; }
-      - name: Dispatch the Connector proof + capture its run id
-        id: dispatch
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          gh workflow run sandbox-smoke.yml --repo layervai/qurl-connector --ref main \
-            -f nhp_controller_run_id=${{ github.run_id }} \
-            -f nhp_controller_run_attempt=${{ github.run_attempt }}
-          # workflow_dispatch does not return the run id; poll for the run this
-          # controller run created (matching created>=before, event=workflow_dispatch).
-          for _ in $(seq 1 20); do
-            rid=$(gh run list --repo layervai/qurl-connector --workflow sandbox-smoke.yml \
-              --event workflow_dispatch --created ">=$before" --limit 1 \
-              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
-            [ -n "${rid:-}" ] && { echo "client_run_id=$rid" >> "$GITHUB_OUTPUT"; break; }
-            sleep 10
-          done
-          [ -n "${rid:-}" ] || { echo "::error::could not resolve the dispatched Connector run id"; exit 1; }
-      - name: Verify the Connector proof run
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          rid="${{ steps.dispatch.outputs.client_run_id }}"
-          gh run watch "$rid" --repo layervai/qurl-connector --exit-status >/dev/null 2>&1 || true
-          j=$(gh api "repos/layervai/qurl-connector/actions/runs/$rid")
-          echo "$j" | jq -e '.status=="completed" and .conclusion=="success" and .event=="workflow_dispatch"' >/dev/null \
-            || { echo "::error::Connector proof run did not conclude successfully"; exit 1; }
-      - name: Stop the broker (always)
-        if: always()
-        run: |
-          aws lambda invoke --function-name "$BROKER_FUNCTION" \
-            --cli-binary-format raw-in-base64-out \
-            --payload "{\"action\":\"stop\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
-            --region "$AWS_REGION" /tmp/broker-stop.json >/dev/null 2>&1 || true
+          test "$CONFIRM" = "RUN_UDP_PROOF" || {
+            echo "::error::confirmation phrase not exact"
+            exit 1
+          }
+          python3 .github/scripts/validate_udp_proof_controller_inputs.py \
+            --client "$CLIENT" \
+            --proof-phase "$PROOF_PHASE" \
+            --connector-ref "$CONNECTOR_REF" \
+            --qurl-go-ref "$QURL_GO_REF" \
+            --connector-proof-run-id "$CONNECTOR_PROOF_RUN_ID" \
+            --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
+            --github-output "$GITHUB_OUTPUT"
 
-  # ── qurl-go second (requires the verified Connector run id) ──────────────────
-  qurl_go:
-    needs: connector
+  proof:
+    needs: gate
+    name: ${{ inputs.client }} / ${{ inputs.proof_phase }}
     runs-on: ubuntu-latest
+    timeout-minutes: 165
     environment: udp-proof-sandbox
     steps:
-      - name: Mint the narrow JIT App installation token
-        id: app
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Mint the runner-management App installation token
+        id: app_runner
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
@@ -180,81 +134,538 @@ jobs:
           repositories: |
             qurl-connector
             qurl-go
-      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+          permission-organization-self-hosted-runners: write
+
+      - name: Verify exact runner-group controls
+        env:
+          GH_TOKEN: ${{ steps.app_runner.outputs.token }}
+          RUNNER_GROUP_ID: ${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}
+          CONNECTOR_WORKFLOW: ${{ needs.gate.outputs.connector_workflow_identity }}
+          QURL_GO_WORKFLOW: ${{ needs.gate.outputs.qurl_go_workflow_identity }}
+        run: |
+          set -euo pipefail
+
+          retry_gh_api() {
+            local attempt output
+            for attempt in 1 2 3; do
+              if output="$(gh api "$@")"; then
+                printf '%s' "$output"
+                return 0
+              fi
+              echo "::warning::runner-group API read failed on attempt ${attempt}/3; retrying" >&2
+              if (( attempt < 3 )); then
+                sleep 5
+              fi
+            done
+            return 1
+          }
+
+          group="$(
+            retry_gh_api \
+              "orgs/layervai/actions/runner-groups/${RUNNER_GROUP_ID}"
+          )" || {
+            echo "::error::could not read runner-group controls after bounded retries"
+            exit 1
+          }
+          jq -e '
+            .visibility == "selected" and
+            .allows_public_repositories == true and
+            .restricted_to_workflows == true
+          ' <<<"$group" >/dev/null || {
+            echo "::error::runner-group visibility/public/restricted control drift"
+            exit 1
+          }
+          jq -e \
+            --arg connector "$CONNECTOR_WORKFLOW" \
+            --arg qurl_go "$QURL_GO_WORKFLOW" \
+            '(.selected_workflows | sort) == ([$connector, $qurl_go] | sort)' \
+            <<<"$group" >/dev/null || {
+            echo "::error::runner-group workflows do not pin both manifest candidate SHAs"
+            exit 1
+          }
+
+          repository_lines="$(
+            retry_gh_api --paginate \
+              "orgs/layervai/actions/runner-groups/${RUNNER_GROUP_ID}/repositories?per_page=100" \
+              --jq '.repositories[].full_name'
+          )" || {
+            echo "::error::could not read runner-group repositories after bounded retries"
+            exit 1
+          }
+          mapfile -t repositories < <(
+            printf '%s\n' "$repository_lines" |
+              sed '/^$/d' |
+              sort
+          )
+          if (( ${#repositories[@]} != 2 )) ||
+            [[ "${repositories[0]:-}" != "layervai/qurl-connector" ]] ||
+            [[ "${repositories[1]:-}" != "layervai/qurl-go" ]]; then
+            echo "::error::runner-group repository allowlist is not exactly qurl-connector and qurl-go"
+            exit 1
+          fi
+
+      - id: aws
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Mint the one-use JIT config
         id: jit
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app_runner.outputs.token }}
+          CLIENT: ${{ inputs.client }}
+          RUNNER_GROUP_ID: ${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}
         run: |
           set -euo pipefail
-          LABEL="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          cfg=$(gh api -X POST "orgs/layervai/actions/runners/generate-jitconfig" \
-            -f "name=udp-proof-${{ github.run_id }}-${{ github.run_attempt }}" \
-            -F "runner_group_id=${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}" \
+          label="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          config="$(gh api -X POST "orgs/layervai/actions/runners/generate-jitconfig" \
+            -f "name=udp-proof-${CLIENT}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -F "runner_group_id=${RUNNER_GROUP_ID}" \
             -f "labels[]=self-hosted" -f "labels[]=Linux" -f "labels[]=X64" \
-            -f "labels[]=udp-proof" -f "labels[]=sandbox" -f "labels[]=$LABEL" \
-            -f "work_folder=_work" --jq '.encoded_jit_config')
-          echo "::add-mask::$cfg"
-          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+            -f "labels[]=udp-proof" -f "labels[]=sandbox" -f "labels[]=$label" \
+            -f "work_folder=_work" --jq '.encoded_jit_config')"
+          if (( ${#config} < 32 || ${#config} > 32768 )); then
+            echo "::error::JIT configuration length is outside the expected bounds"
+            exit 1
+          fi
+          if [[ ! "$config" =~ ^[A-Za-z0-9_+/=-]+$ ]]; then
+            echo "::error::JIT configuration contains unexpected characters"
+            exit 1
+          fi
+          echo "::add-mask::$config"
+          echo "config=$config" >>"$GITHUB_OUTPUT"
+
+      # This first token also ages while the JIT secret is written, the broker
+      # starts, and the correlated run is resolved. Those bounded pre-wait
+      # steps plus the 155-poll first window remain below its one-hour life.
+      - name: Mint the narrow proof-dispatch App installation token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: ${{ inputs.client == 'connector' && 'qurl-connector' || 'qurl-go' }}
+          permission-actions: write
+
       - name: Write the one-use JIT secret
+        env:
+          JIT_CONFIG: ${{ steps.jit.outputs.config }}
         run: |
           set -euo pipefail
           aws secretsmanager create-secret \
             --name "${JIT_SECRET_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}" \
             --kms-key-id "$JIT_KMS_KEY_ARN" \
-            --secret-string "${{ steps.jit.outputs.cfg }}" \
+            --secret-string "$JIT_CONFIG" \
             --tags Key=Environment,Value=sandbox Key=Purpose,Value=udp-proof \
-                   Key=GitHubRunId,Value=${{ github.run_id }} Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
+                   Key=GitHubRunId,Value=${{ github.run_id }} \
+                   Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
             --region "$AWS_REGION" >/dev/null
+
       - name: Start the broker
         run: |
           set -euo pipefail
-          for attempt in 1 2 3 4 5; do
-            if aws lambda invoke --function-name "$BROKER_FUNCTION" \
-                 --cli-binary-format raw-in-base64-out \
-                 --payload "{\"action\":\"start\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
-                 --region "$AWS_REGION" /tmp/broker.json >/dev/null 2>&1; then
-              grep -q '"status"' /tmp/broker.json && break
-            fi
-            sleep $((attempt*10))
-          done
-          grep -q '"status"' /tmp/broker.json || { echo "::error::broker did not confirm a ready runner"; exit 1; }
-      - name: Dispatch the qurl-go proof (requires the verified Connector run id)
+          bash .github/scripts/invoke_udp_proof_broker.sh \
+            start "${{ github.run_id }}" "${{ github.run_attempt }}"
+
+      - name: Dispatch exact client candidate and resolve run
         id: dispatch
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+          DEPLOYMENT_MANIFEST_B64: ${{ inputs.deployment_manifest_b64 }}
+          CLIENT_REPOSITORY: ${{ needs.gate.outputs.client_repository }}
+          CLIENT_WORKFLOW: ${{ needs.gate.outputs.client_workflow }}
+          CLIENT_REF: ${{ needs.gate.outputs.client_ref }}
+          CLIENT_SHA: ${{ needs.gate.outputs.client_sha }}
+          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
+          PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
         run: |
           set -euo pipefail
-          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          gh workflow run native-udp-sandbox.yml --repo layervai/qurl-go --ref main \
-            -f nhp_controller_run_id=${{ github.run_id }} \
-            -f nhp_controller_run_attempt=${{ github.run_attempt }} \
-            -f connector_proof_run_id=${{ needs.connector.outputs.client_run_id }}
-          for _ in $(seq 1 20); do
-            rid=$(gh run list --repo layervai/qurl-go --workflow native-udp-sandbox.yml \
-              --event workflow_dispatch --created ">=$before" --limit 1 \
-              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
-            [ -n "${rid:-}" ] && { echo "client_run_id=$rid" >> "$GITHUB_OUTPUT"; break; }
-            sleep 10
+          nonce="$(openssl rand -hex 16)"
+          [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || {
+            echo "::error::could not generate an exact dispatch correlation nonce"
+            exit 1
+          }
+          correlation_id="$(
+            printf 'nhp-%s-%s-%s-%s-%s' \
+              "${{ github.run_id }}" \
+              "${{ github.run_attempt }}" \
+              "$CLIENT" \
+              "$PROOF_PHASE" \
+              "$nonce"
+          )"
+          expected_title="UDP proof [corr:${correlation_id}]"
+          # Persist the exact lookup envelope before dispatch. If GitHub accepts
+          # the dispatch but its list API does not surface the run within the
+          # bounded resolution window, the always-run cleanup step can still
+          # find and cancel that uniquely correlated run.
+          {
+            echo "client_repository=$CLIENT_REPOSITORY"
+            echo "client_workflow=$CLIENT_WORKFLOW"
+            echo "client_ref=$CLIENT_REF"
+            echo "client_sha=$CLIENT_SHA"
+            echo "client_run_title=$expected_title"
+          } >>"$GITHUB_OUTPUT"
+          dispatch_args=(
+            -f "proof_phase=$PROOF_PHASE"
+            -f "deployment_manifest_b64=$DEPLOYMENT_MANIFEST_B64"
+            -f "nhp_controller_run_id=${{ github.run_id }}"
+            -f "nhp_controller_run_attempt=${{ github.run_attempt }}"
+            -f "dispatch_correlation_id=$correlation_id"
+          )
+          if [[ -n "$PRE_REMOVAL_RUN_ID" ]]; then
+            dispatch_args+=(-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID")
+          fi
+          if [[ "$CLIENT" == "qurl_go" ]]; then
+            dispatch_args+=(-f "connector_proof_run_id=$CONNECTOR_PROOF_RUN_ID")
+          fi
+
+          gh workflow run "$CLIENT_WORKFLOW" \
+            --repo "$CLIENT_REPOSITORY" \
+            --ref "$CLIENT_REF" \
+            "${dispatch_args[@]}"
+
+          run_id=""
+          for attempt in $(seq 1 24); do
+            if ! runs="$(
+              gh run list \
+                --repo "$CLIENT_REPOSITORY" \
+                --workflow "$CLIENT_WORKFLOW" \
+                --branch "$CLIENT_REF" \
+                --event workflow_dispatch \
+                --limit 100 \
+                --json databaseId,displayTitle,headBranch,headSha
+            )"; then
+              echo "::warning::client run discovery API failed on attempt ${attempt}/24; retrying"
+              if (( attempt < 24 )); then
+                sleep 5
+              fi
+              continue
+            fi
+            mapfile -t matching_runs < <(
+              jq -r \
+                --arg title "$expected_title" \
+                --arg ref "$CLIENT_REF" \
+                --arg sha "$CLIENT_SHA" '
+                .[] |
+                select(
+                  .displayTitle == $title and
+                  .headBranch == $ref and
+                  .headSha == $sha
+                ) |
+                .databaseId
+              ' <<<"$runs"
+            )
+            if (( ${#matching_runs[@]} > 1 )); then
+              echo "::error::multiple client runs share the supposedly unique dispatch correlation"
+              exit 1
+            fi
+            if (( ${#matching_runs[@]} == 1 )); then
+              run_id="${matching_runs[0]}"
+              break
+            fi
+            if (( attempt < 24 )); then
+              sleep 5
+            fi
           done
-          [ -n "${rid:-}" ] || { echo "::error::could not resolve the dispatched qurl-go run id"; exit 1; }
-      - name: Verify the qurl-go proof run
+          test -n "$run_id" || {
+            echo "::error::could not resolve the exact dispatched client run; confirm the candidate branch still points at the manifest SHA and renders the required UDP proof correlation run name"
+            exit 1
+          }
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::resolved client run ID is not a positive integer"
+            exit 1
+          }
+          echo "client_run_id=$run_id" >>"$GITHUB_OUTPUT"
+
+      # Installation tokens expire after one hour, while the longest client
+      # proof has a 90-minute job budget that starts only after its JIT runner
+      # accepts the job. Use three independent 155-poll windows so runner boot,
+      # GitHub scheduling, the full client budget, and artifact finalization
+      # have about 115.5 minutes of sleep intervals from dispatch without any
+      # token nearing expiry. Per-attempt API latency extends that real polling
+      # window. The 165-minute controller cap leaves the remainder for bounded
+      # setup, cancellation, and cleanup while still ending before the runner's
+      # independent 180-minute boot-relative hard deadline.
+      # A failure-only cancellation step mints another token below instead of
+      # spending the final verification token's tail.
+      - name: Wait for client proof (first token window)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
         run: |
           set -euo pipefail
-          rid="${{ steps.dispatch.outputs.client_run_id }}"
-          gh run watch "$rid" --repo layervai/qurl-go --exit-status >/dev/null 2>&1 || true
-          j=$(gh api "repos/layervai/qurl-go/actions/runs/$rid")
-          echo "$j" | jq -e '.status=="completed" and .conclusion=="success" and .event=="workflow_dispatch"' >/dev/null \
-            || { echo "::error::qurl-go proof run did not conclude successfully"; exit 1; }
-      - name: Stop the broker (always)
-        if: always()
+          rm -f /tmp/udp-proof-client-run.json
+          bash .github/scripts/wait_for_action_run.sh \
+            "$CLIENT_REPOSITORY" "$CLIENT_RUN_ID" 155 allow \
+            /tmp/udp-proof-client-run.json
+
+      - name: Refresh the narrow JIT App token for the second wait window
+        id: app_wait2
+        if: always() && steps.dispatch.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: ${{ inputs.client == 'connector' && 'qurl-connector' || 'qurl-go' }}
+          permission-actions: read
+
+      - name: Wait for client proof (second token window)
+        if: always() && steps.app_wait2.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app_wait2.outputs.token }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
         run: |
-          aws lambda invoke --function-name "$BROKER_FUNCTION" \
-            --cli-binary-format raw-in-base64-out \
-            --payload "{\"action\":\"stop\",\"github_run_id\":\"${{ github.run_id }}\",\"github_run_attempt\":\"${{ github.run_attempt }}\"}" \
-            --region "$AWS_REGION" /tmp/broker-stop.json >/dev/null 2>&1 || true
+          set -euo pipefail
+          bash .github/scripts/wait_for_action_run.sh \
+            "$CLIENT_REPOSITORY" "$CLIENT_RUN_ID" 155 allow \
+            /tmp/udp-proof-client-run.json
+
+      - name: Refresh the final narrow JIT App token for verification
+        id: app_final
+        if: always() && steps.app_wait2.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: ${{ inputs.client == 'connector' && 'qurl-connector' || 'qurl-go' }}
+          permission-actions: write
+
+      - name: Verify exact client run
+        id: verify
+        if: always() && steps.app_final.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app_final.outputs.token }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
+          CLIENT_WORKFLOW: ${{ steps.dispatch.outputs.client_workflow }}
+          CLIENT_REF: ${{ steps.dispatch.outputs.client_ref }}
+          CLIENT_SHA: ${{ steps.dispatch.outputs.client_sha }}
+          CLIENT_RUN_TITLE: ${{ steps.dispatch.outputs.client_run_title }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/wait_for_action_run.sh \
+            "$CLIENT_REPOSITORY" "$CLIENT_RUN_ID" 155 fail \
+            /tmp/udp-proof-client-run.json
+          run="$(</tmp/udp-proof-client-run.json)"
+          jq -e \
+            --arg repository "$CLIENT_REPOSITORY" \
+            --arg workflow_path ".github/workflows/$CLIENT_WORKFLOW" \
+            --arg ref "$CLIENT_REF" \
+            --arg sha "$CLIENT_SHA" \
+            --arg title "$CLIENT_RUN_TITLE" '
+            .status == "completed" and
+            .conclusion == "success" and
+            .event == "workflow_dispatch" and
+            .run_attempt == 1 and
+            .repository.full_name == $repository and
+            .path == $workflow_path and
+            .head_branch == $ref and
+            .head_sha == $sha and
+            .display_title == $title
+          ' <<<"$run" >/dev/null || {
+            echo "::error::client proof run did not preserve exact dispatch provenance"
+            exit 1
+          }
+
+          runner_label="run-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          jobs="$(
+            gh api --paginate --slurp \
+              "repos/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID}/jobs?filter=all&per_page=100" |
+              jq '{
+                total_count: (.[0].total_count // 0),
+                jobs: [.[].jobs[]]
+              }'
+          )"
+          # The jobs API reports labels declared by each client's `runs-on`,
+          # not every label registered on the JIT runner. Both pinned client
+          # workflows deliberately compose this exact controller-bound label
+          # from the dispatched run-id and attempt inputs.
+          jq -e --arg runner_label "$runner_label" '
+            .total_count == (.jobs | length) and
+            ([.jobs[] | select((.labels // []) | index($runner_label))] | length == 1)
+          ' <<<"$jobs" >/dev/null || {
+            echo "::error::client proof did not use exactly one controller-bound JIT runner job"
+            exit 1
+          }
+
+          {
+            echo "### UDP proof dispatch"
+            echo
+            echo "- Client: \`${{ inputs.client }}\`"
+            echo "- Phase: \`${{ inputs.proof_phase }}\`"
+            echo "- Candidate: \`${CLIENT_SHA}\`"
+            echo "- Client run: [${CLIENT_RUN_ID}](https://github.com/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID})"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Refresh the narrow App token for failure cancellation
+        id: app_cancel
+        if: >-
+          always() &&
+          steps.dispatch.outputs.client_run_title != '' &&
+          steps.verify.outcome != 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: ${{ inputs.client == 'connector' && 'qurl-connector' || 'qurl-go' }}
+          permission-actions: write
+
+      - name: Cancel unfinished client run after controller failure
+        if: >-
+          always() &&
+          steps.dispatch.outputs.client_run_title != '' &&
+          steps.verify.outcome != 'success'
+        env:
+          # app_final is at most one 155-poll window old here. Earlier tokens
+          # may be expired after a full proof and are intentionally not fallbacks.
+          GH_TOKEN: ${{ steps.app_cancel.outputs.token || steps.app_final.outputs.token }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
+          CLIENT_WORKFLOW: ${{ steps.dispatch.outputs.client_workflow }}
+          CLIENT_REF: ${{ steps.dispatch.outputs.client_ref }}
+          CLIENT_SHA: ${{ steps.dispatch.outputs.client_sha }}
+          CLIENT_RUN_TITLE: ${{ steps.dispatch.outputs.client_run_title }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CLIENT_RUN_ID" ]]; then
+            last_lookup_succeeded=false
+            for attempt in $(seq 1 12); do
+              if ! runs="$(
+                gh run list \
+                  --repo "$CLIENT_REPOSITORY" \
+                  --workflow "$CLIENT_WORKFLOW" \
+                  --branch "$CLIENT_REF" \
+                  --event workflow_dispatch \
+                  --limit 100 \
+                  --json databaseId,displayTitle,headBranch,headSha
+              )"; then
+                last_lookup_succeeded=false
+                echo "::warning::unresolved-run cleanup lookup failed on attempt ${attempt}/12; retrying"
+              else
+                last_lookup_succeeded=true
+                mapfile -t matching_runs < <(
+                  jq -r \
+                    --arg title "$CLIENT_RUN_TITLE" \
+                    --arg ref "$CLIENT_REF" '
+                    .[] |
+                    select(
+                      .displayTitle == $title and
+                      .headBranch == $ref
+                    ) |
+                    [.databaseId, .headSha] |
+                    @tsv
+                  ' <<<"$runs"
+                )
+                if (( ${#matching_runs[@]} > 1 )); then
+                  echo "::error::multiple unresolved client runs share the supposedly unique dispatch correlation"
+                  exit 1
+                fi
+                if (( ${#matching_runs[@]} == 1 )); then
+                  IFS=$'\t' read -r CLIENT_RUN_ID resolved_client_sha \
+                    <<<"${matching_runs[0]}"
+                  if [[ "$resolved_client_sha" != "$CLIENT_SHA" ]]; then
+                    echo "::warning::cancelling the uniquely correlated client run after candidate branch SHA movement"
+                  fi
+                  break
+                fi
+              fi
+              if (( attempt < 12 )); then
+                sleep 5
+              fi
+            done
+            "$last_lookup_succeeded" || {
+              echo "::error::could not complete a trustworthy unresolved-run cleanup lookup"
+              exit 1
+            }
+            # A dispatch rejected before creating a run needs no cancellation.
+            [[ -n "$CLIENT_RUN_ID" ]] || exit 0
+          fi
+          [[ "$CLIENT_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::client run ID selected for cancellation is not a positive integer"
+            exit 1
+          }
+          status=""
+          for attempt in $(seq 1 3); do
+            if status="$(gh api \
+              "repos/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID}" \
+              --jq '.status')"; then
+              break
+            fi
+            echo "::warning::client run status lookup failed on attempt ${attempt}/3; retrying"
+            if (( attempt < 3 )); then
+              sleep 5
+            fi
+          done
+          [[ "$status" =~ ^(queued|in_progress|completed|requested|waiting|pending)$ ]] || {
+            echo "::error::could not read a trustworthy client run status before cancellation"
+            exit 1
+          }
+          if [[ "$status" != "completed" ]]; then
+            cancel_requested=false
+            for attempt in $(seq 1 3); do
+              if gh run cancel "$CLIENT_RUN_ID" --repo "$CLIENT_REPOSITORY"; then
+                cancel_requested=true
+                break
+              fi
+              # The run can complete between the status read and cancellation
+              # request. Treat that exact terminal state as successful cleanup;
+              # every other cancellation error remains inside the retry budget.
+              if status="$(gh api \
+                "repos/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID}" \
+                --jq '.status')" &&
+                [[ "$status" == "completed" ]]; then
+                exit 0
+              fi
+              echo "::warning::client run cancellation request failed on attempt ${attempt}/3; retrying"
+              if (( attempt < 3 )); then
+                sleep 5
+              fi
+            done
+            "$cancel_requested" || {
+              echo "::error::could not submit client run cancellation"
+              exit 1
+            }
+            # Give GitHub up to five minutes to converge the accepted
+            # cancellation while the broker's independent reapers remain active.
+            for attempt in $(seq 1 60); do
+              if ! status="$(gh api \
+                "repos/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID}" \
+                --jq '.status')"; then
+                echo "::warning::cancellation confirmation lookup failed on attempt ${attempt}/60; retrying"
+                sleep 5
+                continue
+              fi
+              [[ "$status" == "completed" ]] && exit 0
+              sleep 5
+            done
+            echo "::error::client proof run did not confirm cancellation"
+            exit 1
+          fi
+
+      # The controller role is capped at a one-hour session, while an attended
+      # client proof may consume the full 90-minute wait budget. Refresh via
+      # OIDC immediately before cleanup so expiry cannot strand the runner or
+      # its one-use JIT secret. The stop step still runs and reports failure if
+      # this refresh itself fails.
+      - name: Refresh AWS credentials for broker cleanup
+        if: always() && steps.aws.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop the broker (always)
+        if: always() && steps.aws.outcome == 'success'
+        run: |
+          set -euo pipefail
+          bash .github/scripts/invoke_udp_proof_broker.sh \
+            stop "${{ github.run_id }}" "${{ github.run_attempt }}"

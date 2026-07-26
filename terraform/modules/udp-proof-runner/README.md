@@ -70,6 +70,11 @@ remain proof consumers; neither should grow an AWS runner control plane.
 - The GitHub OIDC controller is trusted only for
   `repo:layervai/nhp:environment:udp-proof-sandbox`. It cannot call EC2 or read
   secrets. It may create tagged JIT metadata and invoke one broker Lambda.
+  Creating a secret with the dedicated customer-managed JIT key requires the
+  exact `GenerateDataKey`/`Decrypt` pair; both actions are restricted to that
+  key through Secrets Manager, and the controller has no `GetSecretValue`
+  permission with which to turn its service-bound decrypt grant into a secret
+  read path.
 - The serialized broker starts the exact Terraform-owned launch-template
   version. The workflow cannot override user data, the instance profile, AMI,
   instance type, storage, or network interface. AWS's
@@ -145,19 +150,27 @@ The composing PR must:
    [`restricted_to_workflows=true` with both full-SHA workflow identities](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/larger-runners/control-access).
    Fail before minting a JIT configuration or dispatching a client workflow if
    any read-back value differs; the attended proof must not repair group access.
-5. Install the JIT GitHub App narrowly: organization self-hosted-runners write,
-   plus Actions dispatch/read in only `layervai/qurl-connector` and
-   `layervai/qurl-go`. It needs no client contents write, no AWS permission, and
-   no Actions permission in NHP. A PAT is forbidden.
+5. Install the JIT GitHub App narrowly: organization self-hosted-runners write
+   for the exact two-repository runner-group check, plus Actions dispatch/read.
+   Each controller run mints its Actions token for only the selected
+   `layervai/qurl-connector` or `layervai/qurl-go` repository; the second
+   polling-only window requests Actions read while dispatch, final
+   verification/cancellation fallback, and failure cancellation request
+   Actions write. It needs no client contents write, no AWS permission, and no
+   Actions permission in NHP. A PAT is forbidden.
 6. Update the client workflows in their own reviewed PRs before composing this
    module. Each strict `workflow_dispatch` path must accept exactly the required
    `nhp_controller_run_id` and `nhp_controller_run_attempt` identity inputs,
    validate them against the broker's respective
    `[1-9][0-9]{0,19}` and `[1-9][0-9]{0,9}` bounds, and derive
    `run-<id>-attempt-<attempt>` itself. A client must not accept a
-   preconstructed `runner_label` input. It targets both the exact organization
-   group and its derived label, and binds both controller inputs into the proof
-   evidence. The Connector's advisory pull-request matrix stays on
+   preconstructed `runner_label` input. Each strict path must also require
+   `dispatch_correlation_id` and render its run name exactly as
+   `UDP proof [corr:<value>]`; the controller uses that title together with the
+   candidate branch and full SHA as its unique dispatch lookup envelope. It
+   targets both the exact organization group and its derived label, and binds
+   both controller inputs into the proof evidence. The Connector's advisory
+   pull-request matrix stays on
    `ubuntu-latest` and must never target the protected group; its dispatch-only
    strict job runs the host and hardened-container assertions in one JIT job
    because a JIT runner accepts exactly one job. The qurl-go
@@ -198,6 +211,16 @@ The composing PR must:
    an attended GitHub re-run distinct from its already-terminated first attempt.
    Invoke the broker with the exact JSON object
    `{"action":"start","github_run_id":"<digits>","github_run_attempt":"<digits>"}`.
+   The synchronous start response is pinned to exactly `action`,
+   `instance_id`, and `status`; `instance_id` must be an EC2 instance id and
+   `status` must be `launched` or `existing`. The stop response is pinned to
+   exactly `action`, `instances`, `secret_deleted`, and `status`;
+   `status=terminated` requires one or more unique EC2 instance ids, while
+   `status=absent` requires an empty instance list, and `secret_deleted` is
+   boolean in either case. Extra fields or status values fail the controller
+   closed. A red stop-schema check is therefore not by itself proof that
+   compute survived: verify the broker sweep and boot-relative hard deadline
+   before classifying a runner as stranded.
    Use a synchronous invoke with bounded retries for `TooManyRequestsException`:
    the intentionally serialized broker can briefly throttle while its
    five-minute sweep is running, and an asynchronous start would not prove the

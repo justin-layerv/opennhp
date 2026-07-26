@@ -245,7 +245,9 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["TagOneTimeJITConfiguration"].Condition["ForAllValues:StringEquals"]["aws:TagKeys"]) == toset(["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]) &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["TagOneTimeJITConfiguration"].Condition.Null["aws:RequestTag/GitHubRunId"] == "false" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["TagOneTimeJITConfiguration"].Condition.Null["aws:RequestTag/GitHubRunAttempt"] == "false" &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Action == "kms:GenerateDataKey"
+      toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Action) == toset(["kms:Decrypt", "kms:GenerateDataKey"]) &&
+      keys(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Condition) == ["StringEquals"] &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Condition.StringEquals["kms:ViaService"] == local.secrets_kms_via_service
     )
     error_message = "The workflow controller must create exactly tagged, dedicated-key JIT metadata and invoke the broker; it gets no EC2 or secret-read surface."
   }

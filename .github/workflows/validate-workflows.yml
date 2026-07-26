@@ -283,6 +283,9 @@ jobs:
       - name: Check Claude workflow contracts
         run: python3 scripts/check-claude-model-lockstep.py
 
+      - name: Test UDP proof controller input and dispatch contracts
+        run: python3 tests/scripts/test_udp_proof_controller_inputs.py
+
       # resolve-app-image-required_test.sh verifies that the relay image's
       # hand-maintained path list covers the actual Go import surface. Pin and
       # warm the endpoints module here so that regression fence does not depend
