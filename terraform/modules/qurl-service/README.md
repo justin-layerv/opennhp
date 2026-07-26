@@ -45,7 +45,8 @@ module "qurl_service" {
 | Variable | Description | Type | Required |
 |----------|-------------|------|----------|
 | `environment` | Environment name (sandbox, prod) | `string` | Yes |
-| `name_prefix` | Prefix for resource names | `string` | Yes |
+| `name_prefix` | Configuration/SSM namespace prefix and default physical-resource prefix | `string` | Yes |
+| `resource_name_prefix` | Optional physical-resource prefix when it must differ from `name_prefix`; `cell_id` is appended | `string` | No |
 | `cell_id` | Cell identifier for multi-cell deployments | `string` | Yes |
 | `tags` | Tags to apply to all resources | `map(string)` | No |
 
@@ -117,6 +118,12 @@ module "qurl_service" {
 | Variable | Description | Type | Required |
 |----------|-------------|------|----------|
 | `audit_retention_days` | Days to retain audit logs in DynamoDB | `number` | Yes |
+
+### CORS
+
+| Variable | Description | Type | Required |
+|----------|-------------|------|----------|
+| `cors_allowed_origins` | Comma-separated allowed origins; production always requires an explicit non-wildcard value, and a private-primary cell may use its exact cell-local internal origin | `string` | Yes |
 
 ### AC Fleet
 

@@ -49,3 +49,53 @@ output "cell_fqdn" {
   description = "Public per-cell DNS name resolving to cell1's NLB."
   value       = module.dns.fqdn
 }
+
+output "qurl_service_runtime_contract_parameter" {
+  description = "Canonical SSM String parameter promoted atomically by the qurl-service main workflow."
+  value       = aws_ssm_parameter.qurl_service_runtime_contract.name
+}
+
+output "qurl_service_publisher_role_arn" {
+  description = "Main-ref-only qurl-service role scoped to the cell1 promotion record and ECS deployment surface."
+  value       = aws_iam_role.qurl_service_publisher.arn
+}
+
+output "qurl_service_cluster_name" {
+  description = "Cell1 qurl-service ECS cluster name; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].cluster_name, null)
+}
+
+output "qurl_service_service_name" {
+  description = "Cell1 qurl-service ECS service name; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].service_name, null)
+}
+
+output "qurl_service_task_definition_arn" {
+  description = "Terraform-registered cell1 qurl-service task definition; compare against the live service and running task."
+  value       = try(module.qurl_service[0].task_definition_arn, null)
+}
+
+output "qurl_service_private_endpoint" {
+  description = "Private cell-local qurl-service origin; null while deploy_qurl_service=false. This is not a public API endpoint."
+  value       = local.qurl_service_deployable ? local.qurl_service_private_origin : null
+}
+
+output "qurl_service_internal_alb_arn" {
+  description = "Cell1 private qurl-service ALB ARN; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].alb_arn, null)
+}
+
+output "qurl_service_target_group_arn" {
+  description = "Cell1 qurl-service target group used for healthy-host proof; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].target_group_arn, null)
+}
+
+output "qurl_service_runtime_image_uri" {
+  description = "Exact repository@sha256 image URI from the single atomic runtime contract; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].runtime_image_uri, null)
+}
+
+output "qurl_service_runtime_source_revision" {
+  description = "Full 40-hex qurl-service source revision paired atomically with runtime_image_uri; null while deploy_qurl_service=false."
+  value       = try(module.qurl_service[0].runtime_source_revision, null)
+}

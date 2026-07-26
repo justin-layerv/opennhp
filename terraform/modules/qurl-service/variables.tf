@@ -42,8 +42,43 @@ variable "private_subnet_ids" {
 }
 
 variable "public_subnet_ids" {
-  description = "Public subnet IDs for ALB"
+  description = "Subnet IDs for the primary ALB. Public subnets are required when public_ingress_enabled=true; private subnets are required when it is false."
   type        = list(string)
+}
+
+variable "resource_name_prefix" {
+  description = "Optional physical-resource prefix, excluding cell_id. Defaults to name_prefix. Use when the caller needs an environment-specific SSM namespace but wants cell_id to appear exactly once in ECS/ALB/Lambda/queue/table names."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.resource_name_prefix == null || trimspace(var.resource_name_prefix) != ""
+    error_message = "resource_name_prefix must be null or a non-empty string."
+  }
+}
+
+# The primary ALB remains internet-facing by default for the existing cell0
+# public API. A private cell-local qurl-service reuses the same task/IAM/data
+# module with this flag false; the ALB then lives in the caller-supplied private
+# subnets and its security group admits only the exact source SGs below.
+variable "public_ingress_enabled" {
+  description = "Whether the primary qurl-service ALB is internet-facing. False creates an internal ALB and requires ingress_security_group_ids; it never adds CIDR ingress."
+  type        = bool
+  default     = true
+}
+
+variable "ingress_security_group_ids" {
+  description = "Exact caller security groups admitted to the primary ALB when public_ingress_enabled=false. Must be empty in public mode and non-empty in private mode."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for security_group_id in var.ingress_security_group_ids :
+      can(regex("^sg-[0-9a-f]+$", security_group_id))
+    ])
+    error_message = "ingress_security_group_ids entries must be AWS security group IDs."
+  }
 }
 
 # ==================== Container ====================
@@ -56,6 +91,34 @@ variable "ecr_repo_url" {
 variable "image_tag_ssm_param" {
   description = "SSM parameter name containing the image tag (e.g., /nhp-sandbox/qurl-api-image-tag)"
   type        = string
+}
+
+variable "image_uri" {
+  description = "Optional complete immutable image URI (repository@sha256:digest). When set, ECS uses it verbatim instead of reconstructing an image from the legacy SSM tag. Must be paired with source_revision."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.image_uri == null || (
+      startswith(var.image_uri, "${var.ecr_repo_url}@sha256:")
+      && can(regex(
+        "^sha256:[0-9a-f]{64}$",
+        trimprefix(var.image_uri, "${var.ecr_repo_url}@"),
+      ))
+    )
+    error_message = "image_uri must be null or exactly ecr_repo_url@sha256:<64 lowercase hexadecimal characters>."
+  }
+}
+
+variable "source_revision" {
+  description = "Optional full lowercase 40-hex source commit paired with image_uri and exposed in the task definition for live runtime proof."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.source_revision == null || can(regex("^[0-9a-f]{40}$", var.source_revision))
+    error_message = "source_revision must be null or a full lowercase 40-hex Git commit."
+  }
 }
 
 variable "container_cpu" {
@@ -278,7 +341,7 @@ variable "audit_retention_days" {
 # ==================== CORS ====================
 
 variable "cors_allowed_origins" {
-  description = "Comma-separated list of allowed CORS origins. Production requires explicit origins (validated in task definition)."
+  description = "Comma-separated list of allowed CORS origins. Every production deployment requires an explicit non-wildcard value because qurl-service validates it at startup; a private-primary cell may use its exact cell-local internal origin."
   type        = string
 }
 
@@ -805,7 +868,7 @@ variable "stripe_checkout_cancel_url" {
 # ==================== NHP Integration ====================
 
 variable "nhp_server_internal_url" {
-  description = "Internal URL of NHP server for headless resolve knock requests (e.g., http://server.nhp.sandbox.internal:8888). Enables POST /v1/resolve endpoint. Prefer the VPC-internal Cloud Map origin; HTTPS origins remain accepted for direct-module/nonstandard topologies. The .internal suffix matches the private DNS namespace in modules/data/main.tf, and HTTP .internal hostnames are expected to be lowercase Cloud Map/private DNS names."
+  description = "Internal URL of NHP server for headless resolve knock requests (e.g., http://server.nhp.sandbox.internal:8888). Enables POST /v1/resolve endpoint. Private-primary mode requires the VPC-internal HTTP .internal:8888 origin so egress stays bound to the exact NHP server security group; HTTPS origins remain accepted only for legacy public/direct-module topologies. The .internal suffix matches the private DNS namespace in modules/data/main.tf, and HTTP .internal hostnames are expected to be lowercase Cloud Map/private DNS names."
   type        = string
   default     = ""
 
@@ -822,6 +885,17 @@ variable "nhp_server_internal_url" {
       || can(regex("^http://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+internal:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$", var.nhp_server_internal_url))
     )
     error_message = "nhp_server_internal_url must be empty, an HTTPS origin URL or an HTTP private hosted-zone origin ending in .internal with an explicit valid TCP port (1-65535); either form must have no path, query, fragment, or trailing slash (for example http://server.nhp.sandbox.internal:8888)."
+  }
+}
+
+variable "nhp_server_security_group_id" {
+  description = "Exact NHP-server security group permitted as the private qurl-service task's internal-API destination. In private-primary mode this must be set iff nhp_server_internal_url is non-empty. Public mode preserves the legacy egress contract and does not require it."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.nhp_server_security_group_id == null || can(regex("^sg-[0-9a-f]+$", var.nhp_server_security_group_id))
+    error_message = "nhp_server_security_group_id must be null or a valid lowercase AWS security group ID."
   }
 }
 
@@ -1240,6 +1314,12 @@ variable "qurl_service_alarm_sns_topic_arn" {
     condition     = var.qurl_service_alarm_sns_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.qurl_service_alarm_sns_topic_arn))
     error_message = "qurl_service_alarm_sns_topic_arn must be empty or a standard SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
   }
+}
+
+variable "target_health_alarm_enabled" {
+  description = "Create a fail-closed HealthyHostCount alarm for the primary ALB target group. Enable for private cell services that must have at least one routable task before activation."
+  type        = bool
+  default     = false
 }
 
 # ==================== qURL v2 (keyed identity) ====================

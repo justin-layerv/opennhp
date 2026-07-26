@@ -86,14 +86,14 @@
 resource "aws_sqs_queue" "resource_lifecycle_queue" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  name                       = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle"
+  name                       = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle"
   visibility_timeout_seconds = 90     # >= the qurl-api drainer's per-message ack budget (60s default per PR #874)
   message_retention_seconds  = 345600 # 4 days — long enough for an ops incident to investigate, short enough that any logical-bug leak evaporates
   receive_wait_time_seconds  = 20     # long polling
   kms_master_key_id          = var.secrets_kms_key_arn
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
-    Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle"
+    Name = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle"
   })
 
   # KMS-NULL FAIL-LOUD: `var.secrets_kms_key_arn` is `default = null` at
@@ -133,12 +133,12 @@ resource "aws_sqs_queue" "resource_lifecycle_queue" {
 resource "aws_sqs_queue" "resource_lifecycle_queue_dlq" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  name                      = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq"
+  name                      = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq"
   message_retention_seconds = 1209600 # 14 days
   kms_master_key_id         = var.secrets_kms_key_arn
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
-    Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq"
+    Name = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq"
   })
 }
 
@@ -182,7 +182,7 @@ resource "aws_sqs_queue_redrive_policy" "resource_lifecycle_queue" {
 resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_backlog" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  alarm_name          = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-queue-backlog"
+  alarm_name          = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-queue-backlog"
   alarm_description   = "Resource-lifecycle SQS queue backlog growing — qurl-api consumer may be falling behind or wedged."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3 # 3 × 5-min periods to absorb a transient burst (first-sweep backfill, redeploy lag)
@@ -201,7 +201,7 @@ resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_backlog" {
   ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
-    Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-queue-backlog"
+    Name = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-queue-backlog"
   })
 }
 
@@ -213,7 +213,7 @@ resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_backlog" {
 resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_dlq_messages" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  alarm_name          = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq-messages"
+  alarm_name          = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq-messages"
   alarm_description   = "Messages in resource-lifecycle DLQ — qurl-api consumer failed 3 attempts (deploy-skew casualty or payload bug)."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
@@ -232,6 +232,6 @@ resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_dlq_messages" {
   ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
-    Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq-messages"
+    Name = "${local.resource_name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq-messages"
   })
 }

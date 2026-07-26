@@ -650,16 +650,15 @@ def require_alarm_registry(
 # carries none of the prod/sandbox alarm/metric parity surfaces directly — its
 # observability must ride an env root this same lint already checks.
 #
-#   sandbox-cell1: a deliberately lean, UDP-server-only second cell (cell1) for
-#   the two-cell qURL Connector proof (PR #3413). Its root wires only the
-#   standalone knock path — networking (VPC) + kms + plugins + dynamodb +
-#   nhp-keypair + compute (public UDP:62206 NLB) + dns — and, unlike every
-#   other env root, does NOT instantiate `module "nhp"`. That module's
+#   sandbox-cell1: a separately deployed second cell (cell1) for the two-cell
+#   qURL Connector proof (PR #3413). Its root wires cell-scoped networking,
+#   NHP, and private qurl-service resources but, unlike every other env root,
+#   does NOT instantiate `module "nhp"`. That module's
 #   always-on `module.security` creates ACCOUNT-SINGLETON GuardDuty/Config/
 #   SecurityHub that would collide with cell0 in the same account, so a second
-#   full instantiation is unsafe here. cell1 ships no AC / qurl-service / relay
-#   to alarm on; its L7 data plane and observability ride cell0, which this
-#   lint checks in full. Removing cell1's tree should drop this entry too.
+#   full instantiation is unsafe here. Account-wide observability remains
+#   cell0-owned while cell1's local qurl-service gets its own health alarm.
+#   Removing cell1's tree should drop this entry too.
 #
 #   sandbox-hub-dns: a DNS-only root that emits public A-alias records whose
 #   target NLBs live in roots that cannot emit their own Route 53 record —

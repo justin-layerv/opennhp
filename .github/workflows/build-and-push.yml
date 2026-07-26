@@ -1629,6 +1629,10 @@ jobs:
         working-directory: terraform/environments/sandbox-cell1
         run: terraform validate
 
+      - name: Test sandbox cell1 qurl-service security contracts
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        run: python3 tests/scripts/test_sandbox_cell1_qurl_service_security_contract.py
+
       - name: Terraform Control Init (no backend)
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/control/environments/${{ matrix.environment }}
@@ -1697,6 +1701,13 @@ jobs:
       - name: Test AC qurl-router routing gate validation
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/modules/ac
+        run: |
+          terraform init -backend=false
+          terraform test
+
+      - name: Test qurl-service private cell contract
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/modules/qurl-service
         run: |
           terraform init -backend=false
           terraform test

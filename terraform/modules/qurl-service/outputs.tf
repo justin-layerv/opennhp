@@ -20,8 +20,23 @@ output "service_arn" {
   value       = aws_ecs_service.qurl.id
 }
 
+output "task_definition_arn" {
+  description = "Terraform-registered qurl-service task definition ARN. Live proof must compare this with the running ECS service/task revision."
+  value       = aws_ecs_task_definition.qurl.arn
+}
+
+output "runtime_image_uri" {
+  description = "Complete immutable qurl-service repository@sha256 URI when the module is in digest-pinned mode; null on the legacy tag-managed path."
+  value       = var.image_uri
+}
+
+output "runtime_source_revision" {
+  description = "Full qurl-service source revision paired with runtime_image_uri and rendered into QURL_RUNTIME_SOURCE_REVISION; null on the legacy tag-managed path."
+  value       = var.source_revision
+}
+
 output "alb_dns_name" {
-  description = "ALB DNS name"
+  description = "Primary ALB DNS name. Internet-facing in public mode and internal in private mode."
   value       = aws_lb.qurl.dns_name
 }
 
@@ -31,8 +46,18 @@ output "alb_zone_id" {
 }
 
 output "alb_arn" {
-  description = "ALB ARN"
+  description = "Primary ALB ARN."
   value       = aws_lb.qurl.arn
+}
+
+output "alb_is_internal" {
+  description = "True when the primary ALB is private and has no public CIDR ingress."
+  value       = !var.public_ingress_enabled
+}
+
+output "target_group_arn" {
+  description = "Primary target group ARN used for live health convergence proof."
+  value       = aws_lb_target_group.qurl.arn
 }
 
 output "internal_alb_dns_name" {

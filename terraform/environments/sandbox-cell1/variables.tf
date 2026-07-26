@@ -143,6 +143,41 @@ variable "log_level" {
   default     = 4
 }
 
+variable "deploy_qurl_service" {
+  description = "Create the private cell1 qurl-service data plane after its governed immutable runtime contract is published. Default false keeps the cell dark and creates no ECS/table/secret runtime."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_auth0_domain" {
+  description = "Auth0 issuer used by the cell-local qurl-service."
+  type        = string
+  default     = "auth.layerv.ai"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.qurl_auth0_domain))
+    error_message = "qurl_auth0_domain must be a bare lowercase DNS hostname."
+  }
+}
+
+variable "qurl_cookie_domain" {
+  description = "Sandbox qURL cookie domain retained for application config even though cell1 has no public API ingress."
+  type        = string
+  default     = ".qurl.site.layerv.xyz"
+}
+
+variable "qurl_link_domain" {
+  description = "Sandbox qURL access-link domain."
+  type        = string
+  default     = "qurl.link.layerv.xyz"
+}
+
+variable "qurl_site_domain" {
+  description = "Sandbox qURL protected-resource domain and NHP redirect suffix."
+  type        = string
+  default     = "qurl.site.layerv.xyz"
+}
+
 variable "tags" {
   description = "Base tags applied to all cell1 resources."
   type        = map(string)

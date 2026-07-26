@@ -1055,8 +1055,8 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertIn("chatbot_owned_externally", result.stderr)
 
     def test_exempt_env_root_without_module_nhp_passes(self) -> None:
-        # sandbox-cell1 is a deliberately lean, UDP-server-only cell that does
-        # NOT instantiate `module "nhp"` — its always-on module.security would
+        # sandbox-cell1 is a separately deployed cell that does NOT instantiate
+        # `module "nhp"` — its always-on module.security would
         # collide with cell0's account-singleton GuardDuty/Config/SecurityHub.
         # It rides cell0 for observability, so it is on the parity guard's
         # explicit exemption set. A root by that name with no `module "nhp"`

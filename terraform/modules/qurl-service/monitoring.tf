@@ -58,3 +58,40 @@ resource "aws_cloudwatch_metric_alarm" "qurl_api_resource_key_provisioning_failu
     Severity  = "page"
   })
 }
+
+# Private cells remain dark at the public edge, but their intra-cell callers
+# still need an actionable readiness signal before catalog activation. The
+# internal primary ALB is the traffic boundary, so HealthyHostCount is stronger
+# evidence than "ECS desired task exists": it proves the task passed the same
+# readiness probe real NHP/qRTS callers traverse.
+resource "aws_cloudwatch_metric_alarm" "qurl_api_no_healthy_targets" {
+  count = var.target_health_alarm_enabled ? 1 : 0
+
+  alarm_name          = "${local.service_name}-no-healthy-targets"
+  alarm_description   = "qurl-service primary ALB has no healthy targets. Keep this cell disabled; inspect the exact ECS task, repo@sha256 image/source revision, secret resolution, and /health/ready logs before activation."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    LoadBalancer = aws_lb.qurl.arn_suffix
+    TargetGroup  = aws_lb_target_group.qurl.arn_suffix
+  }
+
+  alarm_actions             = local.qurl_service_alarm_actions
+  ok_actions                = local.qurl_service_alarm_actions
+  insufficient_data_actions = []
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-no-healthy-targets"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+    Severity  = "page"
+  })
+}

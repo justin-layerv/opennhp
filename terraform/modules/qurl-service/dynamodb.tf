@@ -20,7 +20,7 @@
 # layout so DynamoDB string ordering matches chronological ordering.
 # No TTL: bindings are persistent until application-managed rotation/remediation.
 resource "aws_dynamodb_table" "qurl_external_identities" {
-  name                        = "${var.name_prefix}-${var.cell_id}-qurl-external-identities"
+  name                        = "${local.resource_name_prefix}-${var.cell_id}-qurl-external-identities"
   billing_mode                = "PAY_PER_REQUEST"
   hash_key                    = "pk"
   deletion_protection_enabled = local.is_prod
@@ -64,7 +64,7 @@ resource "aws_dynamodb_table" "qurl_external_identities" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-${var.cell_id}-qurl-external-identities"
+    Name      = "${local.resource_name_prefix}-${var.cell_id}-qurl-external-identities"
     Cell      = var.cell_id
     Component = "qurl-service"
     Purpose   = "External provider identity bindings"

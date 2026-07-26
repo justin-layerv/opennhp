@@ -2,7 +2,8 @@
 # ECS Fargate deployment for the QURL API service
 #
 # Architecture:
-# Internet → ALB (HTTPS 443) → ECS Fargate (port 8080)
+# Public mode:  Internet → ALB (HTTPS 443) → ECS Fargate (port 8080)
+# Private mode: exact caller SGs → internal ALB (HTTP 80) → ECS Fargate
 #
 # The QURL API handles:
 # - Public API: QURL management (Auth0 JWT protected)
@@ -13,7 +14,8 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
-# Subnet lookups for the ALB — used below to compute QURL_TRUSTED_PROXY_CIDRS
+# Subnet lookups for the primary ALB — used below to compute
+# QURL_TRUSTED_PROXY_CIDRS
 # from each subnet's cidr_block. This is the authoritative source for the
 # "what addresses does the ALB actually originate from" question, and keeps
 # the env var correct through any VPC resize or subnet remap without a
@@ -211,8 +213,14 @@ resource "aws_ssm_parameter" "default_ac_id" {
 # ==================== Locals ====================
 
 locals {
-  is_prod      = var.environment == "prod"
-  service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
+  is_prod              = var.environment == "prod"
+  resource_name_prefix = coalesce(var.resource_name_prefix, var.name_prefix)
+  service_name         = "${local.resource_name_prefix}-${var.cell_id}-qurl-api"
+  # ECR repository URLs are `registry/repository-path` (no scheme). Derive the
+  # exact repository ARN once so private-cell execution roles can be bounded to
+  # the only image source they need.
+  ecr_repository_path = trimprefix(var.ecr_repo_url, "${split("/", var.ecr_repo_url)[0]}/")
+  ecr_repository_arn  = "arn:aws:ecr:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:repository/${local.ecr_repository_path}"
 
   # Agent-OTP SES sender domain, derived from the From address (noreply@<domain>
   # → <domain>) — the SES identity is a DOMAIN identity, so ses:SendEmail scopes to
@@ -225,13 +233,19 @@ locals {
   # every qurl-service alarm surface (qurl-api, scanner Lambda,
   # resource-lifecycle queue).
   qurl_service_alarm_actions = var.qurl_service_alarm_sns_topic_arn != "" ? [var.qurl_service_alarm_sns_topic_arn] : []
-  # Shorter name for resources with 32-char limit (ALB/NLB names)
-  short_name = "${var.name_prefix}-${var.cell_id}-qurl"
-  # DNS-safe form used as the base for AWS resources subject to the 32-char
-  # name ceiling (ALB, TG). Computed once so name + length-precondition +
-  # error message can't drift across the resources that share the limit.
-  short_name_dash    = replace(local.short_name, "_", "-")
-  internal_alb_name  = "${local.short_name_dash}-i"
+  # Shorter name for resources with a 32-character limit (ALB/NLB names).
+  # Existing cell0 names stay byte-identical. Long future cell names use a
+  # deterministic hash suffix rather than failing for the first time at apply.
+  raw_short_name = replace("${local.resource_name_prefix}-${var.cell_id}-qurl", "_", "-")
+  short_name = (
+    length(local.raw_short_name) <= 30
+    ? local.raw_short_name
+    : "${substr(local.raw_short_name, 0, 21)}-${substr(sha256(local.raw_short_name), 0, 8)}"
+  )
+  # local.short_name is the DNS-safe base for AWS resources subject to the
+  # 32-char name ceiling (ALB, TG). Computed once so name + length-precondition
+  # + error message can't drift across the resources that share the limit.
+  internal_alb_name  = "${local.short_name}-i"
   internal_name_fits = length(local.internal_alb_name) <= 32
 
   # Task-level CPU/memory with ADOT sidecar overhead.
@@ -302,6 +316,24 @@ locals {
     local.qurl_service_owned_dynamodb_table_arns,
   )
 
+  # Runtime secret ARNs the ECS execution role resolves (and KMS-decrypts) at
+  # task launch: the always-present trio plus the optional Grafana Cloud secret
+  # and agent-OTP pepper. Hoisted so the private-boundary secret read, the
+  # private-boundary KMS EncryptionContext condition, and the execution_secrets
+  # policy below all reference one list and cannot drift.
+  execution_runtime_secret_arns = concat(
+    [
+      var.jwt_secret_arn,
+      var.internal_service_token_arn,
+      var.nhp_internal_auth_secret_arn,
+    ],
+    # Grafana Cloud secret when the ADOT sidecar is enabled.
+    var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : [],
+    # Agent OTP pepper (T1) — only when the OTP path is enabled (root passes a
+    # non-empty ARN). Off → no grant.
+    var.agent_otp_pepper_secret_arn != "" ? [var.agent_otp_pepper_secret_arn] : [],
+  )
+
   # Container environment variables
   container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
@@ -366,6 +398,11 @@ locals {
     { name = "QURL_SESSION_TTL", value = tostring(var.qurl_session_ttl_seconds) },
     { name = "QURL_DEFAULT_LIST_LIMIT", value = tostring(var.qurl_default_list_limit) },
     ],
+    var.source_revision != null ? [
+      # Runtime proof reads this exact full commit from the active task
+      # definition and checks it against the repo@sha256 image contract.
+      { name = "QURL_RUNTIME_SOURCE_REVISION", value = var.source_revision },
+    ] : [],
     # Redis configuration (for distributed rate limiting)
     var.redis_enabled ? concat([
       { name = "REDIS_ENABLED", value = "true" },
@@ -644,7 +681,8 @@ resource "aws_ecs_cluster" "qurl" {
 
 # Task execution role (used by ECS agent to pull images, write logs)
 resource "aws_iam_role" "execution" {
-  name = "${local.service_name}-execution"
+  name                 = "${local.service_name}-execution"
+  permissions_boundary = try(aws_iam_policy.execution_private_boundary[0].arn, null)
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -658,6 +696,79 @@ resource "aws_iam_role" "execution" {
   })
 
   tags = var.tags
+}
+
+# The legacy public cell keeps the AWS-managed execution policy unchanged.
+# Private cells add a permissions boundary that intersects that managed policy
+# and the secret policy below, reducing the effective role to one ECR
+# repository, one log group, and the exact configured secret/parameter/KMS
+# resources. This preserves cell0 state addresses while making new cell roles
+# least-privilege.
+resource "aws_iam_policy" "execution_private_boundary" {
+  count = var.public_ingress_enabled ? 0 : 1
+
+  name        = "${local.service_name}-execution-boundary"
+  description = "Least-privilege ECS execution boundary for private qurl-service cells"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Sid      = "ECRAuthorization"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      {
+        Sid    = "PullExactRepository"
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ]
+        Resource = local.ecr_repository_arn
+      },
+      {
+        Sid    = "WriteExactLogGroup"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = "${aws_cloudwatch_log_group.qurl.arn}:*"
+      },
+      {
+        Sid      = "ReadExactRuntimeSecrets"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = local.execution_runtime_secret_arns
+      },
+      {
+        Sid      = "ReadExactRuntimeParameter"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameters"]
+        Resource = aws_ssm_parameter.default_ac_id.arn
+      },
+      ], var.secrets_kms_key_arn != null ? [{
+        Sid      = "DecryptExactRuntimeKey"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                  = "secretsmanager.${data.aws_region.current.region}.amazonaws.com"
+            "kms:EncryptionContext:SecretARN" = local.execution_runtime_secret_arns
+          }
+        }
+    }] : [])
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-execution-boundary"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
 }
 
 resource "aws_iam_role_policy_attachment" "execution_basic" {
@@ -674,20 +785,9 @@ resource "aws_iam_role_policy" "execution_secrets" {
     Version = "2012-10-17"
     Statement = concat([
       {
-        Effect = "Allow"
-        Action = ["secretsmanager:GetSecretValue"]
-        Resource = concat(
-          [
-            var.jwt_secret_arn,
-            var.internal_service_token_arn,
-            var.nhp_internal_auth_secret_arn,
-          ],
-          # Add Grafana Cloud secret when ADOT sidecar is enabled
-          var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : [],
-          # Agent OTP pepper (T1) — only when the OTP path is enabled (root passes
-          # a non-empty ARN). Off → no grant, mirroring container_secrets above.
-          var.agent_otp_pepper_secret_arn != "" ? [var.agent_otp_pepper_secret_arn] : []
-        )
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = local.execution_runtime_secret_arns
       },
       {
         Effect   = "Allow"
@@ -1180,33 +1280,55 @@ resource "aws_iam_role_policy" "task_custom_domain_cleanup" {
 resource "aws_security_group" "alb" {
   name_prefix = "${local.service_name}-alb-"
   vpc_id      = var.vpc_id
-  description = "Security group for QURL API ALB"
+  description = var.public_ingress_enabled ? "Security group for QURL API ALB" : "Security group for private cell QURL API ALB"
 
-  # HTTPS from anywhere
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS from internet"
+  dynamic "ingress" {
+    for_each = var.public_ingress_enabled ? [1] : []
+    content {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTPS from internet"
+    }
   }
 
-  # HTTP redirect (optional)
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTP redirect"
+  dynamic "ingress" {
+    for_each = var.public_ingress_enabled ? [1] : []
+    content {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTP redirect"
+    }
   }
 
-  # Outbound to ECS tasks - restrict to VPC only (least privilege)
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = [var.vpc_cidr]
-    description = "Outbound to VPC only"
+  # Private mode has no CIDR ingress. Only the exact, root-selected caller
+  # security groups can reach the internal ALB's HTTP listener.
+  dynamic "ingress" {
+    for_each = var.public_ingress_enabled ? [] : [1]
+    content {
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      security_groups = var.ingress_security_group_ids
+      description     = "HTTP from exact private cell callers"
+    }
+  }
+
+  # Preserve the existing public-cell rule exactly. Private primary ALBs use
+  # the standalone SG-to-SG rule below so Terraform does not create a cyclic
+  # inline ALB-SG <-> task-SG dependency.
+  dynamic "egress" {
+    for_each = var.public_ingress_enabled ? [1] : []
+    content {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = [var.vpc_cidr]
+      description = "Outbound to VPC only"
+    }
   }
 
   tags = merge(var.tags, {
@@ -1228,26 +1350,41 @@ resource "aws_security_group" "ecs" {
   lifecycle {
     create_before_destroy = true
 
-    # Without the internal ALB live, flipping enforce_internal_alb_only
-    # to true removes the cidr_blocks rule and leaves ECS reachable only
-    # from the public-ALB SG — internal callers (NHP server, AC Traefik)
-    # lose their path entirely. Reject the combination at plan time.
+    # In the historical dual-ALB mode, removing the VPC CIDR bypass requires
+    # the secondary internal ALB. A private-primary deployment is the other
+    # safe shape: its primary ALB is already internal and source-SG fenced.
     # The flip is reversible: setting enforce_internal_alb_only back to
     # false and re-applying restores the legacy bypass via in-place
     # AuthorizeSecurityGroupIngress.
     precondition {
-      condition     = !var.enforce_internal_alb_only || var.internal_alb_enabled
-      error_message = "enforce_internal_alb_only = true requires internal_alb_enabled = true. Stand up the internal ALB first (set qurl_internal_service_domain), verify, then flip enforce_internal_alb_only on a second apply. ROLLBACK: to disable the internal ALB entirely, you must flip BOTH qurl_enforce_internal_alb_only=false AND qurl_internal_service_domain=null in the same apply — flipping just the domain to null while enforce stays true trips this same precondition."
+      condition     = !var.enforce_internal_alb_only || var.internal_alb_enabled || !var.public_ingress_enabled
+      error_message = "enforce_internal_alb_only = true requires either internal_alb_enabled=true (dual-ALB rollout) or public_ingress_enabled=false (private-primary cell). Otherwise removing the VPC CIDR bypass strands internal callers."
+    }
+    precondition {
+      condition = (
+        var.public_ingress_enabled
+        || ((var.nhp_server_internal_url == "") == (var.nhp_server_security_group_id == null))
+      )
+      error_message = "Private-primary nhp_server_internal_url and nhp_server_security_group_id must be set together or both omitted. The URL without its exact destination SG would require unsafe CIDR egress; an SG without the URL is stale authority."
+    }
+    precondition {
+      condition = (
+        var.public_ingress_enabled
+        || var.nhp_server_internal_url == ""
+        || can(regex("^http://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+internal:8888$", var.nhp_server_internal_url))
+      )
+      error_message = "Private-primary nhp_server_internal_url must be an HTTP private hosted-zone origin ending in .internal:8888. HTTPS or another port could use broad TCP/443 egress instead of the exact NHP server security-group rule."
     }
   }
 
-  # HTTP from public ALB (internet-facing)
+  # HTTP from the primary ALB. In private mode, the primary ALB itself accepts
+  # traffic only from exact caller SGs, so task ingress remains one hop wide.
   ingress {
     from_port       = var.container_port
     to_port         = var.container_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
-    description     = "HTTP from public ALB"
+    description     = var.public_ingress_enabled ? "HTTP from public ALB" : "HTTP from private cell ALB"
   }
 
   # Legacy in-VPC bypass — kept while enforce_internal_alb_only = false so
@@ -1319,17 +1456,87 @@ resource "aws_security_group" "ecs" {
     }
   }
 
-  # All outbound (DynamoDB, Secrets Manager, Redis, etc.)
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
+  # Preserve cell0's established egress shape exactly. Private cells start
+  # narrower: HTTPS for Auth0/AWS APIs/webhooks, DNS to the VPC resolver, and
+  # the cell-local NHP internal API. Stateful SG return traffic needs no
+  # separate rule.
+  dynamic "egress" {
+    for_each = var.public_ingress_enabled ? [1] : []
+    content {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "All outbound"
+    }
+  }
+
+  dynamic "egress" {
+    for_each = var.public_ingress_enabled ? [] : [1]
+    content {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTPS to Auth0, AWS APIs, and configured webhooks"
+    }
+  }
+
+  dynamic "egress" {
+    for_each = var.public_ingress_enabled ? [] : toset(["tcp", "udp"])
+    content {
+      from_port   = 53
+      to_port     = 53
+      protocol    = egress.value
+      cidr_blocks = ["${cidrhost(var.vpc_cidr, 2)}/32"]
+      description = "DNS to VPC resolver"
+    }
+  }
+
+  dynamic "egress" {
+    for_each = !var.public_ingress_enabled && var.nhp_server_security_group_id != null ? [1] : []
+    content {
+      from_port       = 8888
+      to_port         = 8888
+      protocol        = "tcp"
+      security_groups = [var.nhp_server_security_group_id]
+      description     = "HTTP to exact cell-local NHP server SG"
+    }
+  }
+
+  dynamic "egress" {
+    for_each = !var.public_ingress_enabled && var.redis_enabled ? [1] : []
+    content {
+      from_port       = 6379
+      to_port         = 6379
+      protocol        = "tcp"
+      security_groups = [var.redis_security_group_id]
+      description     = "Redis from private qurl-service"
+    }
   }
 
   tags = merge(var.tags, {
     Name      = "${local.service_name}-ecs-sg"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+# Private primary ALBs can initiate only application-port traffic to the exact
+# task SG. Keeping this as a standalone rule avoids the inline SG dependency
+# cycle: the task SG already references the ALB SG for ingress.
+resource "aws_vpc_security_group_egress_rule" "alb_to_ecs_private" {
+  count = var.public_ingress_enabled ? 0 : 1
+
+  security_group_id            = aws_security_group.alb.id
+  description                  = "Private qurl ALB to exact ECS task SG"
+  from_port                    = var.container_port
+  to_port                      = var.container_port
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.ecs.id
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-alb-to-ecs"
     Component = "qurl-service"
     Cell      = var.cell_id
   })
@@ -1401,14 +1608,15 @@ resource "aws_ecs_task_definition" "qurl" {
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
-  # Note: Initial deployment uses "latest" tag from SSM parameter default value.
-  # CI pipeline updates the SSM parameter and deploys new task definitions independently.
-  # Terraform ignores task_definition changes after initial creation (lifecycle.ignore_changes).
+  # Existing cell0 keeps the CI-managed tag path. Private multi-cell runtimes
+  # supply an immutable digest plus full source revision and therefore render
+  # repo@sha256 directly. The task-definition lifecycle precondition rejects
+  # half a contract before ECS can register a task definition.
   container_definitions = jsonencode(concat(
     # QURL API container (always present)
     [{
       name  = "qurl-api"
-      image = "${var.ecr_repo_url}:${aws_ssm_parameter.image_tag.value}"
+      image = var.image_uri != null ? var.image_uri : "${var.ecr_repo_url}:${aws_ssm_parameter.image_tag.value}"
 
       portMappings = [{
         containerPort = var.container_port
@@ -1580,6 +1788,10 @@ resource "aws_ecs_task_definition" "qurl" {
   # Note: When grafana_cloud_enabled=true, CPU is set to max(container_cpu, 512) and memory is increased by 256MB
   lifecycle {
     precondition {
+      condition     = (var.image_uri == null) == (var.source_revision == null)
+      error_message = "image_uri and source_revision must be set together or both left null. An immutable image without its exact source revision (or vice versa) is not deployable provenance."
+    }
+    precondition {
       condition = (
         # When ADOT sidecar is enabled, effective CPU is max(container_cpu, 512) and memory += 256
         var.grafana_cloud_enabled ? (
@@ -1607,12 +1819,12 @@ resource "aws_ecs_task_definition" "qurl" {
 
     precondition {
       condition     = var.environment != "prod" || (var.cors_allowed_origins != "" && var.cors_allowed_origins != "*")
-      error_message = "Production requires explicit CORS origins, not empty or wildcard."
+      error_message = "Every production qurl-service requires explicit CORS origins, not empty or wildcard. Private-primary cells may use their exact cell-local internal origin, but qurl-service still validates this value at startup."
     }
 
     precondition {
-      condition     = var.environment != "prod" || startswith(local.computed_api_base_url, "https://")
-      error_message = "Production requires HTTPS: API_BASE_URL must use https:// in prod environment. Either provide certificate_arn or set api_base_url to an https:// URL."
+      condition     = var.environment != "prod" || !var.public_ingress_enabled || startswith(local.computed_api_base_url, "https://")
+      error_message = "Production public ingress requires HTTPS: API_BASE_URL must use https://. Private-primary cells may use their SG-fenced VPC HTTP origin."
     }
 
     # Fails at plan time if QURL_TRUSTED_PROXY_CIDRS would be empty —
@@ -1655,8 +1867,8 @@ resource "aws_ecs_task_definition" "qurl" {
 # ==================== Application Load Balancer ====================
 
 resource "aws_lb" "qurl" {
-  name               = replace(local.short_name, "_", "-")
-  internal           = false
+  name               = local.short_name
+  internal           = !var.public_ingress_enabled
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   # The set of subnets here is also the source for QURL_TRUSTED_PROXY_CIDRS
@@ -1665,6 +1877,10 @@ resource "aws_lb" "qurl" {
   # data.aws_subnet.alb, or the trust list will silently drift from the
   # actual ALB origin IPs and reopen a narrow XFF-spoofing class.
   subnets = var.public_subnet_ids
+
+  # The existing public ALB retains the provider default. Private cell ALBs
+  # reject malformed headers before the request can reach qurl-service.
+  drop_invalid_header_fields = !var.public_ingress_enabled
 
   # Access logging for production audit compliance
   dynamic "access_logs" {
@@ -1684,6 +1900,20 @@ resource "aws_lb" "qurl" {
 
   lifecycle {
     precondition {
+      condition = (
+        (var.public_ingress_enabled && length(var.ingress_security_group_ids) == 0)
+        || (!var.public_ingress_enabled && length(var.ingress_security_group_ids) > 0)
+      )
+      error_message = "Primary qurl-service ingress must be exactly one mode: public_ingress_enabled=true with no source SGs, or public_ingress_enabled=false with at least one exact ingress_security_group_ids entry."
+    }
+    precondition {
+      condition = (
+        var.public_ingress_enabled
+        || (var.domain_name == null && var.certificate_arn == null)
+      )
+      error_message = "Private primary ingress is HTTP inside the cell and must not configure the public domain/certificate path. Keep domain_name and certificate_arn null and publish a private DNS alias at the environment root."
+    }
+    precondition {
       condition     = var.environment != "prod" || var.alb_access_logs_bucket != null
       error_message = "ALB access logs bucket is required for production environments for audit compliance."
     }
@@ -1691,7 +1921,7 @@ resource "aws_lb" "qurl" {
 }
 
 resource "aws_lb_target_group" "qurl" {
-  name        = replace("${var.name_prefix}-${var.cell_id}-qurl", "_", "-")
+  name        = local.short_name
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
@@ -1994,13 +2224,15 @@ resource "aws_ssm_parameter" "public_internal_lockdown_body" {
 
 # HTTP Listener (redirect to HTTPS when domain configured, otherwise forward)
 # WARNING: When domain_name is null, traffic is served over unencrypted HTTP.
-# This should only be used during initial setup before certificate provisioning.
-# For production, always provide a domain_name (which implies certificate).
+# For an internet-facing ALB this is initial-setup-only before certificate
+# provisioning. A private-primary cell intentionally keeps this HTTP-only
+# listener inside the VPC, fenced by exact source SGs; no SDK or public client
+# reaches it. Production public ingress always requires domain_name/HTTPS.
 resource "aws_lb_listener" "http" {
   lifecycle {
     precondition {
-      condition     = var.environment != "prod" || var.domain_name != null
-      error_message = "Production requires HTTPS: domain_name must be provided for prod environment."
+      condition     = var.environment != "prod" || !var.public_ingress_enabled || var.domain_name != null
+      error_message = "Production public ingress requires HTTPS: domain_name must be provided. Private-primary cells intentionally use their internal HTTP listener."
     }
   }
 

@@ -1,14 +1,13 @@
 # =============================================================================
-# Sandbox cell1 — lean, standalone NHP-server cell (Step 6 of the two-cell UDP
-# substrate for the qURL Connector).
+# Sandbox cell1 — isolated NHP-server plus private qurl-service data plane.
 # =============================================================================
 #
-# SCOPE DECISION (leanest that satisfies the two-cell UDP proof):
-#   The proof is "agent registers on cell0 -> is reassigned to cell1 ->
-#   refreshes on cell1". The only NEW infrastructure that requires is a second
-#   public UDP:62206 knock endpoint (NLB) fronting a second NHP-server fleet,
-#   discoverable by the control/deploy plane via SSM, in an isolated,
-#   non-overlapping VPC. This root therefore provisions:
+# SCOPE DECISION:
+#   A provisionable cell is a working cell-local data plane, not only a second
+#   UDP socket. This root therefore owns the NHP UDP server fleet and a
+#   dark-by-default private qurl-service ECS service with cell-local state. The
+#   public assignment/catalog plane remains elsewhere and does not activate
+#   cell1 merely because these healthy private tasks exist. This root provisions:
 #
 #     * networking  — cell1 VPC (10.104.0.0/16), public/private subnets, 1 NAT.
 #     * kms         — cell1 CMKs (ebs/logs/secrets) for at-rest encryption.
@@ -26,13 +25,13 @@
 #                     UDP listener, and the /sandbox-cell1/nhp/server/* SSM
 #                     parameters incl. udp-listener-arn.
 #     * dns         — cell1.nhp.layerv.xyz A-alias -> cell1 NLB.
+#     * qurl-service — optional, dark-by-default private ECS/ALB data plane.
 #
-# EXPLICITLY OMITTED (justified — not needed for a UDP substrate proof):
-#   * AC (deploy_ac) / qurl-service / relay / redis / billing / developer-portal
+# EXPLICITLY OMITTED:
+#   * AC (deploy_ac) / relay / redis / billing / developer-portal
 #     / status-page / bootstrap-alb / custom-domain-cert / qurl-link / e2e-echo
-#     / cost-analytics / grafana / auth0 — these are optional data-plane and
-#     control-plane features. The knock/refresh proof exercises the NHP UDP
-#     substrate only; the L7 data plane rides cell0's existing deployment.
+#     / cost-analytics / grafana / auth0 — these are not required for the
+#     private cell qurl-service/NHP data plane.
 #   * module.security (GuardDuty / AWS Config / Security Hub / WAF) — these are
 #     ACCOUNT SINGLETONS. cell0 already owns them; a second copy would collide.
 #     Not instantiating the giant root module is what keeps this guarantee.
@@ -150,7 +149,7 @@ module "kms" {
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
-  # qURL v2 keyed-identity is a data-plane feature; off for this lean cell.
+  # qURL v2 issuance/admission remains off in this dark topology slice.
   qurl_v2_issuer_key_enabled         = false
   qurl_v2_resource_keys_enabled      = false
   resource_key_envelope_create_after = null
@@ -171,8 +170,8 @@ module "networking" {
   # NLB -> private-subnet instances; iptables/NHP enforces access.
   allow_private_ingress_443 = true
 
-  # No qurl-service VPC endpoints and no relay in this lean cell.
-  deploy_vpc_endpoints                       = false
+  # QURL service endpoints are created only with the dark deployment gate.
+  deploy_vpc_endpoints                       = local.qurl_service_deployable
   enable_extensible_private_route_tables     = false
   extensible_private_route_table_ready_token = null
 }
@@ -209,8 +208,8 @@ module "dynamodb" {
 
   kms_key_arn = module.kms.secrets_key_arn
 
-  # qurl-service is not deployed in this cell.
-  deploy_qurl_tables = false
+  # Cell-local tables are independent from cell0 and from the Control Authority.
+  deploy_qurl_tables = local.qurl_service_deployable
   enable_sns_alerts  = false
 }
 
@@ -331,9 +330,19 @@ module "compute" {
   # udp-proof-runner's knock-auth model is fixed).
   auth_url = ""
 
-  # Minimal plugin set: the passcode knock plugin. The qURL plugin is omitted
-  # (no qurl_config) because qurl-service is not deployed in this cell.
-  server_plugins = ["passcode"]
+  # Keep qURL handling dark with the service gate. When enabled, NHP reaches
+  # only the cell1 private ALB alias and reads only the cell1 token secret.
+  server_plugins = local.qurl_service_deployable ? ["passcode", "qurl"] : ["passcode"]
+  qurl_config = local.qurl_service_deployable ? {
+    enabled                 = true
+    api_url                 = local.qurl_service_private_origin
+    allowed_redirect_domain = var.qurl_site_domain
+    api_timeout             = 10
+    max_idle_conns          = 20
+    max_idle_conns_per_host = 10
+    idle_conn_timeout       = 30
+  } : null
+  qurl_service_token_secret_arn = local.qurl_service_deployable ? aws_secretsmanager_secret.qurl_service["internal-token"].arn : null
 
   # HTTP timeouts (required; single source of truth in this root).
   http_timeouts_ms = local.http_timeouts_ms
@@ -354,21 +363,28 @@ module "compute" {
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
-  dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name # null (qurl tables off)
+  dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name
   dynamodb_ack_tokens_table     = module.dynamodb.ack_tokens_table_name
 
   # Blue/green REQUIRED so the udp-listener-arn SSM parameter is published.
   enable_blue_green      = true
   green_standby_min_size = var.green_standby_min_size
 
-  # No SNS alarm fan-out for this lean cell (skips blue/green alarms -> no
-  # monitoring module / SNS topic needed). alerts_sns_topic_arn stays null.
+  # No account-wide SNS alarm fan-out in this separate cell root (skips
+  # blue/green alarms and avoids duplicating cell0-owned monitoring).
+  # alerts_sns_topic_arn stays null.
   enable_sns_alerts = false
 
   # No termination-cleanup Lambda, no relay, no qURL resolve endpoint.
   enable_termination_cleanup = false
 
-  depends_on = [terraform_data.nhp_internal_auth_seed]
+  # Both plugin secrets must have a current value before any instance can
+  # render its boot-time environment. Secret creation alone is insufficient:
+  # the out-of-state seeders otherwise race the ASG launch template/instances.
+  depends_on = [
+    terraform_data.nhp_internal_auth_seed,
+    terraform_data.qurl_service_secret_seed,
+  ]
 }
 
 # -----------------------------------------------------------------------------

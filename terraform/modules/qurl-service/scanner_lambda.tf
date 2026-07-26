@@ -150,10 +150,11 @@ locals {
   # Keep these names in lockstep with
   # modules/ecr/main.tf::ecr_qurl_scanner_lambda_source_arn, which grants
   # Lambda image retrieval by matching `qurl-scanner` function names.
-  # terraform/main.tf passes the same `local.name_prefix` to both modules; if
-  # that root wiring ever splits, update the ECR SourceArn at the same time.
-  scanner_lambda_function_name         = "${var.name_prefix}-${var.cell_id}-qurl-scanner"
-  scanner_active_recheck_function_name = "${var.name_prefix}-${var.cell_id}-qurl-scanner-active-recheck"
+  # terraform/main.tf uses the default resource_name_prefix, keeping this in
+  # lockstep with the ECR SourceArn. A caller that overrides physical naming
+  # must provision the corresponding ECR source policy before enabling scanner.
+  scanner_lambda_function_name         = "${local.resource_name_prefix}-${var.cell_id}-qurl-scanner"
+  scanner_active_recheck_function_name = "${local.resource_name_prefix}-${var.cell_id}-qurl-scanner-active-recheck"
   scanner_active_recheck_enabled       = var.qurl_scanner_lambda_enabled && var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_tombstone_write_enabled && var.qurl_scanner_active_recheck_enabled
 
   # Shared tags carried by every scanner Lambda resource. `Name` is
@@ -165,7 +166,9 @@ locals {
   }
 
   scanner_lambda_base_env = {
-    QURL_SCANNER_TABLE_PREFIX = "${var.name_prefix}-${var.cell_id}"
+    # Prefer the caller's authoritative table prefix. The fallback preserves
+    # the historical direct-module behavior when the optional value is empty.
+    QURL_SCANNER_TABLE_PREFIX = var.dynamodb_table_prefix != "" ? var.dynamodb_table_prefix : "${local.resource_name_prefix}-${var.cell_id}"
   }
 
   # Conditional combines BOTH gates so the `[0]` lookup is unreachable when

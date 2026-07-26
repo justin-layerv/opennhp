@@ -1,5 +1,5 @@
-# Sandbox cell1 configuration — lean, standalone NHP-server cell.
-# Step 6 of the two-cell UDP substrate for the qURL Connector.
+# Sandbox cell1 configuration — isolated NHP server plus a dark-by-default
+# private qurl-service data plane.
 #
 # Every value here is also the variable default (see variables.tf); they are
 # pinned explicitly so the cell's identity is legible in one place and a future
@@ -39,6 +39,17 @@ green_standby_min_size = 0 # cold green standby; still publishes green TGs + swi
 
 # --- Server behavior (matches cell0 sandbox posture) -------------------------
 log_level = 4 # debug
+
+# --- Private qurl-service ----------------------------------------------------
+# Keep false until the qurl-service main-only publisher has populated
+# /sandbox-cell1/nhp/qurl-service/runtime-contract with one reviewed
+# {repo@sha256, full source revision} pair. Enabling this does NOT activate the
+# cell catalog; it creates a private-only ECS/ALB service for live proof.
+deploy_qurl_service = false
+qurl_auth0_domain   = "auth.layerv.ai"
+qurl_cookie_domain  = ".qurl.site.layerv.xyz"
+qurl_link_domain    = "qurl.link.layerv.xyz"
+qurl_site_domain    = "qurl.site.layerv.xyz"
 
 tags = {
   Organization = "LayerV"
