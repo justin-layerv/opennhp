@@ -74,6 +74,11 @@ EXPECTED_SANDBOX_MAIN_VPC_CIDR = "10.100.0.0/16"
 EXPECTED_SANDBOX_RELAY_VPC_CIDR = "10.101.0.0/16"
 EXPECTED_SANDBOX_CELL_ID = "cell0"
 EXPECTED_SANDBOX_SERVER_NLB_NAME = "layerv-nhp-sandbox-nlb"
+EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
+# Exact output of sandbox-udp-proof-runner's stable_source_cidr. This one-time
+# migration gate must move in lockstep with #3453's
+# public_nhp_udp_ingress_cidrs input if the proof-runner EIP is replaced.
+EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
 EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
 EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
 EXPECTED_SANDBOX_INTERNAL_UDP_TG_NAME = "layerv-nhp-sandbox-srv-int-udp"
@@ -87,11 +92,27 @@ EXPECTED_IPV4_DEFAULT_CIDR = "0.0.0.0/0"
 EXPECTED_HTTPS_PORT = 443
 EXPECTED_RELAY_BACKEND_PORT = 8080
 EXPECTED_NHP_SERVER_PORT = 62206
+EXPECTED_SERVER_HEALTH_PORT = 8888
 EXPECTED_RELAY_ACK_PORT = 62207
 EXPECTED_DEREGISTRATION_DELAY = 30
 EXPECTED_METRIC_NAMESPACE = "LayerV/NHP"
 EXPECTED_RELAY_HEALTH_PATH = "/health/live"
 EXPECTED_DNS_THREAT_CONFIDENCE = "HIGH"
+
+# Terraform resource types that express a security-group rule. The ingress-only
+# variant covers the standalone ingress rule plus the legacy inline-style
+# aws_security_group_rule; SG_RULE_RESOURCE_TYPES adds the egress rule for scans
+# that inventory both directions.
+INGRESS_SG_RULE_RESOURCE_TYPES = {
+    "aws_vpc_security_group_ingress_rule",
+    "aws_security_group_rule",
+}
+SG_RULE_RESOURCE_TYPES = INGRESS_SG_RULE_RESOURCE_TYPES | {
+    "aws_vpc_security_group_egress_rule",
+}
+# Protocols that are exclusively non-UDP; anything else (udp, -1/all, empty) is
+# treated as UDP-capable when fencing the public source surface.
+NON_UDP_PROTOCOLS = {"tcp", "icmp", "icmpv6"}
 
 
 EXPECTED_INTERFACE_ENDPOINTS = {
@@ -322,7 +343,9 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
         r"aws_lb_target_group\.(?:udp|udp_green|udp_internal|udp_internal_green)|"
         r"aws_autoscaling_attachment\.(?:server|server_internal)|"
         r"aws_autoscaling_group\.server_green|"
-        r"aws_vpc_security_group_ingress_rule\.server_nhp_udp(?:_additional)?)"
+        r"aws_security_group\.server_nlb|"
+        r"aws_vpc_security_group_ingress_rule\.(?:server_nhp_udp(?:_nlb|_additional)?|server_nlb_(?:udp|health))|"
+        r"aws_vpc_security_group_egress_rule\.server_nlb_(?:udp|health))"
         r"(?:\[|$)"
     ),
     re.compile(
@@ -354,9 +377,233 @@ def is_dmz_boundary_address(address: str) -> bool:
     return any(pattern.search(address) for pattern in DMZ_BOUNDARY_ADDRESS_PATTERNS)
 
 
-def validate_dmz_boundary_noop(plan: dict[str, Any]) -> list[str]:
-    """Reject boundary mutations from the automatic push-to-main apply path."""
+EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX = "module.nhp.module.compute"
+
+UDP_SOURCE_FENCE_NLB_REPLACEMENT = "public NLB replacement"
+UDP_SOURCE_FENCE_LISTENER_REPLACEMENT = "public UDP listener replacement"
+UDP_SOURCE_FENCE_NLB_SG_CREATE = "public NLB security group creation"
+UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE = "legacy public target ingress deletion"
+UDP_SOURCE_FENCE_TARGET_UDP_CREATE = "NLB-scoped target UDP ingress creation"
+UDP_SOURCE_FENCE_TARGET_HEALTH_CREATE = (
+    "NLB-scoped target health ingress creation"
+)
+UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE = "proof-runner UDP ingress creation"
+UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE = "NLB target UDP egress creation"
+UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE = (
+    "NLB target health egress creation"
+)
+
+
+def _udp_source_fence_compute_re(suffix: str) -> "re.Pattern[str]":
+    """Anchor a reviewed migration address under the compute module prefix."""
+    return re.compile(
+        rf"^{re.escape(EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX)}\.{suffix}$"
+    )
+
+
+UDP_SOURCE_FENCE_MIGRATION_ACTIONS = (
+    (
+        UDP_SOURCE_FENCE_NLB_REPLACEMENT,
+        _udp_source_fence_compute_re(r"aws_lb\.server\[0\]"),
+        ("create", "delete"),
+    ),
+    (
+        UDP_SOURCE_FENCE_LISTENER_REPLACEMENT,
+        _udp_source_fence_compute_re(r"aws_lb_listener\.udp\[0\]"),
+        ("delete", "create"),
+    ),
+    (
+        UDP_SOURCE_FENCE_NLB_SG_CREATE,
+        _udp_source_fence_compute_re(r"aws_security_group\.server_nlb\[0\]"),
+        ("create",),
+    ),
+    (
+        UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_ingress_rule\.server_nhp_udp\[0\]"
+        ),
+        ("delete",),
+    ),
+    (
+        UDP_SOURCE_FENCE_TARGET_UDP_CREATE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_ingress_rule\.server_nhp_udp_nlb\[0\]"
+        ),
+        ("create",),
+    ),
+    (
+        UDP_SOURCE_FENCE_TARGET_HEALTH_CREATE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_ingress_rule\.server_nlb_health\[0\]"
+        ),
+        ("create",),
+    ),
+    (
+        UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_ingress_rule\.server_nlb_udp\["
+            rf'"{re.escape(EXPECTED_SANDBOX_PROOF_SOURCE_CIDR)}"\]'
+        ),
+        ("create",),
+    ),
+    (
+        UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_egress_rule\.server_nlb_udp\[0\]"
+        ),
+        ("create",),
+    ),
+    (
+        UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE,
+        _udp_source_fence_compute_re(
+            r"aws_vpc_security_group_egress_rule\.server_nlb_health\[0\]"
+        ),
+        ("create",),
+    ),
+)
+UDP_SOURCE_FENCE_MIGRATION_KEYS = tuple(
+    key for key, _, _ in UDP_SOURCE_FENCE_MIGRATION_ACTIONS
+)
+if len(set(UDP_SOURCE_FENCE_MIGRATION_KEYS)) != len(
+    UDP_SOURCE_FENCE_MIGRATION_ACTIONS
+):
+    raise RuntimeError("UDP source-fence migration action keys must be unique")
+
+
+def udp_source_fence_migration_action_key(
+    address: str, actions: tuple[str, ...]
+) -> str | None:
+    """Return the exact reviewed migration step matched by an address/action pair."""
+    matches = [
+        key
+        for key, pattern, expected_actions in UDP_SOURCE_FENCE_MIGRATION_ACTIONS
+        if pattern.search(address) and actions == expected_actions
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def validate_udp_source_fence_transition(
+    steps_by_key: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Pin the reviewed legacy before-state and fenced after-state."""
     errors: list[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            errors.append(message)
+
+    def side(key: str, name: str) -> dict[str, Any] | None:
+        value = (steps_by_key[key].get("change") or {}).get(name)
+        return value if isinstance(value, dict) else None
+
+    nlb_before = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "before")
+    nlb_after = side(UDP_SOURCE_FENCE_NLB_REPLACEMENT, "after")
+    for values, expected_name, label in (
+        (nlb_before, EXPECTED_SANDBOX_SERVER_NLB_NAME, "legacy before-state"),
+        (
+            nlb_after,
+            EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME,
+            "fenced after-state",
+        ),
+    ):
+        tags = (values or {}).get("tags")
+        require(
+            values is not None
+            and values.get("name") == expected_name
+            and values.get("internal") is False
+            and values.get("load_balancer_type") == "network"
+            and isinstance(tags, dict)
+            and tags.get("Environment") == "sandbox"
+            and tags.get("Component") == "compute"
+            and tags.get("Cell") == EXPECTED_SANDBOX_CELL_ID
+            and tags.get("Name") == expected_name,
+            f"UDP source-fence public NLB {label} is not the exact reviewed identity",
+        )
+    require(
+        nlb_before is not None and nlb_before.get("security_groups") == [],
+        "UDP source-fence public NLB legacy before-state must have no attached security groups",
+    )
+
+    listener_before = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "before")
+    listener_after = side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after")
+    listener_after_unknown = (
+        side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after_unknown") or {}
+    )
+    for values, label in (
+        (listener_before, "legacy before-state"),
+        (listener_after, "fenced after-state"),
+    ):
+        require(
+            values is not None
+            and values.get("protocol") == "UDP"
+            and values.get("port") == EXPECTED_NHP_SERVER_PORT,
+            f"UDP source-fence listener {label} must remain UDP 62206",
+        )
+        default_actions = (values or {}).get("default_action")
+        target_group_arn = (
+            default_actions[0].get("target_group_arn")
+            if isinstance(default_actions, list)
+            and len(default_actions) == 1
+            and isinstance(default_actions[0], dict)
+            else None
+        )
+        require(
+            isinstance(target_group_arn, str)
+            and f"/{EXPECTED_SANDBOX_SERVER_UDP_TG_NAME}/" in target_group_arn,
+            f"UDP source-fence listener {label} must retain the canonical public UDP target group",
+        )
+    legacy_listener_nlb_arn = (listener_before or {}).get("load_balancer_arn")
+    require(
+        isinstance(legacy_listener_nlb_arn, str)
+        and f"/{EXPECTED_SANDBOX_SERVER_NLB_NAME}/" in legacy_listener_nlb_arn,
+        "UDP source-fence listener before-state must target the canonical legacy public NLB",
+    )
+    require(
+        (listener_after or {}).get("load_balancer_arn") in (None, "")
+        and listener_after_unknown.get("load_balancer_arn") is True,
+        "UDP source-fence listener after-state must explicitly depend on the newly-created public NLB",
+    )
+
+    legacy_ingress = steps_by_key[UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE]
+    legacy_ingress_before = side(
+        UDP_SOURCE_FENCE_LEGACY_INGRESS_DELETE, "before"
+    )
+    require(
+        legacy_ingress.get("type") == "aws_vpc_security_group_ingress_rule"
+        and legacy_ingress.get("name") == "server_nhp_udp"
+        and legacy_ingress_before is not None
+        and legacy_ingress_before.get("ip_protocol") == "udp"
+        and legacy_ingress_before.get("from_port") == EXPECTED_NHP_SERVER_PORT
+        and legacy_ingress_before.get("to_port") == EXPECTED_NHP_SERVER_PORT
+        and legacy_ingress_before.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR
+        and (legacy_ingress.get("change") or {}).get("after") is None,
+        "UDP source-fence legacy server ingress deletion must remove exactly public UDP 62206",
+    )
+
+    for key in (
+        UDP_SOURCE_FENCE_NLB_SG_CREATE,
+        UDP_SOURCE_FENCE_TARGET_UDP_CREATE,
+        UDP_SOURCE_FENCE_TARGET_HEALTH_CREATE,
+        UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE,
+        UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE,
+        UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE,
+    ):
+        change = steps_by_key[key].get("change") or {}
+        require(
+            change.get("before") is None and isinstance(change.get("after"), dict),
+            f"UDP source-fence create step {key} must be a pure create",
+        )
+    return errors
+
+
+def validate_dmz_boundary_noop(
+    plan: dict[str, Any], *, allow_udp_source_fence_replacement: bool = False
+) -> list[str]:
+    """Reject automatic boundary mutations outside the exact reviewed migration."""
+    errors: list[str] = []
+    migration_steps: list[
+        tuple[dict[str, Any], str, tuple[str, ...], str | None]
+    ] = []
     for raw in plan.get("resource_changes", []):
         if raw.get("mode", "managed") != "managed":
             continue
@@ -365,12 +612,68 @@ def validate_dmz_boundary_noop(plan: dict[str, Any]) -> list[str]:
             continue
         actions = tuple((raw.get("change") or {}).get("actions") or ())
         if actions != ("no-op",):
+            if allow_udp_source_fence_replacement:
+                migration_steps.append(
+                    (
+                        raw,
+                        address,
+                        actions,
+                        udp_source_fence_migration_action_key(address, actions),
+                    )
+                )
+                continue
             errors.append(
                 "automatic apply refuses relay-DMZ boundary change "
                 f"{address} ({', '.join(actions) or 'missing actions'}); "
                 "ordinary deployments require a no-op boundary; introduce a "
                 "newly reviewed temporary migration path before changing it"
             )
+    if not migration_steps:
+        return errors
+
+    invalid_steps = [
+        (address, actions)
+        for _, address, actions, matched_key in migration_steps
+        if matched_key is None
+    ]
+    for address, actions in invalid_steps:
+        errors.append(
+            "automatic apply refuses unreviewed UDP source-fence boundary change "
+            f"{address} ({', '.join(actions) or 'missing actions'})"
+        )
+
+    matched_key_counts = Counter(
+        matched_key
+        for _, _, _, matched_key in migration_steps
+        if matched_key is not None
+    )
+    duplicate_keys = sorted(
+        key for key, count in matched_key_counts.items() if count != 1
+    )
+    missing_keys = sorted(
+        set(UDP_SOURCE_FENCE_MIGRATION_KEYS) - matched_key_counts.keys()
+    )
+    if invalid_steps or duplicate_keys or missing_keys:
+        errors.append(
+            "UDP source-fence migration must contain the exact reviewed nine-step "
+            "boundary action graph"
+            + (f"; missing: {', '.join(missing_keys)}" if missing_keys else "")
+            + (
+                f"; duplicated: {', '.join(duplicate_keys)}"
+                if duplicate_keys
+                else ""
+            )
+        )
+    else:
+        errors.extend(
+            validate_udp_source_fence_transition(
+                {
+                    matched_key: raw
+                    for raw, _, _, matched_key in migration_steps
+                    if matched_key is not None
+                }
+            )
+        )
     return errors
 
 
@@ -453,6 +756,30 @@ def resources_named(
         for resource in resources
         if resource.resource_type == resource_type and resource.name == name
     ]
+
+
+def _sg_rule_protocol(resource: PlannedResource) -> str:
+    """Lowercased protocol of a planned SG rule (ip_protocol or legacy protocol)."""
+    return str(
+        resource.values.get("ip_protocol", resource.values.get("protocol", ""))
+    ).lower()
+
+
+def public_udp_capable_rule(resource: PlannedResource) -> bool:
+    """True for an internet-wide SG rule not proven exclusively non-UDP."""
+    if not (
+        resource.values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR
+        or resource.values.get("cidr_ipv6") == "::/0"
+    ):
+        return False
+    return planned_udp_capable_sg_rule(resource)
+
+
+def planned_udp_capable_sg_rule(resource: PlannedResource) -> bool:
+    """True for a planned SG rule whose protocol is not exclusively TCP/ICMP."""
+    if resource.resource_type not in INGRESS_SG_RULE_RESOURCE_TYPES:
+        return False
+    return _sg_rule_protocol(resource) not in NON_UDP_PROTOCOLS
 
 
 def address_is_scoped_resource(
@@ -625,6 +952,11 @@ def call_refs(call: dict[str, Any] | None, argument: str) -> set[str]:
     return references((call.get("expressions") or {}).get(argument))
 
 
+def ref_targets(ref: str, base: str) -> bool:
+    """True when a config reference traverses the reviewed base resource."""
+    return ref == base or ref.startswith(f"{base}.") or ref.startswith(f"{base}[")
+
+
 def references_exact_resources(
     refs: set[str],
     expected: set[str],
@@ -643,12 +975,11 @@ def references_exact_resources(
         return False
     resource_refs = {ref for ref in refs if ref.startswith(("aws_", "terraform_data."))}
 
-    def targets(ref: str, base: str) -> bool:
-        return ref == base or ref.startswith(f"{base}.") or ref.startswith(f"{base}[")
-
     return all(
-        any(targets(ref, base) for ref in resource_refs) for base in expected
-    ) and all(any(targets(ref, base) for base in expected) for ref in resource_refs)
+        any(ref_targets(ref, base) for ref in resource_refs) for base in expected
+    ) and all(
+        any(ref_targets(ref, base) for base in expected) for ref in resource_refs
+    )
 
 
 def refs_match_expected(refs: set[str], expected: str) -> bool:
@@ -1582,10 +1913,26 @@ def validate_plan(
     require_enabled: bool = True,
     require_pr0_applied: bool = False,
     require_dmz_boundary_noop: bool = False,
+    require_udp_source_fenced_topology: bool = False,
+    allow_udp_source_fence_replacement: bool = False,
 ) -> list[str]:
+    if allow_udp_source_fence_replacement and not require_dmz_boundary_noop:
+        return [
+            "allow_udp_source_fence_replacement requires "
+            "require_dmz_boundary_noop"
+        ]
     v = Validation()
+    source_fenced_topology = (
+        require_udp_source_fenced_topology
+        or allow_udp_source_fence_replacement
+    )
     if require_dmz_boundary_noop:
-        v.errors.extend(validate_dmz_boundary_noop(plan))
+        v.errors.extend(
+            validate_dmz_boundary_noop(
+                plan,
+                allow_udp_source_fence_replacement=allow_udp_source_fence_replacement,
+            )
+        )
     for raw in plan.get("resource_changes", []):
         if raw.get("mode", "managed") != "managed":
             continue
@@ -3285,23 +3632,50 @@ def validate_plan(
         if len(public_server_nlb) == 1
         else []
     )
+    expected_public_server_nlb_name = (
+        EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME
+        if source_fenced_topology
+        else EXPECTED_SANDBOX_SERVER_NLB_NAME
+    )
     expected_public_server_nlb_tags = {
         "Environment": "sandbox",
         "Component": "compute",
         "Cell": EXPECTED_SANDBOX_CELL_ID,
-        "Name": EXPECTED_SANDBOX_SERVER_NLB_NAME,
+        "Name": expected_public_server_nlb_name,
     }
+    public_server_nlb_security_groups = (
+        public_server_nlb[0].values.get("security_groups")
+        if len(public_server_nlb) == 1
+        else None
+    )
+    public_server_nlb_security_groups_unknown = (
+        (public_server_nlb[0].after_unknown or {}).get("security_groups") is True
+        if len(public_server_nlb) == 1
+        else False
+    )
     v.require(
         len(public_server_nlb) == 1
         and public_server_nlb[0].values.get("internal") is False
         and public_server_nlb[0].values.get("load_balancer_type") == "network"
-        and public_server_nlb[0].values.get("name") == EXPECTED_SANDBOX_SERVER_NLB_NAME
+        and public_server_nlb[0].values.get("name") == expected_public_server_nlb_name
+        and (
+            (
+                len(public_server_nlb_security_groups or []) == 1
+                or (
+                    public_server_nlb_security_groups in (None, [])
+                    and public_server_nlb_security_groups_unknown
+                )
+            )
+            if source_fenced_topology
+            else not public_server_nlb_security_groups
+            and not public_server_nlb_security_groups_unknown
+        )
         and isinstance(public_server_nlb_tags, dict)
         and all(
             public_server_nlb_tags.get(key) == value
             for key, value in expected_public_server_nlb_tags.items()
         ),
-        "assigned cell must retain exactly one canonically named and tagged internet-facing server NLB",
+        "assigned cell must retain exactly one canonically named and tagged internet-facing server NLB with its mode-appropriate security-group posture",
     )
     public_target_group_specs = (
         (
@@ -3363,7 +3737,6 @@ def validate_plan(
             and preserve_expression.get("constant_value") is True,
             error_message,
         )
-    public_server_target_group = public_target_groups["udp"]
     public_server_green_target_group = public_target_groups["udp_green"]
     udp_capable_listeners = [
         resource
@@ -3425,33 +3798,9 @@ def validate_plan(
         ),
         "assigned cell server NLB must be the only internet-facing compute NLB",
     )
-    server_base = resources_named(
-        compute, "aws_vpc_security_group_ingress_rule", "server_nhp_udp"
-    )
-    v.require(
-        len(server_base) == 1
-        and server_base[0].values.get("ip_protocol") == "udp"
-        and server_base[0].values.get("from_port") == EXPECTED_NHP_SERVER_PORT
-        and server_base[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
-        and server_base[0].values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR,
-        "assigned cell server SG must accept public NHP UDP 62206",
-    )
-    server_base_config = config_resource(
-        v,
-        compute_config,
-        "aws_vpc_security_group_ingress_rule",
-        "server_nhp_udp",
-    )
-    v.require(
-        references_exact_resources(
-            expression_refs(server_base_config, "security_group_id"),
-            {"aws_security_group.server"},
-        ),
-        "assigned cell public UDP 62206 rule must belong only to the canonical server SG",
-    )
-    server_sg_config = config_resource(
-        v, compute_config, "aws_security_group", "server"
-    )
+    # The canonical server SG must use only reviewed standalone rules in both the
+    # legacy and source-fenced topologies, so assert its shape once before the fork.
+    server_sg_config = config_resource(v, compute_config, "aws_security_group", "server")
     server_sg_expressions = (server_sg_config or {}).get("expressions") or {}
     v.require(
         server_sg_config is not None
@@ -3464,39 +3813,478 @@ def validate_plan(
         ),
         "legacy aws_security_group_rule resources are forbidden in the assigned-cell compute module",
     )
+    if source_fenced_topology:
+        nlb_security_group = resources_named(compute, "aws_security_group", "server_nlb")
+        v.require(
+            len(nlb_security_group) == 1,
+            "assigned cell public NLB must own exactly one dedicated security group",
+        )
+        nlb_security_group_id = (
+            nlb_security_group[0].values.get("id")
+            if len(nlb_security_group) == 1
+            else None
+        )
+        server_security_group = resources_named(compute, "aws_security_group", "server")
+        server_security_group_id = (
+            server_security_group[0].values.get("id")
+            if len(server_security_group) == 1
+            else None
+        )
+        v.require(
+            len(nlb_security_group) == 1
+            and (
+                isinstance(nlb_security_group_id, str)
+                and bool(nlb_security_group_id)
+                or (nlb_security_group[0].after_unknown or {}).get("id") is True
+            ),
+            "assigned cell public NLB SG must have a resolved or explicitly unknown planned ID",
+        )
+        v.require(
+            len(server_security_group) == 1
+            and isinstance(server_security_group_id, str)
+            and bool(server_security_group_id),
+            "assigned cell must retain exactly one existing canonical server SG with a resolved ID",
+        )
 
-    def public_udp_capable_rule(resource: PlannedResource) -> bool:
-        if resource.resource_type not in {
+        def exact_sg_reference(
+            resource: PlannedResource, field: str, expected_id: object
+        ) -> bool:
+            """Require a resolved SG ID, or an explicitly unknown planned reference."""
+            if isinstance(expected_id, str) and expected_id:
+                return resource.values.get(field) == expected_id
+            return (
+                resource.values.get(field) in (None, "")
+                and (resource.after_unknown or {}).get(field) is True
+            )
+
+        v.require(
+            len(public_server_nlb) == 1
+            and (
+                public_server_nlb_security_groups == [nlb_security_group_id]
+                if isinstance(nlb_security_group_id, str) and nlb_security_group_id
+                else public_server_nlb_security_groups in (None, [])
+                and public_server_nlb_security_groups_unknown
+            ),
+            "assigned cell public NLB must attach exactly its dedicated security group at creation",
+        )
+        public_server_nlb_config = config_resource(
+            v, compute_config, "aws_lb", "server"
+        )
+        v.require(
+            references_exact_resources(
+                expression_refs(public_server_nlb_config, "security_groups"),
+                {"aws_security_group.server_nlb"},
+                allowed_metadata=frozenset({"var.public_nhp_udp_ingress_cidrs"}),
+            ),
+            "assigned cell public NLB security_groups must reference only its dedicated SG in authored config",
+        )
+        nlb_security_group_config = config_resource(
+            v, compute_config, "aws_security_group", "server_nlb"
+        )
+        nlb_security_group_expressions = (
+            (nlb_security_group_config or {}).get("expressions") or {}
+        )
+        v.require(
+            nlb_security_group_config is not None
+            and not ({"ingress", "egress"} & set(nlb_security_group_expressions)),
+            "assigned cell public NLB SG must use only reviewed standalone rules and declare no inline ingress or egress",
+        )
+
+        # Plan values for a newly-created SG ID are intentionally unknown. Bind the
+        # authored graph as well as the resolved after-state so another standalone
+        # rule cannot silently target the NLB SG under an unreviewed resource name.
+        expected_nlb_rule_config = {
+            ("aws_vpc_security_group_ingress_rule", "server_nlb_udp"),
+            ("aws_vpc_security_group_egress_rule", "server_nlb_udp"),
+            ("aws_vpc_security_group_egress_rule", "server_nlb_health"),
+        }
+        actual_nlb_rule_config: set[tuple[str, str]] = set()
+        for configured in (compute_config or {}).get("resources", []):
+            resource_type = str(configured.get("type", ""))
+            if resource_type not in SG_RULE_RESOURCE_TYPES:
+                continue
+            security_group_refs = expression_refs(configured, "security_group_id")
+            if any(
+                ref_targets(ref, "aws_security_group.server_nlb")
+                for ref in security_group_refs
+            ):
+                actual_nlb_rule_config.add(
+                    (resource_type, str(configured.get("name", "")))
+                )
+        v.require(
+            actual_nlb_rule_config == expected_nlb_rule_config,
+            "assigned cell public NLB SG standalone ingress/egress inventory must be exactly proof UDP plus target UDP and health egress",
+        )
+        if isinstance(nlb_security_group_id, str) and nlb_security_group_id:
+            actual_nlb_planned_rule_list = [
+                (resource.resource_type, resource.name)
+                for resource in resources
+                if resource.resource_type in SG_RULE_RESOURCE_TYPES
+                and resource.values.get("security_group_id") == nlb_security_group_id
+            ]
+            v.require(
+                len(actual_nlb_planned_rule_list) == 3
+                and set(actual_nlb_planned_rule_list) == expected_nlb_rule_config,
+                "global planned rule inventory targeting the assigned cell public NLB SG must be exactly proof UDP plus target UDP and health egress",
+            )
+        nlb_public_ingress = resources_named(
+            compute, "aws_vpc_security_group_ingress_rule", "server_nlb_udp"
+        )
+        v.require(
+            len(nlb_public_ingress) == 1
+            and exact_sg_reference(
+                nlb_public_ingress[0],
+                "security_group_id",
+                nlb_security_group_id,
+            )
+            and nlb_public_ingress[0].values.get("ip_protocol") == "udp"
+            and nlb_public_ingress[0].values.get("from_port")
+            == EXPECTED_NHP_SERVER_PORT
+            and nlb_public_ingress[0].values.get("to_port")
+            == EXPECTED_NHP_SERVER_PORT
+            and nlb_public_ingress[0].values.get("cidr_ipv4")
+            == EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
+            "assigned cell public NLB ingress must be exactly proof-runner /32 UDP 62206",
+        )
+        nlb_public_ingress_config = config_resource(
+            v,
+            compute_config,
             "aws_vpc_security_group_ingress_rule",
-            "aws_security_group_rule",
-        }:
-            return False
-        if not (
-            resource.values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR
-            or resource.values.get("cidr_ipv6") == "::/0"
-        ):
-            return False
-        protocol = str(
-            resource.values.get("ip_protocol", resource.values.get("protocol", ""))
-        ).lower()
-        if protocol not in {"udp", "-1", "all"}:
-            return False
-        return True
+            "server_nlb_udp",
+        )
+        v.require(
+            references_exact_resources(
+                expression_refs(nlb_public_ingress_config, "security_group_id"),
+                {"aws_security_group.server_nlb"},
+            )
+            and expression_refs(nlb_public_ingress_config, "cidr_ipv4") == {"each.value"}
+            and references(
+                (nlb_public_ingress_config or {}).get("for_each_expression")
+            )
+            == {"var.public_nhp_udp_ingress_cidrs"},
+            "assigned cell public NLB ingress authored config must bind only the NLB SG and reviewed source list",
+        )
+        server_base = resources_named(
+            compute, "aws_vpc_security_group_ingress_rule", "server_nhp_udp_nlb"
+        )
+        v.require(
+            len(server_base) == 1
+            and server_base[0].values.get("ip_protocol") == "udp"
+            and server_base[0].values.get("from_port") == EXPECTED_NHP_SERVER_PORT
+            and server_base[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
+            and exact_sg_reference(
+                server_base[0], "security_group_id", server_security_group_id
+            )
+            and exact_sg_reference(
+                server_base[0],
+                "referenced_security_group_id",
+                nlb_security_group_id,
+            )
+            and server_base[0].values.get("cidr_ipv4") in (None, ""),
+            "assigned cell server SG must accept NHP UDP 62206 only from the public NLB SG",
+        )
+        server_base_config = config_resource(
+            v,
+            compute_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nhp_udp_nlb",
+        )
+        v.require(
+            references_exact_resources(
+                expression_refs(server_base_config, "security_group_id"),
+                {"aws_security_group.server"},
+            )
+            and references_exact_resources(
+                expression_refs(server_base_config, "referenced_security_group_id"),
+                {"aws_security_group.server_nlb"},
+            ),
+            "assigned cell target UDP rule must bind only the canonical server and NLB SGs",
+        )
+        server_health = resources_named(
+            compute, "aws_vpc_security_group_ingress_rule", "server_nlb_health"
+        )
+        v.require(
+            len(server_health) == 1
+            and server_health[0].values.get("ip_protocol") == "tcp"
+            and server_health[0].values.get("from_port")
+            == EXPECTED_SERVER_HEALTH_PORT
+            and server_health[0].values.get("to_port")
+            == EXPECTED_SERVER_HEALTH_PORT
+            and exact_sg_reference(
+                server_health[0], "security_group_id", server_security_group_id
+            )
+            and exact_sg_reference(
+                server_health[0],
+                "referenced_security_group_id",
+                nlb_security_group_id,
+            )
+            and server_health[0].values.get("cidr_ipv4") in (None, ""),
+            "assigned cell server SG must accept TCP 8888 health only from the public NLB SG",
+        )
+        server_health_config = config_resource(
+            v,
+            compute_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nlb_health",
+        )
+        v.require(
+            references_exact_resources(
+                expression_refs(server_health_config, "security_group_id"),
+                {"aws_security_group.server"},
+            )
+            and references_exact_resources(
+                expression_refs(server_health_config, "referenced_security_group_id"),
+                {"aws_security_group.server_nlb"},
+            ),
+            "assigned cell target health rule must bind only the canonical server and NLB SGs",
+        )
 
-    public_server_udp_rules = [
-        resource for resource in compute if public_udp_capable_rule(resource)
-    ]
-    v.require(
-        len(public_server_udp_rules) == 1
-        and public_server_udp_rules[0].name == "server_nhp_udp"
-        and public_server_udp_rules[0].values.get("ip_protocol") == "udp"
-        and public_server_udp_rules[0].values.get("from_port")
-        == EXPECTED_NHP_SERVER_PORT
-        and public_server_udp_rules[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
-        and public_server_udp_rules[0].values.get("cidr_ipv4")
-        == EXPECTED_IPV4_DEFAULT_CIDR,
-        "server SG public UDP-capable ingress must be exactly server_nhp_udp on UDP 62206",
-    )
+        def configured_udp_capable(configured: dict[str, Any]) -> bool:
+            expressions = configured.get("expressions") or {}
+            protocol_expression = expressions.get(
+                "ip_protocol", expressions.get("protocol")
+            )
+            protocol = (
+                protocol_expression.get("constant_value")
+                if isinstance(protocol_expression, dict)
+                else None
+            )
+            return str(protocol or "").lower() not in NON_UDP_PROTOCOLS
+
+        expected_compute_udp_ingress_config = {
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp"),
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_additional"),
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_nlb"),
+            ("aws_vpc_security_group_ingress_rule", "server_nlb_udp"),
+        }
+        actual_compute_udp_ingress_config = {
+            (str(configured.get("type", "")), str(configured.get("name", "")))
+            for configured in (compute_config or {}).get("resources", [])
+            if configured.get("type") in INGRESS_SG_RULE_RESOURCE_TYPES
+            and configured_udp_capable(configured)
+        }
+        v.require(
+            actual_compute_udp_ingress_config
+            == expected_compute_udp_ingress_config,
+            "assigned-cell compute authored UDP-capable ingress inventory must contain only the exact reviewed target and NLB rules",
+        )
+
+        expected_server_udp_config = {
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp"),
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_additional"),
+            ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_nlb"),
+        }
+        actual_server_udp_config = {
+            (str(configured.get("type", "")), str(configured.get("name", "")))
+            for configured in (compute_config or {}).get("resources", [])
+            if configured.get("type") in INGRESS_SG_RULE_RESOURCE_TYPES
+            and references_exact_resources(
+                expression_refs(configured, "security_group_id"),
+                {"aws_security_group.server"},
+            )
+            and configured_udp_capable(configured)
+        }
+        v.require(
+            actual_server_udp_config == expected_server_udp_config,
+            "canonical server SG authored UDP-capable ingress inventory must be exactly legacy-disabled, relay, and NLB-scoped rules",
+        )
+
+        additional_config = config_resource(
+            v,
+            compute_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nhp_udp_additional",
+        )
+        additional_expressions = (additional_config or {}).get("expressions") or {}
+        v.require(
+            references_exact_resources(
+                expression_refs(additional_config, "security_group_id"),
+                {"aws_security_group.server"},
+            )
+            and expression_refs(additional_config, "cidr_ipv4") == {"each.value"}
+            and references((additional_config or {}).get("for_each_expression"))
+            == {"var.additional_nhp_udp_ingress_cidrs"}
+            and (additional_expressions.get("ip_protocol") or {}).get(
+                "constant_value"
+            )
+            == "udp"
+            and (additional_expressions.get("from_port") or {}).get("constant_value")
+            == EXPECTED_NHP_SERVER_PORT
+            and (additional_expressions.get("to_port") or {}).get("constant_value")
+            == EXPECTED_NHP_SERVER_PORT,
+            "canonical server SG relay UDP rule must bind only the reviewed relay source list on UDP 62206",
+        )
+
+        server_udp_rules = [
+            resource
+            for resource in resources
+            if resource.values.get("security_group_id") == server_security_group_id
+            and planned_udp_capable_sg_rule(resource)
+        ]
+        server_udp_counts = Counter(
+            resource.name for resource in server_udp_rules
+        )
+        v.require(
+            len(server_udp_rules) == 4
+            and server_udp_counts["server_nhp_udp_nlb"] == 1
+            and server_udp_counts["server_nhp_udp_additional"] == 3,
+            "canonical server SG planned UDP-capable ingress must be exactly one NLB-scoped rule plus three relay /24 rules",
+        )
+        compute_addresses = {resource.address for resource in compute}
+        unknown_external_sg_rules = [
+            resource.address
+            for resource in resources
+            if resource.address not in compute_addresses
+            and resource.resource_type in SG_RULE_RESOURCE_TYPES
+            and any(
+                (resource.after_unknown or {}).get(field) is True
+                for field in (
+                    "security_group_id",
+                    "referenced_security_group_id",
+                    "source_security_group_id",
+                )
+            )
+            and resource.actions != ("no-op",)
+        ]
+        v.require(
+            not unknown_external_sg_rules,
+            "UDP source-fence migration forbids non-compute changed SG rules with an unknown SG relationship: "
+            + ", ".join(unknown_external_sg_rules),
+        )
+        external_listeners = [
+            resource
+            for resource in resources
+            if resource.address not in compute_addresses
+            and resource.resource_type == "aws_lb_listener"
+        ]
+        unknown_external_listeners = [
+            resource.address
+            for resource in external_listeners
+            if (resource.after_unknown or {}).get("load_balancer_arn") is True
+            and resource.actions != ("no-op",)
+        ]
+        v.require(
+            not unknown_external_listeners,
+            "UDP source-fence migration forbids non-compute changed listeners with an unknown load balancer: "
+            + ", ".join(unknown_external_listeners),
+        )
+        external_udp_capable_listeners = [
+            resource.address
+            for resource in external_listeners
+            if (
+                str(resource.values.get("protocol", "")).upper()
+                in {"UDP", "TCP_UDP"}
+                or (
+                    (resource.after_unknown or {}).get("protocol") is True
+                    and resource.actions != ("no-op",)
+                )
+            )
+        ]
+        v.require(
+            not external_udp_capable_listeners,
+            "UDP source-fenced topology forbids non-compute UDP-capable listeners: "
+            + ", ".join(external_udp_capable_listeners),
+        )
+        compute_udp_rules = [
+            resource
+            for resource in compute
+            if planned_udp_capable_sg_rule(resource)
+        ]
+        compute_udp_counts = Counter(
+            resource.name for resource in compute_udp_rules
+        )
+        v.require(
+            len(compute_udp_rules) == 5
+            and compute_udp_counts["server_nlb_udp"] == 1
+            and compute_udp_counts["server_nhp_udp_nlb"] == 1
+            and compute_udp_counts["server_nhp_udp_additional"] == 3,
+            "assigned-cell compute planned UDP-capable ingress inventory must contain only proof, NLB-scoped target, and relay rules",
+        )
+
+        v.require(
+            not any(public_udp_capable_rule(resource) for resource in compute),
+            "assigned-cell compute must not contain internet-wide UDP ingress",
+        )
+        nlb_egress_specs = (
+            ("server_nlb_udp", "udp", EXPECTED_NHP_SERVER_PORT),
+            ("server_nlb_health", "tcp", EXPECTED_SERVER_HEALTH_PORT),
+        )
+        for rule_name, protocol, port in nlb_egress_specs:
+            matches = resources_named(
+                compute, "aws_vpc_security_group_egress_rule", rule_name
+            )
+            v.require(
+                len(matches) == 1
+                and exact_sg_reference(
+                    matches[0], "security_group_id", nlb_security_group_id
+                )
+                and exact_sg_reference(
+                    matches[0],
+                    "referenced_security_group_id",
+                    server_security_group_id,
+                )
+                and matches[0].values.get("ip_protocol") == protocol
+                and matches[0].values.get("from_port") == port
+                and matches[0].values.get("to_port") == port,
+                f"assigned cell public NLB {rule_name} must be exact SG-scoped {protocol.upper()} {port} egress",
+            )
+            rule_config = config_resource(
+                v,
+                compute_config,
+                "aws_vpc_security_group_egress_rule",
+                rule_name,
+            )
+            v.require(
+                references_exact_resources(
+                    expression_refs(rule_config, "security_group_id"),
+                    {"aws_security_group.server_nlb"},
+                )
+                and references_exact_resources(
+                    expression_refs(rule_config, "referenced_security_group_id"),
+                    {"aws_security_group.server"},
+                ),
+                f"assigned cell public NLB {rule_name} authored config must bind only the NLB and server SGs",
+            )
+    else:
+        server_base = resources_named(
+            compute, "aws_vpc_security_group_ingress_rule", "server_nhp_udp"
+        )
+        v.require(
+            len(server_base) == 1
+            and server_base[0].values.get("ip_protocol") == "udp"
+            and server_base[0].values.get("from_port") == EXPECTED_NHP_SERVER_PORT
+            and server_base[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
+            and server_base[0].values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR,
+            "assigned cell server SG must accept public NHP UDP 62206",
+        )
+        server_base_config = config_resource(
+            v,
+            compute_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nhp_udp",
+        )
+        v.require(
+            references_exact_resources(
+                expression_refs(server_base_config, "security_group_id"),
+                {"aws_security_group.server"},
+            ),
+            "assigned cell public UDP 62206 rule must belong only to the canonical server SG",
+        )
+        public_server_udp_rules = [
+            resource for resource in compute if public_udp_capable_rule(resource)
+        ]
+        v.require(
+            len(public_server_udp_rules) == 1
+            and public_server_udp_rules[0].name == "server_nhp_udp"
+            and public_server_udp_rules[0].values.get("ip_protocol") == "udp"
+            and public_server_udp_rules[0].values.get("from_port")
+            == EXPECTED_NHP_SERVER_PORT
+            and public_server_udp_rules[0].values.get("to_port")
+            == EXPECTED_NHP_SERVER_PORT
+            and public_server_udp_rules[0].values.get("cidr_ipv4")
+            == EXPECTED_IPV4_DEFAULT_CIDR,
+            "server SG public UDP-capable ingress must be exactly server_nhp_udp on UDP 62206",
+        )
     internal_server_nlb = resources_named(compute, "aws_lb", "server_internal")
     v.require(
         len(internal_server_nlb) == 1
@@ -3739,6 +4527,23 @@ def main() -> int:
             "future migrations require a newly reviewed temporary path"
         ),
     )
+    parser.add_argument(
+        "--require-udp-source-fenced-topology",
+        action="store_true",
+        help=(
+            "require the converged cell0 public-NLB source-fenced topology "
+            "without authorizing any boundary mutation"
+        ),
+    )
+    parser.add_argument(
+        "--allow-udp-source-fence-replacement",
+        action="store_true",
+        help=(
+            "while enforcing the automatic-apply boundary, admit only the exact "
+            "reviewed cell0 public-NLB source-fence convergence; implies the "
+            "fenced-topology requirement"
+        ),
+    )
     args = parser.parse_args()
 
     # Boundary-noop is an orthogonal saved-plan constraint and intentionally
@@ -3747,6 +4552,14 @@ def main() -> int:
     if args.allow_disabled and args.require_pr0_applied:
         parser.error(
             "--allow-disabled and --require-pr0-applied are mutually exclusive"
+        )
+    if (
+        args.allow_udp_source_fence_replacement
+        and not args.require_dmz_boundary_noop
+    ):
+        parser.error(
+            "--allow-udp-source-fence-replacement requires "
+            "--require-dmz-boundary-noop"
         )
 
     try:
@@ -3766,6 +4579,10 @@ def main() -> int:
         require_enabled=not args.allow_disabled,
         require_pr0_applied=args.require_pr0_applied,
         require_dmz_boundary_noop=args.require_dmz_boundary_noop,
+        require_udp_source_fenced_topology=(
+            args.require_udp_source_fenced_topology
+        ),
+        allow_udp_source_fence_replacement=args.allow_udp_source_fence_replacement,
     )
     if errors:
         for error in errors:

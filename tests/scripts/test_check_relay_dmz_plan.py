@@ -60,6 +60,12 @@ INVALID_DEREGISTRATION_DELAY_VALUES = (
     True,
     False,
 )
+PROOF_SOURCE_RULE_SUFFIX = (
+    f'.server_nlb_udp["{checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR}"]'
+)
+PROOF_SOURCE_RULE_ADDRESS_SUFFIX = (
+    "aws_vpc_security_group_ingress_rule" + PROOF_SOURCE_RULE_SUFFIX
+)
 
 
 def endpoint_policy(key: str) -> str:
@@ -2134,6 +2140,399 @@ def clean_plan() -> dict[str, Any]:
     return plan
 
 
+def source_fenced_plan() -> dict[str, Any]:
+    """Return the future cell0 topology admitted only by the migration flag."""
+    plan = clean_plan()
+    compute_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+        "module"
+    ]["module_calls"]["compute"]["module"]["resources"]
+
+    public_nlb_config = next(
+        item
+        for item in compute_resources
+        if item["type"] == "aws_lb" and item["name"] == "server"
+    )
+    public_nlb_config["expressions"]["security_groups"] = {
+        "references": [
+            "var.public_nhp_udp_ingress_cidrs",
+            "aws_security_group.server_nlb[0].id",
+            "aws_security_group.server_nlb[0]",
+            "aws_security_group.server_nlb",
+        ]
+    }
+    legacy_udp_config = next(
+        item
+        for item in compute_resources
+        if item["type"] == "aws_vpc_security_group_ingress_rule"
+        and item["name"] == "server_nhp_udp"
+    )
+    legacy_udp_config["count_expression"] = {
+        "references": ["var.public_nhp_udp_ingress_cidrs"]
+    }
+    legacy_udp_config["expressions"].update(
+        {
+            "cidr_ipv4": {"constant_value": checker.EXPECTED_IPV4_DEFAULT_CIDR},
+            "from_port": {"constant_value": checker.EXPECTED_NHP_SERVER_PORT},
+            "ip_protocol": {"constant_value": "udp"},
+            "to_port": {"constant_value": checker.EXPECTED_NHP_SERVER_PORT},
+        }
+    )
+    compute_resources.extend(
+        [
+            config_resource("aws_security_group", "server_nlb", {}),
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "server_nhp_udp_additional",
+                {
+                    "for_each": {
+                        "references": ["var.additional_nhp_udp_ingress_cidrs"]
+                    },
+                    "cidr_ipv4": {"references": ["each.value"]},
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                    "ip_protocol": {"constant_value": "udp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                },
+            ),
+            {
+                **config_resource(
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_nlb_udp",
+                    {
+                        "cidr_ipv4": {"references": ["each.value"]},
+                        "security_group_id": {
+                            "references": [
+                                "aws_security_group.server_nlb[0].id",
+                                "aws_security_group.server_nlb[0]",
+                                "aws_security_group.server_nlb",
+                            ]
+                        },
+                    },
+                ),
+                "for_each_expression": {
+                    "references": ["var.public_nhp_udp_ingress_cidrs"]
+                },
+            },
+            config_resource(
+                "aws_vpc_security_group_egress_rule",
+                "server_nlb_udp",
+                {
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server_nlb[0].id",
+                            "aws_security_group.server_nlb[0]",
+                            "aws_security_group.server_nlb",
+                        ]
+                    },
+                    "referenced_security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                },
+            ),
+            config_resource(
+                "aws_vpc_security_group_egress_rule",
+                "server_nlb_health",
+                {
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server_nlb[0].id",
+                            "aws_security_group.server_nlb[0]",
+                            "aws_security_group.server_nlb",
+                        ]
+                    },
+                    "referenced_security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                },
+            ),
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "server_nhp_udp_nlb",
+                {
+                    "count": {
+                        "references": ["var.public_nhp_udp_ingress_cidrs"]
+                    },
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                    "ip_protocol": {"constant_value": "udp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "referenced_security_group_id": {
+                        "references": [
+                            "aws_security_group.server_nlb[0].id",
+                            "aws_security_group.server_nlb[0]",
+                            "aws_security_group.server_nlb",
+                        ]
+                    },
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                },
+            ),
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "server_nlb_health",
+                {
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_SERVER_HEALTH_PORT
+                    },
+                    "ip_protocol": {"constant_value": "tcp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "referenced_security_group_id": {
+                        "references": [
+                            "aws_security_group.server_nlb[0].id",
+                            "aws_security_group.server_nlb[0]",
+                            "aws_security_group.server_nlb",
+                        ]
+                    },
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_SERVER_HEALTH_PORT
+                    },
+                },
+            ),
+        ]
+    )
+
+    plan["resource_changes"] = [
+        item
+        for item in plan["resource_changes"]
+        if not item["address"].endswith(
+            "aws_vpc_security_group_ingress_rule.server_nhp_udp"
+        )
+    ]
+
+    def add(
+        address: str,
+        resource_type: str,
+        name: str,
+        after: dict[str, Any],
+    ) -> None:
+        plan["resource_changes"].append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": resource_type,
+                "name": name,
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": after,
+                    "after_unknown": {},
+                },
+            }
+        )
+
+    add(
+        "module.nhp.module.compute.aws_security_group.server",
+        "aws_security_group",
+        "server",
+        {"id": "sg-server"},
+    )
+    add(
+        "module.nhp.module.compute.aws_security_group.server_nlb[0]",
+        "aws_security_group",
+        "server_nlb",
+        {"id": "sg-server-nlb"},
+    )
+    for change in plan["resource_changes"]:
+        if (
+            change.get("name") == "server_nhp_udp_additional"
+            and isinstance((change.get("change") or {}).get("after"), dict)
+        ):
+            change["change"]["after"]["security_group_id"] = "sg-server"
+    add(
+        "module.nhp.module.compute." + PROOF_SOURCE_RULE_ADDRESS_SUFFIX,
+        "aws_vpc_security_group_ingress_rule",
+        "server_nlb_udp",
+        {
+            "security_group_id": "sg-server-nlb",
+            "ip_protocol": "udp",
+            "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "cidr_ipv4": checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
+        },
+    )
+    add(
+        "module.nhp.module.compute."
+        "aws_vpc_security_group_ingress_rule.server_nhp_udp_nlb[0]",
+        "aws_vpc_security_group_ingress_rule",
+        "server_nhp_udp_nlb",
+        {
+            "security_group_id": "sg-server",
+            "referenced_security_group_id": "sg-server-nlb",
+            "ip_protocol": "udp",
+            "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "cidr_ipv4": None,
+        },
+    )
+    add(
+        "module.nhp.module.compute."
+        "aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+        "aws_vpc_security_group_ingress_rule",
+        "server_nlb_health",
+        {
+            "security_group_id": "sg-server",
+            "referenced_security_group_id": "sg-server-nlb",
+            "ip_protocol": "tcp",
+            "from_port": checker.EXPECTED_SERVER_HEALTH_PORT,
+            "to_port": checker.EXPECTED_SERVER_HEALTH_PORT,
+            "cidr_ipv4": None,
+        },
+    )
+    for name, protocol, port in (
+        ("server_nlb_udp", "udp", checker.EXPECTED_NHP_SERVER_PORT),
+        ("server_nlb_health", "tcp", checker.EXPECTED_SERVER_HEALTH_PORT),
+    ):
+        add(
+            "module.nhp.module.compute."
+            f"aws_vpc_security_group_egress_rule.{name}[0]",
+            "aws_vpc_security_group_egress_rule",
+            name,
+            {
+                "security_group_id": "sg-server-nlb",
+                "referenced_security_group_id": "sg-server",
+                "ip_protocol": protocol,
+                "from_port": port,
+                "to_port": port,
+            },
+        )
+
+    public_nlb = next(
+        item
+        for item in plan["resource_changes"]
+        if item["address"].endswith("module.compute.aws_lb.server[0]")
+    )
+    public_nlb["change"]["after"].update(
+        {
+            "name": checker.EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME,
+            "security_groups": ["sg-server-nlb"],
+        }
+    )
+    public_nlb["change"]["after"]["tags"][
+        "Name"
+    ] = checker.EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME
+    return plan
+
+
+def source_fence_migration_plan() -> dict[str, Any]:
+    """Return the exact one-time legacy-to-fenced boundary transition."""
+    plan = source_fenced_plan()
+    for change in plan["resource_changes"]:
+        if not checker.is_dmz_boundary_address(str(change.get("address", ""))):
+            continue
+        after = copy.deepcopy((change.get("change") or {}).get("after"))
+        change["change"]["actions"] = ["no-op"]
+        change["change"]["before"] = after
+
+    exact_create_suffixes = (
+        "aws_security_group.server_nlb[0]",
+        PROOF_SOURCE_RULE_ADDRESS_SUFFIX,
+        "aws_vpc_security_group_ingress_rule.server_nhp_udp_nlb[0]",
+        "aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+        "aws_vpc_security_group_egress_rule.server_nlb_udp[0]",
+        "aws_vpc_security_group_egress_rule.server_nlb_health[0]",
+    )
+    for suffix in exact_create_suffixes:
+        change = next(
+            item
+            for item in plan["resource_changes"]
+            if item["address"].endswith(suffix)
+        )
+        change["change"]["actions"] = ["create"]
+        change["change"]["before"] = None
+
+    public_nlb = next(
+        item
+        for item in plan["resource_changes"]
+        if item["address"].endswith("aws_lb.server[0]")
+    )
+    public_nlb["change"]["actions"] = ["create", "delete"]
+    public_nlb["change"]["before"] = {
+        **copy.deepcopy(public_nlb["change"]["after"]),
+        "name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
+        "security_groups": [],
+        "tags": {
+            **copy.deepcopy(public_nlb["change"]["after"]["tags"]),
+            "Name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
+        },
+    }
+
+    udp_listener = next(
+        item
+        for item in plan["resource_changes"]
+        if item["address"].endswith("aws_lb_listener.udp[0]")
+    )
+    listener_target_group = (
+        f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+        f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:"
+        f"targetgroup/{checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME}/fixture"
+    )
+    udp_listener["change"]["after"]["default_action"] = [
+        {"target_group_arn": listener_target_group}
+    ]
+    udp_listener["change"]["actions"] = ["delete", "create"]
+    udp_listener["change"]["before"] = {
+        **copy.deepcopy(udp_listener["change"]["after"]),
+        "load_balancer_arn": (
+            f"arn:aws:elasticloadbalancing:{checker.EXPECTED_SANDBOX_REGION}:"
+            f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:"
+            "loadbalancer/net/layerv-nhp-sandbox-nlb/legacy"
+        ),
+    }
+    udp_listener["change"]["after"].pop("load_balancer_arn", None)
+    udp_listener["change"]["after_unknown"]["load_balancer_arn"] = True
+
+    plan["resource_changes"].append(
+        {
+            "address": (
+                "module.nhp.module.compute."
+                "aws_vpc_security_group_ingress_rule.server_nhp_udp[0]"
+            ),
+            "mode": "managed",
+            "type": "aws_vpc_security_group_ingress_rule",
+            "name": "server_nhp_udp",
+            "change": {
+                "actions": ["delete"],
+                "before": {
+                    "ip_protocol": "udp",
+                    "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+                    "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+                    "cidr_ipv4": checker.EXPECTED_IPV4_DEFAULT_CIDR,
+                },
+                "after": None,
+                "after_unknown": {},
+            },
+        }
+    )
+    return plan
+
+
 def root_level_plan() -> dict[str, Any]:
     plan = clean_plan()
     nested_root = plan["configuration"]["root_module"]
@@ -2272,6 +2671,529 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
 
     def test_clean_synthetic_plan_passes(self) -> None:
         self.assertEqual([], checker.validate_plan(clean_plan()))
+
+    def test_source_fenced_topology_is_opt_in_and_legacy_remains_default(
+        self,
+    ) -> None:
+        self.assertEqual([], checker.validate_plan(clean_plan()))
+        fenced = source_fenced_plan()
+        self.assertNotEqual(
+            [],
+            checker.validate_plan(fenced),
+            "legacy topology mode must reject the source-fenced graph",
+        )
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                fenced, require_udp_source_fenced_topology=True
+            ),
+        )
+
+    def test_source_fenced_topology_requires_explicit_unknown_sg_references(
+        self,
+    ) -> None:
+        plan = source_fenced_plan()
+        nlb = resource(plan, ".aws_lb.server[0]")
+        nlb["change"]["after"].pop("security_groups")
+        nlb["change"]["after_unknown"]["security_groups"] = True
+
+        nlb_sg = resource(plan, ".aws_security_group.server_nlb[0]")
+        nlb_sg["change"]["after"].pop("id")
+        nlb_sg["change"]["after_unknown"]["id"] = True
+
+        unknown_fields = (
+            (
+                PROOF_SOURCE_RULE_SUFFIX,
+                "security_group_id",
+            ),
+            (".server_nhp_udp_nlb[0]", "referenced_security_group_id"),
+            (
+                ".aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+                "referenced_security_group_id",
+            ),
+            (
+                ".aws_vpc_security_group_egress_rule.server_nlb_udp[0]",
+                "security_group_id",
+            ),
+            (
+                ".aws_vpc_security_group_egress_rule.server_nlb_health[0]",
+                "security_group_id",
+            ),
+        )
+        for suffix, field in unknown_fields:
+            change = resource(plan, suffix)["change"]
+            change["after"].pop(field)
+            change["after_unknown"][field] = True
+
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                plan, require_udp_source_fenced_topology=True
+            ),
+        )
+
+        missing_nlb_id = copy.deepcopy(plan)
+        missing_nlb_sg = resource(
+            missing_nlb_id, ".aws_security_group.server_nlb[0]"
+        )
+        missing_nlb_sg["change"]["after_unknown"].pop("id")
+        errors = checker.validate_plan(
+            missing_nlb_id, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("resolved or explicitly unknown planned ID" in error for error in errors),
+            errors,
+        )
+
+        nlb["change"]["after_unknown"]["security_groups"] = False
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("attach exactly its dedicated security group" in error for error in errors),
+            errors,
+        )
+
+    def test_source_fenced_topology_requires_existing_canonical_server_sg(
+        self,
+    ) -> None:
+        plan = source_fenced_plan()
+        plan["resource_changes"] = [
+            change
+            for change in plan["resource_changes"]
+            if not change["address"].endswith("aws_security_group.server")
+        ]
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("existing canonical server SG" in error for error in errors), errors
+        )
+
+    def test_source_fenced_topology_rejects_unreviewed_server_udp_ingress(
+        self,
+    ) -> None:
+        planned = source_fenced_plan()
+        rogue = copy.deepcopy(resource(planned, PROOF_SOURCE_RULE_SUFFIX))
+        rogue["address"] = (
+            "module.nhp.module.compute."
+            'aws_vpc_security_group_ingress_rule.server_backdoor["198.51.100.42/32"]'
+        )
+        rogue["name"] = "server_backdoor"
+        rogue["change"]["after"].update(
+            {
+                "security_group_id": "sg-server",
+                "cidr_ipv4": "198.51.100.42/32",
+            }
+        )
+        planned["resource_changes"].append(rogue)
+        errors = checker.validate_plan(
+            planned, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("planned UDP-capable ingress" in error for error in errors), errors
+        )
+        unknown_planned = copy.deepcopy(planned)
+        unknown_rogue = resource(
+            unknown_planned, '.server_backdoor["198.51.100.42/32"]'
+        )
+        unknown_rogue["change"]["after"].pop("security_group_id")
+        unknown_rogue["change"]["after_unknown"]["security_group_id"] = True
+        errors = checker.validate_plan(
+            unknown_planned, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "compute planned UDP-capable ingress inventory" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        external_server = source_fenced_plan()
+        external_rule = copy.deepcopy(
+            resource(
+                external_server,
+                PROOF_SOURCE_RULE_SUFFIX,
+            )
+        )
+        external_rule["address"] = (
+            'aws_vpc_security_group_ingress_rule.external_server_backdoor["198.51.100.42/32"]'
+        )
+        external_rule["name"] = "external_server_backdoor"
+        external_rule["change"]["after"].update(
+            {
+                "security_group_id": "sg-server",
+                "cidr_ipv4": "198.51.100.42/32",
+            }
+        )
+        external_server["resource_changes"].append(external_rule)
+        errors = checker.validate_plan(
+            external_server, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("canonical server SG planned UDP-capable" in error for error in errors),
+            errors,
+        )
+
+        external_nlb = source_fenced_plan()
+        external_rule = copy.deepcopy(
+            resource(external_nlb, PROOF_SOURCE_RULE_SUFFIX)
+        )
+        external_rule["address"] = (
+            'aws_vpc_security_group_ingress_rule.external_nlb_backdoor["0.0.0.0/0"]'
+        )
+        external_rule["name"] = "external_nlb_backdoor"
+        external_rule["change"]["after"]["cidr_ipv4"] = (
+            checker.EXPECTED_IPV4_DEFAULT_CIDR
+        )
+        external_nlb["resource_changes"].append(external_rule)
+        errors = checker.validate_plan(
+            external_nlb, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("global planned rule inventory" in error for error in errors), errors
+        )
+
+        unknown_external = source_fenced_plan()
+        external_rule = copy.deepcopy(
+            resource(
+                unknown_external,
+                PROOF_SOURCE_RULE_SUFFIX,
+            )
+        )
+        external_rule["address"] = (
+            "module.unrelated."
+            'aws_vpc_security_group_ingress_rule.external_unknown["198.51.100.42/32"]'
+        )
+        external_rule["name"] = "external_unknown"
+        external_rule["change"]["after"].pop("security_group_id")
+        external_rule["change"]["after_unknown"]["security_group_id"] = True
+        unknown_external["resource_changes"].append(external_rule)
+        errors = checker.validate_plan(
+            unknown_external, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("non-compute changed SG rules" in error for error in errors),
+            errors,
+        )
+
+        unknown_tcp_surface = source_fenced_plan()
+        external_rule = copy.deepcopy(
+            resource(
+                unknown_tcp_surface,
+                PROOF_SOURCE_RULE_SUFFIX,
+            )
+        )
+        external_rule["address"] = (
+            "module.unrelated."
+            'aws_vpc_security_group_ingress_rule.external_tcp["0.0.0.0/0"]'
+        )
+        external_rule["name"] = "external_tcp"
+        external_rule["change"]["after"].update(
+            {
+                "cidr_ipv4": checker.EXPECTED_IPV4_DEFAULT_CIDR,
+                "ip_protocol": "tcp",
+                "from_port": checker.EXPECTED_RELAY_ACK_PORT,
+                "to_port": checker.EXPECTED_RELAY_ACK_PORT,
+            }
+        )
+        external_rule["change"]["after"].pop("security_group_id")
+        external_rule["change"]["after_unknown"]["security_group_id"] = True
+        unknown_tcp_surface["resource_changes"].append(external_rule)
+        unknown_tcp_surface["resource_changes"].append(
+            {
+                "address": "module.unrelated.aws_lb_listener.external_tcp",
+                "mode": "managed",
+                "type": "aws_lb_listener",
+                "name": "external_tcp",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "protocol": "TCP",
+                        "port": checker.EXPECTED_RELAY_ACK_PORT,
+                    },
+                    "after_unknown": {"load_balancer_arn": True},
+                },
+            }
+        )
+        errors = checker.validate_plan(
+            unknown_tcp_surface, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("non-compute changed SG rules" in error for error in errors),
+            errors,
+        )
+        self.assertTrue(
+            any("non-compute changed listeners" in error for error in errors),
+            errors,
+        )
+
+        resolved_external_listener = source_fenced_plan()
+        resolved_external_listener["resource_changes"].append(
+            {
+                "address": "module.unrelated.aws_lb_listener.external_udp",
+                "mode": "managed",
+                "type": "aws_lb_listener",
+                "name": "external_udp",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "protocol": "UDP",
+                        "port": checker.EXPECTED_NHP_SERVER_PORT,
+                        "load_balancer_arn": (
+                            "arn:aws:elasticloadbalancing:"
+                            f"{checker.EXPECTED_SANDBOX_REGION}:"
+                            f"{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:"
+                            "loadbalancer/net/external/resolved"
+                        ),
+                    },
+                    "after_unknown": {},
+                },
+            }
+        )
+        errors = checker.validate_plan(
+            resolved_external_listener,
+            require_udp_source_fenced_topology=True,
+        )
+        self.assertTrue(
+            any("non-compute UDP-capable listeners" in error for error in errors),
+            errors,
+        )
+
+        authored = source_fenced_plan()
+        compute_resources = authored["configuration"]["root_module"]["module_calls"][
+            "nhp"
+        ]["module"]["module_calls"]["compute"]["module"]["resources"]
+        compute_resources.append(
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "server_backdoor",
+                {
+                    "cidr_ipv4": {"constant_value": "198.51.100.42/32"},
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                    "ip_protocol": {"constant_value": "udp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                },
+            )
+        )
+        errors = checker.validate_plan(
+            authored, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("authored UDP-capable ingress" in error for error in errors), errors
+        )
+        rogue_config = configured_resource(
+            authored,
+            "compute",
+            "aws_vpc_security_group_ingress_rule",
+            "server_backdoor",
+        )
+        rogue_config["expressions"]["security_group_id"] = {
+            "references": ["var.runtime_security_group_id"]
+        }
+        errors = checker.validate_plan(
+            authored, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "compute authored UDP-capable ingress inventory" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_source_fence_migration_requires_exact_nine_step_action_graph(
+        self,
+    ) -> None:
+        plan = source_fence_migration_plan()
+        missing_boundary_gate = checker.validate_plan(
+            plan,
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertEqual(
+            [
+                "allow_udp_source_fence_replacement requires "
+                "require_dmz_boundary_noop"
+            ],
+            missing_boundary_gate,
+        )
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                plan,
+                require_dmz_boundary_noop=True,
+                allow_udp_source_fence_replacement=True,
+            ),
+        )
+        original_actions = checker.UDP_SOURCE_FENCE_MIGRATION_ACTIONS
+        try:
+            # Declaration order is irrelevant; each address's action ordering is
+            # enforced by the sibling replacement-order mutation tests.
+            checker.UDP_SOURCE_FENCE_MIGRATION_ACTIONS = tuple(
+                reversed(original_actions)
+            )
+            self.assertEqual(
+                [],
+                checker.validate_plan(
+                    plan,
+                    require_dmz_boundary_noop=True,
+                    allow_udp_source_fence_replacement=True,
+                ),
+            )
+        finally:
+            checker.UDP_SOURCE_FENCE_MIGRATION_ACTIONS = original_actions
+
+        migration_changes = [
+            change
+            for change in plan["resource_changes"]
+            if checker.is_dmz_boundary_address(change["address"])
+            and change["change"]["actions"] != ["no-op"]
+        ]
+        self.assertEqual(9, len(migration_changes))
+        for omitted in migration_changes:
+            with self.subTest(omitted=omitted["address"]):
+                candidate = copy.deepcopy(plan)
+                candidate["resource_changes"] = [
+                    change
+                    for change in candidate["resource_changes"]
+                    if change["address"] != omitted["address"]
+                ]
+                errors = checker.validate_dmz_boundary_noop(
+                    candidate, allow_udp_source_fence_replacement=True
+                )
+                self.assertTrue(
+                    any("exact reviewed nine-step" in error for error in errors),
+                    errors,
+                )
+
+    def test_source_fence_migration_pins_exact_before_state(self) -> None:
+        cases = (
+            (".aws_lb.server[0]", "public NLB legacy before-state"),
+            (".aws_lb_listener.udp[0]", "listener legacy before-state"),
+            (".server_nhp_udp[0]", "legacy server ingress deletion"),
+        )
+        for suffix, expected_error in cases:
+            with self.subTest(suffix=suffix):
+                plan = source_fence_migration_plan()
+                resource(plan, suffix)["change"]["before"] = {
+                    "totally": "unreviewed"
+                }
+                errors = checker.validate_dmz_boundary_noop(
+                    plan, allow_udp_source_fence_replacement=True
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+        plan = source_fence_migration_plan()
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        listener["change"]["before"]["default_action"] = [
+            {"target_group_arn": "arn:aws:elasticloadbalancing:rogue"}
+        ]
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("canonical public UDP target group" in error for error in errors),
+            errors,
+        )
+
+        plan = source_fence_migration_plan()
+        nlb_sg = resource(plan, ".aws_security_group.server_nlb[0]")
+        nlb_sg["change"]["before"] = {"id": "sg-existing"}
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(any("must be a pure create" in error for error in errors), errors)
+
+    def test_source_fence_migration_rejects_cross_parent_substitution(self) -> None:
+        plan = source_fence_migration_plan()
+        legacy = resource(plan, ".server_nhp_udp[0]")
+        legacy["address"] = legacy["address"].replace(
+            "module.nhp.module.compute", "module.unrelated.module.compute"
+        )
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("unreviewed UDP source-fence" in error for error in errors), errors
+        )
+
+    def test_source_fence_migration_rejects_wrong_listener_order(self) -> None:
+        plan = source_fence_migration_plan()
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        listener["change"]["actions"] = ["create", "delete"]
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("unreviewed UDP source-fence" in error for error in errors), errors
+        )
+        self.assertTrue(
+            any("public UDP listener replacement" in error for error in errors),
+            errors,
+        )
+
+    def test_source_fence_migration_rejects_wrong_nlb_order(self) -> None:
+        plan = source_fence_migration_plan()
+        nlb = resource(plan, ".aws_lb.server[0]")
+        nlb["change"]["actions"] = ["delete", "create"]
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("unreviewed UDP source-fence" in error for error in errors), errors
+        )
+        self.assertTrue(
+            any("public NLB replacement" in error for error in errors), errors
+        )
+
+    def test_source_fence_migration_rejects_extra_public_source(self) -> None:
+        plan = source_fence_migration_plan()
+        extra = copy.deepcopy(resource(plan, PROOF_SOURCE_RULE_SUFFIX))
+        extra["address"] = extra["address"].replace(
+            f'"{checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR}"',
+            f'"{checker.EXPECTED_IPV4_DEFAULT_CIDR}"',
+        )
+        extra["change"]["after"]["cidr_ipv4"] = checker.EXPECTED_IPV4_DEFAULT_CIDR
+        plan["resource_changes"].append(extra)
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("unreviewed UDP source-fence" in error for error in errors), errors
+        )
+
+    def test_source_fenced_noop_boundary_remains_valid_after_convergence(
+        self,
+    ) -> None:
+        plan = source_fenced_plan()
+        for change in plan["resource_changes"]:
+            if not checker.is_dmz_boundary_address(change["address"]):
+                continue
+            change["change"]["actions"] = ["no-op"]
+            change["change"]["before"] = copy.deepcopy(change["change"]["after"])
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                plan,
+                require_dmz_boundary_noop=True,
+                require_udp_source_fenced_topology=True,
+            ),
+        )
 
     def test_dns_domain_lists_require_aws_canonical_trailing_dots(self) -> None:
         allow_plan = clean_plan()
@@ -2436,6 +3358,12 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "module.compute.aws_autoscaling_attachment.server_internal[0]",
             "module.compute.aws_autoscaling_group.server_green[0]",
             "module.compute.aws_vpc_security_group_ingress_rule.server_nhp_udp",
+            "module.compute.aws_security_group.server_nlb[0]",
+            "module.compute." + PROOF_SOURCE_RULE_ADDRESS_SUFFIX,
+            "module.compute.aws_vpc_security_group_ingress_rule.server_nhp_udp_nlb[0]",
+            "module.compute.aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
+            "module.compute.aws_vpc_security_group_egress_rule.server_nlb_udp[0]",
+            "module.compute.aws_vpc_security_group_egress_rule.server_nlb_health[0]",
             'module.compute.aws_vpc_security_group_ingress_rule.server_nhp_udp_additional["10.101.10.0/24"]',
             "module.outer[0].module.ecr[0].aws_iam_role_policy.context_lookups_relay_ssm[0]",
             "module.nhp[0].terraform_data.relay_cell_routing[0]",
@@ -4975,6 +5903,32 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         plan["resource_changes"].append(rule)
         self.assert_violation(plan, "public UDP-capable ingress")
 
+    def test_public_udp_scan_handles_case_and_fails_closed_on_ambiguity(self) -> None:
+        for protocol_values in (
+            {},
+            {"ip_protocol": None},
+            {"ip_protocol": ""},
+            {"ip_protocol": "gre"},
+            {"ip_protocol": "UDP"},
+            {"ip_protocol": "17"},
+            {"ip_protocol": "6"},
+        ):
+            with self.subTest(protocol_values=protocol_values):
+                candidate = checker.PlannedResource(
+                    address="aws_vpc_security_group_ingress_rule.unreviewed",
+                    resource_type="aws_vpc_security_group_ingress_rule",
+                    name="unreviewed",
+                    values={
+                        "cidr_ipv4": checker.EXPECTED_IPV4_DEFAULT_CIDR,
+                        **protocol_values,
+                    },
+                    after_unknown=None,
+                    before=None,
+                    actions=("create",),
+                )
+                self.assertTrue(checker.public_udp_capable_rule(candidate))
+                self.assertTrue(checker.planned_udp_capable_sg_rule(candidate))
+
     def test_server_sg_rejects_public_udp_ack_port(self) -> None:
         plan = clean_plan()
         rule = copy.deepcopy(resource(plan, ".server_nhp_udp"))
@@ -5982,6 +6936,71 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         self.assertIn("automatic apply refuses", blocked.stderr)
         self.assertIn("newly reviewed temporary migration path", blocked.stderr)
         self.assertNotIn("PR 0 state move", blocked.stderr)
+
+    def test_cli_source_fence_allowance_requires_boundary_gate(self) -> None:
+        result = run_checker_cli(
+            source_fenced_plan(), "--allow-udp-source-fence-replacement"
+        )
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn(
+            "--allow-udp-source-fence-replacement requires "
+            "--require-dmz-boundary-noop",
+            result.stderr,
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_fenced_topology_gate_is_steady_state_only(self) -> None:
+        converged = source_fenced_plan()
+        for change in converged["resource_changes"]:
+            if not checker.is_dmz_boundary_address(change["address"]):
+                continue
+            change["change"]["actions"] = ["no-op"]
+            change["change"]["before"] = copy.deepcopy(change["change"]["after"])
+
+        result = run_checker_cli(
+            converged,
+            "--require-dmz-boundary-noop",
+            "--require-udp-source-fenced-topology",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        legacy_mode = run_checker_cli(
+            converged,
+            "--require-dmz-boundary-noop",
+        )
+        self.assertEqual(1, legacy_mode.returncode, legacy_mode.stderr)
+
+        migration_without_allowance = run_checker_cli(
+            source_fence_migration_plan(),
+            "--require-dmz-boundary-noop",
+            "--require-udp-source-fenced-topology",
+        )
+        self.assertEqual(
+            1, migration_without_allowance.returncode, migration_without_allowance.stderr
+        )
+        self.assertIn("automatic apply refuses", migration_without_allowance.stderr)
+
+    def test_cli_source_fence_allowance_accepts_only_complete_migration(
+        self,
+    ) -> None:
+        plan = source_fence_migration_plan()
+        result = run_checker_cli(
+            plan,
+            "--require-dmz-boundary-noop",
+            "--allow-udp-source-fence-replacement",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
+        listener["change"]["actions"] = ["create", "delete"]
+        blocked = run_checker_cli(
+            plan,
+            "--require-dmz-boundary-noop",
+            "--allow-udp-source-fence-replacement",
+        )
+        self.assertEqual(1, blocked.returncode, blocked.stderr)
+        self.assertIn("unreviewed UDP source-fence", blocked.stderr)
+        self.assertIn("exact reviewed nine-step", blocked.stderr)
 
 
 if __name__ == "__main__":
