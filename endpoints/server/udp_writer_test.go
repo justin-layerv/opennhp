@@ -28,6 +28,68 @@ type recordingUDPWriteSocket struct {
 	writeRelease   chan struct{}
 }
 
+// delayedCancelContext models the observable gap after a parent context's Done
+// channel closes but before its registered child-cancellation callback runs.
+// Standard contexts can expose that gap because Done closes before cancellation
+// propagation has visited every derived context.
+type delayedCancelContext struct {
+	context.Context
+	mu         sync.Mutex
+	done       chan struct{}
+	err        error
+	registered bool
+}
+
+func newDelayedCancelContext() *delayedCancelContext {
+	return &delayedCancelContext{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+	}
+}
+
+func (c *delayedCancelContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *delayedCancelContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// AfterFunc records that context.WithDeadline registered its propagation
+// callback, then deliberately drops that callback: cancelWithoutPropagation
+// closes Done without ever invoking it, reproducing the propagation-lag window.
+// The returned stop closure mirrors context.AfterFunc's fire-once contract so
+// the derived context's cancel() unregisters cleanly.
+func (c *delayedCancelContext) AfterFunc(_ func()) func() bool {
+	c.mu.Lock()
+	c.registered = true
+	c.mu.Unlock()
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.registered {
+			return false
+		}
+		c.registered = false
+		return true
+	}
+}
+
+func (c *delayedCancelContext) propagationRegistered() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registered
+}
+
+func (c *delayedCancelContext) cancelWithoutPropagation() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = context.Canceled
+	close(c.done)
+}
+
 func (f *recordingUDPWriteSocket) SetWriteDeadline(deadline time.Time) error {
 	f.mu.Lock()
 	f.deadlines = append(f.deadlines, deadline)
@@ -320,8 +382,7 @@ func TestWriteUDPDatagramCancellationDuringDeadlineArmResetsWithoutWriting(t *te
 		setRelease:   release,
 	}
 	s := &UdpServer{udpWriteSocket: socket}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	ctx := newDelayedCancelContext()
 	result := make(chan error, 1)
 	go func() {
 		_, err := s.writeUDPDatagram(ctx, []byte("must-not-send"), &net.UDPAddr{}, time.Now().Add(time.Second))
@@ -332,10 +393,15 @@ func TestWriteUDPDatagramCancellationDuringDeadlineArmResetsWithoutWriting(t *te
 	case <-time.After(time.Second):
 		t.Fatal("deadline arm did not start")
 	}
-	<-ctx.Done()
+	// Pin the Go toolchain behavior that makes this propagation-lag simulation
+	// deterministic instead of silently falling back to a watcher goroutine.
+	if !ctx.propagationRegistered() {
+		t.Fatal("context.WithDeadline did not register parent AfterFunc propagation")
+	}
+	ctx.cancelWithoutPropagation()
 	close(release)
-	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("write error = %v, want deadline exceeded", err)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("write error = %v, want canceled", err)
 	}
 	deadlines, writes := socket.snapshot()
 	if len(deadlines) != 2 || !deadlines[1].IsZero() || writes != 0 || s.udpWriteDeadlineDirty.Load() {

@@ -41,6 +41,17 @@ func (s *UdpServer) udpSocket() udpWriteSocket {
 	return s.listenConn
 }
 
+// A parent may expose cancellation before it reaches a derived deadline
+// context. Check both so that propagation lag cannot cross a datagram-write
+// boundary, while the derived context still enforces an earlier explicit
+// deadline.
+func udpWriteContextErr(ctx, waitCtx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return waitCtx.Err()
+}
+
 // writeUDPDatagram makes deadline mutation exclusive with every physical
 // datagram write while preserving concurrency among ordinary writes.
 // explicitDeadline may be zero; when both it and ctx carry a deadline, the
@@ -64,7 +75,7 @@ func (s *UdpServer) writeUDPDatagram(ctx context.Context, payload []byte, remote
 		waitCtx, cancel = context.WithDeadline(ctx, effectiveDeadline)
 		defer cancel()
 	}
-	if err := waitCtx.Err(); err != nil {
+	if err := udpWriteContextErr(ctx, waitCtx); err != nil {
 		return 0, err
 	}
 
@@ -86,7 +97,7 @@ func (s *UdpServer) writeUDPDatagram(ctx context.Context, payload []byte, remote
 		}
 	}
 	defer s.udpWriteGate.Release(gateWeight)
-	if err := waitCtx.Err(); err != nil {
+	if err := udpWriteContextErr(ctx, waitCtx); err != nil {
 		return 0, err
 	}
 
@@ -110,7 +121,7 @@ func (s *UdpServer) writeUDPDatagram(ctx context.Context, payload []byte, remote
 			return 0, fmt.Errorf("set UDP write deadline: %w", err)
 		}
 	}
-	if err := waitCtx.Err(); err != nil {
+	if err := udpWriteContextErr(ctx, waitCtx); err != nil {
 		if deadlineArmed {
 			if resetErr := socket.SetWriteDeadline(time.Time{}); resetErr != nil {
 				return 0, errors.Join(err, fmt.Errorf("reset UDP write deadline after cancellation: %w", resetErr))
