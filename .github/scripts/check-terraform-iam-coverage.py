@@ -128,10 +128,20 @@ _HELPER_SUFFIXES = (
     # in-account at apply, invoked by the shared apply role like the others.
     "control-hub-keygen",
 )
-HELPER_INVOKE_RESOURCES = frozenset(
+_HELPER_INVOKE_ARN_PREFIX = (
     "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-"
-    + suffix
-    for suffix in _HELPER_SUFFIXES
+)
+# aws_lambda_invocation sends Qualifier=$LATEST and IAM treats the qualified and
+# unqualified function ARNs as DIFFERENT resources, so a resource block driving
+# the Hub identity seeding needs the qualified form as well as the bare one.
+# Both are exact ARNs; this is not a wildcard qualifier.
+_QUALIFIED_HELPER_SUFFIXES = ("control-hub-keygen",)
+HELPER_INVOKE_RESOURCES = frozenset(
+    [_HELPER_INVOKE_ARN_PREFIX + suffix for suffix in _HELPER_SUFFIXES]
+    + [
+        _HELPER_INVOKE_ARN_PREFIX + suffix + ":$LATEST"
+        for suffix in _QUALIFIED_HELPER_SUFFIXES
+    ]
 )
 SEMANTIC_READ_INVOKE_RESOURCES = {
     "RelayIdentityStatusInvoke": (
@@ -202,7 +212,10 @@ def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str |
         or len(resources) != len(HELPER_INVOKE_RESOURCES)
         or set(resources) != HELPER_INVOKE_RESOURCES
     ):
-        return "TerraformHelperInvoke must grant only the six exact helper ARNs"
+        return (
+            "TerraformHelperInvoke must grant only the exact helper ARNs "
+            f"({len(HELPER_INVOKE_RESOURCES)} expected)"
+        )
     return None
 
 

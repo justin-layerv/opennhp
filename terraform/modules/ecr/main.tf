@@ -3089,6 +3089,17 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-registration-keygen",
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-keygen",
           "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-control-hub-keygen",
+          # aws_lambda_invocation sends Qualifier=$LATEST, and IAM treats the
+          # qualified and unqualified function ARNs as DIFFERENT resources, so
+          # the bare ARN above does not authorize that call. The Hub identity
+          # seeding invocation failed on exactly this
+          # (control-update-apply run 30220858809: AccessDeniedException on
+          # ...:function:layerv-nhp-sandbox-control-hub-keygen:$LATEST), which
+          # left the Hub identity parameter stuck at its pending-keygen
+          # placeholder. Same trap terraform/CLAUDE.md already records for the
+          # relay-status invocation data source. Pinning $LATEST explicitly
+          # keeps this exact-ARN rather than widening to a wildcard qualifier.
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-control-hub-keygen:$LATEST",
         ]
       },
       {
