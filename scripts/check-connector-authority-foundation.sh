@@ -325,6 +325,11 @@ for required in \
   fi
 done
 
+# The deployed Authority image is selected by the reviewed measurement basis,
+# never by the publisher-owned SSM parameter. qurl-service's build-and-deploy
+# workflow rewrites that parameter on every push to its main, so reading it here
+# let an unrelated repository's release invalidate every Control plan the moment
+# it published. Forbid the read outright rather than requiring it.
 ssm_read_count="$(
   { grep -R -h -E --include='*.tf' \
       'data[[:space:]]+"aws_ssm_parameter"[[:space:]]+"authority_runtime_digest"' \
@@ -335,13 +340,24 @@ ecr_read_count="$(
       'data[[:space:]]+"aws_ecr_image"[[:space:]]+"authority_runtime"' \
       "$module_dir" || true; } | wc -l | tr -d ' '
 )"
-if [[ "$ssm_read_count" -ne 1 || "$ecr_read_count" -ne 1 ]]; then
-  echo "ERROR: Connector Authority runtime must declare exactly one conditional SSM digest read and one conditional ECR digest read" >&2
+if [[ "$ssm_read_count" -ne 0 ]]; then
+  echo "ERROR: Connector Authority runtime must not read the publisher-owned SSM digest; the reviewed basis selects the deployed image" >&2
+  exit 1
+fi
+if [[ "$ecr_read_count" -ne 1 ]]; then
+  echo "ERROR: Connector Authority runtime must declare exactly one conditional ECR digest read" >&2
+  exit 1
+fi
+# The ECR read must resolve the basis digest, which is what proves the reviewed
+# pin refers to a real published image.
+if ! grep -Fq 'image_digest    = local.authority_contract_global.authority_image_digest' \
+  "${module_dir}/ecr.tf"; then
+  echo "ERROR: Connector Authority ECR read must resolve the reviewed basis digest" >&2
   exit 1
 fi
 if ! grep -Fq 'count = local.authority_runtime_contract_enabled ? 1 : 0' \
   "${module_dir}/ecr.tf"; then
-  echo "ERROR: Connector Authority runtime SSM/ECR reads must remain conditional on the verified contract" >&2
+  echo "ERROR: Connector Authority runtime ECR read must remain conditional on the verified contract" >&2
   exit 1
 fi
 

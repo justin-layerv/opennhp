@@ -37,11 +37,9 @@ write_clean_fixture() {
     '# Provider documentation belongs outside this zero-HTTP Terraform root.' \
     'resource "aws_vpc" "control" {}' >"${module_dir}/main.tf"
   printf '%s\n' \
-    'data "aws_ssm_parameter" "authority_runtime_digest" {' \
-    '  count = local.authority_runtime_contract_enabled ? 1 : 0' \
-    '}' \
     'data "aws_ecr_image" "authority_runtime" {' \
     '  count = local.authority_runtime_contract_enabled ? 1 : 0' \
+    '  image_digest    = local.authority_contract_global.authority_image_digest' \
     '}' >"${module_dir}/ecr.tf"
   printf '%s\n' \
     'module "connector_authority_foundation" {' \
@@ -310,7 +308,24 @@ expect_failure 'production Control variables must fail closed' env NHP_REPO_ROOT
 
 write_clean_fixture
 rm "${module_dir}/ecr.tf"
-expect_failure 'must declare exactly one conditional SSM digest read' env NHP_REPO_ROOT="$fixture_root" "$checker"
+expect_failure 'must declare exactly one conditional ECR digest read' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# Reintroducing the publisher-owned SSM digest read must fail closed. That read
+# is what let a qurl-service publish invalidate every Control plan, so the
+# contract forbids it rather than merely not requiring it.
+write_clean_fixture
+printf '%s\n' \
+  'data "aws_ssm_parameter" "authority_runtime_digest" {' \
+  '  count = local.authority_runtime_contract_enabled ? 1 : 0' \
+  '}' >>"${module_dir}/ecr.tf"
+expect_failure 'must not read the publisher-owned SSM digest' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# The ECR read must resolve the reviewed basis digest, not some other source.
+write_clean_fixture
+sed -i.bak 's#image_digest    = local.authority_contract_global.authority_image_digest#image_digest    = "sha256:deadbeef"#' \
+  "${module_dir}/ecr.tf"
+rm "${module_dir}/ecr.tf.bak"
+expect_failure 'ECR read must resolve the reviewed basis digest' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
 printf '%s\n' '# unintended output drift' >>"${control_dir}/environments/prod/outputs.tf"

@@ -4971,7 +4971,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 6, "managed_resource_count": 52},
+            {"data_resource_count": 5, "managed_resource_count": 52},
         )
 
     def test_catalog_holdback_inventory_is_exact_all_or_nothing(self) -> None:
@@ -4982,7 +4982,7 @@ class StateListTests(unittest.TestCase):
         ]
         self.assertEqual(
             self.check(held_back),
-            {"data_resource_count": 6, "managed_resource_count": 50},
+            {"data_resource_count": 5, "managed_resource_count": 50},
         )
 
         partial = [
@@ -5017,7 +5017,7 @@ class StateListTests(unittest.TestCase):
         runtime = [*self.expected_addresses(), *CHECKER.AUTHORITY_RUNTIME_RESOURCES]
         self.assertEqual(
             self.check(runtime),
-            {"data_resource_count": 6, "managed_resource_count": 77},
+            {"data_resource_count": 5, "managed_resource_count": 77},
         )
         # A partial runtime inventory (missing one runtime resource) fails closed.
         partial = [
@@ -5041,7 +5041,7 @@ class StateListTests(unittest.TestCase):
         self.assertEqual(
             self.check(full),
             {
-                "data_resource_count": 6 + len(worker_data),
+                "data_resource_count": 5 + len(worker_data),
                 "managed_resource_count": (
                     52
                     + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)

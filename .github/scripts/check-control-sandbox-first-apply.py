@@ -1088,7 +1088,6 @@ EXPECTED_DATA_RESOURCES = {
     "module.control.data.aws_caller_identity.current": "aws_caller_identity",
     "module.control.data.aws_partition.current": "aws_partition",
     "module.control.data.aws_region.current": "aws_region",
-    "module.control.data.aws_ssm_parameter.authority_runtime_digest[0]": "aws_ssm_parameter",
 }
 DENY_ENDPOINT_POLICY = {
     "Statement": [
@@ -1173,11 +1172,6 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
             "aws",
         ),
         "module.control.data.aws_region.current": ("data", "aws_region", "aws"),
-        "module.control.data.aws_ssm_parameter.authority_runtime_digest": (
-            "data",
-            "aws_ssm_parameter",
-            "aws",
-        ),
         "module.control.data.aws_ecr_image.authority_runtime": (
             "data",
             "aws_ecr_image",
@@ -1213,19 +1207,11 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
         ],
         ("item",): ["each.value"],
     },
-    "module.control.data.aws_ssm_parameter.authority_runtime_digest": {
-        ("count",): ["local.authority_runtime_contract_enabled"],
-        ("name",): [
-            "aws_ssm_parameter.authority_image_digest.name",
-            "aws_ssm_parameter.authority_image_digest",
-        ],
-    },
     "module.control.data.aws_ecr_image.authority_runtime": {
         ("count",): ["local.authority_runtime_contract_enabled"],
         ("image_digest",): [
-            "data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value",
-            "data.aws_ssm_parameter.authority_runtime_digest[0]",
-            "data.aws_ssm_parameter.authority_runtime_digest",
+            "local.authority_contract_global.authority_image_digest",
+            "local.authority_contract_global",
         ],
         ("repository_name",): [
             "aws_ecr_repository.authority.name",
@@ -5023,10 +5009,22 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "no-op",
             "redis-split-transition",
             "authority-contract-binding",
+            # The publisher owns this parameter's value and Terraform ignores it
+            # after creation, so the refresh reports this drift whenever the
+            # publisher has written since the last apply -- it is inherent, not a
+            # signal. An authority image update is precisely the reviewed
+            # transition that follows such a write, so excluding it here blocked
+            # the one plan_mode most likely to carry the drift. The drift itself
+            # is unaffected by this list: _check_digest_normalization still
+            # requires the exact parameter identity, description, ARN, a
+            # well-formed sha256, and a planned no-op matching the refreshed
+            # value, and the image transition remains pinned to its exact
+            # reviewed from/to URIs and evidence.
+            "authority-image-update",
         ):
             raise ContractError(
-                "authority digest normalization may accompany only the reviewed "
-                "Redis split transition"
+                "authority digest normalization may accompany only a reviewed "
+                "Redis split, contract binding, or authority image transition"
             )
         if plan_mode == "no-op" and "resource_changes" in plan:
             raise ContractError(

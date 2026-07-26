@@ -107,14 +107,6 @@ override_resource {
 }
 
 override_data {
-  target          = data.aws_ssm_parameter.authority_runtime_digest[0]
-  override_during = plan
-  values = {
-    insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-  }
-}
-
-override_data {
   target          = data.aws_ecr_image.authority_runtime[0]
   override_during = plan
   values = {

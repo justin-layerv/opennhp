@@ -74,14 +74,6 @@ override_resource {
 }
 
 override_data {
-  target          = data.aws_ssm_parameter.authority_runtime_digest[0]
-  override_during = plan
-  values = {
-    insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-  }
-}
-
-override_data {
   target          = data.aws_ecr_image.authority_runtime[0]
   override_during = plan
   values = {
@@ -259,7 +251,6 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
 
   assert {
     condition = (
-      length(data.aws_ssm_parameter.authority_runtime_digest) == 1 &&
       length(data.aws_ecr_image.authority_runtime) == 1 &&
       length(local.authority_expected_functions) == 3 + 4 * 2 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-ia"] == 10 &&
@@ -277,6 +268,36 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
       ])
     )
     error_message = "Measurement must freeze exact 3 + 4N identities while exposing only complete operation groups present in the contract."
+  }
+}
+
+# Regression fence: the deployed Authority image must be selected by the
+# reviewed measurement basis alone.
+#
+# The publisher-owned SSM parameter is rewritten by qurl-service's
+# build-and-deploy workflow on every push to its main. While that value fed the
+# ECR lookup, an unrelated repository's release invalidated every nhp Control
+# plan the moment it published -- the reviewed basis stopped matching the live
+# parameter and the foundation precondition failed closed on all open Control
+# PRs until someone hand-rolled the basis by hand.
+#
+# This run reads no SSM parameter at all: the module resolves its image from
+# the contract digest, so there is no override_data for one here and none can
+# be reintroduced without this assertion noticing. If a future change routes
+# the deployed digest back through the parameter, the plan below stops
+# resolving to the reviewed digest and this fails.
+run "deployed_image_tracks_reviewed_basis_not_the_publisher_parameter" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract
+  }
+
+  assert {
+    condition = (
+      local.authority_runtime_image_digest == local.authority_contract_global.authority_image_digest
+    )
+    error_message = "The deployed Authority image must come from the reviewed basis digest, never from the publisher-owned SSM parameter."
   }
 }
 

@@ -45,25 +45,31 @@ resource "aws_ssm_parameter" "authority_image_digest" {
   }
 }
 
-# These reads exist only after the exact-main evidence generator has supplied
-# the complete atomic runtime contract. The managed parameter remains the
-# publisher-owned sentinel; its current external value selects an immutable
-# ECR digest, and both reads disappear entirely while the contract is null.
-data "aws_ssm_parameter" "authority_runtime_digest" {
-  count = local.authority_runtime_contract_enabled ? 1 : 0
-
-  name            = aws_ssm_parameter.authority_image_digest.name
-  with_decryption = false
-}
-
+# This read exists only after the exact-main evidence generator has supplied the
+# complete atomic runtime contract, and disappears entirely while it is null.
+#
+# The DESIRED digest comes from the reviewed measurement basis, never from the
+# publisher-owned SSM parameter. qurl-service's build-and-deploy workflow
+# rewrites that parameter on every push to its main, so sourcing the deployed
+# image from it made an unrelated repository's CI able to invalidate every nhp
+# Control plan: the moment it published, the reviewed basis no longer matched
+# the live parameter and authority_contract_identity_valid failed closed on
+# every open Control PR until someone hand-rolled the basis. The parameter
+# records what was last published; it is not an approval to deploy it.
+#
+# The security property is preserved and strengthened. This data source still
+# fails closed unless the reviewed digest actually exists in the Authority ECR
+# repository, which is the real liveness proof; the digest itself now advances
+# only through a reviewed change to the in-repo basis, so no external CI can
+# move what Control deploys.
 data "aws_ecr_image" "authority_runtime" {
   count = local.authority_runtime_contract_enabled ? 1 : 0
 
   repository_name = aws_ecr_repository.authority.name
-  image_digest    = data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value
+  image_digest    = local.authority_contract_global.authority_image_digest
 }
 
 locals {
-  authority_runtime_image_digest = local.authority_runtime_contract_enabled ? data.aws_ssm_parameter.authority_runtime_digest[0].insecure_value : null
+  authority_runtime_image_digest = local.authority_runtime_contract_enabled ? local.authority_contract_global.authority_image_digest : null
   authority_runtime_image_uri    = local.authority_runtime_contract_enabled ? data.aws_ecr_image.authority_runtime[0].image_uri : null
 }

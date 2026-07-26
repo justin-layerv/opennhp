@@ -291,7 +291,15 @@ locals {
     local.authority_contract_global.authority_repository_url == aws_ecr_repository.authority.repository_url &&
     local.authority_contract_global.authority_digest_parameter_name == local.authority_image_digest_parameter_name &&
     can(regex("^sha256:[0-9a-f]{64}$", local.authority_contract_global.authority_image_digest)) &&
-    local.authority_contract_global.authority_image_digest == local.authority_runtime_image_digest &&
+    # The reviewed basis digest IS local.authority_runtime_image_digest now, so
+    # the old basis-equals-live-SSM-parameter assertion has been removed rather
+    # than reduced to a tautology. It compared the reviewed pin against a value
+    # qurl-service CI rewrites on every push to its main, which coupled nhp
+    # Control planning to an unrelated repository's release cadence without
+    # adding a trust boundary: that CI both builds the image and writes the
+    # parameter, so it was never an independent attestation. The binding that
+    # matters is below and still fails closed -- the reviewed digest must
+    # resolve to a real image in the Authority ECR repository.
     data.aws_ecr_image.authority_runtime[0].image_digest == local.authority_runtime_image_digest &&
     data.aws_ecr_image.authority_runtime[0].image_uri == "${aws_ecr_repository.authority.repository_url}@${local.authority_runtime_image_digest}" &&
     local.authority_contract_global.qat1_raw_key_arn == aws_kms_key.qat1_signing.arn &&
