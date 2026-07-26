@@ -290,13 +290,18 @@ jobs:
       - name: Check Claude workflow contracts
         run: python3 scripts/check-claude-model-lockstep.py
 
+      # test_udp_proof_deployment_contract is intentionally absent here: the
+      # "Test UDP proof deployment-manifest contracts" step above already owns
+      # that module. It was listed in both steps only because this step landed
+      # while the step above was still unmerged and carried its own copy of the
+      # shared contract module. Re-adding it here duplicates a run, it does not
+      # add coverage.
       - name: Test UDP proof controller input and dispatch contracts
         run: >-
           python3 -m unittest
-          tests/scripts/test_udp_proof_controller_inputs.py
-          tests/scripts/test_udp_proof_deployment_contract.py
-          tests/scripts/test_udp_proof_producer_artifact.py
-          tests/scripts/test_udp_proof_client_artifact.py
+          tests.scripts.test_udp_proof_controller_inputs
+          tests.scripts.test_udp_proof_producer_artifact
+          tests.scripts.test_udp_proof_client_artifact
 
       # resolve-app-image-required_test.sh verifies that the relay image's
       # hand-maintained path list covers the actual Go import surface. Pin and
