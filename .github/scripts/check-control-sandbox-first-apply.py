@@ -3901,13 +3901,25 @@ def _check_planned_security(
             # "declares no inline block" guarantee, so relaxing the planned-value
             # assertion here would remove the only check without replacing it.
             # Fix alongside the hub-edge SG slice, giving it that contract first.
-            if planned_rules not in (None, []) or (
-                planned_rules is None
-                and unknown_rules is not True
-            ) or (
-                planned_rules == []
-                and unknown_rules not in (None, [], False)
-            ):
+            # `ingress`/`egress` are Optional+Computed. Before the edge slice
+            # applies the SG does not exist, so both are absent/unknown; AFTER it
+            # applies the provider projects the standalone rules AWS actually
+            # holds (hub_nlb_udp ingress plus the udp/health egress pair). This
+            # check previously demanded the pre-apply shape and so rejected every
+            # plan and verify once the slice landed -- the LATENT defect recorded
+            # in #3497, now fired by the applied Hub edge.
+            #
+            # Admit the settled projection; reject only a shape that is neither
+            # the create-time projection nor a rule collection. The rules'
+            # CONTENTS stay pinned by their own exact resource checks
+            # (aws_vpc_security_group_ingress_rule.hub_nlb_udp is proof-runner
+            # /32 UDP 62206; the egress pair is worker UDP 62206 + TCP 62207),
+            # and check_live re-proves the live SG posture independently.
+            if planned_rules is None and unknown_rules is not True:
+                raise ContractError(
+                    f"Hub NLB SG {field} must be exactly create-time unknown"
+                )
+            if planned_rules is not None and not isinstance(planned_rules, list):
                 raise ContractError(
                     f"Hub NLB SG must not declare inline {field} rules"
                 )
