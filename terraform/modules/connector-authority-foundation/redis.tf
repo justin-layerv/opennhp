@@ -22,12 +22,10 @@ locals {
   # each to 40 characters. The AWS provider does not reject an overlong ID at
   # plan time, so foundation_contract fences every derived ID below.
   otp_redis_disabled_default_user_id = "${local.name_prefix}-otp-default"
-  otp_redis_legacy_authority_user_id = "${local.name_prefix}-otp-auth"
   otp_redis_issuer_user_id           = "${local.name_prefix}-otp-issuer"
   otp_redis_activator_user_id        = "${local.name_prefix}-otp-activator"
   otp_redis_user_ids = [
     local.otp_redis_disabled_default_user_id,
-    local.otp_redis_legacy_authority_user_id,
     local.otp_redis_issuer_user_id,
     local.otp_redis_activator_user_id,
   ]
@@ -72,41 +70,13 @@ resource "aws_elasticache_user" "otp_disabled_default" {
   })
 }
 
-# Retain the original IAM user for a non-destructive rollout, but detach it from
-# the active user group below. No runtime role may receive elasticache:Connect
-# to this ARN. NHP #3362 removes it after the split users are live-proven.
-resource "aws_elasticache_user" "otp_authority" {
-  user_id   = local.otp_redis_legacy_authority_user_id
-  user_name = local.otp_redis_legacy_authority_user_id
-  # ElastiCache canonicalizes an allow-list ACL by inserting an explicit
-  # category reset. Keep that canonical form in configuration so a live
-  # refresh does not propose a perpetual normalization update.
-  access_string = "on ~connector:* -@all +@connection +@read +@write +@scripting"
-  engine        = "redis"
-
-  authentication_mode {
-    type = "iam"
-  }
-
-  lifecycle {
-    # Keep the live identity mode fail closed as well as the configured mode.
-    # A password-backed authority would put a long-lived Redis credential back
-    # into the design even if Terraform configuration still said IAM.
-    postcondition {
-      condition = (
-        length(self.authentication_mode) == 1 &&
-        self.authentication_mode[0].type == "iam" &&
-        self.authentication_mode[0].password_count == 0
-      )
-      error_message = "The Connector OTP authority must remain IAM-only and passwordless."
-    }
-  }
-
-  tags = merge(local.common_tags, {
-    Name    = local.otp_redis_legacy_authority_user_id
-    Purpose = "IAM-authenticated Connector OTP authority"
-  })
-}
+# The broad `~connector:*` legacy authority user that predated this split is
+# gone (NHP #3362). It was detached from the user group by the split rollout,
+# never granted elasticache:Connect by any runtime role, and structurally
+# unusable by the runtime, which derives its user id as this cache prefix plus
+# an exact `-issuer`/`-activator` suffix and fails closed on anything else. Do
+# not reintroduce it, including as a rollback path; leave the cache dark until
+# the reviewed split configuration is restored instead.
 
 # OTP issuance owns immutable challenge creation, reissue state reset, and the
 # four admission-rate namespaces. Redis OSS 7 is required below because the

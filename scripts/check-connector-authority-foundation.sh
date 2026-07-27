@@ -213,6 +213,31 @@ if [[ -n "$plan_json" ]]; then
           and .change.before.id == "sg-0584cd75da80a2c7d"
           and (.change.before | legacy_authority_sg_before)
         ) or (
+          # The one reviewed removal of the detached legacy Connector OTP Redis
+          # user (NHP #3362): a net delete, admitted only at its exact reviewed
+          # before-state. Kept field-for-field in lockstep with
+          # _is_exact_legacy_otp_user_delete in the first-apply checker, which
+          # separately refuses to combine it with any other Control change.
+          # Remove this branch once the delete is applied, together with the
+          # LEGACY_OTP_REDIS_USER_* sites in that checker.
+          .address == "module.control.aws_elasticache_user.otp_authority"
+          and .type == "aws_elasticache_user"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete"]
+          and .change.after == null
+          and .change.before.user_id == "layerv-nhp-sandbox-control-otp-auth"
+          and .change.before.user_name == "layerv-nhp-sandbox-control-otp-auth"
+          and .change.before.access_string == (
+            "on ~connector:* -@all +@connection +@read +@write +@scripting"
+          )
+          and .change.before.engine == "redis"
+          and ((.change.before.user_group_ids // []) == [])
+          and ((.change.before.authentication_mode | length) == 1)
+          and .change.before.authentication_mode[0].type == "iam"
+          and .change.before.authentication_mode[0].password_count == 0
+          and ((.change.before.authentication_mode[0].passwords // []) == [])
+        ) or (
           .address == "module.control.aws_lb.hub[0]"
           and .change.actions == ["create", "delete"]
         ) or (

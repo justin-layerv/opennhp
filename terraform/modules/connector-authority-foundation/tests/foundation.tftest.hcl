@@ -282,10 +282,6 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
   assert {
     condition = (
       aws_elasticache_user.otp_disabled_default.access_string == "off ~* -@all" &&
-      aws_elasticache_user.otp_authority.authentication_mode[0].type == "iam" &&
-      aws_elasticache_user.otp_authority.access_string == "on ~connector:* -@all +@connection +@read +@write +@scripting" &&
-      aws_elasticache_user.otp_authority.user_name == aws_elasticache_user.otp_authority.user_id &&
-      !contains(aws_elasticache_user_group.otp.user_ids, aws_elasticache_user.otp_authority.user_id) &&
       aws_elasticache_user.otp_issuer.authentication_mode[0].type == "iam" &&
       aws_elasticache_user.otp_issuer.access_string == "on %W~connector:registration-otp:v2:{*}:challenge %W~connector:registration-otp:v2:{*}:state ~connector:ratelimit:registration-otp:credential:* ~connector:ratelimit:registration-otp:owner:* ~connector:ratelimit:registration-otp:peer:* ~connector:ratelimit:registration-otp:source:* resetchannels -@all +hello +auth +ping +command +cluster|slots +multi +exec +discard +del +hset +expire +eval +evalsha +zremrangebyscore +zcard +zrange +zadd" &&
       aws_elasticache_user.otp_issuer.user_name == aws_elasticache_user.otp_issuer.user_id &&
@@ -298,14 +294,13 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
         aws_elasticache_user.otp_activator.user_id,
       ]) &&
       length(aws_elasticache_user.otp_disabled_default.user_id) <= 40 &&
-      length(aws_elasticache_user.otp_authority.user_id) <= 40 &&
       length(aws_elasticache_user.otp_issuer.user_id) <= 40 &&
       length(aws_elasticache_user.otp_activator.user_id) == 40 &&
       aws_elasticache_serverless_cache.otp.major_engine_version == "7" &&
       aws_elasticache_serverless_cache.otp.user_group_id == aws_elasticache_user_group.otp.user_group_id &&
       aws_elasticache_serverless_cache.otp.snapshot_retention_limit == 0
     )
-    error_message = "OTP Redis must use Redis OSS 7 read/write key ACLs, detach the legacy authority, split issuer and activator permissions, and never snapshot ephemeral state."
+    error_message = "OTP Redis must use Redis OSS 7 read/write key ACLs, declare no user beyond the disabled default plus the split issuer and activator, and never snapshot ephemeral state."
   }
 
   assert {

@@ -406,7 +406,6 @@ EXPECTED_RESOURCES = {
     "module.control.aws_ecr_repository.hub": "aws_ecr_repository",
     "module.control.aws_elasticache_serverless_cache.otp": "aws_elasticache_serverless_cache",
     "module.control.aws_elasticache_user.otp_activator": "aws_elasticache_user",
-    "module.control.aws_elasticache_user.otp_authority": "aws_elasticache_user",
     "module.control.aws_elasticache_user.otp_disabled_default": "aws_elasticache_user",
     "module.control.aws_elasticache_user.otp_issuer": "aws_elasticache_user",
     "module.control.aws_elasticache_user_group.otp": "aws_elasticache_user_group",
@@ -467,6 +466,18 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
         "module.control.aws_elasticache_user.otp_issuer",
     }
 )
+# The single reviewed removal of the broad `~connector:*` legacy Connector OTP
+# Redis user (NHP #3362). The split rollout detached it from the user group but
+# deliberately kept the resource so that destructive cleanup never rode along
+# with the reviewed user-split migration. Source no longer declares it, so the
+# one admitted plan that still mentions this address is its exact delete, which
+# _is_exact_legacy_otp_user_delete pins field-for-field and check_plan refuses
+# to combine with any other Control change. It is absent from EXPECTED_RESOURCES
+# because the state and state-list lanes run only AFTER that apply. Remove all
+# three names once the delete is applied and its no-op proof is recorded.
+LEGACY_OTP_REDIS_USER_ADDRESS = "module.control.aws_elasticache_user.otp_authority"
+LEGACY_OTP_REDIS_USER_ID = f"{CONTROL_PREFIX}-otp-auth"
+LEGACY_OTP_REDIS_USER_TYPE = "aws_elasticache_user"
 
 # ---------------------------------------------------------------------------
 # Connector Authority runtime slice (Step 4).
@@ -2285,9 +2296,6 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
     "module.control.aws_elasticache_user.otp_activator": {
         ("authentication_mode", 0, "type"): "iam",
     },
-    "module.control.aws_elasticache_user.otp_authority": {
-        ("authentication_mode", 0, "type"): "iam",
-    },
     "module.control.aws_elasticache_user.otp_disabled_default": {
         ("authentication_mode", 0, "type"): "no-password-required",
     },
@@ -2364,13 +2372,6 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("vpc_config",),
     ),
     "module.control.aws_elasticache_user.otp_activator": (
-        ("authentication_mode", 0, "passwords"),
-        ("no_password_required",),
-        ("passwords",),
-        ("passwords_wo",),
-        ("passwords_wo_version",),
-    ),
-    "module.control.aws_elasticache_user.otp_authority": (
         ("authentication_mode", 0, "passwords"),
         ("no_password_required",),
         ("passwords",),
@@ -3341,6 +3342,52 @@ def _is_exact_legacy_authority_sg_deposed_delete(item: dict[str, Any]) -> bool:
     )
 
 
+def _is_exact_legacy_otp_user_delete(item: dict[str, Any]) -> bool:
+    """Prove the one reviewed delete of the detached legacy OTP Redis user.
+
+    The issuer/activator split detached this broad `~connector:*` user from the
+    active user group but kept the resource so a destructive cleanup never rode
+    along with that reviewed migration. NHP #3362 removes it from source, so the
+    only plan that may still name this address is its exact delete.
+
+    This pins the whole before-state -- the reviewed user id, the identical user
+    name, the exact legacy ACL, the engine, and IAM-only zero-password identity
+    -- so a user that has drifted (a widened ACL, a password-backed identity, or
+    a re-attached group membership) fails closed and is reviewed rather than
+    silently destroyed. ``check_plan`` separately refuses to combine this delete
+    with any other Control change, so it can never ride along with publisher
+    bootstrap, split-user creation, or runtime activation.
+
+    Remove once the delete is applied and its no-op proof is recorded. Four
+    coupled sites go together: the three LEGACY_OTP_REDIS_USER_* constants, this
+    function, its hook in ``check_plan``, and the fixtures in both test suites.
+    """
+    change = item.get("change")
+    if (
+        item.get("address") != LEGACY_OTP_REDIS_USER_ADDRESS
+        or item.get("type") != LEGACY_OTP_REDIS_USER_TYPE
+        or item.get("mode") != "managed"
+        or item.get("deposed") is not None
+        or not isinstance(change, dict)
+        or change.get("actions") != ["delete"]
+        or change.get("after") is not None
+    ):
+        return False
+    before = change.get("before")
+    if not isinstance(before, dict):
+        return False
+    return (
+        before.get("user_id") == LEGACY_OTP_REDIS_USER_ID
+        and before.get("user_name") == LEGACY_OTP_REDIS_USER_ID
+        and before.get("access_string") == OTP_REDIS_LEGACY_ACCESS
+        and before.get("engine") == "redis"
+        and before.get("user_group_ids") in (None, [], set())
+        and _is_exact_passwordless_authentication_mode(
+            before.get("authentication_mode"), "iam"
+        )
+    )
+
+
 # The dark contract input is `{account_id, control_table_prefix, region}` and the
 # enabled input adds `authority_image_uri`/`authority_runtime_contract`. To keep
 # the dark shape exactly three keys (a no-op against live state) while adding two
@@ -4112,13 +4159,6 @@ def _check_planned_security(
             "user_id": f"{CONTROL_PREFIX}-otp-activator",
             "user_name": f"{CONTROL_PREFIX}-otp-activator",
         },
-        "module.control.aws_elasticache_user.otp_authority": {
-            "access_string": OTP_REDIS_LEGACY_ACCESS,
-            "engine": "redis",
-            "region": AWS_REGION,
-            "user_id": f"{CONTROL_PREFIX}-otp-auth",
-            "user_name": f"{CONTROL_PREFIX}-otp-auth",
-        },
         "module.control.aws_elasticache_user.otp_disabled_default": {
             "access_string": "off ~* -@all",
             "engine": "redis",
@@ -4157,7 +4197,6 @@ def _check_planned_security(
     # this split (including the analogous IPv6 null/empty shapes).
     for address, auth_type in (
         ("module.control.aws_elasticache_user.otp_activator", "iam"),
-        ("module.control.aws_elasticache_user.otp_authority", "iam"),
         (
             "module.control.aws_elasticache_user.otp_disabled_default",
             "no-password",
@@ -7755,6 +7794,23 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
 
+    # Source no longer declares the detached legacy OTP Redis user, so a plan
+    # against the pre-cleanup state carries exactly one address outside the
+    # then-current inventory: its delete. Validate that delete field-for-field
+    # and retire the address here, before the exact-inventory equality below, so
+    # every other contract keeps seeing only the then-current inventory and the
+    # state/state-list lanes -- which run only after this apply -- stay exact.
+    # Any other action on this address (an update, a re-create, or a deposed
+    # object) fails closed rather than widening the plan contract.
+    legacy_otp_user_delete = LEGACY_OTP_REDIS_USER_ADDRESS in by_address
+    if legacy_otp_user_delete and not _is_exact_legacy_otp_user_delete(
+        by_address.pop(LEGACY_OTP_REDIS_USER_ADDRESS)
+    ):
+        raise ContractError(
+            "the detached legacy Connector OTP Redis user may appear only as its "
+            "exact reviewed delete; review the drift rather than applying"
+        )
+
     # The base foundation, plus any complete subset of the independent optional
     # slices: the two-row provisioned-cell catalog, authority runtime (Lambda
     # functions/aliases/roles/…), Hub public edge
@@ -8280,6 +8336,16 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and actual_non_noop.get(HUB_WORKER_S3_ENDPOINT_ADDRESS) == ["update"]
     )
 
+    # The legacy-user cleanup is deliberately delete-only: it must never ride
+    # along with publisher bootstrap, split-user creation, runtime activation, or
+    # any other Control change. Reject the combination before the transition
+    # chain so no other branch can claim a plan that also carries the delete.
+    if legacy_otp_user_delete and (changed or deposed_by_address):
+        raise ContractError(
+            "the detached legacy Connector OTP Redis user delete must be the only "
+            f"change in its plan; got {actual_non_noop}"
+        )
+
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
@@ -8301,6 +8367,12 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         group_before_users = (
             group_before.get("user_ids") if isinstance(group_before, dict) else None
         )
+        # The legacy membership this transition starts from. NHP #3362 removes
+        # the legacy user itself, which makes this starting state unreachable
+        # from source; the transition is kept only so the split-user create
+        # contract (and its exact IAM create envelope) stays reviewed and
+        # testable, and so this cleanup's delete-only plan can never be
+        # mistaken for it.
         if (
             not isinstance(group_before, dict)
             or not isinstance(group_after, dict)
@@ -8308,7 +8380,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             or len(group_before_users) != 2
             or set(group_before_users)
             != {
-                f"{CONTROL_PREFIX}-otp-auth",
+                LEGACY_OTP_REDIS_USER_ID,
                 f"{CONTROL_PREFIX}-otp-default",
             }
         ):
@@ -8470,7 +8542,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     elif changed or deposed_by_address:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
-            "Hub artifact bootstrap, reviewed Redis split, exact Authority "
+            "Hub artifact bootstrap, reviewed Redis split, the exact detached "
+            "legacy OTP Redis user delete, exact Authority "
             "contract binding, the exact provisioned-cell catalog create, the exact "
             "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact Authority alarm "
@@ -8480,6 +8553,14 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "replacement; "
             f"got {actual_non_noop}"
         )
+
+    if legacy_otp_user_delete:
+        # Reached only with an otherwise-exact no-op inventory (the combination
+        # guard above already rejected anything else), so this cannot mask a
+        # second transition. Naming it distinctly keeps the delete out of the
+        # "no-op" bucket that gates state normalization and plan applyability
+        # below, and binds the mode into the saved-plan contract summary.
+        plan_mode = "legacy-otp-user-delete"
 
     # runtime_mode / hub_worker_mode with no non-no-op change is the steady
     # post-slice state; the scoped policies, endpoint opens, and SG ingress are
@@ -8511,6 +8592,14 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         if plan_mode not in (
             "no-op",
             "redis-split-transition",
+            # The detached legacy OTP Redis user delete, for the same reason the
+            # Redis split may carry this drift: the publisher owns this
+            # parameter and may have written since the last apply, which is
+            # inherent refresh noise rather than a signal. The delete stays
+            # address-level exact -- every other Control address is still a
+            # no-op, and _check_digest_normalization independently pins the
+            # parameter identity and requires its planned action be no-op.
+            "legacy-otp-user-delete",
             "authority-contract-binding",
             # The publisher owns this parameter's value and Terraform ignores it
             # after creation, so the refresh reports this drift whenever the
@@ -8527,7 +8616,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         ):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "
-                "Redis split, contract binding, or authority image transition"
+                "Redis split, the legacy OTP Redis user delete, contract "
+                "binding, or authority image transition"
             )
         if plan_mode == "no-op" and "resource_changes" in plan:
             raise ContractError(
@@ -9404,7 +9494,6 @@ def check_state(state: Any) -> dict[str, Any]:
         raise ContractError("OTP Redis cache contract failed")
     activator = values["module.control.aws_elasticache_user.otp_activator"]
     disabled = values["module.control.aws_elasticache_user.otp_disabled_default"]
-    legacy = values["module.control.aws_elasticache_user.otp_authority"]
     issuer = values["module.control.aws_elasticache_user.otp_issuer"]
     group = values["module.control.aws_elasticache_user_group.otp"]
     disabled_auth = disabled.get("authentication_mode", [])
@@ -9415,12 +9504,6 @@ def check_state(state: Any) -> dict[str, Any]:
         or [item.get("password_count") for item in disabled_auth] != [0]
     ):
         raise ContractError("Redis default user is not disabled")
-    _require_iam_redis_user(
-        legacy,
-        f"{CONTROL_PREFIX}-otp-auth",
-        OTP_REDIS_LEGACY_ACCESS,
-        "detached legacy Redis authority ACL drifted",
-    )
     _require_iam_redis_user(
         issuer,
         f"{CONTROL_PREFIX}-otp-issuer",

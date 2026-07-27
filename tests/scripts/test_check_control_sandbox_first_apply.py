@@ -240,17 +240,6 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
             },
             {},
         ),
-        "module.control.aws_elasticache_user.otp_authority": (
-            {
-                "access_string": CHECKER.OTP_REDIS_LEGACY_ACCESS,
-                "authentication_mode": [{"passwords": None, "type": "iam"}],
-                "engine": "redis",
-                "region": CHECKER.AWS_REGION,
-                "user_id": f"{CHECKER.CONTROL_PREFIX}-otp-auth",
-                "user_name": f"{CHECKER.CONTROL_PREFIX}-otp-auth",
-            },
-            {},
-        ),
         "module.control.aws_elasticache_user.otp_issuer": (
             {
                 "access_string": CHECKER.OTP_REDIS_ISSUER_ACCESS,
@@ -574,7 +563,6 @@ def plan_fixture() -> dict:
     vpc["ipv6_netmask_length"] = 0
     for address, auth_type in (
         ("module.control.aws_elasticache_user.otp_activator", "iam"),
-        ("module.control.aws_elasticache_user.otp_authority", "iam"),
         (
             "module.control.aws_elasticache_user.otp_disabled_default",
             "no-password",
@@ -864,6 +852,41 @@ def authority_contract_transition_fixture() -> dict:
     # combination -- the gap the live plan hit; the #3411 terminal review's
     # Finding 2.)
     result["resource_drift"] = authority_enablement_drift_pair(result)
+    return result
+
+
+def legacy_otp_user_before() -> dict:
+    """The exact pre-cleanup state of the detached legacy OTP Redis user."""
+    return {
+        "access_string": CHECKER.OTP_REDIS_LEGACY_ACCESS,
+        "authentication_mode": [
+            {"password_count": 0, "passwords": [], "type": "iam"}
+        ],
+        "engine": "redis",
+        "id": CHECKER.LEGACY_OTP_REDIS_USER_ID,
+        "region": CHECKER.AWS_REGION,
+        "user_group_ids": [],
+        "user_id": CHECKER.LEGACY_OTP_REDIS_USER_ID,
+        "user_name": CHECKER.LEGACY_OTP_REDIS_USER_ID,
+    }
+
+
+def legacy_otp_user_delete_fixture() -> dict:
+    """A no-op Control plan carrying only the reviewed legacy-user delete."""
+    result = plan_fixture()
+    result["applyable"] = True
+    result["resource_changes"].append(
+        {
+            "address": CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS,
+            "mode": "managed",
+            "type": CHECKER.LEGACY_OTP_REDIS_USER_TYPE,
+            "change": {
+                "actions": ["delete"],
+                "before": legacy_otp_user_before(),
+                "after": None,
+            },
+        }
+    )
     return result
 
 
@@ -2945,11 +2968,11 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 52)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 51)
 
     def test_exact_noop_passes(self) -> None:
         summary = CHECKER.check_plan(plan_fixture())
-        self.assertEqual(summary["resource_count"], 52)
+        self.assertEqual(summary["resource_count"], 51)
         self.assertEqual(summary["plan_mode"], "no-op")
         unrefreshed = plan_fixture()
         unrefreshed_role = self.change(
@@ -2957,13 +2980,13 @@ class PlanContractTests(unittest.TestCase):
         )
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
-        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 52)
+        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 51)
 
     def test_provisioned_cell_catalog_transition_is_exact_and_atomic(self) -> None:
         exact = provisioned_cell_catalog_transition_fixture()
         summary = CHECKER.check_plan(exact)
         self.assertEqual(summary["plan_mode"], "provisioned-cell-catalog")
-        self.assertEqual(summary["resource_count"], 52)
+        self.assertEqual(summary["resource_count"], 51)
 
         cell0 = (
             'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
@@ -3072,7 +3095,6 @@ class PlanContractTests(unittest.TestCase):
         ] = False
         for address, auth_type in (
             ("module.control.aws_elasticache_user.otp_activator", "iam"),
-            ("module.control.aws_elasticache_user.otp_authority", "iam"),
             (
                 "module.control.aws_elasticache_user.otp_disabled_default",
                 "no-password",
@@ -3098,7 +3120,7 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 52)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 51)
 
     def test_authority_enablement_benign_drift_pair_passes(self) -> None:
         # The REAL Step-3 enablement plan carries exactly two benign refresh-phase
@@ -3299,7 +3321,6 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for address in (
             "module.control.aws_elasticache_user.otp_activator",
-            "module.control.aws_elasticache_user.otp_authority",
             "module.control.aws_elasticache_user.otp_disabled_default",
             "module.control.aws_elasticache_user.otp_issuer",
         ):
@@ -3308,7 +3329,7 @@ class PlanContractTests(unittest.TestCase):
                 del change[side]["authentication_mode"][0]["passwords"]
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 52)
+        self.assertEqual(summary["resource_count"], 51)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_exact_refresh_disabled_password_null_passes(self) -> None:
@@ -3322,7 +3343,7 @@ class PlanContractTests(unittest.TestCase):
                 change[side]["authentication_mode"][0]["passwords"] = None
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 52)
+        self.assertEqual(summary["resource_count"], 51)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_passwordless_authentication_mode_boundary_is_exact(self) -> None:
@@ -4801,7 +4822,7 @@ class PlanContractTests(unittest.TestCase):
                 result = CHECKER.check_plan(
                     redis_split_transition_fixture(create_addresses)
                 )
-                self.assertEqual(result["resource_count"], 52)
+                self.assertEqual(result["resource_count"], 51)
                 self.assertEqual(result["plan_mode"], "redis-split-transition")
 
     def test_redis_iam_create_authentication_mode_matches_real_golden(self) -> None:
@@ -5105,6 +5126,152 @@ class PlanContractTests(unittest.TestCase):
         piggyback = copy.deepcopy(candidate)
         piggyback["resource_drift"][0]["change"]["after"]["description"] = "changed"
         self.assert_rejected(piggyback, prior_state)
+
+    # --- Detached legacy OTP Redis user cleanup (NHP #3362) -------------------
+
+    def test_exact_legacy_otp_user_delete_passes(self) -> None:
+        summary = CHECKER.check_plan(legacy_otp_user_delete_fixture())
+        self.assertEqual(summary["plan_mode"], "legacy-otp-user-delete")
+        # The delete address is retired before the inventory equality check, so
+        # the count is the then-current inventory the apply converges on.
+        self.assertEqual(summary["resource_count"], 51)
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+        self.assertNotIn(
+            CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS, CHECKER.EXPECTED_RESOURCES
+        )
+
+    def test_legacy_otp_user_delete_requires_the_exact_reviewed_before(self) -> None:
+        for label, mutate in (
+            # A widened or otherwise drifted ACL must be reviewed, not destroyed.
+            ("acl", lambda b: b.update({"access_string": "on ~* +@all"})),
+            ("user_id", lambda b: b.update({"user_id": "layerv-nhp-sandbox-other"})),
+            ("user_name", lambda b: b.update({"user_name": "default"})),
+            ("engine", lambda b: b.update({"engine": "valkey"})),
+            # A password-backed identity means a long-lived Redis credential
+            # exists somewhere; fail closed rather than silently dropping it.
+            (
+                "password-backed",
+                lambda b: b.update(
+                    {
+                        "authentication_mode": [
+                            {"password_count": 1, "passwords": [], "type": "password"}
+                        ]
+                    }
+                ),
+            ),
+            (
+                "password-count",
+                lambda b: b.update(
+                    {
+                        "authentication_mode": [
+                            {"password_count": 2, "passwords": [], "type": "iam"}
+                        ]
+                    }
+                ),
+            ),
+            # Still attached to a user group means it is not the detached user
+            # this cleanup reviewed.
+            (
+                "attached",
+                lambda b: b.update(
+                    {"user_group_ids": [f"{CHECKER.CONTROL_PREFIX}-otp-users"]}
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                candidate = legacy_otp_user_delete_fixture()
+                mutate(self.change(candidate, CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS)["before"])
+                self.assert_rejected(candidate)
+
+    def test_legacy_otp_user_address_admits_only_a_delete(self) -> None:
+        for actions, after in (
+            (["no-op"], legacy_otp_user_before()),
+            (["update"], legacy_otp_user_before()),
+            (["create"], legacy_otp_user_before()),
+            (["create", "delete"], legacy_otp_user_before()),
+            # A delete that still plans an after-state is not a removal.
+            (["delete"], {"user_id": CHECKER.LEGACY_OTP_REDIS_USER_ID}),
+        ):
+            with self.subTest(actions=actions):
+                candidate = legacy_otp_user_delete_fixture()
+                change = self.change(
+                    candidate, CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS
+                )
+                change["actions"] = actions
+                change["after"] = after
+                self.assert_rejected(candidate)
+
+        # A deposed object at this address is never the reviewed delete.
+        deposed = legacy_otp_user_delete_fixture()
+        next(
+            item
+            for item in deposed["resource_changes"]
+            if item["address"] == CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS
+        )["deposed"] = "4a2844f4"
+        self.assert_rejected(deposed)
+
+    def test_legacy_otp_user_delete_cannot_be_combined(self) -> None:
+        # The guardrail: no publisher bootstrap, no split-user creation, no
+        # runtime activation, and no unrelated Control change may ride along.
+        publisher = legacy_otp_user_delete_fixture()
+        for address in CHECKER.PUBLISHER_BOOTSTRAP_RESOURCES:
+            change = self.change(publisher, address)
+            change["actions"] = ["create"]
+            change["before"] = None
+            if address == "module.control.aws_iam_role.authority_publisher":
+                change["after_unknown"]["managed_policy_arns"] = True
+            else:
+                change["after"]["role"] = None
+                change["after_unknown"]["role"] = True
+        self.assert_rejected(publisher)
+
+        split = redis_split_transition_fixture()
+        split["resource_changes"].append(
+            {
+                "address": CHECKER.LEGACY_OTP_REDIS_USER_ADDRESS,
+                "mode": "managed",
+                "type": CHECKER.LEGACY_OTP_REDIS_USER_TYPE,
+                "change": {
+                    "actions": ["delete"],
+                    "before": legacy_otp_user_before(),
+                    "after": None,
+                },
+            }
+        )
+        self.assert_rejected(split)
+
+        unrelated = legacy_otp_user_delete_fixture()
+        group = self.change(
+            unrelated, "module.control.aws_elasticache_user_group.otp"
+        )
+        group["actions"] = ["update"]
+        group["before"] = {**group["after"], "user_ids": []}
+        self.assert_rejected(unrelated)
+
+    def test_legacy_otp_user_delete_may_carry_authority_digest_normalization(
+        self,
+    ) -> None:
+        # The publisher owns the digest parameter and may have written since the
+        # last apply; that inherent refresh noise must not block the cleanup.
+        normalization, prior_state = authority_digest_refresh_candidate()
+        candidate = legacy_otp_user_delete_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+        parameter = self.change(candidate, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+        parameter["before"] = copy.deepcopy(
+            normalization["resource_drift"][0]["change"]["after"]
+        )
+        parameter["after"] = copy.deepcopy(parameter["before"])
+
+        summary = CHECKER.check_plan(candidate, prior_state)
+        self.assertEqual(summary["plan_mode"], "legacy-otp-user-delete")
+        self.assertEqual(summary["normalization_drift_kind"], "authority-digest")
+
+    def test_legacy_otp_user_delete_rejects_publisher_role_normalization(self) -> None:
+        # Publisher-role normalization stays confined to an exact no-op plan.
+        normalization, prior_state = publisher_refresh_candidate()
+        candidate = legacy_otp_user_delete_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+        self.assert_rejected(candidate, prior_state)
 
     # --- Connector Authority runtime slice (Step 4) ---------------------------
 
@@ -5474,7 +5641,7 @@ class PlanContractTests(unittest.TestCase):
         self.assertEqual(summary["plan_mode"], "authority-image-update")
         self.assertEqual(
             summary["resource_count"],
-            50 + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+            49 + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
 
         alias_only = {
@@ -6678,7 +6845,7 @@ class PlanContractTests(unittest.TestCase):
     def test_catalog_holdback_is_exact_all_or_nothing(self) -> None:
         holdback = provisioned_cell_catalog_holdback_fixture()
         summary = CHECKER.check_plan(holdback)
-        self.assertEqual(summary["resource_count"], 50)
+        self.assertEqual(summary["resource_count"], 49)
         self.assertEqual(summary["plan_mode"], "no-op")
 
         partial = provisioned_cell_catalog_holdback_fixture()
@@ -6861,12 +7028,6 @@ class PlanContractTests(unittest.TestCase):
                 "module.control.aws_ssm_parameter.hub_image_digest",
                 ("value_wo",),
                 {"references": ["var.untrusted_digest"]},
-            ),
-            (
-                "authority-password",
-                "module.control.aws_elasticache_user.otp_authority",
-                ("authentication_mode", 0, "passwords"),
-                {"constant_value": ["forbidden-password"]},
             ),
             (
                 "issuer-password",
@@ -7075,7 +7236,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 5, "managed_resource_count": 52},
+            {"data_resource_count": 5, "managed_resource_count": 51},
         )
 
     def test_catalog_holdback_inventory_is_exact_all_or_nothing(self) -> None:
@@ -7086,7 +7247,7 @@ class StateListTests(unittest.TestCase):
         ]
         self.assertEqual(
             self.check(held_back),
-            {"data_resource_count": 5, "managed_resource_count": 50},
+            {"data_resource_count": 5, "managed_resource_count": 49},
         )
 
         partial = [
@@ -7153,7 +7314,7 @@ class StateListTests(unittest.TestCase):
             {
                 "data_resource_count": 5 + len(worker_data),
                 "managed_resource_count": (
-                    52
+                    51
                     + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
                     + len(CHECKER.HUB_EDGE_RESOURCES)
                     + len(worker_managed)
@@ -7386,7 +7547,6 @@ def state_fixture() -> dict:
         }
     )
     default_id = f"{CHECKER.CONTROL_PREFIX}-otp-default"
-    legacy_id = f"{CHECKER.CONTROL_PREFIX}-otp-auth"
     issuer_id = f"{CHECKER.CONTROL_PREFIX}-otp-issuer"
     activator_id = f"{CHECKER.CONTROL_PREFIX}-otp-activator"
     by_address["module.control.aws_elasticache_user.otp_disabled_default"].update(
@@ -7397,14 +7557,6 @@ def state_fixture() -> dict:
             "authentication_mode": [
                 {"password_count": 0, "type": "no-password"}
             ],
-        }
-    )
-    by_address["module.control.aws_elasticache_user.otp_authority"].update(
-        {
-            "user_id": legacy_id,
-            "user_name": legacy_id,
-            "access_string": CHECKER.OTP_REDIS_LEGACY_ACCESS,
-            "authentication_mode": [{"password_count": 0, "type": "iam"}],
         }
     )
     by_address["module.control.aws_elasticache_user.otp_issuer"].update(
@@ -7546,11 +7698,11 @@ class StateContractTests(unittest.TestCase):
         # Update only with an intentional, reviewed address/type inventory change.
         self.assertEqual(
             CHECKER.contract_sha256(),
-            "95e23d7d3b27622823f59bd6a546f8cc0f5a7a64a7222715490462c2e56c4705",
+            "0163ea49dd8a060b4f46c6af2310e83b644719f508b3298626ad047f4cd91d35",
         )
 
     def test_exact_state_passes(self) -> None:
-        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 52)
+        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 51)
 
     def test_catalog_holdback_state_is_exact_and_output_bound(self) -> None:
         holdback = state_fixture()
@@ -7560,7 +7712,7 @@ class StateContractTests(unittest.TestCase):
             if item["address"] not in CHECKER.PROVISIONED_CELL_RESOURCES
         ]
         holdback["values"]["outputs"]["provisioned_cells"]["value"] = {}
-        self.assertEqual(CHECKER.check_state(holdback)["resource_count"], 50)
+        self.assertEqual(CHECKER.check_state(holdback)["resource_count"], 49)
 
         full_output = copy.deepcopy(holdback)
         full_output["values"]["outputs"]["provisioned_cells"]["value"] = (
@@ -7865,7 +8017,6 @@ class StateContractTests(unittest.TestCase):
     def test_state_redis_users_must_have_zero_passwords(self) -> None:
         for address in (
             "module.control.aws_elasticache_user.otp_activator",
-            "module.control.aws_elasticache_user.otp_authority",
             "module.control.aws_elasticache_user.otp_disabled_default",
             "module.control.aws_elasticache_user.otp_issuer",
         ):
@@ -7909,9 +8060,10 @@ class StateContractTests(unittest.TestCase):
         for command in ("hello", "auth", "ping", "command"):
             self.assertEqual(redis.count(f'"+{command}"'), 2)
         self.assertNotIn('"+asking"', redis)
-        # The one remaining broad connection category belongs only to the
-        # detached legacy user retained for non-destructive state rollout.
-        self.assertEqual(redis.count("+@connection"), 1)
+        # NHP #3362 removed the detached legacy user that held the last broad
+        # category grant, so no command category survives anywhere in the file.
+        for category in ("+@connection", "+@read", "+@write", "+@scripting"):
+            self.assertNotIn(category, redis)
         self.assertNotIn('"+client"', redis)
         self.assertNotIn("+hincrby", redis)
         self.assertNotIn('"+hget"', redis)

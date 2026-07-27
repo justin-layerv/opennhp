@@ -203,6 +203,33 @@ expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_r
 printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].change.before.vpc_id = "not-a-vpc"' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# The one reviewed removal of the detached legacy Connector OTP Redis user
+# (NHP #3362): a net delete admitted only at its exact reviewed before-state.
+legacy_otp_user_plan='{"resource_changes":[{"address":"module.control.aws_elasticache_user.otp_authority","type":"aws_elasticache_user","mode":"managed","change":{"actions":["delete"],"before":{"user_id":"layerv-nhp-sandbox-control-otp-auth","user_name":"layerv-nhp-sandbox-control-otp-auth","access_string":"on ~connector:* -@all +@connection +@read +@write +@scripting","engine":"redis","user_group_ids":[],"authentication_mode":[{"type":"iam","password_count":0,"passwords":[]}]},"after":null}}]}'
+printf '%s\n' "$legacy_otp_user_plan" >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# A widened ACL means the user drifted; review it rather than destroying it.
+printf '%s\n' "$legacy_otp_user_plan" | jq '.resource_changes[0].change.before.access_string = "on ~* +@all"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# A password-backed identity means a long-lived Redis credential still exists.
+printf '%s\n' "$legacy_otp_user_plan" | jq '.resource_changes[0].change.before.authentication_mode = [{"type":"password","password_count":1,"passwords":[]}]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# Still attached to a user group is not the detached user this cleanup reviewed.
+printf '%s\n' "$legacy_otp_user_plan" | jq '.resource_changes[0].change.before.user_group_ids = ["layerv-nhp-sandbox-control-otp-users"]' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# The admission is pinned to this one address: no other Redis user may be
+# deleted on the strength of the same before-state shape.
+printf '%s\n' "$legacy_otp_user_plan" | jq '.resource_changes[0].address = "module.control.aws_elasticache_user.otp_issuer"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# A deposed object at that address is never the reviewed delete.
+printf '%s\n' "$legacy_otp_user_plan" | jq '.resource_changes[0].deposed = "4a2844f4"' >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 # Deposed deletes are NOT admitted generally: the same exact shape at any other
 # address, or any other deposed resource, stays destructive.
 printf '%s\n' "$deposed_plan" | jq '.resource_changes[0].address = "module.control.aws_security_group.interface_endpoints"' >"$plan_json"
