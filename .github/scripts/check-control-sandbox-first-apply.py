@@ -6332,12 +6332,21 @@ def _check_state_normalization_drift(
         # binds this kind to the runtime-slice completion (or a refresh-only
         # steady re-read); it is rejected against any other plan shape.
         return "authority-runtime-slice-normalization"
-    if all(isinstance(address, str) for address in drift_addresses) and set(
-        drift_addresses
-    ) <= (
-        set(AUTHORITY_RUNTIME_RESOURCES)
-        | AUTHORITY_RUNTIME_OPENED_ADDRESSES
-        | _PROVIDER_REPROJECTION_ADDRESSES
+    # The digest address is admitted here only ALONGSIDE a real re-projection. A
+    # digest-only drift keeps falling through to its own exact single-drift
+    # handler below, which is the reviewed shape for that kind.
+    if (
+        # Must stay FIRST: a malformed (unhashable) address would raise in the
+        # set expressions below instead of being masked by the diagnostic.
+        all(isinstance(address, str) for address in drift_addresses)
+        and (set(drift_addresses) - {_AUTHORITY_DIGEST_ADDRESS})
+        and set(drift_addresses)
+        <= (
+            set(AUTHORITY_RUNTIME_RESOURCES)
+            | AUTHORITY_RUNTIME_OPENED_ADDRESSES
+            | _PROVIDER_REPROJECTION_ADDRESSES
+            | {_AUTHORITY_DIGEST_ADDRESS}
+        )
     ):
         # The same benign re-projection as the branch above, but spanning the
         # Hub keygen/execution roles and the OTP Redis SG as well, which are
@@ -6368,7 +6377,23 @@ def _check_state_normalization_drift(
         # `local.authority_selected_alias_targets.hub` while it is null. Those
         # are separate defects worth their own fix; this drift shows up on the
         # ordinary refresh-enabled plan, which is where it must be admitted.
-        _check_provider_reprojection_drift(drift)
+        # The Authority image digest parameter rolls on every qurl-service main
+        # publish, so it can co-occur with the re-projection set. It is NOT
+        # admitted loosely: each digest drift is handed to the SAME
+        # _check_digest_normalization used for the single-drift kind, unchanged,
+        # exactly as the enablement pair above validates each of its two drifts
+        # with its own exact checker. Only the remainder goes to the
+        # re-projection gate.
+        digest_drift = [
+            item for item in drift if item.get("address") == _AUTHORITY_DIGEST_ADDRESS
+        ]
+        for item in digest_drift:
+            _check_digest_normalization(item, by_address, spec=_AUTHORITY_DIGEST_SPEC)
+        _check_provider_reprojection_drift(
+            [item for item in drift if item.get("address") != _AUTHORITY_DIGEST_ADDRESS]
+        )
+        if digest_drift:
+            return "provider-reprojection-with-authority-digest"
         return "provider-reprojection"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
