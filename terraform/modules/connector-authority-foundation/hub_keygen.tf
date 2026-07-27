@@ -226,33 +226,30 @@ resource "aws_lambda_invocation" "hub_identity_publication" {
     aws_iam_role_policy.hub_keygen,
   ]
 
-  lifecycle {
-    postcondition {
-      # `self.result` is unresolvable while this invocation is still pending
-      # creation: the instance collection is empty, so evaluating it raises
-      # "Invalid index" rather than returning null, and `try` around only the
-      # jsondecode does not catch that. A `-refresh-only` plan evaluates this
-      # check against exactly that empty collection, so the error made the
-      # workflow's sole sanctioned drift-normalization operation impossible to
-      # run until after the very apply it gates.
-      #
-      # CORRECTION (#3513 claimed otherwise and was wrong): `can()` does NOT
-      # rescue this. Verified by reproducing a `-refresh-only` plan against the
-      # live sandbox Control root with the guard in place — it still fails with
-      # the same "Invalid index". `can()` traps errors raised while EVALUATING
-      # an expression; this one is raised earlier, resolving the `self`
-      # reference against an empty instance collection, so nothing in the
-      # expression body can intercept it. The guard is therefore inert and the
-      # exact-constant assertion below is the only live part of this check.
-      #
-      # `-refresh-only` is separately broken against this module regardless:
-      # hub_worker.tf's locals dereference
-      # `local.authority_selected_alias_targets.hub` while it is null, failing
-      # with "Attempt to get attribute from null value" at lines 39, 68 and 69.
-      # Fixing refresh-only means fixing both, and neither is on the path the
-      # ordinary refresh-enabled plan takes.
-      condition     = !can(self.result) || try(jsondecode(self.result), null) == { seeded = true }
-      error_message = "Hub keygen must return only the exact constant seeded marker."
-    }
-  }
+  # NO postcondition on `self.result`, deliberately, and it must not be
+  # reintroduced in that form.
+  #
+  # It asserted the invocation returned exactly {seeded = true}. But
+  # `self.result` is unresolvable while this CREATE_ONLY invocation is still
+  # pending: the instance collection is empty, so the reference raises "Invalid
+  # index" during REFERENCE RESOLUTION -- earlier than expression evaluation,
+  # which is why neither `try()` nor `can()` intercepts it. #3513 tried `can()`
+  # and it was verified inert by reproducing a refresh-only plan against live
+  # sandbox Control with the guard in place.
+  #
+  # That made `terraform plan -refresh-only` impossible against this module, and
+  # the APPLY LANE REQUIRES IT: control-sandbox-update.yml re-proves the live
+  # refresh drift observation with a refresh-only plan immediately before
+  # applying (the "Re-prove exact live refresh observation before apply" step).
+  # So this check blocked the very apply that would have created the instance it
+  # wanted to inspect -- it could never once have run successfully.
+  #
+  # The seeded outcome is still proved, downstream and against REALITY rather
+  # than a plan value:
+  #   * the verify lane reads /sandbox/nhp/control/hub/identity/public-key;
+  #   * the deployment-manifest producer rejects anything that is not a
+  #     canonical 32-byte public key, failing closed on the `pending-keygen`
+  #     sentinel (udp_proof_deployment_contract.py decode_public_key);
+  #   * the keygen Lambda writes only while the parameter still holds that
+  #     sentinel, so the identity transaction is single-shot and idempotent.
 }

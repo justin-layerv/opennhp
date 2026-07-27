@@ -553,7 +553,22 @@ describe("Terraform boundary", () => {
     assert.match(terraform, /"secretsmanager:PutSecretValue"/);
     assert.match(terraform, /"ssm:GetParameter"/);
     assert.match(terraform, /"ssm:PutParameter"/);
-    assert.match(terraform, /jsondecode\(self\.result\)[\s\S]*seeded = true/);
+    // The seeded-marker assertion must NOT be a postcondition on `self.result`.
+    // While the CREATE_ONLY invocation is pending its instance collection is
+    // empty, so the reference raises "Invalid index" during reference
+    // resolution -- before evaluation, which is why neither try() nor can()
+    // intercepts it. That made `terraform plan -refresh-only` impossible, and
+    // the apply lane re-proves its live refresh observation with exactly such a
+    // plan, so the check blocked the apply that would have created the instance
+    // it wanted to inspect. Pin its ABSENCE so it cannot be reintroduced in that
+    // form, and pin the recorded reason so the next reader sees why.
+    assert.doesNotMatch(terraform, /postcondition\s*\{/);
+    assert.doesNotMatch(terraform, /jsondecode\(self\.result\)/);
+    assert.match(terraform, /NO postcondition on `self\.result`/);
+    // The outcome is still proved, downstream and against reality: the keygen
+    // Lambda writes only while the sentinel is present (asserted above via the
+    // "pending-keygen" default and ignore_changes), the verify lane reads the
+    // parameter, and the manifest producer rejects any non-canonical key.
     assert.match(
       terraform,
       /resource "aws_lambda_invocation" "hub_identity_publication"[\s\S]*depends_on = \[[\s\S]*aws_lambda_invocation\.hub_keygen/,
