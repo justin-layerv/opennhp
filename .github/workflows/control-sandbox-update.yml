@@ -612,11 +612,37 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
               exit 1
+              ;;
+          esac
+          case "$normalization_kind" in
+            provider-reprojection|provider-reprojection-with-authority-digest)
+              # Same character as the runtime-slice kind below: a deterministic
+              # re-read of ALREADY-APPLIED objects, where the provider projects
+              # Optional+Computed attributes (layers, alarm_actions,
+              # inline_policy, an SG's computed rule collections) that state
+              # never carried. check_plan already bound every entry at plan time
+              # -- each differing key must be an absent/null -> [] normalization,
+              # or the OTP Redis ingress proved to be exactly one SG-scoped
+              # TLS/6379 rule.
+              #
+              # The -with-authority-digest variant additionally carries the
+              # Authority image digest parameter, which qurl-service republishes
+              # on every main push. That is EXTERNALLY ROLLING, so a live
+              # refresh-only re-observation races the publisher by construction:
+              # a digest roll between plan and apply would fail this step for a
+              # value the plan already validated against its exact reviewed
+              # digest normalization. Re-observing it is not a staleness guard,
+              # it is a coin flip.
+              #
+              # The real staleness guard is the immediately-before-apply state
+              # {serial, sha256} binding in the next step -- unchanged state
+              # yields identical drift.
+              exit 0
               ;;
           esac
           if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' ]]; then
