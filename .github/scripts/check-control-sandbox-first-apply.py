@@ -5932,6 +5932,44 @@ def _check_state_normalization_drift(
         # binds this kind to the runtime-slice completion (or a refresh-only
         # steady re-read); it is rejected against any other plan shape.
         return "authority-runtime-slice-normalization"
+    if all(isinstance(address, str) for address in drift_addresses) and set(
+        drift_addresses
+    ) <= (
+        set(AUTHORITY_RUNTIME_RESOURCES)
+        | AUTHORITY_RUNTIME_OPENED_ADDRESSES
+        | _PROVIDER_REPROJECTION_ADDRESSES
+    ):
+        # The same benign re-projection as the branch above, but spanning the
+        # Hub keygen/execution roles and the OTP Redis SG as well, which are
+        # foundation and hub-worker resources rather than runtime-slice ones and
+        # so fail that branch's subset test. Observed live on the sandbox Control
+        # root: 27 drift entries over six addresses, every one of them the
+        # provider recording an Optional+Computed collection that was absent from
+        # state (`layers`, `alarm_actions`, `ok_actions`,
+        # `insufficient_data_actions`) plus the OTP Redis standalone TLS/6379
+        # ingress read-back. Nothing changed in AWS out of band.
+        #
+        # Admission is gated on the DELTA SHAPE, not merely the address set:
+        # `_check_provider_reprojection_drift` requires every differing key to be
+        # an absent/null -> [] normalization, with the single exception of the
+        # OTP Redis `ingress`, which is handed to the same
+        # `_check_otp_redis_ingress` used everywhere else and so still must be
+        # exactly one SG-scoped TLS/6379 rule. A real value change to any of
+        # these resources -- including a widened SG rule -- fails closed here.
+        #
+        # NOT gated on refresh-only, following the runtime-slice branch above
+        # rather than the Redis-password one. The safety here is carried by the
+        # delta-shape gate, not by the operation mode, and gating on
+        # refresh-only would make the admission unreachable in practice:
+        # `-refresh-only` currently cannot complete against this module at all.
+        # It dies before writing a plan, in four places -- hub_keygen.tf's
+        # postcondition indexing `self` on an instance that does not exist yet,
+        # and hub_worker.tf's locals dereferencing
+        # `local.authority_selected_alias_targets.hub` while it is null. Those
+        # are separate defects worth their own fix; this drift shows up on the
+        # ordinary refresh-enabled plan, which is where it must be admitted.
+        _check_provider_reprojection_drift(drift)
+        return "provider-reprojection"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
@@ -5966,6 +6004,50 @@ def _check_state_normalization_drift(
         _check_digest_normalization(item, by_address, spec=_HUB_DIGEST_SPEC)
         return "hub-digest"
     raise _unexpected_drift_error(drift)
+
+
+_OTP_REDIS_SG_ADDRESS = "module.control.aws_security_group.otp_redis"
+# Foundation / hub-worker resources that sit OUTSIDE the runtime slice but
+# re-project the same absent -> empty-collection normalization on a refreshed
+# read. Kept as an exact allowlist so a newly drifting address fails closed.
+_PROVIDER_REPROJECTION_ADDRESSES = frozenset(
+    {
+        "module.control.aws_iam_role.hub_keygen[0]",
+        "module.control.aws_iam_role.hub_execution[0]",
+        _OTP_REDIS_SG_ADDRESS,
+    }
+)
+
+
+def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
+    """Require every admitted re-projection to be a pure state normalization.
+
+    The address allowlist alone would admit ANY change to those resources. This
+    pins the delta itself: a differing key is admissible only when it went from
+    absent/null to an empty collection, or when it is the OTP Redis ``ingress``
+    carrying exactly the one standalone SG-scoped TLS/6379 rule.
+    """
+    for item in drift:
+        address = item.get("address")
+        change = item.get("change")
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ContractError(
+                f"{address} re-projection drift must carry object before and after"
+            )
+        for key in sorted(set(before) | set(after)):
+            if before.get(key) == after.get(key):
+                continue
+            if address == _OTP_REDIS_SG_ADDRESS and key == "ingress":
+                # Same exact-shape gate used on the planned and state paths.
+                _check_otp_redis_ingress(after, {}, address)
+                continue
+            if before.get(key) is None and after.get(key) == []:
+                continue
+            raise ContractError(
+                f"{address} drift is not an empty-collection re-projection: {key}"
+            )
 
 
 def _check_redis_password_normalization(

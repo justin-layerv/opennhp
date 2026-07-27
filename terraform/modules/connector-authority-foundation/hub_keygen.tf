@@ -236,10 +236,21 @@ resource "aws_lambda_invocation" "hub_identity_publication" {
       # workflow's sole sanctioned drift-normalization operation impossible to
       # run until after the very apply it gates.
       #
-      # `can()` catches the unresolvable reference and short-circuits to true —
-      # there is no result to validate when no instance exists. Once the
-      # invocation does resolve, the exact-constant assertion below is
-      # unchanged and still the gate on the identity transaction.
+      # CORRECTION (#3513 claimed otherwise and was wrong): `can()` does NOT
+      # rescue this. Verified by reproducing a `-refresh-only` plan against the
+      # live sandbox Control root with the guard in place — it still fails with
+      # the same "Invalid index". `can()` traps errors raised while EVALUATING
+      # an expression; this one is raised earlier, resolving the `self`
+      # reference against an empty instance collection, so nothing in the
+      # expression body can intercept it. The guard is therefore inert and the
+      # exact-constant assertion below is the only live part of this check.
+      #
+      # `-refresh-only` is separately broken against this module regardless:
+      # hub_worker.tf's locals dereference
+      # `local.authority_selected_alias_targets.hub` while it is null, failing
+      # with "Attempt to get attribute from null value" at lines 39, 68 and 69.
+      # Fixing refresh-only means fixing both, and neither is on the path the
+      # ordinary refresh-enabled plan takes.
       condition     = !can(self.result) || try(jsondecode(self.result), null) == { seeded = true }
       error_message = "Hub keygen must return only the exact constant seeded marker."
     }

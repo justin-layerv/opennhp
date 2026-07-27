@@ -3497,6 +3497,86 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assertEqual(summary["plan_mode"], "no-op")
 
+    def test_provider_reprojection_admits_the_observed_live_drift(self) -> None:
+        """The live sandbox Control root reports 27 drift entries over six
+        addresses, every one the provider recording an Optional+Computed
+        collection that was absent from state, plus the OTP Redis standalone
+        TLS/6379 ingress read-back. Nothing changed in AWS out of band.
+        """
+        drift = [
+            {
+                "address": 'module.control.aws_lambda_function.authority["x"]',
+                "change": {"before": {"function_name": "x"},
+                           "after": {"function_name": "x", "layers": []}},
+            },
+            {
+                "address": "module.control.aws_iam_role.hub_keygen[0]",
+                "change": {"before": {"name": "k"},
+                           "after": {"name": "k", "managed_policy_arns": []}},
+            },
+            {
+                "address": "module.control.aws_iam_role.hub_execution[0]",
+                "change": {"before": {"name": "e"},
+                           "after": {"name": "e", "managed_policy_arns": []}},
+            },
+            {
+                "address": CHECKER._OTP_REDIS_SG_ADDRESS,
+                "change": {
+                    "before": {"ingress": []},
+                    "after": {"ingress": [redis_tls_ingress_rule()]},
+                },
+            },
+        ]
+        CHECKER._check_provider_reprojection_drift(drift)
+
+    def test_provider_reprojection_rejects_anything_but_normalization(self) -> None:
+        """The address allowlist alone would admit ANY change to these
+        resources. The delta itself is what is pinned."""
+        cases = {
+            "real value change": {
+                "address": "module.control.aws_iam_role.hub_keygen[0]",
+                "change": {"before": {"name": "k"}, "after": {"name": "attacker"}},
+            },
+            "non-empty collection appears": {
+                "address": "module.control.aws_iam_role.hub_execution[0]",
+                "change": {
+                    "before": {"name": "e"},
+                    "after": {"name": "e", "managed_policy_arns": ["arn:aws:iam::aws:policy/AdministratorAccess"]},
+                },
+            },
+            "widened redis ingress": {
+                "address": CHECKER._OTP_REDIS_SG_ADDRESS,
+                "change": {
+                    "before": {"ingress": []},
+                    "after": {
+                        "ingress": [
+                            {**redis_tls_ingress_rule(), "cidr_blocks": ["0.0.0.0/0"]}
+                        ]
+                    },
+                },
+            },
+            "second redis rule": {
+                "address": CHECKER._OTP_REDIS_SG_ADDRESS,
+                "change": {
+                    "before": {"ingress": []},
+                    "after": {
+                        "ingress": [redis_tls_ingress_rule(), redis_tls_ingress_rule()]
+                    },
+                },
+            },
+            "empty collection becomes populated": {
+                "address": 'module.control.aws_lambda_function.authority["x"]',
+                "change": {
+                    "before": {"layers": []},
+                    "after": {"layers": ["arn:aws:lambda:::layer:evil:1"]},
+                },
+            },
+        }
+        for label, item in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_provider_reprojection_drift([item])
+
     def test_exact_hub_digest_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = authority_digest_refresh_candidate(hub=True)
         summary = CHECKER.check_plan(candidate, prior_state)
