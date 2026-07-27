@@ -3457,6 +3457,8 @@ def _canonical_base64_32(value: Any) -> bytes | None:
 
 def _check_hub_identity_resources(
     by_address: dict[str, dict[str, Any]],
+    *,
+    refresh_disabled: bool = False,
 ) -> None:
     """Prove the Hub seeder's complete secret-to-public identity transaction.
 
@@ -3757,8 +3759,26 @@ def _check_hub_identity_resources(
             decoded_result = json.loads(result) if isinstance(result, str) else None
         except json.JSONDecodeError as exc:
             raise ContractError("Hub identity invocation result is malformed") from exc
-        if decoded_result != {"seeded": True} or not public_bytes or not any(
-            public_bytes
+        publication_is_settled = bool(public_bytes) and any(public_bytes)
+        # The placeholder must NEVER pass as converged on a refreshed plan --
+        # there it genuinely means the seeder did not publish, which is the
+        # invariant test_placeholder_cannot_be_a_converged_noop pins.
+        #
+        # On the refresh-DISABLED lane it means something else entirely. The
+        # parameter carries `ignore_changes = [value]`, Terraform created it
+        # holding the sentinel, and the KEYGEN LAMBDA replaced the live value
+        # out of band, so stored state still reads `pending-keygen` no matter
+        # what AWS holds. Demanding a canonical key there became unsatisfiable
+        # the moment the identity was actually published.
+        #
+        # Admit the sentinel ONLY on that lane, and only alongside a seeded
+        # invocation result. Every other value -- non-canonical, all-zero --
+        # still fails closed on both lanes, and the live key is independently
+        # proved by check_live and by the manifest producer, which rejects the
+        # sentinel outright.
+        publication_is_unrefreshed = refresh_disabled and public_value == "pending-keygen"
+        if decoded_result != {"seeded": True} or not (
+            publication_is_settled or publication_is_unrefreshed
         ):
             raise ContractError("Hub identity steady publication is not proven")
     else:
@@ -3775,6 +3795,7 @@ def _check_planned_security(
     catalog_mode: bool = False,
     runtime_mode: bool = False,
     hub_worker_mode: bool = False,
+    refresh_disabled: bool = False,
 ) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
@@ -4152,7 +4173,7 @@ def _check_planned_security(
     # resources do not exist (the inventory admission gates that); when live their
     # policies are validated here exactly like the runtime dependency endpoints.
     if hub_worker_mode:
-        _check_hub_identity_resources(by_address)
+        _check_hub_identity_resources(by_address, refresh_disabled=refresh_disabled)
         for address, service, endpoint_type in (
             ("module.control.aws_vpc_endpoint.hub_ecr_api[0]", "ecr.api", "Interface"),
             ("module.control.aws_vpc_endpoint.hub_ecr_dkr[0]", "ecr.dkr", "Interface"),
@@ -7792,7 +7813,9 @@ def _hub_identity_transition_pending(
     return exact, creates, updates
 
 
-def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
+def check_plan(
+    plan: Any, prior_state: Any = None, *, refresh_disabled: bool = False
+) -> dict[str, str | int]:
     """Validate one exact reviewed plan shape.
 
     ``prior_state`` is required only when Terraform omits ``resource_changes``
@@ -8636,6 +8659,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         catalog_mode=catalog_mode,
         runtime_mode=runtime_mode,
         hub_worker_mode=hub_worker_mode,
+        refresh_disabled=refresh_disabled,
     )
 
     normalization_drift_kind = _check_state_normalization_drift(
@@ -10025,6 +10049,12 @@ def parse_args() -> argparse.Namespace:
     plan = sub.add_parser("plan")
     plan.add_argument("plan_json", type=Path)
     plan.add_argument("prior_state_json", nargs="?", type=Path)
+    # The PR lane plans with `-refresh=false` (terraform-plan-pr.yml), so any
+    # attribute a resource changed OUT OF BAND still reads as whatever Terraform
+    # last wrote. Declared explicitly rather than inferred from the presence of
+    # prior_state_json: that coupling is incidental and would silently invert if
+    # either caller changed its arguments.
+    plan.add_argument("--refresh-disabled", action="store_true")
 
     normalization_drift = sub.add_parser("normalization-drift")
     normalization_drift.add_argument("plan_json", type=Path)
@@ -10047,7 +10077,11 @@ def main() -> int:
             prior_state = (
                 load_json(args.prior_state_json) if args.prior_state_json else None
             )
-            result = check_plan(load_json(args.plan_json), prior_state)
+            result = check_plan(
+                load_json(args.plan_json),
+                prior_state,
+                refresh_disabled=args.refresh_disabled,
+            )
         elif args.command == "normalization-drift":
             result = check_normalization_drift(
                 load_json(args.plan_json),

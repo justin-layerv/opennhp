@@ -9229,6 +9229,15 @@ class WorkflowContractTests(unittest.TestCase):
             "terraform/control/environments/sandbox/control.tfplan.json",
             plan_workflow,
         )
+        # This lane plans with -refresh=false, so it MUST declare that to the
+        # checker. Without the flag the checker assumes a refreshed plan and
+        # demands values that an out-of-band writer (the keygen Lambda) makes
+        # unobservable here. Pinned so the two cannot drift apart silently.
+        self.assertIn("-refresh=false", plan_workflow)
+        self.assertIn(
+            "control.tfplan.json --refresh-disabled",
+            plan_workflow,
+        )
         self.assertNotIn("--expected-action", plan_workflow)
         self.assertIn(
             "Fail closed on any unreviewed Control mutation",
