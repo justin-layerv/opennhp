@@ -532,6 +532,49 @@ for this rule.
   signal for invariant-free visibility (see
   https://github.com/layervai/nhp/issues/1969#issuecomment-4455100642).
 
+- **The Connector Authority publisher's base dim set is
+  `{EnvironmentID, AuthorityOperation}` plus `CellID` for cell operations
+  only.** Namespace `LayerV/ConnectorAuthority`, emitted as EMF from
+  `layervai/qurl-service internal/connectorauthorityruntime/telemetry.go`
+  (`authorityTelemetry.emitPoint`). The order is fixed: `EnvironmentID`,
+  `AuthorityOperation`, then `CellID` iff `config.go::isCellOperation`, then
+  that metric's own dynamic dimensions in **sorted key order**. Three traps:
+
+  1. `AuthorityOperation` carries the **PascalCase qurl-conformance name**
+     (`ActivateRegistration`), not the snake_case terraform operation key
+     (`activate_registration`). It is the same string the module renders into
+     `CONNECTOR_AUTHORITY_OPERATION`, so build alarm dimensions from
+     `local.authority_operation_conformance_name` rather than the key — see
+     `local.authority_custom_metric_identity_dimensions` in
+     `modules/connector-authority-foundation/authority_alarms.tf`.
+  2. Some counters carry **no** dynamic dimension at all
+     (`adapter_contract_violation`, `adapter_late_result`), so the identity
+     prefix alone is the complete emitted set. Adding an `Outcome` there
+     selects nothing.
+  3. Every emitted metric name must be classified in
+     `local.authority_emitted_custom_metrics` as alarmed or explicitly
+     unalarmed-with-reason; the module's `foundation_contract` precondition
+     rejects a partial or overlapping classification, so a handler that starts
+     emitting a new metric cannot land unmonitored.
+
+- **Alarm state is not evidence on a dark path.** Every Authority alarm uses
+  `treat_missing_data = "notBreaching"` because AWS/Lambda publishes only for
+  periods with invocations and EMF metrics exist only when emitted — so a wrong
+  dim set presents as a permanently green `OK`, not as `INSUFFICIENT_DATA`.
+  The only proof a new zero-baseline alarm actually selects a live stream is a
+  **synthetic failure with a recorded page receipt** (NHP #3455). Do not treat
+  a green console as coverage.
+
+- **Compose, don't invent, for AWS-managed namespaces.** The Authority's
+  non-provisioned-initialization event has no emitted metric (the handler
+  rejects it at init, before telemetry exists), so it is an
+  `aws_cloudwatch_composite_alarm` over the two published signals it must
+  produce — `ALARM(spillover) AND ALARM(errors)` — rather than a guessed metric
+  name. Likewise there is **no `DeadLetterErrors` alarm**: no function in the
+  account publishes it, so the async axis is covered by an `AsyncEventsReceived`
+  guard (which AWS does publish at `{FunctionName}`) plus a plan-time assertion
+  that no Authority function declares a `dead_letter_config`.
+
 ## `templatefile()` multi-line vars in bash comments must be escaped
 
 `templatefile()` resolves `${...}` interpolations **before** bash ever

@@ -955,6 +955,10 @@ RUNTIME_OTP_SECRET_ARN = (
     f"secret:{CHECKER.CONTROL_PREFIX}-otp-pepper-ABCDEF"
 )
 RUNTIME_LAMBDA_SG_ID = "sg-0a110000000000000"
+# The reviewed sandbox operator destination every Authority alarm routes to.
+OPERATOR_ALARM_TOPIC_ARN = (
+    "arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"
+)
 RUNTIME_INTERFACE_SG_ID = "sg-1face00000000000"
 RUNTIME_OTP_REDIS_SG_ID = "sg-0a7ed150000000000"
 RUNTIME_DYNAMODB_PREFIX_LIST_ID = "pl-0123456789abcdef0"
@@ -1262,11 +1266,95 @@ def _runtime_create(after: dict) -> dict:
     }
 
 
+def _authority_alarm_after(address: str, functions: dict) -> dict:
+    """Reviewed after-state for one Authority alarm address (NHP #3455).
+
+    Derived from the checker's own expected dimension/threshold tables so the
+    fixture cannot drift from the contract it is exercising; the tests that must
+    prove a regression fails mutate this after-state deliberately.
+    """
+    after: dict = {"alarm_actions": [OPERATOR_ALARM_TOPIC_ARN]}
+    dimensions = CHECKER.AUTHORITY_ALARM_DIMENSIONS.get(address)
+    if dimensions is None:
+        # Composite alarm: selects its children by name, carries no dimension.
+        fn = address.rsplit('["', 1)[1].removesuffix('"]')
+        after["alarm_rule"] = (
+            f'ALARM("{fn}-provisioned-concurrency-spillover") '
+            f'AND ALARM("{fn}-errors")'
+        )
+        return after
+    after["dimensions"] = dict(dimensions)
+    after["treat_missing_data"] = "notBreaching"
+    after["namespace"] = (
+        CHECKER.AUTHORITY_ALARM_NAMESPACE_LAMBDA
+        if set(dimensions) == {"FunctionName"}
+        else CHECKER.AUTHORITY_ALARM_NAMESPACE_CUSTOM
+    )
+    if "authority_spillover[" in address:
+        after.update(
+            {
+                "metric_name": "ProvisionedConcurrencySpilloverInvocations",
+                "statistic": "Sum",
+                "comparison_operator": "GreaterThanThreshold",
+                "threshold": 0,
+            }
+        )
+        return after
+    if "authority_runtime[" in address:
+        fn, family = address.rsplit('["', 1)[1].removesuffix('"]').split(":")
+        (
+            metric_name,
+            statistic,
+            extended_statistic,
+            comparison,
+            threshold,
+        ) = CHECKER.AUTHORITY_ALARM_LAMBDA_FAMILIES[family]
+        after.update(
+            {
+                "metric_name": metric_name,
+                "statistic": statistic,
+                "extended_statistic": extended_statistic,
+                "comparison_operator": comparison,
+                "threshold": (
+                    threshold
+                    if threshold is not None
+                    else functions[fn]["steady_reserved_concurrency"]
+                ),
+            }
+        )
+        return after
+    # Custom EMF alarms are uniform zero-tolerance Sum counters.
+    after.update(
+        {
+            "statistic": "Sum",
+            "comparison_operator": "GreaterThanThreshold",
+            "threshold": 0,
+        }
+    )
+    return after
+
+
+def _authority_alarm_changes(functions: dict) -> list[dict]:
+    changes: list[dict] = []
+    for address, resource_type in CHECKER.AUTHORITY_ALARM_RESOURCES.items():
+        changes.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": resource_type,
+                "change": _runtime_create(
+                    _authority_alarm_after(address, functions)
+                ),
+            }
+        )
+    return changes
+
+
 def _runtime_resource_changes() -> list[dict]:
     payload = authority_runtime_input_with_concurrency()
     image_uri = payload["authority_image_uri"]
     functions = payload["authority_runtime_contract"]["functions"]
-    changes: list[dict] = []
+    changes: list[dict] = _authority_alarm_changes(functions)
     for fn, spec in functions.items():
         changes.append(
             {
@@ -1358,16 +1446,20 @@ def _runtime_resource_changes() -> list[dict]:
                 "change": _runtime_create({"name": f"/aws/lambda/{fn}"}),
             }
         )
+        spillover_address = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            f'authority_spillover["{fn}"]'
+        )
         changes.append(
             {
-                "address": (
-                    "module.control.aws_cloudwatch_metric_alarm."
-                    f'authority_spillover["{fn}"]'
-                ),
+                "address": spillover_address,
                 "mode": "managed",
                 "type": "aws_cloudwatch_metric_alarm",
                 "change": _runtime_create(
-                    {"alarm_name": f"{fn}-provisioned-concurrency-spillover"}
+                    {
+                        "alarm_name": f"{fn}-provisioned-concurrency-spillover",
+                        **_authority_alarm_after(spillover_address, functions),
+                    }
                 ),
             }
         )
@@ -1574,7 +1666,13 @@ def authority_runtime_legacy_expansion_fixture(
     full_payload = authority_runtime_input_with_concurrency()
     foundation_address = "module.control.terraform_data.foundation_contract"
 
-    for address in CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES:
+    # The alarm-routing addresses post-date this transition entirely, so they are
+    # settled no-ops throughout it. The legacy expansion moves only the missing
+    # cell graph; admitting an alarm create here would widen a historical shape.
+    for address in (
+        set(CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES)
+        | set(CHECKER.AUTHORITY_ALARM_RESOURCES)
+    ):
         change = changes[address]["change"]
         change["actions"] = ["no-op"]
         change["before"] = copy.deepcopy(change["after"])
@@ -1759,6 +1857,32 @@ def authority_runtime_steady_fixture() -> dict:
         change["actions"] = ["no-op"]
         # Steady state: the applied value is both before and after.
         change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+    return result
+
+
+def authority_alarm_routing_fixture() -> dict:
+    """The real NHP #3455 rollout shape, on top of the applied runtime slice.
+
+    Every function, alias, role, endpoint, and SG is a settled no-op; the 11
+    already-live spillover alarms take an in-place ``alarm_actions`` update and
+    the remaining alarm addresses are pending creates. This is the plan the
+    sandbox apply actually produces, distinct from the full-slice fixture the
+    other alarm mutation tests build on.
+    """
+    result = authority_runtime_steady_fixture()
+    result["applyable"] = True
+    changes = {item["address"]: item for item in result["resource_changes"]}
+    for address in CHECKER.AUTHORITY_ALARM_RESOURCES:
+        change = changes[address]["change"]
+        change["actions"] = ["create"]
+        change["before"] = None
+        change["after_unknown"] = {}
+    for address in CHECKER.AUTHORITY_ALARM_UPDATE_ADDRESSES:
+        change = changes[address]["change"]
+        change["actions"] = ["update"]
+        # The pre-#3455 live state: the alarm exists with no operator action.
+        change["before"] = {**copy.deepcopy(change["after"]), "alarm_actions": []}
         change["after_unknown"] = {}
     return result
 
@@ -5590,6 +5714,9 @@ class PlanContractTests(unittest.TestCase):
                 "aws_cloudwatch_metric_alarm",
                 "aws_cloudwatch_log_group",
             }
+            # The spillover alarm is the only alarm that belongs to the original
+            # runtime slice; the rest of the alarm set is NHP #3455's own slice.
+            and item["address"] not in CHECKER.AUTHORITY_ALARM_RESOURCES
         }
         # 11 functions x {exec role, exec policy, spillover alarm, log group}.
         self.assertEqual(
@@ -6114,6 +6241,300 @@ class PlanContractTests(unittest.TestCase):
         ddb["after"] = {**ddb["after"], "policy": json.dumps(CHECKER.DENY_ENDPOINT_POLICY)}
         ddb["before"] = ddb["after"]
         self.assert_rejected(candidate)
+
+    # -----------------------------------------------------------------------
+    # Operator alert routing and the full runtime alarm set (NHP #3455). Each
+    # test below is one of the four regressions the issue names, plus the
+    # dimension-set rule from terraform/CLAUDE.md.
+    # -----------------------------------------------------------------------
+    ALARM_SAMPLE = (
+        "module.control.aws_cloudwatch_metric_alarm."
+        'authority_runtime["layerv-nhp-sandbox-ca-ia:errors"]'
+    )
+    ALARM_CUSTOM_SAMPLE = (
+        "module.control.aws_cloudwatch_metric_alarm."
+        'authority_admission_rejected["layerv-nhp-sandbox-ca-ar-cell0:limited"]'
+    )
+
+    def test_exact_authority_alarm_routing_slice_passes(self) -> None:
+        """The transition this rollout actually uses: functions settled, alarms
+        moving. 106 creates plus the 11 spillover alarms gaining actions, and
+        nothing else."""
+        candidate = authority_alarm_routing_fixture()
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-alarm-routing")
+        changed = {
+            item["address"]: item["change"]["actions"]
+            for item in candidate["resource_changes"]
+            if item["change"]["actions"] != ["no-op"]
+        }
+        self.assertEqual(
+            sum(1 for actions in changed.values() if actions == ["create"]), 106
+        )
+        self.assertEqual(
+            sum(1 for actions in changed.values() if actions == ["update"]), 11
+        )
+        self.assertEqual(len(changed), 117)
+
+    def test_alarm_routing_slice_still_validates_alarm_contents(self) -> None:
+        """The dispatch proof for the mode above.
+
+        ``_check_authority_runtime_resources`` (and therefore
+        ``_check_authority_alarm_routing``) is gated on ``runtime_mode``, which
+        is INVENTORY-derived, not transition-derived — so the dim-set, routing,
+        threshold, and missing-data checks run even when every function is a
+        no-op. Without this test the alarm-routing branch's inline claim that
+        the spillover updates' after-state is validated would be unproven, and a
+        regression during this specific rollout would reach apply.
+        """
+        for mutate, pattern in (
+            (
+                lambda after: after.__setitem__("alarm_actions", []),
+                "at least one operator alarm action",
+            ),
+            (
+                lambda after: after.__setitem__(
+                    "alarm_actions", ["arn:aws:sns:us-east-2:767397897469:*"]
+                ),
+                "exact in-account, in-region SNS topic ARN",
+            ),
+            (
+                lambda after: after.__setitem__(
+                    "dimensions", {"FunctionName": "layerv-nhp-sandbox-ca-ia", "Resource": "x"}
+                ),
+                "must key on exactly",
+            ),
+            (
+                lambda after: after.__setitem__("threshold", 1),
+                "threshold must be exactly",
+            ),
+            (
+                lambda after: after.__setitem__("treat_missing_data", "breaching"),
+                "notBreaching",
+            ),
+        ):
+            with self.subTest(pattern=pattern):
+                candidate = authority_alarm_routing_fixture()
+                mutate(self.change(candidate, self.ALARM_SAMPLE)["after"])
+                with self.assertRaisesRegex(CHECKER.ContractError, pattern):
+                    CHECKER.check_plan(candidate)
+
+        # The same holds for the in-place spillover updates, whose after-state
+        # is the whole point of this transition.
+        spillover = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            'authority_spillover["layerv-nhp-sandbox-ca-ia"]'
+        )
+        candidate = authority_alarm_routing_fixture()
+        self.change(candidate, spillover)["after"]["alarm_actions"] = []
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "at least one operator alarm action"
+        ):
+            CHECKER.check_plan(candidate)
+
+    def test_alarm_routing_slice_admits_no_other_movement(self) -> None:
+        """Observability-only by construction: a function, role, or endpoint
+        moving alongside the alarms means the plan is not what it claims."""
+        for address, actions in (
+            (
+                'module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"]',
+                ["update"],
+            ),
+            (
+                'module.control.aws_iam_role.authority_exec["layerv-nhp-sandbox-ca-ia"]',
+                ["update"],
+            ),
+            ("module.control.aws_vpc_endpoint.dynamodb", ["update"]),
+        ):
+            with self.subTest(address=address):
+                candidate = authority_alarm_routing_fixture()
+                change = self.change(candidate, address)
+                change["actions"] = actions
+                self.assert_rejected(candidate)
+
+    def test_alarm_missing_operator_action_fails_closed(self) -> None:
+        for empty in ([], None):
+            with self.subTest(actions=empty):
+                candidate = authority_runtime_transition_fixture()
+                self.change(candidate, self.ALARM_SAMPLE)["after"][
+                    "alarm_actions"
+                ] = empty
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "at least one operator alarm action"
+                ):
+                    CHECKER.check_plan(candidate)
+
+    def test_alarm_wildcard_destination_fails_closed(self) -> None:
+        for action in (
+            "arn:aws:sns:us-east-2:767397897469:*",
+            "*",
+            "arn:aws:sns:*:*:layerv-nhp-sandbox-cell0-alerts",
+            # Right shape, wrong account: not a destination this account can
+            # publish to, so it is silence dressed as coverage.
+            "arn:aws:sns:us-east-2:000000000000:layerv-nhp-sandbox-cell0-alerts",
+            "arn:aws:sns:us-west-2:767397897469:layerv-nhp-sandbox-cell0-alerts",
+        ):
+            with self.subTest(action=action):
+                candidate = authority_runtime_transition_fixture()
+                self.change(candidate, self.ALARM_SAMPLE)["after"][
+                    "alarm_actions"
+                ] = [action]
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "exact in-account, in-region SNS topic ARN"
+                ):
+                    CHECKER.check_plan(candidate)
+
+    def test_alarm_split_routing_fails_closed(self) -> None:
+        """One family quietly pointed somewhere else is still 'every alarm has
+        an action', which is why sameness is checked, not just non-emptiness."""
+        candidate = authority_runtime_transition_fixture()
+        self.change(candidate, self.ALARM_SAMPLE)["after"]["alarm_actions"] = [
+            "arn:aws:sns:us-east-2:767397897469:some-other-topic"
+        ]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "identical\n?\\s*reviewed operator destination"
+        ):
+            CHECKER.check_plan(candidate)
+
+    def test_alarm_omitted_function_fails_closed(self) -> None:
+        for omitted in (
+            self.ALARM_SAMPLE,
+            (
+                "module.control.aws_cloudwatch_composite_alarm."
+                'authority_non_provisioned_initialization["layerv-nhp-sandbox-ca-ra"]'
+            ),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_terminal_outcome["layerv-nhp-sandbox-ca-ccr-cell1:internal"]'
+            ),
+        ):
+            with self.subTest(omitted=omitted):
+                candidate = authority_runtime_transition_fixture()
+                candidate["resource_changes"] = [
+                    item
+                    for item in candidate["resource_changes"]
+                    if item["address"] != omitted
+                ]
+                # The inventory equality catches it first; either way the plan
+                # is rejected rather than reported as complete coverage.
+                self.assert_rejected(candidate)
+
+    def test_alarm_weakened_threshold_fails_closed(self) -> None:
+        for address, threshold in (
+            (self.ALARM_SAMPLE, 1),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_runtime["layerv-nhp-sandbox-ca-ia:duration"]',
+                9500,
+            ),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_runtime["layerv-nhp-sandbox-ca-ia:concurrency_exhaustion"]',
+                10,
+            ),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_spillover["layerv-nhp-sandbox-ca-ia"]',
+                1,
+            ),
+            (self.ALARM_CUSTOM_SAMPLE, 5),
+        ):
+            with self.subTest(address=address):
+                candidate = authority_runtime_transition_fixture()
+                self.change(candidate, address)["after"]["threshold"] = threshold
+                self.assert_rejected(candidate)
+
+    def test_alarm_partial_dimension_set_fails_closed(self) -> None:
+        """The exact failure terraform/CLAUDE.md records: a dim set the
+        publisher never emits selects a stream nothing writes to, and the alarm
+        sits green forever while the fault it names goes unpaged."""
+        for address, dimensions in (
+            # Dropping CellID from a cell operation's custom alarm.
+            (
+                self.ALARM_CUSTOM_SAMPLE,
+                {
+                    "EnvironmentID": "sandbox",
+                    "AuthorityOperation": "ActivateRegistration",
+                    "Outcome": "limited",
+                },
+            ),
+            # snake_case terraform key instead of the PascalCase conformance
+            # name the handler actually reports.
+            (
+                self.ALARM_CUSTOM_SAMPLE,
+                {
+                    "EnvironmentID": "sandbox",
+                    "AuthorityOperation": "activate_registration",
+                    "CellID": "cell0",
+                    "Outcome": "limited",
+                },
+            ),
+            # An extra dimension is just as fatal as a missing one.
+            (
+                self.ALARM_SAMPLE,
+                {
+                    "FunctionName": "layerv-nhp-sandbox-ca-ia",
+                    "Resource": "layerv-nhp-sandbox-ca-ia:blue",
+                },
+            ),
+        ):
+            with self.subTest(address=address, dimensions=sorted(dimensions)):
+                candidate = authority_runtime_transition_fixture()
+                self.change(candidate, address)["after"]["dimensions"] = dimensions
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "must key on exactly"
+                ):
+                    CHECKER.check_plan(candidate)
+
+    def test_alarm_breaching_missing_data_fails_closed(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        self.change(candidate, self.ALARM_SAMPLE)["after"][
+            "treat_missing_data"
+        ] = "breaching"
+        with self.assertRaisesRegex(CHECKER.ContractError, "notBreaching"):
+            CHECKER.check_plan(candidate)
+
+    def test_non_provisioned_initialization_rule_is_exact(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        composite = (
+            "module.control.aws_cloudwatch_composite_alarm."
+            'authority_non_provisioned_initialization["layerv-nhp-sandbox-ca-ia"]'
+        )
+        # OR instead of AND stops naming the security event and starts
+        # duplicating the two child pages.
+        self.change(candidate, composite)["after"]["alarm_rule"] = (
+            'ALARM("layerv-nhp-sandbox-ca-ia-provisioned-concurrency-spillover") '
+            'OR ALARM("layerv-nhp-sandbox-ca-ia-errors")'
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "exactly the conjunction"
+        ):
+            CHECKER.check_plan(candidate)
+
+    def test_authority_function_may_not_declare_a_dead_letter_queue(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        self.change(
+            candidate,
+            'module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"]',
+        )["after"]["dead_letter_config"] = [
+            {"target_arn": "arn:aws:sqs:us-east-2:767397897469:authority-dlq"}
+        ]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "may not declare a dead_letter_config"
+        ):
+            CHECKER.check_plan(candidate)
+
+    def test_alarm_metric_name_drift_fails_closed(self) -> None:
+        """Metric names must stay inside what AWS actually publishes; an
+        invented name can never select a stream."""
+        candidate = authority_runtime_transition_fixture()
+        self.change(candidate, self.ALARM_SAMPLE)["after"]["metric_name"] = (
+            "FunctionErrors"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "reviewed Errors alarm shape"
+        ):
+            CHECKER.check_plan(candidate)
 
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):
@@ -8669,6 +9090,92 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
             CHECKER.ContractError, "exact reviewed remaining action subset"
         ):
             CHECKER._check_hub_source_fence_transition(candidate)
+
+    def test_alarm_and_fence_address_sets_are_disjoint(self) -> None:
+        """The invariant that lets the fence branch withhold alarm addresses.
+
+        ``check_plan`` filters the NHP #3455 alarm addresses out of the map it
+        hands to the fence validator when the two transitions co-occur. That is
+        only safe while the two sets share no address -- otherwise a fence
+        resource could be hidden from its own deep validation.
+        """
+        alarm_scope = frozenset(CHECKER.AUTHORITY_ALARM_RESOURCES) | frozenset(
+            CHECKER.AUTHORITY_ALARM_UPDATE_ADDRESSES
+        )
+        self.assertEqual(
+            alarm_scope & frozenset(CHECKER.HUB_SOURCE_FENCE_ACTIONS),
+            frozenset(),
+        )
+        # And disjoint from the Hub identity set, so the two co-occurring
+        # slices cannot mask each other either.
+        self.assertEqual(
+            alarm_scope & CHECKER.HUB_IDENTITY_MIGRATION_ADDRESSES,
+            frozenset(),
+        )
+
+    def test_observed_fence_plus_alarm_change_set_composes(self) -> None:
+        """The exact 126-address change set the sandbox Control plan produced.
+
+        Reconstructed from the observed PR-time failure: the 106 pending alarm
+        creates, the 11 in-place spillover updates, the 8 pending Hub
+        source-fence actions, and the still-pending Hub identity publication.
+        Before the alarm subtraction the fence candidate is not a subset of the
+        reviewed fence actions (which is exactly why the plan was rejected);
+        after it, it is. Guards against a future edit dropping the composition
+        and silently re-blocking every Control-root PR.
+        """
+        alarm_slice_changed = set(CHECKER.AUTHORITY_ALARM_RESOURCES) | set(
+            CHECKER.AUTHORITY_ALARM_UPDATE_ADDRESSES
+        )
+        identity = "module.control.aws_lambda_invocation.hub_identity_publication[0]"
+        observed = (
+            alarm_slice_changed | set(CHECKER.HUB_SOURCE_FENCE_ACTIONS) | {identity}
+        )
+        self.assertEqual(len(observed), 126)
+
+        candidate = observed - {identity}
+        self.assertFalse(
+            candidate.issubset(CHECKER.HUB_SOURCE_FENCE_ACTIONS),
+            "without the alarm subtraction the fence subset test must fail",
+        )
+        self.assertTrue(
+            (candidate - alarm_slice_changed).issubset(
+                CHECKER.HUB_SOURCE_FENCE_ACTIONS
+            ),
+            "with the alarm subtraction the fence candidate must be exactly the "
+            "reviewed fence actions",
+        )
+
+    def test_fence_validator_still_rejects_an_alarm_address(self) -> None:
+        """The alarm composition is the call-site filter, not a loosened
+        validator.
+
+        A co-occurring alarm slice is admitted by ``check_plan`` only after
+        ``authority_alarm_slice_exact`` proves its exact shape. The fence
+        validator itself must stay strict, so an alarm address reaching it
+        directly is still an unreviewed action subset.
+        """
+        for address, actions in (
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_runtime["layerv-nhp-sandbox-ca-ia:errors"]',
+                ["create"],
+            ),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                'authority_spillover["layerv-nhp-sandbox-ca-ia"]',
+                ["update"],
+            ),
+        ):
+            with self.subTest(address=address):
+                candidate = hub_source_fence_transition_changes_fixture()
+                candidate[address] = {
+                    "change": {"actions": actions, "before": None, "after": {}}
+                }
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "exact reviewed remaining action subset"
+                ):
+                    CHECKER._check_hub_source_fence_transition(candidate)
 
     def test_unrelated_drift_is_rejected(self) -> None:
         candidate = hub_source_fence_transition_changes_fixture()

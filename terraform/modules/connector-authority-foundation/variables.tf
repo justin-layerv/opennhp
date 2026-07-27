@@ -346,6 +346,50 @@ variable "authority_proof_mutation_controller_role_arns" {
   default     = []
 }
 
+variable "operator_alarm_topic_arns" {
+  description = <<-EOT
+    Exact operator notification destinations for EVERY Connector Authority
+    alarm. This is an address input, never a resource this module owns: the
+    Control root supplies the standard environment operator topic that already
+    carries a confirmed subscriber.
+
+    The module deliberately does not create its own SNS topic. An isolated topic
+    with no confirmed subscription is indistinguishable from a working one until
+    the first real fault, and NHP #3280 is the live record of exactly that
+    failure mode (six configured prod email subscriptions absent from AWS).
+    Reusing the already-delivering operator topic keeps the receipt provable.
+
+    Required non-empty whenever authority_runtime_functions_enabled is true: the
+    module fails closed rather than planning an unrouted alarm set, because an
+    alarm with no action is silent on a real fault. Every entry must be an exact
+    regional SNS topic ARN in this module's own partition, region, and account;
+    wildcard and partial ARNs are rejected. CloudWatch accepts at most 5 actions
+    per alarm state.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    # The name charset excludes "*" and ":", so a wildcard destination
+    # (arn:aws:sns:*:*:*) and a partial ARN both fail this exact shape.
+    condition = alltrue([
+      for arn in var.operator_alarm_topic_arns :
+      can(regex("^arn:aws[a-z-]*:sns:[a-z]{2}(-gov|-iso[a-z]?)?-[a-z]+-[0-9]{1}:[0-9]{12}:[A-Za-z0-9_-]{1,256}$", arn))
+    ])
+    error_message = "Every operator_alarm_topic_arns entry must be an exact regional SNS topic ARN; wildcard, cross-service, and partial ARNs are rejected."
+  }
+
+  validation {
+    condition     = length(distinct(var.operator_alarm_topic_arns)) == length(var.operator_alarm_topic_arns)
+    error_message = "operator_alarm_topic_arns must not repeat a destination."
+  }
+
+  validation {
+    condition     = length(var.operator_alarm_topic_arns) <= 5
+    error_message = "CloudWatch accepts at most 5 alarm actions per state; operator_alarm_topic_arns must list at most 5 destinations."
+  }
+}
+
 variable "tags" {
   description = "Additional tags applied to every supported resource."
   type        = map(string)

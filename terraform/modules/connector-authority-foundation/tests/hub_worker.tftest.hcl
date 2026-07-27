@@ -123,6 +123,9 @@ variables {
   ses_configuration_set_name                   = "layerv-nhp-sandbox-agent-otp"
   authority_runtime_contract_evidence_verified = true
 
+  # The runtime gate fails closed without a reviewed operator alarm destination.
+  operator_alarm_topic_arns = ["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"]
+
   # The exact merged measurement basis: 3 hub functions, cell0 frozen catalog.
   authority_runtime_contract = {
     schema_version           = 1

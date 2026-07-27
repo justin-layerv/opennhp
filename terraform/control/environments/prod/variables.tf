@@ -145,6 +145,28 @@ variable "hub_worker_enabled" {
   }
 }
 
+variable "operator_alarm_topic_arns" {
+  description = <<-EOT
+    Production Authority alarm destination stays empty while the production
+    runtime slice is validation-locked dark: with no functions there are no
+    alarms to route, and the module's own precondition already rejects an
+    enabled runtime with an empty destination list.
+
+    Choosing the production destination is NHP #3280's decision, not this
+    root's. That issue is reconciling six configured production email
+    subscriptions that are absent from live AWS; adopting one of them here
+    before it is confirmed would wire the Authority to a destination that
+    silently delivers nothing.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.operator_alarm_topic_arns) == 0
+    error_message = "The production Authority alarm destination must remain unset until NHP #3280 confirms the production operator recipients and the production runtime slice opens."
+  }
+}
+
 variable "tags" {
   type = map(string)
   default = {

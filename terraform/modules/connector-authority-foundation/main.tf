@@ -118,6 +118,46 @@ resource "terraform_data" "foundation_contract" {
     }
 
     precondition {
+      # An alarm with no alarm_actions is silent on a real fault, which is
+      # strictly worse than no alarm at all because the console shows a green
+      # OK. Running the Authority without a reviewed operator destination is a
+      # hard error, not a degraded mode.
+      condition     = !var.authority_runtime_functions_enabled || length(var.operator_alarm_topic_arns) > 0
+      error_message = "authority_runtime_functions_enabled requires at least one operator_alarm_topic_arns destination; the Authority may not run with an unrouted alarm set."
+    }
+
+    precondition {
+      # Shape is enforced on the variable; locality is enforced here, where the
+      # module's own partition/region/account are resolved. A cross-account or
+      # cross-region topic cannot be published to by these alarms.
+      condition = alltrue([
+        for arn in var.operator_alarm_topic_arns :
+        split(":", arn)[1] == data.aws_partition.current.partition &&
+        split(":", arn)[3] == data.aws_region.current.region &&
+        split(":", arn)[4] == data.aws_caller_identity.current.account_id
+      ])
+      error_message = "Every operator_alarm_topic_arns destination must be an SNS topic in this module's own partition, region, and account."
+    }
+
+    precondition {
+      # Total, disjoint classification of the handler's emitted custom metric
+      # inventory. Adding a metric to the qurl-service Authority handler without
+      # deciding here whether it is alarmed or explicitly dashboard-only fails
+      # the plan instead of silently landing unmonitored.
+      condition = (
+        setunion(
+          local.authority_alarmed_custom_metrics,
+          toset(keys(local.authority_unalarmed_custom_metrics)),
+        ) == local.authority_emitted_custom_metrics &&
+        length(setintersection(
+          local.authority_alarmed_custom_metrics,
+          toset(keys(local.authority_unalarmed_custom_metrics)),
+        )) == 0
+      )
+      error_message = "Every emitted Connector Authority custom metric must be classified exactly once as alarmed or explicitly unalarmed."
+    }
+
+    precondition {
       condition = (
         !var.hub_edge_enabled ||
         (

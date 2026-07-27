@@ -736,7 +736,9 @@ resource "aws_lambda_function" "authority" {
   # The immutable startup graph may consume up to ~9s; keep the whole request
   # inside the source-derived structural ladder. FLAG: resolve the exact
   # timeout/memory empirically against the handler's staged latency proof.
-  timeout     = 10
+  # The duration alarm threshold is derived from this same local, so tightening
+  # the budget tightens the alarm in the same edit (authority_alarms.tf).
+  timeout     = local.authority_runtime_timeout_seconds
   memory_size = 512
   publish     = true
 
@@ -809,33 +811,7 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
   ]
 }
 
-# The rollout-aborting invariant: provisioned-concurrency spillover must remain
-# exactly zero. NHP #3455 tracks operator alarm_actions (SNS) wiring plus the
-# Throttles/Errors/Duration and custom admission/initialization-type alarms;
-# this slice lands the security-critical spillover guard without inventing an
-# unowned notification destination in the new Control root.
-resource "aws_cloudwatch_metric_alarm" "authority_spillover" {
-  for_each = local.authority_runtime_functions
-
-  alarm_name          = "${each.key}-provisioned-concurrency-spillover"
-  alarm_description   = "Connector Authority ${each.value.operation} spilled to an on-demand environment; a nonzero value aborts the rollout."
-  namespace           = "AWS/Lambda"
-  metric_name         = "ProvisionedConcurrencySpilloverInvocations"
-  statistic           = "Sum"
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 0
-  period              = 60
-  evaluation_periods  = 1
-  treat_missing_data  = "notBreaching"
-
-  # Aggregate across both aliases deliberately: any active or standby
-  # spillover violates the function-wide zero-spillover invariant.
-  dimensions = {
-    FunctionName = each.key
-  }
-
-  tags = merge(local.common_tags, {
-    Name      = "${each.key}-provisioned-concurrency-spillover"
-    Operation = each.value.operation
-  })
-}
+# The complete runtime alarm set — including the rollout-aborting
+# provisioned-concurrency spillover guard (aws_cloudwatch_metric_alarm
+# .authority_spillover) — lives in authority_alarms.tf so every alarm, its exact
+# dimension set, and its operator routing are reviewed in one place.

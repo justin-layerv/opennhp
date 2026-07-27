@@ -565,6 +565,160 @@ AUTHORITY_RUNTIME_RESOURCES[
 AUTHORITY_RUNTIME_RESOURCES[
     "module.control.aws_vpc_security_group_ingress_rule.otp_redis_authority[0]"
 ] = "aws_vpc_security_group_ingress_rule"
+
+# ---------------------------------------------------------------------------
+# Operator alert routing and the full runtime alarm set (NHP #3455).
+#
+# The spillover alarm above is the one member that already exists live; every
+# address below is new. They are folded into AUTHORITY_RUNTIME_RESOURCES so the
+# exact-inventory equality admits them, and deliberately EXCLUDED from the
+# legacy-expansion create set (that transition is historical and provably did
+# not contain them).
+#
+# AUTHORITY_ALARM_DIMENSIONS is the authoritative expected dim set per address.
+# It is written out longhand rather than derived from the Terraform, so a
+# Terraform-side dimension change has to be restated here to pass — that is the
+# whole point of the check. The prefix mirrors the qurl-service EMF publisher
+# (internal/connectorauthorityruntime/telemetry.go::emitPoint): EnvironmentID
+# and AuthorityOperation always, CellID only for cell operations, then the
+# metric's own dynamic dimensions.
+# ---------------------------------------------------------------------------
+AUTHORITY_ALARM_NAMESPACE_LAMBDA = "AWS/Lambda"
+AUTHORITY_ALARM_NAMESPACE_CUSTOM = "LayerV/ConnectorAuthority"
+AUTHORITY_OPERATION_CONFORMANCE_NAME = {
+    "issue_assignment": "IssueAssignment",
+    "refresh_assignment": "RefreshAssignment",
+    "issue_credential_recovery": "IssueCredentialRecovery",
+    "issue_registration_otp": "IssueRegistrationOTP",
+    "activate_registration": "ActivateRegistration",
+    "complete_registration": "CompleteRegistration",
+    "complete_credential_recovery": "CompleteCredentialRecovery",
+}
+# The reviewed Lambda timeout is 10s; the duration alarm pages at 80% of it.
+AUTHORITY_ALARM_LAMBDA_TIMEOUT_SECONDS = 10
+AUTHORITY_ALARM_DURATION_THRESHOLD_MS = AUTHORITY_ALARM_LAMBDA_TIMEOUT_SECONDS * 800
+# Registration-adapter metrics are emitted only by the admission-gated cell
+# operations; completion identity rejection only by CompleteRegistration.
+AUTHORITY_ADMISSION_OPERATIONS = frozenset(
+    {"activate_registration", "complete_registration"}
+)
+AUTHORITY_ALARM_ADMISSION_OUTCOMES = ("limited", "unavailable")
+AUTHORITY_ALARM_TERMINAL_OUTCOMES = ("internal", "unavailable")
+AUTHORITY_ALARM_COMPLETION_CAUSE = "authority_fence"
+# (resource name, metric name, statistic, extended statistic, comparison,
+#  threshold; None threshold == resolved from the bound contract).
+AUTHORITY_ALARM_LAMBDA_FAMILIES = {
+    "errors": ("Errors", "Sum", None, "GreaterThanThreshold", 0),
+    "throttles": ("Throttles", "Sum", None, "GreaterThanThreshold", 0),
+    "duration": (
+        "Duration",
+        None,
+        "p99",
+        "GreaterThanThreshold",
+        AUTHORITY_ALARM_DURATION_THRESHOLD_MS,
+    ),
+    "concurrency_exhaustion": (
+        "ConcurrentExecutions",
+        "Maximum",
+        None,
+        "GreaterThanOrEqualToThreshold",
+        None,
+    ),
+    "async_invocation": (
+        "AsyncEventsReceived",
+        "Sum",
+        None,
+        "GreaterThanThreshold",
+        0,
+    ),
+}
+AUTHORITY_ALARM_RESOURCES: dict[str, str] = {}
+AUTHORITY_ALARM_DIMENSIONS: dict[str, dict[str, str]] = {}
+
+
+def _authority_alarm_identity_dimensions(function_name: str) -> dict[str, str]:
+    """The EMF publisher's identity dimension prefix for one function."""
+    operation = AUTHORITY_RUNTIME_FUNCTIONS[function_name]
+    dimensions = {
+        "EnvironmentID": CONTROL_PREFIX.removeprefix("layerv-nhp-").removesuffix(
+            "-control"
+        ),
+        "AuthorityOperation": AUTHORITY_OPERATION_CONFORMANCE_NAME[operation],
+    }
+    if function_name in AUTHORITY_RUNTIME_CELL_FUNCTIONS:
+        dimensions["CellID"] = function_name.rsplit("-", 1)[1]
+    return dimensions
+
+
+for _fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
+    # AWS/Lambda platform alarms key on the published function-wide dim set.
+    AUTHORITY_ALARM_DIMENSIONS[
+        f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
+    ] = {"FunctionName": _fn}
+    for _family in AUTHORITY_ALARM_LAMBDA_FAMILIES:
+        _address = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            f'authority_runtime["{_fn}:{_family}"]'
+        )
+        AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+        AUTHORITY_ALARM_DIMENSIONS[_address] = {"FunctionName": _fn}
+    AUTHORITY_ALARM_RESOURCES[
+        "module.control.aws_cloudwatch_composite_alarm."
+        f'authority_non_provisioned_initialization["{_fn}"]'
+    ] = "aws_cloudwatch_composite_alarm"
+    for _outcome in AUTHORITY_ALARM_TERMINAL_OUTCOMES:
+        _address = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            f'authority_terminal_outcome["{_fn}:{_outcome}"]'
+        )
+        AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+        AUTHORITY_ALARM_DIMENSIONS[_address] = {
+            **_authority_alarm_identity_dimensions(_fn),
+            "Outcome": _outcome,
+        }
+    if _operation not in AUTHORITY_ADMISSION_OPERATIONS:
+        continue
+    for _outcome in AUTHORITY_ALARM_ADMISSION_OUTCOMES:
+        _address = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            f'authority_admission_rejected["{_fn}:{_outcome}"]'
+        )
+        AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+        AUTHORITY_ALARM_DIMENSIONS[_address] = {
+            **_authority_alarm_identity_dimensions(_fn),
+            "Outcome": _outcome,
+        }
+    for _resource in (
+        "authority_adapter_contract_violation",
+        "authority_adapter_late_result",
+    ):
+        _address = (
+            f'module.control.aws_cloudwatch_metric_alarm.{_resource}["{_fn}"]'
+        )
+        AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+        # These two counters carry NO dynamic dimension.
+        AUTHORITY_ALARM_DIMENSIONS[_address] = _authority_alarm_identity_dimensions(
+            _fn
+        )
+    if _operation != "complete_registration":
+        continue
+    _address = (
+        "module.control.aws_cloudwatch_metric_alarm."
+        f'authority_completion_identity_rejected["{_fn}"]'
+    )
+    AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+    AUTHORITY_ALARM_DIMENSIONS[_address] = {
+        **_authority_alarm_identity_dimensions(_fn),
+        "Cause": AUTHORITY_ALARM_COMPLETION_CAUSE,
+    }
+AUTHORITY_RUNTIME_RESOURCES.update(AUTHORITY_ALARM_RESOURCES)
+# The 11 already-live spillover alarms gain alarm_actions in place; every other
+# alarm address is a pure create.
+AUTHORITY_ALARM_UPDATE_ADDRESSES = frozenset(
+    f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
+    for _fn in AUTHORITY_RUNTIME_FUNCTIONS
+)
+
 AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES = {
     AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
 }
@@ -590,6 +744,10 @@ for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
 AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES = frozenset(
     set(AUTHORITY_RUNTIME_RESOURCES)
     - AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
+    # The alarm-routing addresses post-date the legacy expansion; that reviewed
+    # transition provably did not contain them, so admitting them here would
+    # widen a historical shape.
+    - set(AUTHORITY_ALARM_RESOURCES)
 )
 AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES = frozenset(
     {AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS}
@@ -1081,6 +1239,41 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws",
     ),
     "module.control.aws_cloudwatch_metric_alarm.authority_spillover": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_runtime": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization": (
+        "managed",
+        "aws_cloudwatch_composite_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_terminal_outcome": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_admission_rejected": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_adapter_contract_violation": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_adapter_late_result": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_completion_identity_rejected": (
         "managed",
         "aws_cloudwatch_metric_alarm",
         "aws",
@@ -5052,6 +5245,166 @@ def _check_authority_cell_exec_role_policy(
             raise ContractError(f"{fn} SES grant drifted")
 
 
+def _authority_alarm_actions(after: dict[str, Any], address: str) -> list[str]:
+    """The alarm's operator destinations, rejected unless exactly reviewed.
+
+    An alarm with no action is silent on a real fault while presenting a green
+    OK in the console, and a wildcard destination is not a destination at all.
+    Both fail closed here rather than being reported as coverage.
+    """
+    actions = after.get("alarm_actions")
+    if isinstance(actions, (set, frozenset)):
+        actions = sorted(actions)
+    if not isinstance(actions, list) or not actions:
+        raise ContractError(f"{address} must carry at least one operator alarm action")
+    for action in actions:
+        if not isinstance(action, str) or not re.fullmatch(
+            rf"arn:aws:sns:{AWS_REGION}:{ACCOUNT_ID}:[A-Za-z0-9_-]{{1,256}}", action
+        ):
+            raise ContractError(
+                f"{address} alarm action {action!r} must be an exact in-account, "
+                "in-region SNS topic ARN; wildcard and partial ARNs are rejected"
+            )
+    return sorted(actions)
+
+
+def _check_authority_alarm_routing(
+    by_address: dict[str, dict[str, Any]], functions: dict[str, Any]
+) -> None:
+    """Validate operator routing, dim sets, and thresholds for every alarm.
+
+    Fails closed on the four regressions NHP #3455 names: a missing or wildcard
+    operator destination, a function omitted from any per-function alarm family,
+    a weakened threshold, and a dimension set the publisher does not emit.
+    """
+    expected = set(AUTHORITY_ALARM_DIMENSIONS) | set(AUTHORITY_ALARM_RESOURCES)
+    present = {address for address in expected if address in by_address}
+    if present != expected:
+        missing = sorted(expected - present)
+        raise ContractError(
+            f"Authority alarm coverage is incomplete; missing={missing}"
+        )
+
+    destinations: set[tuple[str, ...]] = set()
+    for address in sorted(expected):
+        after = _authority_runtime_after(by_address, address)
+        destinations.add(tuple(_authority_alarm_actions(after, address)))
+
+        expected_dimensions = AUTHORITY_ALARM_DIMENSIONS.get(address)
+        if expected_dimensions is None:
+            # Composite alarms select their children by name, not by dimension.
+            continue
+        if after.get("dimensions") != expected_dimensions:
+            raise ContractError(
+                f"{address} must key on exactly {expected_dimensions}; a partial "
+                "or extra dimension selects a stream the publisher never emits"
+            )
+        if after.get("treat_missing_data") != "notBreaching":
+            raise ContractError(
+                f"{address} must treat missing data as notBreaching; every metric "
+                "here is a zero-baseline counter that publishes nothing when idle"
+            )
+        namespace = (
+            AUTHORITY_ALARM_NAMESPACE_LAMBDA
+            if set(expected_dimensions) == {"FunctionName"}
+            else AUTHORITY_ALARM_NAMESPACE_CUSTOM
+        )
+        if after.get("namespace") != namespace:
+            raise ContractError(f"{address} must publish against {namespace}")
+        if namespace == AUTHORITY_ALARM_NAMESPACE_CUSTOM:
+            # Every custom EMF alarm is a zero-baseline fault counter; a
+            # nonzero threshold silently tolerates the fault it exists to page.
+            if (
+                after.get("statistic") != "Sum"
+                or after.get("comparison_operator") != "GreaterThanThreshold"
+                or after.get("threshold") != 0
+            ):
+                raise ContractError(
+                    f"{address} must stay a zero-tolerance Sum counter; a "
+                    "weakened threshold is a silent loss of coverage"
+                )
+
+    # Every alarm must reach the SAME reviewed destination set; a split routing
+    # is how one family quietly stops paging.
+    if len(destinations) != 1:
+        raise ContractError(
+            "every Connector Authority alarm must route to the identical "
+            f"reviewed operator destination set; got {sorted(destinations)}"
+        )
+
+    for fn in AUTHORITY_RUNTIME_FUNCTIONS:
+        spillover_address = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            f'authority_spillover["{fn}"]'
+        )
+        spillover_after = _authority_runtime_after(by_address, spillover_address)
+        if (
+            spillover_after.get("metric_name")
+            != "ProvisionedConcurrencySpilloverInvocations"
+            or spillover_after.get("statistic") != "Sum"
+            or spillover_after.get("comparison_operator") != "GreaterThanThreshold"
+            or spillover_after.get("threshold") != 0
+        ):
+            raise ContractError(
+                f"{spillover_address} must stay the zero-tolerance spillover guard"
+            )
+
+        for family, (
+            metric_name,
+            statistic,
+            extended_statistic,
+            comparison,
+            threshold,
+        ) in AUTHORITY_ALARM_LAMBDA_FAMILIES.items():
+            address = (
+                "module.control.aws_cloudwatch_metric_alarm."
+                f'authority_runtime["{fn}:{family}"]'
+            )
+            after = _authority_runtime_after(by_address, address)
+            if (
+                after.get("metric_name") != metric_name
+                or after.get("statistic") != statistic
+                or after.get("extended_statistic") != extended_statistic
+                or after.get("comparison_operator") != comparison
+            ):
+                raise ContractError(
+                    f"{address} must stay the reviewed {metric_name} alarm shape"
+                )
+            expected_threshold = threshold
+            if expected_threshold is None:
+                # Concurrency exhaustion is pinned to the bound contract's
+                # steady reserved envelope, never a hand-typed number.
+                spec = functions.get(fn)
+                expected_threshold = (
+                    spec.get("steady_reserved_concurrency")
+                    if isinstance(spec, dict)
+                    else None
+                )
+            if expected_threshold is None or after.get("threshold") != (
+                expected_threshold
+            ):
+                raise ContractError(
+                    f"{address} threshold must be exactly {expected_threshold}; a "
+                    "weakened threshold is a silent loss of coverage"
+                )
+
+        composite_address = (
+            "module.control.aws_cloudwatch_composite_alarm."
+            f'authority_non_provisioned_initialization["{fn}"]'
+        )
+        composite_after = _authority_runtime_after(by_address, composite_address)
+        expected_rule = (
+            f'ALARM("{fn}-provisioned-concurrency-spillover") '
+            f'AND ALARM("{fn}-errors")'
+        )
+        if composite_after.get("alarm_rule") != expected_rule:
+            raise ContractError(
+                f"{composite_address} must be exactly the conjunction of the "
+                "published spillover and Errors alarms; the non-provisioned "
+                "initialization event has no emitted metric of its own"
+            )
+
+
 def _check_authority_runtime_resources(
     by_address: dict[str, dict[str, Any]], foundation: dict[str, Any]
 ) -> None:
@@ -5127,6 +5480,14 @@ def _check_authority_runtime_resources(
             )
             if alias_after.get("name") != color:
                 raise ContractError(f"{fn} {color} alias name drifted")
+
+        if function_after.get("dead_letter_config") not in (None, []):
+            raise ContractError(
+                f"{fn} may not declare a dead_letter_config; the Authority is a "
+                "synchronous RequestResponse contract"
+            )
+
+    _check_authority_alarm_routing(by_address, functions)
 
     lambda_sg_change = by_address[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS]["change"]
     lambda_sg_after = _authority_runtime_after(
@@ -7668,6 +8029,55 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         )
     )
 
+    # Operator alert routing and the full runtime alarm set (NHP #3455). The 11
+    # already-live spillover alarms take an in-place update (they gain
+    # alarm_actions); every other alarm address is a pending pure create. No
+    # function, role, alias, endpoint, or SG may move in this transition — the
+    # alarm slice is observability-only by construction, and anything else
+    # moving alongside it means the plan is not what it claims to be.
+    alarm_creates_pending = {
+        address
+        for address in AUTHORITY_ALARM_RESOURCES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    alarm_updates_pending = {
+        address
+        for address in AUTHORITY_ALARM_UPDATE_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
+    # Every address the alarm slice may ever touch. Used to prove a plan is not
+    # quietly moving an alarm outside the reviewed shape when the slice composes
+    # with another transition.
+    alarm_slice_scope = set(AUTHORITY_ALARM_RESOURCES) | set(
+        AUTHORITY_ALARM_UPDATE_ADDRESSES
+    )
+    alarm_slice_changed = alarm_creates_pending | alarm_updates_pending
+    # "The alarm slice moved as EXACTLY its reviewed shape" — independent of
+    # whether it is the only thing in the plan. Every alarm address is either
+    # settled or moving in its one permitted direction (new alarms create, the
+    # live spillover alarms update in place), and at least one is moving.
+    # This is the precondition for composing with the Hub source-fence
+    # transition below, mirroring how the fence composes with the Hub identity
+    # migration: a NON-exact alarm move leaves this false, so the fence subset
+    # test still sees the alarm addresses and the whole plan falls through to
+    # the fail-closed fallback.
+    authority_alarm_slice_exact = (
+        runtime_mode
+        and bool(alarm_slice_changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in AUTHORITY_ALARM_RESOURCES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in AUTHORITY_ALARM_UPDATE_ADDRESSES
+        )
+    )
+    # The standalone slice: the alarm work is the ENTIRE plan.
+    authority_alarm_routing_transition = (
+        authority_alarm_slice_exact and changed == alarm_slice_changed
+    )
+
     # Immutable Authority image refresh. Terraform publishes one new version of
     # the foundation binding, publishes one new version of each of the three
     # Hub-facing functions, and advances both closed aliases to that version.
@@ -7726,13 +8136,30 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     # excluded from the fence subset test, and they are separately create-shape
     # proved in the branch body. A non-exact identity move keeps the whole
     # predicate false and falls through to the fail-closed fallback.
+    # The fence may equally co-occur with the NHP #3455 alarm slice, which is
+    # observability-only: it creates CloudWatch alarms and adds alarm_actions to
+    # the 11 live spillover alarms, touching no NLB, listener, SG, parameter, or
+    # function. Its address set is disjoint from the fence's (asserted by
+    # test_alarm_and_fence_address_sets_are_disjoint), so neither is a superset
+    # of the other and a plan can legitimately carry both while the fence waits
+    # on an attended apply. Composed under the SAME contract as the identity
+    # migration above: the alarm addresses must form their OWN exact transition
+    # (authority_alarm_slice_exact) before they are excluded from the fence
+    # subset test, and they are separately create-shape proved in the branch
+    # body. Their contents are validated regardless of which branch wins, by
+    # _check_authority_alarm_routing via the inventory-derived runtime_mode. A
+    # non-exact alarm move keeps this predicate false and falls through to the
+    # fail-closed fallback.
     hub_source_fence_candidate = set(actual_non_noop)
     if hub_identity_transition:
         hub_source_fence_candidate -= hub_identity_changed
+    if authority_alarm_slice_exact:
+        hub_source_fence_candidate -= alarm_slice_changed
     hub_source_fence_transition = (
         hub_edge_mode
         and hub_worker_mode
         and (not hub_identity_changed or hub_identity_transition)
+        and (not (changed & alarm_slice_scope) or authority_alarm_slice_exact)
         and (
             bool(deposed_by_address)
             or (
@@ -7850,7 +8277,10 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # Hub identity transition is the one deliberate exception, admitted only
         # as its own exact shape and proved separately below; ordering ahead of
         # the standalone identity branch keeps the deposed proof reachable.
-        plan_mode = "hub-udp-source-fence-replacement"
+        plan_mode_parts = ["hub-udp-source-fence-replacement"]
+        if authority_alarm_slice_exact and (changed & alarm_slice_scope):
+            plan_mode_parts.append("authority-alarm-routing")
+        plan_mode = "-with-".join(plan_mode_parts)
         _require_create_shapes(hub_source_fence_creates & changed, by_address)
         if hub_identity_creates_pending:
             _require_create_shapes(
@@ -7858,14 +8288,22 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
                 by_address,
                 "Hub public identity parameter must be new",
             )
-        # The identity addresses are disjoint from the fence set (asserted by
-        # test_identity_and_fence_address_sets_are_disjoint), so withholding
-        # them here cannot hide a fence resource from its own deep validation.
+        if alarm_creates_pending:
+            _require_create_shapes(
+                alarm_creates_pending,
+                by_address,
+                "Authority alarm resources must be new",
+            )
+        # The identity and alarm addresses are disjoint from the fence set
+        # (asserted by test_identity_and_fence_address_sets_are_disjoint and
+        # test_alarm_and_fence_address_sets_are_disjoint), so withholding them
+        # here cannot hide a fence resource from its own deep validation.
         _check_hub_source_fence_transition(
             {
                 address: item
                 for address, item in by_address.items()
                 if address not in hub_identity_changed
+                and address not in alarm_slice_changed
             },
             deposed_by_address,
         )
@@ -7949,6 +8387,16 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         # the two opened base resources present as updates validated by their
         # exact after-state security checks in _check_planned_security below.
         _require_create_shapes(hub_worker_creates_pending, by_address)
+    elif authority_alarm_routing_transition:
+        plan_mode = "authority-alarm-routing"
+        # The already-live spillover alarms present as in-place updates whose
+        # after-state is validated by _check_authority_alarm_routing; only the
+        # still-pending new alarms must present a pure-create shape.
+        _require_create_shapes(
+            alarm_creates_pending,
+            by_address,
+            "Authority alarm resources must be new",
+        )
     elif hub_s3_correction:
         plan_mode = "hub-s3-endpoint-policy-correction"
         # A single in-place policy update on the already-created hub_s3 gateway
@@ -7960,7 +8408,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "Hub artifact bootstrap, reviewed Redis split, exact Authority "
             "contract binding, the exact provisioned-cell catalog create, the exact "
             "legacy Authority expansion, the exact Hub identity migration, the exact "
-            "Authority runtime slice or image update, the exact "
+            "Authority runtime slice or image update, the exact Authority alarm "
+            "routing slice, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction or Hub UDP source-fence "
             "replacement; "

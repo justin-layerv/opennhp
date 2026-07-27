@@ -165,6 +165,35 @@ variable "hub_worker_enabled" {
   default     = false
 }
 
+variable "operator_alarm_topic_arns" {
+  description = <<-EOT
+    Operator destination for every Connector Authority alarm (NHP #3455).
+
+    This is the standard sandbox operator notification path, not a new topic:
+    layerv-nhp-sandbox-cell0-alerts is created by terraform/modules/monitoring
+    and is the only sandbox SNS topic that carries a CONFIRMED subscription
+    today (an AWS Chatbot HTTPS subscription; it has no email subscribers). The
+    Control root deliberately reuses it rather than declaring its own, because
+    an isolated Control topic would start life silently unsubscribed — the exact
+    condition NHP #3280 is reconciling in production.
+
+    The cell0 name is historical (the monitoring module keys its topic on a
+    cell). The topic is account-wide in practice and the Authority is a
+    Control-scope, cell-independent service; renaming it is a monitoring-module
+    change, not a prerequisite for routing these alarms.
+  EOT
+  type        = list(string)
+  default     = ["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"]
+
+  validation {
+    condition = (
+      length(var.operator_alarm_topic_arns) == 1 &&
+      var.operator_alarm_topic_arns[0] == "arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"
+    )
+    error_message = "The sandbox Authority alarm destination must remain the reviewed operator topic; change it only alongside proof that the new destination has a confirmed subscriber."
+  }
+}
+
 variable "tags" {
   type = map(string)
   default = {

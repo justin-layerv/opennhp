@@ -153,6 +153,9 @@ variables {
   ses_configuration_set_name                   = "layerv-nhp-sandbox-agent-otp"
   authority_runtime_contract_evidence_verified = true
 
+  # The runtime gate fails closed without a reviewed operator alarm destination.
+  operator_alarm_topic_arns = ["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"]
+
   # The exact complete two-cell measurement basis.
   authority_runtime_contract = {
     schema_version           = 1
@@ -579,4 +582,392 @@ run "gate_on_without_contract_fails_closed" {
   expect_failures = [
     terraform_data.foundation_contract,
   ]
+}
+
+# ---------------------------------------------------------------------------
+# Operator alerts and the full runtime alarm set (NHP #3455).
+# ---------------------------------------------------------------------------
+run "alarm_set_is_complete_and_every_alarm_is_actionable" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  assert {
+    condition = (
+      length(aws_cloudwatch_metric_alarm.authority_spillover) == 11 &&
+      length(aws_cloudwatch_metric_alarm.authority_runtime) == 55 &&
+      length(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization) == 11 &&
+      length(aws_cloudwatch_metric_alarm.authority_terminal_outcome) == 22 &&
+      length(aws_cloudwatch_metric_alarm.authority_admission_rejected) == 8 &&
+      length(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation) == 4 &&
+      length(aws_cloudwatch_metric_alarm.authority_adapter_late_result) == 4 &&
+      length(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) == 2
+    )
+    error_message = "The runtime alarm set must be exactly 11 spillover + 55 platform + 11 composite + 22 terminal-outcome + 8 admission + 4 contract-violation + 4 late-result + 2 completion-identity alarms."
+  }
+
+  # Omitting a function from any per-function alarm family is the failure this
+  # catches: every one of the 11 functions must carry all five platform alarms,
+  # the spillover alarm, the composite, and both terminal-outcome alarms.
+  assert {
+    condition = alltrue(flatten([
+      for name in keys(aws_lambda_function.authority) : [
+        contains(keys(aws_cloudwatch_metric_alarm.authority_spillover), name),
+        contains(keys(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization), name),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_runtime), "${name}:errors"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_runtime), "${name}:throttles"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_runtime), "${name}:duration"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_runtime), "${name}:concurrency_exhaustion"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_runtime), "${name}:async_invocation"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_terminal_outcome), "${name}:internal"),
+        contains(keys(aws_cloudwatch_metric_alarm.authority_terminal_outcome), "${name}:unavailable"),
+      ]
+    ]))
+    error_message = "Every Authority function must carry spillover, errors, throttles, duration, concurrency-exhaustion, async-invocation, non-provisioned-initialization, and both terminal-outcome alarms."
+  }
+
+  # An alarm with no action is silent on a real fault while showing a green OK.
+  assert {
+    condition = alltrue(flatten([
+      [for a in values(aws_cloudwatch_metric_alarm.authority_spillover) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_runtime) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_terminal_outcome) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_admission_rejected) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_adapter_late_result) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) : a.alarm_actions == toset(["arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"])],
+    ]))
+    error_message = "Every Authority alarm must route to exactly the reviewed operator destination."
+  }
+
+  # AWS/Lambda platform alarms select the function-wide aggregate stream. AWS
+  # publishes {FunctionName} for every metric used here (verified live); adding
+  # or dropping a dimension selects a stream nothing writes to.
+  assert {
+    condition = alltrue(flatten([
+      [for k, a in aws_cloudwatch_metric_alarm.authority_spillover : a.dimensions == tomap({ FunctionName = k })],
+      [for k, a in aws_cloudwatch_metric_alarm.authority_runtime : a.dimensions == tomap({ FunctionName = split(":", k)[0] })],
+    ]))
+    error_message = "Every AWS/Lambda Authority alarm must key on exactly {FunctionName}, the published function-wide dim set."
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:errors"].metric_name == "Errors" &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:throttles"].metric_name == "Throttles" &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:duration"].metric_name == "Duration" &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:concurrency_exhaustion"].metric_name == "ConcurrentExecutions" &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:async_invocation"].metric_name == "AsyncEventsReceived" &&
+      aws_cloudwatch_metric_alarm.authority_spillover["layerv-nhp-sandbox-ca-ia"].metric_name == "ProvisionedConcurrencySpilloverInvocations" &&
+      alltrue([for a in values(aws_cloudwatch_metric_alarm.authority_runtime) : a.namespace == "AWS/Lambda"])
+    )
+    error_message = "The platform alarm set must use exactly the AWS-published Lambda metric names."
+  }
+
+  # Thresholds. Weakening any of these is the silent-regression this catches:
+  # the zero-tolerance counters must stay at 0, the duration budget must stay
+  # derived from the reviewed timeout, and concurrency exhaustion must stay tied
+  # to the bound contract's reserved envelope rather than a hand-typed number.
+  assert {
+    condition = (
+      alltrue([for a in values(aws_cloudwatch_metric_alarm.authority_spillover) : a.threshold == 0 && a.comparison_operator == "GreaterThanThreshold"]) &&
+      alltrue([
+        for k, a in aws_cloudwatch_metric_alarm.authority_runtime :
+        a.threshold == 0 && a.comparison_operator == "GreaterThanThreshold"
+        if contains(["errors", "throttles", "async_invocation"], split(":", k)[1])
+      ]) &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:duration"].threshold == 8000 &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:duration"].threshold == aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"].timeout * 800 &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:duration"].extended_statistic == "p99" &&
+      aws_cloudwatch_metric_alarm.authority_runtime["layerv-nhp-sandbox-ca-ia:concurrency_exhaustion"].comparison_operator == "GreaterThanOrEqualToThreshold" &&
+      alltrue([
+        for k, a in aws_cloudwatch_metric_alarm.authority_runtime :
+        a.threshold == aws_lambda_function.authority[split(":", k)[0]].reserved_concurrent_executions
+        if split(":", k)[1] == "concurrency_exhaustion"
+      ])
+    )
+    error_message = "Zero-tolerance alarms must stay at threshold 0; duration must stay 80% of the reviewed timeout; concurrency exhaustion must stay pinned to the contract reserved envelope."
+  }
+
+  # Missing data must never breach: every metric here is a zero-baseline fault
+  # counter and idle periods publish no datapoint at all.
+  assert {
+    condition = alltrue(flatten([
+      [for a in values(aws_cloudwatch_metric_alarm.authority_spillover) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_runtime) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_terminal_outcome) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_admission_rejected) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_adapter_late_result) : a.treat_missing_data == "notBreaching"],
+      [for a in values(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) : a.treat_missing_data == "notBreaching"],
+    ]))
+    error_message = "Every Authority alarm must treat missing data as notBreaching; these are zero-baseline fault counters on a path that publishes nothing when idle."
+  }
+
+  # The non-provisioned-initialization event has NO emitted metric (the handler
+  # rejects it at init, before telemetry exists), so it must be composed from
+  # the two published AWS/Lambda signals rather than named into existence.
+  assert {
+    condition = (
+      aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization["layerv-nhp-sandbox-ca-ia"].alarm_rule ==
+      "ALARM(\"layerv-nhp-sandbox-ca-ia-provisioned-concurrency-spillover\") AND ALARM(\"layerv-nhp-sandbox-ca-ia-errors\")" &&
+      aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization["layerv-nhp-sandbox-ca-ccr-cell1"].alarm_rule ==
+      "ALARM(\"layerv-nhp-sandbox-ca-ccr-cell1-provisioned-concurrency-spillover\") AND ALARM(\"layerv-nhp-sandbox-ca-ccr-cell1-errors\")"
+    )
+    error_message = "The non-provisioned-initialization alarm must be the exact conjunction of the published spillover and Errors alarms."
+  }
+
+  # No Authority function may carry a dead-letter queue: the Authority is a
+  # synchronous RequestResponse contract, and a DLQ would silently absorb a
+  # security decision the caller never learns failed. This is the structural
+  # half of the async/DLQ axis; the AsyncEventsReceived alarm is the runtime
+  # half. DeadLetterErrors is deliberately NOT alarmed — nothing publishes it.
+  assert {
+    condition = alltrue([
+      for fn in values(aws_lambda_function.authority) :
+      fn.dead_letter_config == null || length(fn.dead_letter_config) == 0
+    ])
+    error_message = "No Connector Authority function may declare a dead_letter_config; the Authority is a synchronous RequestResponse contract."
+  }
+}
+
+run "custom_metric_alarms_match_the_handler_publisher_dim_sets" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  # Hub operations are NOT cell operations, so the publisher emits no CellID and
+  # the alarm must not list one. AuthorityOperation carries the PascalCase
+  # conformance name the handler reports, never the snake_case terraform key.
+  assert {
+    condition = (
+      aws_cloudwatch_metric_alarm.authority_terminal_outcome["layerv-nhp-sandbox-ca-ia:internal"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "IssueAssignment"
+        Outcome            = "internal"
+      }) &&
+      aws_cloudwatch_metric_alarm.authority_terminal_outcome["layerv-nhp-sandbox-ca-icr:unavailable"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "IssueCredentialRecovery"
+        Outcome            = "unavailable"
+      }) &&
+      aws_cloudwatch_metric_alarm.authority_terminal_outcome["layerv-nhp-sandbox-ca-ia:internal"].namespace == "LayerV/ConnectorAuthority" &&
+      aws_cloudwatch_metric_alarm.authority_terminal_outcome["layerv-nhp-sandbox-ca-ia:internal"].metric_name == "qurl.connector_authority.invocation.total"
+    )
+    error_message = "Hub-operation custom alarms must key on exactly {EnvironmentID, AuthorityOperation, Outcome} with the PascalCase conformance operation name."
+  }
+
+  # Cell operations DO emit CellID, so its absence would select a stream that
+  # never exists.
+  assert {
+    condition = (
+      aws_cloudwatch_metric_alarm.authority_terminal_outcome["layerv-nhp-sandbox-ca-ar-cell0:internal"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "ActivateRegistration"
+        CellID             = "cell0"
+        Outcome            = "internal"
+      }) &&
+      aws_cloudwatch_metric_alarm.authority_admission_rejected["layerv-nhp-sandbox-ca-cr-cell1:limited"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "CompleteRegistration"
+        CellID             = "cell1"
+        Outcome            = "limited"
+      }) &&
+      aws_cloudwatch_metric_alarm.authority_admission_rejected["layerv-nhp-sandbox-ca-ar-cell1:unavailable"].metric_name == "qurl.connector_registration.adapter_admission.total"
+    )
+    error_message = "Cell-operation custom alarms must include the exact CellID the publisher emits."
+  }
+
+  # The two counters the publisher emits with NO dynamic dimensions: the
+  # identity prefix alone is the complete emitted set.
+  assert {
+    condition = (
+      aws_cloudwatch_metric_alarm.authority_adapter_contract_violation["layerv-nhp-sandbox-ca-ar-cell0"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "ActivateRegistration"
+        CellID             = "cell0"
+      }) &&
+      aws_cloudwatch_metric_alarm.authority_adapter_late_result["layerv-nhp-sandbox-ca-cr-cell0"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "CompleteRegistration"
+        CellID             = "cell0"
+      })
+    )
+    error_message = "Adapter contract-violation and late-result alarms must key on the identity prefix alone; the publisher adds no dynamic dimension."
+  }
+
+  # completion_identity_rejected is emitted only from the CompleteRegistration
+  # adapter path, and only the authority_fence cause is a security refusal.
+  assert {
+    condition = (
+      length(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) == 2 &&
+      contains(keys(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected), "layerv-nhp-sandbox-ca-cr-cell0") &&
+      contains(keys(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected), "layerv-nhp-sandbox-ca-cr-cell1") &&
+      aws_cloudwatch_metric_alarm.authority_completion_identity_rejected["layerv-nhp-sandbox-ca-cr-cell0"].dimensions == tomap({
+        EnvironmentID      = "sandbox"
+        AuthorityOperation = "CompleteRegistration"
+        CellID             = "cell0"
+        Cause              = "authority_fence"
+      })
+    )
+    error_message = "The completion-identity alarm must exist only on the CompleteRegistration functions and key on the authority_fence cause."
+  }
+
+  # Registration-adapter alarms exist only on the admission-gated operations,
+  # which are the only functions whose handlers emit those metrics.
+  assert {
+    condition = (
+      toset(keys(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation)) == toset([
+        "layerv-nhp-sandbox-ca-ar-cell0",
+        "layerv-nhp-sandbox-ca-ar-cell1",
+        "layerv-nhp-sandbox-ca-cr-cell0",
+        "layerv-nhp-sandbox-ca-cr-cell1",
+      ]) &&
+      toset(keys(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation)) ==
+      toset(keys(aws_cloudwatch_metric_alarm.authority_adapter_late_result))
+    )
+    error_message = "Registration-adapter alarms must cover exactly the four admission-gated cell functions."
+  }
+
+  # Every custom alarm's AuthorityOperation must be the same string the function
+  # reports in CONNECTOR_AUTHORITY_OPERATION. This is the drift guard that makes
+  # a snake_case/PascalCase mistake impossible to land.
+  assert {
+    condition = alltrue(flatten([
+      [for k, a in aws_cloudwatch_metric_alarm.authority_terminal_outcome :
+      a.dimensions["AuthorityOperation"] == aws_lambda_function.authority[split(":", k)[0]].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION],
+      [for k, a in aws_cloudwatch_metric_alarm.authority_admission_rejected :
+      a.dimensions["AuthorityOperation"] == aws_lambda_function.authority[split(":", k)[0]].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION],
+      [for k, a in aws_cloudwatch_metric_alarm.authority_adapter_contract_violation :
+      a.dimensions["AuthorityOperation"] == aws_lambda_function.authority[k].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION],
+      [for k, a in aws_cloudwatch_metric_alarm.authority_adapter_late_result :
+      a.dimensions["AuthorityOperation"] == aws_lambda_function.authority[k].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION],
+      [for k, a in aws_cloudwatch_metric_alarm.authority_completion_identity_rejected :
+      a.dimensions["AuthorityOperation"] == aws_lambda_function.authority[k].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION],
+    ]))
+    error_message = "Every custom alarm's AuthorityOperation must equal the operation the function itself reports."
+  }
+
+  # Cell alarms must carry the same CellID the function reports, and hub alarms
+  # must carry none.
+  assert {
+    condition = alltrue([
+      for k, a in aws_cloudwatch_metric_alarm.authority_terminal_outcome :
+      (
+        can(aws_lambda_function.authority[split(":", k)[0]].environment[0].variables.CONNECTOR_AUTHORITY_CELL_ID)
+        ? a.dimensions["CellID"] == aws_lambda_function.authority[split(":", k)[0]].environment[0].variables.CONNECTOR_AUTHORITY_CELL_ID
+        : !contains(keys(a.dimensions), "CellID")
+      )
+    ])
+    error_message = "A custom alarm must carry CellID if and only if its function is a cell operation, matching the value the function reports."
+  }
+}
+
+run "runtime_without_operator_destination_fails_closed" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns           = []
+  }
+
+  expect_failures = [
+    terraform_data.foundation_contract,
+  ]
+}
+
+run "wildcard_operator_destination_is_rejected" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns           = ["arn:aws:sns:us-east-2:767397897469:*"]
+  }
+
+  expect_failures = [
+    var.operator_alarm_topic_arns,
+  ]
+}
+
+run "bare_wildcard_operator_destination_is_rejected" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns           = ["*"]
+  }
+
+  expect_failures = [
+    var.operator_alarm_topic_arns,
+  ]
+}
+
+run "duplicate_operator_destination_is_rejected" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns = [
+      "arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts",
+      "arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts",
+    ]
+  }
+
+  expect_failures = [
+    var.operator_alarm_topic_arns,
+  ]
+}
+
+run "foreign_account_operator_destination_fails_closed" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns           = ["arn:aws:sns:us-east-2:000000000000:layerv-nhp-sandbox-cell0-alerts"]
+  }
+
+  expect_failures = [
+    terraform_data.foundation_contract,
+  ]
+}
+
+run "foreign_region_operator_destination_fails_closed" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    operator_alarm_topic_arns           = ["arn:aws:sns:us-west-2:767397897469:layerv-nhp-sandbox-cell0-alerts"]
+  }
+
+  expect_failures = [
+    terraform_data.foundation_contract,
+  ]
+}
+
+run "dark_runtime_plans_no_alarm_and_needs_no_destination" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = false
+    operator_alarm_topic_arns           = []
+  }
+
+  assert {
+    condition = (
+      length(aws_cloudwatch_metric_alarm.authority_spillover) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_runtime) == 0 &&
+      length(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_terminal_outcome) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_admission_rejected) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_adapter_late_result) == 0 &&
+      length(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) == 0
+    )
+    error_message = "A dark runtime must plan no alarm at all, so the operator destination is only required once functions exist."
+  }
 }
