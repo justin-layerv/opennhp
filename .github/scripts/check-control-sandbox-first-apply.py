@@ -618,6 +618,9 @@ AUTHORITY_ALARM_TERMINAL_OUTCOMES = ("internal", "unavailable")
 AUTHORITY_ALARM_COMPLETION_CAUSE = "authority_fence"
 # (resource name, metric name, statistic, extended statistic, comparison,
 #  threshold; None threshold == resolved from the bound contract).
+# A None statistic/extended_statistic means the alarm leaves that field unset --
+# the two are mutually exclusive. It matches both the creation plan's `null` and
+# the applied state's `""`; see _authority_alarm_statistic.
 AUTHORITY_ALARM_LAMBDA_FAMILIES = {
     "errors": ("Errors", "Sum", None, "GreaterThanThreshold", 0),
     "throttles": ("Throttles", "Sum", None, "GreaterThanThreshold", 0),
@@ -5349,6 +5352,25 @@ def _authority_alarm_actions(after: dict[str, Any], address: str) -> list[str]:
     return sorted(actions)
 
 
+def _authority_alarm_statistic(after: dict[str, Any], field: str) -> Any:
+    """One alarm statistic field, with the provider's unset rendering normalized.
+
+    `statistic` and `extended_statistic` are mutually exclusive optional strings:
+    every alarm in this set declares exactly one and leaves the other `null`. A
+    CREATION plan renders the unset one straight from config as `null`, but the
+    applied state that a steady-state plan refreshes from holds the AWS
+    provider's read-back of an absent optional string, which is `""`. Both spell
+    "this alarm does not carry that statistic", and this checker runs on both
+    lanes, so they must compare equal.
+
+    Only that one equivalence is admitted. A wrong statistic still fails, and an
+    unset field where the reviewed shape requires a value still fails, because
+    the normalized `None` never equals a required `"Sum"`/`"p99"`.
+    """
+    value = after.get(field)
+    return None if value == "" else value
+
+
 def _check_authority_alarm_routing(
     by_address: dict[str, dict[str, Any]], functions: dict[str, Any]
 ) -> None:
@@ -5444,8 +5466,9 @@ def _check_authority_alarm_routing(
             after = _authority_runtime_after(by_address, address)
             if (
                 after.get("metric_name") != metric_name
-                or after.get("statistic") != statistic
-                or after.get("extended_statistic") != extended_statistic
+                or _authority_alarm_statistic(after, "statistic") != statistic
+                or _authority_alarm_statistic(after, "extended_statistic")
+                != extended_statistic
                 or after.get("comparison_operator") != comparison
             ):
                 raise ContractError(

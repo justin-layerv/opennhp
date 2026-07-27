@@ -6769,6 +6769,78 @@ class PlanContractTests(unittest.TestCase):
         ):
             CHECKER.check_plan(candidate)
 
+    # The unset statistic field as the AWS provider actually reads it back:
+    # `""`, not the `null` a creation plan renders straight from config. Pinned
+    # from the applied sandbox control state (serial 56) after the #3492 apply.
+    APPLIED_UNSET_STATISTIC = ""
+
+    def test_alarm_applied_unset_statistic_rendering_passes(self) -> None:
+        """The steady-state rendering this checker rejected after #3492 applied.
+
+        ``statistic`` and ``extended_statistic`` are mutually exclusive: each
+        family sets one and leaves the other unset. A CREATION plan renders the
+        unset one as ``null``, but once applied, the provider reads an absent
+        optional string back as ``""`` — so every steady-state plan carries
+        ``""`` and the verify lane rejected all 55 live alarms (11 functions x 5
+        families) as shape drift when the alarms were in fact exactly correct.
+
+        The other alarm fixtures build ``after`` from
+        ``AUTHORITY_ALARM_LAMBDA_FAMILIES`` itself, so they render the checker's
+        own expectation back at it and can never observe this divergence. This
+        test pins the applied rendering instead.
+        """
+        candidate = authority_runtime_transition_fixture()
+        rewritten = 0
+        for item in candidate["resource_changes"]:
+            if ".authority_runtime[" not in item["address"]:
+                continue
+            if item["type"] != "aws_cloudwatch_metric_alarm":
+                continue
+            after = item["change"]["after"]
+            for field in ("statistic", "extended_statistic"):
+                if after.get(field) is None:
+                    after[field] = self.APPLIED_UNSET_STATISTIC
+                    rewritten += 1
+        # Every family leaves exactly one of the two fields unset.
+        self.assertEqual(
+            rewritten,
+            len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
+            * len(CHECKER.AUTHORITY_ALARM_LAMBDA_FAMILIES),
+        )
+        CHECKER.check_plan(candidate)
+
+    def test_alarm_statistic_drift_still_fails_closed(self) -> None:
+        """Admitting the applied ``""`` must not admit a real statistic change.
+
+        Each case is a genuine loss of the reviewed shape, not a rendering
+        difference: a populated field where the family requires none, a wrong
+        populated value, and an unset field where the family requires a value.
+        """
+        duration = (
+            "module.control.aws_cloudwatch_metric_alarm."
+            'authority_runtime["layerv-nhp-sandbox-ca-ia:duration"]'
+        )
+        for address, field, value in (
+            # An extended statistic on a plain Sum counter.
+            (self.ALARM_SAMPLE, "extended_statistic", "p99"),
+            # The wrong aggregation entirely: Average hides a single fault.
+            (self.ALARM_SAMPLE, "statistic", "Average"),
+            # Errors must not silently become an unaggregated alarm.
+            (self.ALARM_SAMPLE, "statistic", self.APPLIED_UNSET_STATISTIC),
+            # A looser percentile than the reviewed p99.
+            (duration, "extended_statistic", "p50"),
+            # Duration losing its percentile is a real coverage change.
+            (duration, "extended_statistic", self.APPLIED_UNSET_STATISTIC),
+            (duration, "statistic", "Average"),
+        ):
+            with self.subTest(address=address, field=field, value=value):
+                candidate = authority_runtime_transition_fixture()
+                self.change(candidate, address)["after"][field] = value
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "reviewed .* alarm shape"
+                ):
+                    CHECKER.check_plan(candidate)
+
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_plan(plan, prior_state)
