@@ -66,6 +66,8 @@ PROOF_SOURCE_RULE_SUFFIX = (
 PROOF_SOURCE_RULE_ADDRESS_SUFFIX = (
     "aws_vpc_security_group_ingress_rule" + PROOF_SOURCE_RULE_SUFFIX
 )
+# The shared migration-plan builder below composes a GREEN-active plan, so it
+# must read the green capture. The blue capture is exercised separately.
 UDP_SOURCE_FENCE_PROVIDER_FIXTURE = (
     REPO_ROOT
     / "tests"
@@ -4210,20 +4212,39 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
 
     def test_udp_source_fence_provider_fixture_digest_fails_closed(self) -> None:
-        fixture_bytes = UDP_SOURCE_FENCE_PROVIDER_FIXTURE.read_bytes()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture_path = Path(temp_dir) / UDP_SOURCE_FENCE_PROVIDER_FIXTURE.name
-            fixture_path.write_bytes(fixture_bytes + b"\n")
-            with mock.patch.object(
-                checker,
-                "UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH",
-                fixture_path,
+        # Every captured colour stays individually digest-pinned.
+        for color in sorted(checker.UDP_SOURCE_FENCE_PROVIDER_FIXTURES):
+            pins = checker.UDP_SOURCE_FENCE_PROVIDER_FIXTURES[color]
+            source = checker._UDP_SOURCE_FENCE_FIXTURE_DIR / pins["filename"]
+            with (
+                self.subTest(color=color),
+                tempfile.TemporaryDirectory() as temp_dir,
             ):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "UDP source-fence provider fixture digest changed",
+                temp_root = Path(temp_dir)
+                (temp_root / pins["filename"]).write_bytes(
+                    source.read_bytes() + b"\n"
+                )
+                with mock.patch.object(
+                    checker, "_UDP_SOURCE_FENCE_FIXTURE_DIR", temp_root
                 ):
-                    checker._load_udp_source_fence_provider_fixture()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "UDP source-fence provider fixture digest changed",
+                    ):
+                        checker._load_udp_source_fence_provider_fixture(color)
+
+    def test_udp_source_fence_every_captured_colour_loads_exactly(self) -> None:
+        # Both captures must load, self-declare their colour, and agree on the
+        # colour-independent public NLB envelope.
+        for color in sorted(checker.UDP_SOURCE_FENCE_PROVIDER_FIXTURES):
+            with self.subTest(color=color):
+                fixture = checker._load_udp_source_fence_provider_fixture(color)
+                self.assertEqual(fixture["active_color"], color)
+        self.assertIsInstance(checker._udp_source_fence_nlb_change(), dict)
+
+    def test_udp_source_fence_unknown_active_colour_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no capture for active color"):
+            checker._load_udp_source_fence_provider_fixture("teal")
 
     def test_pr_plan_restores_complete_trusted_checker_family(self) -> None:
         workflow = (

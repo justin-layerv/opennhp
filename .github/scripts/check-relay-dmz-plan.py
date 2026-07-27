@@ -83,20 +83,42 @@ EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
 EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
 EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
 EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
-UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "tests/fixtures/cell0-udp-source-fence/"
-    "active-green-replacement-terraform-1.14.3-aws-6.54.0.json"
+# One captured envelope per managed active color. cell0's listener default
+# action resolves to the ACTIVE color's target group, so a single-color fixture
+# only matches while the cell happens to sit on that color: the green capture
+# alone made every refreshed deploy plan fail once cell0 was blue, even though
+# nothing about the fence had changed. Each color is still an exact, separately
+# digest-pinned capture -- this admits two known-good envelopes, it does not
+# relax the comparison.
+_UDP_SOURCE_FENCE_FIXTURE_DIR = (
+    Path(__file__).resolve().parents[2] / "tests/fixtures/cell0-udp-source-fence"
 )
-UDP_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256 = (
-    "966147e606d2a38b257b6e484f8a434f6f5243f16163533ffe3a4143060a143c"
-)
-UDP_SOURCE_FENCE_SOURCE_PLAN_SHA256 = (
-    "ad2225486ab874d1527cebee1f3c6406d27b69ed276157cf2c86bbc09f1a7102"
-)
-UDP_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256 = (
-    "665f61e5c436697fca58110c0a191e15b25aa36ad0d358131a439edaef4fd185"
-)
+UDP_SOURCE_FENCE_PROVIDER_FIXTURES: dict[str, dict[str, str]] = {
+    "green": {
+        "filename": "active-green-replacement-terraform-1.14.3-aws-6.54.0.json",
+        "fixture_sha256": (
+            "966147e606d2a38b257b6e484f8a434f6f5243f16163533ffe3a4143060a143c"
+        ),
+        "source_plan_sha256": (
+            "ad2225486ab874d1527cebee1f3c6406d27b69ed276157cf2c86bbc09f1a7102"
+        ),
+        "source_plan_json_sha256": (
+            "665f61e5c436697fca58110c0a191e15b25aa36ad0d358131a439edaef4fd185"
+        ),
+    },
+    "blue": {
+        "filename": "active-blue-replacement-terraform-1.14.3-aws-6.54.0.json",
+        "fixture_sha256": (
+            "89acd0ca2b1d9f738f57d2a1037a1014a6997d8d0bf180df6d38126b058785b3"
+        ),
+        "source_plan_sha256": (
+            "caf3066f8b309c6e7e8ae765857fbb63dcabd3fb9ad50bad410ad5d22948c55d"
+        ),
+        "source_plan_json_sha256": (
+            "239ed881b47463e14bf4fbc4b49aaf74db51e70b748918647bcb2cf687368acc"
+        ),
+    },
+}
 # Exact Terraform expression graph for the managed blue/green selector. Refresh
 # this reviewed set from plan JSON when Terraform/provider rendering changes.
 EXPECTED_PUBLIC_UDP_MANAGED_TARGET_REFS = frozenset(
@@ -568,16 +590,40 @@ def _is_exact_udp_source_fence_target_noop(raw: dict[str, Any]) -> bool:
     return True
 
 
-def _load_udp_source_fence_provider_fixture() -> dict[str, Any]:
-    """Load exact provider envelopes proving the active-green replacement."""
+def _udp_source_fence_nlb_change() -> dict[str, Any]:
+    """Return the NLB replacement envelope, which is identical for both colors.
+
+    The public NLB replacement does not reference a target group, so its
+    captured envelope must not vary with the active color. Requiring the two
+    captures to agree makes that an asserted invariant rather than an
+    assumption, and keeps the deposed-recovery path independent of color.
+    """
+    address = f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb.server[0]"
+    changes = [
+        _load_udp_source_fence_provider_fixture(color)["changes"][address]
+        for color in sorted(UDP_SOURCE_FENCE_PROVIDER_FIXTURES)
+    ]
+    if any(change != changes[0] for change in changes[1:]):
+        raise ValueError(
+            "UDP source-fence public NLB envelope must be identical across "
+            "every captured active color"
+        )
+    return changes[0]
+
+
+def _load_udp_source_fence_provider_fixture(active_color: str) -> dict[str, Any]:
+    """Load exact provider envelopes for the managed active color's replacement."""
+    pins = UDP_SOURCE_FENCE_PROVIDER_FIXTURES.get(active_color)
+    if pins is None:
+        raise ValueError(
+            "UDP source-fence provider fixture has no capture for active color "
+            f"{active_color!r}"
+        )
     try:
-        payload = UDP_SOURCE_FENCE_PROVIDER_FIXTURE_PATH.read_bytes()
+        payload = (_UDP_SOURCE_FENCE_FIXTURE_DIR / pins["filename"]).read_bytes()
     except OSError as exc:
         raise ValueError("UDP source-fence provider fixture is unavailable") from exc
-    if (
-        hashlib.sha256(payload).hexdigest()
-        != UDP_SOURCE_FENCE_PROVIDER_FIXTURE_SHA256
-    ):
+    if hashlib.sha256(payload).hexdigest() != pins["fixture_sha256"]:
         raise ValueError("UDP source-fence provider fixture digest changed")
     try:
         fixture = json.loads(payload)
@@ -630,12 +676,11 @@ def _load_udp_source_fence_provider_fixture() -> dict[str, Any]:
         or fixture.get("source_plan_errored") is not False
         or fixture.get("source_plan_targeted") is not True
         or fixture.get("aws_provider_version") != "6.54.0"
-        or fixture.get("source_plan_sha256")
-        != UDP_SOURCE_FENCE_SOURCE_PLAN_SHA256
+        or fixture.get("source_plan_sha256") != pins["source_plan_sha256"]
         or fixture.get("source_plan_json_sha256")
-        != UDP_SOURCE_FENCE_SOURCE_PLAN_JSON_SHA256
+        != pins["source_plan_json_sha256"]
         or fixture.get("evidence_scope") != expected_scope
-        or fixture.get("active_color") != "green"
+        or fixture.get("active_color") != active_color
         or fixture.get("selected_participant_addresses") != addresses
         or fixture.get("listener_default_action_references")
         != expected_references
@@ -665,11 +710,21 @@ def validate_udp_source_fence_transition(
         value = (steps_by_key.get(key, {}).get("change") or {}).get(name)
         return value if isinstance(value, dict) else None
 
+    # cell0's listener default action resolves to whichever colour is ACTIVE, so
+    # the captured envelope differs per colour while everything else is
+    # identical. Admit the exact captures for every reviewed colour and require
+    # the plan to match one of them in full; a single-colour pin made every
+    # refreshed deploy plan fail as soon as cell0 sat on the other colour.
     try:
-        provider_fixture = _load_udp_source_fence_provider_fixture()
+        provider_changes_by_color = {
+            color: _load_udp_source_fence_provider_fixture(color)["changes"]
+            for color in sorted(UDP_SOURCE_FENCE_PROVIDER_FIXTURES)
+        }
     except ValueError as exc:
         return [str(exc)]
-    provider_changes = provider_fixture["changes"]
+    provider_changes = provider_changes_by_color[
+        sorted(UDP_SOURCE_FENCE_PROVIDER_FIXTURES)[0]
+    ]
 
     if UDP_SOURCE_FENCE_NLB_REPLACEMENT in steps_by_key:
         nlb_change = steps_by_key[UDP_SOURCE_FENCE_NLB_REPLACEMENT].get("change")
@@ -743,12 +798,15 @@ def validate_udp_source_fence_transition(
             side(UDP_SOURCE_FENCE_LISTENER_REPLACEMENT, "after_unknown") or {}
         )
         if listener_actions == ("delete", "create"):
+            listener_address = (
+                f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}."
+                "aws_lb_listener.udp[0]"
+            )
             require(
-                listener_step.get("change")
-                == provider_changes[
-                    f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}."
-                    "aws_lb_listener.udp[0]"
-                ],
+                any(
+                    listener_step.get("change") == changes[listener_address]
+                    for changes in provider_changes_by_color.values()
+                ),
                 "UDP source-fence listener replacement is not the exact "
                 "Terraform 1.14.3/AWS provider 6.54.0 envelope",
             )
@@ -1035,9 +1093,7 @@ def validate_dmz_boundary_noop(
         deposed_change = nlb_deposed_delete.get("change") or {}
         legacy_before = deposed_change.get("before")
         try:
-            provider_nlb_change = _load_udp_source_fence_provider_fixture()["changes"][
-                f"{EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX}.aws_lb.server[0]"
-            ]
+            provider_nlb_change = _udp_source_fence_nlb_change()
         except ValueError as exc:
             errors.append(str(exc))
             provider_nlb_change = {}
