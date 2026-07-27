@@ -82,6 +82,27 @@ variable "runtime_attestation_kms_key_arn" {
   nullable    = true
 }
 
+variable "provisioned_cell_catalog_kms_key_arn" {
+  description = <<-EOT
+    Exact CMK ARN encrypting layerv-nhp-sandbox-control-connector-authority — the
+    provisioned-cell catalog the deployment-manifest producer reads.
+
+    This is the Connector Authority data key (aws_kms_key.authority_data /
+    alias/layerv-nhp-sandbox-authority-data, created by
+    terraform/modules/connector-authority-foundation) and it is owned by the
+    Control root, not by this one. Pinned here as a literal because the two roots
+    have separate state and this root reads no remote state; verified against the
+    live table with `aws dynamodb describe-table`.
+
+    Distinct from proof_kms_key_arns: that is the runner's sealed-agent-state key
+    with a purpose=qurl-agent-x25519-private-key encryption context, not the
+    DynamoDB/ECR data-plane key.
+  EOT
+  type        = string
+  default     = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"
+  nullable    = true
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

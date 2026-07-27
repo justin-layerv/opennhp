@@ -20,3 +20,11 @@ runner_archive_sha256 = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535
 # confirmed key instead (it is NOT authority-data — that's the DDB/ECR data-plane
 # key with no qurl-agent-x25519-private-key encryption context).
 # proof_kms_key_arns = ["arn:aws:kms:us-east-2:767397897469:key/<confirmed-uuid>"]
+
+# Connector Authority data CMK (alias/layerv-nhp-sandbox-authority-data), created
+# by the Control root. It encrypts layerv-nhp-sandbox-control-connector-authority,
+# so the manifest producer needs a DynamoDB-scoped kms:Decrypt on it to read the
+# provisioned-cell catalog rows at all. Confirmed with
+#   aws dynamodb describe-table --table-name layerv-nhp-sandbox-control-connector-authority
+#     --query 'Table.SSEDescription.KMSMasterKeyArn'
+provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"

@@ -87,8 +87,9 @@ variables {
     "arn:aws:kms:us-east-2:767397897469:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     "arn:aws:kms:us-east-2:767397897469:key/11111111-aaaa-bbbb-cccc-222222222222",
   ]
-  runtime_attestation_bucket_arn  = "arn:aws:s3:::layerv-nhp-sandbox-runtime-attestations"
-  runtime_attestation_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/33333333-aaaa-bbbb-cccc-444444444444"
+  runtime_attestation_bucket_arn       = "arn:aws:s3:::layerv-nhp-sandbox-runtime-attestations"
+  runtime_attestation_kms_key_arn      = "arn:aws:kms:us-east-2:767397897469:key/33333333-aaaa-bbbb-cccc-444444444444"
+  provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/55555555-aaaa-bbbb-cccc-666666666666"
 }
 
 run "secure_ephemeral_runner_contract" {
@@ -282,8 +283,29 @@ run "secure_ephemeral_runner_contract" {
 
   assert {
     condition = (
+      length(aws_iam_role_policy.manifest_producer_catalog_decrypt) == 1 &&
+      # Exactly one statement: the catalog decrypt is its own policy so the core
+      # policy's "no kms:Decrypt" contract above stays literally true.
+      toset([for statement in jsondecode(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy).Statement : statement.Sid]) == toset([
+        "DecryptOnlyProvisionedCellCatalog",
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy).Statement : statement.Sid => statement })["DecryptOnlyProvisionedCellCatalog"].Action == "kms:Decrypt" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy).Statement : statement.Sid => statement })["DecryptOnlyProvisionedCellCatalog"].Resource == var.provisioned_cell_catalog_kms_key_arn &&
+      # DynamoDB, never S3/Secrets Manager/ECR — the same CMK protects those
+      # stores and ViaService is the only thing keeping this decrypt off them.
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy).Statement : statement.Sid => statement })["DecryptOnlyProvisionedCellCatalog"].Condition.StringEquals["kms:ViaService"] == "dynamodb.us-east-2.amazonaws.com" &&
+      keys(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy).Statement : statement.Sid => statement })["DecryptOnlyProvisionedCellCatalog"].Condition) == ["StringEquals"] &&
+      # The catalog CMK is a distinct key from the attestation CMK.
+      var.provisioned_cell_catalog_kms_key_arn != var.runtime_attestation_kms_key_arn
+    )
+    error_message = "The provisioned-cell catalog decrypt must be exact-key, DynamoDB-only, and separate from the core read policy."
+  }
+
+  assert {
+    condition = (
       length(aws_iam_role_policy.manifest_producer_core.policy) +
-      length(aws_iam_role_policy.manifest_producer_attestations[0].policy)
+      length(aws_iam_role_policy.manifest_producer_attestations[0].policy) +
+      length(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy)
     ) <= 10240
     error_message = "The manifest producer's aggregate inline-policy text must remain within IAM's 10,240-character role quota."
   }
@@ -409,6 +431,39 @@ run "omit_attestation_access_until_storage_is_pinned" {
     condition     = length(aws_iam_role_policy.manifest_producer_attestations) == 0
     error_message = "The manifest producer must receive no wildcard or placeholder attestation access before exact storage is provisioned."
   }
+}
+
+run "omit_catalog_decrypt_until_cmk_is_pinned" {
+  command = plan
+
+  variables {
+    provisioned_cell_catalog_kms_key_arn = null
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.manifest_producer_catalog_decrypt) == 0
+    error_message = "The manifest producer must receive no wildcard or placeholder catalog-CMK decrypt before the exact key is pinned."
+  }
+}
+
+run "reject_cross_account_catalog_cmk" {
+  command = plan
+
+  variables {
+    provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:111122223333:key/55555555-aaaa-bbbb-cccc-666666666666"
+  }
+
+  expect_failures = [aws_iam_role_policy.manifest_producer_catalog_decrypt]
+}
+
+run "reject_catalog_cmk_reused_from_attestation_storage" {
+  command = plan
+
+  variables {
+    provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/33333333-aaaa-bbbb-cccc-444444444444"
+  }
+
+  expect_failures = [var.provisioned_cell_catalog_kms_key_arn]
 }
 
 run "reject_noncanonical_ami_length" {

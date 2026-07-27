@@ -81,6 +81,14 @@ remain proof consumers; neither should grow an AWS runner control plane.
   fleet identity, public DNS, and immutable versioned attestations. Its S3/KMS
   statement does not exist until the composing root pins both exact storage
   ARNs; it never shares the runner controller's mutation permissions.
+- The catalog table is SSE-KMS, so the producer's exact-table `dynamodb:GetItem`
+  is inert on its own — DynamoDB calls `kms:Decrypt` under the caller's identity
+  and the read fails with a KMS `AccessDeniedException`. The decrypt lives in its
+  own inline policy, bound to the exact catalog CMK and to
+  `kms:ViaService = dynamodb.<region>.<dns_suffix>`, so it cannot be turned
+  against the other stores that same key protects. It does not exist until the
+  composing root pins `provisioned_cell_catalog_kms_key_arn`, and the core
+  read policy stays free of any `kms:Decrypt`.
 - The serialized broker starts the exact Terraform-owned launch-template
   version. The workflow cannot override user data, the instance profile, AMI,
   instance type, storage, or network interface. AWS's

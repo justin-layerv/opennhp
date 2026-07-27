@@ -52,5 +52,9 @@ module "udp_proof_runner" {
   runtime_attestation_bucket_arn  = var.runtime_attestation_bucket_arn
   runtime_attestation_kms_key_arn = var.runtime_attestation_kms_key_arn
 
+  # The catalog table is SSE-KMS, so the producer's dynamodb:GetItem is dead
+  # without a DynamoDB-scoped kms:Decrypt on this Control-owned CMK.
+  provisioned_cell_catalog_kms_key_arn = var.provisioned_cell_catalog_kms_key_arn
+
   tags = local.common_tags
 }

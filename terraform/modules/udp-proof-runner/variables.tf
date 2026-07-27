@@ -165,6 +165,45 @@ variable "runtime_attestation_kms_key_arn" {
   }
 }
 
+variable "provisioned_cell_catalog_kms_key_arn" {
+  description = <<-EOT
+    Exact CMK ARN encrypting the provisioned-cell catalog table
+    (`<name_prefix>-control-connector-authority`) the manifest producer reads.
+
+    The table is SSE-KMS with a customer-managed key, so DynamoDB calls
+    `kms:Decrypt` under the CALLER's identity: `dynamodb:GetItem` alone returns
+    a KMS AccessDeniedException, not a DynamoDB one. Null keeps the decrypt
+    absent (and the catalog read failing) rather than inventing a wildcard key.
+  EOT
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.provisioned_cell_catalog_kms_key_arn == null ||
+      can(regex(
+        "^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$",
+        var.provisioned_cell_catalog_kms_key_arn,
+      ))
+    )
+    error_message = "provisioned_cell_catalog_kms_key_arn must be null or one exact KMS key ARN."
+  }
+
+  # Null-consistency with the other CMK this module wires in: the two protect
+  # different stores under different services, and each grant is bound by its
+  # own kms:ViaService. Passing one ARN for both is the copy-paste failure this
+  # rejects — it would silently widen whichever grant got the wrong key.
+  validation {
+    condition = (
+      var.provisioned_cell_catalog_kms_key_arn == null ||
+      var.runtime_attestation_kms_key_arn == null ||
+      var.provisioned_cell_catalog_kms_key_arn != var.runtime_attestation_kms_key_arn
+    )
+    error_message = "provisioned_cell_catalog_kms_key_arn must differ from runtime_attestation_kms_key_arn."
+  }
+}
+
 variable "runner_archive_url" {
   description = "Exact official GitHub Actions runner linux-x64 release archive URL."
   type        = string

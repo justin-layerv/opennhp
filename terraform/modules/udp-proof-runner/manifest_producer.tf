@@ -236,6 +236,54 @@ resource "aws_iam_role_policy" "manifest_producer_core" {
   })
 }
 
+# ReadProvisionedCellCatalog (core policy, above) grants dynamodb:GetItem, but
+# the catalog table is SSE-KMS encrypted with the Connector Authority
+# customer-managed key (aws_kms_key.authority_data in
+# terraform/modules/connector-authority-foundation/kms.tf). DynamoDB calls
+# kms:Decrypt under the CALLER's identity for an SSE-KMS read, so a GetItem
+# without this grant fails AccessDeniedException from KMS — not from DynamoDB —
+# and no amount of table-scoped dynamodb: permission fixes it.
+#
+# kms:ViaService keeps the decrypt reachable only through DynamoDB, so this
+# grant cannot be turned against the other stores that same CMK protects
+# (Redis, ECR, secrets, control log groups). DynamoDB's per-table encryption
+# context is not an IAM-conditionable key the way S3's aws:s3:arn is, so the
+# exact key ARN plus ViaService is the tightest bound AWS supports here; the
+# table itself stays pinned by ReadProvisionedCellCatalog's exact resource ARN.
+resource "aws_iam_role_policy" "manifest_producer_catalog_decrypt" {
+  count = var.provisioned_cell_catalog_kms_key_arn == null ? 0 : 1
+
+  name = "udp-proof-catalog-decrypt"
+  role = aws_iam_role.manifest_producer.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "DecryptOnlyProvisionedCellCatalog"
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = var.provisioned_cell_catalog_kms_key_arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+          }
+        }
+      },
+    ]
+  })
+
+  lifecycle {
+    precondition {
+      condition = startswith(
+        var.provisioned_cell_catalog_kms_key_arn,
+        "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/",
+      )
+      error_message = "The provisioned-cell catalog CMK must be a current-account, current-region KMS key ARN."
+    }
+  }
+}
+
 resource "aws_iam_role_policy" "manifest_producer_attestations" {
   count = var.runtime_attestation_bucket_arn == null ? 0 : 1
 
