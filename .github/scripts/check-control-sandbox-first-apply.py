@@ -6900,6 +6900,26 @@ def _validate_digest_normalization(
     return before, after
 
 
+# The Hub edge slice settles these three on the first refreshed read after it
+# applies: the listener projects `tags`, the target group picks up the REPLACED
+# load balancer's ARN, and the NLB SG projects the standalone rules AWS holds.
+# None carries secret material, so each is proved by the same structural
+# placeholder rule as the alarms.
+_HUB_EDGE_SETTLING_PREFIXES = (
+    "module.control.aws_lb_listener.hub",
+    "module.control.aws_lb_target_group.hub",
+    "module.control.aws_security_group.hub_nlb",
+)
+# The Hub public identity parameter is DIFFERENT: its `value` is genuinely
+# sensitive (`true`, not a placeholder), so it must never take the structural
+# path -- that path exists to prove nothing sensitive is present. Its metadata is
+# fixed and identical on both sides, so it gets an exact literal instead.
+_HUB_PUBLIC_KEY_REFRESH_SENSITIVE = {
+    "tags": {},
+    "tags_all": {},
+    "value": True,
+    "value_wo": True,
+}
 _ALARM_REFRESH_NORMALIZATION_PREFIXES = (
     "module.control.aws_cloudwatch_metric_alarm.authority_runtime",
     "module.control.aws_cloudwatch_metric_alarm.authority_terminal_outcome",
@@ -6954,7 +6974,14 @@ def _refresh_sensitive_contract(
             _DIGEST_REFRESH_SENSITIVE,
             _DIGEST_REFRESH_SENSITIVE,
         )
-    if address.split("[")[0] in _ALARM_REFRESH_NORMALIZATION_PREFIXES:
+    if address.split("[")[0] == "module.control.aws_ssm_parameter.hub_public_key":
+        return (
+            _HUB_PUBLIC_KEY_REFRESH_SENSITIVE,
+            _HUB_PUBLIC_KEY_REFRESH_SENSITIVE,
+        )
+    if address.split("[")[0] in (
+        _ALARM_REFRESH_NORMALIZATION_PREFIXES + _HUB_EDGE_SETTLING_PREFIXES
+    ):
         # Alarm re-projection. Returning the observed pair would be circular, and
         # a fixed literal cannot work: the shapes differ per family and the
         # composite's `after` legitimately gains a key the `before` lacked --
