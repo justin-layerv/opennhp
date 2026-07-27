@@ -8336,14 +8336,28 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         and actual_non_noop.get(HUB_WORKER_S3_ENDPOINT_ADDRESS) == ["update"]
     )
 
-    # The legacy-user cleanup is deliberately delete-only: it must never ride
-    # along with publisher bootstrap, split-user creation, runtime activation, or
-    # any other Control change. Reject the combination before the transition
-    # chain so no other branch can claim a plan that also carries the delete.
-    if legacy_otp_user_delete and (changed or deposed_by_address):
+    # The legacy-user cleanup is delete-only against every transition EXCEPT the
+    # Hub UDP source-fence replacement, which was already pending and unapplied
+    # when NHP #3362 removed the user from source. Once source stopped declaring
+    # the user, no plan could carry the delete alone: every plan necessarily
+    # carries the pending fence too, so a delete-only contract became unreachable
+    # by construction and deadlocked BOTH the PR and apply lanes. Compose the two
+    # exactly, the same way the fence already composes with authority-alarm
+    # routing -- each half must independently match its own reviewed shape
+    # (_is_exact_legacy_otp_user_delete above; _check_hub_source_fence_transition
+    # in the branch body), and the delete is still refused alongside publisher
+    # bootstrap, split-user creation, runtime activation, or anything else.
+    # Remove this composition once the fence is applied and the delete is the
+    # only pending change again.
+    if (
+        legacy_otp_user_delete
+        and (changed or deposed_by_address)
+        and not hub_source_fence_transition
+    ):
         raise ContractError(
-            "the detached legacy Connector OTP Redis user delete must be the only "
-            f"change in its plan; got {actual_non_noop}"
+            "the detached legacy Connector OTP Redis user delete may accompany "
+            "only the reviewed Hub UDP source-fence replacement; got "
+            f"{actual_non_noop}"
         )
 
     if publisher_transition:
@@ -8417,6 +8431,11 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         plan_mode_parts = ["hub-udp-source-fence-replacement"]
         if authority_alarm_slice_exact and (changed & alarm_slice_scope):
             plan_mode_parts.append("authority-alarm-routing")
+        if legacy_otp_user_delete:
+            # Its exact before-state was already proved above, and the address
+            # was retired from by_address before the inventory check, so it
+            # cannot reach any fence validation below.
+            plan_mode_parts.append("legacy-otp-user-delete")
         plan_mode = "-with-".join(plan_mode_parts)
         _require_create_shapes(hub_source_fence_creates & changed, by_address)
         if hub_identity_creates_pending:
@@ -8554,12 +8573,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             f"got {actual_non_noop}"
         )
 
-    if legacy_otp_user_delete:
-        # Reached only with an otherwise-exact no-op inventory (the combination
-        # guard above already rejected anything else), so this cannot mask a
-        # second transition. Naming it distinctly keeps the delete out of the
-        # "no-op" bucket that gates state normalization and plan applyability
-        # below, and binds the mode into the saved-plan contract summary.
+    if legacy_otp_user_delete and plan_mode == "no-op":
+        # The standalone delete: reached only with an otherwise-exact no-op
+        # inventory, so it cannot mask a second transition. Guarded on "no-op"
+        # so it cannot overwrite the source-fence composite, which already
+        # appended its own part. Naming it distinctly keeps the delete out of
+        # the "no-op" bucket that gates state normalization and plan
+        # applyability below, and binds the mode into the contract summary.
         plan_mode = "legacy-otp-user-delete"
 
     # runtime_mode / hub_worker_mode with no non-no-op change is the steady
