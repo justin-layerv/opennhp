@@ -426,8 +426,47 @@ jobs:
     # Serialize concurrent runs against the same env to prevent two builds
     # racing to overwrite the SSM parameter (the "winning" AMI is then
     # consumed by the next instance refresh, leaving the loser as garbage).
+    #
+    # …but serialize ONLY the runs that can actually bake. GitHub keeps at most
+    # one *pending* job per concurrency group and cancels the previously-pending
+    # one as soon as a newer job queues behind it — `cancel-in-progress: false`
+    # protects the running job, not the queued one. Entering the shared group
+    # unconditionally therefore meant a burst of main merges (a Dependabot batch:
+    # 7 runs in 3 minutes on 2026-07-27) cancelled the packer leg of every run
+    # but the newest. A cancelled leg fails `terraform-plan`'s success-or-skip
+    # gate, which skips the entire sandbox deploy chain — so each of those runs
+    # built images and silently deployed nothing. This is exactly the hazard the
+    # workflow-level concurrency block calls out ("pending push runs get
+    # cancelled by newer ones, silently skipping deploys"), reintroduced at job
+    # level.
+    #
+    # On a run where no packer/** file changed, this job only reads SSM and
+    # exits — there is nothing to serialize, so take a per-run group and never
+    # queue. That is the overwhelming majority of runs. When packer/** did
+    # change (the case that produces a real `packer build` and a real SSM write)
+    # we enter the shared per-env group and serialize exactly as before.
+    #
+    # Polarity is deliberate: the expression tests for the literal 'false' and
+    # takes the SHARED group for anything else, so it fails CLOSED. Written the
+    # obvious way round (`== 'true'` → shared, else per-run) every wiring
+    # breakage — `changes` dropped from needs:, the `packer` output renamed, a
+    # paths-filter upgrade that emits `True`/`1`, a typo — would silently
+    # degrade to per-run groups and lose the SSM-overwrite protection with no
+    # error anywhere. Inverted, the same breakages degrade to "serialize every
+    # run", i.e. exactly today's behaviour: safe, and self-announcing, because
+    # the preemption it causes now posts a "superseded" Slack message. Prefer a
+    # loud over-serialization to a silent lost race. Fenced by A7 in
+    # scripts/check-packer-failure-surfaced.sh.
+    #
+    # Residual (accepted): the job also bakes when the SSM parameter is *missing*
+    # — fresh-environment bootstrap — which this expression can't see, so two
+    # concurrent bootstrap runs could both bake and both publish. That window is
+    # one-time per environment, ends the moment either run publishes, and costs
+    # an orphan AMI rather than a bad one; a brand-new environment is not taking
+    # racing main merges. Silently skipped deploys on every merge burst is the
+    # strictly worse failure.
     concurrency:
-      group: packer-build-${{ matrix.environment }}
+      group: ${{ needs.changes.outputs.packer == 'false' && format('packer-build-{0}-{1}', matrix.environment, github.run_id) || format('packer-build-{0}', matrix.environment) }}
       cancel-in-progress: false
     strategy:
       matrix:
@@ -3580,10 +3619,19 @@ jobs:
       needs.deploy-sandbox-blue-green.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Narrower than the workflow-level default (which carries id-token: write
+    # and pull-requests: write for the build/deploy jobs). notify posts to Slack
+    # and reads the run list to resolve the superseding run — nothing else.
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Notify Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Used only to look up whether a newer run on this branch superseded
+          # this one (see the SUPERSEDED_NOTE block below).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Build phase
           TEST_RESULT: ${{ needs.test.result }}
           TEST_LAMBDAS_RESULT: ${{ needs.test-lambdas.result }}
@@ -3661,6 +3709,98 @@ jobs:
             esac
           }
 
+          # Superseded-run detection.
+          #
+          # Push events get a unique workflow-level group per run, but several
+          # jobs hold shared cross-run groups to serialize the things that must
+          # not interleave: the per-environment Packer AMI lock, and the sandbox
+          # infra / qURL / relay deploys. GitHub cancels the previously-pending
+          # job in a concurrency group as soon as a newer one queues behind it,
+          # so a cancelled leg on a push almost always means "a newer push to
+          # this branch queued behind us" — not that anything broke.
+          #
+          # Report that as one run-level fact rather than per-job. Preemption is
+          # a property of the run, and every one of these legs produces the same
+          # user-visible outcome (this run stopped early and shipped nothing);
+          # reporting each separately is how the packer case ended up rendering
+          # a green "NHP Build successful" with a lone :warning: beside Packer
+          # AMI, and how a preempted infra leg still reads as a bare "Deploy
+          # cancelled" with no hint that it was deliberate.
+          #
+          # That outcome is benign if and only if a newer run exists to carry
+          # the commit (main only moves forward, so a later run's tree contains
+          # this one). Resolve that instead of asserting it — a cancelled leg
+          # with nothing behind it means the commit really is built-but-never-
+          # deployed, which is the one case that does want attention.
+          #
+          # Smoke is deliberately NOT in this set: a cancelled smoke means we
+          # never confirmed post-deploy health, which is treated as a failure
+          # below, not as a benign preempt. Blue/green is also absent — it has
+          # `cancel-in-progress: true` and its own notify-level suppression (see
+          # the job `if:` above), which is a separate decision from #1082.
+          # First match wins, and the order is the dependency cascade, so at
+          # most one of these is ever 'cancelled' in a single run: packer gates
+          # terraform-plan, which gates deploy-sandbox-infra, which gates both
+          # qURL and relay. A cancelled job leaves its dependents *skipped*, not
+          # cancelled — so naming the first match names the only one.
+          PREEMPTED_LEG=""
+          if [[ "$PACKER_RESULT" == "cancelled" ]]; then
+            PREEMPTED_LEG="Packer AMI bake"
+          elif [[ "$SANDBOX_INFRA" == "cancelled" ]]; then
+            PREEMPTED_LEG="sandbox infrastructure deploy"
+          elif [[ "$SANDBOX_QURL" == "cancelled" ]]; then
+            PREEMPTED_LEG="qURL service deploy"
+          elif [[ "$SANDBOX_RELAY" == "cancelled" ]]; then
+            PREEMPTED_LEG="relay deploy"
+          fi
+          # Every way this lookup can come up empty — a genuinely stranded run,
+          # a rate-limited or 5xx `gh api`, a token blip, a jq regression, or a
+          # successor that fell off the single 100-run page we read — routes to
+          # the amber "assume stranded, go look" message rather than the grey
+          # "superseded, ignore me" one. That asymmetry is deliberate: this path
+          # exists to stop a non-deploying run from reading as fine, so the one
+          # thing it must never do is claim supersession it didn't verify.
+          # Over-alerting during a GitHub API incident is the acceptable cost.
+          # (The page bound is not a practical limit: notify fires minutes after
+          # the superseding push, so the successor is always on page 1.)
+          SUPERSEDED_BY=""
+          if [[ -n "$PREEMPTED_LEG" ]]; then
+            # Percent-encode the branch before it enters the query string. Only
+            # 'main' reaches here today (every preemptable leg is main-only), but
+            # an unencoded '/' in a future branch name would truncate the
+            # `branch=` filter and silently return empty → a false amber. '/' is
+            # the only query-relevant character git ref rules permit; space, '?',
+            # '*', '[', '\', '~', '^' and ':' are all already forbidden in refs.
+            SUPERSEDED_BY=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build-and-push.yml/runs?branch=${GITHUB_REF_NAME//\//%2F}&per_page=100" \
+              --jq "[.workflow_runs[] | select(.run_number > ${GITHUB_RUN_NUMBER})] | min_by(.run_number) | .run_number // empty" \
+              2>/dev/null) || SUPERSEDED_BY=""
+          fi
+
+          # A bare :warning: on the Packer field reads as "something broke". Say
+          # which of the two cancelled cases it is, inline.
+          PACKER_FIELD="$(status_emoji "$PACKER_RESULT")"
+          SUPERSEDED_NOTE=""
+          if [[ -n "$PREEMPTED_LEG" ]]; then
+            if [[ -n "$SUPERSEDED_BY" ]]; then
+              [[ "$PACKER_RESULT" == "cancelled" ]] && PACKER_FIELD=":fast_forward: preempted by a newer run"
+              # "#N or later", not "#N": in a burst, run N+1 may itself have
+              # been preempted. What is always true is that the burst's tip
+              # deploys a tree containing this commit, since main only moves
+              # forward — so name the successor as the start of the chain that
+              # carries it, not as the run that necessarily deployed it.
+              # States what was observed, not why. Concurrency preemption is the
+              # overwhelmingly common cause, but an operator aborting the job by
+              # hand is indistinguishable from here — and asserting "a newer push
+              # preempted it" would be a flat lie in that case, on a line that
+              # also tells the reader to ignore the message.
+              SUPERSEDED_NOTE="*Superseded — no action needed.* This run's ${PREEMPTED_LEG} was cancelled — normally a newer push to \`${GITHUB_REF_NAME}\` queuing behind it — so the run stopped early. Run #${SUPERSEDED_BY} (or a later one) carries this commit forward."
+            else
+              [[ "$PACKER_RESULT" == "cancelled" ]] && PACKER_FIELD=":warning: cancelled"
+              SUPERSEDED_NOTE="*This commit did NOT finish deploying.* The ${PREEMPTED_LEG} was cancelled and no newer run has started on \`${GITHUB_REF_NAME}\`, so nothing is carrying it forward — re-run this workflow or dispatch a sandbox deploy."
+            fi
+          fi
+
           # Check if any sandbox deploy ran
           SANDBOX_DEPLOYED="false"
           if [[ "$SANDBOX_INFRA" != "skipped" ]]; then
@@ -3690,6 +3830,35 @@ jobs:
             EMOJI="x"
             HEADER="NHP Packer AMI Build"
             STATUS_TEXT="failed"
+          elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
+            # Ahead of the preempt arms on purpose. packer-build runs in
+            # parallel with test/build (only its shared group is preemptable —
+            # push build jobs get unique per-run groups), so "preempted AND a
+            # genuine build failure" is reachable. A real failure outranks the
+            # preempt: the superseding run would surface it too, but telling
+            # someone "no action needed" about a red build is the one thing
+            # this message must never do.
+            COLOR="#dc3545"
+            EMOJI="x"
+            HEADER="NHP Build"
+            STATUS_TEXT="failed"
+          elif [[ -n "$PREEMPTED_LEG" && -n "$SUPERSEDED_BY" ]]; then
+            # Preempted by a newer run that carries this commit. Deliberately
+            # neither green nor red: green ("Build successful") is what this
+            # message used to say and it's wrong — the run deployed nothing —
+            # while red implies something broke. Grey + "superseded" says the
+            # true thing: this run was retired in favour of a newer one.
+            COLOR="#6c757d"
+            EMOJI="fast_forward"
+            HEADER="NHP Build"
+            STATUS_TEXT="superseded by run #${SUPERSEDED_BY}"
+          elif [[ -n "$PREEMPTED_LEG" ]]; then
+            # Cancelled with no newer run behind it — the commit is stranded
+            # part-deployed. This one is worth a look.
+            COLOR="#ffc107"
+            EMOJI="warning"
+            HEADER="NHP Build"
+            STATUS_TEXT="stopped early"
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
@@ -3701,9 +3870,12 @@ jobs:
             done
             # Smoke is a required signal — a cancelled smoke means we
             # never confirmed post-deploy health. Treat as failure.
-            # Other components have dedicated cancelled-handling branches
-            # below (infra -> yellow, blue-green -> Notify skipped via
-            # job if:), so only smoke needs this here.
+            # The other components are handled outside this branch: the
+            # concurrency-serialized legs (packer, infra, qURL, relay) are
+            # caught by the PREEMPTED_LEG arms above, and blue-green skips
+            # Notify entirely via the job `if:`. Only smoke needs this here,
+            # because a cancelled smoke is the one case that must NOT read as
+            # a benign preempt.
             if [[ "$NHP_SMOKE_RESULT" == "cancelled" ]]; then
               DEPLOY_FAILED="true"
             fi
@@ -3728,22 +3900,12 @@ jobs:
               EMOJI="white_check_mark"
               HEADER="NHP Build"
               STATUS_TEXT="successful"
-            elif [[ "$SANDBOX_INFRA" == "cancelled" ]]; then
-              COLOR="#ffc107"
-              EMOJI="warning"
-              HEADER="NHP Server + AC Deploy"
-              STATUS_TEXT="cancelled"
             else
               COLOR="#dc3545"
               EMOJI="x"
               HEADER="NHP Server + AC Deploy"
               STATUS_TEXT="incomplete"
             fi
-          elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
-            COLOR="#dc3545"
-            EMOJI="x"
-            HEADER="NHP Build"
-            STATUS_TEXT="failed"
           elif [[ "$BUILD_RESULT" == "cancelled" ]]; then
             COLOR="#ffc107"
             EMOJI="warning"
@@ -3813,10 +3975,24 @@ jobs:
                 },
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Packer AMI:*\n$(status_emoji "$PACKER_RESULT")\"
+                  \"text\": \"*Packer AMI:*\n$PACKER_FIELD\"
                 }
               ]
             }"
+
+          # Explain a preempted packer leg in words, immediately under the
+          # status fields. Without this the reader sees a green header and a
+          # lone :warning: and has to reverse-engineer the concurrency model.
+          if [[ -n "$SUPERSEDED_NOTE" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"$SUPERSEDED_NOTE\"
+              }
+            }"
+          fi
 
           # Add sandbox component status if deployed
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then

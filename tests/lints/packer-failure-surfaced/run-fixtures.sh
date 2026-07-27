@@ -34,7 +34,7 @@
 # behavioral unit test of the REAL need() extracted from source and driven
 # with a multi-line block whose match is on the FIRST line (the exact
 # early-close shape the race corrupted). need()'s full wiring semantics
-# (A1–A5) stay covered by tests/scripts/check-packer-failure-surfaced_test.sh
+# (A1–A8) stay covered by tests/scripts/check-packer-failure-surfaced_test.sh
 # and the adjacent "Check Packer Build AMI failures" gate in
 # validate-workflows.yml, so this fixture stays a fast, deterministic
 # source-level fence and does not re-run the script itself.
@@ -96,9 +96,9 @@ fi
 # `grep -E` (no -q) whose result is captured into a var, so printf can
 # never be cut off mid-write.
 if grep -qE 'hit=\$\(printf .* \| grep -E ' "${SCRIPT}"; then
-  pass "need() captures drained 'grep -E' output (no early close)"
+  pass "need_in() captures drained 'grep -E' output (no early close)"
 else
-  fail "need() no longer uses the capture-then-test form (grep -E into a var)"
+  fail "need_in() no longer uses the capture-then-test form (grep -E into a var)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -112,9 +112,12 @@ fi
 # would exercise the identical drained-grep path, so it adds no coverage
 # over the first-line case and is omitted.)
 # ---------------------------------------------------------------------------
-eval "$(sed -n '/^need() {/,/^}/p' "${SCRIPT}")"
-if ! declare -F need >/dev/null; then
-  fail "could not extract need() from ${SCRIPT}"
+# Both functions, because need() is a thin wrapper that binds $notify_block and
+# delegates to need_in(), which owns the capture-then-test body under test.
+# Extracting only need() would eval a call to an undefined function.
+eval "$(sed -n '/^need_in() {/,/^}/p;/^need() {/,/^}/p' "${SCRIPT}")"
+if ! declare -F need >/dev/null || ! declare -F need_in >/dev/null; then
+  fail "could not extract need()/need_in() from ${SCRIPT}"
 else
   # need() reads two globals: $notify_block (the haystack) and $fail (the
   # flag it sets to 1 on a miss). We set both, then assert $fail after each
