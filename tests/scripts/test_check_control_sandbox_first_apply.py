@@ -5414,6 +5414,68 @@ class PlanContractTests(unittest.TestCase):
             len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
 
+    def test_authority_runtime_steady_state_admits_applied_standalone_egress(
+        self,
+    ) -> None:
+        """A REFRESHED steady-state plan reports the egress rules AWS actually
+        holds, because `egress` is Optional+Computed and the generation-2 group
+        declares no inline block. Live sandbox state carries exactly this: an
+        empty `ingress` and a populated `egress`.
+
+        The steady fixture used to copy `after` into `before` with both empty,
+        so no test ever modeled the refreshed shape -- which is how a contract
+        that only admitted the creating plan reached main and then failed every
+        subsequent plan.
+        """
+        fixture = authority_runtime_steady_fixture()
+        applied_egress = legacy_authority_lambda_sg_before()["egress"]
+        for item in fixture["resource_changes"]:
+            if item["address"] == CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS:
+                item["change"]["before"]["egress"] = copy.deepcopy(applied_egress)
+                item["change"]["after"]["egress"] = copy.deepcopy(applied_egress)
+                break
+        else:  # pragma: no cover - fixture drift
+            self.fail("steady fixture is missing the Authority function SG")
+        summary = CHECKER.check_plan(fixture)
+        self.assertEqual(summary["plan_mode"], "no-op")
+
+    def test_authority_runtime_steady_state_rejects_any_group_rule_rewrite(
+        self,
+    ) -> None:
+        """Admitting the applied egress must not admit the group MUTATING it.
+
+        An inline block (even `egress = []`) without `ignore_changes` surfaces
+        as a revoking diff -- the first-apply-vs-refresh trap documented on
+        modules/bootstrap-alb's SG. Both directions fail closed. On a steady
+        plan the generic no-op guard is what fires, which is deliberately
+        stricter than the rule-set comparison: on a no-op resource NOTHING may
+        differ, so this asserts the address rather than a specific message.
+        """
+        applied_egress = legacy_authority_lambda_sg_before()["egress"]
+        mutations = {
+            # The group revokes every standalone rule it does not declare.
+            "egress revoked": ("egress", copy.deepcopy(applied_egress), []),
+            # Nothing dials the functions on the network path, so a populated
+            # ingress is a real posture change in every state -- never drift.
+            "ingress opened": ("ingress", [], copy.deepcopy(applied_egress[:1])),
+        }
+        for label, (field, before, after) in mutations.items():
+            with self.subTest(label):
+                fixture = authority_runtime_steady_fixture()
+                for item in fixture["resource_changes"]:
+                    if item["address"] == CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS:
+                        item["change"]["before"][field] = before
+                        item["change"]["after"][field] = after
+                        break
+                else:  # pragma: no cover - fixture drift
+                    self.fail("steady fixture is missing the Authority function SG")
+                with self.assertRaises(CHECKER.ContractError) as caught:
+                    CHECKER.check_plan(fixture)
+                self.assertIn(
+                    CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS,
+                    str(caught.exception),
+                )
+
     def test_authority_runtime_slice_partial_retry_passes(self) -> None:
         """After a partial apply (e.g. the DynamoDB gateway open was rejected
         mid-run) the already-created slice resources replan as no-ops and only

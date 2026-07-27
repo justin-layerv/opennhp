@@ -5066,13 +5066,56 @@ def _check_authority_runtime_resources(
     lambda_sg_unknown = lambda_sg_change.get("after_unknown")
     if not isinstance(lambda_sg_unknown, dict):
         lambda_sg_unknown = {}
-    if (
-        lambda_sg_after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-"
-        or lambda_sg_after.get("ingress") not in ([], None)
-        or lambda_sg_after.get("egress") not in ([], None)
-    ):
+    lambda_sg_before = lambda_sg_change.get("before")
+    if not isinstance(lambda_sg_before, dict):
+        lambda_sg_before = {}
+    if lambda_sg_after.get("name_prefix") != f"{CONTROL_PREFIX}-ca-fn-v2-":
         raise ContractError(
             "function SG must be generation 2 with no inline ingress or egress"
+        )
+    # Nothing dials the functions on the network path, so ingress stays empty
+    # in every state; a populated one is a real posture change, not drift.
+    if lambda_sg_after.get("ingress") not in ([], None):
+        raise ContractError(
+            "function SG must be generation 2 with no inline ingress or egress"
+        )
+    # `egress` is Optional+Computed. The generation-2 SG declares no inline
+    # block, so a REFRESHED plan reports the standalone rules AWS actually
+    # holds -- exactly the three aws_vpc_security_group_egress_rule resources
+    # contract-checked below. Demanding an empty list here was only ever
+    # satisfiable on the creating plan, so this check began failing every plan
+    # the moment the slice applied and the rules existed. The load-bearing
+    # property in the steady state is not emptiness but that THIS plan does not
+    # rewrite the attribute: an inline block (even `egress = []`) without
+    # `ignore_changes` would show up here as a revoking diff, which is the
+    # first-apply-vs-refresh trap documented on modules/bootstrap-alb's SG.
+    def _sg_rule_set(value: Any) -> list[Any]:
+        # Terraform encodes "no rules" as both `[]` and an absent/None key
+        # depending on whether the attribute was ever written; normalize so the
+        # comparison reports real rule changes rather than encoding changes.
+        return value if isinstance(value, list) else []
+
+    lambda_sg_actions = lambda_sg_change.get("actions")
+    if not isinstance(lambda_sg_actions, list):
+        lambda_sg_actions = []
+    if "create" in lambda_sg_actions:
+        # Creating the group, including the generation-1 -> generation-2
+        # replacement, where `before` describes the OUTGOING legacy group and
+        # so cannot be compared against. A freshly created generation-2 group
+        # declares no rules: they are empty, or unknown until the standalone
+        # rules apply.
+        if lambda_sg_after.get("egress") not in ([], None) and (
+            lambda_sg_unknown.get("egress") is not True
+        ):
+            raise ContractError(
+                "function SG must be generation 2 with no inline ingress or egress"
+            )
+    elif _sg_rule_set(lambda_sg_after.get("egress")) != _sg_rule_set(
+        lambda_sg_before.get("egress")
+    ):
+        raise ContractError(
+            "function SG egress must not be rewritten by the security group "
+            "itself; the standalone egress rules are the only owner"
         )
     lambda_sg_id = lambda_sg_after.get("id")
     lambda_sg_id_is_known = (
