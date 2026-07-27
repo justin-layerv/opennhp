@@ -49,6 +49,16 @@ the running NHP container's ECR digest and `org.opencontainers.image.revision`
 label, or the installed qRTS binary's SHA-256 and its boot-captured ECR build
 receipt.
 
+Launch-template identity comes from two independent control-plane records read
+over SigV4 — the Auto Scaling membership row (`DescribeAutoScalingInstances`)
+and the reserved `aws:ec2launchtemplate:*` tags EC2 stamps at launch — which
+must agree. `DescribeInstances` returns **no** top-level `LaunchTemplate` for an
+ASG-launched instance, and IMDS is deliberately not used for this field: it
+serves the same tags over unauthenticated plaintext HTTP on a link-local
+address, so one on-box redirect would let a node name whatever template it
+liked. Both records state what the instance was *launched with*, so neither
+drifts to the group's newer desired version during a rolling replacement.
+
 Installation is not user-data's job to get right: the pinned State Manager
 document `layerv-nhp-sandbox-runtime-attestation-repair` writes the collector and
 both systemd units only from payloads whose SHA-256 equals the published

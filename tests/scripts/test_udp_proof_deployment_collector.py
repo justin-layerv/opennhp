@@ -1429,5 +1429,103 @@ class CanarySourceArtifactDigestTest(unittest.TestCase):
                     contract._sha256(value, "canary source artifact digest")
 
 
+class LaunchTemplateEvidenceTest(unittest.TestCase):
+    """The producer re-derives launch-template identity from the control plane.
+
+    `ec2:DescribeInstances` returns no top-level `LaunchTemplate` for an
+    ASG-launched instance, so the producer reads the Auto Scaling membership
+    row and the reserved `aws:ec2launchtemplate:*` tags and requires the two to
+    agree before comparing them to what the node attested.
+    """
+
+    TEMPLATE_ID = "lt-054583eecc18ceed6"
+
+    def described_instance(
+        self,
+        *,
+        template_id: str | None = TEMPLATE_ID,
+        version: str | None = "2",
+        extra_tags: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        tags: list[dict[str, object]] = [
+            {"Key": "Name", "Value": "layerv-nhp-sandbox-cell1-server"}
+        ]
+        if template_id is not None:
+            tags.append({"Key": "aws:ec2launchtemplate:id", "Value": template_id})
+        if version is not None:
+            tags.append({"Key": "aws:ec2launchtemplate:version", "Value": version})
+        tags.extend(extra_tags or [])
+        return {"InstanceId": "i-0b74635bfac7d988c", "Tags": tags}
+
+    def test_accepts_a_membership_row(self) -> None:
+        self.assertEqual(
+            collector._launch_template_pair(
+                {
+                    "LaunchTemplateId": self.TEMPLATE_ID,
+                    "LaunchTemplateName": "layerv-nhp-sandbox-cell1-server-c262",
+                    "Version": "2",
+                },
+                "membership",
+            ),
+            (self.TEMPLATE_ID, "2"),
+        )
+
+    def test_rejects_a_missing_record(self) -> None:
+        # This is exactly what `instance.get("LaunchTemplate")` yielded for
+        # every ASG-launched node before the fix.
+        for absent in (None, "", [], {}):
+            with self.subTest(absent=absent):
+                with self.assertRaises(collector.EvidenceError):
+                    collector._launch_template_pair(absent, "membership")
+
+    def test_rejects_malformed_identities(self) -> None:
+        for template_id, version in (
+            ("lt-ZZZZ", "2"),
+            ("lt-", "2"),
+            (self.TEMPLATE_ID, "$Latest"),
+            (self.TEMPLATE_ID, "0"),
+            (self.TEMPLATE_ID, "-1"),
+            (self.TEMPLATE_ID, 2),
+            (self.TEMPLATE_ID, ""),
+        ):
+            with self.subTest(template_id=template_id, version=version):
+                with self.assertRaises(collector.EvidenceError):
+                    collector._launch_template_pair(
+                        {"LaunchTemplateId": template_id, "Version": version},
+                        "membership",
+                    )
+
+    def test_reads_the_reserved_tags(self) -> None:
+        self.assertEqual(
+            collector._reserved_launch_template_tags(self.described_instance()),
+            {"LaunchTemplateId": self.TEMPLATE_ID, "Version": "2"},
+        )
+
+    def test_reserved_tag_failures_are_fail_closed(self) -> None:
+        cases = [
+            {"InstanceId": "i-0b74635bfac7d988c"},
+            {"InstanceId": "i-0b74635bfac7d988c", "Tags": "aws:ec2launchtemplate:id"},
+            {"InstanceId": "i-0b74635bfac7d988c", "Tags": [None]},
+            self.described_instance(
+                extra_tags=[
+                    {"Key": "aws:ec2launchtemplate:version", "Value": "9"},
+                ]
+            ),
+        ]
+        for instance in cases:
+            with self.subTest(instance=instance):
+                with self.assertRaises(collector.EvidenceError):
+                    collector._reserved_launch_template_tags(instance)
+
+    def test_absent_reserved_tags_fail_closed_downstream(self) -> None:
+        with self.assertRaises(collector.EvidenceError):
+            collector._launch_template_pair(
+                collector._reserved_launch_template_tags(
+                    self.described_instance(template_id=None, version=None)
+                ),
+                "reserved instance tag",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

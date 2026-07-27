@@ -2961,6 +2961,57 @@ def _require_no_active_instance_refresh(workload_key: str, asg_name: str) -> Non
         raise EvidenceError(f"{workload_key} ASG instance refresh is still active")
 
 
+LAUNCH_TEMPLATE_ID_TAG = "aws:ec2launchtemplate:id"
+LAUNCH_TEMPLATE_VERSION_TAG = "aws:ec2launchtemplate:version"
+LAUNCH_TEMPLATE_ID_RE = re.compile(r"lt-[0-9a-f]{8,17}")
+LAUNCH_TEMPLATE_VERSION_RE = re.compile(r"[1-9][0-9]{0,9}")
+
+
+def _launch_template_pair(source: Any, name: str) -> tuple[str, str]:
+    """Normalize one control-plane launch-template record, failing closed."""
+
+    if not isinstance(source, dict):
+        raise EvidenceError(f"{name} has no launch-template identity")
+    template_id = source.get("LaunchTemplateId")
+    version = source.get("Version")
+    if (
+        not isinstance(template_id, str)
+        or LAUNCH_TEMPLATE_ID_RE.fullmatch(template_id) is None
+        or not isinstance(version, str)
+        or LAUNCH_TEMPLATE_VERSION_RE.fullmatch(version) is None
+    ):
+        raise EvidenceError(f"{name} launch-template identity is malformed")
+    return template_id, version
+
+
+def _reserved_launch_template_tags(instance: dict[str, Any]) -> dict[str, Any]:
+    """Read the reserved launch-template tags EC2 stamps on the instance.
+
+    `ec2:DescribeInstances` returns no top-level `LaunchTemplate` for an
+    ASG-launched instance, so this record and the Auto Scaling membership row
+    are the two independent control-plane statements of what launched it.  The
+    `aws:` tag namespace is reserved — no principal, including the node's own
+    instance role, may write a key in it — so neither is node-authored.
+    """
+
+    tags = instance.get("Tags")
+    if not isinstance(tags, list):
+        raise EvidenceError("instance description carries no tags")
+    reserved: dict[str, Any] = {}
+    for tag in tags:
+        if not isinstance(tag, dict):
+            raise EvidenceError("instance tag set is malformed")
+        key = tag.get("Key")
+        if key in (LAUNCH_TEMPLATE_ID_TAG, LAUNCH_TEMPLATE_VERSION_TAG):
+            if key in reserved:
+                raise EvidenceError("instance has duplicate launch-template tags")
+            reserved[key] = tag.get("Value")
+    return {
+        "LaunchTemplateId": reserved.get(LAUNCH_TEMPLATE_ID_TAG),
+        "Version": reserved.get(LAUNCH_TEMPLATE_VERSION_TAG),
+    }
+
+
 def _collect_ec2_workload(
     workload_key: str,
     *,
@@ -3019,6 +3070,12 @@ def _collect_ec2_workload(
         raise EvidenceError(f"{workload_key} ASG is not healthily converged")
     _require_no_active_instance_refresh(workload_key, asg_name)
     in_service = sorted(in_service_unsorted)
+    # The membership row records the template each member was *launched with*,
+    # so it does not drift to the group's newer desired version mid-replacement.
+    asg_launch_templates = {
+        instance.get("InstanceId"): instance.get("LaunchTemplate")
+        for instance in instances
+    }
     described = _aws(
         "ec2",
         ["describe-instances", "--instance-ids", *in_service],
@@ -3169,13 +3226,20 @@ def _collect_ec2_workload(
             expected_role_arn=role_arn,
             expected_collector_contract=collector_contract,
         )
-        launch_template = instance.get("LaunchTemplate")
+        live_launch_template = _launch_template_pair(
+            asg_launch_templates.get(instance_id), f"{instance_id} ASG membership"
+        )
+        tagged_launch_template = _launch_template_pair(
+            _reserved_launch_template_tags(instance),
+            f"{instance_id} reserved instance tag",
+        )
+        attested_launch_template = (
+            attestation["launch_template_id"],
+            str(attestation["launch_template_version"]),
+        )
         if (
-            not isinstance(launch_template, dict)
-            or attestation["launch_template_id"]
-            != launch_template.get("LaunchTemplateId")
-            or str(attestation["launch_template_version"])
-            != str(launch_template.get("Version"))
+            live_launch_template != tagged_launch_template
+            or attested_launch_template != live_launch_template
         ):
             raise EvidenceError(f"{instance_id} launch-template attestation drift")
         live_repair = _verify_repair(

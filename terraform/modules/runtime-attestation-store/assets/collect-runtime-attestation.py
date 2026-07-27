@@ -53,6 +53,9 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 STATE_DIR = Path("/var/lib/layerv/runtime-attestation")
 BOOT_CAPTURE_PATH = STATE_DIR / "boot-capture.json"
 
+LAUNCH_TEMPLATE_ID_TAG = "aws:ec2launchtemplate:id"
+LAUNCH_TEMPLATE_VERSION_TAG = "aws:ec2launchtemplate:version"
+
 NHP_CONTAINER_NAME = "nhp-server"
 NHP_IMAGE_REPOSITORY = "layerv/nhp-server"
 QRTS_IMAGE_REPOSITORY = "layerv/qurl-reverse-tunnel-server"
@@ -190,6 +193,65 @@ def _iso_utc_seconds(value: Any, name: str) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _launch_template_identity(source: Any, name: str) -> tuple[str, int]:
+    """Normalize one control-plane launch-template record, failing closed.
+
+    Deliberately NOT sourced from IMDS.  IMDS would serve the same launch
+    template through `/latest/meta-data/tags/instance/`, but it answers
+    unauthenticated plaintext HTTP on a link-local address: one on-box NAT
+    redirect makes it say anything, and the IMDSv2 token is issued by the very
+    endpoint being impersonated, so it proves nothing.  Only the signed
+    instance-identity documents carry integrity, and they have no launch
+    template field.  Every source normalized here instead comes back over a
+    SigV4-signed call to a regional control-plane endpoint.
+    """
+
+    if not isinstance(source, dict):
+        raise CollectorError(f"{name} has no launch-template identity")
+    template_id = _require(
+        source.get("LaunchTemplateId"),
+        LAUNCH_TEMPLATE_ID_RE,
+        f"{name} launch template id",
+    )
+    try:
+        version = int(str(source.get("Version")))
+    except (TypeError, ValueError) as exc:
+        raise CollectorError(
+            f"{name} launch template version is not an integer"
+        ) from exc
+    if version <= 0:
+        raise CollectorError(f"{name} launch template version must be positive")
+    return template_id, version
+
+
+def _reserved_launch_template_tags(instance: dict[str, Any]) -> dict[str, Any]:
+    """Read the reserved launch-template tags EC2 stamps on the instance.
+
+    The `aws:` tag namespace is reserved: AWS refuses every principal —
+    including this node's own instance role, whatever `ec2:CreateTags` it
+    holds — permission to create, edit, or delete a key in it.  These values
+    are therefore the EC2 control plane's own record of what launched this
+    instance, not something the node can author about itself.
+    """
+
+    tags = instance.get("Tags")
+    if not isinstance(tags, list):
+        raise CollectorError("instance description carries no tags")
+    reserved: dict[str, Any] = {}
+    for tag in tags:
+        if not isinstance(tag, dict):
+            raise CollectorError("instance tag set is malformed")
+        key = tag.get("Key")
+        if key in (LAUNCH_TEMPLATE_ID_TAG, LAUNCH_TEMPLATE_VERSION_TAG):
+            if key in reserved:
+                raise CollectorError("instance has duplicate launch-template tags")
+            reserved[key] = tag.get("Value")
+    return {
+        "LaunchTemplateId": reserved.get(LAUNCH_TEMPLATE_ID_TAG),
+        "Version": reserved.get(LAUNCH_TEMPLATE_VERSION_TAG),
+    }
+
+
 def _collect_identity() -> dict[str, Any]:
     token = _imds_token()
     try:
@@ -249,20 +311,24 @@ def _collect_identity() -> dict[str, Any]:
     ):
         raise CollectorError("instance description is ambiguous")
     instance = reservations[0]["Instances"][0]
-    launch_template = instance.get("LaunchTemplate")
-    if not isinstance(launch_template, dict):
-        raise CollectorError("instance has no launch-template identity")
-    launch_template_id = _require(
-        launch_template.get("LaunchTemplateId"),
-        LAUNCH_TEMPLATE_ID_RE,
-        "launch template id",
+    # `ec2:DescribeInstances` returns no top-level `LaunchTemplate` for an
+    # ASG-launched instance — that field is only populated for an instance the
+    # RunInstances caller launched from a template directly.  The launch
+    # identity of an ASG member lives in two independent control-plane records:
+    # the Auto Scaling membership row, and the reserved `aws:ec2launchtemplate:*`
+    # tags EC2 stamps at launch.  Both are read here over SigV4 and must agree;
+    # each records what this instance was *launched with*, so neither drifts to
+    # the group's newer desired version during a rolling replacement.
+    launch_template_id, launch_template_version = _launch_template_identity(
+        rows[0].get("LaunchTemplate"), "ASG membership"
     )
-    try:
-        launch_template_version = int(str(launch_template.get("Version")))
-    except (TypeError, ValueError) as exc:
-        raise CollectorError("launch template version is not an integer") from exc
-    if launch_template_version <= 0:
-        raise CollectorError("launch template version must be positive")
+    tagged_id, tagged_version = _launch_template_identity(
+        _reserved_launch_template_tags(instance), "reserved instance tag"
+    )
+    if (tagged_id, tagged_version) != (launch_template_id, launch_template_version):
+        raise CollectorError(
+            "launch-template identity differs across control-plane records"
+        )
 
     try:
         boot_id = BOOT_ID_PATH.read_text(encoding="ascii").strip()
