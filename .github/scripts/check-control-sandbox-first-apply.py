@@ -871,7 +871,16 @@ HUB_EDGE_RESOURCES: dict[str, str] = {
 # one internet-facing NLB, and only once the tagged public-edge route table
 # proves the edge is live.
 HUB_EDGE_LOAD_BALANCER_NAME = "layerv-nhp-sandbox-hub-edge"
+# The generation-1 name, still live until the source-fence replacement applies.
+# Attaching a security group to an NLB forces replacement (AWS only accepts
+# `security_groups` at creation), and the replacement also renames. The
+# PRE-apply boundary check therefore observes this name, while the post-apply
+# state carries HUB_EDGE_LOAD_BALANCER_NAME. Admitting only the post name made
+# the check reject the exact state it exists to gate.
 HUB_EDGE_LEGACY_LOAD_BALANCER_NAME = f"{CONTROL_PREFIX}-hub"
+HUB_EDGE_REVIEWED_LOAD_BALANCER_NAMES = frozenset(
+    {HUB_EDGE_LOAD_BALANCER_NAME, HUB_EDGE_LEGACY_LOAD_BALANCER_NAME}
+)
 HUB_EDGE_TARGET_GROUP_NAME = f"{CONTROL_PREFIX}-hub"
 HUB_SOURCE_FENCE_PROVIDER_FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -9850,7 +9859,8 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         if not isinstance(hub_lb, dict):
             raise ContractError("Control load-balancer evidence is malformed")
         if (
-            hub_lb.get("LoadBalancerName") != HUB_EDGE_LOAD_BALANCER_NAME
+            hub_lb.get("LoadBalancerName")
+            not in HUB_EDGE_REVIEWED_LOAD_BALANCER_NAMES
             or hub_lb.get("Type") != "network"
             or hub_lb.get("Scheme") != "internet-facing"
             or hub_lb.get("VpcId") != vpc_id
