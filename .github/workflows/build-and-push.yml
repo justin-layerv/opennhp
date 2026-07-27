@@ -1504,9 +1504,9 @@ jobs:
     # with real state is handled by terraform-plan-pr.yml, which intentionally
     # re-opens that PR-time path for same-repo branches only. It uses a
     # dedicated read-only sandbox role instead of the apply role, but that role
-    # can still read state/SSM/KMS-decrypted material and the workflow fetches
-    # Auth0 Terraform credentials; enabling it requires the rollout-ledger
-    # security sign-off for the PR plan gate.
+    # can still read state/SSM/KMS-decrypted material; enabling it requires the
+    # rollout-ledger security sign-off for the PR plan gate. It no longer
+    # exposes an Auth0 credential — #3284 retired the Auth0 provider.
     # No dependabot filter: this job mints no AWS creds, so Dependabot's
     # restricted token scope is sufficient — let dependabot PRs that touch
     # terraform get the same fmt/validate coverage as human-authored PRs.
@@ -2136,13 +2136,6 @@ jobs:
           # does not move (not -migrate-state). See tfstate-kms-migration runbook.
           terraform init -reconfigure
 
-      - name: Fetch Auth0 Token
-        id: auth0
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
-
       # Resolve the qurl-reverse-tunnel-server image tag from SSM so terraform
       # plan/apply picks up the live tag the release pipeline (separate repo)
       # most recently published. The SSM parameter is created by Terraform and
@@ -2268,10 +2261,6 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -2518,10 +2507,6 @@ jobs:
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Apply exactly the saved plan that passed the DMZ contract above.
@@ -2550,9 +2535,6 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail

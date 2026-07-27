@@ -630,25 +630,22 @@ module "auth0" {
 
   # SPA dashboard client for developer login
   enable_spa_dashboard = var.enable_auth0_spa_dashboard
-  spa_callback_urls    = var.auth0_spa_callback_urls
-  spa_logout_urls      = var.auth0_spa_logout_urls
-  spa_web_origins      = var.auth0_spa_web_origins
   auth0_custom_domain  = var.auth0_custom_domain
 
-  # Social connections (Google + GitHub)
-  # OAuth credentials are passed via TF_VAR_* environment variables from GitHub Secrets
-  google_oauth_client_id     = var.google_oauth_client_id
-  google_oauth_client_secret = var.google_oauth_client_secret
-  github_oauth_client_id     = var.github_oauth_client_id
-  github_oauth_client_secret = var.github_oauth_client_secret
+  # Auth0 client IDs (#3284). The Auth0 provider is retired, so the AWS-side
+  # resources here take the client IDs as inputs. These are PUBLIC identifiers
+  # (the dashboard one is already a plaintext SSM parameter shipped to browsers
+  # as NEXT_PUBLIC_AUTH0_CLIENT_ID), not secrets. Client SECRETS are written
+  # straight into Secrets Manager by an operator and never enter Terraform.
+  backend_service_client_id = var.auth0_backend_service_client_id
+  smoke_test_client_id      = var.auth0_smoke_test_client_id
+  spa_dashboard_client_id   = var.auth0_spa_dashboard_client_id
 
   # Dedicated smoke test M2M client (system tier)
   enable_smoke_test_client = true
 
   # Email (SES) — layerv.ai domain needs SES verification for prod
-  email_from_address = "LayerV <noreply@layerv.ai>"
-  email_ses_region   = "us-east-1"
-  email_result_url   = "https://layerv.ai"
+  email_ses_region = "us-east-1"
 }
 
 # ==============================================================================

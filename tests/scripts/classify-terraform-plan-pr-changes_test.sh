@@ -71,8 +71,9 @@ run_case "plan workflow addition sets bootstrap flag" true false true \
 	$'A\t.github/workflows/terraform-plan-pr.yml'
 run_case "lambda packaging helper triggers sandbox plan" true false false \
 	$'M\t.github/actions/build-lambda-packages/action.yml'
-run_case "auth0 helper triggers sandbox plan" true false false \
-	$'M\t.github/scripts/fetch-auth0-token.sh'
+# The fetch-auth0-token.sh case that lived here was removed with #3284: the
+# helper is deleted and the Auth0 provider retired, so there is no Auth0
+# credential for this workflow to fetch and no plan input to guard.
 run_case "classifier helper triggers sandbox plan" true false false \
 	$'M\t.github/scripts/classify-terraform-plan-pr-changes.sh'
 run_case "relay DMZ checker triggers sandbox plan" true false false \

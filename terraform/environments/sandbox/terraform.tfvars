@@ -829,26 +829,10 @@ auth0_custom_domain = "auth.layerv.ai"
 
 # Callback URLs: Auth0 redirects here after login
 # Include staging site + localhost for development
-auth0_spa_callback_urls = [
-  "https://staging.layerv.ai/qurl/dashboard/callback/",
-  "https://staging.layerv.ai/api/auth/callback/",
-  "http://localhost:3000/qurl/dashboard/callback/",
-  "http://localhost:3000/api/auth/callback/",
-]
 
 # Logout URLs: Auth0 redirects here after logout
-auth0_spa_logout_urls = [
-  "https://staging.layerv.ai",
-  "https://staging.layerv.ai/qurl/dashboard/",
-  "http://localhost:3000",
-  "http://localhost:3000/qurl/dashboard/",
-]
 
 # Web origins: allowed for CORS and silent authentication
-auth0_spa_web_origins = [
-  "https://staging.layerv.ai",
-  "http://localhost:3000",
-]
 
 # ==============================================================================
 # Auth0 Slack OAuth Configuration
@@ -859,10 +843,20 @@ auth0_spa_web_origins = [
 # ==============================================================================
 enable_auth0_slack_oauth_client = true
 
-# Social connections (Google + GitHub) for developer login
-# OAuth credentials are passed via TF_VAR_* environment variables
-# Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
-#                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
+# ==============================================================================
+# Auth0 client IDs (#3284)
+# ==============================================================================
+# Tenant configuration lives in the Auth0 dashboard; Terraform no longer manages
+# it (see modules/auth0/removed.tf). These IDs are inputs to the AWS resources
+# that publish/reference them. Public identifiers, not secrets — client secrets
+# are put straight into Secrets Manager by an operator.
+#
+# Read them from the Auth0 dashboard (Applications > <app> > Settings) or:
+#   GET https://layerv.us.auth0.com/api/v2/clients?fields=client_id,name
+auth0_backend_service_client_id = "vLkOiUhRTtO87D4DReZ7J1030kJsdYbC" # Website Playground (sandbox)
+auth0_smoke_test_client_id      = "5hUGQ5Y6JsoUdzNDvtjAhuJK5aRVhABB" # Smoke Test (sandbox)
+auth0_spa_dashboard_client_id   = "fhtppYPLcNmItML0QmxGdOihFKU1UgiA" # QURL Dashboard (sandbox)
+auth0_slack_oauth_client_id     = "DOnL3bpEHhXEi49YBeDdiXoE22ArZGzw" # qurl-bot-slack (sandbox)
 
 # ==============================================================================
 # E2E Testing

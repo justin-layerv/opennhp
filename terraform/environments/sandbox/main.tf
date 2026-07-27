@@ -635,17 +635,17 @@ module "auth0" {
 
   # SPA dashboard client for developer login
   enable_spa_dashboard = var.enable_auth0_spa_dashboard
-  spa_callback_urls    = var.auth0_spa_callback_urls
-  spa_logout_urls      = var.auth0_spa_logout_urls
-  spa_web_origins      = var.auth0_spa_web_origins
   auth0_custom_domain  = var.auth0_custom_domain
 
-  # Social connections (Google + GitHub)
-  # OAuth credentials are passed via TF_VAR_* environment variables from GitHub Secrets
-  google_oauth_client_id     = var.google_oauth_client_id
-  google_oauth_client_secret = var.google_oauth_client_secret
-  github_oauth_client_id     = var.github_oauth_client_id
-  github_oauth_client_secret = var.github_oauth_client_secret
+  # Auth0 client IDs (#3284). The Auth0 provider is retired, so the AWS-side
+  # resources here take the client IDs as inputs. These are PUBLIC identifiers
+  # (the dashboard one is already a plaintext SSM parameter shipped to browsers
+  # as NEXT_PUBLIC_AUTH0_CLIENT_ID), not secrets. Client SECRETS are written
+  # straight into Secrets Manager by an operator and never enter Terraform.
+  backend_service_client_id = var.auth0_backend_service_client_id
+  smoke_test_client_id      = var.auth0_smoke_test_client_id
+  spa_dashboard_client_id   = var.auth0_spa_dashboard_client_id
+  slack_oauth_client_id     = var.auth0_slack_oauth_client_id
 
   # Dedicated smoke test M2M client (system tier)
   enable_smoke_test_client = true
@@ -656,35 +656,16 @@ module "auth0" {
   # of truth for the bot's hostname; changes to the DNS local propagate here
   # without an extra tfvars edit.
   enable_slack_oauth_client = var.enable_auth0_slack_oauth_client
-  slack_oauth_callback_urls = ["https://${local.slack_bot_domain}/oauth/qurl/callback"]
 
   # Email (SES)
-  email_from_address = "LayerV <noreply@layerv.xyz>"
-  email_ses_region   = "us-east-2"
-  email_result_url   = "https://staging.layerv.ai"
+  email_ses_region = "us-east-2"
 }
 
-# State migration: module.auth0 was previously deployed with count (as module.auth0[0])
-# These moved blocks handle the migration to the non-indexed version
-moved {
-  from = module.auth0[0].auth0_resource_server.qurl_api
-  to   = module.auth0.auth0_resource_server.qurl_api
-}
-
-moved {
-  from = module.auth0[0].auth0_resource_server_scopes.qurl_scopes
-  to   = module.auth0.auth0_resource_server_scopes.qurl_scopes
-}
-
-moved {
-  from = module.auth0[0].auth0_client.backend_service
-  to   = module.auth0.auth0_client.backend_service
-}
-
-moved {
-  from = module.auth0[0].auth0_client_grant.backend_qurl_api
-  to   = module.auth0.auth0_client_grant.backend_qurl_api
-}
+# The module.auth0[0] -> module.auth0 state migration `moved` blocks that lived
+# here were deleted with #3284. Their targets were `auth0_*` resources, which
+# Terraform no longer manages (see modules/auth0/removed.tf); a `moved` block
+# pointing at a resource absent from configuration is not valid. The migration
+# itself completed long ago — sandbox state records the non-indexed addresses.
 
 # ==============================================================================
 # Smoke Test Customer Record (system tier)

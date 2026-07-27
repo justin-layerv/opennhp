@@ -149,8 +149,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: |
           set -euo pipefail
 

@@ -37,18 +37,28 @@ the unqualified function ARN does not authorize that qualified request. That
 function has a distinct handler and execution role which can only read the
 relay secret and public-key parameter, aside from writing its own scoped log
 stream; the multi-action identity/keygen Lambda is not invokable by the PR role.
-The workflow also fetches
-Auth0 Terraform credentials before planning, so the rollout sign-off must
-confirm that PR-head code execution with the short-lived Auth0 token and
-sandbox read role is accepted, including plan-time exfil paths such as
-`data.http`, the `external` provider, and provider endpoint overrides. It must
-also confirm that the Auth0
-Terraform client grant is read-only or any write-capable exposure is explicitly
-accepted. The workflow restores its helper action/script paths from the trusted
-base commit before exposing the long-lived Auth0 client secret, and it fetches
-the Auth0 token using a base-commit copy of sandbox `terraform.tfvars` so
-PR-head `auth0_domain` edits cannot redirect the client-secret POST. Terraform
-HCL and tfvars still execute from the PR head during plan.
+**The Auth0 exposure that used to dominate this section is gone (#3284).** The
+workflow no longer fetches an Auth0 Management API token, no longer receives the
+long-lived Auth0 client secret, and no longer needs the base-commit
+`terraform.tfvars` copy that pinned the `auth0_domain` the client-secret POST
+was sent to. Terraform manages no Auth0 resource at all — see
+[`modules/auth0/removed.tf`](modules/auth0/removed.tf). This mattered because
+the credential in question was not read-only: the `Terraform` M2M held 37
+Management API scopes (audited 2026-07-26) including `create:connections`,
+`update:connections`, `create`/`update`/`delete:clients`, `update:branding`,
+`create:actions`, and `read:client_keys` — enough to read every client secret in
+the shared tenant, prod included, from a PR-head plan. The sign-off this section
+used to demand for that grant is therefore moot; **do not reintroduce an Auth0
+provider or credential into any Terraform path without re-opening it.**
+`tests/scripts/test_auth0_not_terraform_managed.py` fails CI if that is
+attempted.
+
+The remaining PR-time exposure is the sandbox read role, so the rollout sign-off
+must still confirm that PR-head code execution with it is accepted, including
+plan-time exfil paths such as `data.http`, the `external` provider, and provider
+endpoint overrides. The workflow restores its helper action/script paths from
+the trusted base commit, but Terraform HCL and tfvars still execute from the PR
+head during plan.
 AWS IAM cannot evaluate GitHub `workflow_ref`/`job_workflow_ref` custom claims,
 so the IAM trust is repo-wide `pull_request` and the fork/secret gates are
 workflow-level controls. Before making `Terraform Plan (PR)` required, confirm
@@ -59,6 +69,46 @@ design first. A GitHub Environment is the standard tighter OIDC path because it
 changes the AWS-matchable `sub` to `repo:ORG/REPO:environment:NAME`. Prod-only
 Terraform PRs should skip the sandbox plan and rely on prod validation rather
 than being blocked by unrelated sandbox state.
+
+## Auth0 Is Not Terraform-Managed (#3284)
+
+**Terraform does not manage the Auth0 tenant. Do not add it back.** Clients,
+connections, the API/resource server, roles, the post-login Action, branding,
+attack protection, and email provider/templates are all owned in the Auth0
+dashboard. `modules/auth0/` is now an AWS-only module: Secrets Manager
+containers, SSM parameters, the SES IAM user, and the (disabled) rotation
+Lambda. It takes Auth0 client IDs as tfvars inputs — those are public
+identifiers, already published as plaintext SSM parameters and shipped to
+browsers as `NEXT_PUBLIC_AUTH0_CLIENT_ID`. Client **secrets** are never
+Terraform inputs; an operator writes them straight into Secrets Manager with
+`aws secretsmanager put-secret-value`.
+
+Three reasons this is a boundary and not a preference:
+
+- **A tenant-write credential in PR-time code execution.** See the PR-Time
+  Terraform Plan Security section above. Retiring the provider deleted that
+  exposure rather than documenting an acceptance for it.
+- **Terraform could never own the tenant completely.** Writing a connection's
+  `options` needs `update:connections_options`, which the CI M2M does not hold.
+  The #2305 attempt left read-after-create drift that failed *every* subsequent
+  apply — including changes unrelated to Auth0 — until it was un-managed.
+  Partial ownership of a shared tenant is a standing outage risk on unrelated
+  work.
+- **The provider cannot read back what it writes.** Without `read:client_keys`
+  it returns an empty `client_secret`, which is why every credential secret in
+  the module carried `ignore_changes` plus an operator `put-secret-value` step
+  long before this change.
+
+`tests/scripts/test_auth0_not_terraform_managed.py` fails CI on any new
+`auth0_*` resource or data source, on a real credential reappearing in the
+provider config, and on `TF_VAR_auth0_*` returning to a workflow.
+
+The `provider "auth0"` stub in `environments/*/backend.tf` and
+`modules/auth0/removed.tf` are transitional: Terraform requires an explicit
+provider configuration to decode state entries even for a forget-only plan, so
+they must outlive the apply that forgets those entries. Delete both — plus the
+`auth0` entry in `required_providers` — once `terraform state list | grep
+auth0_` is empty in **both** environments.
 
 ## GitHub Actions Apply-Role IAM Quotas
 

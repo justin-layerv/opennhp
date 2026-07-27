@@ -1312,38 +1312,6 @@ variable "auth0_domain" {
   }
 }
 
-# Required for local dev (no default — must be set explicitly).
-# In CI these are still passed but the provider nulls them when api_token is set.
-variable "auth0_tf_client_id" {
-  description = "Auth0 M2M client ID for Terraform provider. Set via TF_VAR_auth0_tf_client_id."
-  type        = string
-  sensitive   = true
-
-  validation {
-    condition     = length(var.auth0_tf_client_id) > 0
-    error_message = "auth0_tf_client_id must be set. Pass via TF_VAR_auth0_tf_client_id environment variable or sensitive.auto.tfvars."
-  }
-}
-
-variable "auth0_tf_client_secret" {
-  description = "Auth0 M2M client secret for Terraform provider. Set via TF_VAR_auth0_tf_client_secret."
-  type        = string
-  sensitive   = true
-
-  validation {
-    condition     = length(var.auth0_tf_client_secret) > 0
-    error_message = "auth0_tf_client_secret must be set. Pass via TF_VAR_auth0_tf_client_secret environment variable or sensitive.auto.tfvars."
-  }
-}
-
-# Optional — CI-only. When set, the provider uses this token and ignores client_id/client_secret.
-variable "auth0_api_token" {
-  description = "Pre-fetched Auth0 Management API token. When set, the Auth0 provider uses this instead of client_id/client_secret (saves 1 M2M token per plan/apply). Set via TF_VAR_auth0_api_token in CI."
-  type        = string
-  sensitive   = true
-  default     = ""
-}
-
 variable "auth0_manage_tenant_resources" {
   description = "Whether this environment manages shared Auth0 tenant resources (roles, branding, attack protection, email, social connections). Only one environment should set this to true per shared tenant."
   type        = bool
@@ -1703,63 +1671,10 @@ variable "enable_auth0_spa_dashboard" {
   default     = false
 }
 
-variable "auth0_spa_callback_urls" {
-  description = "Auth0 SPA callback URLs for dashboard"
-  type        = list(string)
-  default     = []
-}
-
-variable "auth0_spa_logout_urls" {
-  description = "Auth0 SPA logout URLs for dashboard"
-  type        = list(string)
-  default     = []
-}
-
-variable "auth0_spa_web_origins" {
-  description = "Auth0 SPA web origins for dashboard CORS"
-  type        = list(string)
-  default     = []
-}
-
 variable "auth0_custom_domain" {
   description = "Auth0 custom domain for SPA login (e.g., auth.layerv.ai). If null, falls back to auth0_domain."
   type        = string
   default     = null
-}
-
-# ==============================================================================
-# Auth0 Social Connection Configuration
-# ==============================================================================
-# OAuth credentials for social login providers (Google, GitHub).
-# Pass via environment variables: TF_VAR_google_oauth_client_id, etc.
-# Store in GitHub Secrets for CI/CD.
-
-variable "google_oauth_client_id" {
-  description = "Google OAuth2 client ID for social login. If null, Google connection is not created."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
-variable "google_oauth_client_secret" {
-  description = "Google OAuth2 client secret for social login."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
-variable "github_oauth_client_id" {
-  description = "GitHub OAuth client ID for social login. If null, GitHub connection is not created."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
-variable "github_oauth_client_secret" {
-  description = "GitHub OAuth client secret for social login."
-  type        = string
-  default     = null
-  sensitive   = true
 }
 
 # ==================== QURL Integrations DNS ====================
@@ -2373,4 +2288,31 @@ variable "qurl_v2_relay_allowlist" {
     condition     = var.qurl_v2_relay_allowlist == "" || can(regex("^[A-Za-z0-9.:_-]+(,[A-Za-z0-9.:_-]+)*$", var.qurl_v2_relay_allowlist))
     error_message = "qurl_v2_relay_allowlist must be empty or a comma-separated list of host[:port] entries (no spaces or scheme)."
   }
+}
+
+# ==============================================================================
+# Auth0 client IDs (#3284)
+# ==============================================================================
+# The Auth0 Terraform provider is retired — tenant configuration lives in the
+# Auth0 dashboard. These IDs are inputs to the AWS-side resources that publish
+# and reference them. Auth0 client IDs are PUBLIC identifiers, not secrets: the
+# dashboard client ID is already a plaintext SSM parameter and ships to browsers
+# as NEXT_PUBLIC_AUTH0_CLIENT_ID. Client SECRETS are never Terraform inputs.
+
+variable "auth0_backend_service_client_id" {
+  description = "Auth0 client ID of the Website Playground M2M application. Public identifier."
+  type        = string
+  default     = null
+}
+
+variable "auth0_smoke_test_client_id" {
+  description = "Auth0 client ID of the smoke-test M2M application. Public identifier."
+  type        = string
+  default     = null
+}
+
+variable "auth0_spa_dashboard_client_id" {
+  description = "Auth0 client ID of the dashboard SPA. Public identifier, published to SSM for the website build."
+  type        = string
+  default     = null
 }

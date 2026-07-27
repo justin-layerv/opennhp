@@ -214,7 +214,6 @@ jobs:
           # reads local action bodies from the workspace when the step executes.
           trusted_paths=(
             .github/actions/build-lambda-packages
-            .github/scripts/fetch-auth0-token.sh
             .github/scripts/summarize-terraform-plan.py
           )
           for trusted_path in "${trusted_paths[@]}"; do
@@ -246,17 +245,11 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "$RUNNER_TEMP/terraform-plan-pr"
-          git show "$BASE_SHA:terraform/environments/sandbox/terraform.tfvars" > "$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars"
-          echo "TRUSTED_AUTH0_TFVARS=$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars" >> "$GITHUB_ENV"
-
-      - name: Fetch Auth0 Token
-        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
-        id: auth0
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/fetch-auth0-token.sh "$TRUSTED_AUTH0_TFVARS" sandbox
+          # The base-commit copy of sandbox terraform.tfvars that used to be
+          # written here existed solely so a PR-head `auth0_domain` edit could
+          # not redirect the Auth0 client-secret POST. #3284 retired the Auth0
+          # provider, so no Auth0 credential is fetched or exposed by this
+          # workflow any more and the pin has nothing left to protect.
 
       - name: Setup Terraform
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
@@ -274,8 +267,8 @@ jobs:
 
       # Build packages before assuming AWS credentials; the composite action
       # also forces dummy AWS env vars for its Python unit tests. Keep this
-      # after Fetch Auth0 Token so PR-head build scripts cannot re-tamper with
-      # the restored Auth0 helper before the long-lived client secret is used.
+      # after the trusted-path restore so PR-head build scripts cannot re-tamper
+      # with restored helpers before they run.
       - name: Build Lambda Packages
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         uses: ./.github/actions/build-lambda-packages
@@ -459,9 +452,6 @@ jobs:
           TF_VAR_auth_aes_key: 0123456789abcdef0123456789abcdef
           TF_VAR_ac_license_key: pr-plan-placeholder-ac-license-key
           TF_VAR_grafana_auth: pr-plan-placeholder-grafana-token
-          TF_VAR_auth0_tf_client_id: pr-plan-token-authenticated
-          TF_VAR_auth0_tf_client_secret: pr-plan-token-authenticated
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_image_tag: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail

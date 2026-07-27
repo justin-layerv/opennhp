@@ -38,40 +38,6 @@ variable "api_audience" {
   }
 }
 
-# Token lifetime configuration
-variable "api_token_lifetime" {
-  description = "Token lifetime for API access in seconds (default: 1 hour)"
-  type        = number
-  default     = 3600
-
-  validation {
-    condition     = var.api_token_lifetime >= 300 && var.api_token_lifetime <= 86400
-    error_message = "api_token_lifetime must be between 300 (5 min) and 86400 (24 hours) seconds"
-  }
-}
-
-variable "web_token_lifetime" {
-  description = "Token lifetime for web/browser-based apps in seconds (default: 1 hour). Must be <= api_token_lifetime."
-  type        = number
-  default     = 3600
-
-  validation {
-    condition     = var.web_token_lifetime >= 300 && var.web_token_lifetime <= 86400
-    error_message = "web_token_lifetime must be between 300 (5 min) and 86400 (24 hours) seconds"
-  }
-}
-
-variable "m2m_token_lifetime" {
-  description = "Token lifetime for M2M clients in seconds (default: 1 hour)"
-  type        = number
-  default     = 3600
-
-  validation {
-    condition     = var.m2m_token_lifetime >= 300 && var.m2m_token_lifetime <= 86400
-    error_message = "m2m_token_lifetime must be between 300 (5 min) and 86400 (24 hours) seconds"
-  }
-}
-
 # ==============================================================================
 # Secret Rotation Configuration
 # ==============================================================================
@@ -237,54 +203,6 @@ variable "enable_spa_dashboard" {
   default     = false
 }
 
-variable "spa_callback_urls" {
-  description = "Allowed callback URLs for SPA dashboard (Auth0 redirect after login)"
-  type        = list(string)
-  default     = []
-
-  validation {
-    condition     = alltrue([for url in var.spa_callback_urls : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
-    error_message = "All SPA callback URLs must use HTTPS (http://localhost is allowed for development)"
-  }
-
-  validation {
-    condition     = !var.enable_spa_dashboard || length(var.spa_callback_urls) > 0
-    error_message = "spa_callback_urls must not be empty when enable_spa_dashboard is true"
-  }
-}
-
-variable "spa_logout_urls" {
-  description = "Allowed logout redirect URLs for SPA dashboard"
-  type        = list(string)
-  default     = []
-
-  validation {
-    condition     = alltrue([for url in var.spa_logout_urls : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
-    error_message = "All SPA logout URLs must use HTTPS (http://localhost is allowed for development)"
-  }
-
-  validation {
-    condition     = !var.enable_spa_dashboard || length(var.spa_logout_urls) > 0
-    error_message = "spa_logout_urls must not be empty when enable_spa_dashboard is true"
-  }
-}
-
-variable "spa_web_origins" {
-  description = "Allowed web origins for SPA dashboard (CORS)"
-  type        = list(string)
-  default     = []
-
-  validation {
-    condition     = alltrue([for url in var.spa_web_origins : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
-    error_message = "All SPA web origins must use HTTPS (http://localhost is allowed for development)"
-  }
-
-  validation {
-    condition     = !var.enable_spa_dashboard || length(var.spa_web_origins) > 0
-    error_message = "spa_web_origins must not be empty when enable_spa_dashboard is true"
-  }
-}
-
 # ==============================================================================
 # Slack OAuth (qurl-bot-slack workspace-install) Configuration
 # ==============================================================================
@@ -308,60 +226,68 @@ variable "enable_slack_oauth_client" {
   default     = false
 }
 
-variable "slack_oauth_callback_urls" {
-  description = <<-EOT
-    Allowed callback URLs for the Slack OAuth regular_web client (Auth0
-    redirect after admin login). Typically a single entry per environment:
-      - sandbox: `https://slackbot.layerv.xyz/oauth/qurl/callback`
-      - prod:    `https://slackbot.layerv.ai/oauth/qurl/callback` (once prod DNS lands)
-    The path suffix `/oauth/qurl/callback` is fixed by the qurl-bot-slack
-    handler; the host is fixed by per-env DNS. Callers should derive this
-    from their env's bot-domain local rather than duplicating the literal.
-  EOT
-  type        = list(string)
-  default     = []
+# ==============================================================================
+# Auth0 client IDs (#3284)
+# ==============================================================================
+# Since the Auth0 provider was retired (see `removed.tf`), the AWS resources in
+# this module take client IDs as inputs instead of reading them off `auth0_*`
+# attributes. Auth0 client IDs are PUBLIC identifiers — the dashboard client ID
+# is already published as a plaintext SSM parameter and shipped to browsers in
+# `NEXT_PUBLIC_AUTH0_CLIENT_ID` — so they live in tfvars, not in secrets.
+#
+# The matching client SECRETS are not inputs here and never should be: they are
+# written straight into Secrets Manager by an operator (`put-secret-value`), so
+# they never enter Terraform state or a plan log.
+#
+# These replaced the former google_oauth_client_id/secret and
+# github_oauth_client_id/secret variables, which were dead — their
+# `auth0_connection` resources were gated on `<provider>_oauth_client_id !=
+# null`, no workflow ever exported the matching `TF_VAR_*`, and the GitHub
+# Actions secrets their tfvars comments referenced were never created, so
+# `count` was permanently 0 in both environments.
+
+variable "backend_service_client_id" {
+  description = "Auth0 client ID of the Website Playground M2M application (legacy resource name `backend_service`). Public identifier. Null leaves the value absent from module outputs."
+  type        = string
+  default     = null
 
   validation {
-    condition     = alltrue([for url in var.slack_oauth_callback_urls : can(regex("^https://", url))])
-    error_message = "All slack_oauth_callback_urls must use HTTPS — Slack-flow callbacks never run on http://localhost (the regular_web client is exercised through the public ALB on `slackbot.layerv.<tld>`, never directly)."
+    condition     = var.backend_service_client_id == null || can(regex("^[A-Za-z0-9]{32}$", var.backend_service_client_id))
+    error_message = "backend_service_client_id must be a 32-character alphanumeric Auth0 client ID."
   }
+}
+
+variable "smoke_test_client_id" {
+  description = "Auth0 client ID of the smoke-test M2M application. Public identifier. Required when enable_smoke_test_client is true."
+  type        = string
+  default     = null
 
   validation {
-    condition     = !var.enable_slack_oauth_client || length(var.slack_oauth_callback_urls) > 0
-    error_message = "slack_oauth_callback_urls must not be empty when enable_slack_oauth_client is true"
+    condition     = var.smoke_test_client_id == null || can(regex("^[A-Za-z0-9]{32}$", var.smoke_test_client_id))
+    error_message = "smoke_test_client_id must be a 32-character alphanumeric Auth0 client ID."
   }
 }
 
-# ==============================================================================
-# Social Connection Configuration (Google + GitHub)
-# ==============================================================================
-
-variable "google_oauth_client_id" {
-  description = "Google OAuth2 client ID for social login. If null, Google connection is not created."
+variable "spa_dashboard_client_id" {
+  description = "Auth0 client ID of the dashboard SPA. Public identifier — published to SSM and consumed by the website as NEXT_PUBLIC_AUTH0_CLIENT_ID. Required when enable_spa_dashboard is true."
   type        = string
   default     = null
-  sensitive   = true
+
+  validation {
+    condition     = var.spa_dashboard_client_id == null || can(regex("^[A-Za-z0-9]{32}$", var.spa_dashboard_client_id))
+    error_message = "spa_dashboard_client_id must be a 32-character alphanumeric Auth0 client ID."
+  }
 }
 
-variable "google_oauth_client_secret" {
-  description = "Google OAuth2 client secret for social login."
+variable "slack_oauth_client_id" {
+  description = "Auth0 client ID of the qurl-bot-slack workspace-install application. Public identifier. Required when enable_slack_oauth_client is true."
   type        = string
   default     = null
-  sensitive   = true
-}
 
-variable "github_oauth_client_id" {
-  description = "GitHub OAuth client ID for social login. If null, GitHub connection is not created."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
-variable "github_oauth_client_secret" {
-  description = "GitHub OAuth client secret for social login."
-  type        = string
-  default     = null
-  sensitive   = true
+  validation {
+    condition     = var.slack_oauth_client_id == null || can(regex("^[A-Za-z0-9]{32}$", var.slack_oauth_client_id))
+    error_message = "slack_oauth_client_id must be a 32-character alphanumeric Auth0 client ID."
+  }
 }
 
 # ==============================================================================
@@ -379,88 +305,8 @@ variable "auth0_custom_domain" {
   }
 }
 
-# ==============================================================================
-# Attack Protection Configuration
-# ==============================================================================
-
-variable "bot_detection_level" {
-  description = "Bot detection sensitivity level (low, medium, high). Higher levels catch more bots but may challenge more legitimate users."
-  type        = string
-  default     = "medium"
-
-  validation {
-    condition     = contains(["low", "medium", "high"], var.bot_detection_level)
-    error_message = "bot_detection_level must be one of: low, medium, high"
-  }
-}
-
-variable "bot_detection_monitoring" {
-  description = "Enable monitoring mode for bot detection. When true, Auth0 logs risk assessments without blocking. Set to false after ~1 week of traffic observation to enforce."
-  type        = bool
-  default     = true
-}
-
-variable "brute_force_max_attempts" {
-  description = "Number of failed login attempts per IP+identifier before blocking"
-  type        = number
-  default     = 10
-
-  validation {
-    condition     = var.brute_force_max_attempts >= 3 && var.brute_force_max_attempts <= 100
-    error_message = "brute_force_max_attempts must be between 3 and 100"
-  }
-}
-
-# ==============================================================================
-# Branding Configuration
-# ==============================================================================
-
-variable "branding_logo_url" {
-  description = "URL to the logo displayed on Auth0 Universal Login and emails"
-  type        = string
-  default     = "https://layerv.ai/layerv-wordmark.svg"
-}
-
-variable "branding_primary_color" {
-  description = "Primary brand color for Auth0 UI elements"
-  type        = string
-  default     = "#0099FF"
-
-  validation {
-    condition     = can(regex("^#[0-9a-fA-F]{6}$", var.branding_primary_color))
-    error_message = "branding_primary_color must be a 6-digit hex color (e.g., #0099FF)"
-  }
-}
-
-variable "branding_page_background" {
-  description = "Background color for Auth0 Universal Login page"
-  type        = string
-  default     = "#030712"
-
-  validation {
-    condition     = can(regex("^#[0-9a-fA-F]{6}$", var.branding_page_background))
-    error_message = "branding_page_background must be a 6-digit hex color (e.g., #030712)"
-  }
-}
-
-# ==============================================================================
-# Email Configuration
-# ==============================================================================
-
-variable "email_from_address" {
-  description = "From address for Auth0 transactional emails via SES (e.g., LayerV <noreply@layerv.xyz>)"
-  type        = string
-  default     = "LayerV <noreply@layerv.xyz>"
-}
-
 variable "email_ses_region" {
   description = "AWS region where SES domain is verified"
   type        = string
   default     = "us-east-2"
-}
-
-variable "email_result_url" {
-  description = "URL to redirect users to after email actions (e.g., after verifying email)"
-  type        = string
-  default     = "https://layerv.ai"
 }

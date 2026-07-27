@@ -2,18 +2,12 @@
 
 output "api_identifier" {
   description = "The Auth0 API identifier (audience)"
-  value       = auth0_resource_server.qurl_api.identifier
+  value       = var.api_audience
 }
 
 output "backend_service_client_id" {
   description = "Website playground M2M client ID (legacy name: 'backend_service')"
-  value       = auth0_client.backend_service.client_id
-}
-
-output "backend_service_client_secret" {
-  description = "Website playground M2M client secret (stored in Secrets Manager)"
-  value       = auth0_client_credentials.backend_service.client_secret
-  sensitive   = true
+  value       = var.backend_service_client_id
 }
 
 output "backend_credentials_secret_arn" {
@@ -55,7 +49,7 @@ output "dev_portal_mgmt_secret_arn" {
 # Smoke Test outputs
 output "smoke_test_client_id" {
   description = "Auth0 smoke test M2M client ID (null if not enabled)"
-  value       = var.enable_smoke_test_client ? auth0_client.smoke_test[0].client_id : null
+  value       = var.enable_smoke_test_client ? var.smoke_test_client_id : null
 }
 
 output "smoke_test_credentials_secret_arn" {
@@ -71,7 +65,7 @@ output "smoke_test_credentials_secret_name" {
 # SPA Dashboard outputs
 output "spa_dashboard_client_id" {
   description = "Auth0 SPA dashboard client ID (for NEXT_PUBLIC_AUTH0_CLIENT_ID)"
-  value       = var.enable_spa_dashboard ? auth0_client.spa_dashboard[0].client_id : null
+  value       = var.enable_spa_dashboard ? var.spa_dashboard_client_id : null
 }
 
 output "spa_dashboard_enabled" {
@@ -86,7 +80,7 @@ output "auth0_domain" {
 
 output "api_audience" {
   description = "Auth0 API audience for frontend configuration (NEXT_PUBLIC_AUTH0_AUDIENCE)"
-  value       = auth0_resource_server.qurl_api.identifier
+  value       = var.api_audience
 }
 
 # SSM parameter ARNs (for cross-stack references / IAM policies)
@@ -108,7 +102,7 @@ output "spa_api_audience_ssm_arn" {
 # Slack OAuth outputs (qurl-bot-slack workspace-install client)
 output "slack_oauth_client_id" {
   description = "Auth0 regular_web client ID for qurl-bot-slack workspace OAuth (null if not enabled)"
-  value       = var.enable_slack_oauth_client ? auth0_client.slack_oauth[0].client_id : null
+  value       = var.enable_slack_oauth_client ? var.slack_oauth_client_id : null
 }
 
 output "slack_oauth_credentials_secret_arn" {
@@ -126,16 +120,13 @@ output "slack_oauth_credentials_secret_arn" {
     (`qurl-bot-slack/<env>/auth0`, mirroring `qurl-bot-discord`'s
     `var.auth0_secret_arn` pattern — see qurl-integrations-infra #565).
 
-    This secret is therefore a **producer-side TF-managed record**:
-    Terraform attempts to auto-write `auth0_client_credentials.slack_oauth.client_secret`
-    on apply (the value will be empty unless the management M2M holds
-    `read:client_keys` — same provider limitation as the existing 4
-    clients in this module, documented at L246-258). Operator manually
-    pastes the dashboard value into BOTH this secret AND
-    qurl-integrations-infra's local secret one time. ARN is exported
-    so the operator can resolve it via `terraform output -raw
-    slack_oauth_credentials_secret_arn` for the `aws secretsmanager
-    put-secret-value` step.
+    Terraform manages the secret CONTAINER only. Since #3284 retired the
+    Auth0 provider, the version is written entirely by the operator: read
+    the client secret from the Auth0 dashboard (Applications >
+    qurl-bot-slack > Settings) and `aws secretsmanager put-secret-value`
+    it into BOTH this secret AND qurl-integrations-infra's local secret.
+    The ARN is exported so the operator can resolve it via
+    `terraform output -raw slack_oauth_credentials_secret_arn`.
   EOT
   value       = var.enable_slack_oauth_client ? aws_secretsmanager_secret.slack_oauth[0].arn : null
 }

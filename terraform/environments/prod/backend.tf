@@ -114,17 +114,26 @@ provider "aws" {
   }
 }
 
-# Auth0 provider for identity management
-# Uses EITHER api_token (CI) OR client_id+client_secret (local dev) — never both,
-# because the provider's schema marks them as ConflictsWith each other.
+# Auth0 provider — RETIRED, stub only (#3284).
 #
-# CI: fetch-auth0-token.sh fetches one token, passed via TF_VAR_auth0_api_token.
-#     client_id/client_secret are still passed (for the variable definitions) but
-#     the ternary nulls them out so the provider only sees api_token.
-# Local: auth0_api_token defaults to "" so client_id/client_secret are used.
+# Terraform no longer manages any Auth0 resource; the tenant is owned in the
+# Auth0 dashboard. See `../../modules/auth0/removed.tf` for why, and for the
+# full list of resources being forgotten (`removed` + `destroy = false`).
+#
+# This block survives ONLY to let Terraform decode the `auth0_*` entries still
+# recorded in state so it can forget them. Terraform demands an explicit
+# provider configuration for that even though a forget makes no API calls —
+# without this block the plan fails with `Error: Invalid provider
+# configuration`. Because no call is made, the token below is a literal
+# placeholder: there are deliberately NO real Auth0 credentials in this
+# configuration, in CI, or in the plan environment any more.
+#
+# DELETE THIS BLOCK, the `auth0` entry in `required_providers` above, and
+# `modules/auth0/removed.tf` once BOTH environments have applied and neither
+# state contains an `auth0_*` entry:
+#   terraform state list | grep auth0_    # must print nothing
+# Removing it earlier strands those state entries and breaks the plan.
 provider "auth0" {
-  domain        = var.auth0_domain
-  api_token     = var.auth0_api_token != "" ? var.auth0_api_token : null
-  client_id     = var.auth0_api_token == "" ? var.auth0_tf_client_id : null
-  client_secret = var.auth0_api_token == "" ? var.auth0_tf_client_secret : null
+  domain    = var.auth0_domain
+  api_token = "retired-see-modules-auth0-removed-tf-no-api-calls-are-made"
 }

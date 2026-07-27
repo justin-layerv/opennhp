@@ -684,26 +684,24 @@ enable_auth0_spa_dashboard = true
 auth0_custom_domain = "auth.layerv.ai"
 
 # Callback URLs: Auth0 redirects here after login
-auth0_spa_callback_urls = [
-  "https://layerv.ai/qurl/dashboard/callback/",
-  "https://layerv.ai/api/auth/callback/",
-]
 
 # Logout URLs: Auth0 redirects here after logout
-auth0_spa_logout_urls = [
-  "https://layerv.ai",
-  "https://layerv.ai/qurl/dashboard/",
-]
 
 # Web origins: allowed for CORS and silent authentication
-auth0_spa_web_origins = [
-  "https://layerv.ai",
-]
 
-# Social connections (Google + GitHub) for developer login
-# OAuth credentials are passed via TF_VAR_* environment variables
-# Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
-#                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
+# ==============================================================================
+# Auth0 client IDs (#3284)
+# ==============================================================================
+# Tenant configuration lives in the Auth0 dashboard; Terraform no longer manages
+# it (see modules/auth0/removed.tf). These IDs are inputs to the AWS resources
+# that publish/reference them. Public identifiers, not secrets — client secrets
+# are put straight into Secrets Manager by an operator.
+#
+# Read them from the Auth0 dashboard (Applications > <app> > Settings) or:
+#   GET https://layerv.us.auth0.com/api/v2/clients?fields=client_id,name
+auth0_backend_service_client_id = "V1n2pT1oSzcOVqBghwBUM1e7afp2AaPH" # Website Playground (prod)
+auth0_smoke_test_client_id      = "2jgXb70UztKbn7Sbekk993cvUt8XtfDv" # Smoke Test (prod)
+auth0_spa_dashboard_client_id   = "EhwI8cJwqviPsDFxKnBMVn6xWgR769IW" # qURL Dashboard (prod)
 
 # Custom domain certificate manager — provisions Let's Encrypt certs for
 # customer custom domains registered via the QURL API.

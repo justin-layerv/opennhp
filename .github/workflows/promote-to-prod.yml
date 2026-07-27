@@ -1123,15 +1123,18 @@ jobs:
             echo "  This may be expected if the role has not been created yet."
           fi
 
+      # PROD_AUTH0_CLIENT_ID / PROD_AUTH0_CLIENT_SECRET were dropped from this
+      # check with #3284: Terraform no longer configures the Auth0 provider, so
+      # a prod apply neither needs nor receives an Auth0 credential. Delete the
+      # repository secrets themselves once both environments have applied the
+      # retirement — tracked in the #3284 rollout-ledger entry.
       - name: Verify GitHub secrets are set
         env:
-          PROD_AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          PROD_AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
           PROD_GRAFANA_AUTH: ${{ secrets.PROD_GRAFANA_AUTH }}
         run: |
           echo "Verifying GitHub secrets..."
           MISSING=0
-          for var in PROD_AUTH0_CLIENT_ID PROD_AUTH0_CLIENT_SECRET PROD_GRAFANA_AUTH; do
+          for var in PROD_GRAFANA_AUTH; do
             if [[ -z "${!var}" ]]; then
               echo "::error::GitHub secret $var is not set"
               MISSING=1
@@ -1701,13 +1704,6 @@ jobs:
           # does not move (not -migrate-state). See tfstate-kms-migration runbook.
           terraform init -reconfigure
 
-      - name: Fetch Auth0 Token
-        id: auth0
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
-
       - name: Terraform change summary
         continue-on-error: true
         run: |
@@ -1798,9 +1794,6 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
           TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
           TF_VAR_frps_image_tag: ${{ needs.manifest.outputs.frps_image_tag }}
@@ -2328,13 +2321,6 @@ jobs:
           # does not move (not -migrate-state). See tfstate-kms-migration runbook.
           terraform init -reconfigure
 
-      - name: Fetch Auth0 Token
-        id: auth0
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
-
       - name: Terraform Apply
         working-directory: terraform/environments/prod
         env:
@@ -2342,9 +2328,6 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
           TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
           TF_VAR_frps_image_tag: ${{ needs.manifest.outputs.frps_image_tag }}
