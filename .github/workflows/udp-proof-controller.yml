@@ -64,8 +64,14 @@ env:
   BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
   JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
   JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
-  PINNED_CONNECTOR_SHA: 16cdff6260c20b671cdee735333a9096007b5f6e
-  PINNED_QURL_GO_SHA: aaf682e3cd8836cf874627e95a5d2d4b9e8b12ab
+  # Frozen client candidate heads. These MUST equal the live head SHAs of the
+  # open qurl-connector/qurl-go candidate PRs at the moment the trusted-main
+  # producer runs, because the producer resolves `repositories.qurl_connector`
+  # and `repositories.qurl_go` from those live PR heads and the gate below
+  # rejects any producer artifact that binds a different head. If either head
+  # moves, re-run the producer and update both pins plus runner-group 5.
+  PINNED_CONNECTOR_SHA: 742bd32e521ded4b75a0d56f6f442421eea6bdc7
+  PINNED_QURL_GO_SHA: e9004a8a07fbc30de8d5f7b95f6c169016c03e95
 
 jobs:
   gate:
