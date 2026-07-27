@@ -3653,6 +3653,72 @@ class PlanContractTests(unittest.TestCase):
         ]
         CHECKER._check_provider_reprojection_drift(drift)
 
+    def test_provider_reprojection_admits_inline_policy_readback(self) -> None:
+        """`inline_policy` is a deprecated Optional+Computed read-back of the
+        separately managed aws_iam_role_policy, so a refreshed plan re-projects
+        it even though the role block declares none. Includes the Lambda VPC ENI
+        statement, whose `Resource: "*"` is required by AWS because those ec2
+        actions do not support resource-level permissions -- an earlier revision
+        of this gate rejected exactly that and was wrong.
+        """
+        policy = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "LambdaVpcEni",
+                        "Effect": "Allow",
+                        "Action": ["ec2:CreateNetworkInterface"],
+                        "Resource": "*",
+                    }
+                ],
+            }
+        )
+        CHECKER._check_provider_reprojection_drift(
+            [
+                {
+                    "address": 'module.control.aws_iam_role.authority_exec["z"]',
+                    "change": {
+                        "before": {"inline_policy": []},
+                        "after": {
+                            "inline_policy": [
+                                {"name": "connector-authority-x", "policy": policy}
+                            ]
+                        },
+                    },
+                }
+            ]
+        )
+
+    def test_provider_reprojection_rejects_malformed_inline_policy(self) -> None:
+        """Shape is asserted even though content deliberately is not."""
+        cases = {
+            "scalar": "not-a-list",
+            "empty": [],
+            "unparseable": [{"name": "n", "policy": "{not json"}],
+            "extra key": [
+                {"name": "n", "policy": '{"Statement":[{"Effect":"Allow"}]}', "x": 1}
+            ],
+            "no statements": [{"name": "n", "policy": '{"Statement":[]}'}],
+            "blank name": [
+                {"name": "", "policy": '{"Statement":[{"Effect":"Allow"}]}'}
+            ],
+        }
+        for label, value in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_provider_reprojection_drift(
+                        [
+                            {
+                                "address": 'module.control.aws_iam_role.hub_keygen[0]',
+                                "change": {
+                                    "before": {},
+                                    "after": {"inline_policy": value},
+                                },
+                            }
+                        ]
+                    )
+
     def test_provider_reprojection_rejects_anything_but_normalization(self) -> None:
         """The address allowlist alone would admit ANY change to these
         resources. The delta itself is what is pinned."""

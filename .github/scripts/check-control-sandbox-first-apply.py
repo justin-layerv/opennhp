@@ -6380,6 +6380,54 @@ _PROVIDER_REPROJECTION_ADDRESSES = frozenset(
 )
 
 
+def _require_inline_policy_projection(value: Any, address: str) -> None:
+    """Require an ``inline_policy`` re-projection to be exactly that.
+
+    Every entry must be a named, non-empty, parseable IAM policy document. A
+    scalar, a malformed entry, or an unparseable document is not a projection
+    of the managed ``aws_iam_role_policy`` and fails closed.
+    """
+    if not isinstance(value, list) or not value:
+        raise ContractError(
+            f"{address} inline_policy projection must be a non-empty collection"
+        )
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"name", "policy"}:
+            raise ContractError(
+                f"{address} inline_policy entry must carry exactly name and policy"
+            )
+        name = entry.get("name")
+        policy = entry.get("policy")
+        if not isinstance(name, str) or not name:
+            raise ContractError(f"{address} inline_policy entry name is invalid")
+        if not isinstance(policy, str) or not policy:
+            raise ContractError(f"{address} inline_policy {name} document is invalid")
+        try:
+            document = json.loads(policy)
+        except json.JSONDecodeError as exc:
+            raise ContractError(
+                f"{address} inline_policy {name} is not parseable JSON: {exc}"
+            ) from exc
+        statements = document.get("Statement") if isinstance(document, dict) else None
+        if not isinstance(statements, list) or not statements:
+            raise ContractError(
+                f"{address} inline_policy {name} must hold at least one statement"
+            )
+        for statement in statements:
+            if not isinstance(statement, dict) or not statement.get("Effect"):
+                raise ContractError(
+                    f"{address} inline_policy {name} statement is malformed"
+                )
+        # Deliberately SHAPE ONLY -- no assertion about actions or resources.
+        # The policy content is owned by aws_iam_role_policy and gated by
+        # check-terraform-iam-coverage.py; re-asserting it from a drift
+        # projection would duplicate that contract in a weaker place and get it
+        # wrong. It already did once here: an earlier revision rejected a
+        # wildcard Resource, which fails against the Lambda VPC ENI statement
+        # (ec2:CreateNetworkInterface and friends do not support resource-level
+        # permissions, so AWS requires "*").
+
+
 def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
     """Require every admitted re-projection to be a pure state normalization.
 
@@ -6403,6 +6451,23 @@ def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
             if address == _OTP_REDIS_SG_ADDRESS and key == "ingress":
                 # Same exact-shape gate used on the planned and state paths.
                 _check_otp_redis_ingress(after, {}, address)
+                continue
+            if key == "inline_policy" and ".aws_iam_role." in str(address):
+                # `inline_policy` is a deprecated Optional+Computed READ-BACK of
+                # the separately managed aws_iam_role_policy resource, so a
+                # refreshed plan re-projects whatever AWS holds even though the
+                # role block declares no inline policy. Live sandbox Control
+                # shows it on authority_exec (state had []), hub_execution and
+                # hub_keygen (state had a stale earlier projection).
+                #
+                # This does NOT take the policy CONTENT on trust. The content is
+                # owned by aws_iam_role_policy, which is in this same plan: if
+                # live differed from config, Terraform would plan a change to
+                # that resource. Verified on the CI plan, where every
+                # aws_iam_role_policy is a no-op and the only non-no-op changes
+                # are the Hub edge slice. What is asserted here is the shape --
+                # a projection of named policy documents and nothing else.
+                _require_inline_policy_projection(after.get(key), address)
                 continue
             if before.get(key) is None and after.get(key) == []:
                 continue
