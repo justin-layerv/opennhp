@@ -71,6 +71,17 @@ CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
 
+def applied_provisioned_cell_item(cell_id: str) -> str:
+    """Render a catalog row the way a refreshed read renders it.
+
+    The create plan carries the configuration's `jsonencode` text, but the
+    provider re-renders `item` from the live AttributeValue map through Go's
+    `json.Encoder`, which terminates the document with a newline. Steady-state
+    fixtures must carry that applied spelling, not the create-time one.
+    """
+    return CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id] + "\n"
+
+
 def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
     data_key_arn = (
         f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
@@ -363,9 +374,9 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "hash_key_value": "REGISTRY",
                 "id": (
                     f"{CHECKER.PROVISIONED_CELL_TABLE_NAME}"
-                    f"|REGISTRY|CELL#{cell_id}"
+                    f",REGISTRY,CELL#{cell_id}"
                 ),
-                "item": CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id],
+                "item": applied_provisioned_cell_item(cell_id),
                 "range_key": "sk",
                 "range_key_value": f"CELL#{cell_id}",
                 "region": CHECKER.AWS_REGION,
@@ -3057,6 +3068,164 @@ class PlanContractTests(unittest.TestCase):
         destructive = provisioned_cell_catalog_transition_fixture()
         self.change(destructive, cell0)["actions"] = ["delete"]
         self.assert_rejected(destructive)
+
+    def test_catalog_item_admits_rendering_and_still_pins_every_value(
+        self,
+    ) -> None:
+        """Tolerate the provider's serialisation of `item`, nothing else.
+
+        A refreshed read re-renders the row through the provider's Go
+        `json.Encoder`, so the applied text is the create-time `jsonencode`
+        spelling plus a trailing newline. That difference must be admitted --
+        it blocked every PR and the Control Sandbox Update lane on main -- but
+        no attribute, type tag or value may move with it.
+        """
+        cell0 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        )
+        canonical = json.loads(
+            CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON["cell0"]
+        )
+
+        def plan_with_item(rendered: object) -> dict:
+            plan = plan_fixture()
+            change = self.change(plan, cell0)
+            change["after"]["item"] = rendered
+            change["before"]["item"] = rendered
+            return plan
+
+        # The same object, spelled differently, is the same contract.
+        for label, rendered in (
+            (
+                "create-time jsonencode",
+                CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON["cell0"],
+            ),
+            ("applied trailing newline", applied_provisioned_cell_item("cell0")),
+            (
+                "reordered keys",
+                json.dumps(
+                    dict(reversed(list(canonical.items()))),
+                    separators=(",", ":"),
+                ),
+            ),
+            ("expanded whitespace", json.dumps(canonical, indent=2)),
+        ):
+            with self.subTest(rendering=label):
+                self.assertEqual(
+                    CHECKER.check_plan(plan_with_item(rendered))["plan_mode"],
+                    "no-op",
+                )
+
+        # One real change per attribute must still fail closed, and must name
+        # the attribute that moved rather than the opaque `item` blob.
+        for attribute, value in (
+            ("status", {"S": "revoked"}),
+            ("nhp_host", {"S": "attacker.example"}),
+            ("nhp_port", {"N": "443"}),
+            (
+                "server_public_key_b64",
+                {"S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+            ),
+            ("selection_weight", {"N": "2"}),
+            ("updated_at", {"S": "2026-07-26T00:00:00Z"}),
+            ("cell_id", {"S": "cell1"}),
+            ("endpoint_revision", {"N": "2"}),
+            ("pk", {"S": "REGISTRY-SHADOW"}),
+            ("sk", {"S": "CELL#cell1"}),
+            # Decoding must not launder DynamoDB's numeric spelling: N values
+            # travel as JSON strings, so "1" and "1.0" stay distinct.
+            ("selection_weight-respelled", {"N": "1.0"}),
+            # Nor may a type tag be swapped under an unchanged value.
+            ("selection_weight-retyped", {"S": "1"}),
+        ):
+            with self.subTest(attribute=attribute):
+                name = attribute.split("-")[0]
+                drifted = copy.deepcopy(canonical)
+                drifted[name] = value
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError,
+                    rf"provisioned-cell item attributes differ: \['{name}'\]",
+                ):
+                    CHECKER.check_plan(
+                        plan_with_item(
+                            json.dumps(
+                                drifted, separators=(",", ":"), sort_keys=True
+                            )
+                        )
+                    )
+
+        # Added and removed attributes are value differences, not renderings.
+        added = copy.deepcopy(canonical)
+        added["ttl"] = {"N": "1"}
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            r"provisioned-cell item attributes differ: \['ttl'\]",
+        ):
+            CHECKER.check_plan(plan_with_item(json.dumps(added)))
+
+        removed = copy.deepcopy(canonical)
+        del removed["status"]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            r"provisioned-cell item attributes differ: \['status'\]",
+        ):
+            CHECKER.check_plan(plan_with_item(json.dumps(removed)))
+
+        # Decoding may never become a way in: the text must be a JSON object,
+        # and a repeated key must not hide a real value behind an admitted one.
+        for label, rendered, pattern in (
+            ("not JSON", "{not json", r"item is malformed JSON"),
+            ("not a string", None, r"item must be JSON text"),
+            ("not an object", '"REGISTRY"', r"item is not a JSON object"),
+            (
+                "repeated key",
+                CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON["cell0"].replace(
+                    '{"cell_id"',
+                    '{"status":{"S":"revoked"},"cell_id"',
+                    1,
+                ),
+                r"item is malformed JSON: object repeats a key",
+            ),
+        ):
+            with self.subTest(rejection=label):
+                with self.assertRaisesRegex(CHECKER.ContractError, pattern):
+                    CHECKER.check_plan(plan_with_item(rendered))
+
+    def test_catalog_row_resource_id_matches_the_applied_provider_spelling(
+        self,
+    ) -> None:
+        """The composite id is the pinned components, provider-separated.
+
+        #3458 calibrated it as "|"-joined from the create plan, where `id` is
+        unknown and so was never observed. Every applied row renders it
+        ","-joined. Exactly one spelling stays admitted; the unobserved one
+        must now fail closed.
+        """
+        cell0 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        )
+        table = CHECKER.PROVISIONED_CELL_TABLE_NAME
+        self.assertEqual(
+            CHECKER._provisioned_cell_resource_id("cell0"),
+            f"{table},REGISTRY,CELL#cell0",
+        )
+        self.assertEqual(CHECKER.check_plan(plan_fixture())["plan_mode"], "no-op")
+
+        for label, resource_id in (
+            ("unobserved pipe spelling", f"{table}|REGISTRY|CELL#cell0"),
+            ("other cell", f"{table},REGISTRY,CELL#cell1"),
+            ("other table", f"{table}-shadow,REGISTRY,CELL#cell0"),
+            ("unseparated", f"{table}REGISTRYCELL#cell0"),
+        ):
+            with self.subTest(resource_id=label):
+                drifted = plan_fixture()
+                change = self.change(drifted, cell0)
+                change["after"]["id"] = resource_id
+                change["before"]["id"] = resource_id
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "steady key identity is not exact"
+                ):
+                    CHECKER.check_plan(drifted)
 
     def test_foundation_input_jsondecode_unknown_tolerance_boundary(self) -> None:
         # The enablement fixture carries the real after_unknown.input jsondecode
@@ -7880,10 +8049,91 @@ class StateContractTests(unittest.TestCase):
         resources = identity_drift["values"]["root_module"]["resources"]
         by_address = {item["address"]: item["values"] for item in resources}
         by_address[cell0]["id"] = (
-            f"{CHECKER.PROVISIONED_CELL_TABLE_NAME}|REGISTRY|CELL#cell1"
+            f"{CHECKER.PROVISIONED_CELL_TABLE_NAME},REGISTRY,CELL#cell1"
         )
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_state(identity_drift)
+
+    def test_state_catalog_item_admits_rendering_and_pins_every_value(
+        self,
+    ) -> None:
+        """The refreshed-state lane tolerates the same serialisation, only it.
+
+        `check_state` reads the applied rows, so it sees the provider's
+        re-rendered `item` on every run. It must accept that spelling and
+        still reject any moved value.
+        """
+        cell0 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell0"]'
+        )
+        canonical = json.loads(
+            CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON["cell0"]
+        )
+
+        def state_with_item(rendered: object) -> dict:
+            state = state_fixture()
+            by_address = {
+                item["address"]: item["values"]
+                for item in state["values"]["root_module"]["resources"]
+            }
+            by_address[cell0]["item"] = rendered
+            return state
+
+        for label, rendered in (
+            (
+                "create-time jsonencode",
+                CHECKER.PROVISIONED_CELL_EXPECTED_ITEM_JSON["cell0"],
+            ),
+            ("applied trailing newline", applied_provisioned_cell_item("cell0")),
+            ("expanded whitespace", json.dumps(canonical, indent=2)),
+        ):
+            with self.subTest(rendering=label):
+                CHECKER.check_state(state_with_item(rendered))
+
+        for attribute, value in (
+            ("status", {"S": "revoked"}),
+            ("nhp_host", {"S": "attacker.example"}),
+            ("nhp_port", {"N": "443"}),
+            (
+                "server_public_key_b64",
+                {"S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+            ),
+            ("selection_weight", {"N": "2"}),
+            ("updated_at", {"S": "2026-07-26T00:00:00Z"}),
+        ):
+            with self.subTest(attribute=attribute):
+                drifted = copy.deepcopy(canonical)
+                drifted[attribute] = value
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError,
+                    rf"provisioned-cell item attributes differ: \['{attribute}'\]",
+                ):
+                    CHECKER.check_state(
+                        state_with_item(
+                            json.dumps(
+                                drifted, separators=(",", ":"), sort_keys=True
+                            )
+                        )
+                    )
+
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "item is malformed JSON"
+        ):
+            CHECKER.check_state(state_with_item("{not json"))
+
+        # The unobserved "|"-joined resource id must fail closed here too.
+        pipe_id = state_fixture()
+        by_address = {
+            item["address"]: item["values"]
+            for item in pipe_id["values"]["root_module"]["resources"]
+        }
+        by_address[cell0]["id"] = (
+            f"{CHECKER.PROVISIONED_CELL_TABLE_NAME}|REGISTRY|CELL#cell0"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "steady key identity is not exact"
+        ):
+            CHECKER.check_state(pipe_id)
 
     def test_exact_runtime_state_passes(self) -> None:
         self.assertEqual(

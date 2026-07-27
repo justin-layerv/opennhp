@@ -384,13 +384,21 @@ PROVISIONED_CELL_RESOURCES = {
 PROVISIONED_CELL_ID_BY_ADDRESS = {
     address: cell_id for cell_id, address in PROVISIONED_CELL_ADDRESSES.items()
 }
-# Canonical serialized item is fixed per cell; serialize once at import rather
-# than on every plan/state validation call.
+# The configuration's `jsonencode` spelling of each row, fixed per cell and
+# serialized once at import. This is the exact create-plan rendering; a
+# refreshed read re-renders the same object differently (see
+# `_require_provisioned_cell_item`), so the checker compares the DECODED item
+# and this literal only documents the canonical create-time text.
 PROVISIONED_CELL_EXPECTED_ITEM_JSON = {
     cell_id: json.dumps(item, separators=(",", ":"), sort_keys=True)
     for cell_id, item in PROVISIONED_CELL_DYNAMODB_ITEMS.items()
 }
 PROVISIONED_CELL_TABLE_NAME = f"{CONTROL_PREFIX}-connector-authority"
+# Separator the locked hashicorp/aws 6.55.0 provider uses to compose the
+# aws_dynamodb_table_item resource id. Observed on the applied sandbox rows,
+# not assumed; a provider that changed it must fail closed and be re-proven
+# from a real refreshed state.
+PROVISIONED_CELL_ID_SEPARATOR = ","
 
 EXPECTED_RESOURCES = {
     "module.control.aws_cloudwatch_log_group.flow_logs": "aws_cloudwatch_log_group",
@@ -2899,6 +2907,53 @@ def _require_fields(
         )
 
 
+def _provisioned_cell_resource_id(cell_id: str) -> str:
+    """Derive the row's Terraform resource id from its pinned key components.
+
+    The provider composes `id` from three attributes this checker already pins
+    exactly -- table name, hash key value, range key value -- glued with the
+    standard AWS-provider resource-id separator. #3458 calibrated the whole
+    string as "|"-joined against the create plan, where `id` is unknown and so
+    was never observed; every applied row renders ","-joined. Compose the
+    pinned components rather than restating a spelling, so the separator is
+    the only thing this literal asserts.
+    """
+    return PROVISIONED_CELL_ID_SEPARATOR.join(
+        (PROVISIONED_CELL_TABLE_NAME, "REGISTRY", f"CELL#{cell_id}")
+    )
+
+
+def _require_provisioned_cell_item(
+    values: dict[str, Any], cell_id: str, address: str
+) -> None:
+    """Pin the catalog row to its exact producer-owned attribute projection.
+
+    `item` is compared as a DECODED object rather than as JSON text. Terraform
+    carries the create plan's value straight from the configuration's
+    `jsonencode`, but every refreshed read re-renders it from the live
+    AttributeValue map through the provider's Go `json.Encoder`, which
+    terminates the document with a newline. Both spellings are the same
+    object, so a string comparison rejects the applied row over a
+    serialisation the checker does not own. Decoding admits only that
+    rendering: every attribute name, type tag and value stays pinned exactly,
+    and because DynamoDB numbers travel as JSON strings even numeric spelling
+    ("1" vs "1.0") remains byte-exact.
+    """
+    expected_item = PROVISIONED_CELL_DYNAMODB_ITEMS[cell_id]
+    decoded = _decode_exact_json(values.get("item"), "item", address)
+    if not isinstance(decoded, dict):
+        raise ContractError(f"{address} provisioned-cell item is not a JSON object")
+    if decoded != expected_item:
+        differing = sorted(
+            attribute
+            for attribute in {*expected_item, *decoded}
+            if decoded.get(attribute) != expected_item.get(attribute)
+        )
+        raise ContractError(
+            f"{address} provisioned-cell item attributes differ: {differing}"
+        )
+
+
 def _require_provisioned_cell_values(
     values: Any,
     unknown: Any,
@@ -2911,21 +2966,21 @@ def _require_provisioned_cell_values(
     if cell_id is None or not isinstance(values, dict) or not isinstance(unknown, dict):
         raise ContractError(f"{address} provisioned-cell values are malformed")
 
-    expected_item = PROVISIONED_CELL_EXPECTED_ITEM_JSON[cell_id]
     expected = {
         "hash_key": "pk",
-        "item": expected_item,
         "range_key": "sk",
         "region": AWS_REGION,
         "table_name": PROVISIONED_CELL_TABLE_NAME,
     }
     _require_fields(values, expected, address)
+    _require_provisioned_cell_item(values, cell_id, address)
+    expected_fields = {*expected, "item"}
 
     if create:
         # The sandbox Control root currently pins hashicorp/aws 6.55.0. A
         # provider upgrade must re-prove this exact create envelope from a real
         # reviewed plan before changing the trusted checker.
-        if set(values) != set(expected):
+        if set(values) != expected_fields:
             raise ContractError(
                 f"{address} create values contain an unexpected field set"
             )
@@ -2940,7 +2995,7 @@ def _require_provisioned_cell_values(
         return
 
     if set(values) != {
-        *expected,
+        *expected_fields,
         "hash_key_value",
         "id",
         "range_key_value",
@@ -2949,8 +3004,7 @@ def _require_provisioned_cell_values(
     if (
         values.get("hash_key_value") != "REGISTRY"
         or values.get("range_key_value") != f"CELL#{cell_id}"
-        or values.get("id")
-        != f"{PROVISIONED_CELL_TABLE_NAME}|REGISTRY|CELL#{cell_id}"
+        or values.get("id") != _provisioned_cell_resource_id(cell_id)
         or unknown != {}
     ):
         raise ContractError(f"{address} steady key identity is not exact")
@@ -3012,17 +3066,35 @@ def _require_provisioned_cell_planned_output(
         )
 
 
-def _require_json_field(
-    values: dict[str, Any], field: str, expected: Any, address: str
-) -> None:
-    raw = values.get(field)
+def _reject_repeated_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse rendered JSON whose objects repeat a key.
+
+    Python decodes a repeated key last-writer-wins, which would let a repeat
+    park a real value behind an admitted one. No pinned projection repeats a
+    key, so a repeat is never a rendering difference.
+    """
+    decoded = dict(pairs)
+    if len(decoded) != len(pairs):
+        raise ValueError("object repeats a key")
+    return decoded
+
+
+def _decode_exact_json(raw: Any, field: str, address: str) -> Any:
+    """Decode a rendered JSON attribute for exact semantic comparison."""
     if not isinstance(raw, str):
         raise ContractError(f"{address} {field} must be JSON text")
     try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        # json.JSONDecodeError subclasses ValueError, so this also carries the
+        # repeated-key refusal above.
+        return json.loads(raw, object_pairs_hook=_reject_repeated_json_keys)
+    except ValueError as exc:
         raise ContractError(f"{address} {field} is malformed JSON: {exc}") from exc
-    if decoded != expected:
+
+
+def _require_json_field(
+    values: dict[str, Any], field: str, expected: Any, address: str
+) -> None:
+    if _decode_exact_json(values.get(field), field, address) != expected:
         raise ContractError(f"{address} {field} differs from the dark contract")
 
 
