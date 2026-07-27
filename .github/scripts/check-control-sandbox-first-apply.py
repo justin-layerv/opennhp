@@ -9939,6 +9939,20 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
     if not public_edge_ids:
         if hub_nlb_groups:
             raise ContractError("Control Hub NLB SG exists while the edge is dark")
+    elif not hub_nlb_groups and live_load_balancers[0].get("SecurityGroups") in (
+        None,
+        [],
+    ):
+        # PRE-fence steady state. The public edge route tables are live, but the
+        # reviewed NLB SG does not exist yet and the NLB attaches none -- which is
+        # precisely WHY the fence transition replaces the NLB: AWS accepts
+        # `security_groups` only at creation. Requiring a singular SG here demanded
+        # the post-apply state and so rejected the exact state this check gates.
+        #
+        # Admitted ONLY when both are absent together. An NLB carrying security
+        # groups that are not the reviewed edge SG, or a reviewed SG with no
+        # attachment, still falls through to the strict branch below and fails.
+        pass
     else:
         if len(hub_nlb_groups) != 1:
             raise ContractError("Control Hub NLB SG is not singular")
