@@ -337,12 +337,17 @@ if ! cmp -s "$sandbox_wrapper" "$prod_wrapper"; then
   exit 1
 fi
 
-# This source guard intentionally pins the temporary Authority-first holdback.
-# The reviewed restoration PR must update it and its fixtures to the true-only
-# sandbox latch described in the rollout ledger.
-require_catalog_materialization_holdback() {
+# The Authority-first holdback is complete, so this source guard now pins the
+# true-only sandbox latch the rollout ledger described: sandbox must hard-lock
+# materialization TRUE (removing a live catalog row is a drain/migrate
+# procedure, not an input flip), while production keeps its unchanged
+# hard-locked FALSE until a separately reviewed production cell inventory
+# exists. Either way exactly one default and one condition must be present and
+# agree on the environment's pinned polarity; a mismatch fails closed.
+require_catalog_materialization_latch() {
   local variables_file="$1"
   local environment="$2"
+  local expected="$3"
   local variable_block
 
   if ! variable_block="$(
@@ -371,24 +376,30 @@ require_catalog_materialization_holdback() {
     exit 1
   fi
 
+  # A true latch asserts the variable directly; a false latch negates it.
+  local negation=''
+  if [[ "$expected" == 'false' ]]; then
+    negation='!'
+  fi
+
   local default_count
-  local false_default_count
+  local pinned_default_count
   local condition_count
-  local false_condition_count
+  local pinned_condition_count
   default_count="$(grep -E -c \
     '^[[:space:]]*default[[:space:]]*=' <<<"$variable_block" || true)"
-  false_default_count="$(grep -E -c \
-    '^[[:space:]]*default[[:space:]]*=[[:space:]]*false[[:space:]]*$' \
+  pinned_default_count="$(grep -E -c \
+    "^[[:space:]]*default[[:space:]]*=[[:space:]]*${expected}[[:space:]]*\$" \
     <<<"$variable_block" || true)"
   condition_count="$(grep -E -c \
     '^[[:space:]]*condition[[:space:]]*=' <<<"$variable_block" || true)"
-  false_condition_count="$(grep -E -c \
-    '^[[:space:]]*condition[[:space:]]*=[[:space:]]*!var\.provisioned_cell_catalog_materialization_enabled[[:space:]]*$' \
+  pinned_condition_count="$(grep -E -c \
+    "^[[:space:]]*condition[[:space:]]*=[[:space:]]*${negation}var\.provisioned_cell_catalog_materialization_enabled[[:space:]]*\$" \
     <<<"$variable_block" || true)"
 
-  if [[ "$default_count" -ne 1 || "$false_default_count" -ne 1 ||
-        "$condition_count" -ne 1 || "$false_condition_count" -ne 1 ]]; then
-    echo "ERROR: ${environment} Control variables must hard-lock provisioned-cell catalog materialization false during the Authority-first holdback" >&2
+  if [[ "$default_count" -ne 1 || "$pinned_default_count" -ne 1 ||
+        "$condition_count" -ne 1 || "$pinned_condition_count" -ne 1 ]]; then
+    echo "ERROR: ${environment} Control variables must hard-lock provisioned-cell catalog materialization ${expected}" >&2
     exit 1
   fi
 }
@@ -412,8 +423,15 @@ for environment in sandbox prod; do
     echo "ERROR: ${environment} Control wrapper must pass the provisioned-cell materialization gate exactly once from its root variable" >&2
     exit 1
   fi
-  require_catalog_materialization_holdback \
-    "${environment_root}/variables.tf" "$environment"
+  # Sandbox owns the two reviewed rows after the restoration; production keeps
+  # provisioned_cells={} and stays dark until its own reviewed cell inventory.
+  if [[ "$environment" == 'sandbox' ]]; then
+    expected_catalog_latch='true'
+  else
+    expected_catalog_latch='false'
+  fi
+  require_catalog_materialization_latch \
+    "${environment_root}/variables.tf" "$environment" "$expected_catalog_latch"
   # Reject any COMMITTED tfvars in the Control root (a committed *.auto.tfvars /
   # *.auto.tfvars.json would be terraform-auto-loaded and could open the latch),
   # but EXCLUDE the sanctioned exact-main runtime output

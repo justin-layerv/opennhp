@@ -111,13 +111,13 @@ variable "provisioned_cells" {
 }
 
 variable "provisioned_cell_catalog_materialization_enabled" {
-  description = "Temporary one-transition rollout gate. The reviewed catalog remains available to the Authority contract while false, but Terraform neither materializes nor publishes catalog rows until the Authority-only transition is verified."
+  description = "Restored sandbox catalog materialization. The Authority-first holdback is complete, so Terraform owns and publishes the reviewed cell0/cell1 rows. Kept as a validated variable rather than a literal so the module gate stays a single reviewed input; a tfvars or -var override cannot turn materialization back off, because unmaterializing a live row is a drain/migrate procedure, not an input flip."
   type        = bool
-  default     = false
+  default     = true
 
   validation {
-    condition     = !var.provisioned_cell_catalog_materialization_enabled
-    error_message = "The sandbox provisioned-cell catalog must remain unmaterialized during the temporary Authority-first rollout holdback."
+    condition     = var.provisioned_cell_catalog_materialization_enabled
+    error_message = "The sandbox provisioned-cell catalog must stay materialized; removing a live catalog row is a drain/migrate procedure, not an input flip."
   }
 }
 

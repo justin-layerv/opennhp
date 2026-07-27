@@ -53,9 +53,9 @@ write_clean_fixture() {
     'variable "authority_runtime_contract" { default = null }' \
     'variable "authority_runtime_contract_evidence_verified" { default = false }' \
     'variable "provisioned_cell_catalog_materialization_enabled" {' \
-    '  default = false' \
+    '  default = true' \
     '  validation {' \
-    '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+    '    condition = var.provisioned_cell_catalog_materialization_enabled' \
     '  }' \
     '}' \
     >"${control_dir}/environments/sandbox/variables.tf"
@@ -361,29 +361,43 @@ expect_failure 'sandbox Control variables must declare exactly one closed provis
 write_clean_fixture
 printf '%s\n' \
   'variable "provisioned_cell_catalog_materialization_enabled" {' \
-  '  default = false' \
+  '  default = true' \
   '  validation {' \
-  '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+  '    condition = var.provisioned_cell_catalog_materialization_enabled' \
   '  }' \
   '}' >>"${control_dir}/environments/sandbox/variables.tf"
 expect_failure 'sandbox Control variables must declare exactly one closed provisioned-cell materialization gate' \
   env NHP_REPO_ROOT="$fixture_root" "$checker"
 
+# The restoration pins opposite polarities per environment: sandbox owns the two
+# reviewed rows (true-only latch), production stays dark (false-only latch).
+# Flipping either half of either latch -- including flipping one environment to
+# the OTHER environment's pinned polarity -- must fail closed.
 for environment in sandbox prod; do
+  if [[ "$environment" == 'sandbox' ]]; then
+    expected='true'
+    wrong='false'
+    condition_flip='s/condition = var\./condition = !var./'
+  else
+    expected='false'
+    wrong='true'
+    condition_flip='s/condition = !var\./condition = var./'
+  fi
+
   write_clean_fixture
   sed -i.bak \
-    '/variable "provisioned_cell_catalog_materialization_enabled"/,/^}$/s/  default = false/  default = true/' \
+    "/variable \"provisioned_cell_catalog_materialization_enabled\"/,/^}\$/s/  default = ${expected}/  default = ${wrong}/" \
     "${control_dir}/environments/${environment}/variables.tf"
   rm "${control_dir}/environments/${environment}/variables.tf.bak"
-  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization false" \
+  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization ${expected}" \
     env NHP_REPO_ROOT="$fixture_root" "$checker"
 
   write_clean_fixture
   sed -i.bak \
-    '/variable "provisioned_cell_catalog_materialization_enabled"/,/^}$/s/condition = !var\./condition = var./' \
+    "/variable \"provisioned_cell_catalog_materialization_enabled\"/,/^}\$/${condition_flip}" \
     "${control_dir}/environments/${environment}/variables.tf"
   rm "${control_dir}/environments/${environment}/variables.tf.bak"
-  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization false" \
+  expect_failure "${environment} Control variables must hard-lock provisioned-cell catalog materialization ${expected}" \
     env NHP_REPO_ROOT="$fixture_root" "$checker"
 done
 
