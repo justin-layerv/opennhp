@@ -6702,6 +6702,41 @@ def _require_inline_policy_projection(value: Any, address: str) -> None:
         # permissions, so AWS requires "*").
 
 
+def _require_hub_carrier_move(before: Any, after: Any, address: str) -> None:
+    """Admit exactly the reviewed Hub NLB replacement, nothing else."""
+    if not isinstance(before, list) or not isinstance(after, list):
+        raise ContractError(f"{address} load_balancer_arns must be collections")
+    if len(before) != 1 or len(after) != 1:
+        raise ContractError(
+            f"{address} must stay associated with exactly one load balancer"
+        )
+    if not str(before[0]).endswith(f"/{HUB_EDGE_LEGACY_LOAD_BALANCER_NAME}") and (
+        f"/{HUB_EDGE_LEGACY_LOAD_BALANCER_NAME}/" not in str(before[0])
+    ):
+        raise ContractError(f"{address} did not move from the reviewed legacy carrier")
+    if f"/{HUB_EDGE_LOAD_BALANCER_NAME}/" not in str(after[0]):
+        raise ContractError(f"{address} did not move to the reviewed edge carrier")
+
+
+def _require_hub_identity_seeding(
+    key: str, before: Any, after: Any, address: str
+) -> None:
+    """Admit exactly the sentinel -> published-key transition, one direction."""
+    if key == "version":
+        if not isinstance(before, int) or not isinstance(after, int) or after <= before:
+            raise ContractError(f"{address} version must advance")
+        return
+    if before != "pending-keygen":
+        raise ContractError(
+            f"{address} may only be seeded from the pending-keygen sentinel"
+        )
+    decoded = _canonical_base64_32(after)
+    if not decoded or not any(decoded):
+        raise ContractError(
+            f"{address} must be seeded with a canonical non-zero 32-byte key"
+        )
+
+
 def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
     """Require every admitted re-projection to be a pure state normalization.
 
@@ -6742,6 +6777,29 @@ def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
                 # are the Hub edge slice. What is asserted here is the shape --
                 # a projection of named policy documents and nothing else.
                 _require_inline_policy_projection(after.get(key), address)
+                continue
+            if (
+                address.split("[")[0]
+                == "module.control.aws_lb_target_group.hub"
+                and key == "load_balancer_arns"
+            ):
+                # The Hub edge replaced the NLB, so the target group's sole
+                # association follows it. Admit ONLY a one-for-one move between
+                # the two reviewed carrier names -- legacy -> generation 2. A
+                # target group that gains a second load balancer, loses its
+                # association, or points at an unreviewed carrier still fails.
+                _require_hub_carrier_move(before.get(key), after.get(key), address)
+                continue
+            if (
+                address.split("[")[0]
+                == "module.control.aws_ssm_parameter.hub_public_key"
+                and key in ("value", "version")
+            ):
+                # The identity seeding itself: the keygen Lambda replaced the
+                # sentinel with the published key, bumping the parameter version.
+                # This is the ONE transition this parameter may make -- proved
+                # exactly, in that direction only.
+                _require_hub_identity_seeding(key, before.get(key), after.get(key), address)
                 continue
             if before.get(key) is None and after.get(key) == []:
                 continue
