@@ -228,7 +228,19 @@ resource "aws_lambda_invocation" "hub_identity_publication" {
 
   lifecycle {
     postcondition {
-      condition     = try(jsondecode(self.result), null) == { seeded = true }
+      # `self.result` is unresolvable while this invocation is still pending
+      # creation: the instance collection is empty, so evaluating it raises
+      # "Invalid index" rather than returning null, and `try` around only the
+      # jsondecode does not catch that. A `-refresh-only` plan evaluates this
+      # check against exactly that empty collection, so the error made the
+      # workflow's sole sanctioned drift-normalization operation impossible to
+      # run until after the very apply it gates.
+      #
+      # `can()` catches the unresolvable reference and short-circuits to true —
+      # there is no result to validate when no instance exists. Once the
+      # invocation does resolve, the exact-constant assertion below is
+      # unchanged and still the gate on the identity transaction.
+      condition     = !can(self.result) || try(jsondecode(self.result), null) == { seeded = true }
       error_message = "Hub keygen must return only the exact constant seeded marker."
     }
   }
