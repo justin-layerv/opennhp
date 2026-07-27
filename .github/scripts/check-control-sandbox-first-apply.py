@@ -2966,11 +2966,20 @@ def _require_provisioned_cell_create_output(plan: dict[str, Any]) -> None:
         if isinstance(output_changes, dict)
         else None
     )
+    # The catalog output is DECLARED unconditionally, so it has existed as an
+    # empty map since the Control root was first applied. Populating it is
+    # therefore an `update` from {}, not a `create` from null -- the create
+    # shape only ever existed before the output was declared. Admit both, since
+    # they are the same transition: nothing -> exactly the reviewed two rows.
+    actions = change.get("actions") if isinstance(change, dict) else None
+    before = change.get("before") if isinstance(change, dict) else None
+    catalog_appears = (actions == ["create"] and before is None) or (
+        actions == ["update"] and before == {}
+    )
     if (
         not isinstance(change, dict)
         or set(change) != _CHANGE_KEYS
-        or change.get("actions") != ["create"]
-        or change.get("before") is not None
+        or not catalog_appears
         or change.get("after") != PROVISIONED_CELL_CATALOG
         or change.get("after_unknown") is not False
         or change.get("before_sensitive") is not False
