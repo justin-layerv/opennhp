@@ -3562,7 +3562,19 @@ def validate_plan(
         v.require(
             str(asg.values.get("name", "")).endswith("-relay-dmz")
             and asg.values.get("health_check_type") == "ELB"
-            and asg.values.get("desired_capacity") == 3
+            # Three is the reviewed one-per-AZ FLOOR, not a pin. compute.tf sets
+            # `ignore_changes = [desired_capacity]` and aws_autoscaling_policy
+            # .relay_requests (TargetTrackingScaling on ALBRequestCountPerTarget)
+            # owns the value out of band up to relay_max_capacity = 6. Under
+            # ignore_changes Terraform copies the REFRESHED live value into
+            # change.after, and asg.values IS change.after -- so an equality read
+            # live fleet size and failed after any scale-out. min_size stays an
+            # exact pin; that is the capacity contract. This matches the sibling
+            # detector scripts/check-relay-dmz-live.py, which already uses
+            # `desired_capacity < 3` and whose comment requires the two to move
+            # together.
+            and isinstance(asg.values.get("desired_capacity"), int)
+            and asg.values.get("desired_capacity") >= 3
             and asg.values.get("min_size") == 3,
             "relay ASG must be the three-instance DMZ fleet with ELB health",
         )

@@ -3639,6 +3639,19 @@ def _check_planned_security(
             # until AWS allocates it (after omits the field, after_unknown=true).
             # A steady SG projects the same authored absence as an explicit
             # empty collection. Any concrete rule or other unknown shape fails.
+            #
+            # KNOWN LATENT DEFECT: that second sentence is false. ingress/egress
+            # are Optional+Computed, so once hub_nlb_udp and the egress rules
+            # apply, a REFRESHED plan projects them as concrete entries and this
+            # rejects them -- the same class as the Authority function SG (#3495)
+            # and OTP Redis (#3496). It has not fired only because
+            # module.control.aws_security_group.hub_nlb[0] is absent from Control
+            # state, and hub_edge_mode gates this whole block on its presence.
+            # Left strict deliberately: unlike those two, this SG has no exact
+            # configuration-expression contract to carry the state-independent
+            # "declares no inline block" guarantee, so relaxing the planned-value
+            # assertion here would remove the only check without replacing it.
+            # Fix alongside the hub-edge SG slice, giving it that contract first.
             if planned_rules not in (None, []) or (
                 planned_rules is None
                 and unknown_rules is not True
@@ -8421,13 +8434,45 @@ def check_state(state: Any) -> dict[str, Any]:
                 "endpoints only"
             )
             or function_sg.get("vpc_id") != vpc_id
+            # `ingress` stays empty in every state: nothing dials the functions
+            # on the network path. `egress` deliberately is NOT asserted empty
+            # here -- this reads REFRESHED state, where the Optional+Computed
+            # attribute reflects the standalone egress rules AWS holds. Those
+            # three rules are pinned exactly by the _require_exact_state_sg_rule
+            # calls immediately below, which is the stronger assertion; an empty
+            # egress here would contradict them.
             or function_sg.get("ingress") not in ([], None)
-            or function_sg.get("egress") not in ([], None)
         ):
             raise ContractError(
                 "Authority function SG must be generation 2, in the Control VPC, "
-                "and carry no inline rules"
+                "and carry no inline ingress"
             )
+        # The reflected egress is whatever the standalone rules put in AWS. Each
+        # of those three is pinned exactly by _require_exact_state_sg_rule below,
+        # but assert the SHAPE here as well so an inline CIDR- or self-reachable
+        # rule can never masquerade as a reflected standalone rule: the lawful
+        # ones are SG-referenced (interface endpoints, OTP Redis) or prefix-list
+        # scoped (DynamoDB gateway), never raw CIDR.
+        function_sg_egress = function_sg.get("egress")
+        if function_sg_egress not in (None, []):
+            if not isinstance(function_sg_egress, list):
+                raise ContractError(
+                    "Authority function SG egress must be a rule collection"
+                )
+            for rule in function_sg_egress:
+                if not isinstance(rule, dict):
+                    raise ContractError(
+                        "Authority function SG egress rule is malformed"
+                    )
+                if (
+                    rule.get("cidr_blocks") not in (None, [])
+                    or rule.get("ipv6_cidr_blocks") not in (None, [])
+                    or rule.get("self") not in (None, False)
+                ):
+                    raise ContractError(
+                        "Authority function SG egress must be SG- or "
+                        "prefix-list-scoped, never CIDR/self reachable"
+                    )
         runtime_function_sg_id = function_sg_id
         _require_exact_state_sg_rule(
             values,
@@ -8474,8 +8519,9 @@ def check_state(state: Any) -> dict[str, Any]:
         item = values[address]
         # The interface-endpoint SG carries exactly one TLS/443 SG-scoped ingress
         # per live caller slice: the runtime function SG, plus -- once the Hub
-        # worker slice is live -- the Hub worker SG. The default and OTP Redis SGs
-        # stay closed. Egress stays empty on all three.
+        # worker slice is live -- the Hub worker SG. The OTP Redis SG carries the
+        # one TLS/6379 rule the runtime slice attaches. The default SG stays
+        # closed. Egress stays empty on all three.
         if (
             runtime_present or hub_worker_present
         ) and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
@@ -8528,6 +8574,16 @@ def check_state(state: Any) -> dict[str, Any]:
                         "interface-endpoint SG ingress is not exactly TLS/443 from "
                         f"one caller SG: {address}"
                     )
+            continue
+        if address == "module.control.aws_security_group.otp_redis":
+            # Not dark once the runtime slice lands: it carries exactly the one
+            # standalone SG-to-SG TLS/6379 rule the slice attaches, which this
+            # same function pins exactly via _require_exact_state_sg_rule. This
+            # reads REFRESHED state, so demanding an empty ingress here both
+            # contradicted that rule check and rejected every post-slice state.
+            if item.get("egress") not in ([], None):
+                raise ContractError(f"dark security group has egress rules: {address}")
+            _check_otp_redis_ingress(item, {}, address)
             continue
         if item.get("ingress") not in ([], None) or item.get("egress") not in (
             [],
