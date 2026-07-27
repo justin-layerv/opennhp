@@ -9317,6 +9317,50 @@ class WorkflowContractTests(unittest.TestCase):
         )
 
 
+class AlarmRefreshSensitiveTests(unittest.TestCase):
+    """Alarm re-projection is validated structurally, not against a literal."""
+
+    def test_placeholder_maps_are_admitted(self) -> None:
+        # Terraform renders these structurally: False for a non-sensitive
+        # scalar, empty collections for lists/maps. This is the real shape the
+        # applied sandbox alarms carry.
+        for value in (
+            {"alarm_actions": [False], "dimensions": {}, "tags": {}},
+            {"actions_suppressor": [], "alarm_actions": [False], "tags_all": {}},
+            {},
+            [],
+            False,
+            None,
+        ):
+            with self.subTest(repr(value)[:40]):
+                self.assertTrue(CHECKER._is_placeholder_sensitive(value))
+
+    def test_any_real_sensitive_value_is_refused(self) -> None:
+        # A True anywhere means an actual sensitive value is present. Admitting
+        # one as "normalization" would let a secret ride in on a drift entry.
+        for value in (
+            True,
+            {"alarm_actions": [False], "leaked": True},
+            {"nested": {"deeper": [True]}},
+            [False, [True]],
+            "a-string-is-not-a-placeholder",
+        ):
+            with self.subTest(repr(value)[:40]):
+                self.assertFalse(CHECKER._is_placeholder_sensitive(value))
+
+    def test_only_the_reviewed_alarm_families_take_the_structural_path(self) -> None:
+        for address in CHECKER._ALARM_REFRESH_NORMALIZATION_PREFIXES:
+            with self.subTest(address):
+                self.assertEqual(
+                    CHECKER._refresh_sensitive_contract(f'{address}["x"]'),
+                    (None, None),
+                )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._refresh_sensitive_contract(
+                "module.control.aws_cloudwatch_metric_alarm.not_reviewed"
+            )
+
+
 class HubSourceFenceTransitionTests(unittest.TestCase):
     """One-time Hub carrier replacement must bind its exact legacy state."""
 

@@ -6900,6 +6900,39 @@ def _validate_digest_normalization(
     return before, after
 
 
+_ALARM_REFRESH_NORMALIZATION_PREFIXES = (
+    "module.control.aws_cloudwatch_metric_alarm.authority_runtime",
+    "module.control.aws_cloudwatch_metric_alarm.authority_terminal_outcome",
+    "module.control.aws_cloudwatch_metric_alarm.authority_admission_rejected",
+    "module.control.aws_cloudwatch_metric_alarm.authority_adapter_contract_violation",
+    "module.control.aws_cloudwatch_metric_alarm.authority_adapter_late_result",
+    "module.control.aws_cloudwatch_metric_alarm.authority_completion_identity_rejected",
+    "module.control.aws_cloudwatch_metric_alarm.authority_spillover",
+    "module.control.aws_cloudwatch_composite_alarm."
+    "authority_non_provisioned_initialization",
+)
+
+
+def _is_placeholder_sensitive(value: Any) -> bool:
+    """True when a sensitive map marks only WHERE a value could be sensitive.
+
+    Terraform renders these maps structurally: `False` for a scalar that is not
+    sensitive, and empty collections for lists/maps. A `True` anywhere means a
+    REAL sensitive value is present. The alarm families carry no secret material,
+    so their maps must be placeholders all the way down -- this refuses to admit
+    an alarm re-projection that suddenly carries one.
+    """
+    if value is True:
+        return False
+    if value is False or value is None:
+        return True
+    if isinstance(value, list):
+        return all(_is_placeholder_sensitive(item) for item in value)
+    if isinstance(value, dict):
+        return all(_is_placeholder_sensitive(item) for item in value.values())
+    return False
+
+
 def _refresh_sensitive_contract(
     address: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -6921,6 +6954,15 @@ def _refresh_sensitive_contract(
             _DIGEST_REFRESH_SENSITIVE,
             _DIGEST_REFRESH_SENSITIVE,
         )
+    if address.split("[")[0] in _ALARM_REFRESH_NORMALIZATION_PREFIXES:
+        # Alarm re-projection. Returning the observed pair would be circular, and
+        # a fixed literal cannot work: the shapes differ per family and the
+        # composite's `after` legitimately gains a key the `before` lacked --
+        # the same first-projection settling the value side shows. `None` asks
+        # the caller to validate STRUCTURALLY instead: both maps must be
+        # placeholders all the way down, so an alarm drift that ever carried a
+        # real sensitive value is rejected rather than normalized.
+        return None, None
     raise ContractError(f"refresh drift is not approved for normalization: {address}")
 
 
@@ -7060,7 +7102,18 @@ def _reconstruct_refresh_only_changes(
                     "refresh-only normalization drift contains unknown values"
                 )
             before_sensitive, after_sensitive = _refresh_sensitive_contract(address)
-            if (
+            if before_sensitive is None:
+                if (
+                    "before_sensitive" not in change
+                    or "after_sensitive" not in change
+                    or not _is_placeholder_sensitive(change["before_sensitive"])
+                    or not _is_placeholder_sensitive(change["after_sensitive"])
+                ):
+                    raise ContractError(
+                        "refresh-only normalization drift has unexpected "
+                        "sensitive-value metadata"
+                    )
+            elif (
                 "before_sensitive" not in change
                 or "after_sensitive" not in change
                 or not _json_equal(
