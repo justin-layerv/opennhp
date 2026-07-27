@@ -2111,6 +2111,61 @@ def _assert_manifest_rejects_no_op(jobs: dict, failures: list[str]) -> None:
             failures.append(f"Reject no-op dispatch missing {needle!r}")
 
 
+def _assert_deploy_qurl_needs_agent_key_inventory(
+    jobs: dict, failures: list[str]
+) -> None:
+    """deploy-qurl must be blocked by the agent-key inventory gate.
+
+    qurl-service#1237. The gate scans the prod api-key and agent-key tables
+    immediately before the qurl image deploy and exits non-zero on any
+    pre-contract row. It only protects anything if deploy-qurl actually
+    cascades off it, and there are two distinct ways that silently breaks:
+
+    1. `needs:` drops the job — the gate still runs, still turns the run red,
+       but deploy-qurl no longer waits for it and can ship first.
+    2. `needs:` keeps it while the `if:` stops requiring success. Because
+       deploy-qurl is an `always()` gate, a *failed* dependency does not
+       skip it; without an explicit success clause the gate becomes purely
+       advisory. This is the subtle one — the job list still looks correct.
+
+    Both leave every other gate looking right, so pin both.
+    """
+    deploy_qurl = jobs.get("deploy-qurl", {})
+    needs = deploy_qurl.get("needs", [])
+    if not _check(
+        "deploy-qurl.needs includes `qurl-agent-key-inventory`",
+        "qurl-agent-key-inventory" in needs,
+        f"needs: {needs}",
+    ):
+        failures.append("deploy-qurl.needs missing qurl-agent-key-inventory")
+
+    gate_if = _normalize(str(deploy_qurl.get("if", "")))
+    if not _check(
+        "deploy-qurl.if requires the inventory gate to have succeeded",
+        "needs.qurl-agent-key-inventory.result == 'success'" in gate_if,
+        f"if: {gate_if!r}",
+    ):
+        failures.append(
+            "deploy-qurl.if missing "
+            "`needs.qurl-agent-key-inventory.result == 'success'` — under "
+            "always() the gate would be advisory, not blocking"
+        )
+
+    # The gate must also be scoped to the deploy it guards: if it were to run
+    # unconditionally it would fail runs that never deploy qurl, and operators
+    # would learn to bypass it.
+    inventory = jobs.get("qurl-agent-key-inventory", {})
+    inventory_if = _normalize(str(inventory.get("if", "")))
+    if not _check(
+        "qurl-agent-key-inventory gated on `inputs.deploy_qurl`",
+        "inputs.deploy_qurl" in inventory_if,
+        f"if: {inventory_if!r}",
+    ):
+        failures.append(
+            "qurl-agent-key-inventory missing `inputs.deploy_qurl` gate"
+        )
+
+
 def _assert_terraform_apply_needs_schema_compat(jobs: dict, failures: list[str]) -> None:
     """terraform-apply must continue to depend on qurl-schema-compat AND terraform-plan.
 
@@ -4095,6 +4150,54 @@ _BAD_FIXTURE_TERRAFORM_APPLY_NEEDS = textwrap.dedent(
 )
 
 
+_BAD_FIXTURE_AGENT_KEY_INVENTORY_NEEDS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      qurl-agent-key-inventory:
+        runs-on: ubuntu-latest
+        if: inputs.deploy_qurl
+        steps:
+          - run: ":"
+      deploy-qurl:
+        runs-on: ubuntu-latest
+        # Bug: needs: drops qurl-agent-key-inventory, so the deploy no
+        # longer waits for the pre-contract inventory to pass.
+        needs: [manifest, preflight]
+        if: |
+          always() &&
+          needs.qurl-agent-key-inventory.result == 'success' &&
+          inputs.deploy_qurl
+        steps:
+          - run: ":"
+    """
+)
+
+
+_BAD_FIXTURE_AGENT_KEY_INVENTORY_ADVISORY = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      qurl-agent-key-inventory:
+        runs-on: ubuntu-latest
+        if: inputs.deploy_qurl
+        steps:
+          - run: ":"
+      deploy-qurl:
+        runs-on: ubuntu-latest
+        needs: [manifest, preflight, qurl-agent-key-inventory]
+        # Bug: `needs:` still lists the gate, but the always() gate no
+        # longer requires it to have SUCCEEDED — a failed inventory does
+        # not skip this job, so the gate is advisory only.
+        if: |
+          always() &&
+          inputs.deploy_qurl
+        steps:
+          - run: ":"
+    """
+)
+
+
 _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_UPLOAD_ONLY = textwrap.dedent(
     """
     on: workflow_dispatch
@@ -5026,6 +5129,16 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             _assert_terraform_apply_needs_schema_compat,
             _BAD_FIXTURE_SCHEMA_COMPAT_NEGATED,
         ),
+        (
+            "deploy-qurl.needs drops the agent-key inventory gate",
+            _assert_deploy_qurl_needs_agent_key_inventory,
+            _BAD_FIXTURE_AGENT_KEY_INVENTORY_NEEDS,
+        ),
+        (
+            "agent-key inventory gate demoted to advisory (if: drops success)",
+            _assert_deploy_qurl_needs_agent_key_inventory,
+            _BAD_FIXTURE_AGENT_KEY_INVENTORY_ADVISORY,
+        ),
         ("preflight", _assert_preflight, _BAD_FIXTURE_PREFLIGHT),
         (
             "lambda-artifact symmetry (upload without matching download)",
@@ -5311,6 +5424,7 @@ def main() -> int:
         _assert_image_deploys,
         _assert_manifest_rejects_no_op,
         _assert_terraform_apply_needs_schema_compat,
+        _assert_deploy_qurl_needs_agent_key_inventory,
         _assert_lambda_artifact_symmetry,
         _assert_lambda_loud_fail_policy,
         _assert_lambda_tests_before_prod_credentials,

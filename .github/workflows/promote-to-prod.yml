@@ -144,6 +144,11 @@ env:
   ECR_QURL_REPO: 'layerv/nhp-qurl'
   ECR_QRTS_REPO: 'layerv/qurl-reverse-tunnel-server'
   PROD_SSM_PREFIX: 'layerv-nhp-prod'
+  # Table-name prefix for the qurl agent-identity tables the pre-deploy
+  # inventory gate scans (qurl-service#1237). Prod runs a single cell; if a
+  # second prod cell ever lands, the gate must run once per cell prefix —
+  # a single-cell run would report PASS while the other cell went unchecked.
+  PROD_QURL_TABLE_PREFIX: 'layerv-nhp-prod-cell0'
 
 jobs:
   # =============================================================================
@@ -3053,9 +3058,151 @@ jobs:
   # param and adds a running-vs-latest idempotency guard (it runs on every push
   # to main). Both reuse deploy-ecs-service.sh, so a change to the shared
   # deployer / ECS contract should prompt a look at the other path.
+  # =============================================================================
+  # QURL AGENT-KEY INVENTORY GATE (qurl-service#1237)
+  # =============================================================================
+  # Hard pre-deploy control for the agent-identity contract. Runs immediately
+  # before deploy-qurl and blocks it on any blocker.
+  #
+  # Why this is a deploy gate and not a post-deploy check: the qurl image
+  # enforces an immutable agent_id during API-key authentication, and the
+  # qurl-agent-keys table is read by nhp-server on the UDP knock path. A
+  # pre-contract row therefore breaks credentials or knocks the moment the new
+  # image serves traffic, and an ordinary revoke cannot clear its issued-device
+  # sentinel. qurl-service#1240 found four such rows in sandbox on 2026-07-14;
+  # the rollout ledger has required a complete strongly consistent zero-blocker
+  # inventory before every promotion ever since. This job makes that
+  # mechanically unskippable instead of a manual attestation.
+  #
+  # The binary ships in the same image as qurl-api (qurl-service#1324), so the
+  # gate enforces the exact validators the server about to run is compiled
+  # with — no version skew between gate and gated.
+  #
+  # It is read-only: the promotion role is granted dynamodb:Scan on exactly the
+  # two qurl agent-identity tables and nothing else (see the
+  # DynamoDBQurlAgentKeyInventoryGate statement in
+  # terraform/modules/ecr/main.tf). That grant is on the CI principal and does
+  # NOT relax nhp-server's reader role, which remains Scan-free per
+  # docs/design/QURL_AGENT_KEYS_SCHEMA.md.
+  qurl-agent-key-inventory:
+    name: QURL Agent-Key Inventory Gate
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac]
+    # Mirrors deploy-qurl's gate exactly: this check exists to guard that
+    # deploy, so it must run in precisely the cases that deploy runs and be
+    # skipped in the rest. If the two conditions ever drift, the gate becomes
+    # skippable — keep them in lockstep.
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      inputs.deploy_qurl
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Sandbox credentials first: the image lives in sandbox ECR. Prod
+      # credentials are configured afterwards so the scan itself runs against
+      # prod — order is load-bearing, the second configure-aws-credentials
+      # replaces the first.
+      - name: Configure AWS credentials (sandbox - ECR pull)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to sandbox ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+
+      - name: Pull qurl-service image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$QURL_IMAGE_TAG" ]]; then
+            echo "::error::deploy_qurl=true but the manifest produced no qurl_image_tag — cannot gate the deploy."
+            exit 1
+          fi
+          IMAGE="$ECR_REGISTRY/$ECR_QURL_REPO:$QURL_IMAGE_TAG"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker pull "$IMAGE"
+
+          # Runtime contract: --version must short-circuit before any AWS call.
+          # Proving the binary is runnable here means a later non-zero exit is a
+          # real verdict rather than a missing/broken binary. An image predating
+          # qurl-service#1324 fails at this step with a clear cause.
+          if ! SMOKE=$(docker run --rm --entrypoint /app/qurl-agent-key-inventory "$IMAGE" --version 2>&1); then
+            echo "::group::qurl-agent-key-inventory --version output"
+            echo "$SMOKE"
+            echo "::endgroup::"
+            echo "::error::qurl-agent-key-inventory is not runnable in image $IMAGE. The image likely predates qurl-service#1324, which added the binary. The inventory verdict below cannot be trusted until this passes."
+            exit 1
+          fi
+          echo "qurl-agent-key-inventory smoke OK: $SMOKE"
+
+      - name: Configure AWS credentials (prod - DynamoDB read)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run agent-key inventory against prod
+        run: |
+          set -euo pipefail
+          echo "Scanning $PROD_QURL_TABLE_PREFIX-qurl-{api,agent}-keys in $PROD_ACCOUNT_ID..."
+          set +e
+          docker run --rm \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="$AWS_REGION" \
+            --entrypoint /app/qurl-agent-key-inventory "$IMAGE" \
+            --table-prefix "$PROD_QURL_TABLE_PREFIX" \
+            --expect-account "$PROD_ACCOUNT_ID" \
+            --json > agent-key-inventory.json
+          EXIT=$?
+          set -e
+
+          # Evidence is emitted even on a non-zero exit (partial runs are
+          # marked INCOMPLETE), so publish it before deciding.
+          echo "::group::inventory evidence"
+          cat agent-key-inventory.json || true
+          echo "::endgroup::"
+
+          case $EXIT in
+            0)
+              echo "::notice::Agent-key inventory PASS — zero pre-contract blockers in $PROD_QURL_TABLE_PREFIX."
+              ;;
+            1)
+              echo "::error::Agent-key inventory found contract blockers in prod. Deploying now would break those credentials or fail-close their knocks, and an ordinary revoke cannot clear an issued-device sentinel. Remediate under an explicitly authorized, condition-fenced repair (see qurl-service#1240) and re-run this gate before promoting."
+              exit 1
+              ;;
+            130)
+              echo "::error::Agent-key inventory was cancelled. A partial inventory never gates a deploy — re-run."
+              exit 1
+              ;;
+            *)
+              echo "::error::Agent-key inventory could not complete (exit $EXIT): AWS error, decode error, incomplete pagination, or a caller identity that is not $PROD_ACCOUNT_ID. Refusing to advance the deploy on unproven evidence."
+              exit 1
+              ;;
+          esac
+
+      - name: Upload inventory evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qurl-agent-key-inventory-prod
+          path: agent-key-inventory.json
+          retention-days: 90
+          if-no-files-found: warn
+
   deploy-qurl:
     name: Deploy QURL Service
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, qurl-agent-key-inventory]
     # Same terraform-apply rule as deploy-server (issue #1322). The
     # deploy-server / deploy-traefik-plugins / deploy-ac clauses
     # preserve the chained-deploy contract: QURL ships only if every
@@ -3083,6 +3230,7 @@ jobs:
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      needs.qurl-agent-key-inventory.result == 'success' &&
       inputs.deploy_qurl
     runs-on: ubuntu-latest
     timeout-minutes: 15

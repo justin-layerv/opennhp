@@ -1217,6 +1217,49 @@ resource "aws_iam_role_policy" "context_lookups" {
   })
 }
 
+# qurl-service#1237: the pre-deploy agent-key inventory gate. The promotion
+# workflow runs the gate binary out of the qurl image immediately before
+# deploy-qurl; it needs a complete strongly consistent Scan of exactly the two
+# qurl agent-identity tables and nothing else.
+#
+# Deliberately its OWN inline policy rather than another statement inside
+# `context_lookups`: that policy is a reviewed relay-DMZ boundary resource
+# (DMZ_BOUNDARY_ADDRESS_PATTERNS in .github/scripts/check-relay-dmz-plan.py),
+# and ordinary deploys must leave it a no-op. Folding an unrelated CI read into
+# it fails the DMZ plan contract and drags this grant into a security-boundary
+# review it has nothing to do with.
+#
+# Inline rather than a managed policy because the github_actions role already
+# carries the AWS default maximum of 10 attached managed policies
+# (GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT in
+# .github/scripts/check-terraform-iam-coverage.py); an 11th attachment would
+# fail at apply. The role's inline aggregate has room for a document this small.
+#
+# Scope note: this is the CI/promotion principal and is NOT nhp-server's task
+# role. docs/design/QURL_AGENT_KEYS_SCHEMA.md keeps that reader Scan-free, and
+# tests/scripts/test_check_terraform_plan_pr_policy_readonly.py fences it
+# against the `dynamodb_read` policy. That fence covers a different document
+# and is unaffected here — do not consolidate this statement into it.
+resource "aws_iam_role_policy" "qurl_agent_key_inventory" {
+  name = "qurl-agent-key-inventory"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DynamoDBQurlAgentKeyInventoryGate"
+        Effect = "Allow"
+        Action = ["dynamodb:Scan"]
+        Resource = [
+          "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-qurl-api-keys",
+          "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-qurl-agent-keys"
+        ]
+      }
+    ]
+  })
+}
+
 # Run Command is needed only by the relay-enabled sandbox integration and is
 # isolated from the context-lookups policy so production retains its existing
 # document unchanged. SendCommand authorization evaluates both the document
