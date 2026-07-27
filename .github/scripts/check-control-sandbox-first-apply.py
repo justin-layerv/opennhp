@@ -6635,7 +6635,22 @@ _PROVIDER_REPROJECTION_ADDRESSES = frozenset(
         "module.control.aws_iam_role.hub_keygen[0]",
         "module.control.aws_iam_role.hub_execution[0]",
         _OTP_REDIS_SG_ADDRESS,
+        # The Hub edge slice settles these on its first refreshed read: the
+        # listener projects `tags`, the target group picks up the REPLACED load
+        # balancer's ARN, the NLB SG reads back its standalone rules, and the
+        # identity parameter carries the key the keygen Lambda published.
+        "module.control.aws_lb_listener.hub[0]",
+        "module.control.aws_lb_target_group.hub[0]",
+        "module.control.aws_security_group.hub_nlb[0]",
+        "module.control.aws_ssm_parameter.hub_public_key[0]",
     }
+    # Every Authority alarm re-projects `ok_actions` and
+    # `insufficient_data_actions` from absent to []. 106 of them applied with
+    # the Hub edge slice. Enumerated from the same constant the alarm contract
+    # uses, so a new alarm family cannot silently widen this set -- it has to be
+    # added to AUTHORITY_ALARM_RESOURCES, which its own exact checks then bind.
+    | set(AUTHORITY_ALARM_RESOURCES)
+    | set(AUTHORITY_ALARM_UPDATE_ADDRESSES)
 )
 
 
