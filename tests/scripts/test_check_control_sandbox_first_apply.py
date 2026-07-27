@@ -1237,6 +1237,22 @@ def runtime_interface_ingress_rule() -> dict:
     }
 
 
+def redis_tls_ingress_rule() -> dict:
+    """The one standalone SG-to-SG rule the runtime slice attaches to the OTP
+    Redis SG, as a refreshed plan renders it."""
+    return {
+        "description": "Redis TLS from Connector Authority OTP functions",
+        "from_port": 6379,
+        "to_port": 6379,
+        "protocol": "tcp",
+        "security_groups": [RUNTIME_LAMBDA_SG_ID],
+        "cidr_blocks": [],
+        "ipv6_cidr_blocks": [],
+        "prefix_list_ids": [],
+        "self": False,
+    }
+
+
 def _runtime_create(after: dict) -> dict:
     return {
         "actions": ["create"],
@@ -5692,6 +5708,52 @@ class PlanContractTests(unittest.TestCase):
             "ingress": [runtime_interface_ingress_rule()],
         }
         self.assert_rejected(candidate)
+
+    def test_authority_runtime_admits_the_applied_redis_tls_ingress(self) -> None:
+        """Post-slice, the OTP Redis SG legitimately carries the ONE standalone
+        SG-to-SG TLS/6379 rule that aws_vpc_security_group_ingress_rule
+        .otp_redis_authority attaches. `ingress` is Optional+Computed, so a
+        refreshed plan reports it -- live sg-081a26fbcf3d14ca6 carries exactly
+        this. Demanding an empty list admitted only the pre-slice state and so
+        failed every plan after the slice applied.
+        """
+        candidate = authority_runtime_transition_fixture()
+        redis_sg = self.change(candidate, "module.control.aws_security_group.otp_redis")
+        redis_sg["actions"] = ["no-op"]
+        redis_sg["after"] = {
+            **redis_sg["after"],
+            "ingress": [redis_tls_ingress_rule()],
+        }
+        redis_sg["before"] = copy.deepcopy(redis_sg["after"])
+        CHECKER.check_plan(candidate)
+
+    def test_authority_runtime_rejects_unlawful_redis_ingress_shapes(self) -> None:
+        """Admitting the applied rule must not admit a broader one."""
+        cidr_reachable = {**redis_tls_ingress_rule(), "cidr_blocks": ["0.0.0.0/0"]}
+        wrong_port = {**redis_tls_ingress_rule(), "from_port": 6380, "to_port": 6380}
+        self_reachable = {**redis_tls_ingress_rule(), "self": True}
+        cases = {
+            "cidr reachable": [cidr_reachable],
+            "wrong port": [wrong_port],
+            "self reachable": [self_reachable],
+            "two rules": [redis_tls_ingress_rule(), redis_tls_ingress_rule()],
+            "multi-SG rule": [
+                {
+                    **redis_tls_ingress_rule(),
+                    "security_groups": [RUNTIME_LAMBDA_SG_ID, "sg-0deadbeef"],
+                }
+            ],
+        }
+        for label, ingress in cases.items():
+            with self.subTest(label):
+                candidate = authority_runtime_transition_fixture()
+                redis_sg = self.change(
+                    candidate, "module.control.aws_security_group.otp_redis"
+                )
+                redis_sg["actions"] = ["no-op"]
+                redis_sg["after"] = {**redis_sg["after"], "ingress": ingress}
+                redis_sg["before"] = copy.deepcopy(redis_sg["after"])
+                self.assert_rejected(candidate)
 
     def test_authority_runtime_rejects_world_interface_endpoint_egress(self) -> None:
         candidate = authority_runtime_transition_fixture()

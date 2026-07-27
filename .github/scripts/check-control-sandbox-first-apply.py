@@ -3599,8 +3599,9 @@ def _check_planned_security(
     ):
         after, unknown = values(address)
         # The interface-endpoint SG gains exactly one TLS/443 SG-scoped ingress
-        # in the runtime slice; the default and OTP Redis SGs stay closed. Egress
-        # stays empty on all three.
+        # in the runtime slice, and the OTP Redis SG gains exactly one TLS/6379
+        # SG-scoped ingress from the function SG. The default SG stays closed.
+        # Egress stays empty on all three.
         if (
             runtime_mode or hub_worker_mode
         ) and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
@@ -3610,6 +3611,14 @@ def _check_planned_security(
             _check_authority_interface_endpoint_ingress(
                 after, unknown, address, hub_worker_mode=hub_worker_mode
             )
+            continue
+        if (runtime_mode or hub_worker_mode) and address == (
+            "module.control.aws_security_group.otp_redis"
+        ):
+            _require_fields(after, {"egress": []}, address)
+            if unknown.get("egress", []) != []:
+                raise ContractError(f"{address} has unknown planned egress rules")
+            _check_otp_redis_ingress(after, unknown, address)
             continue
         _require_fields(after, {"ingress": [], "egress": []}, address)
         if unknown.get("ingress", []) != [] or unknown.get("egress", []) != []:
@@ -4668,6 +4677,53 @@ def _check_authority_interface_endpoint_ingress(
             raise ContractError(
                 f"{address} each ingress rule must reference exactly one caller SG"
             )
+
+
+def _check_otp_redis_ingress(
+    after: dict[str, Any], unknown: dict[str, Any], address: str
+) -> None:
+    # The OTP Redis SG is created closed and stays closed until the
+    # authority-runtime slice attaches its ONE standalone SG-to-SG TLS/6379
+    # ingress rule (aws_vpc_security_group_ingress_rule.otp_redis_authority),
+    # which is itself contract-checked. `ingress` is Optional+Computed, so once
+    # that rule applies a refreshed plan reports it here -- demanding an empty
+    # list admitted only the pre-slice state and rejected every plan after it.
+    #
+    # Admit exactly the two lawful shapes: closed (pre-slice), or precisely one
+    # SG-scoped TLS/6379 rule. Anything CIDR/prefix/self-reachable, a second
+    # rule, or a different port fails closed.
+    ingress = after.get("ingress")
+    if ingress in (None, []):
+        return
+    if not isinstance(ingress, list) or len(ingress) != 1:
+        raise ContractError(
+            f"{address} must carry at most one TLS/6379 ingress rule"
+        )
+    rule = ingress[0]
+    if not isinstance(rule, dict):
+        raise ContractError(f"{address} ingress rule is malformed")
+    if (
+        rule.get("from_port") != 6379
+        or rule.get("to_port") != 6379
+        or rule.get("protocol") != "tcp"
+    ):
+        raise ContractError(f"{address} ingress must be exactly TLS/6379/tcp")
+    if (
+        rule.get("cidr_blocks") not in (None, [])
+        or rule.get("ipv6_cidr_blocks") not in (None, [])
+        or rule.get("prefix_list_ids") not in (None, [])
+        or rule.get("self") not in (None, False)
+    ):
+        raise ContractError(
+            f"{address} ingress must be SG-scoped, never CIDR/prefix/self reachable"
+        )
+    security_groups = rule.get("security_groups")
+    known_single = isinstance(security_groups, list) and len(security_groups) == 1
+    unknown_single = security_groups in (None, []) and bool(unknown.get("ingress"))
+    if not (known_single or unknown_single):
+        raise ContractError(
+            f"{address} ingress must reference exactly one caller SG"
+        )
 
 
 def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> None:
