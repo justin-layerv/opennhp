@@ -2160,9 +2160,12 @@ def authority_runtime_partial_retry_fixture(applied_addresses: set[str]) -> dict
 
 
 def _slice_refresh_drift(address: str, resource_type: str) -> dict:
-    """A minimal benign refresh re-projection ``resource_drift`` entry. The
-    runtime-slice normalization admits by address (confined to the slice + its
-    opens), so trivial projected values suffice for coverage."""
+    """A minimal benign refresh re-projection ``resource_drift`` entry.
+
+    ``before`` holds an EMPTY collection, so this is a pure first projection:
+    state recorded no prior value, nothing changed out of band, and
+    ``_drift_is_first_projection_only`` classifies it benign.
+    """
     return {
         "address": address,
         "mode": "managed",
@@ -2171,6 +2174,27 @@ def _slice_refresh_drift(address: str, resource_type: str) -> dict:
             "actions": ["update"],
             "before": {"tags_all": {}},
             "after": {"tags_all": {"reviewed": "yes"}},
+            "after_unknown": {},
+        },
+    }
+
+
+def _substantive_refresh_drift(address: str, resource_type: str) -> dict:
+    """A refresh drift entry that carries a REAL out-of-band value change.
+
+    Same address/shape as ``_slice_refresh_drift``, but ``before`` holds a
+    RECORDED value that the refresh read back differently. That is the signal the
+    checker exists to catch, so it must never be filtered as a first projection
+    and must still be rejected unless it matches an exact reviewed normalization.
+    """
+    return {
+        "address": address,
+        "mode": "managed",
+        "type": resource_type,
+        "change": {
+            "actions": ["update"],
+            "before": {"tags_all": {"reviewed": "yes"}},
+            "after": {"tags_all": {"reviewed": "tampered"}},
             "after_unknown": {},
         },
     }
@@ -3897,6 +3921,12 @@ class PlanContractTests(unittest.TestCase):
         # mode, which skips the full inventory contract). Its {count, kind,
         # sha256} must equal the plan lane's for the identical drift, so the
         # workflow's plan-vs-live cmp matches and the completion apply proceeds.
+        #
+        # These entries are pure first projections, so BOTH lanes now classify
+        # them "first-projection" ahead of any reviewed-kind match. The agreement
+        # this test exists to prove is what matters and is unchanged; only the
+        # kind string moved. Lane agreement is load-bearing: if only one lane
+        # filtered, a benign projection would abort the apply as "moved".
         exec_roles = sorted(
             address
             for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
@@ -3916,7 +3946,7 @@ class PlanContractTests(unittest.TestCase):
         observation = CHECKER.check_normalization_drift(refresh, prior_state)
         self.assertEqual(
             observation["normalization_drift_kind"],
-            "authority-runtime-slice-normalization",
+            "first-projection",
         )
         self.assertEqual(observation["normalization_drift_count"], 3)
         self.assertEqual(
@@ -3941,8 +3971,10 @@ class PlanContractTests(unittest.TestCase):
     def test_authority_runtime_slice_normalization_reproof_rejects_outside_slice(
         self,
     ) -> None:
-        # A re-prove observation whose drift reaches outside the slice must fail
-        # closed in the narrow lane too (not just check_plan).
+        # A re-prove observation carrying a REAL out-of-band value change outside
+        # the slice must fail closed in the narrow lane too (not just check_plan).
+        # As above, the out-of-slice entry is substantive; a pure first projection
+        # there is admitted by design in both lanes.
         exec_role = next(
             address
             for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
@@ -3952,7 +3984,7 @@ class PlanContractTests(unittest.TestCase):
         refresh["applyable"] = True
         refresh["resource_drift"] = [
             _slice_refresh_drift(exec_role, "aws_iam_role"),
-            _slice_refresh_drift(
+            _substantive_refresh_drift(
                 "module.control.aws_kms_key.authority_data", "aws_kms_key"
             ),
         ]
@@ -6015,10 +6047,18 @@ class PlanContractTests(unittest.TestCase):
     def test_authority_runtime_slice_completion_rejects_drift_outside_slice(
         self,
     ) -> None:
-        """Refresh drift that reaches ANY address outside the slice ∪ its opens
-        is NOT admitted by the slice normalization — it falls through to the exact
-        single-drift handling and fails closed (a base resource must never drift
-        silently during a slice completion)."""
+        """A REAL value change on an address outside the slice ∪ its opens is NOT
+        admitted by the slice normalization — it falls through to the exact
+        single-drift handling and fails closed (a base resource must never change
+        out of band during a slice completion).
+
+        The out-of-slice entry carries a SUBSTANTIVE before-value. A pure first
+        projection on a base resource is now admitted by design and is covered by
+        ``test_first_projection_outside_the_slice_is_admitted``: state that never
+        recorded a value cannot evidence an out-of-band change, and the live
+        sandbox emits 106 such alarm projections (95 metric + 11 composite) on
+        base resources. What must stay rejected is a recorded value that changed,
+        which is what this asserts."""
         role = next(
             item["address"]
             for item in authority_runtime_transition_fixture()["resource_changes"]
@@ -6028,7 +6068,7 @@ class PlanContractTests(unittest.TestCase):
         candidate = authority_runtime_partial_retry_fixture({role})
         candidate["resource_drift"] = [
             _slice_refresh_drift(role, "aws_iam_role"),
-            _slice_refresh_drift(
+            _substantive_refresh_drift(
                 "module.control.aws_kms_key.authority_data", "aws_kms_key"
             ),
         ]
@@ -9981,6 +10021,249 @@ class HubEdgeSliceTests(unittest.TestCase):
             result["resource_changes"].append(change)
         summary = CHECKER.check_plan(result)
         self.assertEqual(summary["plan_mode"], "no-op")
+
+
+class FirstProjectionDriftTests(unittest.TestCase):
+    """The before-value discriminator that filters signal-free refresh drift.
+
+    State that held NO prior value cannot evidence an out-of-band change, so
+    such drift is admitted ahead of the reviewed-kind matching. State that held
+    a value which then differs is the signal this checker exists to catch and
+    must still match an exact reviewed normalization.
+    """
+
+    @staticmethod
+    def _entry(before: object, after: object, address: str = "m.a") -> dict:
+        return {
+            "address": address,
+            "mode": "managed",
+            "type": "aws_iam_role",
+            "change": {"actions": ["update"], "before": before, "after": after},
+        }
+
+    def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(plan, prior_state)
+
+    # --- the discriminator itself -------------------------------------------
+
+    def test_unrecorded_before_values_are_first_projections(self) -> None:
+        for label, before in (
+            ("absent", {"other": 1}),
+            ("null", {"other": 1, "k": None}),
+            ("empty-list", {"other": 1, "k": []}),
+            ("empty-dict", {"other": 1, "k": {}}),
+        ):
+            with self.subTest(label=label):
+                entry = self._entry({**before}, {**before, "k": ["populated"]})
+                self.assertTrue(CHECKER._drift_is_first_projection_only(entry))
+
+    def test_recorded_before_value_is_never_a_first_projection(self) -> None:
+        # A recorded value that changed is the signal. Scalars count as recorded
+        # even when falsy: "" / 0 / False are real provider settings, and a
+        # boolean flip is exactly the posture change that must not slip through.
+        for label, before_value, after_value in (
+            ("populated-list", ["a"], ["a", "b"]),
+            ("populated-dict", {"a": 1}, {"a": 2}),
+            ("empty-string", "", "arn:aws:kms:::key/real"),
+            ("zero", 0, 3),
+            ("false", False, True),
+            ("list-emptied", ["a"], []),
+            ("string-changed", "old", "new"),
+        ):
+            with self.subTest(label=label):
+                entry = self._entry({"k": before_value}, {"k": after_value})
+                self.assertFalse(CHECKER._drift_is_first_projection_only(entry))
+
+    def test_mixed_entry_needs_every_differing_key_unrecorded(self) -> None:
+        # One recorded key that changed taints the whole entry, even alongside
+        # any number of genuine projections.
+        entry = self._entry(
+            {"ok_actions": None, "tags": {}, "description": "reviewed"},
+            {"ok_actions": [], "tags": {"a": "b"}, "description": "tampered"},
+        )
+        self.assertFalse(CHECKER._drift_is_first_projection_only(entry))
+
+    def test_empty_before_object_is_not_a_first_projection(self) -> None:
+        # An empty before object is a CREATE (or a malformed entry), not a
+        # re-projection onto an object state already tracked.
+        self.assertFalse(
+            CHECKER._drift_is_first_projection_only(self._entry({}, {"k": ["v"]}))
+        )
+
+    def test_nothing_differing_is_not_a_first_projection(self) -> None:
+        # Must not be vacuously true: that would admit malformed entries whose
+        # before/after are identical, bypassing the bounded rejection diagnostic.
+        self.assertFalse(
+            CHECKER._drift_is_first_projection_only(
+                self._entry({"k": "v"}, {"k": "v"})
+            )
+        )
+
+    def test_malformed_change_envelopes_fail_closed(self) -> None:
+        for label, entry in (
+            ("no-change", {"address": "m.a"}),
+            ("change-not-object", {"address": "m.a", "change": "x"}),
+            ("before-not-object", self._entry("x", {"k": []})),
+            ("after-not-object", self._entry({"k": None}, "x")),
+            ("before-null", self._entry(None, {"k": []})),
+            ("item-not-object", "x"),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(CHECKER._drift_is_first_projection_only(entry))
+
+    def test_discriminator_is_not_the_attribute_name(self) -> None:
+        # Noise and signal arrive in the SAME attributes. `ingress` from an empty
+        # state is the Hub NLB read-back; `ingress` from a recorded rule set is a
+        # widened security group and must not be filtered.
+        rule = {"from_port": 62206, "to_port": 62206, "protocol": "udp"}
+        self.assertTrue(
+            CHECKER._drift_is_first_projection_only(
+                self._entry({"ingress": []}, {"ingress": [rule]})
+            )
+        )
+        self.assertFalse(
+            CHECKER._drift_is_first_projection_only(
+                self._entry(
+                    {"ingress": [rule]},
+                    {"ingress": [rule, {**rule, "cidr_blocks": ["0.0.0.0/0"]}]},
+                )
+            )
+        )
+
+    # --- end-to-end through check_plan --------------------------------------
+
+    def test_first_projection_outside_the_slice_is_admitted(self) -> None:
+        # The counterpart to
+        # test_authority_runtime_slice_completion_rejects_drift_outside_slice:
+        # base-resource drift that never held a prior value is admitted without
+        # any reviewed kind. This is the live sandbox shape (106 alarm
+        # projections on base resources during a slice completion).
+        role = next(
+            item["address"]
+            for item in authority_runtime_transition_fixture()["resource_changes"]
+            if item["type"] == "aws_iam_role"
+            and item["change"]["actions"] == ["create"]
+        )
+        candidate = authority_runtime_partial_retry_fixture({role})
+        candidate["resource_drift"] = [
+            _slice_refresh_drift(role, "aws_iam_role"),
+            _slice_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            ),
+            _slice_refresh_drift(
+                "module.control.aws_cloudwatch_metric_alarm.hub_target_health",
+                "aws_cloudwatch_metric_alarm",
+            ),
+        ]
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["normalization_drift_kind"], "first-projection")
+        self.assertEqual(summary["normalization_drift_count"], 3)
+
+    def test_one_substantive_entry_among_many_benign_is_rejected(self) -> None:
+        # The live shape with a tampered needle: 20 pure projections plus one
+        # recorded value that changed. The filter must not let the volume of
+        # benign entries carry the substantive one through.
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            _slice_refresh_drift(
+                f"module.control.aws_cloudwatch_metric_alarm.a{index}",
+                "aws_cloudwatch_metric_alarm",
+            )
+            for index in range(20)
+        ] + [
+            _substantive_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            )
+        ]
+        self.assert_rejected(candidate)
+
+    def test_rejection_diagnostic_names_only_substantive_entries(self) -> None:
+        # Filtering happens before the diagnostic, so the operator sees the one
+        # entry that actually carries a signal rather than the noise around it.
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            _slice_refresh_drift(
+                f"module.control.aws_cloudwatch_metric_alarm.a{index}",
+                "aws_cloudwatch_metric_alarm",
+            )
+            for index in range(20)
+        ] + [
+            _substantive_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            )
+        ]
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+        decoded = json.loads(
+            str(error.exception).split("resource_drift_identity=", 1)[1]
+        )
+        self.assertEqual(decoded["count"], 1)
+        self.assertEqual(
+            [identity["address"] for identity in decoded["identities"]],
+            ["module.control.aws_kms_key.authority_data"],
+        )
+
+    def test_publisher_roles_stay_on_the_strict_path(self) -> None:
+        # Their reviewed normalization is BY DEFINITION a first projection
+        # (before inline_policy is null or []), so filtering them would make
+        # _check_publisher_role_normalization unreachable and drop both the role
+        # identity proof and the no-op-plan binding. They must stay strict.
+        for address in (
+            "module.control.aws_iam_role.authority_publisher",
+            "module.control.aws_iam_role.hub_publisher",
+        ):
+            with self.subTest(address=address):
+                entry = self._entry({"inline_policy": []}, {"inline_policy": [{}]})
+                entry["address"] = address
+                self.assertTrue(CHECKER._drift_is_first_projection_only(entry))
+                benign, substantive = CHECKER._partition_first_projection_drift(
+                    [entry]
+                )
+                self.assertEqual(benign, [])
+                self.assertEqual(substantive, [entry])
+
+    def test_publisher_role_projection_still_requires_a_noop_plan(self) -> None:
+        # The invariant the strict-path exemption exists to preserve: this
+        # projection may not ride along with a resource transition.
+        normalization, prior_state = publisher_refresh_candidate()
+        candidate = redis_split_transition_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+        self.assert_rejected(candidate, prior_state)
+
+    def test_malformed_unhashable_address_reaches_the_diagnostic(self) -> None:
+        # The strict-address membership test must not raise TypeError on an
+        # unhashable address before the bounded, value-free diagnostic runs.
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": {"unhashable": True},
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": {
+                    "actions": ["update"],
+                    "before": {"k": "recorded"},
+                    "after": {"k": "changed"},
+                },
+            }
+        ]
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+        self.assertIn("resource_drift_identity=", str(error.exception))
+
+    def test_both_lanes_agree_on_a_substantive_rejection(self) -> None:
+        # Lane agreement must hold for rejection too, not just admission.
+        refresh = plan_fixture()
+        refresh["applyable"] = True
+        refresh["resource_drift"] = [
+            _substantive_refresh_drift(
+                "module.control.aws_kms_key.authority_data", "aws_kms_key"
+            )
+        ]
+        prior_state = terraform_1_14_refresh_only_golden(refresh)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_normalization_drift(refresh, prior_state)
+        self.assert_rejected(refresh, prior_state)
 
 
 if __name__ == "__main__":

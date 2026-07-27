@@ -2460,6 +2460,115 @@ def _normalization_drift_sha256(drift: list[dict[str, Any]]) -> str:
     return _json_sha256(ordered)
 
 
+def _drift_before_is_unrecorded(before: dict[str, Any], key: str) -> bool:
+    """Return True when state held NO prior value for ``key``.
+
+    "Unrecorded" is deliberately narrow: the key is absent, explicitly null, or
+    an EMPTY collection. A populated value of any kind is a recorded value, and
+    so is ``""``/``0``/``False`` -- those are real settings a provider can
+    return, not placeholders, and admitting them would let a scalar flip
+    (``false`` -> ``true`` on a public-access toggle) pass as a projection.
+    Emptiness is tested only on list/dict so Python's ``0 == False`` and
+    ``[] == ()`` coercions cannot widen it.
+    """
+    if key not in before:
+        return True
+    value = before[key]
+    if value is None:
+        return True
+    return isinstance(value, (list, dict)) and not value
+
+
+def _drift_is_first_projection_only(item: Any) -> bool:
+    """Return True when a drift entry carries no out-of-band-change signal.
+
+    Terraform's ``resource_drift`` mixes two very different things. When state
+    held a PRIOR VALUE and the refresh read a DIFFERENT one, something changed
+    outside Terraform -- an edited policy, a widened security-group rule, a
+    revoked KMS grant. That is the signal this checker exists to catch. When
+    state held NOTHING for an attribute and the refresh recorded one, state is
+    merely catching up to a reality it never described: Optional+Computed
+    collections the provider now returns (``ok_actions``,
+    ``insufficient_data_actions``, ``tags``), or a deprecated read-back such as
+    ``inline_policy``. Nothing changed; there was no prior value to change FROM.
+
+    The discriminator is NOT the attribute name -- signal and noise arrive in
+    the SAME attributes (``ingress``, ``inline_policy``) -- so it is the
+    before-value that decides.
+
+    Admitting these does not blind the checker to a live/config divergence. The
+    projected after-state is what Terraform computes the PLANNED changes
+    against, and those are validated separately and in full (inventory
+    equality, per-address action shape, ``_check_planned_security``, the
+    endpoint-policy and runtime-resource field contracts). If live differed
+    from config, the owning resource would carry a non-no-op planned change and
+    fail there. This is the same reasoning ``_require_inline_policy_projection``
+    already relies on for policy content.
+
+    Fails closed on anything it cannot positively prove benign.
+    """
+    change = item.get("change") if isinstance(item, dict) else None
+    before = change.get("before") if isinstance(change, dict) else None
+    after = change.get("after") if isinstance(change, dict) else None
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    if not before:
+        # An empty before object is a CREATE (or a malformed entry), not a
+        # re-projection onto an object state already tracked.
+        return False
+    differing = [
+        key
+        for key in (set(before) | set(after))
+        if not _json_equal(before.get(key), after.get(key))
+    ]
+    if not differing:
+        # Nothing differs. Returning True here would be vacuous and would admit
+        # malformed entries whose before/after are identical, so fail closed and
+        # let the strict path reject them with the bounded identity diagnostic.
+        return False
+    return all(_drift_before_is_unrecorded(before, key) for key in differing)
+
+
+# Addresses whose drift ALWAYS takes the strict reviewed-kind path, even when it
+# is a pure first projection. These are not exceptions to the discriminator --
+# they are the two roles whose reviewed normalization
+# (``_check_publisher_role_normalization``) is BY DEFINITION a first projection:
+# it requires ``before["inline_policy"]`` to be null or ``[]``. Filtering them
+# would make that checker unreachable and silently drop what it proves beyond
+# noise-classification: that the drifted role is the reviewed publisher identity
+# and that its projected inline policy matches the separately managed
+# ``aws_iam_role_policy`` in the same plan. The caller additionally binds this
+# kind to a pure no-op plan. Both properties are real invariants, so the two
+# addresses stay strict. This set is fixed and does NOT grow as new slices apply
+# -- neither role appears in the sandbox drift this change was measured against
+# -- so it cannot reintroduce the widening treadmill.
+_STRICT_DRIFT_ADDRESSES = frozenset(
+    {
+        "module.control.aws_iam_role.authority_publisher",
+        "module.control.aws_iam_role.hub_publisher",
+    }
+)
+
+
+def _partition_first_projection_drift(
+    drift: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split drift into (benign first projections, everything else)."""
+    benign: list[dict[str, Any]] = []
+    substantive: list[dict[str, Any]] = []
+    for item in drift:
+        address = item.get("address") if isinstance(item, dict) else None
+        # Guard the isinstance BEFORE the set membership: a malformed address can
+        # be an unhashable value (a dict), which would raise TypeError here
+        # instead of reaching the bounded, value-free rejection diagnostic.
+        strict = isinstance(address, str) and address in _STRICT_DRIFT_ADDRESSES
+        if not strict and _drift_is_first_projection_only(item):
+            benign.append(item)
+        else:
+            substantive.append(item)
+    return benign, substantive
+
+
 def _bounded_drift_identity_field(field: str, value: Any) -> tuple[str, bool]:
     """Render one public Terraform identity field without arbitrary values."""
     if not isinstance(value, str):
@@ -6330,9 +6439,30 @@ def _check_state_normalization_drift(
     Terraform marks that delta applyable for ``-refresh-only``. An ordinary
     refresh-enabled plan with no configuration changes is not applyable and is
     rejected by ``check_plan`` below, independent of the workflow operation.
+
+    Pure first projections (``_drift_is_first_projection_only``) are filtered
+    FIRST and carry no signal, so they never need a reviewed kind. Whatever
+    remains -- every entry where state held a prior value that changed -- still
+    requires an exact reviewed normalization below, unchanged.
     """
     if not drift:
         return "none"
+    # Invert the default. Matching an allowlist of attribute names and addresses
+    # made every newly applied slice a blocking widening PR, because a
+    # first-applied resource necessarily projects attributes no allowlist
+    # anticipated -- five such PRs in one day, none of which caught a defect. The
+    # measured sandbox Control drift was 108 of 110 pure first projections (106
+    # alarms re-projecting ok_actions/insufficient_data_actions, a listener tags
+    # -> {}, and the Hub NLB security group's ingress/egress read back from an
+    # empty state). Filtering on the before-value keeps the two real value
+    # changes -- the seeded Hub identity parameter and a replaced load-balancer
+    # ARN -- on the strict path, where they still must match a reviewed shape.
+    _, drift = _partition_first_projection_drift(drift)
+    if not drift:
+        return "first-projection"
+    # From here down ``drift`` is the substantive remainder, and every existing
+    # reviewed-kind matcher below sees exactly that. Rejection diagnostics
+    # therefore name only the entries that actually carry a signal.
     addresses = tuple(item.get("address") for item in drift)
     if addresses == _REDIS_PASSWORD_NORMALIZATION_ADDRESSES:
         if not refresh_only:
@@ -8771,9 +8901,18 @@ def check_plan(
         refresh_only="resource_changes" not in plan,
     )
     # ``_check_state_normalization_drift`` returns "none" iff ``drift`` is
-    # empty, so ``len(drift)`` already yields 0 in that case.
+    # empty, so ``len(drift)`` already yields 0 in that case. This stays the
+    # TOTAL observed drift, benign projections included, so the plan lane and
+    # the pre-apply live lane keep counting the same thing.
     normalization_drift_count = len(drift)
 
+    # "first-projection" is deliberately NOT bound to a plan_mode. Every other
+    # kind below is pinned to the transitions it may accompany because it
+    # reports a real value change whose blast radius depends on what else the
+    # plan does. A pure first projection reports no change at all -- state had no
+    # prior value -- so there is no interaction to constrain, and pinning it
+    # would rebuild exactly the per-transition treadmill this replaces. The
+    # planned changes it accompanies are still fully validated on their own.
     if normalization_drift_kind in (
         "publisher-role",
         "hub-publisher-role",
@@ -9059,6 +9198,19 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         )
     _check_no_embedded_actions(plan)
     drift = _non_noop(plan.get("resource_drift"), "resource_drift")
+    # Same first-projection filter, and in the same position (ahead of every
+    # reviewed-kind match), as the ``check_plan`` lane. The workflow compares
+    # {count, kind, sha256} between this live pre-apply observation and the
+    # reviewed plan, so the two lanes MUST classify identical drift identically
+    # or a benign projection aborts the apply. The count stays the TOTAL observed
+    # drift on both sides, and the sha256 covers the full array.
+    _, substantive = _partition_first_projection_drift(drift)
+    if drift and not substantive:
+        return {
+            "normalization_drift_count": len(drift),
+            "normalization_drift_kind": "first-projection",
+            "normalization_drift_sha256": _normalization_drift_sha256(drift),
+        }
     if (
         len(drift) == 2
         and {item.get("address") for item in drift}
