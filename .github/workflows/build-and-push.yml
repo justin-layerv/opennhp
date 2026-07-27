@@ -1864,6 +1864,22 @@ jobs:
       - name: Check terraform tag charset (#1915 regression fence)
         run: python3 ./.github/scripts/check-terraform-tag-charset.py terraform
 
+      - name: Run terraform-sg-rule-ownership fixture suite
+        # Fixtures first so a checker regression surfaces before it can
+        # mask real mixed ownership. The clean fixture asserts the
+        # cross-module resolver still reaches every group — a resolver
+        # that quietly stopped following references would otherwise
+        # "pass" by seeing nothing.
+        run: ./tests/lints/terraform-sg-rule-ownership/run-fixtures.sh
+
+      - name: Check terraform SG rule ownership (#3281 regression fence)
+        # An aws_security_group with an inline ingress/egress attribute is
+        # authoritative for that whole rule set and revokes any rule owned
+        # by a standalone *_security_group_rule resource. #3281 found that
+        # armed against the prod Redis SG, one apply away from dropping
+        # qurl-service's ECS ingress.
+        run: python3 ./.github/scripts/check-terraform-sg-rule-ownership.py terraform
+
       - name: Run ASG capacity-deficit alarm fixture suite
         # Fixtures first so a checker regression surfaces before it can
         # mask a real drift back to the non-published #2041 metric.

@@ -1,10 +1,15 @@
 """Shared helpers for the terraform-prod-drift lints (#1324).
 
-Both `check-terraform-iam-coverage.py` and
-`check-terraform-policy-conditions.py` walk the same terraform tree and
-parse the same `policy = jsonencode({...})` constructs; the helpers here
-keep them on a single canonical implementation. Adding a third lint? Reuse
-these.
+`check-terraform-iam-coverage.py`,
+`check-terraform-policy-conditions.py`, and
+`check-terraform-sg-rule-ownership.py` walk the same terraform tree; the
+helpers here keep them on a single canonical implementation. Adding
+another lint? Reuse these.
+
+`iter_module_calls` / `iter_outputs` exist for lints that must follow a
+reference across a module boundary — python-hcl2 parses each file in
+isolation, so the module graph has to be reassembled by hand from the
+`source` attribute on module calls and the `value` expression on outputs.
 
 The non-obvious bits this module hides:
 
@@ -163,6 +168,38 @@ def iter_data_sources(
                         unquote(name),
                         body if isinstance(body, dict) else {},
                     )
+
+
+def iter_module_calls(
+    parsed: list[tuple[Path, dict[str, Any]]],
+) -> Iterable[tuple[Path, str, dict[str, Any]]]:
+    """Yield (file, label, body) for every `module "label" { ... }` block.
+
+    Callers resolve `body["source"]` against `file.parent` to get the
+    callee's directory — that is the only reliable way to follow a
+    variable across a module boundary, because python-hcl2 parses each
+    file in isolation and has no notion of the module graph.
+    """
+    for file, doc in parsed:
+        for block in doc.get("module", []):
+            for label, body in block.items():
+                yield file, unquote(label), body if isinstance(body, dict) else {}
+
+
+def iter_outputs(
+    parsed: list[tuple[Path, dict[str, Any]]],
+) -> Iterable[tuple[Path, str, dict[str, Any]]]:
+    """Yield (file, name, body) for every `output "name" { ... }` block.
+
+    Paired with `iter_module_calls` this closes the loop for
+    cross-module reference resolution: a consumer passes
+    `module.X.some_output` into a child module's variable, and the
+    output's `value` expression names the underlying resource.
+    """
+    for file, doc in parsed:
+        for block in doc.get("output", []):
+            for name, body in block.items():
+                yield file, unquote(name), body if isinstance(body, dict) else {}
 
 
 def extract_policy_body(policy_value: Any) -> dict[str, Any] | None:

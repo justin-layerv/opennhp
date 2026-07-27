@@ -24,18 +24,18 @@ resource "aws_security_group" "redis" {
   vpc_id      = var.vpc_id
   description = "Security group for Redis ElastiCache"
 
-  # ElastiCache Serverless uses port 6379 with mandatory TLS.
-  # (Legacy non-serverless ElastiCache used 6380 for TLS, but Serverless
-  # standardized on 6379 for all connections.)
-  ingress {
-    from_port   = 6379
-    to_port     = 6379
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "Redis from VPC (ElastiCache Serverless, TLS enforced)"
-  }
-
-  # No egress rules - Redis (ElastiCache Serverless) does not initiate
+  # This resource deliberately declares NO inline ingress/egress blocks.
+  # `security_group_id` is exported (outputs.tf) and qurl-service attaches
+  # its own standalone rule to this SG cross-module, so the rule set has
+  # more than one writer. `ingress`/`egress` on aws_security_group are
+  # Optional+Computed: a single inline block makes this resource
+  # authoritative for the WHOLE attribute and it then revokes every rule it
+  # does not itself declare. That is what #3281 found in prod — the inline
+  # VPC-CIDR block below was silently planning to revoke qurl-service's
+  # ecs_to_redis rule on the next apply. Rules now live in standalone
+  # resources only (this file, plus qurl-service's ecs_to_redis).
+  #
+  # No egress rules — Redis (ElastiCache Serverless) does not initiate
   # outbound connections. It only responds to inbound client requests.
 
   tags = merge(var.tags, {
@@ -46,7 +46,38 @@ resource "aws_security_group" "redis" {
 
   lifecycle {
     create_before_destroy = true
+
+    # Freeze both rule attributes so a future inline block cannot quietly
+    # re-arm the revocation race against the standalone owners. Mirrors the
+    # same guard on bootstrap-alb, relay, and relay-network's SGs.
+    # `.github/scripts/check-terraform-sg-rule-ownership.py` fences the
+    # source-level invariant; this is the runtime backstop.
+    ignore_changes = [ingress, egress]
   }
+}
+
+# Sole owner of the VPC-CIDR ingress rule. Port/protocol/CIDR and the
+# description are byte-identical to the inline block this replaces, so the
+# environment-level import blocks adopt the existing rule in place rather
+# than revoking and recreating it — there is no traffic gap during the
+# ownership transition.
+resource "aws_vpc_security_group_ingress_rule" "redis_from_vpc" {
+  security_group_id = aws_security_group.redis.id
+
+  # ElastiCache Serverless uses port 6379 with mandatory TLS.
+  # (Legacy non-serverless ElastiCache used 6380 for TLS, but Serverless
+  # standardized on 6379 for all connections.)
+  from_port   = 6379
+  to_port     = 6379
+  ip_protocol = "tcp"
+  cidr_ipv4   = var.vpc_cidr
+  description = "Redis from VPC (ElastiCache Serverless, TLS enforced)"
+
+  tags = merge(var.tags, {
+    Name      = "${local.cluster_name}-from-vpc"
+    Component = "redis"
+    Cell      = var.cell_id
+  })
 }
 
 # ==================== Subnet Group ====================
