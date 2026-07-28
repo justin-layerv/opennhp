@@ -1260,6 +1260,48 @@ resource "aws_iam_role_policy" "qurl_agent_key_inventory" {
   })
 }
 
+# Cloud Map instance registration for the cell-local qurl-api name.
+#
+# A private cell exposes its internal qurl ALB as qurl-api.<namespace>, and that
+# name CANNOT be a Route53 record: the namespace's hosted zone is Cloud Map
+# owned and Route53 refuses direct writes to it ("can only be managed through
+# AWS Cloud Map"). The only way to publish the name is an
+# aws_service_discovery_instance carrying AWS_INSTANCE_CNAME, whose CRUD is
+# Register/DeregisterInstance -- neither of which the role's existing
+# servicediscovery grants cover (they are Get*/List* plus namespace and service
+# creation).
+#
+# This is a SEPARATE inline policy on purpose, for two reasons documented in
+# terraform/CLAUDE.md and enforced by CI:
+#   * the relay-DMZ boundary resources (context_lookups, context_lookups_relay_ssm,
+#     terraform_apply_relay_dmz) must stay no-op in ordinary deploys, so an
+#     unrelated statement added to one of them breaks check-relay-dmz-plan.py;
+#   * the nhp-<env>-github-actions role sits at the AWS default 10/10 attached
+#     managed policies, so this cannot be an 11th managed attachment.
+#
+# Scoped to instances under this environment's own services rather than "*".
+resource "aws_iam_role_policy" "servicediscovery_instance_registration" {
+  name = "servicediscovery-instance-registration"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudMapCellInstanceRegistration"
+        Effect = "Allow"
+        Action = [
+          "servicediscovery:RegisterInstance",
+          "servicediscovery:DeregisterInstance",
+        ]
+        Resource = [
+          "arn:aws:servicediscovery:${local.region}:${local.account_id}:service/*",
+        ]
+      },
+    ]
+  })
+}
+
 # Run Command is needed only by the relay-enabled sandbox integration and is
 # isolated from the context-lookups policy so production retains its existing
 # document unchanged. SendCommand authorization evaluates both the document

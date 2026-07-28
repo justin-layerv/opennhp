@@ -149,9 +149,27 @@ module "kms" {
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
-  # qURL v2 issuance/admission remains off in this dark topology slice.
-  qurl_v2_issuer_key_enabled         = false
-  qurl_v2_resource_keys_enabled      = false
+  # qURL v2 ISSUANCE/ADMISSION remains off in this dark topology slice; cell1
+  # mints no tickets and admits nothing.
+  qurl_v2_issuer_key_enabled = false
+
+  # Resource keys are NOT part of that gate and must be on. The qurl-service
+  # image treats the resource public key as public REST resource identity and
+  # refuses to boot without it:
+  #
+  #   fatal error: invalid configuration: QURL_V2_RESOURCE_KEYS_ENABLED=true is
+  #   required because public REST resource identity is the resource public key
+  #
+  # so leaving this false made the cell1 task exit on every start. cell0 already
+  # runs with it true (terraform/environments/sandbox/terraform.tfvars), so this
+  # is parity, not a new capability -- and it stays independent of issuance,
+  # which the flag above still holds dark.
+  qurl_v2_resource_keys_enabled = true
+
+  # No IAM propagation shim here, unlike terraform/main.tf. That shim waits on
+  # the CI role's kms:EnableKeyRotation grant landing via module.ecr's apply
+  # policy; this lean root is applied out-of-band with operator credentials that
+  # already hold it, and it has no module.ecr to key the wait on.
   resource_key_envelope_create_after = null
 }
 

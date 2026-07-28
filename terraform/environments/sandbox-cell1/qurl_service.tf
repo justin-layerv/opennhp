@@ -67,8 +67,14 @@ locals {
     ]),
     false,
   )
+  # tostring() rather than a bare `== 1`, so this check cannot silently break
+  # again if the fallbacks above ever stop being `null`. The exact numeric form
+  # is not left to this check anyway: it is pinned, more strictly, by
+  # qurl_service_runtime_contract_canonical_json below, which rebuilds the
+  # document with a literal number and compares it to the raw parameter bytes.
+  # A string-typed schema_version therefore still fails closed there.
   qurl_service_runtime_contract_identity_valid = try(
-    local.qurl_service_runtime_contract.schema_version == 1
+    tostring(local.qurl_service_runtime_contract.schema_version) == "1"
     && startswith(
       local.qurl_service_runtime_contract.image_uri,
       "${data.aws_ecr_repository.qurl_service.repository_url}@sha256:",
@@ -77,8 +83,24 @@ locals {
     && can(regex("^[0-9a-f]{40}$", local.qurl_service_runtime_contract.source_revision)),
     false,
   )
+  # Rebuild the document from its parts rather than re-encoding the decoded
+  # value. Re-encoding is what made this unsatisfiable before the `null`
+  # fallbacks above: any type collapse rewrote schema_version to "1", so
+  # jsonencode(<decoded>) emitted 230 bytes against the publisher's 228 and
+  # could never equal the raw parameter for ANY valid contract.
+  #
+  # Reconstructing with a literal 1 removes that coupling entirely -- this
+  # comparison no longer depends on how the decode happened to be typed -- and
+  # is STRICTER than the original intent. It pins numeric form, key set, key
+  # order (jsonencode sorts) and compact separators in one comparison against
+  # the raw bytes, so a contract whose schema_version were 2, or string-typed,
+  # or reordered, or whitespace-padded, still fails closed here.
   qurl_service_runtime_contract_canonical_json = try(
-    local.qurl_service_runtime_contract_raw == jsonencode(local.qurl_service_runtime_contract),
+    local.qurl_service_runtime_contract_raw == jsonencode({
+      schema_version  = 1
+      image_uri       = local.qurl_service_runtime_contract.image_uri
+      source_revision = local.qurl_service_runtime_contract.source_revision
+    }),
     false,
   )
   qurl_service_deployable = (
@@ -463,6 +485,13 @@ module "qurl_service" {
   cell_id     = var.cell_id
   tags        = merge(local.common_tags, { Service = "qurl" })
 
+  # Required by the image itself, not optional hardening -- see the comment on
+  # module.kms in main.tf. The module's own precondition also refuses the flag
+  # without a non-empty envelope CMK, which module.kms only creates when its
+  # matching flag is true, so these two move together by construction.
+  qurl_v2_resource_keys_enabled         = true
+  qurl_v2_resource_key_envelope_key_arn = module.kms.qurl_v2_resource_key_envelope_key_arn
+
   resource_name_prefix = local.qurl_service_resource_name_prefix
 
   vpc_id             = module.networking.vpc_id
@@ -474,6 +503,26 @@ module "qurl_service" {
   ingress_security_group_ids = [module.compute.security_group_id]
   api_base_url               = local.qurl_service_private_origin
   enforce_internal_alb_only  = true
+
+  # Deny list of this cell's root-delegating CMKs, mirroring
+  # local.qurl_v2_resource_key_protected_kms_arns in terraform/main.tf. Without
+  # it a compromised task could TagResource one of these with
+  # purpose=qurl-v2-resource-key and reach it through the tag-scoped grant --
+  # including ScheduleKeyDeletion on the envelope CMK every wrapped software
+  # resource key depends on. The module refuses the feature with an empty list
+  # rather than silently granting the tag-scoped policy with no Deny.
+  #
+  # compact() drops qurl_v2_issuer_key_arn, which is null here because cell1
+  # deliberately keeps issuance dark (module.kms in main.tf).
+  qurl_v2_resource_key_protected_kms_arns = compact([
+    module.kms.ebs_key_arn,
+    module.kms.efs_key_arn,
+    module.kms.secrets_key_arn,
+    module.kms.logs_key_arn,
+    module.kms.rds_key_arn,
+    module.kms.qurl_v2_issuer_key_arn,
+    module.kms.qurl_v2_resource_key_envelope_key_arn,
+  ])
 
   ecr_repo_url        = data.aws_ecr_repository.qurl_service.repository_url
   image_tag_ssm_param = "/${local.name_prefix}/qurl-api-image-tag"
@@ -566,19 +615,58 @@ module "qurl_service" {
   ]
 }
 
-# Private Route53 alias inside the cell1 Cloud Map namespace. It resolves only
-# from the cell1 VPC and targets an internal ALB whose SG admits only the NHP
-# server SG. There is no public record and no 0.0.0.0/0 listener rule.
-resource "aws_route53_record" "qurl_service_private" {
+# Private cell1 name for the internal qurl ALB. Resolves only from the cell1
+# VPC and targets an internal ALB whose SG admits only the NHP server SG. There
+# is no public record and no 0.0.0.0/0 listener rule.
+#
+# This MUST go through Cloud Map, not aws_route53_record. The zone behind
+# aws_service_discovery_private_dns_namespace is owned by Cloud Map, and Route53
+# refuses direct writes to it:
+#
+#   AccessDenied: The resource hostedzone/Z10224932OY0NJE0XW9SV can only be
+#   managed through AWS Cloud Map (arn:aws:servicediscovery:...:namespace/...)
+#
+# so the previous aws_route53_record alias could never apply. It had never run
+# before because this is the first apply with deploy_qurl_service = true.
+#
+# Cloud Map cannot express a Route53 *alias* to an ALB, so this registers a
+# CNAME instance instead. The resolved name is byte-identical
+# (qurl-api.<namespace>), which is what keeps qurl_service_private_origin and
+# every consumer of it unchanged. CNAME records in Cloud Map require the
+# WEIGHTED routing policy.
+#
+# The one behavioural difference from the unusable alias is that an alias would
+# have carried evaluate_target_health. Target health is still enforced where it
+# matters -- the ALB health-checks its own targets and fails requests to
+# unhealthy ones -- this only means DNS itself does not withdraw the name.
+resource "aws_service_discovery_service" "qurl_service_private" {
   count = local.qurl_service_deployable ? 1 : 0
 
-  zone_id = aws_service_discovery_private_dns_namespace.cell1.hosted_zone
-  name    = local.qurl_service_private_dns_name
-  type    = "A"
+  name = "qurl-api"
 
-  alias {
-    name                   = module.qurl_service[0].alb_dns_name
-    zone_id                = module.qurl_service[0].alb_zone_id
-    evaluate_target_health = true
+  dns_config {
+    namespace_id   = aws_service_discovery_private_dns_namespace.cell1.id
+    routing_policy = "WEIGHTED"
+
+    dns_records {
+      ttl  = 60
+      type = "CNAME"
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-qurl-api"
+    Component = "qurl-service"
+  })
+}
+
+resource "aws_service_discovery_instance" "qurl_service_private" {
+  count = local.qurl_service_deployable ? 1 : 0
+
+  instance_id = "qurl-api-alb"
+  service_id  = aws_service_discovery_service.qurl_service_private[0].id
+
+  attributes = {
+    AWS_INSTANCE_CNAME = module.qurl_service[0].alb_dns_name
   }
 }

@@ -42,11 +42,14 @@ green_standby_min_size = 0 # cold green standby; still publishes green TGs + swi
 log_level = 4 # debug
 
 # --- Private qurl-service ----------------------------------------------------
-# Keep false until the qurl-service main-only publisher has populated
-# /sandbox-cell1/nhp/qurl-service/runtime-contract with one reviewed
-# {repo@sha256, full source revision} pair. Enabling this does NOT activate the
-# cell catalog; it creates a private-only ECS/ALB service for live proof.
-deploy_qurl_service = false
+# Enabled 2026-07-28: the qurl-service main-only publisher (publish-cell-runtime
+# run 30326312353, phase=publish_only) populated
+# /sandbox-cell1/nhp/qurl-service/runtime-contract with the reviewed pair
+# {layerv/nhp-qurl@sha256:59935a38..., 0b7c5a54009e7ab5be9e3aaf582037b127789e1d},
+# which is step 2 of the ordered dark rollout in qurl_service.tf. This is step 3.
+# Enabling this does NOT activate the cell catalog; it creates a private-only
+# ECS/ALB service for live proof.
+deploy_qurl_service = true
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_cookie_domain  = ".qurl.site.layerv.xyz"
 qurl_link_domain    = "qurl.link.layerv.xyz"

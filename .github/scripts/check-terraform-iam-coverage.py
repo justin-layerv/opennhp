@@ -733,6 +733,23 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
         "ses:DeleteConfigurationSetEventDestination",
         "ses:GetConfigurationSetEventDestinations",
     ],
+    # internal/service/servicediscovery/instance.go — create and update are the
+    # same RegisterInstance call (the provider upserts), delete is
+    # DeregisterInstance, and read is GetInstance. Both mutations return an
+    # operation id the provider then polls, hence GetOperation.
+    #
+    # Mapped here rather than grandfathered in RESOURCE_UNCHECKED_ACK, even
+    # though its two sibling servicediscovery types are grandfathered: that list
+    # means "the apply role is already known to cover this", and the only
+    # evidence this type applies cleanly is an out-of-band operator apply of the
+    # lean sandbox-cell1 root, not the CI apply role. Claiming the grandfather
+    # on that basis is exactly the unverified assertion the check warns about.
+    "aws_service_discovery_instance": [
+        "servicediscovery:RegisterInstance",
+        "servicediscovery:DeregisterInstance",
+        "servicediscovery:GetInstance",
+        "servicediscovery:GetOperation",
+    ],
 }
 
 # Grandfathered resource types: present in `terraform/` when resource-create
