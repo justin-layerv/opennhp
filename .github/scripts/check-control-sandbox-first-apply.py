@@ -345,17 +345,17 @@ PROVISIONED_CELL_CATALOG = {
         "nhp_port": 62206,
         "server_public_key_b64": "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8=",
         "selection_weight": "1",
-        "updated_at": "2026-07-25T00:00:00Z",
+        "updated_at": "2026-07-27T00:00:00Z",
     },
     "cell1": {
         "cell_id": "cell1",
-        "status": "disabled",
+        "status": "active",
         "endpoint_revision": 1,
         "nhp_host": "cell1.nhp.layerv.xyz",
         "nhp_port": 62206,
         "server_public_key_b64": "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=",
         "selection_weight": "1",
-        "updated_at": "2026-07-25T00:00:00Z",
+        "updated_at": "2026-07-27T00:00:00Z",
     },
 }
 PROVISIONED_CELL_DYNAMODB_ITEMS = {
