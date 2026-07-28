@@ -76,7 +76,9 @@ resource "aws_ssm_document" "repair" {
 }
 
 data "aws_ssm_parameter" "asg_name" {
-  for_each = var.asg_name_ssm_parameters
+  # Keyed by the parameter path itself, so a parameter shared by two fleets is
+  # read exactly once.
+  for_each = toset(flatten(values(var.asg_name_ssm_parameters)))
 
   name = each.value
 }
@@ -90,9 +92,16 @@ resource "aws_ssm_association" "repair" {
   schedule_expression = var.repair_schedule_expression
 
   # Exactly one target selector — the producer rejects any other target shape.
+  # Its values are EVERY colour's ASG for this fleet, sorted so the plan does
+  # not churn on input order. The producer pins this exact set and additionally
+  # requires the colour it resolved as active to be a member, so widening from
+  # one name to the fleet's full colour set does not loosen what is proven.
   targets {
-    key    = "tag:aws:autoscaling:groupName"
-    values = [nonsensitive(data.aws_ssm_parameter.asg_name[each.key].value)]
+    key = "tag:aws:autoscaling:groupName"
+    values = sort(distinct([
+      for parameter in each.value :
+      nonsensitive(data.aws_ssm_parameter.asg_name[parameter].value)
+    ]))
   }
 
   # Fail closed: one node that cannot prove the exact installed bytes fails the

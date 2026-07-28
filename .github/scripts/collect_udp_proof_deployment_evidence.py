@@ -2934,6 +2934,7 @@ def _verify_repair(
     instance_id: str,
     *,
     autoscaling_group: str,
+    attested_asg_names: list[str],
     collector_contract: dict[str, Any],
 ) -> str:
     association_id = attestation["repair_association_id"]
@@ -2953,13 +2954,19 @@ def _verify_repair(
         or association.get("Name") != collector_contract["repair_document_name"]
         or association.get("DocumentVersion")
         != collector_contract["repair_document_version"]
+        # The association targets EVERY colour of the fleet, because it is
+        # plan-time state and the active colour changes at runtime. Pin that
+        # exact set -- so an unrelated or extra ASG is still rejected -- and
+        # separately require the colour resolved as active to be a member, so a
+        # fleet whose active colour is not actually covered fails closed.
         or association.get("Targets")
         != [
             {
                 "Key": "tag:aws:autoscaling:groupName",
-                "Values": [autoscaling_group],
+                "Values": attested_asg_names,
             }
         ]
+        or autoscaling_group not in attested_asg_names
         # Success comes from Overview, NOT Status. DescribeAssociation omits the
         # Status member entirely for a tag-targeted State Manager association --
         # verified against all three live repair associations, where "Status" is
@@ -3286,6 +3293,26 @@ def _reserved_launch_template_tags(instance: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_attested_asg_names(workload_key: str) -> list[str]:
+    """Every ASG the workload's repair association is allowed to target.
+
+    For a blue/green fleet that is both colours' groups. The association is
+    plan-time state while the active colour changes at runtime, so it targets
+    every colour rather than re-encoding create-time colour; the caller still
+    pins this exact set AND requires the resolved active group to be in it.
+    """
+    spec = EC2_WORKLOADS[workload_key]
+    if spec["active_color_parameter"] is None:
+        return [_resolve_active_asg_name(workload_key)]
+    names = {
+        contract._string(
+            _ssm_parameter(parameter)["Value"], f"{workload_key} {color} ASG name"
+        )
+        for color, parameter in spec["color_asg_parameters"].items()
+    }
+    return sorted(names)
+
+
 def _resolve_active_asg_name(workload_key: str) -> str:
     """Resolve the ASG that actually serves the workload's active colour.
 
@@ -3336,6 +3363,7 @@ def _collect_ec2_workload(
 ) -> dict[str, Any]:
     spec = EC2_WORKLOADS[workload_key]
     asg_name = _resolve_active_asg_name(workload_key)
+    attested_asg_names = _resolve_attested_asg_names(workload_key)
     response = _aws(
         "autoscaling",
         ["describe-auto-scaling-groups", "--auto-scaling-group-names", asg_name],
@@ -3557,6 +3585,7 @@ def _collect_ec2_workload(
             attestation,
             instance_id,
             autoscaling_group=asg_name,
+            attested_asg_names=attested_asg_names,
             collector_contract=collector_contract,
         )
         if attestation["repair_last_success_at"] != live_repair:

@@ -51,22 +51,40 @@ variables {
 run "storage_boundary_contract" {
   command = apply
 
+  # The live values, verified in 767397897469/us-east-2. Note that cell0's
+  # blue-asg-name and /sandbox/nhp/server/asg-name hold the SAME name --
+  # that identity is exactly why asg-name is useless as an active-colour
+  # pointer and why the green fleet went unattested.
   override_data {
-    target = data.aws_ssm_parameter.asg_name["nhp_cell0"]
+    target = data.aws_ssm_parameter.asg_name["/sandbox/nhp/server/blue-asg-name"]
     values = {
       value = "layerv-nhp-sandbox-server"
     }
   }
 
   override_data {
-    target = data.aws_ssm_parameter.asg_name["nhp_cell1"]
+    target = data.aws_ssm_parameter.asg_name["/sandbox/nhp/server/green-asg-name"]
+    values = {
+      value = "layerv-nhp-sandbox-server-green"
+    }
+  }
+
+  override_data {
+    target = data.aws_ssm_parameter.asg_name["/sandbox-cell1/nhp/server/blue-asg-name"]
     values = {
       value = "layerv-nhp-sandbox-cell1-server"
     }
   }
 
   override_data {
-    target = data.aws_ssm_parameter.asg_name["qurl_reverse_tunnel_server"]
+    target = data.aws_ssm_parameter.asg_name["/sandbox-cell1/nhp/server/green-asg-name"]
+    values = {
+      value = "layerv-nhp-sandbox-cell1-server-green"
+    }
+  }
+
+  override_data {
+    target = data.aws_ssm_parameter.asg_name["/sandbox/nhp/reverse-tunnel-server/asg-name"]
     values = {
       value = "layerv-nhp-sandbox-frps"
     }
@@ -201,21 +219,35 @@ run "storage_boundary_contract" {
         association.document_version == aws_ssm_document.repair.document_version &&
         length(association.targets) == 1 &&
         association.targets[0].key == "tag:aws:autoscaling:groupName" &&
-        length(association.targets[0].values) == 1 &&
+        length(association.targets[0].values) > 0 &&
+        length(association.targets[0].values) == length(distinct(association.targets[0].values)) &&
+        association.targets[0].values == sort(association.targets[0].values) &&
         association.max_errors == "0" &&
         association.schedule_expression == "rate(30 minutes)"
       )
     ])
-    error_message = "Each repair association must target exactly one ASG by tag, pin the exact document version, and fail closed."
+    error_message = "Each repair association must target its ASGs by tag as one sorted distinct selector, pin the exact document version, and fail closed."
   }
 
+  # Both cells are blue/green, so both colours must be targeted. Targeting only
+  # the colour-blind asg-name (which equals blue-asg-name) left cell0's ACTIVE
+  # green fleet with no collector installed and no attestations at all, so the
+  # producer could never assemble evidence for the fleet actually serving UDP.
   assert {
     condition = (
-      aws_ssm_association.repair["nhp_cell0"].targets[0].values == tolist(["layerv-nhp-sandbox-server"]) &&
-      aws_ssm_association.repair["nhp_cell1"].targets[0].values == tolist(["layerv-nhp-sandbox-cell1-server"]) &&
-      aws_ssm_association.repair["qurl_reverse_tunnel_server"].targets[0].values == tolist(["layerv-nhp-sandbox-frps"])
+      aws_ssm_association.repair["nhp_cell0"].targets[0].values == tolist([
+        "layerv-nhp-sandbox-server",
+        "layerv-nhp-sandbox-server-green",
+      ]) &&
+      aws_ssm_association.repair["nhp_cell1"].targets[0].values == tolist([
+        "layerv-nhp-sandbox-cell1-server",
+        "layerv-nhp-sandbox-cell1-server-green",
+      ]) &&
+      aws_ssm_association.repair["qurl_reverse_tunnel_server"].targets[0].values == tolist([
+        "layerv-nhp-sandbox-frps",
+      ])
     )
-    error_message = "Each attested fleet's association must target its own exact ASG."
+    error_message = "Every colour of each attested fleet must be targeted, so the active colour is always covered."
   }
 
   # ---------------------------------------------------------------------------

@@ -27,12 +27,20 @@ variable "attested_node_roles" {
 }
 
 variable "asg_name_ssm_parameters" {
-  description = "Canonical SSM parameters holding each attested fleet's exact ASG name."
-  type        = map(string)
+  description = "Canonical SSM parameters holding each attested fleet's exact ASG names. Blue/green fleets list every colour."
+  type        = map(list(string))
   default = {
-    nhp_cell0                  = "/sandbox/nhp/server/asg-name"
-    nhp_cell1                  = "/sandbox-cell1/nhp/server/asg-name"
-    qurl_reverse_tunnel_server = "/sandbox/nhp/reverse-tunnel-server/asg-name"
+    nhp_cell0 = [
+      "/sandbox/nhp/server/blue-asg-name",
+      "/sandbox/nhp/server/green-asg-name",
+    ]
+    nhp_cell1 = [
+      "/sandbox-cell1/nhp/server/blue-asg-name",
+      "/sandbox-cell1/nhp/server/green-asg-name",
+    ]
+    qurl_reverse_tunnel_server = [
+      "/sandbox/nhp/reverse-tunnel-server/asg-name",
+    ]
   }
 }
 

@@ -291,6 +291,143 @@ class CollectIdentityTest(unittest.TestCase):
 
 
 
+class _StopSelection(Exception):
+    """Raised once association selection has succeeded, to stop the collector."""
+
+    def __init__(self, association_id: str) -> None:
+        super().__init__(association_id)
+        self.association_id = association_id
+
+
+class RepairAssociationCoverageTest(unittest.TestCase):
+    """A node must find the association that COVERS its ASG, not one that only names it.
+
+    Observed live on 2026-07-28: after the repair association was corrected to
+    target both colours, every green cell0 node installed the collector and its
+    timer, then failed every run with "this ASG has no unique repair
+    association" and published nothing --
+
+        layerv-runtime-attestation.service: Main process exited, status=1/FAILURE
+
+    -- because the match required `Targets == [{...: [own asg]}]`. That is the
+    same colour-blind assumption as the producer's, one layer further down.
+    """
+
+    DOCUMENT = "layerv-nhp-sandbox-runtime-attestation-repair"
+    BLUE = "layerv-nhp-sandbox-server"
+    GREEN = "layerv-nhp-sandbox-server-green"
+    ASSOCIATION_ID = "3b7fbdbc-77c6-4d2f-874b-c6a1581071ea"
+
+    def _association(self, values, *, name=None, association_id=None):
+        return {
+            "Name": name or self.DOCUMENT,
+            "AssociationId": association_id or self.ASSOCIATION_ID,
+            "Targets": [
+                {"Key": "tag:aws:autoscaling:groupName", "Values": list(values)}
+            ],
+        }
+
+    def _resolve(self, associations, autoscaling_group):
+        """Run only the association-selection half of `_collect_repair`."""
+        calls = []
+
+        def fake_aws(service, arguments, name):
+            calls.append(arguments[0])
+            if arguments[0] == "list-associations":
+                return {"Associations": associations}
+            # Selection succeeded; stop before the executions query.
+            raise _StopSelection(self.ASSOCIATION_ID)
+
+        with mock.patch.object(collector, "_aws", side_effect=fake_aws):
+            try:
+                collector._collect_repair(self.DOCUMENT, autoscaling_group)
+            except _StopSelection as reached:
+                return reached.association_id
+        raise AssertionError("selection did not reach the executions query")
+
+    def test_green_node_is_covered_by_the_both_colour_association(self) -> None:
+        # The live shape after the fix.
+        self.assertEqual(
+            self._resolve([self._association([self.BLUE, self.GREEN])], self.GREEN),
+            self.ASSOCIATION_ID,
+        )
+
+    def test_blue_node_is_still_covered(self) -> None:
+        self.assertEqual(
+            self._resolve([self._association([self.BLUE, self.GREEN])], self.BLUE),
+            self.ASSOCIATION_ID,
+        )
+
+    def test_uncovered_asg_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            collector.CollectorError, "no unique repair association"
+        ):
+            self._resolve(
+                [self._association([self.BLUE, self.GREEN])],
+                "layerv-nhp-sandbox-frps",
+            )
+
+    def test_two_covering_associations_are_ambiguous(self) -> None:
+        # The producer pins ONE association id per instance, so two associations
+        # covering the same ASG must not silently resolve to the first.
+        with self.assertRaisesRegex(
+            collector.CollectorError, "no unique repair association"
+        ):
+            self._resolve(
+                [
+                    self._association([self.BLUE, self.GREEN]),
+                    self._association(
+                        [self.GREEN],
+                        association_id="00000000-1111-2222-3333-444444444444",
+                    ),
+                ],
+                self.GREEN,
+            )
+
+    def test_foreign_document_is_ignored(self) -> None:
+        with self.assertRaisesRegex(
+            collector.CollectorError, "no unique repair association"
+        ):
+            self._resolve(
+                [self._association([self.GREEN], name="some-other-document")],
+                self.GREEN,
+            )
+
+    def test_malformed_selectors_fail_closed(self) -> None:
+        def association(targets):
+            return {
+                "Name": self.DOCUMENT,
+                "AssociationId": self.ASSOCIATION_ID,
+                "Targets": targets,
+            }
+
+        tag = "tag:aws:autoscaling:groupName"
+        malformed = [
+            # Two selectors: the association must carry exactly one.
+            [
+                {"Key": tag, "Values": [self.GREEN]},
+                {"Key": "InstanceIds", "Values": ["*"]},
+            ],
+            # Wrong selector key -- an InstanceIds wildcard must never match.
+            [{"Key": "InstanceIds", "Values": ["*"]}],
+            # Extra member smuggled into the selector.
+            [{"Key": tag, "Values": [self.GREEN], "Unexpected": "value"}],
+            # Values is not a list (a bare string would still "contain" the ASG
+            # under a substring test).
+            [{"Key": tag, "Values": self.GREEN}],
+            # No selector at all.
+            [],
+        ]
+        for targets in malformed:
+            with (
+                self.subTest(targets=targets),
+                self.assertRaisesRegex(
+                    collector.CollectorError, "no unique repair association"
+                ),
+            ):
+                self._resolve([association(targets)], self.GREEN)
+
+
 class RepairExecutionOrderingTest(unittest.TestCase):
     """A Status filter destroys DescribeAssociationExecutions' ordering.
 

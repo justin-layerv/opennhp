@@ -69,16 +69,60 @@ variable "attested_node_roles" {
 
 variable "asg_name_ssm_parameters" {
   description = <<-EOT
-    Canonical SSM parameters holding each attested fleet's exact ASG name,
+    Canonical SSM parameters holding each attested fleet's exact ASG names,
     keyed by the same workload keys as attested_node_roles. The repair
     association targets those exact ASGs, which is what the producer verifies
-    (`Targets == [{tag:aws:autoscaling:groupName: [<asg>]}]`).
+    (`Targets == [{tag:aws:autoscaling:groupName: [<asg>...]}]`).
+
+    A blue/green fleet lists EVERY colour's ASG parameter, not the active one.
+    The association is plan-time state while the active colour changes at
+    runtime, so resolving <env>/nhp/server/active-color here would re-encode
+    create-time colour into the plan and drift on the next switch. Targeting
+    every colour keeps the plan stable across a switch AND guarantees the
+    colour that is active now is always covered.
+
+    <env>/nhp/server/asg-name must NOT appear: modules/compute publishes it
+    from the base/blue group for CI/CD instance refreshes, so it names blue no
+    matter which colour serves traffic. Targeting it left the active green
+    fleet with no collector installed and no attestations at all.
   EOT
-  type        = map(string)
+  type        = map(list(string))
   default = {
-    nhp_cell0                  = "/sandbox/nhp/server/asg-name"
-    nhp_cell1                  = "/sandbox-cell1/nhp/server/asg-name"
-    qurl_reverse_tunnel_server = "/sandbox/nhp/reverse-tunnel-server/asg-name"
+    nhp_cell0 = [
+      "/sandbox/nhp/server/blue-asg-name",
+      "/sandbox/nhp/server/green-asg-name",
+    ]
+    nhp_cell1 = [
+      "/sandbox-cell1/nhp/server/blue-asg-name",
+      "/sandbox-cell1/nhp/server/green-asg-name",
+    ]
+    # Not blue/green: the whole /sandbox/nhp/reverse-tunnel-server/ path is
+    # asg-name, image-tag and min-client-version, with no active-color marker.
+    qurl_reverse_tunnel_server = [
+      "/sandbox/nhp/reverse-tunnel-server/asg-name",
+    ]
+  }
+
+  validation {
+    condition     = alltrue([for parameters in values(var.asg_name_ssm_parameters) : length(parameters) > 0])
+    error_message = "Every attested fleet must list at least one ASG name parameter."
+  }
+
+  validation {
+    condition = alltrue([
+      for parameters in values(var.asg_name_ssm_parameters) :
+      length(parameters) == length(distinct(parameters))
+    ])
+    error_message = "Each fleet's ASG name parameters must be distinct."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for parameters in values(var.asg_name_ssm_parameters) : [
+        for parameter in parameters : !endswith(parameter, "/server/asg-name")
+      ]
+    ]))
+    error_message = "The colour-blind <env>/nhp/server/asg-name must not be an attested ASG source; list each colour's <colour>-asg-name instead."
   }
 }
 

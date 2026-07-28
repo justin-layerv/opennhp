@@ -415,15 +415,36 @@ def _collect_repair(document_name: str, autoscaling_group: str) -> dict[str, Any
     associations = listed.get("Associations") if isinstance(listed, dict) else None
     if not isinstance(associations, list):
         raise CollectorError("repair associations are unreadable")
-    expected_targets = [
-        {"Key": "tag:aws:autoscaling:groupName", "Values": [autoscaling_group]}
-    ]
+    # A blue/green fleet's association targets EVERY colour, because it is
+    # plan-time state while the active colour changes at runtime. Match on this
+    # node's ASG being COVERED by the one canonical selector rather than being
+    # its sole value: requiring `Values == [own asg]` meant a green node found
+    # no association at all and published nothing, so the entire active fleet
+    # was unattested while the idle blue one looked healthy.
+    #
+    # Still fail-closed, and on the property that matters: exactly one
+    # association may cover this node. Zero is unattestable and two is
+    # ambiguous -- the producer pins one association id per instance.
+    def _covers_this_node(association: object) -> bool:
+        if not isinstance(association, dict):
+            return False
+        if association.get("Name") != document_name:
+            return False
+        targets = association.get("Targets")
+        if not isinstance(targets, list) or len(targets) != 1:
+            return False
+        target = targets[0]
+        if (
+            not isinstance(target, dict)
+            or target.get("Key") != "tag:aws:autoscaling:groupName"
+            or set(target) != {"Key", "Values"}
+        ):
+            return False
+        values = target.get("Values")
+        return isinstance(values, list) and autoscaling_group in values
+
     matches = [
-        association
-        for association in associations
-        if isinstance(association, dict)
-        and association.get("Name") == document_name
-        and association.get("Targets") == expected_targets
+        association for association in associations if _covers_this_node(association)
     ]
     if len(matches) != 1:
         raise CollectorError("this ASG has no unique repair association")

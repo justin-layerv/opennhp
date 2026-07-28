@@ -24,8 +24,23 @@ attested_node_roles = {
 
 # The repair association targets each exact ASG by name, read from the same
 # canonical parameters the producer uses to discover the fleets.
+#
+# Both cells are blue/green, so both colours are listed. The active colour is
+# runtime state and this association is plan-time state; targeting every colour
+# covers whichever is active without re-encoding create-time colour into the
+# plan. /<env>/nhp/server/asg-name is deliberately absent -- it is the
+# colour-blind base/blue group, and targeting it is what left cell0's active
+# green fleet with no collector installed and no attestations at all.
 asg_name_ssm_parameters = {
-  nhp_cell0                  = "/sandbox/nhp/server/asg-name"
-  nhp_cell1                  = "/sandbox-cell1/nhp/server/asg-name"
-  qurl_reverse_tunnel_server = "/sandbox/nhp/reverse-tunnel-server/asg-name"
+  nhp_cell0 = [
+    "/sandbox/nhp/server/blue-asg-name",
+    "/sandbox/nhp/server/green-asg-name",
+  ]
+  nhp_cell1 = [
+    "/sandbox-cell1/nhp/server/blue-asg-name",
+    "/sandbox-cell1/nhp/server/green-asg-name",
+  ]
+  qurl_reverse_tunnel_server = [
+    "/sandbox/nhp/reverse-tunnel-server/asg-name",
+  ]
 }

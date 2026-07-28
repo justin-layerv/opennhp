@@ -1156,7 +1156,13 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
     def test_repair_association_is_exact_asg_and_version_bound(self) -> None:
         association_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         document_name = "layerv-nhp-sandbox-runtime-attestation-repair"
-        asg_name = "layerv-nhp-sandbox-server"
+        # cell0 is blue/green and green is active, so the association targets
+        # BOTH colours and the resolved active group is the green one.
+        asg_name = "layerv-nhp-sandbox-server-green"
+        attested_asg_names = [
+            "layerv-nhp-sandbox-server",
+            "layerv-nhp-sandbox-server-green",
+        ]
         responses = [
             {
                 "AssociationDescription": {
@@ -1166,7 +1172,7 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                     "Targets": [
                         {
                             "Key": "tag:aws:autoscaling:groupName",
-                            "Values": [asg_name],
+                            "Values": list(attested_asg_names),
                         }
                     ],
                     # The real DescribeAssociation shape for a tag-targeted
@@ -1225,6 +1231,7 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                 attestation,
                 "i-00000000000000001",
                 autoscaling_group=asg_name,
+                attested_asg_names=attested_asg_names,
                 collector_contract=collector_contract,
             )
         self.assertEqual(observed, "2026-07-25T11:30:00Z")
@@ -1242,6 +1249,7 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                 attestation,
                 "i-00000000000000001",
                 autoscaling_group=asg_name,
+                attested_asg_names=attested_asg_names,
                 collector_contract=collector_contract,
             )
 
@@ -1254,6 +1262,7 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                 attestation,
                 "i-00000000000000001",
                 autoscaling_group=asg_name,
+                attested_asg_names=attested_asg_names,
                 collector_contract=collector_contract,
             )
 
@@ -1573,6 +1582,169 @@ class ActiveColorAsgResolutionTest(unittest.TestCase):
                     # local.manifest_ssm_parameters entries are ARN suffixes and
                     # so carry no leading slash.
                     self.assertIn(f'"{parameter.lstrip("/")}",', granted)
+
+
+class AttestedAsgCoverageTest(unittest.TestCase):
+    """The repair association must cover every colour, including the active one.
+
+    Live on 2026-07-26 the association for nhp_cell0 targeted
+    `tag:aws:autoscaling:groupName = layerv-nhp-sandbox-server` -- the
+    colour-BLIND blue group -- because modules/runtime-attestation-store read
+    the same /<env>/nhp/server/asg-name parameter the producer did. The repair
+    document is what installs the collector and its timer, so the ACTIVE green
+    instances had no collector and published nothing: the bucket held
+    attestations for all three idle blue instances and none for
+    i-02afa00ae723b243b, i-0b514e2da4ba022fb or i-0cb07b293e218e49b.
+    """
+
+    ASSOCIATION_ID = "3b7fbdbc-77c6-4d2f-874b-c6a1581071ea"
+    DOCUMENT_NAME = "layerv-nhp-sandbox-runtime-attestation-repair"
+    CONTRACT = {
+        "repair_document_name": DOCUMENT_NAME,
+        "repair_document_version": "2",
+    }
+    BLUE = "layerv-nhp-sandbox-server"
+    GREEN = "layerv-nhp-sandbox-server-green"
+
+    def _description(self, values: list[str]) -> dict[str, object]:
+        return {
+            "AssociationDescription": {
+                "AssociationId": self.ASSOCIATION_ID,
+                "Name": self.DOCUMENT_NAME,
+                "AssociationVersion": "2",
+                "DocumentVersion": "2",
+                "ScheduleExpression": "rate(30 minutes)",
+                "Targets": [
+                    {"Key": "tag:aws:autoscaling:groupName", "Values": values}
+                ],
+                "Overview": {
+                    "Status": "Success",
+                    "DetailedStatus": "Success",
+                    "AssociationStatusAggregatedCount": {"Success": 3},
+                },
+            }
+        }
+
+    def _verify(self, *, targets: list[str], attested: list[str], active: str) -> None:
+        with mock.patch.object(
+            collector, "_aws", side_effect=[self._description(targets)]
+        ):
+            collector._verify_repair(
+                {
+                    "repair_association_id": self.ASSOCIATION_ID,
+                    "repair_document_name": self.DOCUMENT_NAME,
+                    "repair_last_success_at": "2026-07-25T11:30:00Z",
+                },
+                "i-02afa00ae723b243b",
+                autoscaling_group=active,
+                attested_asg_names=attested,
+                collector_contract=self.CONTRACT,
+            )
+
+    def test_colour_blind_single_target_is_rejected(self) -> None:
+        # The live defect: association targets blue only, green is active.
+        with self.assertRaisesRegex(collector.EvidenceError, "identity drift"):
+            self._verify(
+                targets=[self.BLUE],
+                attested=[self.BLUE, self.GREEN],
+                active=self.GREEN,
+            )
+
+    def test_active_colour_absent_from_the_attested_set_is_rejected(self) -> None:
+        # Even a self-consistent association fails closed when the fleet the
+        # producer resolved as active is not one the association covers.
+        with self.assertRaisesRegex(collector.EvidenceError, "identity drift"):
+            self._verify(
+                targets=[self.BLUE],
+                attested=[self.BLUE],
+                active=self.GREEN,
+            )
+
+    def test_extra_or_foreign_asg_is_still_rejected(self) -> None:
+        # Widening from one name to the colour set must not become "any set".
+        for targets in (
+            [self.BLUE, self.GREEN, "layerv-nhp-sandbox-frps"],
+            ["other-asg", self.GREEN],
+            [self.GREEN],
+        ):
+            with (
+                self.subTest(targets=targets),
+                self.assertRaisesRegex(collector.EvidenceError, "identity drift"),
+            ):
+                self._verify(
+                    targets=targets,
+                    attested=[self.BLUE, self.GREEN],
+                    active=self.GREEN,
+                )
+
+    def test_resolver_returns_every_colour_sorted(self) -> None:
+        responses = {
+            "/sandbox/nhp/server/blue-asg-name": self.BLUE,
+            "/sandbox/nhp/server/green-asg-name": self.GREEN,
+        }
+
+        def call(service, arguments, name):
+            requested = arguments[arguments.index("--name") + 1]
+            return {
+                "Parameter": {
+                    "Name": requested,
+                    "Type": "String",
+                    "Value": responses[requested],
+                    "Version": 1,
+                    "LastModifiedDate": "2026-02-05T12:53:40.340000-07:00",
+                    "ARN": f"arn:aws:ssm:us-east-2:767397897469:parameter{requested}",
+                    "DataType": "text",
+                }
+            }
+
+        with mock.patch.object(collector, "_aws", side_effect=call):
+            self.assertEqual(
+                collector._resolve_attested_asg_names("nhp_cell0"),
+                [self.BLUE, self.GREEN],
+            )
+
+    def test_non_blue_green_fleet_attests_its_single_asg(self) -> None:
+        parameter = {
+            "Parameter": {
+                "Name": "/sandbox/nhp/reverse-tunnel-server/asg-name",
+                "Type": "String",
+                "Value": "layerv-nhp-sandbox-frps",
+                "Version": 1,
+                "LastModifiedDate": "2026-01-15T14:22:11.104000-07:00",
+                "ARN": (
+                    "arn:aws:ssm:us-east-2:767397897469:parameter"
+                    "/sandbox/nhp/reverse-tunnel-server/asg-name"
+                ),
+                "DataType": "text",
+            }
+        }
+        with mock.patch.object(collector, "_aws", return_value=parameter):
+            self.assertEqual(
+                collector._resolve_attested_asg_names("qurl_reverse_tunnel_server"),
+                ["layerv-nhp-sandbox-frps"],
+            )
+
+    def test_terraform_targets_every_colour(self) -> None:
+        # The producer's expectation and the association's authored targets must
+        # agree, or the manifest can never be produced.
+        tfvars = (
+            ROOT
+            / "terraform"
+            / "environments"
+            / "sandbox-runtime-attestation"
+            / "terraform.tfvars"
+        ).read_text(encoding="utf-8")
+        for workload_key, spec in collector.EC2_WORKLOADS.items():
+            expected = (
+                sorted(spec["color_asg_parameters"].values())
+                if spec["active_color_parameter"] is not None
+                else [spec["asg_parameter"]]
+            )
+            for parameter in expected:
+                with self.subTest(workload=workload_key, parameter=parameter):
+                    self.assertIn(f'"{parameter}"', tfvars)
+        self.assertNotIn('"/sandbox/nhp/server/asg-name"', tfvars)
+        self.assertNotIn('"/sandbox-cell1/nhp/server/asg-name"', tfvars)
 
 
 class EdgeServesResolvedFleetTest(unittest.TestCase):
@@ -2299,7 +2471,13 @@ class RepairExecutionBindingTest(unittest.TestCase):
 
     ASSOCIATION_ID = "3b7fbdbc-77c6-4d2f-874b-c6a1581071ea"
     DOCUMENT_NAME = "layerv-nhp-sandbox-runtime-attestation-repair"
-    ASG = "layerv-nhp-sandbox-server"
+    # The association targets every colour of the fleet; ASG is the one the
+    # producer resolved as ACTIVE and must find inside that set.
+    ATTESTED_ASGS = [
+        "layerv-nhp-sandbox-server",
+        "layerv-nhp-sandbox-server-green",
+    ]
+    ASG = "layerv-nhp-sandbox-server-green"
     INSTANCE = "i-081174c8c26a42d70"
     CONTRACT = {
         "repair_document_name": DOCUMENT_NAME,
@@ -2317,7 +2495,7 @@ class RepairExecutionBindingTest(unittest.TestCase):
                 "Targets": [
                     {
                         "Key": "tag:aws:autoscaling:groupName",
-                        "Values": [self.ASG],
+                        "Values": list(self.ATTESTED_ASGS),
                     }
                 ],
                 "Overview": {
@@ -2391,6 +2569,7 @@ class RepairExecutionBindingTest(unittest.TestCase):
                 },
                 self.INSTANCE,
                 autoscaling_group=self.ASG,
+                attested_asg_names=list(self.ATTESTED_ASGS),
                 collector_contract=self.CONTRACT,
             )
         return observed, calls
