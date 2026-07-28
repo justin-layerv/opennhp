@@ -3797,6 +3797,131 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertFalse(checker.is_dmz_boundary_address(address))
 
+    def _privatelink_enforcement_plan(
+        self, *, before: str = "", after: str = "on"
+    ) -> dict[str, Any]:
+        """A converged boundary carrying only the exact PrivateLink flip."""
+        plan = boundary_noop_plan()
+        nlb = resource(plan, ".aws_lb.server[0]")
+        change = nlb["change"]
+        change["actions"] = ["update"]
+        change["before"] = copy.deepcopy(change["before"])
+        change["after"] = copy.deepcopy(change["before"])
+        change["before"][checker.PRIVATELINK_ENFORCEMENT_ATTRIBUTE] = before
+        change["after"][checker.PRIVATELINK_ENFORCEMENT_ATTRIBUTE] = after
+        change["after_unknown"] = {}
+        change.pop("replace_paths", None)
+        return plan
+
+    def test_privatelink_enforcement_update_needs_its_own_allowance(self) -> None:
+        # The fence-replacement allowance must NOT admit the in-place flip: it
+        # exists for the create/delete edge hand-over and carries a DNS repoint.
+        plan = self._privatelink_enforcement_plan()
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(
+            any("aws_lb.server[0] (update)" in error for error in errors), errors
+        )
+
+        errors = checker.validate_dmz_boundary_noop(plan)
+        self.assertTrue(
+            any(
+                "automatic apply refuses relay-DMZ boundary change" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        self.assertEqual(
+            [],
+            checker.validate_dmz_boundary_noop(
+                plan, allow_privatelink_enforcement_update=True
+            ),
+        )
+
+    def test_privatelink_enforcement_allowance_admits_off_predecessor(self) -> None:
+        for before in ("", "off"):
+            with self.subTest(before=before):
+                self.assertEqual(
+                    [],
+                    checker.validate_dmz_boundary_noop(
+                        self._privatelink_enforcement_plan(before=before),
+                        allow_privatelink_enforcement_update=True,
+                    ),
+                )
+
+    def test_privatelink_enforcement_allowance_is_exactly_bounded(self) -> None:
+        # Each mutation below is a way the lane could be widened into a general
+        # boundary escape; every one must still be refused WITH the allowance.
+        def refused(plan: dict[str, Any]) -> None:
+            errors = checker.validate_dmz_boundary_noop(
+                plan, allow_privatelink_enforcement_update=True
+            )
+            self.assertTrue(
+                any(
+                    "automatic apply refuses relay-DMZ boundary change" in error
+                    for error in errors
+                ),
+                errors,
+            )
+
+        with self.subTest("a second attribute may not ride along"):
+            plan = self._privatelink_enforcement_plan()
+            resource(plan, ".aws_lb.server[0]")["change"]["after"]["name"] = "rogue"
+            refused(plan)
+
+        with self.subTest("the target value must be exactly on"):
+            for after in ("off", "", "ON", "true"):
+                refused(self._privatelink_enforcement_plan(after=after))
+
+        with self.subTest("an already-on predecessor is not a correction"):
+            refused(self._privatelink_enforcement_plan(before="on"))
+
+        with self.subTest("nothing may be deferred to apply time"):
+            plan = self._privatelink_enforcement_plan()
+            resource(plan, ".aws_lb.server[0]")["change"]["after_unknown"] = {
+                "subnets": True
+            }
+            refused(plan)
+
+        with self.subTest("a forced replacement must fail closed"):
+            plan = self._privatelink_enforcement_plan()
+            change = resource(plan, ".aws_lb.server[0]")["change"]
+            change["replace_paths"] = [["security_groups"]]
+            refused(plan)
+
+        with self.subTest("a replacement action is not this lane"):
+            plan = self._privatelink_enforcement_plan()
+            resource(plan, ".aws_lb.server[0]")["change"]["actions"] = [
+                "create",
+                "delete",
+            ]
+            refused(plan)
+
+        with self.subTest("a deposed object is not this lane"):
+            plan = self._privatelink_enforcement_plan()
+            resource(plan, ".aws_lb.server[0]")["deposed"] = "abcd1234"
+            refused(plan)
+
+        with self.subTest("the allowance is scoped to the public NLB alone"):
+            plan = self._privatelink_enforcement_plan()
+            listener = resource(plan, ".aws_lb_listener.udp[0]")
+            listener["change"]["actions"] = ["update"]
+            listener["change"]["after"] = {"rogue": True}
+            refused(plan)
+
+    def test_privatelink_enforcement_allowance_requires_boundary_gate(self) -> None:
+        self.assertEqual(
+            [
+                "allow_privatelink_enforcement_update requires "
+                "require_dmz_boundary_noop"
+            ],
+            checker.validate_plan(
+                boundary_noop_plan(), allow_privatelink_enforcement_update=True
+            ),
+        )
+
     def test_runtime_monitoring_provider_readback_order_is_pinned(self) -> None:
         security_main = REPO_ROOT / "terraform/modules/security/main.tf"
         source = security_main.read_text(encoding="utf-8")

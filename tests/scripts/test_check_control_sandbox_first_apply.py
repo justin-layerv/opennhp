@@ -9840,6 +9840,133 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractError, "replacement after"):
             CHECKER._check_hub_source_fence_transition(candidate)
 
+    def _privatelink_enforcement_plan(
+        self, *, before: str = "", after: str = "on"
+    ) -> dict:
+        """A steady post-fence plan carrying only the exact PrivateLink flip."""
+        plan = hub_edge_transition_fixture()
+        # The edge is already applied: every edge resource settles to a no-op so
+        # the only non-no-op left is the attribute flip under test.
+        for entry in plan["resource_changes"]:
+            change = entry["change"]
+            if change.get("actions") == ["create"]:
+                change["actions"] = ["no-op"]
+                change["before"] = copy.deepcopy(change["after"])
+        item = next(
+            entry
+            for entry in plan["resource_changes"]
+            if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+        )
+        change = item["change"]
+        change["actions"] = ["update"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after"] = copy.deepcopy(change["after"])
+        change["before"].update(
+            {
+                "internal": False,
+                "load_balancer_type": "network",
+                "name": CHECKER.HUB_EDGE_LOAD_BALANCER_NAME,
+                CHECKER.PRIVATELINK_ENFORCEMENT_ATTRIBUTE: before,
+            }
+        )
+        change["after"].update(
+            {
+                "internal": False,
+                "load_balancer_type": "network",
+                "name": CHECKER.HUB_EDGE_LOAD_BALANCER_NAME,
+                CHECKER.PRIVATELINK_ENFORCEMENT_ATTRIBUTE: after,
+            }
+        )
+        change["after_unknown"] = {}
+        return plan
+
+    def test_privatelink_enforcement_is_its_own_bounded_plan_mode(self) -> None:
+        for before in ("", "off"):
+            with self.subTest(before=before):
+                self.assertEqual(
+                    "hub-privatelink-enforcement",
+                    CHECKER.check_plan(
+                        self._privatelink_enforcement_plan(before=before)
+                    )["plan_mode"],
+                )
+
+    def test_privatelink_enforcement_lane_is_exactly_bounded(self) -> None:
+        # Each mutation is a way the lane could be widened into a general Hub-edge
+        # mutation escape; every one must fall through to the fail-closed
+        # fallback rather than being admitted.
+        def refused(plan: dict) -> None:
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_plan(plan)
+
+        with self.subTest("a second attribute may not ride along"):
+            plan = self._privatelink_enforcement_plan()
+            next(
+                entry
+                for entry in plan["resource_changes"]
+                if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+            )["change"]["after"]["security_groups"] = ["sg-rogue"]
+            refused(plan)
+
+        with self.subTest("the target value must be exactly on"):
+            for after in ("off", "", "ON", "true"):
+                refused(self._privatelink_enforcement_plan(after=after))
+
+        with self.subTest("an already-on predecessor is not a correction"):
+            refused(self._privatelink_enforcement_plan(before="on"))
+
+        with self.subTest("nothing may be deferred to apply time"):
+            plan = self._privatelink_enforcement_plan()
+            next(
+                entry
+                for entry in plan["resource_changes"]
+                if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+            )["change"]["after_unknown"] = {"subnets": True}
+            refused(plan)
+
+        with self.subTest("a forced replacement must fail closed"):
+            plan = self._privatelink_enforcement_plan()
+            next(
+                entry
+                for entry in plan["resource_changes"]
+                if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+            )["change"]["replace_paths"] = [["security_groups"]]
+            refused(plan)
+
+        with self.subTest("the edge identity must be the reviewed one"):
+            plan = self._privatelink_enforcement_plan()
+            change = next(
+                entry
+                for entry in plan["resource_changes"]
+                if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+            )["change"]
+            change["before"]["name"] = "layerv-nhp-sandbox-hub-rogue"
+            change["after"]["name"] = "layerv-nhp-sandbox-hub-rogue"
+            refused(plan)
+
+        with self.subTest("the lane admits no co-travelling change"):
+            plan = self._privatelink_enforcement_plan()
+            other = next(
+                entry
+                for entry in plan["resource_changes"]
+                if entry["address"]
+                == "module.control.aws_lb_listener.hub[0]"
+            )
+            other["change"]["actions"] = ["update"]
+            other["change"]["after"] = {"rogue": True}
+            refused(plan)
+
+    def test_privatelink_enforcement_does_not_mask_a_pending_fence(self) -> None:
+        # The replacement lane's own NLB action is create/delete, never update,
+        # and a pending fence necessarily carries more than this singleton.
+        plan = self._privatelink_enforcement_plan()
+        next(
+            entry
+            for entry in plan["resource_changes"]
+            if entry["address"] == CHECKER.HUB_EDGE_LOAD_BALANCER_ADDRESS
+        )["change"]["actions"] = ["create", "delete"]
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(plan)
+
     def test_listener_certificate_injection_is_rejected(self) -> None:
         candidate = hub_source_fence_transition_changes_fixture()
         candidate["module.control.aws_lb_listener.hub[0]"]["change"]["after"][

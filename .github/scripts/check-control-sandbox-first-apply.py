@@ -1160,6 +1160,16 @@ HUB_WORKER_OPENED_ADDRESSES = frozenset(
 # ["update"] on a HUB_WORKER_RESOURCES member -- admitted by the bounded
 # hub-s3-endpoint-policy-correction lane, not the opened-address tolerance.
 HUB_WORKER_S3_ENDPOINT_ADDRESS = "module.control.aws_vpc_endpoint.hub_s3[0]"
+# The Hub public edge NLB. Also the sole participant of the bounded
+# hub-privatelink-enforcement lane below.
+HUB_EDGE_LOAD_BALANCER_ADDRESS = "module.control.aws_lb.hub[0]"
+PRIVATELINK_ENFORCEMENT_ATTRIBUTE = (
+    "enforce_security_group_inbound_rules_on_private_link_traffic"
+)
+# ELBv2 leaves the attribute empty until it is set explicitly; "off" is the
+# documented disabled value. Both mean the Hub source fence is NOT enforced for
+# PrivateLink traffic, so both are legal predecessors of the corrective flip.
+PRIVATELINK_ENFORCEMENT_BEFORE_VALUES = frozenset({"", "off"})
 # The Hub worker container log group ARN (awslogs driver target), matched exactly
 # in the opened logs endpoint policy. Slash-namespaced, distinct from the dash
 # CONTROL_PREFIX.
@@ -7642,6 +7652,69 @@ def _is_exact_hub_source_fence_target_noop(change: Any) -> bool:
     )
 
 
+def _is_exact_hub_privatelink_enforcement_update(item: dict[str, Any]) -> bool:
+    """Prove the Hub edge change is EXACTLY the PrivateLink-enforcement flip.
+
+    Pinning this attribute makes the Hub fence's PrivateLink posture
+    Terraform-owned rather than an inherited AWS default (AWS enforces inbound
+    rules on PrivateLink traffic by default and omits the member from
+    DescribeLoadBalancers until it is set explicitly). Turning it on is an
+    in-place ModifyLoadBalancerAttributes (the attribute is Optional+Computed,
+    not ForceNew), so it must NOT be admitted through the replacement lane, whose
+    reviewed envelope is a create/delete edge hand-over carrying a DNS repoint.
+
+    Deliberately total: it admits a lone "update" whose before and after differ
+    in this ONE attribute and nothing else, moving from unset or "off" to "on",
+    with no unknowns and no replacement paths. Any additional field drift, any
+    unknown, any replace_paths, or a deposed/data address fails it, so the lane
+    cannot be widened into a general Hub-edge mutation escape.
+    """
+    if item.get("mode") != "managed" or item.get("type") != "aws_lb":
+        return False
+    change = item.get("change")
+    if not isinstance(change, dict):
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        change.get("actions") != ["update"]
+        or not isinstance(before, dict)
+        or not isinstance(after, dict)
+        # Nothing may be deferred to apply time.
+        or change.get("after_unknown") != {}
+        # An in-place update must not carry replacement paths; a ForceNew
+        # regression in a future provider would surface here and fail closed.
+        or change.get("replace_paths") is not None
+        or set(before) != set(after)
+        or before.get(PRIVATELINK_ENFORCEMENT_ATTRIBUTE)
+        not in PRIVATELINK_ENFORCEMENT_BEFORE_VALUES
+        or after.get(PRIVATELINK_ENFORCEMENT_ATTRIBUTE) != "on"
+        # The edge identity itself must be the reviewed one, so the lane cannot
+        # be reached by a differently named or re-scoped load balancer.
+        or before.get("name") != HUB_EDGE_LOAD_BALANCER_NAME
+        or before.get("internal") is not False
+        or before.get("load_balancer_type") != "network"
+    ):
+        return False
+    # Every other attribute must be byte-identical: this is the clause that keeps
+    # the lane from smuggling a subnet, security-group, or name change.
+    if any(
+        before[key] != after[key]
+        for key in before
+        if key != PRIVATELINK_ENFORCEMENT_ATTRIBUTE
+    ):
+        return False
+    for before_key, after_key in (
+        ("before_sensitive", "after_sensitive"),
+        ("before_identity", "after_identity"),
+    ):
+        if (before_key in change) != (after_key in change) or (
+            before_key in change and change[before_key] != change[after_key]
+        ):
+            return False
+    return True
+
+
 def _check_hub_source_fence_transition(
     by_address: dict[str, dict[str, Any]],
     deposed_by_address: dict[str, list[dict[str, Any]]] | None = None,
@@ -8748,6 +8821,34 @@ def check_plan(
     # _check_authority_alarm_routing via the inventory-derived runtime_mode. A
     # non-exact alarm move keeps this predicate false and falls through to the
     # fail-closed fallback.
+    # A bounded, post-fence hardening of the Hub public edge: pin ON
+    # enforce_security_group_inbound_rules_on_private_link_traffic. The fence
+    # (#3362) attached an SG admitting exactly the reviewed proof-runner /32 on
+    # UDP 62206; this makes that SG's PrivateLink posture Terraform-owned rather
+    # than an inherited AWS default, so an out-of-band flip to "off" becomes
+    # visible drift. collect_udp_proof_deployment_evidence.py has required the
+    # literal "on" of the live edge since #3462 and cannot pass while
+    # DescribeLoadBalancers omits the member.
+    # This lane admits EXACTLY the single in-place attribute flip with
+    # nothing else moving and no deposed object, proved byte-for-byte by
+    # _is_exact_hub_privatelink_enforcement_update.
+    #
+    # It CANNOT mask the replacement lane: a pending fence carries the SG creates
+    # and the listener replacement too, so `changed` would exceed this singleton,
+    # and the fence's own NLB action is ["create", "delete"], not ["update"].
+    # Gated on hub_edge_mode so it cannot fire before the edge exists; once
+    # applied the address is a no-op again and the steady-state edge checks still
+    # enforce the fenced shape. Remove this lane once applied.
+    hub_privatelink_enforcement = (
+        hub_edge_mode
+        and not deposed_by_address
+        and changed == {HUB_EDGE_LOAD_BALANCER_ADDRESS}
+        and actual_non_noop.get(HUB_EDGE_LOAD_BALANCER_ADDRESS) == ["update"]
+        and _is_exact_hub_privatelink_enforcement_update(
+            by_address[HUB_EDGE_LOAD_BALANCER_ADDRESS]
+        )
+    )
+
     hub_source_fence_candidate = set(actual_non_noop)
     if hub_identity_transition:
         hub_source_fence_candidate -= hub_identity_changed
@@ -8899,6 +9000,14 @@ def check_plan(
         plan_mode = "provisioned-cell-catalog"
         _require_create_shapes(changed, by_address)
         _require_provisioned_cell_create_output(plan)
+    elif hub_privatelink_enforcement:
+        plan_mode = "hub-privatelink-enforcement"
+        # Ordered ahead of the source-fence branch because the fence's address
+        # subset test would otherwise claim this singleton and reject it as a
+        # non-exact remaining action subset. No create shape to assert -- the
+        # edge already exists; the exact in-place delta is proved by the
+        # predicate above, and the fenced after-state is still validated by the
+        # steady-state edge checks in _check_planned_security.
     elif hub_source_fence_transition:
         # Ordered ahead of the image-update branch (and therefore ahead of every
         # branch it precedes) on purpose: deposed resources are validated ONLY
@@ -9050,7 +9159,8 @@ def check_plan(
             "Authority runtime slice or image update, the exact Authority alarm "
             "routing slice, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
-            "exact Hub S3 endpoint-policy correction or Hub UDP source-fence "
+            "exact Hub S3 endpoint-policy correction, Hub PrivateLink "
+            "inbound-rule enforcement, or Hub UDP source-fence "
             "replacement; "
             f"got {actual_non_noop}"
         )
