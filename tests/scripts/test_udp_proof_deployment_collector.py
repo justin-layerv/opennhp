@@ -1566,13 +1566,11 @@ class BucketPolicyDigestNormalisationTest(unittest.TestCase):
     }
 
     def digest(self, policy: dict) -> str:
-        return hashlib.sha256(
-            contract.canonical_bytes(
-                collector._sorted_policy_scalar_lists(policy),
-                maximum=64 * 1024,
-                name="policy",
-            )
-        ).hexdigest()
+        return collector._terraform_jsonencode_digest(
+            collector._sorted_policy_scalar_lists(policy),
+            maximum=64 * 1024,
+            name="policy",
+        )
 
     def aws_returned(self) -> dict:
         """The same policy with AWS's principal ordering."""
@@ -1619,3 +1617,85 @@ class BucketPolicyDigestNormalisationTest(unittest.TestCase):
         swapped = self.aws_returned()
         swapped["Statement"].reverse()
         self.assertNotEqual(self.digest(swapped), self.digest(self.AUTHORED))
+
+
+class TerraformJsonencodeDigestTest(unittest.TestCase):
+    """The contract digests are sha256(jsonencode(...)) from Terraform.
+
+    Terraform's jsonencode is Go's encoding/json, which HTML-escapes <, > and &.
+    Python does not. The repair document is a shell script full of `>` and `&&`,
+    so digesting it as plain canonical JSON diverged on every run.
+    """
+
+    def digest(self, value: object) -> str:
+        return collector._terraform_jsonencode_digest(
+            value, maximum=64 * 1024, name="document"
+        )
+
+    def go_jsonencode(self, value: object) -> str:
+        """An independent re-implementation of Go's encoding/json escaping."""
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        for character in ("<", ">", "&"):
+            encoded = encoded.replace(
+                character, "\\u%04x" % ord(character)
+            )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def test_matches_go_escaping_for_shell_content(self) -> None:
+        document = {
+            "schemaVersion": "2.2",
+            "mainSteps": [
+                {
+                    "inputs": {
+                        "runCommand": [
+                            "set -euo pipefail",
+                            "test -f /etc/x && echo ok > /tmp/out",
+                            "if [ 1 -lt 2 ]; then echo '<done>'; fi",
+                        ]
+                    }
+                }
+            ],
+        }
+        self.assertEqual(self.digest(document), self.go_jsonencode(document))
+
+    def test_differs_from_unescaped_canonical_json(self) -> None:
+        """The bug: plain canonical JSON disagrees whenever <, > or & appear."""
+        document = {"runCommand": "echo a > b && echo '<c>'"}
+        unescaped = hashlib.sha256(
+            contract.canonical_bytes(document, maximum=64 * 1024, name="d")
+        ).hexdigest()
+        self.assertNotEqual(self.digest(document), unescaped)
+
+    def test_agrees_with_canonical_json_without_those_characters(self) -> None:
+        """Why the bucket policy matched but the repair document never did."""
+        document = {"runCommand": "echo plain", "schemaVersion": "2.2"}
+        self.assertEqual(
+            self.digest(document),
+            hashlib.sha256(
+                contract.canonical_bytes(document, maximum=64 * 1024, name="d")
+            ).hexdigest(),
+        )
+
+    def test_key_order_does_not_change_the_digest(self) -> None:
+        self.assertEqual(
+            self.digest({"a": 1, "b": 2}), self.digest({"b": 2, "a": 1})
+        )
+
+    def test_content_changes_still_break_the_digest(self) -> None:
+        base = {"runCommand": "echo a > b"}
+        for mutated in (
+            {"runCommand": "echo a > c"},
+            {"runCommand": "echo a >> b"},
+            {"runCommand": "echo a > b", "extra": True},
+            {},
+        ):
+            with self.subTest(mutated=mutated):
+                self.assertNotEqual(self.digest(mutated), self.digest(base))
+
+    def test_oversized_documents_fail_closed(self) -> None:
+        with self.assertRaises(collector.EvidenceError):
+            collector._terraform_jsonencode_digest(
+                {"big": "x" * 4096}, maximum=64, name="document"
+            )

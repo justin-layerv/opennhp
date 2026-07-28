@@ -1533,6 +1533,48 @@ def _runtime_attestation_collector_contract() -> dict[str, Any]:
     }
 
 
+def _terraform_jsonencode_digest(value: Any, *, maximum: int, name: str) -> str:
+    """Digest a document the way Terraform's jsonencode would have.
+
+    Every digest in the collector contract is published by Terraform as
+    `sha256(jsonencode(<value>))`, so re-deriving it here means reproducing
+    Terraform's encoder, not merely "some canonical JSON".
+
+    The two agree on the easy parts -- both sort object keys and emit compact
+    separators -- which is why the bucket policy happened to match under plain
+    canonical_bytes. They diverge on escaping: Terraform's jsonencode is Go's
+    encoding/json, which HTML-escapes `<`, `>` and `&` into \\u003c, \\u003e and
+    \\u0026. Python writes those characters literally.
+
+    That difference is invisible until a document actually contains them -- and
+    the repair document is a shell script full of `>` redirects and `&&`, so it
+    diverged on every single run while the policy did not. Reproducing the
+    escaping yields the published digest exactly.
+
+    U+2028/U+2029 are escaped for the same reason: Go escapes them too, and a
+    document is free to contain them.
+    """
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    for character, escape in (
+        ("<", "\\u003c"),
+        (">", "\\u003e"),
+        ("&", "\\u0026"),
+        ("\u2028", "\\u2028"),
+        ("\u2029", "\\u2029"),
+    ):
+        encoded = encoded.replace(character, escape)
+    raw = encoded.encode("utf-8")
+    if len(raw) > maximum:
+        raise EvidenceError(f"{name} is oversized")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _validate_repair_document(collector_contract: dict[str, Any]) -> None:
     response = _aws(
         "ssm",
@@ -1559,13 +1601,11 @@ def _validate_repair_document(collector_contract: dict[str, Any]) -> None:
     document = _loads(content, "runtime-attestation repair document content")
     if not isinstance(document, dict):
         raise EvidenceError("runtime-attestation repair document must be JSON")
-    digest = hashlib.sha256(
-        contract.canonical_bytes(
-            document,
-            maximum=64 * 1024,
-            name="runtime-attestation repair document",
-        )
-    ).hexdigest()
+    digest = _terraform_jsonencode_digest(
+        document,
+        maximum=64 * 1024,
+        name="runtime-attestation repair document",
+    )
     if digest != collector_contract["repair_document_sha256"]:
         raise EvidenceError("runtime-attestation repair document content drift")
 
@@ -2749,13 +2789,11 @@ def _validate_attestation_bucket(bucket: str) -> tuple[str, str]:
     policy = _loads(policy_raw, "runtime-attestation bucket policy")
     if not isinstance(policy, dict):
         raise EvidenceError("runtime-attestation bucket policy must be an object")
-    policy_sha256 = hashlib.sha256(
-        contract.canonical_bytes(
-            _sorted_policy_scalar_lists(policy),
-            maximum=64 * 1024,
-            name="runtime-attestation bucket policy",
-        )
-    ).hexdigest()
+    policy_sha256 = _terraform_jsonencode_digest(
+        _sorted_policy_scalar_lists(policy),
+        maximum=64 * 1024,
+        name="runtime-attestation bucket policy",
+    )
     if (
         versioning.get("Status") != "Enabled"
         or public_config
