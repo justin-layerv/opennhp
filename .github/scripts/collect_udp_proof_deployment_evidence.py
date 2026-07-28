@@ -3039,12 +3039,34 @@ def _require_no_active_instance_refresh(workload_key: str, asg_name: str) -> Non
     refreshes = (
         response.get("InstanceRefreshes") if isinstance(response, dict) else None
     )
+    # NextToken is NOT checked, deliberately. This call passes --max-records 1
+    # to fetch only the newest refresh, and DescribeInstanceRefreshes returns
+    # them in reverse chronological order, so AWS hands back a NextToken
+    # whenever the group has ANY older refresh -- which every long-lived ASG
+    # accumulates (cell0's server group is on its sixth). Treating that token as
+    # an incomplete readback made this unsatisfiable for exactly the mature
+    # fleets it exists to guard, while a brand-new group with one refresh passed.
+    #
+    # Verified against live cell0: the newest refresh is Successful at 100% and
+    # a NextToken is present purely because five older refreshes exist.
+    #
+    # Completeness here means "we saw the most recent refresh", and --max-records
+    # 1 plus newest-first ordering already guarantees that. The status allow-list
+    # below is what actually decides, and it stays closed: more than one entry
+    # means the API broke its own contract, and any non-terminal or unrecognised
+    # status still fails.
+    #
+    # One NextToken case IS still rejected: an EMPTY page alongside a token. We
+    # asked for the newest refresh and got none while AWS says more exist, so we
+    # demonstrably did not see the most recent one -- genuinely ambiguous, unlike
+    # a token accompanying a returned refresh. An empty page with no token is the
+    # ordinary never-refreshed group.
     if (
         not isinstance(response, dict)
-        or response.get("NextToken") not in (None, "")
         or not isinstance(refreshes, list)
         or len(refreshes) > 1
         or any(not isinstance(refresh, dict) for refresh in refreshes)
+        or (not refreshes and response.get("NextToken") not in (None, ""))
     ):
         raise EvidenceError(f"{workload_key} ASG refresh readback is incomplete")
     if not refreshes:

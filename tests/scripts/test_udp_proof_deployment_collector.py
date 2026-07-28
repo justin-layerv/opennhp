@@ -1756,3 +1756,62 @@ class EcrManifestMultiTagTest(unittest.TestCase):
 
     def test_non_dict_entries_fail_closed(self) -> None:
         self.assertFalse(self.resolve([self.entry("a"), "not-a-dict"]))
+
+
+class InstanceRefreshPaginationTest(unittest.TestCase):
+    """--max-records 1 always yields a NextToken once older refreshes exist.
+
+    DescribeInstanceRefreshes returns newest-first, so the single returned entry
+    IS the most recent one. cell0's server group is on its sixth refresh, so a
+    token is present on every healthy call.
+    """
+
+    ASG = "layerv-nhp-sandbox-server"
+
+    def refresh(self, status="Successful"):
+        return {"AutoScalingGroupName": self.ASG, "Status": status}
+
+    def check(self, response):
+        with mock.patch.object(collector, "_aws", return_value=response):
+            collector._require_no_active_instance_refresh("nhp_cell0", self.ASG)
+
+    def test_terminal_refresh_with_older_history_is_accepted(self) -> None:
+        """The live cell0 shape: Successful, plus a token for older refreshes."""
+        self.check({"InstanceRefreshes": [self.refresh()], "NextToken": "older"})
+
+    def test_terminal_refresh_without_token_is_accepted(self) -> None:
+        self.check({"InstanceRefreshes": [self.refresh()]})
+
+    def test_never_refreshed_group_is_accepted(self) -> None:
+        self.check({"InstanceRefreshes": []})
+
+    def test_empty_page_with_a_token_still_fails_closed(self) -> None:
+        """We asked for the newest and got none while AWS says more exist."""
+        with self.assertRaisesRegex(collector.EvidenceError, "is incomplete"):
+            self.check({"InstanceRefreshes": [], "NextToken": "more"})
+
+    def test_active_refresh_still_fails_closed(self) -> None:
+        for status in ("InProgress", "Pending", "Cancelling", "Bogus"):
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(collector.EvidenceError, "still active"):
+                    self.check(
+                        {
+                            "InstanceRefreshes": [self.refresh(status)],
+                            "NextToken": "older",
+                        }
+                    )
+
+    def test_more_than_one_entry_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(collector.EvidenceError, "is incomplete"):
+            self.check({"InstanceRefreshes": [self.refresh(), self.refresh()]})
+
+    def test_foreign_group_name_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(collector.EvidenceError, "still active"):
+            self.check(
+                {
+                    "InstanceRefreshes": [
+                        {"AutoScalingGroupName": "other-asg", "Status": "Successful"}
+                    ],
+                    "NextToken": "older",
+                }
+            )
