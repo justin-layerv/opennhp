@@ -288,3 +288,57 @@ class CollectIdentityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepairExecutionOrderingTest(unittest.TestCase):
+    """A Status filter destroys DescribeAssociationExecutions' ordering.
+
+    Unfiltered pages are strictly newest-first. The Status-filtered page is
+    stably jumbled (observed live: 19:08, 14:08, the PREVIOUS day's 20:38,
+    21:38, 00:38), so taking rows[0] recorded an arbitrary successful execution
+    as last_success_at instead of the latest one.
+    """
+
+    def row(self, created, status="Success"):
+        return {"CreatedTime": created, "Status": status}
+
+    def created_seconds(self, rows):
+        return [collector._iso_utc_seconds(r["CreatedTime"], "repair") for r in rows]
+
+    def test_newest_first_page_is_accepted_and_newest_wins(self) -> None:
+        rows = [
+            self.row("2026-07-28T01:38:18.333000-06:00"),
+            self.row("2026-07-28T01:08:20.120000-06:00"),
+            self.row("2026-07-28T00:38:02.949000-06:00"),
+        ]
+        created = self.created_seconds(rows)
+        self.assertEqual(created, sorted(created, reverse=True))
+        self.assertEqual(created[0], "2026-07-28T07:38:18Z")
+
+    def test_the_jumbled_status_filtered_page_is_rejected(self) -> None:
+        """The exact live shape the Status filter produced."""
+        rows = [
+            self.row("2026-07-27T19:08:29.268000-06:00"),
+            self.row("2026-07-27T14:08:20.395000-06:00"),
+            self.row("2026-07-26T20:38:06.289000-06:00"),
+            self.row("2026-07-27T21:38:30.243000-06:00"),
+            self.row("2026-07-28T00:38:02.949000-06:00"),
+        ]
+        created = self.created_seconds(rows)
+        self.assertNotEqual(created, sorted(created, reverse=True))
+
+    def test_mixed_offsets_compare_in_utc(self) -> None:
+        """-06:00 and +00:00 spellings must order by absolute time, not text."""
+        rows = [
+            self.row("2026-07-28T01:38:18.333000-06:00"),  # 07:38:18Z
+            self.row("2026-07-28T07:08:20.120000+00:00"),  # 07:08:20Z
+        ]
+        created = self.created_seconds(rows)
+        self.assertEqual(created, ["2026-07-28T07:38:18Z", "2026-07-28T07:08:20Z"])
+        self.assertEqual(created, sorted(created, reverse=True))
+
+    def test_sub_second_precision_is_truncated_to_whole_seconds(self) -> None:
+        self.assertEqual(
+            collector._iso_utc_seconds("2026-07-28T07:38:18.999999+00:00", "repair"),
+            "2026-07-28T07:38:18Z",
+        )

@@ -385,18 +385,41 @@ def _collect_repair(document_name: str, autoscaling_group: str) -> dict[str, Any
             "describe-association-executions",
             "--association-id",
             association_id,
-            "--filters",
-            "Key=Status,Value=Success,Type=EQUAL",
+            # DELIBERATELY UNFILTERED. A Status filter destroys the API's
+            # ordering: the unfiltered page is strictly newest-first, but
+            # "Key=Status,Value=Success,Type=EQUAL" returns a stably jumbled page
+            # (observed live: 19:08, 14:08, then the PREVIOUS day's 20:38, then
+            # 21:38, then 00:38). Taking rows[0] from that page recorded an
+            # arbitrary successful execution as last_success_at rather than the
+            # latest one.
+            #
+            # The consequence was not cosmetic. Every instance in this fleet
+            # reported the same 01:08:29Z execution, which had targeted the
+            # previous, pre-refresh generation and predates every current
+            # instance's launch -- so the producer's per-target check correctly
+            # refused an attestation naming a run that never touched the
+            # instance, and the 6h21m gap also blew MAX_REPAIR_AGE.
+            #
+            # Unfiltered keeps newest-first, so rows[0] is genuinely the latest
+            # execution. Ordering is then asserted below rather than assumed.
             "--max-results",
-            "1",
+            "20",
         ],
         "repair executions",
     )
     rows = (
         executions.get("AssociationExecutions") if isinstance(executions, dict) else None
     )
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+    if not isinstance(rows, list) or not rows or not all(
+        isinstance(row, dict) for row in rows
+    ):
         raise CollectorError("this ASG has no successful repair execution")
+    # Fail closed if the page is not newest-first, rather than trusting it. This
+    # is exactly the property the Status filter silently broke, so it is asserted
+    # here instead of assumed.
+    created = [_iso_utc_seconds(row.get("CreatedTime"), "repair") for row in rows]
+    if created != sorted(created, reverse=True):
+        raise CollectorError("repair executions are not newest-first")
     if rows[0].get("Status") != "Success":
         raise CollectorError("latest repair execution did not succeed")
     return {
