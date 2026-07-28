@@ -590,85 +590,6 @@ def _is_exact_udp_source_fence_target_noop(raw: dict[str, Any]) -> bool:
     return True
 
 
-PRIVATELINK_ENFORCEMENT_ATTRIBUTE = (
-    "enforce_security_group_inbound_rules_on_private_link_traffic"
-)
-
-# The public NLB is the ONLY DMZ boundary address this lane may move, and the
-# fenced cell edge is always aws_lb.server[0] under the reviewed compute prefix.
-PRIVATELINK_ENFORCEMENT_ADDRESS_RE = _udp_source_fence_compute_re(
-    r"aws_lb\.server\[0\]"
-)
-
-# ELBv2 leaves the attribute empty until it is set explicitly; "off" is the
-# documented disabled value. Both mean the source fence is NOT enforced for
-# PrivateLink traffic, so both are legal predecessors of the corrective flip.
-PRIVATELINK_ENFORCEMENT_BEFORE_VALUES = frozenset({"", "off"})
-
-
-def _is_exact_privatelink_enforcement_update(raw: dict[str, Any]) -> bool:
-    """Prove a boundary change is EXACTLY the PrivateLink-enforcement flip.
-
-    Pinning this attribute makes the fence's PrivateLink posture Terraform-owned
-    rather than an inherited AWS default (AWS enforces inbound rules on
-    PrivateLink traffic by default and omits the member from
-    DescribeLoadBalancers until it is set explicitly). Turning it on is an
-    in-place ModifyLoadBalancerAttributes (the attribute is Optional+Computed,
-    not ForceNew), so it must NOT be admitted through the replacement lane, which
-    exists for the create/delete edge hand-over and carries a DNS repoint.
-
-    This predicate is deliberately total: it admits a lone "update" whose before
-    and after differ in this ONE attribute and nothing else, moving from unset or
-    "off" to "on", with no unknowns and no replacement paths. Any additional
-    field drift, any unknown, any replace_paths, or a deposed/data address fails
-    it, so the lane cannot be widened into a general boundary-mutation escape.
-    """
-    change = raw.get("change")
-    if not isinstance(change, dict):
-        return False
-    before = change.get("before")
-    after = change.get("after")
-    if (
-        raw.get("mode", "managed") != "managed"
-        or raw.get("deposed") is not None
-        or not PRIVATELINK_ENFORCEMENT_ADDRESS_RE.fullmatch(
-            str(raw.get("address", ""))
-        )
-        or frozenset(change) not in UDP_SOURCE_FENCE_ALLOWED_CHANGE_KEY_SETS
-        or change.get("actions") != ["update"]
-        or not isinstance(before, dict)
-        or not isinstance(after, dict)
-        # after_unknown == {} proves nothing else is deferred to apply time, and
-        # its absence from the allowed key sets is impossible by construction.
-        or change.get("after_unknown") != {}
-        # An in-place update must not carry replacement paths; a ForceNew
-        # regression in a future provider would surface here and fail closed.
-        or change.get("replace_paths") is not None
-        or set(before) != set(after)
-        or before.get(PRIVATELINK_ENFORCEMENT_ATTRIBUTE)
-        not in PRIVATELINK_ENFORCEMENT_BEFORE_VALUES
-        or after.get(PRIVATELINK_ENFORCEMENT_ATTRIBUTE) != "on"
-    ):
-        return False
-    # Every other attribute must be byte-identical: this is the clause that keeps
-    # the lane from smuggling a subnet, security-group, or name change.
-    if any(
-        before[key] != after[key]
-        for key in before
-        if key != PRIVATELINK_ENFORCEMENT_ATTRIBUTE
-    ):
-        return False
-    for before_key, after_key in (
-        ("before_sensitive", "after_sensitive"),
-        ("before_identity", "after_identity"),
-    ):
-        if (before_key in change) != (after_key in change) or (
-            before_key in change and change[before_key] != change[after_key]
-        ):
-            return False
-    return True
-
-
 def _udp_source_fence_nlb_change() -> dict[str, Any]:
     """Return the NLB replacement envelope, which is identical for both colors.
 
@@ -1011,7 +932,6 @@ def validate_dmz_boundary_noop(
     plan: dict[str, Any],
     *,
     allow_udp_source_fence_replacement: bool = False,
-    allow_privatelink_enforcement_update: bool = False,
 ) -> list[str]:
     """Reject automatic boundary mutations outside the exact reviewed migration."""
     errors: list[str] = []
@@ -1021,17 +941,6 @@ def validate_dmz_boundary_noop(
             continue
         address = str(raw.get("address", ""))
         if not is_dmz_boundary_address(address):
-            continue
-        # The PrivateLink-enforcement flip is its own bounded, separately gated
-        # lane: an exact in-place attribute correction on the already-fenced
-        # edge. Consume it BEFORE the replacement bookkeeping below, which models
-        # the create/delete edge hand-over and would otherwise score this as an
-        # unreviewed step. It is deliberately NOT added to boundary_changes, so
-        # it can neither satisfy nor disturb a concurrent replacement's
-        # complement accounting.
-        if allow_privatelink_enforcement_update and (
-            _is_exact_privatelink_enforcement_update(raw)
-        ):
             continue
         boundary_changes.append(raw)
         actions = tuple((raw.get("change") or {}).get("actions") or ())
@@ -2482,20 +2391,10 @@ def validate_plan(
     require_dmz_boundary_noop: bool = False,
     require_udp_source_fenced_topology: bool = False,
     allow_udp_source_fence_replacement: bool = False,
-    allow_privatelink_enforcement_update: bool = False,
 ) -> list[str]:
     if allow_udp_source_fence_replacement and not require_dmz_boundary_noop:
         return [
             "allow_udp_source_fence_replacement requires "
-            "require_dmz_boundary_noop"
-        ]
-    # Same fail-closed coupling as the replacement lane: the allowance is only
-    # meaningful while the boundary-noop constraint is being enforced, and
-    # accepting it silently without that constraint would imply a boundary check
-    # that is not actually running.
-    if allow_privatelink_enforcement_update and not require_dmz_boundary_noop:
-        return [
-            "allow_privatelink_enforcement_update requires "
             "require_dmz_boundary_noop"
         ]
     v = Validation()
@@ -2508,9 +2407,6 @@ def validate_plan(
             validate_dmz_boundary_noop(
                 plan,
                 allow_udp_source_fence_replacement=allow_udp_source_fence_replacement,
-                allow_privatelink_enforcement_update=(
-                    allow_privatelink_enforcement_update
-                ),
             )
         )
     for raw in plan.get("resource_changes", []):
@@ -5152,17 +5048,6 @@ def main() -> int:
             "fenced-topology requirement"
         ),
     )
-    parser.add_argument(
-        "--allow-privatelink-enforcement-update",
-        action="store_true",
-        help=(
-            "while enforcing the automatic-apply boundary, admit only the exact "
-            "in-place flip of "
-            "enforce_security_group_inbound_rules_on_private_link_traffic to "
-            "'on' on the fenced cell public NLB; every other attribute must be "
-            "unchanged. Remove once applied"
-        ),
-    )
     args = parser.parse_args()
 
     # Boundary-noop is an orthogonal saved-plan constraint and intentionally
@@ -5202,9 +5087,6 @@ def main() -> int:
             args.require_udp_source_fenced_topology
         ),
         allow_udp_source_fence_replacement=args.allow_udp_source_fence_replacement,
-        allow_privatelink_enforcement_update=(
-            args.allow_privatelink_enforcement_update
-        ),
     )
     if errors:
         for error in errors:
