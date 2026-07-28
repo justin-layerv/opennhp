@@ -8400,6 +8400,27 @@ def check_plan(
             for address in PROVISIONED_CELL_RESOURCES
         )
     )
+    # The catalog's first MUTATION, as distinct from its materialization above.
+    # Row content is an attended lifecycle decision (cell activation, endpoint
+    # revision), so the rows update in place rather than being created. The
+    # create-only predicate above cannot describe that, and before this the
+    # catalog could be born but never changed.
+    #
+    # This admits ONLY update-in-place on exactly the reviewed row set. The
+    # after-state is still pinned field-for-field by
+    # _require_provisioned_cell_values against PROVISIONED_CELL_EXPECTED_ITEM_JSON,
+    # which derives from the reviewed catalog constant -- so a row may only
+    # become what this repo's reviewed catalog already says it is. A create, a
+    # delete, a partial row set, or any content the constant does not name still
+    # fails closed.
+    provisioned_cell_catalog_lifecycle = (
+        changed == set(PROVISIONED_CELL_RESOURCES)
+        and bool(PROVISIONED_CELL_RESOURCES)
+        and all(
+            actual_non_noop.get(address) == ["update"]
+            for address in PROVISIONED_CELL_RESOURCES
+        )
+    )
     provisioned_cell_catalog_creates_pending = {
         address
         for address in PROVISIONED_CELL_RESOURCES
@@ -8869,6 +8890,11 @@ def check_plan(
             )
     elif authority_contract_transition:
         plan_mode = "authority-contract-binding"
+    elif provisioned_cell_catalog_lifecycle:
+        plan_mode = "provisioned-cell-catalog-lifecycle"
+        # No create shapes to assert -- every row already exists. The exact
+        # after-state check below is what binds this to the reviewed catalog.
+        _require_provisioned_cell_planned_output(plan, catalog_present=True)
     elif provisioned_cell_catalog_transition:
         plan_mode = "provisioned-cell-catalog"
         _require_create_shapes(changed, by_address)
