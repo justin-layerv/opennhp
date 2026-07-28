@@ -1582,6 +1582,39 @@ resource "aws_lb" "server" {
   # local.public_udp_source_fenced IS `var.public_nhp_udp_ingress_cidrs != null`.
   security_groups = var.public_nhp_udp_ingress_cidrs != null ? [aws_security_group.server_nlb[0].id] : null
 
+  # Pin the PrivateLink posture of the source fence instead of inheriting it.
+  # This governs whether the SG above is evaluated for traffic that reaches the
+  # NLB through a VPC endpoint service. Read the threat model precisely, because
+  # the naive reading is wrong in BOTH directions:
+  #
+  #   * AWS's documented default is to ENFORCE inbound rules on PrivateLink
+  #     traffic; the setting exists to turn enforcement OFF. So an unset
+  #     attribute is not an open bypass.
+  #   * DescribeLoadBalancers OMITS the member entirely until it is set
+  #     explicitly (it is `Required: No` with no documented response default),
+  #     which is exactly what the live sandbox edges return today.
+  #
+  # So this is hardening, not an exploit fix: it converts an unpinned AWS
+  # default into an asserted, Terraform-owned invariant, so that an out-of-band
+  # flip to "off" becomes drift this repo can see. It also satisfies
+  # .github/scripts/collect_udp_proof_deployment_evidence.py, which requires the
+  # literal "on" of the live edge and cannot pass while the member is omitted.
+  #
+  # In-place ModifyLoadBalancerAttributes, NOT a replacement: the attribute is
+  # Optional+Computed and not ForceNew, so this never re-runs the DNS repoint or
+  # the canary/pin cycle that the fence transition above required.
+  #
+  # Gated on the SAME condition as security_groups, and that gate is
+  # correctness-relevant, not cosmetic: the attribute only has meaning when the
+  # NLB carries security groups to enforce. Production still runs the unfenced,
+  # SG-less edge (terraform/environments/prod/variables.tf pins
+  # public_nhp_udp_ingress_cidrs == null), so null leaves the attribute unset and
+  # Computed there, preserving today's prod behaviour exactly rather than
+  # risking a SetSecurityGroups call against a load balancer with no SGs. This
+  # mirrors the authored-expression note above: the reviewed staging-gate
+  # variable is referenced directly, never through a `local.` indirection.
+  enforce_security_group_inbound_rules_on_private_link_traffic = var.public_nhp_udp_ingress_cidrs != null ? "on" : null
+
   enable_cross_zone_load_balancing = true
   enable_deletion_protection       = local.is_prod
 

@@ -483,10 +483,15 @@ jobs:
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code == '0'
         working-directory: terraform/environments/sandbox
         run: |
+          # --allow-privatelink-enforcement-update is a TEMPORARY migration path
+          # for the one in-place flip of
+          # enforce_security_group_inbound_rules_on_private_link_traffic to "on"
+          # on the fenced cell public NLB; remove it once applied.
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
             tfplan.json \
             --require-dmz-boundary-noop \
-            --allow-udp-source-fence-replacement
+            --allow-udp-source-fence-replacement \
+            --allow-privatelink-enforcement-update
 
       - name: Summarize Terraform Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != ''

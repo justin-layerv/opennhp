@@ -2312,10 +2312,17 @@ jobs:
             # rm`, untaint, or refresh a relay ASG. The named final pre-apply
             # step repeats the same gate against the post-recovery artifact.
             terraform show -json tfplan > plan-boundary-preflight.json
+            # --allow-privatelink-enforcement-update is a TEMPORARY migration
+            # path for the one in-place flip of
+            # enforce_security_group_inbound_rules_on_private_link_traffic to
+            # "on" on the fenced cell public NLB. Remove it (here and in the
+            # named pre-apply step below) once applied; the post-apply
+            # idempotency gate deliberately never carries it.
             python3 ../../../.github/scripts/check-relay-dmz-plan.py \
               --require-pr0-applied \
               --require-dmz-boundary-noop \
               --allow-udp-source-fence-replacement \
+              --allow-privatelink-enforcement-update \
               plan-boundary-preflight.json
           }
 
@@ -2526,10 +2533,15 @@ jobs:
           test -s plan-show.json
           # The initial relay DMZ cutover is complete. Every normal deployment
           # must leave all fenced security-boundary resources unchanged.
+          # --allow-privatelink-enforcement-update is a TEMPORARY migration path
+          # for the one in-place flip of
+          # enforce_security_group_inbound_rules_on_private_link_traffic to "on"
+          # on the fenced cell public NLB; remove it once applied.
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
             --require-pr0-applied \
             --require-dmz-boundary-noop \
             --allow-udp-source-fence-replacement \
+            --allow-privatelink-enforcement-update \
             plan-show.json
 
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
