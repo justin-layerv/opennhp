@@ -297,7 +297,14 @@ resource "aws_iam_role_policy" "manifest_producer_attestations" {
         Sid    = "ReadAttestationBucketControls"
         Effect = "Allow"
         Action = [
-          "s3:GetBucketEncryption",
+          # NOT "s3:GetBucketEncryption" -- that string is not an IAM action at
+          # all. The GetBucketEncryption *API* is authorized by the differently
+          # named s3:GetEncryptionConfiguration. IAM accepts unrecognised action
+          # strings in a policy document without error, so the wrong name fails
+          # closed only at call time, as a runtime AccessDenied that names the
+          # action it actually wanted. The other five below are APIs whose IAM
+          # action name does match the call, so they are correct as written.
+          "s3:GetEncryptionConfiguration",
           "s3:GetBucketOwnershipControls",
           "s3:GetBucketPolicy",
           "s3:GetBucketPolicyStatus",

@@ -2650,6 +2650,43 @@ def _bucket_name(bucket_arn: str) -> str:
     return name
 
 
+def _sorted_policy_scalar_lists(value: Any) -> Any:
+    """Order-normalise an IAM policy document before digesting it.
+
+    The published contract digest is `sha256(jsonencode(<authored policy>))`
+    from Terraform, and Terraform's jsonencode is byte-identical to
+    `contract.canonical_bytes` for this document -- both sort object keys and
+    emit compact separators. The two sides therefore already agree on
+    canonicalisation, and the digest is a genuine binding of the whole policy.
+
+    What they do NOT agree on is list order. S3 stores the document and
+    GetBucketPolicy returns `Principal.AWS` arrays in an order that differs from
+    the authored one (here: `layerv-nhp-sandbox-server` comes back first rather
+    than in the authored sort order). The principal SETS are identical -- this
+    is a re-ordering by AWS, not a policy change, and `terraform plan` is
+    correctly a no-op because aws_s3_bucket_policy diffs by policy equivalence,
+    not by bytes.
+
+    So digesting the returned document verbatim compares an AWS-ordered
+    document against a Terraform-ordered one and can never match except by
+    luck. Sorting scalar lists first is exactly the missing normalisation:
+    Action, Resource, Principal and Condition values are SETS in IAM semantics,
+    where order carries no meaning, so this discards nothing the digest is
+    supposed to protect. Every element is still bound -- an added, removed or
+    altered principal changes the digest.
+
+    Lists holding non-scalars (statement lists) keep their order untouched.
+    """
+    if isinstance(value, dict):
+        return {key: _sorted_policy_scalar_lists(item) for key, item in value.items()}
+    if isinstance(value, list):
+        items = [_sorted_policy_scalar_lists(item) for item in value]
+        if all(isinstance(item, str) for item in items):
+            return sorted(items)
+        return items
+    return value
+
+
 def _validate_attestation_bucket(bucket: str) -> tuple[str, str]:
     versioning = _aws(
         "s3api", ["get-bucket-versioning", "--bucket", bucket], "attestation versioning"
@@ -2714,7 +2751,7 @@ def _validate_attestation_bucket(bucket: str) -> tuple[str, str]:
         raise EvidenceError("runtime-attestation bucket policy must be an object")
     policy_sha256 = hashlib.sha256(
         contract.canonical_bytes(
-            policy,
+            _sorted_policy_scalar_lists(policy),
             maximum=64 * 1024,
             name="runtime-attestation bucket policy",
         )

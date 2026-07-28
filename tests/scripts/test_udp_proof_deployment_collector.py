@@ -1529,3 +1529,93 @@ class LaunchTemplateEvidenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BucketPolicyDigestNormalisationTest(unittest.TestCase):
+    """S3 re-orders Principal.AWS, so the digest must be order-normalised.
+
+    The published contract digest is sha256(jsonencode(<authored policy>)) from
+    Terraform. GetBucketPolicy returns the same document with its principal
+    lists in a different order, so digesting it verbatim can never match.
+    """
+
+    AUTHORED = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowSelfBoundNodeAttestationWrites",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": [
+                        "arn:aws:iam::767397897469:role/a-server",
+                        "arn:aws:iam::767397897469:role/b-frps",
+                        "arn:aws:iam::767397897469:role/c-cell1",
+                    ]
+                },
+                "Action": ["s3:PutObject"],
+                "Resource": "arn:aws:s3:::bucket/runtime/*",
+            },
+            {
+                "Sid": "DenyInsecureTransport",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": "arn:aws:s3:::bucket",
+            },
+        ],
+    }
+
+    def digest(self, policy: dict) -> str:
+        return hashlib.sha256(
+            contract.canonical_bytes(
+                collector._sorted_policy_scalar_lists(policy),
+                maximum=64 * 1024,
+                name="policy",
+            )
+        ).hexdigest()
+
+    def aws_returned(self) -> dict:
+        """The same policy with AWS's principal ordering."""
+        returned = copy.deepcopy(self.AUTHORED)
+        returned["Statement"][0]["Principal"]["AWS"] = [
+            "arn:aws:iam::767397897469:role/c-cell1",
+            "arn:aws:iam::767397897469:role/a-server",
+            "arn:aws:iam::767397897469:role/b-frps",
+        ]
+        return returned
+
+    def test_reordered_principals_produce_the_authored_digest(self) -> None:
+        self.assertNotEqual(
+            self.AUTHORED["Statement"][0]["Principal"]["AWS"],
+            self.aws_returned()["Statement"][0]["Principal"]["AWS"],
+        )
+        self.assertEqual(self.digest(self.aws_returned()), self.digest(self.AUTHORED))
+
+    def test_an_added_principal_still_breaks_the_digest(self) -> None:
+        tampered = self.aws_returned()
+        tampered["Statement"][0]["Principal"]["AWS"].append(
+            "arn:aws:iam::767397897469:role/attacker"
+        )
+        self.assertNotEqual(self.digest(tampered), self.digest(self.AUTHORED))
+
+    def test_a_removed_principal_still_breaks_the_digest(self) -> None:
+        tampered = self.aws_returned()
+        tampered["Statement"][0]["Principal"]["AWS"].pop()
+        self.assertNotEqual(self.digest(tampered), self.digest(self.AUTHORED))
+
+    def test_effect_and_action_changes_still_break_the_digest(self) -> None:
+        for mutate in (
+            lambda p: p["Statement"][0].__setitem__("Effect", "Deny"),
+            lambda p: p["Statement"][0].__setitem__("Action", ["s3:*"]),
+            lambda p: p["Statement"][1].__setitem__("Principal", "arn:aws:iam::1:root"),
+        ):
+            with self.subTest(mutate=mutate):
+                tampered = self.aws_returned()
+                mutate(tampered)
+                self.assertNotEqual(self.digest(tampered), self.digest(self.AUTHORED))
+
+    def test_statement_order_is_preserved(self) -> None:
+        """Statement lists hold objects, so their order must NOT be sorted."""
+        swapped = self.aws_returned()
+        swapped["Statement"].reverse()
+        self.assertNotEqual(self.digest(swapped), self.digest(self.AUTHORED))
