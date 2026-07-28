@@ -63,9 +63,16 @@ locals {
     for cluster in local.manifest_ecs_clusters :
     "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:task/${cluster}/*"
   ]
+  # cell1's profile carries the DOUBLE "cell1" segment. The sandbox-cell1 root's
+  # name_prefix already contains the cell id and modules/compute appends it
+  # again, so the live profile is layerv-nhp-sandbox-cell1-cell1-server -- the
+  # same convention as its 22 DynamoDB tables. Pinning the single-segment name
+  # produced AccessDenied on iam:GetInstanceProfile for a profile that exists
+  # under a different name, which reads as a missing grant rather than a typo.
+  # Verified with `aws iam list-instance-profiles`.
   manifest_instance_profile_arns = [
     "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-server",
-    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-cell1-server",
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-cell1-cell1-server",
     "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/layerv-nhp-sandbox-frps",
   ]
 }
