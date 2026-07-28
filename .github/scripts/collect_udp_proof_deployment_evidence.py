@@ -1011,11 +1011,33 @@ def _ecr_manifest(
         ],
         f"{name} ECR manifest",
     )
+    # batch-get-image returns ONE ENTRY PER TAG, not one per image. A digest
+    # carrying two tags -- which is the normal result of the governed publisher,
+    # since it stamps both a run-scoped staging tag and the source-revision tag
+    # on the promoted image -- comes back as two entries whose imageDigest and
+    # imageManifest are byte-identical.
+    #
+    # Requiring len(images) == 1 therefore rejected an unambiguous digest purely
+    # for being tagged twice, which is neither an integrity property nor
+    # something the publisher can avoid. What actually matters is that the digest
+    # resolves to exactly ONE manifest: assert that directly, over the distinct
+    # manifests, so a digest that somehow resolved to differing content still
+    # fails closed. The per-entry digest match and the sha256(manifest) == digest
+    # verification below are unchanged.
     if (
         not isinstance(response, dict)
         or response.get("failures") != []
         or not isinstance(response.get("images"), list)
-        or len(response["images"]) != 1
+        or not response["images"]
+        or not all(isinstance(entry, dict) for entry in response["images"])
+        or len({
+            (
+                entry.get("imageId", {}).get("imageDigest"),
+                entry.get("imageManifest"),
+            )
+            for entry in response["images"]
+        })
+        != 1
     ):
         raise EvidenceError(f"{name} ECR digest does not resolve exactly once")
     image = response["images"][0]

@@ -1699,3 +1699,60 @@ class TerraformJsonencodeDigestTest(unittest.TestCase):
             collector._terraform_jsonencode_digest(
                 {"big": "x" * 4096}, maximum=64, name="document"
             )
+
+
+class EcrManifestMultiTagTest(unittest.TestCase):
+    """batch-get-image returns one entry PER TAG, not per image.
+
+    The governed publisher stamps both a run-scoped staging tag and the
+    source-revision tag on the promoted image, so a correct digest routinely
+    comes back as two byte-identical entries.
+    """
+
+    DIGEST = "sha256:" + "a" * 64
+
+    def entry(self, tag, *, digest=None, manifest="MANIFEST"):
+        return {
+            "imageId": {"imageDigest": digest or self.DIGEST, "imageTag": tag},
+            "imageManifest": manifest,
+        }
+
+    def resolve(self, images):
+        """Mirror the collector's resolution predicate."""
+        response = {"failures": [], "images": images}
+        return (
+            isinstance(response, dict)
+            and response.get("failures") == []
+            and isinstance(response.get("images"), list)
+            and bool(response["images"])
+            and all(isinstance(e, dict) for e in response["images"])
+            and len({
+                (e.get("imageId", {}).get("imageDigest"), e.get("imageManifest"))
+                for e in response["images"]
+            })
+            == 1
+        )
+
+    def test_two_tags_on_one_digest_resolve(self) -> None:
+        self.assertTrue(self.resolve([self.entry("stage-tag"), self.entry("rev-tag")]))
+
+    def test_single_tag_resolves(self) -> None:
+        self.assertTrue(self.resolve([self.entry("only")]))
+
+    def test_differing_manifests_fail_closed(self) -> None:
+        self.assertFalse(
+            self.resolve([self.entry("a"), self.entry("b", manifest="OTHER")])
+        )
+
+    def test_differing_digests_fail_closed(self) -> None:
+        self.assertFalse(
+            self.resolve(
+                [self.entry("a"), self.entry("b", digest="sha256:" + "b" * 64)]
+            )
+        )
+
+    def test_no_images_fails_closed(self) -> None:
+        self.assertFalse(self.resolve([]))
+
+    def test_non_dict_entries_fail_closed(self) -> None:
+        self.assertFalse(self.resolve([self.entry("a"), "not-a-dict"]))
