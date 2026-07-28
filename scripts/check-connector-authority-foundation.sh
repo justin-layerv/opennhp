@@ -9,6 +9,8 @@ fi
 
 plan_json="${1:-}"
 repo_root="${NHP_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+checker_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+control_plan_checker="${checker_repo_root}/.github/scripts/check-control-sandbox-first-apply.py"
 module_dir="${repo_root}/terraform/modules/connector-authority-foundation"
 control_dir="${repo_root}/terraform/control"
 scan_paths=("$module_dir" "$control_dir")
@@ -139,7 +141,37 @@ if [[ -n "$plan_json" ]]; then
   # Keep the SG admissions self-contained and exact here as well as in the
   # first-apply checker. Any retained/substituted CIDR or any other delete stays
   # destructive.
-  destructive_resources="$(jq -r '
+  # The Hub ECS task definition is immutable, so an image-only deploy presents
+  # as a destructive replacement. Admit it here only after the authoritative
+  # Python plan validator proves it is the sole non-noop change and pins every
+  # non-image field plus the exact sandbox account/region/repository/digest.
+  # This shell fence deliberately delegates the deep shape instead of growing a
+  # second jq implementation that can drift from the complete Control checker.
+  hub_worker_image_update_allowed=false
+  if jq -e '
+    [
+      (.resource_changes[]?, .resource_drift[]?)
+      | select(
+          .change.actions != ["no-op"]
+          and .change.actions != ["read"]
+        )
+    ] | map(select(.change.actions | index("delete"))) as $destructive
+    | ($destructive | length) == 1
+      and $destructive[0].address
+        == "module.control.aws_ecs_task_definition.hub[0]"
+      and $destructive[0].change.actions == ["delete", "create"]
+  ' "$plan_json" >/dev/null; then
+    if ! python3 "$control_plan_checker" \
+      hub-worker-image-update "$plan_json" >/dev/null; then
+      echo "ERROR: Hub worker task-definition replacement failed its exact image-only contract" >&2
+      exit 1
+    fi
+    hub_worker_image_update_allowed=true
+  fi
+
+  destructive_resources="$(jq -r \
+    --argjson hub_worker_image_update_allowed \
+      "$hub_worker_image_update_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -242,6 +274,14 @@ if [[ -n "$plan_json" ]]; then
           and .change.actions == ["create", "delete"]
         ) or (
           .address == "module.control.aws_lb_listener.hub[0]"
+          and .change.actions == ["delete", "create"]
+        ) or (
+          $hub_worker_image_update_allowed
+          and .address
+            == "module.control.aws_ecs_task_definition.hub[0]"
+          and .type == "aws_ecs_task_definition"
+          and .mode == "managed"
+          and (.deposed // null) == null
           and .change.actions == ["delete", "create"]
         )) | not
       )

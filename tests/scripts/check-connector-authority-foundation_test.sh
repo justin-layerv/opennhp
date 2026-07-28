@@ -266,6 +266,123 @@ expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_r
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lb_listener.hub[0]","type":"aws_lb_listener","change":{"actions":["create","delete"],"after":{"port":62206,"protocol":"UDP"}}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# A Hub image deploy replaces the immutable ECS task definition. The shell
+# destructive-action fence delegates this one exact shape to the authoritative
+# Python validator; it must not maintain a weaker duplicate in jq.
+hub_worker_plan="$(
+  jq -n \
+    --arg old_image '767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-hub@sha256:7777777777777777777777777777777777777777777777777777777777777777' \
+    --arg new_image '767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-hub@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    '{
+      resource_changes: [{
+        address: "module.control.aws_ecs_task_definition.hub[0]",
+        type: "aws_ecs_task_definition",
+        mode: "managed",
+        change: {
+          actions: ["delete", "create"],
+          before: {
+            family: "hub",
+            cpu: "512",
+            memory: "1024",
+            execution_role_arn: "arn:aws:iam::767397897469:role/hub-exec",
+            task_role_arn: "arn:aws:iam::767397897469:role/hub-task",
+            container_definitions: ([{
+              name: "hub",
+              image: $old_image,
+              essential: true,
+              portMappings: [{containerPort: 62206}]
+            }, {
+              name: "hub-init",
+              image: $old_image,
+              essential: false
+            }] | tojson),
+            enable_fault_injection: false,
+            ipc_mode: "",
+            pid_mode: "",
+            volume: [{
+              name: "hub-etc",
+              configure_at_launch: false,
+              docker_volume_configuration: [],
+              efs_volume_configuration: [],
+              fsx_windows_file_server_volume_configuration: [],
+              host_path: "",
+              s3files_volume_configuration: []
+            }],
+            arn: "arn:aws:ecs:us-east-2:767397897469:task-definition/hub:1",
+            arn_without_revision: "arn:aws:ecs:us-east-2:767397897469:task-definition/hub",
+            id: "hub",
+            revision: 1,
+            tags_all: {}
+          },
+          after: {
+            family: "hub",
+            cpu: "512",
+            memory: "1024",
+            execution_role_arn: "arn:aws:iam::767397897469:role/hub-exec",
+            task_role_arn: "arn:aws:iam::767397897469:role/hub-task",
+            container_definitions: ([{
+              name: "hub",
+              image: $new_image,
+              essential: true,
+              portMappings: [{containerPort: 62206}]
+            }, {
+              name: "hub-init",
+              image: $new_image,
+              essential: false
+            }] | tojson),
+            ipc_mode: null,
+            pid_mode: null,
+            volume: [{
+              name: "hub-etc",
+              docker_volume_configuration: [],
+              efs_volume_configuration: [],
+              fsx_windows_file_server_volume_configuration: [],
+              host_path: "",
+              s3files_volume_configuration: []
+            }],
+            tags_all: {}
+          },
+          after_unknown: {
+            arn: true,
+            arn_without_revision: true,
+            id: true,
+            revision: true,
+            enable_fault_injection: true,
+            volume: [{
+              configure_at_launch: true,
+              docker_volume_configuration: [],
+              efs_volume_configuration: [],
+              fsx_windows_file_server_volume_configuration: [],
+              s3files_volume_configuration: []
+            }]
+          },
+          replace_paths: [["container_definitions"]]
+        }
+      }]
+    }'
+)"
+printf '%s\n' "$hub_worker_plan" >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# Same repository name in a foreign registry is not the reviewed artifact.
+printf '%s\n' "$hub_worker_plan" \
+  | jq '.resource_changes[0].change.after.container_definitions |= (fromjson | .[0].image |= sub("767397897469"; "000000000000") | tojson)' \
+    >"$plan_json"
+expect_failure 'failed its exact image-only contract' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# The observed Terraform lifecycle is destroy then create; reversing it is a
+# different transition and must remain destructive.
+printf '%s\n' "$hub_worker_plan" \
+  | jq '.resource_changes[0].change.actions = ["create", "delete"]' \
+    >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+# A second destructive change prevents the replacement from borrowing this lane.
+printf '%s\n' "$hub_worker_plan" \
+  | jq '.resource_changes += [{"address":"aws_vpc.smuggled","type":"aws_vpc","mode":"managed","change":{"actions":["delete","create"],"before":{},"after":{}}}]' \
+    >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 printf '%s\n' '{"resource_changes":[{"address":"aws_route_table.isolated[0]","type":"aws_route_table","change":{"actions":["create"],"after":{"route":[]},"after_unknown":{"route":true}}}]}' >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 

@@ -10643,5 +10643,316 @@ class FirstProjectionDriftTests(unittest.TestCase):
         self.assert_rejected(refresh, prior_state)
 
 
+class HubWorkerImageUpdateLaneTest(unittest.TestCase):
+    """Shipping a reviewed Hub image was not expressible before this lane.
+
+    ECS task definitions are immutable, so the deploy can only ever present as
+    delete+create. The allow-list carried a lane for the Authority runtime's
+    image update and none for the Hub worker, so the plan was rejected as an
+    unreviewed transition -- the same create-time-only shape seen repeatedly.
+    """
+
+    HUB_REPO = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-hub"
+    OLD_IMAGE = f"{HUB_REPO}@sha256:{'7' * 64}"
+    NEW_IMAGE = f"{HUB_REPO}@sha256:{'c' * 64}"
+
+    def containers(self, image):
+        return json.dumps(
+            [
+                {
+                    "name": "hub",
+                    "image": image,
+                    "cpu": 512,
+                    "memory": 1024,
+                    "essential": True,
+                    "portMappings": [{"containerPort": 62206}],
+                },
+                {
+                    "name": "hub-init",
+                    "image": image,
+                    "essential": False,
+                },
+            ]
+        )
+
+    def state(self, image, **overrides):
+        base = {
+            "family": "hub",
+            "cpu": "512",
+            "memory": "1024",
+            "execution_role_arn": "arn:aws:iam::767397897469:role/hub-exec",
+            "task_role_arn": "arn:aws:iam::767397897469:role/hub-task",
+            "container_definitions": self.containers(image),
+            "enable_fault_injection": False,
+            "ipc_mode": "",
+            "pid_mode": "",
+            "volume": [
+                {
+                    "name": "hub-etc",
+                    "configure_at_launch": False,
+                    "docker_volume_configuration": [],
+                    "efs_volume_configuration": [],
+                    "fsx_windows_file_server_volume_configuration": [],
+                    "host_path": "",
+                    "s3files_volume_configuration": [],
+                }
+            ],
+            "arn": "arn:aws:ecs:us-east-2:767397897469:task-definition/hub:1",
+            "arn_without_revision": (
+                "arn:aws:ecs:us-east-2:767397897469:task-definition/hub"
+            ),
+            "id": "hub",
+            "revision": 1,
+            "tags_all": {},
+        }
+        base.update(overrides)
+        return base
+
+    def by_address(self, before, after, actions=("delete", "create"), unknown=None):
+        after = copy.deepcopy(after)
+        for key in (
+            "arn",
+            "arn_without_revision",
+            "enable_fault_injection",
+            "id",
+            "revision",
+        ):
+            after.pop(key, None)
+        after["ipc_mode"] = None
+        after["pid_mode"] = None
+        after["volume"][0].pop("configure_at_launch")
+        return {
+            CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS: {
+                "address": CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS,
+                "type": "aws_ecs_task_definition",
+                "mode": "managed",
+                "change": {
+                    "actions": list(actions),
+                    "replace_paths": [["container_definitions"]],
+                    "before": before,
+                    "after": after,
+                    "after_unknown": {
+                        "arn": True,
+                        "arn_without_revision": True,
+                        "id": True,
+                        "revision": True,
+                        "enable_fault_injection": True,
+                        "volume": [
+                            {
+                                "configure_at_launch": True,
+                                "docker_volume_configuration": [],
+                                "efs_volume_configuration": [],
+                                "fsx_windows_file_server_volume_configuration": [],
+                                "s3files_volume_configuration": [],
+                            }
+                        ],
+                    }
+                    if unknown is None
+                    else unknown,
+                },
+            }
+        }
+
+    def test_an_image_only_replacement_is_admitted(self) -> None:
+        CHECKER._check_hub_worker_image_update(
+            self.by_address(self.state(self.OLD_IMAGE), self.state(self.NEW_IMAGE))
+        )
+
+    def test_a_replacement_that_moves_no_image_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "both container images"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), self.state(self.OLD_IMAGE))
+            )
+
+    def test_a_smuggled_task_role_change_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "task_role_arn"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(
+                    self.state(self.OLD_IMAGE),
+                    self.state(self.NEW_IMAGE, task_role_arn="arn:aws:iam::1:role/evil"),
+                )
+            )
+
+    def test_a_smuggled_sizing_change_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "'cpu'"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(
+                    self.state(self.OLD_IMAGE), self.state(self.NEW_IMAGE, cpu="1024")
+                )
+            )
+
+    def test_a_smuggled_container_field_change_is_rejected(self) -> None:
+        """Every non-image key inside the container definition is pinned too."""
+        after = self.state(self.NEW_IMAGE)
+        containers = json.loads(after["container_definitions"])
+        containers[0]["portMappings"] = [{"containerPort": 9999}]
+        after["container_definitions"] = json.dumps(containers)
+        with self.assertRaisesRegex(CHECKER.ContractError, "portMappings"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), after)
+            )
+
+    def test_only_the_live_provider_container_defaults_are_normalized(self) -> None:
+        before = self.state(self.OLD_IMAGE)
+        containers = json.loads(before["container_definitions"])
+        containers[0].update(
+            {"environment": [], "systemControls": [], "volumesFrom": []}
+        )
+        containers[0]["portMappings"][0]["hostPort"] = 62206
+        containers[1].update(
+            {"portMappings": [], "systemControls": [], "volumesFrom": []}
+        )
+        before["container_definitions"] = json.dumps(containers)
+        CHECKER._check_hub_worker_image_update(
+            self.by_address(before, self.state(self.NEW_IMAGE))
+        )
+
+        containers[0]["portMappings"][0]["hostPort"] = 62207
+        before["container_definitions"] = json.dumps(containers)
+        with self.assertRaisesRegex(CHECKER.ContractError, "key set|portMappings"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(before, self.state(self.NEW_IMAGE))
+            )
+
+    def test_a_floating_tag_is_rejected(self) -> None:
+        """The lane must not be usable to float the worker onto a mutable ref."""
+        with self.assertRaisesRegex(CHECKER.ContractError, "pinned by digest"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(
+                    self.state(self.OLD_IMAGE), self.state(f"{self.HUB_REPO}:latest")
+                )
+            )
+
+    def test_a_foreign_repository_is_rejected(self) -> None:
+        foreign = (
+            "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/evil"
+            f"@sha256:{'c' * 64}"
+        )
+        with self.assertRaisesRegex(CHECKER.ContractError, "pinned by digest"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), self.state(foreign))
+            )
+
+    def test_a_foreign_account_or_region_is_rejected(self) -> None:
+        for foreign in (
+            self.NEW_IMAGE.replace("767397897469", "000000000000", 1),
+            self.NEW_IMAGE.replace("us-east-2", "us-west-2", 1),
+        ):
+            with self.subTest(foreign=foreign):
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "pinned by digest"
+                ):
+                    CHECKER._check_hub_worker_image_update(
+                        self.by_address(
+                            self.state(self.OLD_IMAGE), self.state(foreign)
+                        )
+                    )
+
+    def test_missing_or_empty_unknown_revision_is_rejected(self) -> None:
+        for unknown in ({}, None):
+            with self.subTest(unknown=unknown):
+                by_address = self.by_address(
+                    self.state(self.OLD_IMAGE),
+                    self.state(self.NEW_IMAGE),
+                    unknown=unknown,
+                )
+                if unknown is None:
+                    del by_address[
+                        CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS
+                    ]["change"]["after_unknown"]
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "defer its computed revision"
+                ):
+                    CHECKER._check_hub_worker_image_update(by_address)
+
+    def test_reverse_replacement_order_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "destroy-then-create"
+        ):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(
+                    self.state(self.OLD_IMAGE),
+                    self.state(self.NEW_IMAGE),
+                    actions=("create", "delete"),
+                )
+            )
+
+    def test_partial_or_divergent_container_roll_is_rejected(self) -> None:
+        for mode in ("partial", "divergent"):
+            with self.subTest(mode=mode):
+                after = self.state(self.NEW_IMAGE)
+                containers = json.loads(after["container_definitions"])
+                containers[0]["image"] = (
+                    self.OLD_IMAGE
+                    if mode == "partial"
+                    else self.NEW_IMAGE.replace("c" * 64, "d" * 64)
+                )
+                after["container_definitions"] = json.dumps(containers)
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError,
+                    "both container images|move together",
+                ):
+                    CHECKER._check_hub_worker_image_update(
+                        self.by_address(self.state(self.OLD_IMAGE), after)
+                    )
+
+    def test_unreviewed_provider_projection_is_rejected(self) -> None:
+        by_address = self.by_address(
+            self.state(self.OLD_IMAGE), self.state(self.NEW_IMAGE)
+        )
+        by_address[CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS]["change"][
+            "after_unknown"
+        ]["task_role_arn"] = True
+        with self.assertRaisesRegex(CHECKER.ContractError, "not exact"):
+            CHECKER._check_hub_worker_image_update(by_address)
+
+    def test_attribute_or_container_key_set_change_is_rejected(self) -> None:
+        after = self.state(self.NEW_IMAGE)
+        after["smuggled"] = True
+        with self.assertRaisesRegex(CHECKER.ContractError, "attribute set"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), after)
+            )
+
+        after = self.state(self.NEW_IMAGE)
+        containers = json.loads(after["container_definitions"])
+        containers[0]["smuggled"] = True
+        after["container_definitions"] = json.dumps(containers)
+        with self.assertRaisesRegex(CHECKER.ContractError, "key set"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), after)
+            )
+
+    def test_non_json_or_empty_containers_are_rejected(self) -> None:
+        for raw in ("not-json", "[]"):
+            with self.subTest(raw=raw):
+                after = self.state(self.NEW_IMAGE)
+                after["container_definitions"] = raw
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_hub_worker_image_update(
+                        self.by_address(self.state(self.OLD_IMAGE), after)
+                    )
+
+    def test_an_in_place_update_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "task-definition replacement"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(
+                    self.state(self.OLD_IMAGE),
+                    self.state(self.NEW_IMAGE),
+                    actions=("update",),
+                )
+            )
+
+    def test_a_container_count_change_is_rejected(self) -> None:
+        after = self.state(self.NEW_IMAGE)
+        containers = json.loads(after["container_definitions"])
+        containers.append({"name": "sidecar", "image": self.NEW_IMAGE})
+        after["container_definitions"] = json.dumps(containers)
+        with self.assertRaisesRegex(CHECKER.ContractError, "containers must remain"):
+            CHECKER._check_hub_worker_image_update(
+                self.by_address(self.state(self.OLD_IMAGE), after)
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

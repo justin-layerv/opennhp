@@ -1176,6 +1176,10 @@ PRIVATELINK_ENFORCEMENT_BEFORE_VALUES = frozenset({"", "off"})
 HUB_LOG_GROUP_ARN = (
     f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/layerv/nhp/sandbox/control/hub:*"
 )
+HUB_WORKER_IMAGE_RE = re.compile(
+    rf"^{ACCOUNT_ID}\.dkr\.ecr\.{re.escape(AWS_REGION)}\.amazonaws\.com/"
+    rf"{re.escape(HUB_ECR_REPOSITORY_NAME)}@sha256:[0-9a-f]{{64}}$"
+)
 # The Hub key-material secret ARN carries a random 6-char Secrets Manager suffix,
 # so the opened secretsmanager endpoint policy Resource is matched by shape, not a
 # constructed literal.
@@ -6400,6 +6404,301 @@ def _check_authority_image_new_noops(
             )
 
 
+HUB_WORKER_TASK_DEFINITION_ADDRESS = "module.control.aws_ecs_task_definition.hub[0]"
+# Attributes ECS/Terraform recompute for every new task-definition revision.
+# Everything NOT listed here must be byte-identical across the replacement.
+HUB_WORKER_TASK_DEFINITION_COMPUTED = frozenset(
+    {"arn", "arn_without_revision", "id", "revision"}
+)
+
+
+def _check_hub_worker_image_update(by_address: dict[str, Any]) -> None:
+    """Prove a Hub worker replacement is EXACTLY a container-image change.
+
+    ECS task definitions are immutable, so deploying a new Hub image can only
+    ever present as delete+create. The allow-list already carries a lane for the
+    Authority runtime's image update and had none for the Hub worker, so the
+    ordinary act of shipping a reviewed Hub image was not expressible at all --
+    the same create-time-only shape this checker has hit repeatedly.
+
+    Admitting it is safe only if the replacement is provably image-only, so this
+    pins every other field: the container set, their names, and every non-image
+    key inside each container definition, plus every top-level task-definition
+    attribute apart from the ones ECS recomputes per revision. A change that also
+    moved a role, a port, a log group, or an environment variable fails here.
+
+    The new image must be the sandbox Hub ECR repository pinned by digest, never
+    a tag, so this lane cannot be used to float the worker onto a mutable ref.
+    """
+    item = by_address.get(HUB_WORKER_TASK_DEFINITION_ADDRESS)
+    if (
+        not isinstance(item, dict)
+        or item.get("address") != HUB_WORKER_TASK_DEFINITION_ADDRESS
+        or item.get("type") != "aws_ecs_task_definition"
+        or item.get("mode") != "managed"
+        or item.get("deposed") is not None
+    ):
+        raise ContractError("Hub worker task definition identity is not exact")
+    change = item.get("change")
+    if not isinstance(change, dict):
+        raise ContractError("Hub worker task definition change is malformed")
+    if change.get("actions") != ["delete", "create"]:
+        raise ContractError(
+            "Hub worker image update must be exactly one destroy-then-create "
+            "task-definition replacement"
+        )
+    if change.get("replace_paths") != [["container_definitions"]]:
+        raise ContractError(
+            "Hub worker replacement must be caused only by container_definitions"
+        )
+    after_unknown = change.get("after_unknown")
+    if not isinstance(after_unknown, dict) or not after_unknown:
+        # A brand-new revision always defers arn/revision, so an empty
+        # after_unknown means this is not the replacement it claims to be.
+        raise ContractError("Hub worker replacement must defer its computed revision")
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError("Hub worker task definition before/after are malformed")
+    expected_before_only = HUB_WORKER_TASK_DEFINITION_COMPUTED | {
+        "enable_fault_injection"
+    }
+    if set(after) - set(before) or set(before) - set(after) != expected_before_only:
+        raise ContractError("Hub worker task definition attribute set changed")
+
+    _check_hub_worker_provider_projections(before, after, after_unknown)
+
+    before_containers = _loads_container_definitions(before, "before")
+    after_containers = _loads_container_definitions(after, "after")
+    expected_container_names = ["hub", "hub-init"]
+    if (
+        [item.get("name") for item in before_containers if isinstance(item, dict)]
+        != expected_container_names
+        or [item.get("name") for item in after_containers if isinstance(item, dict)]
+        != expected_container_names
+        or len(before_containers) != len(expected_container_names)
+        or len(after_containers) != len(expected_container_names)
+    ):
+        raise ContractError(
+            "Hub worker containers must remain exactly hub then hub-init"
+        )
+
+    moved_images: list[tuple[str, str]] = []
+    for old, new in zip(before_containers, after_containers):
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            raise ContractError("Hub worker container definition is malformed")
+        if old.get("name") != new.get("name"):
+            raise ContractError("Hub worker container order or naming changed")
+        normalized_old = _normalize_hub_worker_container(old)
+        normalized_new = _normalize_hub_worker_container(new)
+        if set(normalized_old) != set(normalized_new):
+            raise ContractError("Hub worker container key set changed")
+        for key in normalized_old:
+            if key == "image":
+                continue
+            if normalized_old[key] != normalized_new[key]:
+                raise ContractError(
+                    f"Hub worker container {old.get('name')!r} changed {key!r}; "
+                    "this lane admits an image change and nothing else"
+                )
+        if old.get("image") != new.get("image"):
+            moved_images.append((str(old.get("image")), str(new.get("image"))))
+
+    if len(moved_images) != len(expected_container_names):
+        raise ContractError("Hub worker replacement must update both container images")
+    if (
+        len({old_image for old_image, _ in moved_images}) != 1
+        or len({new_image for _, new_image in moved_images}) != 1
+    ):
+        raise ContractError(
+            "Hub worker containers must move together between identical image digests"
+        )
+    for old_image, new_image in moved_images:
+        if not HUB_WORKER_IMAGE_RE.fullmatch(old_image):
+            raise ContractError(
+                "Hub worker prior image must be the sandbox Hub repository pinned "
+                "by digest"
+            )
+        if not HUB_WORKER_IMAGE_RE.fullmatch(new_image):
+            raise ContractError(
+                "Hub worker image must be the sandbox Hub repository pinned by "
+                "digest"
+            )
+
+    for key in before:
+        if key in (
+            *HUB_WORKER_TASK_DEFINITION_COMPUTED,
+            "container_definitions",
+            "enable_fault_injection",
+            "ipc_mode",
+            "pid_mode",
+            "volume",
+        ):
+            continue
+        if before[key] != after[key]:
+            raise ContractError(
+                f"Hub worker task definition changed {key!r}; this lane admits an "
+                "image change and nothing else"
+            )
+
+
+def _normalize_hub_worker_container(container: dict[str, Any]) -> dict[str, Any]:
+    """Remove only the AWS provider's proven container JSON defaults."""
+    normalized = copy.deepcopy(container)
+    name = normalized.get("name")
+
+    for key in ("systemControls", "volumesFrom"):
+        if normalized.get(key) == []:
+            normalized.pop(key)
+
+    if name == "hub":
+        if normalized.get("environment") == []:
+            normalized.pop("environment")
+        port_mappings = normalized.get("portMappings")
+        if isinstance(port_mappings, list):
+            for mapping in port_mappings:
+                if (
+                    isinstance(mapping, dict)
+                    and "hostPort" in mapping
+                    and mapping.get("hostPort") == mapping.get("containerPort")
+                ):
+                    mapping.pop("hostPort")
+    elif name == "hub-init" and normalized.get("portMappings") == []:
+        normalized.pop("portMappings")
+
+    return normalized
+
+
+def _true_unknown_paths(value: Any, path: tuple[Any, ...] = ()) -> set[tuple[Any, ...]]:
+    """Return the exact paths Terraform marks unknown with boolean true."""
+    if value is True:
+        return {path}
+    if isinstance(value, dict):
+        paths: set[tuple[Any, ...]] = set()
+        for key, item in value.items():
+            paths.update(_true_unknown_paths(item, (*path, key)))
+        return paths
+    if isinstance(value, list):
+        paths = set()
+        for index, item in enumerate(value):
+            paths.update(_true_unknown_paths(item, (*path, index)))
+        return paths
+    return set()
+
+
+def _check_hub_worker_provider_projections(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    after_unknown: dict[str, Any],
+) -> None:
+    """Admit only the exact AWS-provider projections in the live replace."""
+    expected_true_unknowns = {
+        ("arn",),
+        ("arn_without_revision",),
+        ("enable_fault_injection",),
+        ("id",),
+        ("revision",),
+        ("volume", 0, "configure_at_launch"),
+    }
+    if _true_unknown_paths(after_unknown) != expected_true_unknowns:
+        raise ContractError("Hub worker deferred attributes are not exact")
+
+    if (
+        before.get("enable_fault_injection") is not False
+        or "enable_fault_injection" in after
+        or after_unknown.get("enable_fault_injection") is not True
+    ):
+        raise ContractError(
+            "Hub worker enable_fault_injection projection is not exact"
+        )
+
+    before_volumes = before.get("volume")
+    after_volumes = after.get("volume")
+    expected_old_volume = {
+        "configure_at_launch": False,
+        "docker_volume_configuration": [],
+        "efs_volume_configuration": [],
+        "fsx_windows_file_server_volume_configuration": [],
+        "host_path": "",
+        "name": "hub-etc",
+        "s3files_volume_configuration": [],
+    }
+    expected_new_volume = {
+        key: value
+        for key, value in expected_old_volume.items()
+        if key != "configure_at_launch"
+    }
+    if (
+        before_volumes != [expected_old_volume]
+        or after_volumes != [expected_new_volume]
+    ):
+        raise ContractError("Hub worker volume projection is not exact")
+
+    if (
+        before.get("ipc_mode") != ""
+        or after.get("ipc_mode") is not None
+        or before.get("pid_mode") != ""
+        or after.get("pid_mode") is not None
+    ):
+        raise ContractError("Hub worker ipc_mode/pid_mode projections are not exact")
+
+
+def check_hub_worker_image_update_plan(plan: Any) -> dict[str, str | int]:
+    """Validate the one destructive Hub image transition for the shell fence.
+
+    ``check-connector-authority-foundation.sh`` runs before the complete Control
+    plan checker. It must reject destructive actions generally while allowing
+    this one immutable ECS replacement. Reuse the authoritative Python validator
+    here instead of maintaining a second field-by-field implementation in jq.
+    """
+    if not isinstance(plan, dict):
+        raise ContractError("Terraform plan must be an object")
+
+    destructive: list[dict[str, Any]] = []
+    for field in ("resource_changes", "resource_drift"):
+        entries = plan.get(field, [])
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise ContractError(f"Terraform plan {field} must be an array")
+        for item in entries:
+            if not isinstance(item, dict):
+                raise ContractError(f"Terraform plan {field} item is malformed")
+            change = item.get("change")
+            if not isinstance(change, dict):
+                raise ContractError(f"Terraform plan {field} change is malformed")
+            actions = change.get("actions")
+            if isinstance(actions, list) and "delete" in actions:
+                destructive.append(item)
+
+    if (
+        len(destructive) != 1
+        or destructive[0].get("address") != HUB_WORKER_TASK_DEFINITION_ADDRESS
+    ):
+        raise ContractError(
+            "Hub worker image update must be the only destructive resource change"
+        )
+    _check_hub_worker_image_update(
+        {HUB_WORKER_TASK_DEFINITION_ADDRESS: destructive[0]}
+    )
+    return {"changed_resources": 1, "plan_mode": "hub-worker-image-update"}
+
+
+def _loads_container_definitions(state: dict[str, Any], side: str) -> list:
+    raw = state.get("container_definitions")
+    if not isinstance(raw, str):
+        raise ContractError(f"Hub worker {side} container_definitions is not JSON text")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ContractError(
+            f"Hub worker {side} container_definitions is not valid JSON"
+        ) from error
+    if not isinstance(parsed, list) or not parsed:
+        raise ContractError(f"Hub worker {side} container_definitions is empty")
+    return parsed
+
+
 def _check_authority_image_update(
     changed: set[str],
     by_address: dict[str, dict[str, Any]],
@@ -9144,6 +9443,12 @@ def check_plan(
             by_address,
             "Authority alarm resources must be new",
         )
+    elif changed == {HUB_WORKER_TASK_DEFINITION_ADDRESS}:
+        # Deploying a reviewed Hub image. Immutable task definitions make this a
+        # replacement by construction; _check_hub_worker_image_update proves the
+        # replacement is image-only before it is admitted.
+        plan_mode = "hub-worker-image-update"
+        _check_hub_worker_image_update(by_address)
     elif hub_s3_correction:
         plan_mode = "hub-s3-endpoint-policy-correction"
         # A single in-place policy update on the already-created hub_s3 gateway
@@ -9159,7 +9464,8 @@ def check_plan(
             "Authority runtime slice or image update, the exact Authority alarm "
             "routing slice, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
-            "exact Hub S3 endpoint-policy correction, Hub PrivateLink "
+            "exact Hub S3 endpoint-policy correction, the exact Hub worker "
+            "image update, Hub PrivateLink "
             "inbound-rule enforcement, or Hub UDP source-fence "
             "replacement; "
             f"got {actual_non_noop}"
@@ -10605,6 +10911,9 @@ def parse_args() -> argparse.Namespace:
     normalization_drift.add_argument("plan_json", type=Path)
     normalization_drift.add_argument("prior_state_json", type=Path)
 
+    hub_worker_image_update = sub.add_parser("hub-worker-image-update")
+    hub_worker_image_update.add_argument("plan_json", type=Path)
+
     state_list = sub.add_parser("state-list")
     state_list.add_argument("path", type=Path)
 
@@ -10632,6 +10941,8 @@ def main() -> int:
                 load_json(args.plan_json),
                 load_json(args.prior_state_json),
             )
+        elif args.command == "hub-worker-image-update":
+            result = check_hub_worker_image_update_plan(load_json(args.plan_json))
         elif args.command == "state-list":
             result = check_state_list(args.path)
         elif args.command == "state":
