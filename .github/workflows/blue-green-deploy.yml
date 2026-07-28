@@ -18,7 +18,7 @@ name: Blue/Green Deploy
 # time window, or if the run is held by the concurrency group /
 # environment approval and reported as status=waiting. Shows up in
 # the GitHub UI as the run's title and in `gh run list --json displayTitle`.
-run-name: "Blue/Green ${{ inputs.environment }} ${{ inputs.component }} ${{ inputs.action }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+run-name: "Blue/Green ${{ inputs.environment }} ${{ inputs.cell_id }} ${{ inputs.component }} ${{ inputs.action }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
 
 on:
   workflow_dispatch:
@@ -132,6 +132,30 @@ concurrency:
 
 env:
   AWS_REGION: us-east-2
+  # Infrastructure namespace for the cell being deployed. This is a SEPARATE
+  # axis from `environment`, and conflating the two is what left cell1 without
+  # a deploy lane.
+  #
+  #   environment  — the GitHub deployment environment (secrets, protection
+  #                  rules) and the NHP/Authority protocol environment. Stays
+  #                  `sandbox` for BOTH sandbox cells; tickets bind
+  #                  {environment=sandbox, cell_id=cellN}.
+  #   INFRA_ENVIRONMENT — what terraform keys resource names and SSM paths on:
+  #                  cell0 -> "sandbox"       -> /sandbox/nhp/...
+  #                  cell1 -> "sandbox-cell1" -> /sandbox-cell1/nhp/...
+  #
+  # terraform/environments/sandbox-cell1/variables.tf pins `environment` to
+  # "sandbox-cell1" (validated != "sandbox") while `protocol_environment`
+  # stays "sandbox" — this expression is the CI-side mirror of that split.
+  #
+  # Before this, every SSM read was /${inputs.environment}/nhp/... and the
+  # cell_id input only labelled deploy-window markers, AC-assignment cleanup
+  # and CloudWatch dimensions. A dispatch with cell_id=cell1 therefore read
+  # cell0's parameters and would have rolled cell0's fleet under cell1's
+  # labels — silently wrong rather than merely unsupported.
+  #
+  # cell0 keeps `sandbox` verbatim, so this is a no-op for the existing lane.
+  INFRA_ENVIRONMENT: ${{ inputs.cell_id == 'cell0' && inputs.environment || format('{0}-{1}', inputs.environment, inputs.cell_id) }}
 
 jobs:
   # =============================================================================
@@ -149,6 +173,31 @@ jobs:
     environment: ${{ inputs.environment }}
     timeout-minutes: 180
     steps:
+      # Fence the cell_id BEFORE the lock is taken. INFRA_ENVIRONMENT is built
+      # by string concatenation, so an unknown value (a typo like "cel1")
+      # would otherwise resolve to a plausible-looking namespace such as
+      # /sandbox-cel1/nhp/... and only blow up several jobs later — while
+      # holding the shared live-environment mutex on its 4h TTL. Failing here
+      # costs seconds and never acquires the lock.
+      #
+      # Allowlist rather than a regex: only cells that actually have a
+      # blue/green server fleet belong here. cell0 is terraform/ (root) and
+      # cell1 is terraform/environments/sandbox-cell1/. Add a cell to this
+      # list only once its /<infra-env>/nhp/server/* parameters exist.
+      - name: Validate Cell Identifier
+        env:
+          CELL_ID: ${{ inputs.cell_id }}
+        run: |
+          set -euo pipefail
+          case "$CELL_ID" in
+            cell0|cell1) ;;
+            *)
+              echo "::error::Unknown cell_id '$CELL_ID' (expected cell0 or cell1). The infrastructure namespace is derived from this value, so an unrecognised cell would address a non-existent SSM namespace." >&2
+              exit 1
+              ;;
+          esac
+          echo "cell_id=$CELL_ID -> infrastructure namespace /${INFRA_ENVIRONMENT}/nhp/..."
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -237,7 +286,7 @@ jobs:
         id: server-state
         if: steps.components.outputs.deploy_server == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           COMPONENT: ${{ inputs.component }}
         run: |
           SSM_BASE="/${ENVIRONMENT}/nhp/server"
@@ -362,7 +411,7 @@ jobs:
         id: ac-state
         if: steps.components.outputs.deploy_ac == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           COMPONENT: ${{ inputs.component }}
         run: |
           SSM_BASE="/${ENVIRONMENT}/nhp/ac"
@@ -636,7 +685,9 @@ jobs:
         if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
         uses: ./.github/actions/mark-deployment-window
         with:
-          environment: ${{ inputs.environment }}
+          # Same DeploymentWindow metric as the instance-refresh heartbeat
+          # below, so it must carry the same Environment dimension.
+          environment: ${{ env.INFRA_ENVIRONMENT }}
           cell_id: ${{ inputs.cell_id }}
           component: ${{ inputs.component }}
           strategy: blue-green-standby
@@ -647,7 +698,7 @@ jobs:
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
           IMAGE_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
         run: |
           REPO_NAME=$(aws ssm get-parameter \
             --name "/${ENVIRONMENT}/nhp/server/ecr-repo-name" \
@@ -683,7 +734,7 @@ jobs:
       - name: "[Server] Update Standby Image Tag"
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
           IMAGE_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -716,7 +767,11 @@ jobs:
           STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
           ACTIVE_ASG: ${{ needs.prepare.outputs.server_active_asg }}
           DRY_RUN: ${{ inputs.dry_run }}
+          # Same boot budget as the standby health probe: reaching InService
+          # costs a user_data boot plus the ASG health-check grace.
+          STANDBY_HEALTH_TIMEOUT_MINUTES: ${{ inputs.standby_health_timeout_minutes }}
         run: |
+          set -euo pipefail
           ACTIVE_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ACTIVE_ASG" \
             --query "AutoScalingGroups[0].DesiredCapacity" --output text)
@@ -727,6 +782,56 @@ jobs:
             aws autoscaling update-auto-scaling-group \
               --auto-scaling-group-name "$STANDBY_ASG" \
               --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
+
+            # Wait for the standby to actually reach capacity before the next
+            # steps observe it.
+            #
+            # A WARM standby (cell0 keeps both colours at 3) is already there,
+            # so this returns on the first poll and the step is unchanged for
+            # the existing lane. A COLD standby is the new case: cell1's green
+            # ASG sits at DesiredCapacity 0 until its first deploy. Without
+            # this wait, start-instance-refresh can run against a still-empty
+            # ASG and complete instantly as a no-op, after which
+            # verify-asg-instances-healthy.sh hard-fails with "No InService
+            # instances found" — a red deploy on a perfectly healthy rollout.
+            # Fall back to the input's declared default if the value ever
+            # arrives non-numeric: arithmetic treats a blank as 0, which would
+            # trip the deadline on the first iteration and fail a healthy
+            # rollout. dispatch-and-poll-blue-green.sh does not pass this
+            # input, so cell1 deploys ride on the workflow default.
+            WAIT_MINUTES="$STANDBY_HEALTH_TIMEOUT_MINUTES"
+            if [[ ! "$WAIT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::warning::standby_health_timeout_minutes='$WAIT_MINUTES' is not a positive integer; using 15"
+              WAIT_MINUTES=15
+            fi
+            DEADLINE=$(($(date +%s) + WAIT_MINUTES * 60))
+            while :; do
+              # Tolerate a transient DescribeAutoScalingGroups failure
+              # (throttling, eventual consistency). A cold standby can take
+              # minutes, and one blip must not abort an otherwise-healthy
+              # rollout under `set -e` — DEADLINE below is the real bound.
+              # Same posture as the transient-tolerant polling in
+              # dispatch-and-poll-blue-green.sh.
+              INSERVICE=$(aws autoscaling describe-auto-scaling-groups \
+                --auto-scaling-group-names "$STANDBY_ASG" \
+                --query "length(AutoScalingGroups[0].Instances[?LifecycleState=='InService'])" \
+                --output text 2>/dev/null) || INSERVICE=""
+              if [[ "$INSERVICE" =~ ^[0-9]+$ ]]; then
+                if ((INSERVICE >= ACTIVE_CAPACITY)); then
+                  echo "Standby ASG $STANDBY_ASG reached $INSERVICE/$ACTIVE_CAPACITY InService"
+                  break
+                fi
+                PROGRESS="$INSERVICE/$ACTIVE_CAPACITY InService"
+              else
+                PROGRESS="capacity read failed (transient), retrying"
+              fi
+              if (($(date +%s) >= DEADLINE)); then
+                echo "::error::Standby ASG $STANDBY_ASG did not reach $ACTIVE_CAPACITY InService instance(s) within ${WAIT_MINUTES}m (last observation: $PROGRESS)" >&2
+                exit 1
+              fi
+              echo "  Standby at $PROGRESS, waiting..."
+              sleep 15
+            done
           fi
 
       # ---- AC Setup Steps (moved before refresh to enable parallel refresh) ----
@@ -735,7 +840,7 @@ jobs:
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
           IMAGE_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
         run: |
           REPO_NAME=$(aws ssm get-parameter \
             --name "/${ENVIRONMENT}/nhp/ac/ecr-repo-name" \
@@ -768,7 +873,7 @@ jobs:
       - name: "[AC] Update Standby Image Tag"
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
           IMAGE_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -827,7 +932,7 @@ jobs:
           DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
           DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
           REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
-          DEPLOYMENT_WINDOW_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOYMENT_WINDOW_ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           DEPLOYMENT_WINDOW_CELL_ID: ${{ inputs.cell_id }}
           DEPLOYMENT_WINDOW_COMPONENT: ${{ inputs.component }}
           DEPLOYMENT_WINDOW_STRATEGY: blue-green-standby-refresh
@@ -1021,7 +1126,9 @@ jobs:
         if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
         uses: ./.github/actions/mark-deployment-window
         with:
-          environment: ${{ inputs.environment }}
+          # Same DeploymentWindow metric as the instance-refresh heartbeat
+          # below, so it must carry the same Environment dimension.
+          environment: ${{ env.INFRA_ENVIRONMENT }}
           cell_id: ${{ inputs.cell_id }}
           component: ${{ inputs.component }}
           strategy: blue-green-switch
@@ -1033,7 +1140,7 @@ jobs:
       - name: "[Server] Assert Standby Image Tag Matches Target"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           EXPECTED_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
         run: |
           ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" server standby "$EXPECTED_TAG"
@@ -1041,7 +1148,7 @@ jobs:
       - name: "[AC] Assert Standby Image Tag Matches Target"
         if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           EXPECTED_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
         run: |
           ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" ac standby "$EXPECTED_TAG"
@@ -1052,7 +1159,7 @@ jobs:
           STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
           ACTIVE_COLOR: ${{ needs.prepare.outputs.server_active_color }}
           DRY_RUN: ${{ inputs.dry_run }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           ACTION: ${{ inputs.action }}
         run: |
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -1068,7 +1175,7 @@ jobs:
           STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
           ACTIVE_COLOR: ${{ needs.prepare.outputs.ac_active_color }}
           DRY_RUN: ${{ inputs.dry_run }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           ACTION: ${{ inputs.action }}
         run: |
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -1086,7 +1193,7 @@ jobs:
       - name: "[Server] Assert Active Image Tag Matches Target"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           EXPECTED_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
         run: |
           ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" server active "$EXPECTED_TAG"
@@ -1094,7 +1201,7 @@ jobs:
       - name: "[AC] Assert Active Image Tag Matches Target"
         if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           EXPECTED_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
         run: |
           ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" ac active "$EXPECTED_TAG"
@@ -1119,7 +1226,7 @@ jobs:
       - name: "[AC] Clear DynamoDB AC Assignments (stale server IPs)"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           CELL_ID: ${{ inputs.cell_id }}
         run: |
           set -euo pipefail
@@ -1346,7 +1453,7 @@ jobs:
       - name: "[Server] Reconcile Listener and SSM State"
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           PRIMARY_LISTENER: ${{ needs.prepare.outputs.server_primary_listener_arn }}
           GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.server_green_primary_tg_arn }}
           BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.server_blue_primary_tg_arn }}
@@ -1391,7 +1498,7 @@ jobs:
       - name: "[Server] Reconcile Internal Relay Listener and SSM State"
         if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_internal_listener_arn != ''
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           INTERNAL_LISTENER: ${{ needs.prepare.outputs.server_internal_listener_arn }}
           GREEN_INTERNAL_TG: ${{ needs.prepare.outputs.server_green_internal_tg_arn }}
           BLUE_INTERNAL_TG: ${{ needs.prepare.outputs.server_blue_internal_tg_arn }}
@@ -1436,7 +1543,7 @@ jobs:
       - name: "[AC] Reconcile Listener and SSM State"
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           PRIMARY_LISTENER: ${{ needs.prepare.outputs.ac_primary_listener_arn }}
           GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.ac_green_primary_tg_arn }}
           BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.ac_blue_primary_tg_arn }}
@@ -1477,7 +1584,7 @@ jobs:
 
       - name: Run Validation Script
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
         run: |
           if [[ -f scripts/validate-deployment.sh ]]; then
             chmod +x scripts/validate-deployment.sh
@@ -1490,7 +1597,7 @@ jobs:
 
       - name: Push Deployment Metric
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           CELL_ID: ${{ inputs.cell_id }}
           COMPONENT: ${{ inputs.component }}
         run: |
@@ -1684,7 +1791,7 @@ jobs:
 
       - name: Send deployment notification
         env:
-          ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
           COMPONENT: ${{ inputs.component }}
           ACTION: ${{ inputs.action }}
           IMAGE_TAG: ${{ inputs.image_tag }}

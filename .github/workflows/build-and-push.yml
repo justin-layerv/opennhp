@@ -3073,6 +3073,12 @@ jobs:
     concurrency:
       group: deploy-sandbox-blue-green
       cancel-in-progress: true
+    outputs:
+      # Consumed by deploy-sandbox-cell1-blue-green so cell1 deploys the exact
+      # tag cell0 was dispatched with. Resolving cell1's tag independently
+      # would let the two cells drift at the moment the UDP proof producer
+      # requires them equal.
+      server_tag: ${{ steps.resolve-tag.outputs.server_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3187,6 +3193,165 @@ jobs:
             echo "--- Dispatching component=$COMPONENT tag=$TAG ---"
             ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox "$COMPONENT" "$TAG" </dev/null
           done <<< "$PLAN"
+
+  # ============================================================================
+  # DEPLOY SANDBOX CELL1 - Blue/Green (server only)
+  # ============================================================================
+  # cell1 is the second cell of the two-cell UDP substrate. It has its own
+  # infrastructure namespace (/sandbox-cell1/nhp/...), its own blue/green ASG
+  # pair (layerv-nhp-sandbox-cell1-server{,-green}), and NO AC fleet — so it
+  # deploys component=server only.
+  #
+  # Why this job exists: nothing deployed cell1's server fleet before it. This
+  # workflow only ran `terraform init/validate` against
+  # terraform/environments/sandbox-cell1, and blue-green-deploy.yml keyed every
+  # SSM read on `environment` (a choice input whose only option is `sandbox`),
+  # so even a cell_id=cell1 dispatch read cell0's /sandbox/nhp/server/*
+  # parameters. cell1 therefore sat at image-tag `latest` with
+  # deployed-commit=initial and deployed-at=never, and never converged to main.
+  #
+  # That is what fails the UDP proof manifest producer: it requires nhp_cell0,
+  # nhp_cell1 and nhp_hub to report one shared source_revision, and raises
+  # "deployed NHP or qurl-service source revisions are mixed" otherwise
+  # (.github/scripts/collect_udp_proof_deployment_evidence.py).
+  #
+  # Ordering: runs AFTER deploy-sandbox-blue-green, not beside it. Both cells'
+  # blue/green runs take the same /layerv-nhp-sandbox/qurl-live-env-lock SSM
+  # mutex and share blue-green-deploy.yml's `blue-green-sandbox` concurrency
+  # group, so a parallel dispatch would just block on the lock. Sequencing
+  # keeps the wait short and failure attribution clean.
+  #
+  # cell1's terraform root is applied out-of-band (this workflow validates but
+  # never applies terraform/environments/sandbox-cell1). That is fine for
+  # convergence: the image tag reaches instances through SSM
+  # (/sandbox-cell1/nhp/server/{,green-}image-tag, read at boot by
+  # terraform/modules/compute/user_data.sh.tpl via the DeployColor tag) plus an
+  # instance refresh — no apply required. Launch-template/user_data changes
+  # still need that out-of-band apply.
+  deploy-sandbox-cell1-blue-green:
+    name: Deploy Sandbox cell1 - Blue/Green
+    # Only deploy-sandbox-blue-green is listed: it already needs setup, build
+    # and deploy-sandbox-infra, so gating on its success gates transitively on
+    # all of them, and its server_tag output is the only value used here.
+    needs: [deploy-sandbox-blue-green]
+    if: |
+      always() &&
+      needs.deploy-sandbox-blue-green.result == 'success' &&
+      needs.deploy-sandbox-blue-green.outputs.server_tag != ''
+    runs-on: ubuntu-latest
+    environment: sandbox
+    # Single dispatch: one find-run window (FIND_RETRIES 24 x 5s = 120s) plus
+    # the 2400s poll budget is ~42m. 50m covers that plus checkout/AWS/SSM
+    # pre-steps with buffer. deploy-sandbox-blue-green needs 90m only because
+    # its drift path can dispatch twice; cell1 has one component.
+    timeout-minutes: 50
+    # Job-level permissions REPLACE the workflow-level block, so re-list every
+    # scope. actions: write for the workflow-dispatch REST call,
+    # id-token: write for the AWS OIDC role, contents: read for checkout.
+    permissions:
+      id-token: write
+      contents: read
+      actions: write
+    concurrency:
+      group: deploy-sandbox-cell1-blue-green
+      cancel-in-progress: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Dispatch cell1 Blue/Green Deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # The tag cell0 was dispatched with — convergence is the point.
+          SERVER_TAG: ${{ needs.deploy-sandbox-blue-green.outputs.server_tag }}
+          # Read by dispatch-and-poll-blue-green.sh and passed through as
+          # blue-green-deploy.yml's cell_id input, which now also selects the
+          # /sandbox-cell1/nhp/... infrastructure namespace.
+          CELL_ID: cell1
+          POLL_TIMEOUT: "2400"
+        run: |
+          set -euo pipefail
+          echo "============================================"
+          echo "DISPATCHING CELL1 BLUE/GREEN DEPLOYMENT"
+          echo "  cell:       cell1"
+          echo "  component:  server (cell1 has no AC fleet)"
+          echo "  server tag: $SERVER_TAG"
+          echo "============================================"
+          ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox server "$SERVER_TAG" </dev/null
+
+      # Same fail-closed posture as cell0's "Update Deployment Tracking": prove
+      # the configured active tag before recording anything, and leave the
+      # marker stale (failing red) rather than claiming an unproven deploy.
+      - name: Update cell1 Deployment Tracking
+        env:
+          SERVER_TAG: ${{ needs.deploy-sandbox-blue-green.outputs.server_tag }}
+        run: |
+          set -euo pipefail
+
+          # Re-read through the active-color indirection rather than trusting
+          # the dispatch's exit status: blue-green-deploy.yml writes the
+          # STANDBY slot and then flips active-color, so only this read proves
+          # which tag cell1 actually serves now.
+          ACTIVE_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox-cell1 server active)
+          if [[ "$ACTIVE_TAG" != "$SERVER_TAG" ]]; then
+            echo "::error::cell1 active image tag is '$ACTIVE_TAG' but this deploy targeted '$SERVER_TAG'. Leaving /sandbox-cell1/nhp/deploy/deployed-commit stale so the next deploy re-proves it." >&2
+            exit 1
+          fi
+          echo "cell1 active image tag confirmed: $ACTIVE_TAG"
+
+          # Provenance fence. cell1 was seeded with the compute module's default
+          # image_tag ("latest") in BOTH colour slots and never deployed, so its
+          # running build was whatever :latest happened to point at when the
+          # instance booted — observed 2026-07-28 as 48b432bc while :latest had
+          # already moved on to 1d58e1db. A mutable tag in the active slot means
+          # the fleet is not reproducible and an instance replacement silently
+          # changes the running build, so refuse to record it as deployed.
+          if [[ ! "$ACTIVE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::cell1 active image tag '$ACTIVE_TAG' is not an immutable 40-hex commit SHA. A mutable tag (e.g. 'latest'/'sandbox') gives the fleet no pinned provenance — an instance replacement would silently change the running build." >&2
+            exit 1
+          fi
+
+          # The standby slot is only rewritten when a deploy targets that
+          # colour, so a never-deployed cell reaches a fully-pinned pair after
+          # its second deploy. Surface the residual window rather than leaving
+          # it silent.
+          STANDBY_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox-cell1 server standby)
+          if [[ ! "$STANDBY_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::cell1 standby image tag is '$STANDBY_TAG', not a pinned commit SHA. The standby colour is not a reproducible rollback target until the next deploy writes that slot."
+          fi
+
+          # deployed-commit records the commit whose IMAGE cell1 runs, which on
+          # the infra-only path is cell0's active tag rather than github.sha.
+          # cell0 stamps github.sha there because this workflow applies cell0's
+          # terraform at that SHA; it does not apply cell1's root, so github.sha
+          # would be an unearned claim for cell1.
+          CURRENT=$(aws ssm get-parameter \
+            --name "/sandbox-cell1/nhp/deploy/deployed-commit" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [[ -n "$CURRENT" && "$CURRENT" != "initial" && "$CURRENT" != "$SERVER_TAG" ]]; then
+            aws ssm put-parameter \
+              --name "/sandbox-cell1/nhp/deploy/deployed-commit-previous" \
+              --value "$CURRENT" --type String --overwrite \
+              || echo "::warning::Failed to update SSM /sandbox-cell1/nhp/deploy/deployed-commit-previous"
+            echo "  Previous commit saved: deployed-commit-previous = $CURRENT"
+          fi
+
+          aws ssm put-parameter \
+            --name "/sandbox-cell1/nhp/deploy/deployed-commit" \
+            --value "$SERVER_TAG" --type String --overwrite \
+            || echo "::warning::Failed to update SSM /sandbox-cell1/nhp/deploy/deployed-commit"
+          aws ssm put-parameter \
+            --name "/sandbox-cell1/nhp/deploy/deployed-at" \
+            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
+            || echo "::warning::Failed to update SSM /sandbox-cell1/nhp/deploy/deployed-at"
+          echo "::notice::cell1 deployment tracking updated: deployed-commit = $SERVER_TAG"
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
@@ -3592,6 +3757,11 @@ jobs:
       # Sandbox deploy jobs
       - deploy-sandbox-infra
       - deploy-sandbox-blue-green
+      # cell1 server fleet. Same surface-the-failure rationale as the legs
+      # below: cell1 failing to converge is exactly what breaks the UDP proof
+      # manifest producer's shared-source_revision requirement, and it must not
+      # be masked by a green cell0 deploy.
+      - deploy-sandbox-cell1-blue-green
       # qurl ECS roll (#1634). Included so a failed roll surfaces in Slack
       # instead of being masked by a green build/blue-green — the same
       # surface-the-failure rationale as packer-build above.
@@ -3641,6 +3811,7 @@ jobs:
           # Sandbox deploy components
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
+          SANDBOX_CELL1_BLUE_GREEN: ${{ needs.deploy-sandbox-cell1-blue-green.result }}
           SANDBOX_QURL: ${{ needs.deploy-sandbox-qurl.result }}
           SANDBOX_RELAY: ${{ needs.deploy-sandbox-relay.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
@@ -3862,7 +4033,7 @@ jobs:
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_CELL1_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break

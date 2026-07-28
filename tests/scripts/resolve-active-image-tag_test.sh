@@ -126,7 +126,34 @@ _assert_fail "missing standby resolved slot -> non-zero" sandbox server standby 
 "/sandbox/nhp/server/active-color green
 /sandbox/nhp/server/green-image-tag GREENTAG"
 
-# Input validation: only sandbox is supported (prod is canary, read directly).
+# cell1 is a second infrastructure namespace on the same blue/green shape.
+# Its SSM paths are /sandbox-cell1/nhp/server/* — keyed on terraform's
+# `environment` ("sandbox-cell1"), not on the protocol environment (both
+# sandbox cells are protocol environment "sandbox").
+_assert_tag "cell1 active=blue -> image-tag" sandbox-cell1 server active "C1BLUE" \
+"/sandbox-cell1/nhp/server/active-color blue
+/sandbox-cell1/nhp/server/image-tag C1BLUE
+/sandbox-cell1/nhp/server/green-image-tag C1GREEN"
+
+_assert_tag "cell1 standby with active=blue -> green-image-tag" sandbox-cell1 server standby "C1GREEN" \
+"/sandbox-cell1/nhp/server/active-color blue
+/sandbox-cell1/nhp/server/image-tag C1BLUE
+/sandbox-cell1/nhp/server/green-image-tag C1GREEN"
+
+# cell1 must never resolve cell0's parameters: with only /sandbox/... populated,
+# a cell1 lookup has to fail rather than silently return cell0's tag. This is
+# the exact confusion that left cell1 with no deploy lane.
+_assert_fail "cell1 does not fall back to cell0 parameters" sandbox-cell1 server active \
+"/sandbox/nhp/server/active-color blue
+/sandbox/nhp/server/image-tag CELL0TAG"
+
+# cell1 is server-only — it has no /sandbox-cell1/nhp/ac/* parameters.
+_assert_fail "cell1 ac component rejected" sandbox-cell1 ac active \
+"/sandbox-cell1/nhp/ac/active-color blue
+/sandbox-cell1/nhp/ac/image-tag C1AC"
+
+# Input validation: only the blue/green infra namespaces are supported
+# (prod is canary, read directly).
 _assert_fail "non-sandbox environment rejected" prod server active \
 "/prod/nhp/server/active-color blue
 /prod/nhp/server/image-tag PRODTAG"

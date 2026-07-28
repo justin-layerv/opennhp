@@ -16,10 +16,14 @@
 # Usage: resolve-active-image-tag.sh <environment> <component> [active|standby]
 #
 # Arguments:
-#   environment  — currently only "sandbox" (the only env using blue/green
-#                  for nhp components today; prod uses canary on a single
-#                  /image-tag slot and should read it directly).
-#   component    — "server" or "ac".
+#   environment  — an *infrastructure* namespace using blue/green: "sandbox"
+#                  (cell0) or "sandbox-cell1" (cell1). These are the terraform
+#                  `environment` values, which is what /<env>/nhp/... SSM paths
+#                  are keyed on — NOT the protocol environment (both sandbox
+#                  cells share protocol environment "sandbox"). Prod uses
+#                  canary on a single /image-tag slot and should read it
+#                  directly.
+#   component    — "server" or "ac". cell1 is server-only.
 #   slot         — optional logical slot, "active" (default) or "standby".
 #
 # Stdout: the requested logical image tag (a SHA, or whatever value is stored).
@@ -33,7 +37,7 @@ set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
   echo "Usage: $0 <environment> <component> [active|standby]" >&2
-  echo "  environment: sandbox" >&2
+  echo "  environment: sandbox | sandbox-cell1" >&2
   echo "  component:   server | ac" >&2
   echo "  slot:        active | standby (default: active)" >&2
   exit 1
@@ -43,8 +47,20 @@ ENVIRONMENT="$1"
 COMPONENT="$2"
 SLOT="${3:-active}"
 
-if [[ "$ENVIRONMENT" != "sandbox" ]]; then
-  echo "::error::resolve-active-image-tag.sh only supports sandbox today (got '$ENVIRONMENT'). Prod uses canary on /prod/nhp/<component>/image-tag — read that slot directly." >&2
+# Allowlist, not a prefix match: these are the two infrastructure namespaces
+# that actually publish /<env>/nhp/<component>/active-color. Keep it in
+# lockstep with the cell allowlist in blue-green-deploy.yml's
+# "Validate Cell Identifier" step.
+if [[ "$ENVIRONMENT" != "sandbox" && "$ENVIRONMENT" != "sandbox-cell1" ]]; then
+  echo "::error::resolve-active-image-tag.sh supports sandbox (cell0) and sandbox-cell1 (cell1) today (got '$ENVIRONMENT'). Prod uses canary on /prod/nhp/<component>/image-tag — read that slot directly." >&2
+  exit 1
+fi
+
+# cell1 is a server-only cell: it has no /sandbox-cell1/nhp/ac/* parameters,
+# so an "ac" lookup there would fail deep in the SSM read with a confusing
+# ParameterNotFound instead of naming the real problem.
+if [[ "$ENVIRONMENT" == "sandbox-cell1" && "$COMPONENT" == "ac" ]]; then
+  echo "::error::sandbox-cell1 (cell1) has no AC fleet — only component=server is valid there." >&2
   exit 1
 fi
 
