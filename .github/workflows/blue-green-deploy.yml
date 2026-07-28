@@ -1583,13 +1583,24 @@ jobs:
   # =============================================================================
   # FINALIZE SANDBOX LIVE-ENVIRONMENT LOCK
   # =============================================================================
-  # Release only after the complete blue/green mutation reached a verified
-  # terminal state. A failed mutation may leave an instance refresh, listener,
-  # or active-color transition requiring operator reconciliation, so retain the
-  # lock fail-closed instead of admitting an unrelated qv2 proof into it.
+  # Release once the run can no longer move the live boundary. A mutation that
+  # actually reached the listeners and then failed may leave a half-switched
+  # boundary or an unconverged active color requiring operator reconciliation,
+  # so retain the lock fail-closed there instead of admitting an unrelated qv2
+  # proof into it. A run that failed before switch-traffic never touched the
+  # customer path and releases; classify-blue-green-lock-release.sh draws that
+  # line and is the tested contract.
+  #
+  # Gated on always() alone, NOT on the acquire job's result: the acquire step
+  # writes the SSM parameter and then still has post-steps to run, so a
+  # cancellation in that window leaves the lock held by a job whose result is
+  # 'cancelled'. Gating on 'success' skipped finalize there and leaked the lock
+  # for the full TTL. Reaching the release unconditionally is safe because the
+  # vendored helper deletes only after re-reading and matching this run's exact
+  # owner token, and no-ops when the lock is absent or owned by anyone else.
   finalize-qurl-live-env-lock:
     name: Finalize qURL Live-Environment Lock
-    if: always() && needs.acquire-qurl-live-env-lock.result == 'success'
+    if: always()
     needs:
       - acquire-qurl-live-env-lock
       - prepare

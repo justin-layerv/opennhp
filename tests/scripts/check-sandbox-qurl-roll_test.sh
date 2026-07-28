@@ -801,8 +801,11 @@ if [[ -z "$BG_FINALIZE" ]]; then
   report_fail "blue/green lock-finalize job exists" \
     "no '  finalize-qurl-live-env-lock:' job header found in blue-green-deploy.yml"
 else
-  assert_in "$BG_FINALIZE" finalize-qurl-live-env-lock "blue/green lock finalization runs after failed dependencies" \
-    "if: always\(\) && needs\.acquire-qurl-live-env-lock\.result == 'success'"
+  # Unconditional always(): the acquire job can be cancelled after it has already
+  # written the SSM parameter, so gating finalization on that job's result leaks
+  # the lock for its full TTL. Exact-owner release makes the ungated run safe.
+  assert_in "$BG_FINALIZE" finalize-qurl-live-env-lock "blue/green lock finalization runs after failed, cancelled, or unacquired dependencies" \
+    "if: always\(\)$"
   for dependency in prepare deploy-to-standby switch-traffic validate scale-down-previous; do
     assert_in "$BG_FINALIZE" finalize-qurl-live-env-lock "blue/green lock finalize waits for $dependency" \
       "-[[:space:]]*$dependency"

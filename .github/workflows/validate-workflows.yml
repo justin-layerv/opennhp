@@ -442,6 +442,7 @@ jobs:
           bash tests/scripts/resolve-live-app-image-required_test.sh
           bash tests/scripts/verify-live-app-images-ready_test.sh
           python3 tests/scripts/test_ssm_live_env_lock.py
+          python3 tests/scripts/test_blue_green_lock_release.py
           bash tests/scripts/check-sandbox-qurl-roll_test.sh
 
       # PR-time fence for the #2680 post-deploy relay smoke helper. The live

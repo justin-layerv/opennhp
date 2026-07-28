@@ -542,6 +542,7 @@ lint-workflows:
 	@bash tests/scripts/resolve-live-app-image-required_test.sh
 	@bash tests/scripts/verify-live-app-images-ready_test.sh
 	@python3 tests/scripts/test_ssm_live_env_lock.py
+	@python3 tests/scripts/test_blue_green_lock_release.py
 	@bash tests/scripts/check-sandbox-qurl-roll_test.sh
 	@command -v node >/dev/null 2>&1 || { \
 		echo "$(COLOUR_RED)[OpenNHP] node not found. Install Node.js 18+ to run the qURL relay bootstrap smoke self-test$(END_COLOUR)"; \

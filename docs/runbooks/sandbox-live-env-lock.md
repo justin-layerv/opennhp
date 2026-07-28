@@ -129,10 +129,35 @@ validation, and actual previous-color warm-standby convergence all succeed.
 Rollback and switch-only runs release only after their switch and validation
 succeed; explicitly skipped validation is not release-safe after a mutation. A
 prepare failure, true dry run, or successful prepare that selects no deployable
-component is safe to release because none can mutate live state. Any other
-terminal shape retains the lock: reconcile active-color parameters, listener
-target groups, ASG capacities/refreshes, and knock readiness before exact-owner
-release.
+component is safe to release because none can mutate live state.
+
+A run whose `Switch Traffic` job is **skipped** also releases. `switch-traffic`
+is the only job that mutates the live boundary — every `aws elbv2
+modify-listener` and the authoritative `active-color` write live in
+`blue-green-switch.sh`, which nothing else invokes — and its own guard is
+`needs.deploy-to-standby.result == 'success' || == 'skipped'`. A skipped switch
+therefore proves the roll failed or was cancelled before any listener moved and
+the customer path is exactly as the run found it. The standby-only residue such
+a run leaves (scaled-up standby ASG, refreshed standby fleet, updated standby
+image tag) is off every live target group, is the normal mid-roll state, and is
+reconciled from scratch by the next run's `Prepare`/`Deploy to Standby`.
+
+Any other terminal shape retains the lock: reconcile active-color parameters,
+listener target groups, ASG capacities/refreshes, and knock readiness before
+exact-owner release. A **cancelled** `Switch Traffic` is deliberately in the
+retain set even though a skipped one is not — cancellation mid-switch can leave
+public UDP flipped and the internal relay listener not, which is precisely the
+half-switched boundary the mutex exists to fence.
+
+The release decision is executable and tested: see
+`.github/scripts/classify-blue-green-lock-release.sh` and
+`tests/scripts/test_blue_green_lock_release.py`. Narrowing retention to
+boundary-moving failures closed a compounding livelock observed on 2026-07-28:
+run `30337884706` failed at `[Server] Verify Knock Readiness (AC Peers
+Connected)` — before any switch — and pinned the lock for its full four-hour
+TTL, whereupon run `30354530304` took it the moment the TTL lapsed, failed
+identically, and held it four hours more, stalling `Build and Deploy NHP` on
+main. Retention there protected nothing: the boundary had never moved.
 
 This broader boundary was added after NHP run `29658670289` overlapped
 qurl-service exact-image smoke run `29658663594`. The smoke acquired the old
