@@ -1158,6 +1158,39 @@ def _oci_revision(
     }
 
 
+def _require_revision_on_default_branch(
+    revision: str, default_branch_head: str, name: str
+) -> None:
+    """Prove a revision is a commit on the default branch, not merely its tip.
+
+    Equality with the tip is not the trust property and cannot hold in steady
+    state -- any commit to the branch, including a CI-only dependabot bump,
+    invalidates every previously built image until it is rebuilt.
+
+    Containment is the real boundary. GitHub's compare API reports behind_by == 0
+    exactly when the base commit is reachable from the head, so a commit on a
+    fork, a PR branch that never merged, or a history that was rewritten all
+    still fail closed.
+    """
+    if revision == default_branch_head:
+        return
+    comparison = _gh(
+        f"repos/{contract.REPOSITORIES['qurl_reverse_tunnel_server']}"
+        f"/compare/{revision}...{default_branch_head}",
+        f"{name} default-branch containment",
+    )
+    if not isinstance(comparison, dict):
+        raise EvidenceError(f"{name} default-branch comparison is unreadable")
+    behind_by = comparison.get("behind_by")
+    status = comparison.get("status")
+    if (
+        type(behind_by) is not int
+        or behind_by != 0
+        or status not in {"identical", "ahead"}
+    ):
+        raise EvidenceError(f"{name} OCI revision is not a commit on trusted main")
+
+
 def _qrts_build_receipt(
     repository: str,
     digest: str,
@@ -1177,14 +1210,34 @@ def _qrts_build_receipt(
         expected_source_revision,
         f"{name} expected main source revision",
     )
-    if revision != expected_source_revision:
-        raise EvidenceError(f"{name} OCI revision is not the expected main commit")
+    # The image must be built FROM TRUSTED MAIN -- not that it was built from
+    # main's current tip. Those are different claims, and only the first is a
+    # security property.
+    #
+    # Requiring the tip is unsatisfiable in steady state: every commit to the
+    # default branch moves it, including CI-only ones that produce no new image.
+    # Live proof at the time of this change -- the deployed qRTS image is built
+    # from acdeb262, main's tip is 47df78e9, and the four commits between them
+    # touch ONLY .github/workflows/* (dependabot action bumps). The image is
+    # exactly as trustworthy as it was, but the check demanded a rebuild after
+    # every unrelated CI bump, forever.
+    #
+    # Assert ancestry instead: the revision must be a commit ON the default
+    # branch. GitHub's compare reports behind_by == 0 when the base is contained
+    # in the head, so a fork commit, a PR-only commit, or a rewritten history
+    # still fails closed -- which is the actual trust boundary.
+    _require_revision_on_default_branch(revision, expected_source_revision, name)
 
-    _verify_qrts_runtime_signature(repository, digest, expected_source_revision)
+    # Downstream verification binds to the IMAGE's OWN revision, not the branch
+    # tip. The cosign signature and the build-receipt attestation were produced
+    # for the commit the image was built from, so checking them against the tip
+    # was wrong independently of the equality bug above -- it only ever passed
+    # when a rebuild happened to be the newest commit.
+    _verify_qrts_runtime_signature(repository, digest, revision)
     receipt = _verify_qrts_build_receipt_attestation(
         repository,
         digest,
-        expected_source_revision,
+        revision,
     )
     receipt_raw = _qrts_canonical_receipt_bytes(receipt)
     return revision, {

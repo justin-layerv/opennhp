@@ -760,9 +760,17 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                 "_ecr_config",
                 return_value=(config, f"sha256:{'e' * 64}"),
             ),
+            # A revision that is NOT contained in the default branch: GitHub
+            # reports the base as behind, which is the fork / unmerged-PR /
+            # rewritten-history case the check exists to reject.
+            mock.patch.object(
+                collector,
+                "_gh",
+                return_value={"status": "diverged", "behind_by": 3, "ahead_by": 1},
+            ),
             self.assertRaisesRegex(
                 collector.EvidenceError,
-                "OCI revision is not the expected main commit",
+                "OCI revision is not a commit on trusted main",
             ),
         ):
             collector._qrts_build_receipt(
@@ -2209,3 +2217,57 @@ class RepairExecutionBindingTest(unittest.TestCase):
                     executions=[self._execution(created)],  # type: ignore[arg-type]
                     next_token=None,
                 )
+
+
+class RevisionOnDefaultBranchTest(unittest.TestCase):
+    """Built-from-trusted-main is the property; equality with the tip is not.
+
+    Every commit to the default branch moves the tip, including CI-only
+    dependabot bumps that produce no new image, so equality is unsatisfiable in
+    steady state while containment holds for exactly the trustworthy images.
+    """
+
+    TIP = "4" * 40
+    REV = "a" * 40
+
+    def check(self, comparison):
+        with mock.patch.object(collector, "_gh", return_value=comparison):
+            collector._require_revision_on_default_branch(self.REV, self.TIP, "qRTS")
+
+    def test_identical_revision_needs_no_api_call(self) -> None:
+        """The tip itself short-circuits, so the common case costs nothing."""
+        with mock.patch.object(collector, "_gh") as gh:
+            collector._require_revision_on_default_branch(self.TIP, self.TIP, "qRTS")
+        gh.assert_not_called()
+
+    def test_ancestor_behind_the_tip_is_accepted(self) -> None:
+        """The live case: image built 4 CI-only commits before the tip."""
+        self.check({"status": "ahead", "behind_by": 0, "ahead_by": 4})
+
+    def test_identical_comparison_is_accepted(self) -> None:
+        self.check({"status": "identical", "behind_by": 0, "ahead_by": 0})
+
+    def test_diverged_revision_fails_closed(self) -> None:
+        """A fork or unmerged PR commit carries commits main does not have."""
+        for comparison in (
+            {"status": "diverged", "behind_by": 2, "ahead_by": 1},
+            {"status": "behind", "behind_by": 1, "ahead_by": 0},
+        ):
+            with self.subTest(comparison=comparison):
+                with self.assertRaisesRegex(
+                    collector.EvidenceError, "not a commit on trusted main"
+                ):
+                    self.check(comparison)
+
+    def test_malformed_comparison_fails_closed(self) -> None:
+        for comparison in (
+            {},
+            {"status": "ahead"},
+            {"status": "ahead", "behind_by": "0"},
+            {"status": "ahead", "behind_by": True},
+            {"status": "unknown", "behind_by": 0},
+            None,
+        ):
+            with self.subTest(comparison=comparison):
+                with self.assertRaises(collector.EvidenceError):
+                    self.check(comparison)
