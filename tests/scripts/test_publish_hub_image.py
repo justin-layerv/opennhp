@@ -880,3 +880,103 @@ class ProvenanceAndWorkflowContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanWaiverTest(unittest.TestCase):
+    """Time-boxed waivers for glibc CVEs with no upstream fix.
+
+    The waiver must never be able to hide something it does not name, and must
+    stop working on its own once it expires.
+    """
+
+    TODAY = "2026-07-28"
+    EXPIRED = "2026-08-28"
+
+    def finding(self, name, package, severity="CRITICAL"):
+        return {
+            "name": name,
+            "severity": severity,
+            "attributes": [{"key": "package_name", "value": package}],
+        }
+
+    def glibc_findings(self):
+        out = []
+        for cve, severity in (
+            ("CVE-2026-5450", "CRITICAL"),
+            ("CVE-2026-5435", "HIGH"),
+            ("CVE-2026-5928", "HIGH"),
+            ("CVE-2026-4046", "HIGH"),
+        ):
+            for package in ("libc6", "glibc", "libc-bin"):
+                out.append(self.finding(cve, package, severity))
+        return out
+
+    def counts(self, findings):
+        out = {}
+        for f in findings:
+            out[f["severity"]] = out.get(f["severity"], 0) + 1
+        return out
+
+    def test_the_live_glibc_set_is_fully_waived(self) -> None:
+        findings = self.glibc_findings()
+        waived, blocking = PUBLISHER.partition_scan_findings(
+            findings, self.counts(findings), self.TODAY
+        )
+        self.assertEqual(len(waived), 12)
+        self.assertEqual(blocking, [])
+
+    def test_waiver_is_inert_after_expiry(self) -> None:
+        findings = self.glibc_findings()
+        with self.assertRaisesRegex(PUBLISHER.ContractError, "expired"):
+            PUBLISHER.partition_scan_findings(
+                findings, self.counts(findings), self.EXPIRED
+            )
+
+    def test_an_unlisted_cve_still_blocks(self) -> None:
+        findings = self.glibc_findings() + [self.finding("CVE-9999-1", "openssl")]
+        _, blocking = PUBLISHER.partition_scan_findings(
+            findings, self.counts(findings), self.TODAY
+        )
+        self.assertEqual([f["name"] for f in blocking], ["CVE-9999-1"])
+
+    def test_a_waived_cve_on_another_package_still_blocks(self) -> None:
+        """The waiver is (CVE, package), never a CVE wildcard."""
+        findings = self.glibc_findings() + [self.finding("CVE-2026-5450", "openssl")]
+        _, blocking = PUBLISHER.partition_scan_findings(
+            findings, self.counts(findings), self.TODAY
+        )
+        self.assertEqual(len(blocking), 1)
+
+    def test_another_glibc_cve_still_blocks(self) -> None:
+        """The waiver is not a package wildcard either."""
+        findings = self.glibc_findings() + [self.finding("CVE-2027-0001", "libc6")]
+        _, blocking = PUBLISHER.partition_scan_findings(
+            findings, self.counts(findings), self.TODAY
+        )
+        self.assertEqual(len(blocking), 1)
+
+    def test_a_short_findings_list_fails_closed(self) -> None:
+        """Counts are reported independently, so they must reconcile."""
+        findings = self.glibc_findings()
+        with self.assertRaisesRegex(PUBLISHER.ContractError, "incomplete list"):
+            PUBLISHER.partition_scan_findings(
+                findings[:3], self.counts(findings), self.TODAY
+            )
+
+    def test_a_finding_without_a_package_fails_closed(self) -> None:
+        findings = [{"name": "CVE-2026-5450", "severity": "CRITICAL"}]
+        with self.assertRaisesRegex(PUBLISHER.ContractError, "name or package"):
+            PUBLISHER.partition_scan_findings(
+                findings, {"CRITICAL": 1}, self.TODAY
+            )
+
+    def test_medium_findings_are_ignored_entirely(self) -> None:
+        findings = self.glibc_findings() + [
+            self.finding("CVE-2026-1111", "curl", severity="MEDIUM")
+        ]
+        counts = self.counts(findings)
+        waived, blocking = PUBLISHER.partition_scan_findings(
+            findings, counts, self.TODAY
+        )
+        self.assertEqual(len(waived), 12)
+        self.assertEqual(blocking, [])

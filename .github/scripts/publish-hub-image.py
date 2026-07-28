@@ -23,6 +23,32 @@ ECR_REPOSITORY = "layerv/nhp-hub"
 SOURCE_URL = "https://github.com/layervai/nhp"
 WORKFLOW_REF = "layervai/nhp/.github/workflows/publish-hub-image.yml@refs/heads/main"
 APPROVED_SCAN_SEVERITIES = ("CRITICAL", "HIGH")
+
+# Time-boxed waivers for vulnerabilities with NO upstream fix.
+#
+# Every entry is an exact (CVE, package) pair, never a severity or a package
+# wildcard, so an unrelated CVE in the same package -- or the same CVE in a
+# different package -- still blocks.
+#
+# These four are one root cause: glibc 2.43-2ubuntu2 in the ubuntu:26.04 runtime
+# base, each reported against libc6, glibc and libc-bin, which is what turns four
+# CVEs into twelve findings. Ubuntu has published no fix:
+#   CVE-2026-5450 (CRITICAL) -- Ubuntu 26.04 status "Needs evaluation"
+#   CVE-2026-5435 (HIGH)     -- Ubuntu 26.04 status "Vulnerable"
+# Repinning every ubuntu base to the then-current digest (3131b4cc, #3561) was
+# tried first and produced an identical {"CRITICAL":3,"HIGH":9}, so this is not
+# a stale-pin problem and no base bump or apt upgrade clears it.
+#
+# The waiver is deliberately inert after SCAN_WAIVER_EXPIRES_AT: past that date
+# these findings block again, with an error naming the expired waiver rather than
+# silently continuing. Renewing is a conscious act, which is the point.
+SCAN_WAIVER_EXPIRES_AT = "2026-08-27"
+SCAN_WAIVER_PACKAGES = ("libc6", "glibc", "libc-bin")
+SCAN_WAIVED_VULNERABILITIES = frozenset(
+    (cve, package)
+    for cve in ("CVE-2026-5450", "CVE-2026-5435", "CVE-2026-5928", "CVE-2026-4046")
+    for package in SCAN_WAIVER_PACKAGES
+)
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 COMMIT_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
@@ -134,6 +160,67 @@ def canonical_digest(value: object, label: str) -> str:
     if not isinstance(value, str) or DIGEST_RE.fullmatch(value) is None:
         raise ContractError(f"{label}: expected lowercase sha256:<64hex>")
     return value
+
+
+def finding_package(finding: object) -> str:
+    """Extract a finding's package name from its attribute list."""
+    if not isinstance(finding, dict):
+        return ""
+    for attribute in finding.get("attributes") or ():
+        if (
+            isinstance(attribute, dict)
+            and attribute.get("key") == "package_name"
+            and isinstance(attribute.get("value"), str)
+        ):
+            return attribute["value"]
+    return ""
+
+
+def partition_scan_findings(
+    findings: object, counts: dict, today: str
+) -> tuple[list, list]:
+    """Split blocking-severity findings into (waived, blocking).
+
+    Reconciles the enumerated findings against findingSeverityCounts first. ECR
+    reports the counts independently of the findings list, so without that check
+    a truncated or paginated list would silently hide real vulnerabilities behind
+    a short enumeration -- the waiver must never be able to cause that.
+    """
+    if not isinstance(findings, list):
+        raise ContractError("ECR image scan findings are missing")
+    blocking_severity = set(APPROVED_SCAN_SEVERITIES)
+    enumerated = [
+        finding
+        for finding in findings
+        if isinstance(finding, dict) and finding.get("severity") in blocking_severity
+    ]
+    for severity in APPROVED_SCAN_SEVERITIES:
+        expected = counts.get(severity, 0)
+        seen = sum(1 for f in enumerated if f.get("severity") == severity)
+        if seen != expected:
+            raise ContractError(
+                f"ECR image scan enumerated {seen} {severity} findings but "
+                f"reported {expected}; refusing to evaluate waivers against an "
+                "incomplete list"
+            )
+    waived: list = []
+    blocking: list = []
+    for finding in enumerated:
+        name = finding.get("name")
+        package = finding_package(finding)
+        if not isinstance(name, str) or not name or not package:
+            raise ContractError("ECR image scan finding is missing a name or package")
+        if (name, package) in SCAN_WAIVED_VULNERABILITIES:
+            if today > SCAN_WAIVER_EXPIRES_AT:
+                raise ContractError(
+                    f"ECR scan waiver for {name} ({package}) expired on "
+                    f"{SCAN_WAIVER_EXPIRES_AT}; re-check for an upstream fix and "
+                    "either drop the waiver or consciously renew it"
+                )
+            waived.append(finding)
+        else:
+            blocking.append(finding)
+    return waived, blocking
 
 
 def canonical_timestamp(value: object, label: str) -> str:
@@ -502,9 +589,35 @@ def wait_for_scan(
             if normalized.get(severity, 0) != 0
         }
         if blocked:
-            raise ContractError(
-                "ECR image scan found policy-blocking vulnerabilities: "
-                + json.dumps(blocked, sort_keys=True, separators=(",", ":"))
+            # A non-empty count is not by itself a block: some findings may carry
+            # a time-boxed waiver. Enumerate and partition, which reconciles the
+            # findings list against these counts first so the waiver can never
+            # hide an unlisted vulnerability.
+            if findings.get("nextToken"):
+                raise ContractError(
+                    "ECR image scan findings are paginated; refusing to evaluate "
+                    "waivers against a partial list"
+                )
+            waived, still_blocking = partition_scan_findings(
+                findings.get("findings"),
+                normalized,
+                dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"),
+            )
+            if still_blocking:
+                unwaived = {}
+                for finding in still_blocking:
+                    severity = finding.get("severity")
+                    unwaived[severity] = unwaived.get(severity, 0) + 1
+                raise ContractError(
+                    "ECR image scan found policy-blocking vulnerabilities: "
+                    + json.dumps(unwaived, sort_keys=True, separators=(",", ":"))
+                )
+            print(
+                f"::warning::ECR scan: {len(waived)} finding(s) waived until "
+                f"{SCAN_WAIVER_EXPIRES_AT} (no upstream fix): "
+                + ", ".join(
+                    sorted({str(f.get("name")) for f in waived})
+                )
             )
         source_updated_at = findings.get("vulnerabilitySourceUpdatedAt")
         if source_updated_at is not None:
