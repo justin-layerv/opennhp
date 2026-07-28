@@ -25,6 +25,22 @@ output "task_definition_arn" {
   value       = aws_ecs_task_definition.qurl.arn
 }
 
+# The effective task shape is NOT the container reservation: Fargate accepts
+# only a fixed set of CPU/memory combinations, so memory is rounded up to a
+# whole GB (and CPU is raised to at least 512 when the ADOT sidecar is on).
+# Exported so a root that pins this shape somewhere else — notably a publisher
+# role's ecs:task-cpu / ecs:task-memory IAM conditions — can fence its copy
+# against the real value instead of re-deriving the arithmetic by hand.
+output "task_cpu" {
+  description = "Effective Fargate task-level CPU units registered by this module."
+  value       = local.task_cpu
+}
+
+output "task_memory" {
+  description = "Effective Fargate task-level memory (MiB) registered by this module, rounded up to a whole GB for CPU/memory-combination validity."
+  value       = local.task_memory
+}
+
 output "runtime_image_uri" {
   description = "Complete immutable qurl-service repository@sha256 URI when the module is in digest-pinned mode; null on the legacy tag-managed path."
   value       = var.image_uri

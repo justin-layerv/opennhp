@@ -142,6 +142,26 @@ locals {
     for tag_key, tag_value in local.qurl_service_publisher_task_definition_tags :
     "aws:RequestTag/${tag_key}" => tag_value
   }
+
+  # Container reservation for the single qurl-api container. cell1 runs no ADOT
+  # sidecar, so var.grafana_cloud_enabled stays at its module default of false.
+  qurl_service_container_cpu    = 256
+  qurl_service_container_memory = 512
+
+  # The task-level shape the module actually registers, which is NOT the
+  # container reservation above. Fargate accepts only a fixed set of
+  # CPU/memory combinations, so the module rounds memory up to a whole GB:
+  # ceil(512 / 1024) * 1024 = 1024. Task CPU is unchanged at 256 because
+  # nothing raises it without the sidecar.
+  #
+  # The publisher's ecs:task-cpu / ecs:task-memory IAM conditions below pin
+  # this shape, so they MUST use these values and not the container
+  # reservation. A stale pin is invisible at plan time and surfaces only as
+  # AccessDenied on ecs:RegisterTaskDefinition during a deploy —
+  # qurl_service_publisher_task_shape_lockstep fences that against the
+  # module's own output.
+  qurl_service_runtime_task_cpu    = local.qurl_service_container_cpu
+  qurl_service_runtime_task_memory = ceil(local.qurl_service_container_memory / 1024) * 1024
 }
 
 data "aws_ecr_repository" "qurl_service" {
@@ -364,8 +384,8 @@ resource "aws_iam_role_policy" "qurl_service_publisher" {
             "ecs:privileged" = "false"
           }
           NumericEquals = {
-            "ecs:task-cpu"    = 256
-            "ecs:task-memory" = 512
+            "ecs:task-cpu"    = local.qurl_service_runtime_task_cpu
+            "ecs:task-memory" = local.qurl_service_runtime_task_memory
           }
           "ForAllValues:StringEquals" = {
             "aws:TagKeys"               = local.qurl_service_publisher_task_definition_tag_keys
@@ -426,6 +446,29 @@ resource "terraform_data" "qurl_service_publisher_name_lockstep" {
         && module.qurl_service[0].service_name == local.qurl_service_name
       )
       error_message = "Publisher IAM ARNs derive from local.qurl_service_name, but the qurl-service module produced a different cluster/service name. Re-align local.qurl_service_resource_name_prefix with the module's naming before deploying; otherwise the scoped publisher grants reference the wrong ARNs."
+    }
+  }
+}
+
+# The publisher's RegisterTaskDefinition grant pins ecs:task-cpu/ecs:task-memory
+# with NumericEquals, so those numbers must equal the task shape the module
+# actually registers. They are easy to get wrong because the task shape is not
+# the container reservation: Fargate accepts only a fixed set of CPU/memory
+# combinations, so the module rounds memory up to a whole GB. A stale pin is
+# completely invisible at plan time — the policy applies cleanly and then denies
+# the publisher's ecs:RegisterTaskDefinition at deploy time with an opaque
+# AccessDenied. Prove the pin against the module's own effective shape whenever
+# the module is actually deployed.
+resource "terraform_data" "qurl_service_publisher_task_shape_lockstep" {
+  count = local.qurl_service_deployable ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = (
+        tostring(module.qurl_service[0].task_cpu) == tostring(local.qurl_service_runtime_task_cpu)
+        && tostring(module.qurl_service[0].task_memory) == tostring(local.qurl_service_runtime_task_memory)
+      )
+      error_message = "The cell1 publisher's ecs:task-cpu/ecs:task-memory IAM conditions must equal the qurl-service module's effective Fargate task shape. The module rounds container_memory up to a whole GB for CPU/memory-combination validity, so the pin is not the container reservation. Re-align local.qurl_service_runtime_task_cpu/local.qurl_service_runtime_task_memory with the module's task_cpu/task_memory outputs before deploying; otherwise the publisher is denied ecs:RegisterTaskDefinition at deploy time."
     }
   }
 }
@@ -528,8 +571,8 @@ module "qurl_service" {
   image_tag_ssm_param = "/${local.name_prefix}/qurl-api-image-tag"
   image_uri           = local.qurl_service_runtime_contract.image_uri
   source_revision     = local.qurl_service_runtime_contract.source_revision
-  container_cpu       = 256
-  container_memory    = 512
+  container_cpu       = local.qurl_service_container_cpu
+  container_memory    = local.qurl_service_container_memory
   desired_count       = 1
 
   dynamodb_table_arns = module.dynamodb.qurl_table_arns
