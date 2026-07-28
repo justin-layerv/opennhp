@@ -67,6 +67,49 @@ minutes; State Manager's 30-minute association repairs and re-verifies the bytes
 but is deliberately **not** the freshness clock — the producer rejects any object
 older than ten minutes.
 
+## The qRTS boot capture
+
+`qurl-reverse-tunnel-server` keeps no container: its user-data pulls the ECR
+image, `docker cp`s the binary out, and `docker rmi`s the image. The ECR digest
+and OCI revision are therefore observable **only** during that window, so
+`modules/qurl-reverse-tunnel-server/user_data.sh.tpl` writes
+`/var/lib/layerv/runtime-attestation/boot-capture.json` before the `docker rmi`.
+The collector refuses to publish without it.
+
+The capture's `build_receipt_sha256` is not copied from anywhere — the node
+reconstructs the canonical build receipt the publisher signs (a fixed-layout
+ASCII line over `schema_version`, `source_revision`, `binary_path`,
+`binary_sha256`) from its own observations. It can only match when the binary on
+that disk is byte-identical to the signed one, and the producer re-derives the
+same value from the cosign-verified attestation. Nothing is written on the two
+legacy `docker cp` paths or on the S3 binary fallback: those have no ECR
+provenance, and the right output is no capture at all.
+
+## The association must not go green while the fleet publishes nothing
+
+The repair step runs `layerv-collect-runtime-attestation.py --verify`
+synchronously and lets the exit status stand, so State Manager compliance —
+`CRITICAL`, `max_errors = 0` — is where a broken evidence channel surfaces.
+Before that, the step's only exercise of the collector was `systemctl start
+--no-block ... || true` followed by an unconditional success line, and all three
+frps instances reported `Success` for eleven hours while the collector failed
+every run and the store held no frps object.
+
+`--verify` performs every observation an attestation is made of and publishes
+nothing. It skips two things on purpose:
+
+- **the collector's own repair-status check**, which is self-referential and
+  would latch the association red forever after one failure (a failed execution
+  makes every later collector run fail, which fails the next execution);
+- **the upload**, because the store holds exactly one object per instance and
+  the producer requires it to be unique and current — a probe object would
+  either break that or overwrite real evidence.
+
+It exits 0 on an instance that is not `InService`: tag-targeted runs also reach
+Pending, Standby, and Terminating members that the producer never reads, and
+failing the association for one would take the fleet's evidence channel down
+during any rolling replacement.
+
 ## Canonical JSON
 
 The collector contract and the bucket policy are compared byte for byte against

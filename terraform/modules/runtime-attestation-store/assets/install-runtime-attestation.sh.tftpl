@@ -73,4 +73,28 @@ systemctl is-active --quiet layerv-runtime-attestation.timer
 # minutes, so a failure here can only withhold evidence, never fabricate it.
 systemctl start --no-block layerv-runtime-attestation.service || true
 
+# ...but "cannot fabricate evidence" is not the same as "is allowed to be
+# silent". Until this ran, the step above was the ONLY thing that exercised the
+# collector, its failure was discarded by `|| true`, and the success line below
+# printed unconditionally. That is a fail-open: all three frps instances
+# reported Status=Success/DetailedStatus=Success on this CRITICAL,
+# max_errors=0 association for eleven hours while their collector failed every
+# single run and the store held no frps object at all. The producer discovered
+# it instead, and could only name the symptom.
+#
+# So verify synchronously and let the result stand. `--verify` performs every
+# observation an attestation is made of and publishes nothing; it deliberately
+# skips the collector's own repair-status check, which is self-referential and
+# would latch this association red forever after a single failure. It also
+# exits 0 on an instance that is not InService, because tag-targeted runs reach
+# Pending/Standby/Terminating members the producer never reads.
+#
+# `set -e` is in force: a non-zero exit fails the step, the association, and
+# State Manager compliance — which is where a broken evidence channel should
+# surface, not three layers downstream in a manifest producer.
+set -a
+. /etc/layerv/runtime-attestation.env
+set +a
+/usr/bin/python3 /usr/local/bin/layerv-collect-runtime-attestation.py --verify
+
 echo "runtime-attestation collector verified and active"

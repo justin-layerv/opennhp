@@ -216,6 +216,12 @@ ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 FRPS_IMAGE="$ECR_REGISTRY/layerv/qurl-reverse-tunnel-server:$IMAGE_TAG"
+# The in-image path named by the signed build receipt. Keep in lockstep with
+# QRTS_BUILD_RECEIPT_BINARY_PATH in
+# .github/scripts/collect_udp_proof_deployment_evidence.py — the runtime
+# attestation below reconstructs the receipt byte-for-byte from this constant,
+# so a silent drift here shows up as an unexplained producer failure.
+RECEIPT_BINARY_PATH=/usr/local/bin/qurl-reverse-tunnel-server
 # Let docker's stderr flow to user-data.log (via `exec 2>&1` at the top) so
 # on-call sees the root cause (expired token / image not found / timeout)
 # instead of a bare "Could not pull from ECR" falling through to the S3
@@ -241,15 +247,91 @@ if docker pull "$FRPS_IMAGE"; then
   # `WARN: legacy fallback ...` line to user-data.log → CloudWatch so a
   # single Logs Insights query gates the eventual cleanup; without that
   # signal "nobody complained" is the only proxy for safe-to-drop.
+  # IMAGE_BINARY_PATH records which in-image path actually won, because only
+  # the canonical one is named by the signed build receipt the runtime
+  # attestation reconstructs below.
+  IMAGE_BINARY_PATH="$RECEIPT_BINARY_PATH"
   docker cp "$CONTAINER_ID:/usr/local/bin/qurl-reverse-tunnel-server" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps || {
     echo "WARN: legacy fallback to /usr/local/bin/nhp-frps — image is pre-rename"
+    IMAGE_BINARY_PATH=/usr/local/bin/nhp-frps
     docker cp "$CONTAINER_ID:/usr/local/bin/nhp-frps" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
   } || {
     echo "WARN: legacy fallback to /nhp-frps — image is even older"
+    IMAGE_BINARY_PATH=/nhp-frps
     docker cp "$CONTAINER_ID:/nhp-frps" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
   }
   docker rm "$CONTAINER_ID"
   trap - EXIT
+
+  # ==========================================================================
+  # Runtime-attestation boot capture
+  #
+  # Written here and nowhere else, while the extraction image is still on the
+  # box. This is the only moment a qRTS node can honestly observe the ECR
+  # digest and OCI revision of the image its binary came from: `docker rmi`
+  # below destroys that evidence, and the running service keeps no container to
+  # re-inspect. Re-deriving it later from the SSM image-tag parameter would be
+  # worse than nothing — a mutable pointer cannot prove what THIS instance
+  # booted, which is the entire reason
+  # terraform/modules/runtime-attestation-store exists.
+  #
+  # `build_receipt_sha256` is the SHA-256 of the canonical build receipt
+  # layervai/qurl-reverse-tunnel-server's Docker Publish workflow signs: a
+  # fixed-layout ASCII line over (schema_version, source_revision, binary_path,
+  # binary_sha256) with a trailing newline. The node RECONSTRUCTS it from its
+  # own observations rather than fetching it, so it can only match when the
+  # binary on this disk is byte-identical to the one that was signed. The
+  # producer re-derives the same value from the cosign-verified attestation and
+  # fails closed on any divergence, so a node cannot talk its way past a
+  # mismatch.
+  #
+  # Deliberately NOT written on the two legacy `docker cp` paths or on the S3
+  # fallback below: the signed receipt names /usr/local/bin/qurl-reverse-tunnel-
+  # server, and an S3-sourced binary carries no ECR provenance at all. In both
+  # cases the correct output is no capture — the collector then fails closed
+  # with "qRTS boot capture is missing" instead of publishing a claim this node
+  # cannot support.
+  # ==========================================================================
+  IMAGE_DIGEST=$(docker image inspect "$FRPS_IMAGE" \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+    | grep -F "$ECR_REGISTRY/layerv/qurl-reverse-tunnel-server@" \
+    | cut -d'@' -f2 | sort -u || true)
+  IMAGE_DIGEST_COUNT=$(printf '%s\n' "$IMAGE_DIGEST" | grep -c . || true)
+  SOURCE_REVISION=$(docker image inspect "$FRPS_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+  INSTALLED_BINARY_SHA256=$(sha256sum /opt/layerv/qurl-reverse-tunnel-server/nhp-frps | cut -d' ' -f1 || true)
+
+  if [ "$IMAGE_BINARY_PATH" = "$RECEIPT_BINARY_PATH" ] &&
+    [ "$IMAGE_DIGEST_COUNT" = "1" ] &&
+    printf '%s' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' &&
+    printf '%s' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$' &&
+    printf '%s' "$INSTALLED_BINARY_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+    BUILD_RECEIPT_SHA256=$(printf \
+      '{"schema_version":1,"source_revision":"%s","binary_path":"%s","binary_sha256":"%s"}\n' \
+      "$SOURCE_REVISION" "$RECEIPT_BINARY_PATH" "$INSTALLED_BINARY_SHA256" \
+      | sha256sum | cut -d' ' -f1)
+    install -d -m 0755 -o root -g root /var/lib/layerv/runtime-attestation
+    BOOT_CAPTURE_STAGED=$(mktemp)
+    jq -n \
+      --arg image_digest "$IMAGE_DIGEST" \
+      --arg source_revision "$SOURCE_REVISION" \
+      --arg build_receipt_sha256 "$BUILD_RECEIPT_SHA256" \
+      --arg installed_binary_sha256 "$INSTALLED_BINARY_SHA256" \
+      '{
+        image_digest: $image_digest,
+        source_revision: $source_revision,
+        build_receipt_sha256: $build_receipt_sha256,
+        installed_binary_sha256: $installed_binary_sha256,
+        source_kind: "ecr_build_receipt"
+      }' >"$BOOT_CAPTURE_STAGED"
+    install -m 0644 -o root -g root "$BOOT_CAPTURE_STAGED" \
+      /var/lib/layerv/runtime-attestation/boot-capture.json
+    rm -f "$BOOT_CAPTURE_STAGED"
+    echo "Wrote runtime-attestation boot capture for $IMAGE_DIGEST ($SOURCE_REVISION)"
+  else
+    echo "WARN: no runtime-attestation boot capture written (in-image path '$IMAGE_BINARY_PATH', digest '$IMAGE_DIGEST', revision '$SOURCE_REVISION'). This node cannot prove its runtime provenance, so the collector will fail closed and the UDP-proof manifest producer will refuse to emit a manifest for this fleet."
+  fi
+
   # Reclaim the image layers (best-effort). Each instance only ever pulls once
   # at boot — new images arrive via ASG instance refresh, not in-place — but
   # keeping the layers around has no upside on a single-service host. Let

@@ -19,6 +19,11 @@ Every step fails closed.  A stale, partial, or unverifiable observation is
 never published: the deployment-manifest producer requires a fresh object and
 treats a missing one as a hard failure, so silence is the correct output.
 
+Run with `--verify` it publishes nothing and only proves this node can still
+observe everything an attestation is made of.  The repair document runs that
+synchronously so State Manager's own result is honest about a fleet whose
+collector has stopped working; see `_verify` for what it deliberately omits.
+
 The emitted document is the exact canonical JSON the producer's contract
 accepts (`sort_keys`, `(",", ":")` separators, ASCII).  Its schema is owned by
 `.github/scripts/udp_proof_deployment_contract.py::normalize_runtime_attestation`.
@@ -80,6 +85,18 @@ CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 class CollectorError(RuntimeError):
     """A fail-closed collection error.  Nothing is published."""
+
+
+class NotAttestableHere(CollectorError):
+    """This instance is outside the attestable fleet at this moment.
+
+    An ASG-tag-targeted repair run reaches instances that are Pending, Standby,
+    or Terminating, and the producer reads none of them.  Publishing still fails
+    closed (this is a `CollectorError`), but `--verify` reports success: an
+    instance nobody will read is not evidence that the collector is broken, and
+    failing the repair association for one is actively harmful — see the
+    `--verify` note in `main`.
+    """
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -294,7 +311,7 @@ def _collect_identity() -> dict[str, Any]:
     if not isinstance(autoscaling_group, str) or not autoscaling_group:
         raise CollectorError("ASG name is missing")
     if rows[0].get("LifecycleState") != "InService":
-        raise CollectorError("instance is not InService")
+        raise NotAttestableHere("instance is not InService")
 
     described = _aws(
         "ec2",
@@ -529,7 +546,24 @@ def _collect_installed_binary_runtime() -> dict[str, Any]:
 
 
 def _collect_runtime() -> dict[str, Any]:
-    if BOOT_CAPTURE_PATH.exists():
+    """Branch on what this node actually installs, not on the evidence file.
+
+    The discriminator used to be the boot capture's own existence, so a qRTS
+    node whose capture was absent fell silently through to the container branch
+    and failed with `no such object: nhp-server` — an error naming a workload
+    that never runs on that fleet, at a node that was in fact perfectly healthy.
+    That misdirection is what let a fleet-wide collection outage read as a
+    single confusing line in the producer.
+
+    The installed qRTS binary is this node's kind and cannot be absent on a
+    qRTS node, so a missing capture now fails closed AS a missing capture.
+    Nothing is weakened by branching on it: the producer independently pins each
+    workload key to its own ECR repository and rejects an attestation whose
+    `image_repository` does not match, so a node cannot cross into another
+    fleet's evidence by arranging which paths exist on its disk.
+    """
+
+    if QRTS_BINARY_PATH.exists():
         return _collect_installed_binary_runtime()
     return _collect_docker_runtime()
 
@@ -564,13 +598,68 @@ def _publish(bucket: str, kms_key_arn: str, key: str, raw: bytes) -> None:
         )
 
 
+def _verify() -> int:
+    """Prove this node can still observe everything an attestation is made of.
+
+    Run by the repair document, synchronously, so State Manager's own result is
+    honest.  Before this existed the document did `systemctl start --no-block
+    ... || true` and then unconditionally printed success, so the association
+    reported `Success` on all three frps instances for eleven hours while the
+    collector had failed one hundred percent of its runs and the store held no
+    frps object at all.  A CRITICAL, `max_errors = 0` association that goes
+    green while its fleet publishes nothing is a fail-open: the producer became
+    the discoverer, and it could only report the downstream symptom (`has no
+    unique current attestation`) rather than the cause.
+
+    Two things are deliberately NOT verified here.
+
+    `_collect_repair` is skipped because it is self-referential: it requires the
+    association's latest execution to be `Success`, and this code runs *inside*
+    an execution whose status is not yet final.  Worse, wiring it in would latch
+    — one failed execution would make every subsequent collector run fail the
+    repair check, which would fail the next execution, and the fleet could never
+    recover without manual intervention.  Verification must be able to go green
+    again on its own.
+
+    Publishing is skipped because the store holds exactly one object per
+    instance and the producer requires it to be unique and current; a probe
+    object would either corrupt that or overwrite real evidence with a
+    verification artifact.  Silence remains the only honest failure output.
+    """
+
+    try:
+        identity = _collect_identity()
+        _sha256_file(COLLECTOR_PATH)
+        _sha256_file(SERVICE_UNIT_PATH)
+        _sha256_file(TIMER_UNIT_PATH)
+        _collect_runtime()
+    except NotAttestableHere as exc:
+        # Not a defect: the repair association targets by ASG tag, which also
+        # reaches Pending, Standby, and Terminating instances that the producer
+        # never reads.  Failing the association for one of those would take the
+        # whole fleet's evidence channel down during any rolling replacement.
+        print(f"runtime attestation not required here: {exc}")
+        return 0
+    except CollectorError as exc:
+        print(f"runtime attestation cannot be collected: {exc}", file=sys.stderr)
+        return 1
+    print(f"runtime attestation collectable for {identity['instance_id']}")
+    return 0
+
+
 def main() -> int:
+    verify_only = "--verify" in sys.argv[1:]
+    if [argument for argument in sys.argv[1:] if argument != "--verify"]:
+        print("usage: collect-runtime-attestation.py [--verify]", file=sys.stderr)
+        return 2
     bucket = os.environ.get("LAYERV_ATTESTATION_BUCKET", "")
     kms_key_arn = os.environ.get("LAYERV_ATTESTATION_KMS_KEY_ARN", "")
     document_name = os.environ.get("LAYERV_ATTESTATION_REPAIR_DOCUMENT", "")
     if not bucket or not kms_key_arn or not document_name:
         print("collector environment is incomplete", file=sys.stderr)
         return 2
+    if verify_only:
+        return _verify()
     try:
         identity = _collect_identity()
         attestation = {

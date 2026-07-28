@@ -9,9 +9,13 @@ whether a node publishes an attestation at all.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -286,9 +290,6 @@ class CollectIdentityTest(unittest.TestCase):
             self._run()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RepairExecutionOrderingTest(unittest.TestCase):
     """A Status filter destroys DescribeAssociationExecutions' ordering.
@@ -342,3 +343,214 @@ class RepairExecutionOrderingTest(unittest.TestCase):
             collector._iso_utc_seconds("2026-07-28T07:38:18.999999+00:00", "repair"),
             "2026-07-28T07:38:18Z",
         )
+
+
+class WorkloadBranchTest(unittest.TestCase):
+    """The collector must branch on what a node installs, not on its evidence.
+
+    The discriminator used to be the boot capture's own existence, so an frps
+    node with no capture fell through to the NHP container branch and died with
+    `no such object: nhp-server` -- naming a workload that never runs on that
+    fleet. Live evidence (2026-07-28): all three `layerv-nhp-sandbox-frps`
+    instances failed every five-minute run that way for eleven hours while the
+    repair association reported Success, and nothing in the repository ever
+    wrote the capture the branch required.
+    """
+
+    def branch(self, *, qrts_binary: bool, boot_capture: bool) -> str:
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary, capture = root / "nhp-frps", root / "boot-capture.json"
+            if qrts_binary:
+                binary.write_bytes(b"elf")
+            if boot_capture:
+                capture.write_text("{}", encoding="utf-8")
+            with mock.patch.object(
+                collector, "QRTS_BINARY_PATH", binary
+            ), mock.patch.object(
+                collector, "BOOT_CAPTURE_PATH", capture
+            ), mock.patch.object(
+                collector,
+                "_collect_installed_binary_runtime",
+                side_effect=lambda: calls.append("qrts"),
+            ), mock.patch.object(
+                collector,
+                "_collect_docker_runtime",
+                side_effect=lambda: calls.append("docker"),
+            ):
+                collector._collect_runtime()
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_an_installed_qrts_binary_selects_the_qrts_branch(self) -> None:
+        self.assertEqual(self.branch(qrts_binary=True, boot_capture=True), "qrts")
+
+    def test_a_qrts_node_with_no_capture_stays_on_the_qrts_branch(self) -> None:
+        """The regression: this used to select the container branch."""
+        self.assertEqual(self.branch(qrts_binary=True, boot_capture=False), "qrts")
+
+    def test_a_node_without_the_qrts_binary_selects_the_container_branch(self) -> None:
+        self.assertEqual(self.branch(qrts_binary=False, boot_capture=False), "docker")
+
+    def test_a_missing_capture_names_the_capture_not_the_container(self) -> None:
+        """The exact live failure, end to end, with no branch mocked."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "nhp-frps"
+            binary.write_bytes(b"elf")
+            with mock.patch.object(
+                collector, "QRTS_BINARY_PATH", binary
+            ), mock.patch.object(
+                collector, "BOOT_CAPTURE_PATH", root / "boot-capture.json"
+            ):
+                with self.assertRaises(collector.CollectorError) as raised:
+                    collector._collect_runtime()
+        self.assertIn("boot capture is missing", str(raised.exception))
+        self.assertNotIn(collector.NHP_CONTAINER_NAME, str(raised.exception))
+
+
+class VerifyModeTest(unittest.TestCase):
+    """`--verify` is what keeps the repair association's Success honest.
+
+    It must fail on a node that cannot collect, pass on one that can, and pass
+    on a member the producer will never read -- without ever publishing.
+    """
+
+    def run_verify(self, *, identity=None, runtime=None):
+        published = []
+        identity = identity or (lambda: {"instance_id": INSTANCE_ID})
+        runtime = runtime or (lambda: {"kind": "installed_binary"})
+        with mock.patch.object(
+            collector, "_collect_identity", side_effect=identity
+        ), mock.patch.object(
+            collector, "_collect_runtime", side_effect=runtime
+        ), mock.patch.object(
+            collector, "_sha256_file", return_value="0" * 64
+        ), mock.patch.object(
+            collector, "_publish", side_effect=lambda *a, **k: published.append(a)
+        ), mock.patch.object(
+            collector, "_collect_repair", side_effect=AssertionError("self-referential")
+        ):
+            code = collector._verify()
+        self.assertEqual(published, [], "--verify must never publish")
+        return code
+
+    def test_a_healthy_node_verifies(self) -> None:
+        self.assertEqual(self.run_verify(), 0)
+
+    def test_a_node_that_cannot_collect_fails_the_step(self) -> None:
+        def boom() -> dict[str, object]:
+            raise collector.CollectorError("qRTS boot capture is missing")
+
+        self.assertEqual(self.run_verify(runtime=boom), 1)
+
+    def test_a_member_outside_the_fleet_is_not_a_defect(self) -> None:
+        """Tag-targeted runs reach Pending/Standby/Terminating instances.
+
+        Failing the association for one would take the whole fleet's evidence
+        channel down during any rolling replacement.
+        """
+
+        def not_here() -> dict[str, object]:
+            raise collector.NotAttestableHere("instance is not InService")
+
+        self.assertEqual(self.run_verify(identity=not_here), 0)
+
+    def test_publishing_still_fails_closed_outside_the_fleet(self) -> None:
+        """`--verify` tolerance must not leak into the publish path."""
+        self.assertTrue(issubclass(collector.NotAttestableHere, collector.CollectorError))
+
+    def test_verify_does_not_consult_the_associations_own_status(self) -> None:
+        """Wiring `_collect_repair` in would latch the association red forever.
+
+        One failed execution would make every later collector run fail the
+        repair check, which would fail the next execution. `run_verify` patches
+        `_collect_repair` to raise, so reaching it fails this test.
+        """
+        self.assertEqual(self.run_verify(), 0)
+
+
+class BuildReceiptReconstructionTest(unittest.TestCase):
+    """qRTS user-data reconstructs the signed receipt; the bytes must match.
+
+    `user_data.sh.tpl` builds the canonical build receipt with `printf` from its
+    own observations and hashes it, and the producer rebuilds the same bytes
+    from the cosign-verified attestation. They live in different files and
+    different languages, so drift in either would surface only as an
+    unexplainable manifest failure. Compare them directly.
+    """
+
+    USER_DATA = (
+        ROOT
+        / "terraform"
+        / "modules"
+        / "qurl-reverse-tunnel-server"
+        / "user_data.sh.tpl"
+    )
+
+    SOURCE_REVISION = "acdeb262a7b5cce58688c72fdcd8d4cbc0f2f3b5"
+    BINARY_SHA256 = "f075a26498bf8f26001b9a1f3028999ffb287273b82eccc78940169ad27611f8"
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+        import collect_udp_proof_deployment_evidence as producer
+
+        self.producer = producer
+
+    def printf_format(self) -> str:
+        text = self.USER_DATA.read_text(encoding="utf-8")
+        matches = re.findall(r"'(\{\"schema_version\":1[^']*)'", text)
+        self.assertEqual(len(matches), 1, "one canonical receipt format expected")
+        return matches[0]
+
+    def test_the_shell_format_reproduces_the_producers_canonical_bytes(self) -> None:
+        rendered = subprocess.run(
+            [
+                "printf",
+                self.printf_format(),
+                self.SOURCE_REVISION,
+                self.producer.QRTS_BUILD_RECEIPT_BINARY_PATH,
+                self.BINARY_SHA256,
+            ],
+            capture_output=True,
+            check=True,
+        ).stdout
+        expected = self.producer._qrts_canonical_receipt_bytes(
+            {
+                "source_revision": self.SOURCE_REVISION,
+                "binary_sha256": self.BINARY_SHA256,
+            }
+        )
+        self.assertEqual(rendered, expected)
+        # The live sandbox value on 2026-07-28, cross-checked against the
+        # cosign-verified attestation for
+        # sha256:33b2ea3b1bccf1ff47d9b2cf9f00b473b8fc93f79a7acb34c0d25d638fce50a9
+        # and the binary actually installed on the frps fleet.
+        self.assertEqual(
+            hashlib.sha256(rendered).hexdigest(),
+            "c7308ccafb1d328f7917d0ad817c8acd910fab46119c35dc74e365b0aae7e046",
+        )
+
+    def test_user_data_pins_the_same_in_image_binary_path(self) -> None:
+        text = self.USER_DATA.read_text(encoding="utf-8")
+        self.assertIn(
+            f"RECEIPT_BINARY_PATH={self.producer.QRTS_BUILD_RECEIPT_BINARY_PATH}\n",
+            text,
+        )
+
+    def test_the_capture_carries_exactly_the_keys_the_collector_requires(self) -> None:
+        text = self.USER_DATA.read_text(encoding="utf-8")
+        for key in (
+            "image_digest",
+            "source_revision",
+            "build_receipt_sha256",
+            "installed_binary_sha256",
+            "source_kind",
+        ):
+            self.assertIn(f"{key}:", text)
+        self.assertIn('source_kind: "ecr_build_receipt"', text)
+
+
+if __name__ == "__main__":
+    unittest.main()

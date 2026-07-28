@@ -7,6 +7,13 @@
 # Manager's 30-minute minimum association schedule repairs and verifies the
 # units and their hashes — it is deliberately NOT the freshness clock.
 #
+# The repair step also runs the collector with `--verify` synchronously and lets
+# the exit status stand, so an association cannot report Success for a fleet
+# whose collector can no longer observe anything. qRTS nodes additionally need
+# the boot capture written by modules/qurl-reverse-tunnel-server's user-data,
+# because their ECR provenance is only observable before the extraction image is
+# removed. Both are documented in README.md.
+#
 # The producer requires an object no older than ten minutes carrying the exact
 # current boot/instance/role/ASG/launch-template identity, the exact collector
 # and unit hashes published here, and a healthy exact document/association
