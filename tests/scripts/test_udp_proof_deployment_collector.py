@@ -1176,11 +1176,21 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                 }
             },
             {
+                # The real DescribeAssociationExecutions row shape. AWS never
+                # returns a whole-second "Z" CreatedTime here: it is always
+                # sub-second and rendered in the caller's local zone. The old
+                # fixture's "2026-07-25T11:30:00Z" echoed the attested value
+                # back, which is exactly what the equality filter under test
+                # could never make AWS do.
                 "AssociationExecutions": [
                     {
+                        "AssociationId": association_id,
+                        "AssociationVersion": "2",
                         "ExecutionId": "execution-1",
                         "Status": "Success",
-                        "CreatedTime": "2026-07-25T11:30:00Z",
+                        "DetailedStatus": "Success",
+                        "CreatedTime": "2026-07-25T05:30:00.482000-06:00",
+                        "ResourceCountByStatus": "{Success=3}",
                     }
                 ]
             },
@@ -1211,6 +1221,9 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
             )
         self.assertEqual(observed, "2026-07-25T11:30:00Z")
 
+        # A page that stops inside the attested second proves nothing about
+        # uniqueness: a sibling execution in that same second could be sitting
+        # on the page that was never fetched.
         paginated = copy.deepcopy(responses)
         paginated[1]["NextToken"] = "unexpected"
         with (
@@ -1880,3 +1893,319 @@ class RepairAssociationOverviewTest(unittest.TestCase):
         for association in ({}, {"Overview": None}, {"Overview": "Success"}):
             with self.subTest(association=association):
                 self.assertFalse(collector._repair_association_succeeded(association))
+
+
+class RepairExecutionBindingTest(unittest.TestCase):
+    """Bind the attestation to one real successful repair execution.
+
+    The previous query filtered `Key=CreatedTime,Value=<attested>,Type=EQUAL`
+    and required exactly one Success in the result.  That is unsatisfiable, so
+    the branch could never pass for any instance, healthy or not.  Verified
+    live against the sandbox cell-0 repair association while it was healthy --
+    69 consecutive successful executions on a `rate(30 minutes)` schedule --
+    where the EQUAL filter returned zero rows for the attested second AND for
+    the attested instant reproduced to the microsecond.  Two independent
+    reasons: SSM does not honour EQUAL on CreatedTime, and every real
+    CreatedTime carries sub-second precision while the attested value is
+    truncated to whole UTC seconds by the on-instance collector.
+
+    So these fixtures use the real wire shape -- microseconds, a non-UTC
+    offset, newest-first ordering, `NextToken` on a healthy association.  A
+    fixture that echoes the attested `...Z` string back as CreatedTime encodes
+    the checker's own assumption and cannot catch a filter that never matches.
+    """
+
+    ASSOCIATION_ID = "3b7fbdbc-77c6-4d2f-874b-c6a1581071ea"
+    DOCUMENT_NAME = "layerv-nhp-sandbox-runtime-attestation-repair"
+    ASG = "layerv-nhp-sandbox-server"
+    INSTANCE = "i-081174c8c26a42d70"
+    CONTRACT = {
+        "repair_document_name": DOCUMENT_NAME,
+        "repair_document_version": "2",
+    }
+
+    def _description(self) -> dict[str, object]:
+        return {
+            "AssociationDescription": {
+                "AssociationId": self.ASSOCIATION_ID,
+                "Name": self.DOCUMENT_NAME,
+                "AssociationVersion": "2",
+                "DocumentVersion": "2",
+                "ScheduleExpression": "rate(30 minutes)",
+                "Targets": [
+                    {
+                        "Key": "tag:aws:autoscaling:groupName",
+                        "Values": [self.ASG],
+                    }
+                ],
+                "Overview": {
+                    "Status": "Success",
+                    "DetailedStatus": "Success",
+                    "AssociationStatusAggregatedCount": {"Success": 3},
+                },
+            }
+        }
+
+    def _execution(
+        self,
+        created: str,
+        *,
+        status: str = "Success",
+        execution_id: str = "9ea26ea3-dab5-48c7-92a0-12a9d0f2d207",
+    ) -> dict[str, object]:
+        return {
+            "AssociationId": self.ASSOCIATION_ID,
+            "AssociationVersion": "2",
+            "ExecutionId": execution_id,
+            "Status": status,
+            "DetailedStatus": status,
+            "CreatedTime": created,
+            "ResourceCountByStatus": "{Success=3}",
+        }
+
+    def _target(
+        self, resource_id: str, *, status: str = "Success"
+    ) -> dict[str, object]:
+        return {
+            "AssociationId": self.ASSOCIATION_ID,
+            "ResourceId": resource_id,
+            "ResourceType": "ManagedInstance",
+            "Status": status,
+            "DetailedStatus": status,
+        }
+
+    def _verify(
+        self,
+        *,
+        attested: str,
+        executions: list[dict[str, object]],
+        next_token: str | None = "AAMAAR2/G2G1w8MZ1UALsJbAGZYI8TOIoow1K69",
+        targets: list[dict[str, object]] | None = None,
+    ) -> tuple[str, list[list[str]]]:
+        """Drive `_verify_repair` over one fake SSM conversation."""
+
+        executions_response: dict[str, object] = {"AssociationExecutions": executions}
+        if next_token is not None:
+            executions_response["NextToken"] = next_token
+        if targets is None:
+            targets = [self._target(self.INSTANCE)]
+        responses = [
+            self._description(),
+            executions_response,
+            {"AssociationExecutionTargets": targets},
+        ]
+        calls: list[list[str]] = []
+
+        def fake_aws(service: str, arguments: list[str], name: str) -> object:
+            calls.append(arguments)
+            return responses[len(calls) - 1]
+
+        with mock.patch.object(collector, "_aws", side_effect=fake_aws):
+            observed = collector._verify_repair(
+                {
+                    "repair_association_id": self.ASSOCIATION_ID,
+                    "repair_document_name": self.DOCUMENT_NAME,
+                    "repair_last_success_at": attested,
+                },
+                self.INSTANCE,
+                autoscaling_group=self.ASG,
+                collector_contract=self.CONTRACT,
+            )
+        return observed, calls
+
+    def _expect(self, message: str, **kwargs: object) -> None:
+        with self.assertRaisesRegex(collector.EvidenceError, message):
+            self._verify(**kwargs)  # type: ignore[arg-type]
+
+    def test_attested_second_binds_to_its_successful_execution(self) -> None:
+        """Happy path: a live, healthy, paginated association."""
+
+        observed, calls = self._verify(
+            attested="2026-07-28T07:08:20Z",
+            executions=[
+                self._execution("2026-07-28T07:08:20.120000+00:00"),
+                self._execution(
+                    "2026-07-28T06:38:02.949000+00:00",
+                    execution_id="1b8700c8-3c37-4434-9485-6344a120112a",
+                ),
+                self._execution(
+                    "2026-07-28T06:08:28.999000+00:00",
+                    execution_id="080500f4-104e-4c82-90e6-3122ec029778",
+                ),
+            ],
+        )
+        self.assertEqual(observed, "2026-07-28T07:08:20Z")
+        # The unsatisfiable equality filter must be gone, replaced by the
+        # exclusive upper edge of the attested second.
+        self.assertIn(
+            "Key=CreatedTime,Value=2026-07-28T07:08:21Z,Type=LESS_THAN", calls[1]
+        )
+        self.assertNotIn(
+            "Key=CreatedTime,Value=2026-07-28T07:08:20Z,Type=EQUAL", calls[1]
+        )
+
+    def test_upper_bound_rolls_over_the_minute(self) -> None:
+        _, calls = self._verify(
+            attested="2026-07-28T07:08:59Z",
+            executions=[self._execution("2026-07-28T07:08:59.999000+00:00")],
+            next_token=None,
+        )
+        self.assertIn(
+            "Key=CreatedTime,Value=2026-07-28T07:09:00Z,Type=LESS_THAN", calls[1]
+        )
+
+    def test_sub_second_and_non_utc_offset_still_match(self) -> None:
+        """The exact shape that made the equality filter unsatisfiable.
+
+        `2026-07-28T01:08:20.120000-06:00` is one real CreatedTime as the CLI
+        renders it on a UTC-6 caller.  It is the same instant as the attested
+        `2026-07-28T07:08:20Z`, and neither the microseconds nor the offset may
+        be allowed to break the binding.
+        """
+
+        observed, _ = self._verify(
+            attested="2026-07-28T07:08:20Z",
+            executions=[self._execution("2026-07-28T01:08:20.120000-06:00")],
+            next_token=None,
+        )
+        self.assertEqual(observed, "2026-07-28T07:08:20Z")
+
+    def test_attestation_naming_a_nonexistent_execution_fails_closed(self) -> None:
+        """No execution ran during the attested second."""
+
+        self._expect(
+            "has no unique successful repair execution",
+            attested="2026-07-28T07:09:11Z",
+            executions=[
+                self._execution("2026-07-28T07:08:20.120000+00:00"),
+                self._execution(
+                    "2026-07-28T06:38:02.949000+00:00",
+                    execution_id="1b8700c8-3c37-4434-9485-6344a120112a",
+                ),
+            ],
+        )
+
+    def test_failed_execution_in_the_attested_second_fails_closed(self) -> None:
+        """A newer success elsewhere on the page must not rescue it."""
+
+        self._expect(
+            "has no unique successful repair execution",
+            attested="2026-07-28T06:38:02Z",
+            executions=[
+                self._execution(
+                    "2026-07-28T06:38:02.949000+00:00",
+                    status="Failed",
+                    execution_id="1b8700c8-3c37-4434-9485-6344a120112a",
+                ),
+                self._execution(
+                    "2026-07-28T06:08:28.999000+00:00",
+                    execution_id="080500f4-104e-4c82-90e6-3122ec029778",
+                ),
+            ],
+        )
+
+    def test_empty_result_fails_closed(self) -> None:
+        self._expect(
+            "has no unique successful repair execution",
+            attested="2026-07-28T07:08:20Z",
+            executions=[],
+            next_token=None,
+        )
+
+    def test_ambiguous_second_fails_closed(self) -> None:
+        """Two executions in the attested second: the binding is not unique."""
+
+        self._expect(
+            "has no unique successful repair execution",
+            attested="2026-07-28T07:08:20Z",
+            executions=[
+                self._execution("2026-07-28T07:08:20.870000+00:00"),
+                self._execution(
+                    "2026-07-28T07:08:20.120000+00:00",
+                    execution_id="1b8700c8-3c37-4434-9485-6344a120112a",
+                ),
+            ],
+            next_token=None,
+        )
+
+    def test_page_that_stops_inside_the_attested_second_is_incomplete(self) -> None:
+        """Uniqueness is unprovable while the next page may hold a sibling."""
+
+        self._expect(
+            "repair executions are incomplete",
+            attested="2026-07-28T07:08:20Z",
+            executions=[self._execution("2026-07-28T07:08:20.120000+00:00")],
+        )
+
+    def test_empty_truncated_page_is_incomplete(self) -> None:
+        self._expect(
+            "repair executions are incomplete",
+            attested="2026-07-28T07:08:20Z",
+            executions=[],
+        )
+
+    def test_row_newer_than_the_attested_second_is_incomplete(self) -> None:
+        """The server-side bound was not applied, so nothing can be trusted."""
+
+        self._expect(
+            "repair executions are incomplete",
+            attested="2026-07-28T06:38:02Z",
+            executions=[
+                self._execution("2026-07-28T07:08:20.120000+00:00"),
+                self._execution(
+                    "2026-07-28T06:38:02.949000+00:00",
+                    execution_id="1b8700c8-3c37-4434-9485-6344a120112a",
+                ),
+            ],
+            next_token=None,
+        )
+
+    def test_unordered_page_is_incomplete(self) -> None:
+        """Newest-first is what makes the head-of-page argument sound."""
+
+        self._expect(
+            "repair executions are incomplete",
+            attested="2026-07-28T07:08:20Z",
+            executions=[
+                self._execution(
+                    "2026-07-28T06:08:28.999000+00:00",
+                    execution_id="080500f4-104e-4c82-90e6-3122ec029778",
+                ),
+                self._execution("2026-07-28T07:08:20.120000+00:00"),
+            ],
+            next_token=None,
+        )
+
+    def test_execution_that_skipped_this_instance_fails_closed(self) -> None:
+        """The exact live defect: a real success that never ran here.
+
+        The on-instance collector picked execution 48c5b316 (a genuine Success)
+        for `i-081174c8c26a42d70`, but that execution targeted five other
+        instances and predates this one's launch.  Matching the attested second
+        is necessary, not sufficient -- the per-target check still has to see
+        this instance succeed.
+        """
+
+        self._expect(
+            "repair execution was not successful",
+            attested="2026-07-28T07:08:20Z",
+            executions=[self._execution("2026-07-28T07:08:20.120000+00:00")],
+            next_token=None,
+            targets=[
+                self._target("i-0b10c8548017573b5"),
+                self._target("i-0a817cc296ac6efcc"),
+                self._target("i-0580b55d04f4dfd81"),
+                self._target("i-0a4b3adaf767b0365"),
+                self._target("i-0a07f03415a26e6e3"),
+            ],
+        )
+
+    def test_malformed_created_time_fails_closed(self) -> None:
+        for created in (None, "", "2026-07-28 07:08:20", "2026-07-28T07:08:20"):
+            with self.subTest(created=created):
+                self._expect(
+                    "repair execution timestamp",
+                    attested="2026-07-28T07:08:20Z",
+                    executions=[self._execution(created)],  # type: ignore[arg-type]
+                    next_token=None,
+                )

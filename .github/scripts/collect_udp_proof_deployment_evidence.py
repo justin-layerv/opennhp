@@ -2899,6 +2899,30 @@ def _verify_repair(
         or not _repair_association_succeeded(association)
     ):
         raise EvidenceError(f"{instance_id} repair association identity drift")
+    attested_at = _iso_utc_seconds(
+        attestation["repair_last_success_at"], f"{instance_id} attested repair"
+    )
+    # Bound the query by the upper edge of the attested second instead of
+    # filtering `Key=CreatedTime,...,Type=EQUAL`. That EQUAL filter was
+    # unsatisfiable, so this branch could never pass for any instance, healthy
+    # or not: SSM answers a CreatedTime EQUAL filter with zero rows even when
+    # the value is a row's own timestamp reproduced to the microsecond, and the
+    # attested value is second-truncated anyway (the on-instance collector
+    # normalizes with the same `_iso_utc_seconds`) while every real CreatedTime
+    # carries sub-second precision.
+    #
+    # LESS_THAN is honoured, and -- unlike the Status filter, which scrambles
+    # the result order -- a CreatedTime filter preserves the API's newest-first
+    # ordering. So every execution created during the attested second sorts
+    # ahead of every older one and cannot be hidden behind a page boundary,
+    # which is what makes the uniqueness claim below sound rather than an
+    # artefact of how much of the history one page happened to show.
+    upper_bound = (
+        datetime.strptime(attested_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        + timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     executions_response = _aws(
         "ssm",
         [
@@ -2906,8 +2930,7 @@ def _verify_repair(
             "--association-id",
             association_id,
             "--filters",
-            "Key=CreatedTime,"
-            f"Value={attestation['repair_last_success_at']},Type=EQUAL",
+            f"Key=CreatedTime,Value={upper_bound},Type=LESS_THAN",
             "--max-results",
             "10",
         ],
@@ -2920,21 +2943,43 @@ def _verify_repair(
     )
     if (
         not isinstance(executions_response, dict)
-        or executions_response.get("NextToken") not in (None, "")
         or not isinstance(executions, list)
         or len(executions) > 10
+        or not all(isinstance(execution, dict) for execution in executions)
     ):
         raise EvidenceError(f"{instance_id} repair executions are incomplete")
-    successful = [
-        execution
-        for execution in executions or []
-        if isinstance(execution, dict) and execution.get("Status") == "Success"
+    created = [
+        _iso_utc_seconds(
+            execution.get("CreatedTime"), f"{instance_id} repair execution"
+        )
+        for execution in executions
     ]
-    if len(successful) != 1:
+    truncated = executions_response.get("NextToken") not in (None, "")
+    if (
+        # Newest-first, so the attested second is at the head of the page.
+        created != sorted(created, reverse=True)
+        # The server-side bound must have held: nothing newer than the
+        # attested second may appear.
+        or (created and created[0] > attested_at)
+        # A truncated page only proves uniqueness once it reaches strictly
+        # past the attested second; otherwise a sibling execution in the same
+        # second could be sitting on the next page.
+        or (truncated and (not created or created[-1] >= attested_at))
+    ):
+        raise EvidenceError(f"{instance_id} repair executions are incomplete")
+    matched = [
+        execution
+        for execution, timestamp in zip(executions, created)
+        if timestamp == attested_at
+    ]
+    # Fail closed on all three ways this can be wrong: the attestation names a
+    # second in which nothing ran, it names a second holding two executions so
+    # the binding is ambiguous, or the execution it names did not succeed.
+    if len(matched) != 1 or matched[0].get("Status") != "Success":
         raise EvidenceError(
             f"{instance_id} has no unique successful repair execution"
         )
-    execution = successful[0]
+    execution = matched[0]
     execution_id = contract._string(
         execution.get("ExecutionId"), f"{instance_id} repair execution ID"
     )
