@@ -552,5 +552,89 @@ class BuildReceiptReconstructionTest(unittest.TestCase):
         self.assertIn('source_kind: "ecr_build_receipt"', text)
 
 
+
+class FileHashBoundTest(unittest.TestCase):
+    """The installed qRTS binary must be hashable.
+
+    `_sha256_file`'s bound was sized for the pinned assets -- the collector and
+    two unit files, a few kilobytes each -- but the qRTS branch hashes a ~20 MiB
+    Go binary through the same helper. Live on 2026-07-28
+    `/opt/layerv/qurl-reverse-tunnel-server/nhp-frps` was 21,528,738 bytes, so
+    `installed_binary` collection failed unconditionally with `is too large to
+    hash`. It stayed invisible behind the missing boot capture: nothing wrote
+    the capture, so the branch was never reached on a real node.
+    """
+
+    def write(self, directory: str, size: int) -> Path:
+        path = Path(directory) / "nhp-frps"
+        path.write_bytes(b"\0" * size)
+        return path
+
+    def test_a_twenty_megabyte_binary_hashes(self) -> None:
+        size = 21_528_738
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, size)
+            self.assertEqual(
+                collector._sha256_file(
+                    path, maximum=collector.MAX_INSTALLED_BINARY_BYTES
+                ),
+                hashlib.sha256(b"\0" * size).hexdigest(),
+            )
+
+    def test_the_pinned_asset_default_would_still_reject_it(self) -> None:
+        """The exact live regression, against the old bound."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, 21_528_738)
+            with self.assertRaises(collector.CollectorError) as raised:
+                collector._sha256_file(path)
+        self.assertIn("too large to hash", str(raised.exception))
+
+    def test_the_binary_bound_is_still_a_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, 4096)
+            with self.assertRaises(collector.CollectorError):
+                collector._sha256_file(path, maximum=1024)
+
+    def test_the_qrts_branch_uses_the_binary_bound(self) -> None:
+        """Guard the call site, not just the helper."""
+        seen = {}
+
+        def record(path, *, maximum=collector.MAX_PINNED_ASSET_BYTES):
+            seen[path] = maximum
+            return "0" * 64
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "boot-capture.json"
+            capture.write_text(
+                json.dumps(
+                    {
+                        "image_digest": "sha256:" + "a" * 64,
+                        "source_revision": "b" * 40,
+                        "build_receipt_sha256": "c" * 64,
+                        "installed_binary_sha256": "0" * 64,
+                        "source_kind": "ecr_build_receipt",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                collector, "BOOT_CAPTURE_PATH", capture
+            ), mock.patch.object(collector, "_sha256_file", side_effect=record):
+                collector._collect_installed_binary_runtime()
+
+        self.assertEqual(
+            seen[collector.QRTS_BINARY_PATH],
+            collector.MAX_INSTALLED_BINARY_BYTES,
+        )
+        self.assertGreater(
+            collector.MAX_INSTALLED_BINARY_BYTES, collector.MAX_PINNED_ASSET_BYTES
+        )
+
+    def test_hashing_is_chunked_so_memory_does_not_track_the_bound(self) -> None:
+        self.assertLessEqual(
+            collector.HASH_CHUNK_BYTES, collector.MAX_PINNED_ASSET_BYTES
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

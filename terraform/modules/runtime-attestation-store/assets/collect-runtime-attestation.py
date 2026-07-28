@@ -50,6 +50,12 @@ IMDS_TIMEOUT = 5
 AWS_TIMEOUT = 60
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_OBJECT_BYTES = 32 * 1024
+# The collector and both unit files; a few kilobytes each.
+MAX_PINNED_ASSET_BYTES = 4 * 1024 * 1024
+# The installed qRTS binary: a statically linked Go binary, ~20 MiB live on
+# 2026-07-28. Generous headroom, still bounded.
+MAX_INSTALLED_BINARY_BYTES = 64 * 1024 * 1024
+HASH_CHUNK_BYTES = 1024 * 1024
 
 COLLECTOR_PATH = Path("/usr/local/bin/layerv-collect-runtime-attestation.py")
 SERVICE_UNIT_PATH = Path("/etc/systemd/system/layerv-runtime-attestation.service")
@@ -112,14 +118,43 @@ def _canonical_bytes(value: Any) -> bytes:
     return raw
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, maximum: int = MAX_PINNED_ASSET_BYTES) -> str:
+    """Hash a root-owned file under an explicit size bound.
+
+    The default is the pinned-asset bound: the collector and both unit files are
+    a few kilobytes, and anything larger at those exact paths is anomalous.  The
+    qRTS binary is a ~20 MiB Go binary and needs its own bound — hashing it
+    under the pinned-asset default made `installed_binary` collection fail
+    unconditionally with `is too large to hash`, which is why raising the bound
+    is a fix rather than a relaxation: no qRTS node could ever satisfy it.
+
+    That defect stayed invisible because it sat behind another one.  The branch
+    was selected by the boot capture's existence, nothing wrote the capture, so
+    this line was unreachable on every real node.
+
+    Reading in chunks keeps memory flat whatever the bound, and the post-read
+    total is re-checked so a file that grows mid-hash fails closed instead of
+    being hashed past its bound.
+    """
+
     try:
         metadata = path.lstat()
         if path.is_symlink() or not os.path.isfile(path):
             raise CollectorError(f"{path} must be a regular file")
-        if metadata.st_size > 4 * 1024 * 1024:
+        if metadata.st_size > maximum:
             raise CollectorError(f"{path} is too large to hash")
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        hashed = 0
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                hashed += len(chunk)
+                if hashed > maximum:
+                    raise CollectorError(f"{path} grew while being hashed")
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError as exc:
         raise CollectorError(f"cannot hash {path}") from exc
 
@@ -523,7 +558,7 @@ def _collect_installed_binary_runtime() -> dict[str, Any]:
         raise CollectorError("qRTS boot capture has an unexpected shape")
     if capture.get("source_kind") != "ecr_build_receipt":
         raise CollectorError("qRTS boot capture is not ECR-receipt sourced")
-    installed = _sha256_file(QRTS_BINARY_PATH)
+    installed = _sha256_file(QRTS_BINARY_PATH, maximum=MAX_INSTALLED_BINARY_BYTES)
     if installed != _require(
         capture.get("installed_binary_sha256"), SHA256_RE, "captured binary hash"
     ):
