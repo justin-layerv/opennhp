@@ -7,7 +7,9 @@
 # Usage: soak-period.sh
 #
 # Required Environment Variables:
-#   ENVIRONMENT:    Target environment (sandbox, prod)
+#   ENVIRONMENT:    Target environment. Must be a blue/green-capable environment
+#                   (sandbox, sandbox-cell1) -- it must publish
+#                   /<env>/nhp/server/active-color and the per-color ASG names.
 #   SOAK_MINUTES:   Duration of soak period in minutes
 #   SKIP_SOAK:      "true" to skip soak entirely
 #   AWS_REGION:     AWS region (default: us-east-2)
@@ -32,20 +34,51 @@ if [[ "${SKIP_SOAK:-false}" == "true" ]]; then
   exit 0
 fi
 
-# Get ASG name from SSM
-ASG_NAME=$(aws ssm get-parameter \
-  --name "/${ENVIRONMENT}/nhp/server/asg-name" \
-  --region "$AWS_REGION" \
-  --query "Parameter.Value" --output text 2>/dev/null) || ASG_NAME=""
+# Resolve the fleet that is actually SERVING traffic.
+#
+# This soak runs strictly AFTER the color switch. scheduled-release.yml orders
+# ensure-sandbox-deployed -> soak, and ensure-sandbox-deployed dispatches
+# build-and-push.yml, whose blue/green leg runs deploy-to-standby ->
+# switch-traffic -> validate -> scale-down-previous. By the time we get here the
+# newly refreshed color is active and the previous color has been scaled down to
+# a single warm-standby instance. So the soak must watch the ACTIVE color.
+#
+# /<env>/nhp/server/asg-name is NOT the active-color pointer. modules/compute
+# publishes it from aws_autoscaling_group.server -- the base/BLUE group -- and
+# /<env>/nhp/server/blue-asg-name holds the identical value. Soaking it watches
+# the idle fleet whenever green is active: its ASG is healthy but its target
+# groups are deliberately "unused" (Target.NotInUse), so the soak's verdict
+# describes a fleet that serves no traffic.
+#
+# Fail closed. An unreadable or unknown color, or a missing per-color ASG
+# parameter, is an error. There is deliberately no fallback to asg-name and no
+# fallback to a blind time-based sleep: both would let the soak report success
+# having never observed the fleet that serves traffic.
+SSM_BASE="/${ENVIRONMENT}/nhp/server"
 
-if [[ -z "$ASG_NAME" ]]; then
-  echo "WARNING: Could not read ASG name from SSM. Falling back to time-based soak only."
-  sleep "$((SOAK_MINUTES * 60))"
-  echo "Soak period complete (time-based only)."
-  exit 0
+get_ssm_param() {
+  aws ssm get-parameter \
+    --name "$1" \
+    --region "$AWS_REGION" \
+    --query "Parameter.Value" --output text 2>/dev/null
+}
+
+ACTIVE_COLOR=$(get_ssm_param "${SSM_BASE}/active-color") || ACTIVE_COLOR=""
+if [[ "$ACTIVE_COLOR" != "blue" && "$ACTIVE_COLOR" != "green" ]]; then
+  echo "ERROR: Could not resolve a known active color from ${SSM_BASE}/active-color (got: '${ACTIVE_COLOR}')."
+  echo "       Expected exactly 'blue' or 'green'. Refusing to soak an unverified fleet."
+  exit 1
 fi
 
-echo "ASG Name: $ASG_NAME"
+ASG_NAME=$(get_ssm_param "${SSM_BASE}/${ACTIVE_COLOR}-asg-name") || ASG_NAME=""
+if [[ -z "$ASG_NAME" || "$ASG_NAME" == "None" ]]; then
+  echo "ERROR: Active color is '${ACTIVE_COLOR}' but ${SSM_BASE}/${ACTIVE_COLOR}-asg-name is missing or empty."
+  echo "       Refusing to fall back to ${SSM_BASE}/asg-name, which is the color-blind base (blue) group."
+  exit 1
+fi
+
+echo "Active color: $ACTIVE_COLOR"
+echo "ASG Name:     $ASG_NAME (active fleet)"
 
 # Get NLB target group ARN for health checks
 TG_ARN=$(aws autoscaling describe-auto-scaling-groups \
@@ -61,6 +94,8 @@ CHECK_NUM=0
 # Instance refresh may still be in progress, so we warn rather than fail.
 echo ""
 echo "--- Initial Health Check (non-fatal) ---"
+# Backticks are JMESPath literals, not shell substitutions.
+# shellcheck disable=SC2016
 INITIAL_ASG_INFO=$(aws autoscaling describe-auto-scaling-groups \
   --auto-scaling-group-names "$ASG_NAME" \
   --region "$AWS_REGION" \
@@ -98,6 +133,8 @@ while [[ $ELAPSED -lt $TOTAL_SECONDS ]]; do
   echo "--- Health Check #${CHECK_NUM} (${REMAINING}min remaining) ---"
 
   # Check 1: ASG healthy instance count
+  # Backticks are JMESPath literals, not shell substitutions.
+  # shellcheck disable=SC2016
   ASG_INFO=$(aws autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG_NAME" \
     --region "$AWS_REGION" \
@@ -119,6 +156,8 @@ while [[ $ELAPSED -lt $TOTAL_SECONDS ]]; do
 
   # Check 2: NLB target group health
   if [[ -n "$TG_ARN" && "$TG_ARN" != "None" ]]; then
+    # Backticks are JMESPath literals, not shell substitutions.
+    # shellcheck disable=SC2016
     UNHEALTHY_COUNT=$(aws elbv2 describe-target-health \
       --target-group-arn "$TG_ARN" \
       --region "$AWS_REGION" \
