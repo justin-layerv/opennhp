@@ -224,7 +224,30 @@ run "secure_ephemeral_runner_contract" {
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "secretsmanager:") &&
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "kms:Decrypt") &&
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "ssm:GetParametersByPath") &&
-      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactPublicRuntimeParameters"].Resource) == 8 &&
+      # Pin the exact parameter SET, not just its cardinality. A bare count
+      # accepts a renamed or wrong-cell parameter, which is precisely the class
+      # of mistake that produces an AccessDenied reading as missing
+      # infrastructure. The two cells are resolved by ACTIVE COLOUR:
+      # <env>/nhp/server/active-color selects <env>/nhp/server/<colour>-asg-name.
+      # <env>/nhp/server/asg-name is deliberately absent -- it is the
+      # colour-blind base/blue group modules/compute publishes for CI/CD
+      # instance refreshes, and granting it invites the colour-blind read back.
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactPublicRuntimeParameters"].Resource) == toset([
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/identity/public-key",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/udp-proof/runtime-attestation-bucket-arn",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/udp-proof/runtime-attestation-collector-contract",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/server/active-color",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/server/blue-asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/server/green-asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/server/active-color",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/server/blue-asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/server/green-asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/reverse-tunnel-server/asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/qurl-service/runtime-contract",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/qurl-service/runtime-contract",
+      ]) &&
+      !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "parameter/sandbox/nhp/server/asg-name") &&
+      !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "parameter/sandbox-cell1/nhp/server/asg-name") &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRepairDocument"].Resource == "arn:aws:ssm:us-east-2:767397897469:document/layerv-nhp-sandbox-runtime-attestation-repair" &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadProvisionedCellCatalog"].Action == "dynamodb:GetItem" &&
       length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRuntimeImages"].Resource) == 5 &&

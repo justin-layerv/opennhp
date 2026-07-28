@@ -6,8 +6,18 @@ locals {
     "sandbox/nhp/control/hub/identity/public-key",
     "sandbox/nhp/udp-proof/runtime-attestation-bucket-arn",
     "sandbox/nhp/udp-proof/runtime-attestation-collector-contract",
-    "sandbox/nhp/server/asg-name",
-    "sandbox-cell1/nhp/server/asg-name",
+    # The producer resolves each cell's server fleet by active colour: read
+    # <env>/nhp/server/active-color, then that colour's <env>/nhp/server/
+    # <colour>-asg-name. <env>/nhp/server/asg-name is the colour-BLIND base/blue
+    # group modules/compute publishes for CI/CD instance refreshes, so it is no
+    # longer read and no longer granted. The reverse-tunnel server has no
+    # blue/green parameters and keeps its single asg-name.
+    "sandbox/nhp/server/active-color",
+    "sandbox/nhp/server/blue-asg-name",
+    "sandbox/nhp/server/green-asg-name",
+    "sandbox-cell1/nhp/server/active-color",
+    "sandbox-cell1/nhp/server/blue-asg-name",
+    "sandbox-cell1/nhp/server/green-asg-name",
     "sandbox/nhp/reverse-tunnel-server/asg-name",
     "sandbox/nhp/qurl-service/runtime-contract",
     "sandbox-cell1/nhp/qurl-service/runtime-contract",

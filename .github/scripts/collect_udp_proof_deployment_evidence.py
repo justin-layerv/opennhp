@@ -110,16 +110,39 @@ ECS_WORKLOADS: dict[str, ECSWorkloadSpec] = {
         "source_parameter": "/sandbox-cell1/nhp/qurl-service/runtime-contract",
     },
 }
+# /<env>/nhp/server/asg-name is NOT the active-colour pointer. modules/compute
+# publishes it from aws_autoscaling_group.server -- the base/blue group -- for
+# CI/CD instance refreshes, and /<env>/nhp/server/blue-asg-name holds the same
+# value. Resolving the fleet from it is colour-blind: with active-color=green
+# the cell0 edge NLB forwards to the green target group and its healthy targets
+# are the GREEN ASG's members, while asg-name still names the blue group, so the
+# NLB-versus-ASG comparison below compares two different fleets and can never
+# hold. Read the active colour first, then that colour's ASG parameter -- the
+# same correction #3494 made for the UDP source fence, which this producer's ASG
+# resolution was never updated to match.
 EC2_WORKLOADS = {
     "nhp_cell0": {
-        "asg_parameter": "/sandbox/nhp/server/asg-name",
+        "active_color_parameter": "/sandbox/nhp/server/active-color",
+        "color_asg_parameters": {
+            "blue": "/sandbox/nhp/server/blue-asg-name",
+            "green": "/sandbox/nhp/server/green-asg-name",
+        },
         "repository": "layerv/nhp-server",
     },
     "nhp_cell1": {
-        "asg_parameter": "/sandbox-cell1/nhp/server/asg-name",
+        "active_color_parameter": "/sandbox-cell1/nhp/server/active-color",
+        "color_asg_parameters": {
+            "blue": "/sandbox-cell1/nhp/server/blue-asg-name",
+            "green": "/sandbox-cell1/nhp/server/green-asg-name",
+        },
         "repository": "layerv/nhp-server",
     },
+    # The reverse-tunnel server is not blue/green. Verified live: the whole
+    # /sandbox/nhp/reverse-tunnel-server/ path is asg-name, image-tag and
+    # min-client-version -- there is no active-color and no per-colour ASG
+    # parameter to resolve, so its single asg-name IS the active fleet.
     "qurl_reverse_tunnel_server": {
+        "active_color_parameter": None,
         "asg_parameter": "/sandbox/nhp/reverse-tunnel-server/asg-name",
         "repository": "layerv/qurl-reverse-tunnel-server",
     },
@@ -3263,6 +3286,45 @@ def _reserved_launch_template_tags(instance: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_active_asg_name(workload_key: str) -> str:
+    """Resolve the ASG that actually serves the workload's active colour.
+
+    Fail-closed at every step: a missing colour marker or a missing per-colour
+    ASG parameter surfaces as an SSM read failure, and a marker that is not
+    exactly one of the known colours is rejected rather than defaulted.
+    """
+    spec = EC2_WORKLOADS[workload_key]
+    color_parameter = spec["active_color_parameter"]
+    if color_parameter is None:
+        asg_name = _ssm_parameter(spec["asg_parameter"])["Value"]
+        return contract._string(asg_name, f"{workload_key} ASG name")
+    active_color = _ssm_parameter(color_parameter)["Value"]
+    color_parameters = spec["color_asg_parameters"]
+    if active_color not in color_parameters:
+        raise EvidenceError(
+            f"{workload_key} active colour is not exactly one of "
+            f"{sorted(color_parameters)}"
+        )
+    asg_name = _ssm_parameter(color_parameters[active_color])["Value"]
+    return contract._string(asg_name, f"{workload_key} {active_color} ASG name")
+
+
+def _require_edge_serves_fleet(
+    cell_id: str,
+    *,
+    healthy_target_ids: list[str],
+    in_service_instance_ids: list[str],
+) -> None:
+    """The cell's public edge must serve exactly the resolved fleet.
+
+    Both sides are sorted, so this is an exact set-and-multiplicity match: an
+    extra target, a missing target, or a fleet resolved from the wrong colour
+    all fail closed.
+    """
+    if healthy_target_ids != in_service_instance_ids:
+        raise EvidenceError(f"{cell_id} public NLB targets differ from its healthy ASG")
+
+
 def _collect_ec2_workload(
     workload_key: str,
     *,
@@ -3273,9 +3335,7 @@ def _collect_ec2_workload(
     expected_source_revision: str | None = None,
 ) -> dict[str, Any]:
     spec = EC2_WORKLOADS[workload_key]
-    asg_parameter = _ssm_parameter(spec["asg_parameter"])
-    asg_name = asg_parameter["Value"]
-    contract._string(asg_name, f"{workload_key} ASG name")
+    asg_name = _resolve_active_asg_name(workload_key)
     response = _aws(
         "autoscaling",
         ["describe-auto-scaling-groups", "--auto-scaling-group-names", asg_name],
@@ -3751,14 +3811,13 @@ def collect_aws_and_build_snapshot(
             ),
         )
     for cell_id in ("cell0", "cell1"):
-        workload = workloads[f"nhp_{cell_id}"]
-        if (
-            cell_edges[cell_id]["healthy_target_ids"]
-            != workload["in_service_instance_ids"]
-        ):
-            raise EvidenceError(
-                f"{cell_id} public NLB targets differ from its healthy ASG"
-            )
+        _require_edge_serves_fleet(
+            cell_id,
+            healthy_target_ids=cell_edges[cell_id]["healthy_target_ids"],
+            in_service_instance_ids=workloads[f"nhp_{cell_id}"][
+                "in_service_instance_ids"
+            ],
+        )
     hub_task_addresses = sorted(
         address
         for task in workloads["nhp_hub"]["tasks"]

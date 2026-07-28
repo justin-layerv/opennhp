@@ -1258,6 +1258,380 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
             )
 
 
+class ActiveColorAsgResolutionTest(unittest.TestCase):
+    """The server fleet must be resolved by ACTIVE COLOUR, not by asg-name.
+
+    /<env>/nhp/server/asg-name is the colour-BLIND base/blue group that
+    modules/compute publishes for CI/CD instance refreshes; blue-asg-name holds
+    the same value. Live on 2026-07-26, cell0 had active-color=green with the
+    edge NLB forwarding to the green target group, while asg-name still named
+    the blue group -- so the producer compared the green NLB's healthy targets
+    against the blue ASG's members and could never succeed.
+
+    Every fixture below is a verbatim `aws ssm get-parameter --output json`
+    response captured from account 767397897469 in us-east-2, including the
+    LastModifiedDate/ARN/DataType fields the collector ignores. Hand-trimmed
+    fixtures here have repeatedly encoded the checker's own assumptions instead
+    of what AWS actually returns.
+    """
+
+    CELL0_ACTIVE_COLOR_GREEN = {
+        "Parameter": {
+            "Name": "/sandbox/nhp/server/active-color",
+            "Type": "String",
+            "Value": "green",
+            "Version": 549,
+            "LastModifiedDate": "2026-07-26T20:50:51.213000-06:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox/nhp/server/active-color"
+            ),
+            "DataType": "text",
+        }
+    }
+    CELL0_GREEN_ASG = {
+        "Parameter": {
+            "Name": "/sandbox/nhp/server/green-asg-name",
+            "Type": "String",
+            "Value": "layerv-nhp-sandbox-server-green",
+            "Version": 1,
+            "LastModifiedDate": "2026-02-05T12:53:40.340000-07:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox/nhp/server/green-asg-name"
+            ),
+            "DataType": "text",
+        }
+    }
+    CELL0_BLUE_ASG = {
+        "Parameter": {
+            "Name": "/sandbox/nhp/server/blue-asg-name",
+            "Type": "String",
+            # Identical to /sandbox/nhp/server/asg-name -- that is exactly why
+            # asg-name is colour-blind and unusable as the active pointer.
+            "Value": "layerv-nhp-sandbox-server",
+            "Version": 1,
+            "LastModifiedDate": "2026-02-05T12:53:40.281000-07:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox/nhp/server/blue-asg-name"
+            ),
+            "DataType": "text",
+        }
+    }
+    CELL1_ACTIVE_COLOR_BLUE = {
+        "Parameter": {
+            "Name": "/sandbox-cell1/nhp/server/active-color",
+            "Type": "String",
+            "Value": "blue",
+            "Version": 1,
+            "LastModifiedDate": "2026-07-25T09:29:57.960000-06:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox-cell1/nhp/server/active-color"
+            ),
+            "DataType": "text",
+        }
+    }
+    CELL1_BLUE_ASG = {
+        "Parameter": {
+            "Name": "/sandbox-cell1/nhp/server/blue-asg-name",
+            "Type": "String",
+            "Value": "layerv-nhp-sandbox-cell1-server",
+            "Version": 1,
+            "LastModifiedDate": "2026-07-25T09:35:52.726000-06:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox-cell1/nhp/server/blue-asg-name"
+            ),
+            "DataType": "text",
+        }
+    }
+    QRTS_ASG = {
+        "Parameter": {
+            "Name": "/sandbox/nhp/reverse-tunnel-server/asg-name",
+            "Type": "String",
+            "Value": "layerv-nhp-sandbox-frps",
+            "Version": 1,
+            "LastModifiedDate": "2026-01-15T14:22:11.104000-07:00",
+            "ARN": (
+                "arn:aws:ssm:us-east-2:767397897469:parameter"
+                "/sandbox/nhp/reverse-tunnel-server/asg-name"
+            ),
+            "DataType": "text",
+        }
+    }
+
+    @staticmethod
+    def _ssm(responses):
+        """Serve get-parameter by NAME, so call ORDER cannot fake a pass."""
+        by_name = {
+            response["Parameter"]["Name"]: response for response in responses
+        }
+
+        def call(service, arguments, name):
+            assert service == "ssm", service
+            assert arguments[0] == "get-parameter", arguments
+            requested = arguments[arguments.index("--name") + 1]
+            if requested not in by_name:
+                # The real CLI exits non-zero with ParameterNotFound, which
+                # _run_json surfaces as an EvidenceError.
+                raise collector.EvidenceError(
+                    f"SSM parameter {requested} read failed: An error occurred "
+                    "(ParameterNotFound) when calling the GetParameter operation:"
+                )
+            return by_name[requested]
+
+        return call
+
+    def test_cell0_resolves_the_green_asg_while_green_is_active(self) -> None:
+        with mock.patch.object(
+            collector,
+            "_aws",
+            side_effect=self._ssm(
+                [
+                    self.CELL0_ACTIVE_COLOR_GREEN,
+                    self.CELL0_BLUE_ASG,
+                    self.CELL0_GREEN_ASG,
+                ]
+            ),
+        ):
+            self.assertEqual(
+                collector._resolve_active_asg_name("nhp_cell0"),
+                "layerv-nhp-sandbox-server-green",
+            )
+
+    def test_cell0_resolves_the_blue_asg_after_a_switch_back(self) -> None:
+        blue = copy.deepcopy(self.CELL0_ACTIVE_COLOR_GREEN)
+        blue["Parameter"]["Value"] = "blue"
+        blue["Parameter"]["Version"] = 550
+        with mock.patch.object(
+            collector,
+            "_aws",
+            side_effect=self._ssm(
+                [blue, self.CELL0_BLUE_ASG, self.CELL0_GREEN_ASG]
+            ),
+        ):
+            self.assertEqual(
+                collector._resolve_active_asg_name("nhp_cell0"),
+                "layerv-nhp-sandbox-server",
+            )
+
+    def test_cell1_resolves_by_colour_too(self) -> None:
+        # cell1 is blue/green-capable -- it publishes active-color, blue-asg-name
+        # and green-asg-name, and layerv-nhp-sandbox-cell1-server-green exists at
+        # DesiredCapacity 0. It is only *coincidentally* correct today because
+        # active-color is blue and asg-name equals blue-asg-name; the first
+        # switch to green would break it exactly as cell0 broke.
+        with mock.patch.object(
+            collector,
+            "_aws",
+            side_effect=self._ssm(
+                [self.CELL1_ACTIVE_COLOR_BLUE, self.CELL1_BLUE_ASG]
+            ),
+        ):
+            self.assertEqual(
+                collector._resolve_active_asg_name("nhp_cell1"),
+                "layerv-nhp-sandbox-cell1-server",
+            )
+
+    def test_cell1_switched_to_green_follows_the_green_asg(self) -> None:
+        green = copy.deepcopy(self.CELL1_ACTIVE_COLOR_BLUE)
+        green["Parameter"]["Value"] = "green"
+        green["Parameter"]["Version"] = 2
+        green_asg = copy.deepcopy(self.CELL1_BLUE_ASG)
+        green_asg["Parameter"]["Name"] = "/sandbox-cell1/nhp/server/green-asg-name"
+        green_asg["Parameter"]["Value"] = "layerv-nhp-sandbox-cell1-server-green"
+        with mock.patch.object(
+            collector, "_aws", side_effect=self._ssm([green, green_asg])
+        ):
+            self.assertEqual(
+                collector._resolve_active_asg_name("nhp_cell1"),
+                "layerv-nhp-sandbox-cell1-server-green",
+            )
+
+    def test_unknown_colour_fails_closed(self) -> None:
+        # Includes the shapes a defaulting resolver would silently accept:
+        # padded, cased, empty, and a plausible third colour.
+        for value in ("", "GREEN", " green", "green ", "canary", "blue/green"):
+            marker = copy.deepcopy(self.CELL0_ACTIVE_COLOR_GREEN)
+            marker["Parameter"]["Value"] = value
+            with (
+                self.subTest(active_color=value),
+                mock.patch.object(
+                    collector,
+                    "_aws",
+                    side_effect=self._ssm(
+                        [marker, self.CELL0_BLUE_ASG, self.CELL0_GREEN_ASG]
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    collector.EvidenceError, "active colour is not exactly one of"
+                ),
+            ):
+                collector._resolve_active_asg_name("nhp_cell0")
+
+    def test_missing_active_colour_parameter_fails_closed(self) -> None:
+        with (
+            mock.patch.object(
+                collector,
+                "_aws",
+                side_effect=self._ssm(
+                    [self.CELL0_BLUE_ASG, self.CELL0_GREEN_ASG]
+                ),
+            ),
+            self.assertRaisesRegex(collector.EvidenceError, "ParameterNotFound"),
+        ):
+            collector._resolve_active_asg_name("nhp_cell0")
+
+    def test_missing_per_colour_parameter_fails_closed(self) -> None:
+        # Green is active but /sandbox/nhp/server/green-asg-name is absent. The
+        # resolver must NOT fall back to blue-asg-name or to asg-name.
+        with (
+            mock.patch.object(
+                collector,
+                "_aws",
+                side_effect=self._ssm(
+                    [self.CELL0_ACTIVE_COLOR_GREEN, self.CELL0_BLUE_ASG]
+                ),
+            ),
+            self.assertRaisesRegex(
+                collector.EvidenceError,
+                r"/sandbox/nhp/server/green-asg-name read failed",
+            ),
+        ):
+            collector._resolve_active_asg_name("nhp_cell0")
+
+    def test_empty_per_colour_asg_name_fails_closed(self) -> None:
+        blank = copy.deepcopy(self.CELL0_GREEN_ASG)
+        blank["Parameter"]["Value"] = ""
+        with (
+            mock.patch.object(
+                collector,
+                "_aws",
+                side_effect=self._ssm([self.CELL0_ACTIVE_COLOR_GREEN, blank]),
+            ),
+            self.assertRaises(contract.ContractError),
+        ):
+            collector._resolve_active_asg_name("nhp_cell0")
+
+    def test_non_blue_green_workload_keeps_its_single_asg_parameter(self) -> None:
+        # Verified live: the whole /sandbox/nhp/reverse-tunnel-server/ path is
+        # asg-name, image-tag and min-client-version. There is no active-color
+        # marker to read, so the resolver must not invent one.
+        self.assertIsNone(
+            collector.EC2_WORKLOADS["qurl_reverse_tunnel_server"][
+                "active_color_parameter"
+            ]
+        )
+        with mock.patch.object(
+            collector, "_aws", side_effect=self._ssm([self.QRTS_ASG])
+        ):
+            self.assertEqual(
+                collector._resolve_active_asg_name("qurl_reverse_tunnel_server"),
+                "layerv-nhp-sandbox-frps",
+            )
+
+    def test_colour_blind_asg_name_is_no_longer_read(self) -> None:
+        # The regression itself: nothing may read /<env>/nhp/server/asg-name.
+        # It is also no longer granted in the producer's IAM policy, so a
+        # reintroduced read would surface as AccessDenied in CI.
+        for workload_key in ("nhp_cell0", "nhp_cell1"):
+            spec = collector.EC2_WORKLOADS[workload_key]
+            with self.subTest(workload=workload_key):
+                self.assertNotIn("asg_parameter", spec)
+                self.assertNotIn(
+                    "asg-name",
+                    [
+                        parameter.rsplit("/", 1)[-1]
+                        for parameter in spec["color_asg_parameters"].values()
+                    ],
+                )
+                self.assertEqual(
+                    sorted(spec["color_asg_parameters"]), ["blue", "green"]
+                )
+
+    def test_iam_policy_grants_every_parameter_the_collector_reads(self) -> None:
+        # Without this the producer gets AccessDenied on ssm:GetParameter for a
+        # parameter that exists, which reads as missing infrastructure.
+        granted = (
+            ROOT
+            / "terraform"
+            / "modules"
+            / "udp-proof-runner"
+            / "manifest_producer.tf"
+        ).read_text(encoding="utf-8")
+        for workload_key, spec in collector.EC2_WORKLOADS.items():
+            required = []
+            if spec["active_color_parameter"] is not None:
+                required.append(spec["active_color_parameter"])
+                required.extend(spec["color_asg_parameters"].values())
+            else:
+                required.append(spec["asg_parameter"])
+            for parameter in required:
+                with self.subTest(workload=workload_key, parameter=parameter):
+                    # local.manifest_ssm_parameters entries are ARN suffixes and
+                    # so carry no leading slash.
+                    self.assertIn(f'"{parameter.lstrip("/")}",', granted)
+
+
+class EdgeServesResolvedFleetTest(unittest.TestCase):
+    """The cell edge must serve exactly the colour-resolved fleet."""
+
+    # Live on 2026-07-26 in account 767397897469 / us-east-2.
+    GREEN_MEMBERS = [
+        "i-02afa00ae723b243b",
+        "i-0b514e2da4ba022fb",
+        "i-0cb07b293e218e49b",
+    ]
+    BLUE_MEMBERS = [
+        "i-014f7005e28046a78",
+        "i-07be87f0a27ddfac4",
+        "i-0d75eb62dae4c1bcd",
+    ]
+
+    def test_active_colour_fleet_matches_the_edge(self) -> None:
+        # layerv-nhp-sandbox-edge forwards to targetgroup/layerv-nhp-sandbox-udp-grn
+        # /42191fec63dd965a, whose three healthy targets are the green ASG's
+        # members exactly.
+        collector._require_edge_serves_fleet(
+            "cell0",
+            healthy_target_ids=sorted(self.GREEN_MEMBERS),
+            in_service_instance_ids=sorted(self.GREEN_MEMBERS),
+        )
+
+    def test_colour_blind_fleet_is_rejected(self) -> None:
+        # The exact failure of run 30350781941: the edge serves green while the
+        # fleet was resolved from the colour-blind asg-name (blue).
+        with self.assertRaisesRegex(
+            collector.EvidenceError,
+            "cell0 public NLB targets differ from its healthy ASG",
+        ):
+            collector._require_edge_serves_fleet(
+                "cell0",
+                healthy_target_ids=sorted(self.GREEN_MEMBERS),
+                in_service_instance_ids=sorted(self.BLUE_MEMBERS),
+            )
+
+    def test_partial_overlap_and_extra_targets_are_rejected(self) -> None:
+        for healthy in (
+            sorted(self.GREEN_MEMBERS[:2]),
+            sorted(self.GREEN_MEMBERS + self.BLUE_MEMBERS[:1]),
+            [],
+        ):
+            with (
+                self.subTest(healthy=healthy),
+                self.assertRaisesRegex(
+                    collector.EvidenceError, "differ from its healthy ASG"
+                ),
+            ):
+                collector._require_edge_serves_fleet(
+                    "cell0",
+                    healthy_target_ids=healthy,
+                    in_service_instance_ids=sorted(self.GREEN_MEMBERS),
+                )
+
+
 class InstanceRefreshConvergenceTest(unittest.TestCase):
     """A converged instance count must not stand in for a stable fleet."""
 
