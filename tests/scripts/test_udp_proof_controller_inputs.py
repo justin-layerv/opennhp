@@ -163,7 +163,7 @@ class WorkflowContractTest(unittest.TestCase):
             "actions/runs/${PRODUCER_RUN_ID}/artifacts?per_page=100",
             "could not authenticate the producer run after bounded retries",
             "could not authenticate the producer artifact after bounded retries",
-            "PINNED_CONNECTOR_SHA: 742bd32e521ded4b75a0d56f6f442421eea6bdc7",
+            "PINNED_CONNECTOR_SHA: 29a0a7eba76187a915c29d7bd71f1a20cca7776f",
             "PINNED_QURL_GO_SHA: e9004a8a07fbc30de8d5f7b95f6c169016c03e95",
             "producer artifact does not bind the frozen Connector head",
             "producer artifact does not bind the frozen qurl-go head",
