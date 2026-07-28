@@ -1161,7 +1161,18 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
                             "Values": [asg_name],
                         }
                     ],
-                    "Status": {"Name": "Success"},
+                    # The real DescribeAssociation shape for a tag-targeted
+                    # State Manager association: no Status member at all, with
+                    # Overview carrying the result. This fixture previously
+                    # asserted {"Status": {"Name": "Success"}}, which AWS never
+                    # returns here -- it encoded the checker's assumption rather
+                    # than the API, so the suite passed while the check could
+                    # not succeed against any live association.
+                    "Overview": {
+                        "Status": "Success",
+                        "DetailedStatus": "Success",
+                        "AssociationStatusAggregatedCount": {"Success": 3},
+                    },
                 }
             },
             {
@@ -1815,3 +1826,57 @@ class InstanceRefreshPaginationTest(unittest.TestCase):
                     "NextToken": "older",
                 }
             )
+
+
+class RepairAssociationOverviewTest(unittest.TestCase):
+    """DescribeAssociation omits Status for tag-targeted associations.
+
+    Verified against all three live repair associations: "Status" is not null,
+    it is absent from the response body. Overview is the populated member.
+    """
+
+    def overview(self, **kwargs):
+        base = {
+            "Status": "Success",
+            "DetailedStatus": "Success",
+            "AssociationStatusAggregatedCount": {"Success": 3},
+        }
+        base.update(kwargs)
+        return {"Overview": base}
+
+    def test_live_shape_succeeds(self) -> None:
+        self.assertTrue(collector._repair_association_succeeded(self.overview()))
+
+    def test_absent_status_member_is_not_itself_a_failure(self) -> None:
+        """The exact regression: no Status key at all, yet healthy."""
+        association = self.overview()
+        self.assertNotIn("Status", association)
+        self.assertTrue(collector._repair_association_succeeded(association))
+
+    def test_partial_fleet_failure_fails_closed(self) -> None:
+        self.assertFalse(
+            collector._repair_association_succeeded(
+                self.overview(AssociationStatusAggregatedCount={"Success": 2, "Failed": 1})
+            )
+        )
+
+    def test_non_success_detail_fails_closed(self) -> None:
+        for detail in ("Pending", "Failed", "InProgress"):
+            with self.subTest(detail=detail):
+                self.assertFalse(
+                    collector._repair_association_succeeded(
+                        self.overview(DetailedStatus=detail)
+                    )
+                )
+
+    def test_zero_successes_fails_closed(self) -> None:
+        self.assertFalse(
+            collector._repair_association_succeeded(
+                self.overview(AssociationStatusAggregatedCount={"Success": 0})
+            )
+        )
+
+    def test_missing_or_malformed_overview_fails_closed(self) -> None:
+        for association in ({}, {"Overview": None}, {"Overview": "Success"}):
+            with self.subTest(association=association):
+                self.assertFalse(collector._repair_association_succeeded(association))

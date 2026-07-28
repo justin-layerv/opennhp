@@ -2884,7 +2884,19 @@ def _verify_repair(
                 "Values": [autoscaling_group],
             }
         ]
-        or (association.get("Status") or {}).get("Name") != "Success"
+        # Success comes from Overview, NOT Status. DescribeAssociation omits the
+        # Status member entirely for a tag-targeted State Manager association --
+        # verified against all three live repair associations, where "Status" is
+        # not merely null but absent from the response body. The previous
+        # `(association.get("Status") or {}).get("Name") != "Success"` therefore
+        # evaluated true unconditionally, so this check could never pass for any
+        # association, healthy or not.
+        #
+        # Overview is what AWS populates here, and it is strictly MORE evidence:
+        # DetailedStatus is asserted alongside Status, and the aggregated count
+        # must show at least one Success and no non-Success bucket, so a
+        # partially-failed fleet fails closed rather than passing on a summary.
+        or not _repair_association_succeeded(association)
     ):
         raise EvidenceError(f"{instance_id} repair association identity drift")
     executions_response = _aws(
@@ -3014,6 +3026,28 @@ def _current_object_version(
     return contract._string(
         versions[0].get("VersionId"), f"{instance_id} attestation version"
     )
+
+
+def _repair_association_succeeded(association: dict[str, Any]) -> bool:
+    """Prove a repair association reports success across every target.
+
+    DescribeAssociation carries no Status member for tag-targeted State Manager
+    associations; Overview is the populated one. Both its Status and
+    DetailedStatus must read Success, and the aggregated per-target counts must
+    contain at least one Success and nothing else, so an association that
+    succeeded on some instances and failed on others cannot pass on the strength
+    of a summary field.
+    """
+    overview = association.get("Overview")
+    if not isinstance(overview, dict):
+        return False
+    if overview.get("Status") != "Success" or overview.get("DetailedStatus") != "Success":
+        return False
+    counts = overview.get("AssociationStatusAggregatedCount")
+    if not isinstance(counts, dict) or set(counts) != {"Success"}:
+        return False
+    successes = counts["Success"]
+    return type(successes) is int and successes >= 1
 
 
 def _require_no_active_instance_refresh(workload_key: str, asg_name: str) -> None:
