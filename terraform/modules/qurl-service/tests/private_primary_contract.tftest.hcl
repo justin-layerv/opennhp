@@ -127,6 +127,11 @@ run "legacy_public_primary_stays_unchanged" {
   assert {
     condition = (
       aws_lb.qurl.name == "layerv-nhp-sandbox-cell0-qurl"
+      # cell0 leaves resource_name_prefix unset, so the physical and data
+      # prefixes coincide and this name must stay byte-identical. Pinned here so
+      # any future change to the owned-table prefix proves it is a no-op for the
+      # applied cell0 table before it can reach a plan.
+      && aws_dynamodb_table.qurl_external_identities.name == "layerv-nhp-sandbox-cell0-qurl-external-identities"
       && aws_lb.qurl.internal == false
       && aws_security_group.alb.description == "Security group for QURL API ALB"
       && length(aws_lb_listener.https) == 1
@@ -188,7 +193,12 @@ run "private_primary_is_internal_and_digest_pinned" {
     condition = (
       aws_ecs_cluster.qurl.name == "layerv-nhp-sandbox-cell1-qurl-api"
       && aws_lb.qurl.name == "layerv-nhp-sandbox-cell1-qurl"
-      && aws_dynamodb_table.qurl_external_identities.name == "layerv-nhp-sandbox-cell1-qurl-external-identities"
+      # Module-OWNED tables follow the DATA prefix (var.dynamodb_table_prefix,
+      # the same value the container gets as DYNAMODB_TABLE_PREFIX), never the
+      # physical ECS/ALB prefix. In this private shape the two intentionally
+      # differ, so this is the assertion that pins the app's lookup name to the
+      # table Terraform actually creates.
+      && aws_dynamodb_table.qurl_external_identities.name == "layerv-nhp-sandbox-cell1-cell1-qurl-external-identities"
       && aws_ssm_parameter.ecs_cluster.name == "/layerv-nhp-sandbox-cell1/qurl-ecs-cluster"
       && aws_lb.qurl.internal
       && aws_lb.qurl.drop_invalid_header_fields

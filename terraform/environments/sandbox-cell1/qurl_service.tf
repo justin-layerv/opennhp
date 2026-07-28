@@ -32,10 +32,25 @@ locals {
   qurl_service_resource_name_prefix = "layerv-nhp-${var.protocol_environment}"
 
   qurl_service_runtime_contract_raw = var.deploy_qurl_service ? data.aws_ssm_parameter.qurl_service_runtime_contract[0].insecure_value : ""
+  # The fallback and the false-branch are `null`, NOT `{}`. Both arms of a
+  # conditional (and of try()) are type-unified, and unifying the decoded
+  # contract object -- whose schema_version is a JSON NUMBER -- with the empty
+  # object `{}` collapses the whole value to map(string). That silently rewrote
+  # schema_version to the STRING "1", which made two of the three fail-closed
+  # preconditions below unsatisfiable by construction:
+  #   * identity: `"1" == 1` is false in Terraform, so schema_version could
+  #     never validate;
+  #   * canonical: jsonencode() re-emitted `"schema_version":"1"` (230 bytes)
+  #     while the publisher writes `"schema_version":1` (228 bytes), so the
+  #     round-trip could never equal the raw parameter.
+  # `null` carries no type, so unification preserves the decoded object exactly
+  # and a correctly-published contract validates. Every consumer of this local
+  # is either try()-guarded or count-gated behind qurl_service_deployable, so
+  # the null path stays fail-closed when deploy_qurl_service = false.
   qurl_service_runtime_contract = var.deploy_qurl_service ? try(
     jsondecode(data.aws_ssm_parameter.qurl_service_runtime_contract[0].insecure_value),
-    {},
-  ) : {}
+    null,
+  ) : null
   qurl_service_runtime_image_uri    = try(local.qurl_service_runtime_contract.image_uri, "")
   qurl_service_runtime_image_digest = try(split("@", local.qurl_service_runtime_image_uri)[1], "")
   # Contract-shape validation split into named sub-checks so the deployable
@@ -43,7 +58,7 @@ locals {
   # terraform_data.qurl_service_runtime_contract reference the same expressions
   # rather than re-authoring them (a silent-drift hazard). Each is individually
   # try()-guarded so it is safe to evaluate on the UNPUBLISHED sentinel or when
-  # deploy_qurl_service = false (the contract decodes to {}).
+  # deploy_qurl_service = false (the contract is null).
   qurl_service_runtime_contract_keys_valid = try(
     toset(keys(local.qurl_service_runtime_contract)) == toset([
       "schema_version",
