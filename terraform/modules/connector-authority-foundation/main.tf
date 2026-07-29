@@ -43,6 +43,13 @@ resource "terraform_data" "foundation_contract" {
       })
       : "{}"
     ),
+    var.authority_proof_policy_consumers_staged ? {
+      authority_proof_policy_consumers_staged = true
+    } : {},
+    local.authority_proof_policy_rollout_active ? {
+      authority_proof_policy_selected_color = var.authority_proof_policy_selected_color
+      authority_proof_policy_prepared_color = var.authority_proof_policy_prepared_color
+    } : {},
   )
 
   lifecycle {
@@ -195,6 +202,16 @@ resource "terraform_data" "foundation_contract" {
     precondition {
       condition     = local.authority_proof_policy_consumers_fence_valid
       error_message = "authority_proof_policy_consumers_staged is sandbox-only and requires the live attended-proof mutation control and Authority runtime."
+    }
+
+    precondition {
+      condition     = local.authority_proof_policy_rollout_fence_valid
+      error_message = "The attended-proof rollout requires sandbox, staged IA/RA/ICR policy, live Hub/runtime/proof controls, the fixed blue basis selector, complete selected/prepared colors, equal active/standby pools, and the exact IA/RA/ICR + ca-pm graph."
+    }
+
+    precondition {
+      condition     = local.authority_proof_policy_selected_alias_ready
+      error_message = "A selector apply may not retarget its selected alias; when selected equals prepared, every selected IA/RA/ICR alias must already point at the staged published version."
     }
 
     precondition {

@@ -220,6 +220,7 @@ run "secure_ephemeral_runner_contract" {
     condition = (
       toset([for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid]) == toset([
         "ReadExactPublicRuntimeParameters",
+        "DescribeExactProofKeys",
         "ReadExactRepairDocument",
         "ReadProvisionedCellCatalog",
         "ReadExactRuntimeImages",
@@ -236,6 +237,8 @@ run "secure_ephemeral_runner_contract" {
       ]) &&
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "secretsmanager:") &&
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "kms:Decrypt") &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["DescribeExactProofKeys"].Action == "kms:DescribeKey" &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["DescribeExactProofKeys"].Resource) == var.proof_kms_key_arns &&
       !strcontains(aws_iam_role_policy.manifest_producer_core.policy, "ssm:GetParametersByPath") &&
       # Pin the exact parameter SET, not just its cardinality. A bare count
       # accepts a renamed or wrong-cell parameter, which is precisely the class
@@ -256,6 +259,7 @@ run "secure_ephemeral_runner_contract" {
         "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/server/blue-asg-name",
         "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/server/green-asg-name",
         "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/reverse-tunnel-server/asg-name",
+        "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/qurl/relay-url",
         "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/qurl-service/runtime-contract",
         "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox-cell1/nhp/qurl-service/runtime-contract",
       ]) &&
@@ -267,7 +271,7 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRuntimeImages"].Action) == toset(["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]) &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Action == "ecr:GetAuthorizationToken" &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2" &&
-      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactAuthorityFunctions"].Resource) == 24 &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactAuthorityFunctions"].Resource) == 26 &&
       toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactECSDeployments"].Resource) == toset([
         "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-control-hub/layerv-nhp-sandbox-control-hub",
         "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-cell0-qurl-api/layerv-nhp-sandbox-cell0-qurl-api",
@@ -339,9 +343,25 @@ run "secure_ephemeral_runner_contract" {
 
   assert {
     condition = (
+      toset([for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid]) == toset([
+        "ReadExactSandboxTerraformState",
+        "DecryptOnlyExactSandboxTerraformState",
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid => statement })["ReadExactSandboxTerraformState"].Action == "s3:GetObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid => statement })["ReadExactSandboxTerraformState"].Resource == "arn:aws:s3:::layerv-terraform-state-767397897469/nhp/sandbox/terraform.tfstate" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid => statement })["DecryptOnlyExactSandboxTerraformState"].Resource == "arn:aws:kms:us-east-2:767397897469:key/289dbe35-ab5a-4752-8564-4c96c607c9f4" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid => statement })["DecryptOnlyExactSandboxTerraformState"].Condition.StringEquals["kms:ViaService"] == "s3.us-east-2.amazonaws.com" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_terraform_state.policy).Statement : statement.Sid => statement })["DecryptOnlyExactSandboxTerraformState"].Condition.StringEquals["kms:EncryptionContext:aws:s3:arn"] == "arn:aws:s3:::layerv-terraform-state-767397897469/nhp/sandbox/terraform.tfstate"
+    )
+    error_message = "Terraform state access must be one exact object and its exact S3-only KMS context."
+  }
+
+  assert {
+    condition = (
       length(aws_iam_role_policy.manifest_producer_core.policy) +
       length(aws_iam_role_policy.manifest_producer_attestations[0].policy) +
-      length(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy)
+      length(aws_iam_role_policy.manifest_producer_catalog_decrypt[0].policy) +
+      length(aws_iam_role_policy.manifest_producer_terraform_state.policy)
     ) <= 10240
     error_message = "The manifest producer's aggregate inline-policy text must remain within IAM's 10,240-character role quota."
   }
@@ -391,13 +411,28 @@ run "secure_ephemeral_runner_contract" {
         "DeleteRunBoundProofCredential",
         "CreateRunBoundProofCredential",
         "TagRunBoundProofCredential",
+        "ReadExactAuthorityProofConcurrency",
+        "ReadExactAuthorityProofAliases",
+        "ReadAuthorityProofMetrics",
         "ReadAssignmentProofCheckpoint",
         "WriteAssignmentProofReceipt",
         "DenyAssignmentProofCheckpointWrites",
+        "ReadTransportProofCheckpoint",
+        "WriteTransportProofReceipt",
+        "DenyTransportProofCheckpointWrites",
+        "ReadExactLifecycleRouteLogs",
         "EncryptAssignmentProofHandshake",
         "ResolveAssignmentProofHandshakeKey",
+        "ReadAndDeleteBoundRecoveryRequest",
+        "PrepareExactUnlimitedProofOwner",
+        "CreateBoundRecoveryResponse",
+        "TagBoundRecoveryResponse",
       ]) &&
       !strcontains(aws_iam_role_policy.controller.policy, "ec2:") &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAndDeleteBoundRecoveryRequest"].Resource == "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/udp-proof/recovery/request/*" &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAndDeleteBoundRecoveryRequest"].Action) == toset(["secretsmanager:GetSecretValue", "secretsmanager:DeleteSecret"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareExactUnlimitedProofOwner"].Resource == "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-customers" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareExactUnlimitedProofOwner"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == ["layerv-nhp-sandbox-udp-proof"] &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Action == "secretsmanager:CreateSecret" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Condition.StringEquals["secretsmanager:KmsKeyArn"] == aws_kms_key.jit.arn &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Condition.StringEquals["aws:RequestTag/Environment"] == var.environment &&
@@ -423,6 +458,13 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Condition.StringEquals["aws:RequestTag/Purpose"] == local.proof_account_jit_purpose &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactAuthorityProofConcurrency"].Action) == toset(["lambda:GetFunctionConcurrency", "lambda:ListProvisionedConcurrencyConfigs"]) &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactAuthorityProofConcurrency"].Resource) == 4 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactAuthorityProofAliases"].Action == "lambda:GetAlias" &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactAuthorityProofAliases"].Resource) == 8 &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAuthorityProofMetrics"].Action == "cloudwatch:GetMetricStatistics" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAuthorityProofMetrics"].Resource == "*" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAuthorityProofMetrics"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAssignmentProofCheckpoint"].Action == "s3:GetObject" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAssignmentProofCheckpoint"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/checkpoint.json" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["WriteAssignmentProofReceipt"].Action == "s3:PutObject" &&
@@ -433,7 +475,16 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["EncryptAssignmentProofHandshake"].Resource == aws_kms_key.assignment_handshake.arn &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ResolveAssignmentProofHandshakeKey"].Action == "kms:DescribeKey" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ResolveAssignmentProofHandshakeKey"].Resource == aws_kms_key.assignment_handshake.arn &&
-      output.assignment_handshake_kms_key_arn == aws_kms_key.assignment_handshake.arn
+      output.assignment_handshake_kms_key_arn == aws_kms_key.assignment_handshake.arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadTransportProofCheckpoint"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/transport-checkpoint.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["WriteTransportProofReceipt"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/transport-receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DenyTransportProofCheckpointWrites"].Effect == "Deny" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactLifecycleRouteLogs"].Action == "logs:FilterLogEvents" &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadExactLifecycleRouteLogs"].Resource) == toset([
+        "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/cell0/qurl-api:*",
+        "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/cell1/qurl-api:*",
+        "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/relay:*",
+      ])
     )
     error_message = "The workflow controller must retain no EC2 surface and may touch only exact tagged run metadata, the bound proof account, and its digest-fenced Control rows."
   }
@@ -452,26 +503,30 @@ run "secure_ephemeral_runner_contract" {
   assert {
     condition = (
       toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DescribeProofKeys"].Resource) == var.proof_kms_key_arns &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Resource) == var.proof_kms_key_arns &&
-      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Action == "kms:Decrypt" &&
-      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Condition.StringEquals["kms:EncryptionContext:purpose"] == "qurl-agent-x25519-private-key" &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Condition.StringEquals["kms:EncryptionContext:provider"]) == toset(["aws-kms", "aws-nitro"]) &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Resource) == var.proof_kms_key_arns &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Action) == toset(["kms:Encrypt", "kms:Decrypt"]) &&
-      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition.StringEquals == {
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoAgentState"].Resource) == var.proof_kms_key_arns &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoAgentState"].Action) == toset(["kms:Encrypt", "kms:Decrypt"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoAgentState"].Condition.StringEquals == {
         "kms:EncryptionContext:qurl_purpose"          = "qurl-go/agent-state"
         "kms:EncryptionContext:qurl_envelope_version" = "1"
         "kms:EncryptionContext:qurl_provider_id"      = "aws-kms"
       } &&
-      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition.StringLike == {
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoAgentState"].Condition.StringLike == {
         "kms:EncryptionContext:qurl_agent_id" = "qurl-go-sandbox-*"
       } &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition["ForAllValues:StringEquals"]["kms:EncryptionContextKeys"]) == toset([
-        "qurl_purpose",
-        "qurl_envelope_version",
-        "qurl_provider_id",
-        "qurl_agent_id",
-      ]) &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoAgentState"].Condition["ForAllValues:StringEquals"]["kms:EncryptionContextKeys"]) == toset(["qurl_purpose", "qurl_envelope_version", "qurl_provider_id", "qurl_agent_id"]) &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundConnectorAgentState"].Resource) == var.proof_kms_key_arns &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundConnectorAgentState"].Action) == toset(["kms:Encrypt", "kms:Decrypt"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundConnectorAgentState"].Condition.StringEquals == {
+        "kms:EncryptionContext:purpose"          = "qurl-go/agent-state-dek/qurl-go/agent-state"
+        "kms:EncryptionContext:envelope_version" = "1"
+        "kms:EncryptionContext:provider_id"      = "aws-kms"
+      } &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundConnectorAgentState"].Condition.StringLike == {
+        "kms:EncryptionContext:agent_id" = "connector-sandbox-*"
+      } &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundConnectorAgentState"].Condition["ForAllValues:StringEquals"]["kms:EncryptionContextKeys"]) == toset(["purpose", "envelope_version", "provider_id", "agent_id"]) &&
+      !strcontains(aws_iam_role_policy.runner.policy, "qurl-agent-x25519-private-key") &&
+      !strcontains(aws_iam_role_policy.runner.policy, "\"kms:EncryptionContext:provider\"") &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == local.proof_account_jit_purpose &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxQueue"].Resource == aws_sqs_queue.proof_otp_mailbox.arn &&
@@ -483,9 +538,12 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Effect == "Deny" &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Action == "s3:PutObject" &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["WriteTransportProofCheckpoint"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/transport-checkpoint.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadTransportProofReceipt"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/transport-receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyTransportProofReceiptWrites"].Effect == "Deny" &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["EncryptAssignmentProofHandshake"].Resource == aws_kms_key.assignment_handshake.arn
     )
-    error_message = "Proof KMS access must be exact-key and encryption-context bound separately to Connector decrypt and qurl-go sealed-state use."
+    error_message = "Proof KMS access must be exact-key Describe/Encrypt/Decrypt and independently bound to qurl-go and Connector sealed-state contexts."
   }
 
   assert {
@@ -495,6 +553,18 @@ run "secure_ephemeral_runner_contract" {
       aws_lambda_function.broker.logging_config[0].log_format == "Text" &&
       aws_lambda_function.broker.logging_config[0].log_group == aws_cloudwatch_log_group.broker.name &&
       aws_lambda_function.broker.environment[0].variables.EIP_ALLOCATION_ID == aws_eip.source.id &&
+      aws_lambda_function.broker.environment[0].variables.JIT_SECRET_PREFIX == "layerv-nhp-sandbox/udp-proof/jit/" &&
+      aws_lambda_function.broker.environment[0].variables.RECOVERY_REQUEST_SECRET_PREFIX == "layerv-nhp-sandbox/udp-proof/recovery/request/" &&
+      aws_lambda_function.broker.environment[0].variables.RECOVERY_RESPONSE_SECRET_PREFIX == "layerv-nhp-sandbox/udp-proof/recovery/response/" &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.broker.policy).Statement : statement.Sid => statement })["InspectProofSecretMetadata"].Resource) == toset([
+        local.jit_secret_arn_pattern,
+        local.recovery_request_secret_arn_pattern,
+        local.recovery_response_secret_arn_pattern,
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.broker.policy).Statement : statement.Sid => statement })["DeleteExpiredRecoveryRequests"].Resource == local.recovery_request_secret_arn_pattern &&
+      ({ for statement in jsondecode(aws_iam_role_policy.broker.policy).Statement : statement.Sid => statement })["DeleteExpiredRecoveryRequests"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == "udp-proof-recovery-request" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.broker.policy).Statement : statement.Sid => statement })["DeleteExpiredRecoveryResponses"].Resource == local.recovery_response_secret_arn_pattern &&
+      ({ for statement in jsondecode(aws_iam_role_policy.broker.policy).Statement : statement.Sid => statement })["DeleteExpiredRecoveryResponses"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == "udp-proof-recovery-response" &&
       aws_cloudwatch_event_rule.sweep.schedule_expression == "rate(5 minutes)" &&
       aws_lambda_permission.events.principal == "events.amazonaws.com"
     )

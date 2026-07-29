@@ -5,6 +5,7 @@ set -euo pipefail
 action="${1:-}"
 github_run_id="${2:-}"
 github_run_attempt="${3:-}"
+github_output="${4:-}"
 
 if [[ "$action" != "start" && "$action" != "stop" ]]; then
   echo "::error::broker action must be start or stop"
@@ -20,6 +21,10 @@ if [[ ! "$github_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
 fi
 : "${BROKER_FUNCTION:?BROKER_FUNCTION is required}"
 : "${AWS_REGION:?AWS_REGION is required}"
+if [[ "$action" == "stop" ]]; then
+  : "${RECOVERY_REQUEST_PREFIX:?RECOVERY_REQUEST_PREFIX is required for stop}"
+  : "${RECOVERY_RESPONSE_PREFIX:?RECOVERY_RESPONSE_PREFIX is required for stop}"
+fi
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
@@ -37,9 +42,9 @@ payload="$(
     }'
 )"
 
-# On stop, false means the secret was already absent. The broker raises instead
-# of returning if deletion fails, so either boolean is terminal cleanup
-# confirmation rather than permission to leave a secret behind.
+# On stop, false or an empty deletion list means the exact secret was already
+# absent or proved to be in force-deletion. The broker raises on any other
+# cleanup failure, and this bounded loop makes the controller report it.
 for attempt in 1 2 3 4 5; do
   if aws lambda invoke \
     --function-name "$BROKER_FUNCTION" \
@@ -49,14 +54,17 @@ for attempt in 1 2 3 4 5; do
     "$response_file" >"$invoke_file" &&
     jq -e '.StatusCode == 200 and (has("FunctionError") | not)' \
       "$invoke_file" >/dev/null &&
-    jq -e --arg action "$action" '
+    jq -e \
+      --arg action "$action" \
+      --arg recovery_request "${RECOVERY_REQUEST_PREFIX:-}${github_run_id}/${github_run_attempt}" \
+      --arg recovery_response "${RECOVERY_RESPONSE_PREFIX:-}${github_run_id}/${github_run_attempt}" '
       if $action == "start" then
         (keys | sort) == ["action", "instance_id", "status"] and
         .action == "start" and
         (.status == "launched" or .status == "existing") and
         (.instance_id | type == "string" and test("^i-[0-9a-f]+$"))
       else
-        (keys | sort) == ["account_credential_secret_deleted", "action", "instances", "secret_deleted", "status"] and
+        (keys | sort) == ["account_credential_secret_deleted", "action", "instances", "recovery_secrets_deleted", "secret_deleted", "status"] and
         .action == "stop" and
         (.status == "terminated" or .status == "absent") and
         (.instances | type == "array") and
@@ -68,9 +76,18 @@ for attempt in 1 2 3 4 5; do
           (.instances | length) == 0
         end) and
         (.secret_deleted | type == "boolean") and
-        (.account_credential_secret_deleted | type == "boolean")
+        (.account_credential_secret_deleted | type == "boolean") and
+        (.recovery_secrets_deleted | type == "array") and
+        (.recovery_secrets_deleted | all(.[];
+          . == $recovery_request or . == $recovery_response
+        )) and
+        (.recovery_secrets_deleted | unique | length) == (.recovery_secrets_deleted | length)
       end
     ' "$response_file" >/dev/null; then
+    if [[ "$action" == "start" && -n "$github_output" ]]; then
+      instance_id="$(jq -er '.instance_id' "$response_file")"
+      printf 'instance_id=%s\n' "$instance_id" >>"$github_output"
+    fi
     exit 0
   fi
 
@@ -83,6 +100,6 @@ done
 if [[ "$action" == "start" ]]; then
   echo "::error::broker did not confirm an exact ready runner"
 else
-  echo "::error::broker did not confirm exact runner/run-bound secret cleanup"
+  echo "::error::broker did not confirm exact runner/run-bound/recovery secret cleanup after 5 attempts"
 fi
 exit 1

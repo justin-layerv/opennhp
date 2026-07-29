@@ -2532,6 +2532,20 @@ jobs:
             --allow-udp-source-fence-replacement \
             plan-show.json
 
+      - name: Prepare UDP retirement apply receipt
+        id: udp-retirement-receipt
+        working-directory: terraform/environments/sandbox
+        run: |
+          set -euo pipefail
+          python3 ../../../.github/scripts/produce_udp_proof_terraform_apply_receipt.py \
+            --plan-json plan-show.json \
+            --saved-plan tfplan \
+            --output "${RUNNER_TEMP}/udp-proof-terraform-apply-receipt/udp-proof-terraform-apply-receipt.json" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --head-sha "${GITHUB_SHA}"
+
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
       # exported to GITHUB_ENV by the
       # "Resolve qurl-reverse-tunnel-server Image Tag" step earlier in this
@@ -2554,6 +2568,16 @@ jobs:
           test -s tfplan
           echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
           terraform apply -auto-approve tfplan
+
+      - name: Upload authenticated UDP retirement apply receipt
+        if: steps.udp-retirement-receipt.outputs.produced == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: udp-proof-terraform-apply-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/udp-proof-terraform-apply-receipt/udp-proof-terraform-apply-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
 
       - name: Verify AWS CLI major for relay DMZ detector
         run: |

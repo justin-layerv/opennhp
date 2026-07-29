@@ -52,6 +52,24 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      proof_policy_selected_color:
+        description: 'Sandbox proof rollout selector. Use only with a separately prepared READY color; selector applies must not retarget aliases.'
+        required: false
+        type: choice
+        options:
+          - 'none'
+          - 'blue'
+          - 'green'
+        default: 'none'
+      proof_policy_prepared_color:
+        description: 'Inactive proof-policy color prepared by Terraform. Keep unchanged during a selector apply.'
+        required: false
+        type: choice
+        options:
+          - 'none'
+          - 'blue'
+          - 'green'
+        default: 'none'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -113,6 +131,8 @@ jobs:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+          PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
           SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
           PLAN_SHA256: ${{ inputs.plan_sha256 }}
@@ -128,6 +148,15 @@ jobs:
           fi
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' && "$PROOF_MUTATION_CONTROLS_ENABLED" != 'true' ]]; then
             echo '::error::Proof policy consumers require the attended-proof mutation control.'
+            exit 1
+          fi
+          if [[ "$PROOF_POLICY_SELECTED_COLOR" == 'none' || "$PROOF_POLICY_PREPARED_COLOR" == 'none' ]]; then
+            if [[ "$PROOF_POLICY_SELECTED_COLOR" != 'none' || "$PROOF_POLICY_PREPARED_COLOR" != 'none' ]]; then
+              echo '::error::Proof rollout selected and prepared colors must be supplied together.'
+              exit 1
+            fi
+          elif [[ "$PROOF_POLICY_CONSUMERS_STAGED" != 'true' || "${{ inputs.hub_worker_enabled }}" != 'true' ]]; then
+            echo '::error::Proof rollout colors require staged proof consumers and the live Hub worker.'
             exit 1
           fi
           if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
@@ -242,6 +271,8 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+          PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -266,6 +297,13 @@ jobs:
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
             proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
           fi
+          proof_policy_rollout_flags=()
+          if [[ "$PROOF_POLICY_SELECTED_COLOR" != 'none' ]]; then
+            proof_policy_rollout_flags=(
+              --proof-policy-selected-color "$PROOF_POLICY_SELECTED_COLOR"
+              --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR"
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -276,7 +314,8 @@ jobs:
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
-            "${proof_policy_consumer_stage_flags[@]}"
+            "${proof_policy_consumer_stage_flags[@]}" \
+            "${proof_policy_rollout_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -547,6 +586,8 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+          PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -571,6 +612,13 @@ jobs:
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
             proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
           fi
+          proof_policy_rollout_flags=()
+          if [[ "$PROOF_POLICY_SELECTED_COLOR" != 'none' ]]; then
+            proof_policy_rollout_flags=(
+              --proof-policy-selected-color "$PROOF_POLICY_SELECTED_COLOR"
+              --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR"
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -581,7 +629,8 @@ jobs:
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
-            "${proof_policy_consumer_stage_flags[@]}"
+            "${proof_policy_consumer_stage_flags[@]}" \
+            "${proof_policy_rollout_flags[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -766,6 +815,17 @@ jobs:
               ;;
           esac
 
+      - name: Require exact warm pools before a proof selector apply
+        if: >-
+          inputs.proof_policy_selected_color != 'none' &&
+          inputs.proof_policy_selected_color == inputs.proof_policy_prepared_color
+        env:
+          SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_udp_proof_authority_evidence.py readiness \
+            --selected-color "$SELECTED_COLOR"
+
       - name: Re-read live main and consume saved plan immediately before exact apply
         env:
           GH_TOKEN: ${{ github.token }}
@@ -925,6 +985,8 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+          PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -949,6 +1011,13 @@ jobs:
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
             proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
           fi
+          proof_policy_rollout_flags=()
+          if [[ "$PROOF_POLICY_SELECTED_COLOR" != 'none' ]]; then
+            proof_policy_rollout_flags=(
+              --proof-policy-selected-color "$PROOF_POLICY_SELECTED_COLOR"
+              --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR"
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -959,7 +1028,8 @@ jobs:
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
-            "${proof_policy_consumer_stage_flags[@]}"
+            "${proof_policy_consumer_stage_flags[@]}" \
+            "${proof_policy_rollout_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

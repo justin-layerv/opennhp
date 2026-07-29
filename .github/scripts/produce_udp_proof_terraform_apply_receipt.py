@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Emit a non-secret receipt for one exact saved retirement plan.
+
+The build-and-push workflow creates this before apply and uploads it only after
+that exact `tfplan` applies successfully. Normal sandbox deploys emit nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import udp_proof_deployment_contract as deployment
+import udp_proof_orchestrator_contract as orchestrator
+
+
+MAX_PLAN_BYTES = 128 * 1024 * 1024
+
+
+class TerraformApplyReceiptError(orchestrator.OrchestratorContractError):
+    """The saved plan is not the exact reviewed retirement deletion set."""
+
+
+def _read_bounded(path: Path, name: str) -> bytes:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise TerraformApplyReceiptError(f"could not read {name}") from exc
+    if not raw or len(raw) > MAX_PLAN_BYTES:
+        raise TerraformApplyReceiptError(
+            f"{name} must contain 1..{MAX_PLAN_BYTES} bytes"
+        )
+    return raw
+
+
+def _logical_retirement_address(address: str) -> str | None:
+    bootstrap = "module.nhp.module.bootstrap_alb[0]"
+    if address.startswith(f"{bootstrap}."):
+        return bootstrap
+    for expected in orchestrator.TERRAFORM_RETIREMENT_RESOURCES:
+        if address == expected or re.fullmatch(
+            rf"{re.escape(expected)}\[[^\]\r\n]+\]", address
+        ):
+            return expected
+    return None
+
+
+def build_receipt(
+    plan_value: Any,
+    *,
+    saved_plan_sha256: str,
+    run_id: int,
+    run_attempt: int,
+    head_sha: str,
+) -> dict[str, Any] | None:
+    if not isinstance(plan_value, dict):
+        raise TerraformApplyReceiptError("Terraform plan JSON must be an object")
+    changes = plan_value.get("resource_changes")
+    if not isinstance(changes, list):
+        raise TerraformApplyReceiptError(
+            "Terraform plan JSON must contain resource_changes"
+        )
+
+    approved: set[str] = set()
+    unapproved_deletions: list[str] = []
+    for index, raw_change in enumerate(changes):
+        if not isinstance(raw_change, dict):
+            raise TerraformApplyReceiptError(
+                f"Terraform resource_changes[{index}] must be an object"
+            )
+        address = raw_change.get("address")
+        change = raw_change.get("change")
+        if not isinstance(address, str) or not isinstance(change, dict):
+            raise TerraformApplyReceiptError(
+                f"Terraform resource_changes[{index}] identity is invalid"
+            )
+        actions = change.get("actions")
+        if not isinstance(actions, list) or not all(
+            isinstance(action, str) for action in actions
+        ):
+            raise TerraformApplyReceiptError(
+                f"Terraform resource_changes[{index}] actions are invalid"
+            )
+        if "delete" not in actions:
+            continue
+        logical = _logical_retirement_address(address)
+        if logical is None:
+            unapproved_deletions.append(address)
+        elif actions == ["delete"]:
+            approved.add(logical)
+        else:
+            raise TerraformApplyReceiptError(
+                f"retirement resource {address} must be a pure deletion, got {actions}"
+            )
+
+    if unapproved_deletions:
+        raise TerraformApplyReceiptError(
+            "Terraform plan includes unapproved deletion actions "
+            f"{sorted(unapproved_deletions)}"
+        )
+    if not approved:
+        return None
+    expected = set(orchestrator.TERRAFORM_RETIREMENT_RESOURCES)
+    if approved != expected:
+        missing = sorted(expected - approved)
+        extra = sorted(approved - expected)
+        raise TerraformApplyReceiptError(
+            f"retirement plan deletion set drift; missing={missing}, extra={extra}"
+        )
+
+    receipt = {
+        "schema_version": orchestrator.TERRAFORM_APPLY_RECEIPT_SCHEMA_VERSION,
+        "gate": orchestrator.GATE,
+        "phase": "post_removal",
+        "producer": {
+            "repository": "layervai/nhp",
+            "workflow_path": orchestrator.TERRAFORM_APPLY_WORKFLOW_PATH,
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "head_sha": head_sha,
+        },
+        "saved_plan_sha256": saved_plan_sha256,
+        "approved_deletions": list(orchestrator.TERRAFORM_RETIREMENT_RESOURCES),
+    }
+    return orchestrator.validate_terraform_apply_receipt(
+        receipt,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        head_sha=head_sha,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plan-json", type=Path, required=True)
+    parser.add_argument("--saved-plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--github-output", type=Path, required=True)
+    parser.add_argument("--run-id", type=int, required=True)
+    parser.add_argument("--run-attempt", type=int, required=True)
+    parser.add_argument("--head-sha", required=True)
+    args = parser.parse_args()
+    try:
+        raw_plan_json = _read_bounded(args.plan_json, "Terraform plan JSON")
+        saved_plan = _read_bounded(args.saved_plan, "Terraform saved plan")
+        try:
+            plan_value = json.loads(
+                raw_plan_json.decode("utf-8"),
+                object_pairs_hook=deployment._reject_duplicate_keys,
+                parse_constant=deployment._reject_nonfinite,
+                parse_float=deployment._parse_finite_float,
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            deployment.ContractError,
+        ) as exc:
+            raise TerraformApplyReceiptError("Terraform plan JSON is invalid") from exc
+        receipt = build_receipt(
+            plan_value,
+            saved_plan_sha256=hashlib.sha256(saved_plan).hexdigest(),
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            head_sha=args.head_sha,
+        )
+        with args.github_output.open("a", encoding="utf-8") as output:
+            if receipt is None:
+                output.write("produced=false\n")
+                return 0
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_bytes(orchestrator.canonical_bytes(receipt))
+            output.write("produced=true\n")
+    except deployment.ContractError as exc:
+        parser.error(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -31,6 +31,7 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
                 "qurl_connector_pr_number",
                 "qurl_go_pr_number",
                 "connector_canary_run_id",
+                "terraform_apply_run_id",
             },
         )
         self.assertEqual(
@@ -106,12 +107,19 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         self.assertLess(observe, upload)
         step = steps[observe]
         self.assertEqual(
-            set(step["env"]), {"GH_TOKEN", "PROOF_PHASE"}
+            set(step["env"]),
+            {"GH_TOKEN", "PROOF_PHASE", "TERRAFORM_APPLY_RUN_ID"},
+        )
+        self.assertIn("collect_udp_proof_orchestrator_evidence.py", step["run"])
+        self.assertIn("--output artifact/orchestrator-evidence.json", step["run"])
+        self.assertIn(
+            '--terraform-apply-run-id "${TERRAFORM_APPLY_RUN_ID}"',
+            step["run"],
         )
         self.assertIn(
-            "collect_udp_proof_orchestrator_evidence.py", step["run"]
+            "pre_removal forbids terraform_apply_run_id",
+            step["run"],
         )
-        self.assertIn("--output artifact/orchestrator-evidence.json", step["run"])
         # The producer reads only the deployed revisions, so it needs no AWS
         # credential and must not acquire one.
         self.assertNotIn("aws ", step["run"])

@@ -19,6 +19,7 @@ from typing import Any
 
 import udp_proof_deployment_contract as deployment
 import udp_proof_orchestrator_contract as orchestrator
+import udp_proof_retirement_targets_contract as retirement_targets
 import validate_udp_proof_controller_inputs as controller
 
 
@@ -189,6 +190,33 @@ def validate_metadata(
     }
 
 
+def _proof_recovery_alias_arn(provenance: dict[str, Any]) -> str:
+    """Return the one deployment-attested selected recovery-control alias."""
+
+    try:
+        functions = provenance["evidence"]["workloads"]["qurl_service_authority"][
+            "functions"
+        ]
+    except (KeyError, TypeError) as exc:
+        raise ArtifactValidationError(
+            "producer provenance omits the Authority function set"
+        ) from exc
+    if not isinstance(functions, list):
+        raise ArtifactValidationError("producer Authority function set is invalid")
+    prefix = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:"
+    allowed = {prefix + "blue", prefix + "green"}
+    matches = [
+        item["alias_arn"]
+        for item in functions
+        if isinstance(item, dict) and item.get("alias_arn") in allowed
+    ]
+    if len(matches) != 1:
+        raise ArtifactValidationError(
+            "producer provenance must attest exactly one selected recovery-control alias"
+        )
+    return matches[0]
+
+
 def validate_files(
     directory: Path,
     *,
@@ -224,13 +252,35 @@ def validate_files(
         orchestrator.validate_orchestrator_bytes(
             orchestrator_raw,
             manifest=manifest,
+            runtime=runtime,
+            provenance=provenance,
             manifest_bytes=manifest_raw,
             runtime_bytes=runtime_raw,
+            provenance_bytes=provenance_raw,
             proof_phase=proof_phase,
             producer_run_id=run_id,
             producer_run_attempt=run_attempt,
             producer_head_sha=producer_head_sha,
             validation_time=now,
+        )
+        retirement_targets_value = deployment.load_canonical_file(
+            directory / retirement_targets.ARTIFACT_FILE_NAME,
+            maximum=retirement_targets.MAX_ARTIFACT_BYTES,
+            name=retirement_targets.ARTIFACT_FILE_NAME,
+        )
+        retirement_targets.validate(
+            retirement_targets_value,
+            proof_phase=proof_phase,
+            producer_run_id=run_id,
+            producer_run_attempt=run_attempt,
+            producer_head_sha=producer_head_sha,
+            deployment_provenance_sha256=hashlib.sha256(
+                provenance_raw
+            ).hexdigest(),
+            validation_time=now,
+        )
+        retirement_targets_raw = retirement_targets.canonical_bytes(
+            retirement_targets_value
         )
     except deployment.ContractError as exc:
         raise ArtifactValidationError(str(exc)) from exc
@@ -249,6 +299,7 @@ def validate_files(
         raise ArtifactValidationError(str(exc)) from exc
     outputs.update(
         {
+            "proof_recovery_alias_arn": _proof_recovery_alias_arn(provenance),
             "deployment_manifest_b64": manifest_b64,
             "deployment_runtime_inputs_b64": base64.b64encode(runtime_raw).decode(
                 "ascii"
@@ -256,9 +307,16 @@ def validate_files(
             "deployment_provenance_b64": base64.b64encode(provenance_raw).decode(
                 "ascii"
             ),
+            "retirement_probe_targets_b64": base64.b64encode(
+                retirement_targets_raw
+            ).decode("ascii"),
             "deployment_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
-            "deployment_runtime_inputs_sha256": hashlib.sha256(
-                runtime_raw
+            "deployment_runtime_inputs_sha256": hashlib.sha256(runtime_raw).hexdigest(),
+            "deployment_provenance_sha256": hashlib.sha256(
+                provenance_raw
+            ).hexdigest(),
+            "retirement_probe_targets_sha256": hashlib.sha256(
+                retirement_targets_raw
             ).hexdigest(),
             "orchestrator_evidence_sha256": hashlib.sha256(
                 orchestrator_raw

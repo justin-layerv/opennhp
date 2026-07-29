@@ -99,7 +99,8 @@ locals {
   # the sandbox-only gate is on, so the committed default reproduces the exact
   # historical 3 + 4N graph byte for byte.
   authority_contract_proof_operation_suffixes = var.authority_proof_mutation_controls_enabled ? {
-    mutate_proof_agent = "pm"
+    mutate_proof_agent                = "pm"
+    prepare_proof_credential_recovery = "pcr"
   } : {}
   # The handler (layervai/qurl-service internal/connectorauthorityruntime,
   # parseOperation) matches CONNECTOR_AUTHORITY_OPERATION EXACTLY against the
@@ -112,14 +113,15 @@ locals {
   # intended signal to extend this map when an operation is added above. Note
   # OTP capitalization rules out deriving these from the snake_case keys.
   authority_operation_conformance_name = {
-    issue_assignment             = "IssueAssignment"
-    refresh_assignment           = "RefreshAssignment"
-    issue_credential_recovery    = "IssueCredentialRecovery"
-    issue_registration_otp       = "IssueRegistrationOTP"
-    activate_registration        = "ActivateRegistration"
-    complete_registration        = "CompleteRegistration"
-    complete_credential_recovery = "CompleteCredentialRecovery"
-    mutate_proof_agent           = "MutateProofAgent"
+    issue_assignment                  = "IssueAssignment"
+    refresh_assignment                = "RefreshAssignment"
+    issue_credential_recovery         = "IssueCredentialRecovery"
+    issue_registration_otp            = "IssueRegistrationOTP"
+    activate_registration             = "ActivateRegistration"
+    complete_registration             = "CompleteRegistration"
+    complete_credential_recovery      = "CompleteCredentialRecovery"
+    mutate_proof_agent                = "MutateProofAgent"
+    prepare_proof_credential_recovery = "PrepareProofCredentialRecovery"
   }
   authority_contract_function_keys = toset([
     "steady_provisioned_concurrency",
@@ -639,7 +641,43 @@ locals {
     var.authority_proof_mutation_controls_enabled &&
     local.authority_runtime_contract_enabled &&
     var.authority_runtime_functions_enabled &&
-    length(local.authority_expected_proof_names) == 1,
+    length(local.authority_expected_proof_names) == 2,
+    false,
+  )
+
+  authority_proof_policy_rollout_fence_valid = try(
+    (
+      var.authority_proof_policy_selected_color == null &&
+      var.authority_proof_policy_prepared_color == null
+      ) || (
+      local.authority_proof_policy_rollout_active &&
+      var.environment == "sandbox" &&
+      !local.is_prod &&
+      var.authority_proof_policy_consumers_staged &&
+      var.authority_proof_mutation_controls_enabled &&
+      var.authority_runtime_functions_enabled &&
+      var.hub_worker_enabled &&
+      var.authority_runtime_contract.selected_authority_color == "blue" &&
+      length(local.authority_proof_policy_consumer_functions) == 3 &&
+      length(local.authority_proof_policy_rollout_functions) == 4 &&
+      alltrue([
+        for function_name in local.authority_proof_policy_rollout_function_names :
+        local.authority_contract_functions[function_name].rollout_active_provisioned_concurrency ==
+        local.authority_contract_functions[function_name].rollout_standby_provisioned_concurrency
+      ])
+    ),
+    false,
+  )
+
+  authority_proof_policy_selected_alias_ready = try(
+    !local.authority_proof_policy_rollout_active ||
+    var.authority_proof_policy_selected_color != var.authority_proof_policy_prepared_color ||
+    alltrue([
+      for function_name in keys(local.authority_proof_policy_consumer_functions) :
+      data.aws_lambda_alias.authority_proof_policy_live[
+        "${function_name}:${var.authority_proof_policy_selected_color}"
+      ].function_version == aws_lambda_function.authority[function_name].version
+    ]),
     false,
   )
 
@@ -654,13 +692,14 @@ locals {
       for function_name in local.authority_actual_function_names :
       function_name
       if endswith(function_name, "-pm")
+      || endswith(function_name, "-pcr")
     ]) == 0
   )
 
   authority_selected_alias_targets = !local.authority_runtime_contract_enabled ? null : {
     hub = {
       for function_name, spec in local.authority_expected_hub_functions :
-      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${var.authority_runtime_contract.selected_authority_color}"
+      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${local.authority_proof_policy_effective_color}"
     }
     cells = {
       for cell_id, expected_names in local.authority_expected_cell_names :
@@ -676,7 +715,7 @@ locals {
     # even though it lives in the same derivation.
     proof = {
       for function_name, spec in local.authority_expected_proof_functions :
-      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${var.authority_runtime_contract.selected_authority_color}"
+      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${spec.operation == "mutate_proof_agent" ? local.authority_proof_policy_effective_color : var.authority_runtime_contract.selected_authority_color}"
       if contains(local.authority_actual_function_names, function_name)
     }
   }

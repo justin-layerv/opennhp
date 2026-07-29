@@ -111,15 +111,26 @@ class FakeEC2:
 
 NOW = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
 PREFIX = "layerv-nhp-sandbox/udp-proof/jit/"
+RECOVERY_REQUEST_PREFIX = "layerv-nhp-sandbox/udp-proof/recovery/request/"
+RECOVERY_RESPONSE_PREFIX = "layerv-nhp-sandbox/udp-proof/recovery/response/"
 RUN_ID = "123456789"
 RUN_ATTEMPT = "1"
 
 
-def tags(run_id=RUN_ID, run_attempt=RUN_ATTEMPT):
+def tags(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, purpose="udp-proof"):
     return [
         {"Key": "Component", "Value": "udp-proof-runner"},
         {"Key": "Environment", "Value": "sandbox"},
-        {"Key": "Purpose", "Value": "udp-proof"},
+        {"Key": "Purpose", "Value": purpose},
+        {"Key": "GitHubRunId", "Value": run_id},
+        {"Key": "GitHubRunAttempt", "Value": run_attempt},
+    ]
+
+
+def recovery_tags(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, purpose="udp-proof"):
+    return [
+        {"Key": "Environment", "Value": "sandbox"},
+        {"Key": "Purpose", "Value": purpose},
         {"Key": "GitHubRunId", "Value": run_id},
         {"Key": "GitHubRunAttempt", "Value": run_attempt},
     ]
@@ -163,6 +174,22 @@ def account_secret(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, created=NOW):
     return value
 
 
+def recovery_secret(
+    prefix,
+    purpose,
+    run_id=RUN_ID,
+    run_attempt=RUN_ATTEMPT,
+    created=NOW,
+):
+    name = prefix + run_id + "/" + run_attempt
+    return {
+        "Name": name,
+        "ARN": "arn:aws:secretsmanager:us-east-2:767397897469:secret:" + name + "-abc123",
+        "CreatedDate": created,
+        "Tags": recovery_tags(run_id, run_attempt, purpose),
+    }
+
+
 def new_broker(ec2=None, secrets=None):
     return broker_module.Broker(
         ec2 or FakeEC2(),
@@ -174,6 +201,8 @@ def new_broker(ec2=None, secrets=None):
         max_runtime_seconds=3600,
         secret_prefix=PREFIX,
         account_credential_secret_prefix=PREFIX + "credential/",
+        recovery_request_secret_prefix=RECOVERY_REQUEST_PREFIX,
+        recovery_response_secret_prefix=RECOVERY_RESPONSE_PREFIX,
         now=lambda: NOW,
     )
 
@@ -235,6 +264,8 @@ class BrokerTest(unittest.TestCase):
             "MAX_RUNTIME_SECONDS": "3600",
             "JIT_SECRET_PREFIX": PREFIX,
             "ACCOUNT_CREDENTIAL_SECRET_PREFIX": PREFIX + "credential/",
+            "RECOVERY_REQUEST_SECRET_PREFIX": RECOVERY_REQUEST_PREFIX,
+            "RECOVERY_RESPONSE_SECRET_PREFIX": RECOVERY_RESPONSE_PREFIX,
         }
         with (
             patch.dict(os.environ, environment, clear=True),
@@ -277,6 +308,8 @@ class BrokerTest(unittest.TestCase):
             "max_runtime_seconds": 3600,
             "secret_prefix": PREFIX,
             "account_credential_secret_prefix": PREFIX + "credential/",
+            "recovery_request_secret_prefix": RECOVERY_REQUEST_PREFIX,
+            "recovery_response_secret_prefix": RECOVERY_RESPONSE_PREFIX,
         }
         invalid_values = (
             ("environment", "production"),
@@ -287,6 +320,9 @@ class BrokerTest(unittest.TestCase):
             ("max_runtime_seconds", 14401),
             ("secret_prefix", PREFIX.rstrip("/")),
             ("account_credential_secret_prefix", PREFIX + "other/"),
+            ("recovery_request_secret_prefix", RECOVERY_REQUEST_PREFIX.rstrip("/")),
+            ("recovery_response_secret_prefix", RECOVERY_RESPONSE_PREFIX.rstrip("/")),
+            ("recovery_response_secret_prefix", RECOVERY_REQUEST_PREFIX),
         )
         for field, value in invalid_values:
             with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
@@ -496,6 +532,7 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(secrets.deleted, [{"SecretId": name, "ForceDeleteWithoutRecovery": True}])
         self.assertTrue(result["secret_deleted"])
         self.assertFalse(result["account_credential_secret_deleted"])
+        self.assertEqual(result["recovery_secrets_deleted"], [])
 
     def test_stop_deletes_only_the_same_run_account_credential_secret(self):
         name = PREFIX + "credential/" + RUN_ID + "/" + RUN_ATTEMPT
@@ -503,6 +540,43 @@ class BrokerTest(unittest.TestCase):
         result = new_broker(FakeEC2(), secrets).stop(RUN_ID, RUN_ATTEMPT)
         self.assertEqual(secrets.deleted, [{"SecretId": name, "ForceDeleteWithoutRecovery": True}])
         self.assertTrue(result["account_credential_secret_deleted"])
+
+    def test_stop_deletes_exact_owned_recovery_mailboxes(self):
+        request = recovery_secret(
+            RECOVERY_REQUEST_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+        )
+        response = recovery_secret(
+            RECOVERY_RESPONSE_PREFIX,
+            broker_module.RECOVERY_RESPONSE_PURPOSE,
+        )
+        secrets = FakeSecrets({request["Name"]: request, response["Name"]: response})
+
+        result = new_broker(FakeEC2(), secrets).stop(RUN_ID, RUN_ATTEMPT)
+
+        self.assertEqual(
+            result["recovery_secrets_deleted"],
+            [request["Name"], response["Name"]],
+        )
+        self.assertEqual(
+            [deleted["SecretId"] for deleted in secrets.deleted],
+            [request["Name"], response["Name"]],
+        )
+
+        wrong_binding = dict(request)
+        wrong_binding["Tags"] = recovery_tags(
+            "987654321",
+            RUN_ATTEMPT,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+        )
+        with self.assertRaisesRegex(
+            broker_module.ContractError,
+            "proof secret failed its ownership contract",
+        ):
+            new_broker(
+                FakeEC2(),
+                FakeSecrets({request["Name"]: wrong_binding}),
+            ).stop(RUN_ID, RUN_ATTEMPT)
 
     def test_stop_accepts_only_proved_already_deleting_secret(self):
         name = PREFIX + RUN_ID + "/" + RUN_ATTEMPT
@@ -603,6 +677,98 @@ class BrokerTest(unittest.TestCase):
             ],
         )
         self.assertEqual(secrets.paginator.calls[0]["Filters"], [{"Key": "name", "Values": [PREFIX]}])
+
+    def test_sweep_deletes_only_exact_expired_recovery_contracts(self):
+        request = recovery_secret(
+            RECOVERY_REQUEST_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+            created=NOW - timedelta(hours=2),
+        )
+        response = recovery_secret(
+            RECOVERY_RESPONSE_PREFIX,
+            broker_module.RECOVERY_RESPONSE_PURPOSE,
+            created=NOW - timedelta(hours=2),
+        )
+        malformed_name = recovery_secret(
+            RECOVERY_REQUEST_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+            run_id="invalid",
+            created=NOW - timedelta(hours=2),
+        )
+        wrong_purpose = recovery_secret(
+            RECOVERY_RESPONSE_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+            run_id="777777777",
+            created=NOW - timedelta(hours=2),
+        )
+        wrong_binding = recovery_secret(
+            RECOVERY_REQUEST_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+            run_id="888888888",
+            created=NOW - timedelta(hours=2),
+        )
+        wrong_binding["Tags"] = recovery_tags(
+            "999999999",
+            RUN_ATTEMPT,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+        )
+        fresh = recovery_secret(
+            RECOVERY_REQUEST_PREFIX,
+            broker_module.RECOVERY_REQUEST_PURPOSE,
+            run_id="666666666",
+            created=NOW,
+        )
+        secrets = FakeSecrets(
+            pages=[
+                {
+                    "SecretList": [
+                        request,
+                        response,
+                        malformed_name,
+                        wrong_purpose,
+                        wrong_binding,
+                        fresh,
+                    ]
+                }
+            ]
+        )
+
+        result = new_broker(FakeEC2(), secrets).sweep()
+
+        self.assertEqual(
+            result["deleted_secret_names"],
+            [request["Name"], response["Name"]],
+        )
+        self.assertEqual(
+            [deleted["SecretId"] for deleted in secrets.deleted],
+            [request["Name"], response["Name"]],
+        )
+        self.assertEqual(
+            [call["Filters"] for call in secrets.paginator.calls],
+            [
+                [{"Key": "name", "Values": [PREFIX]}],
+                [{"Key": "name", "Values": [RECOVERY_REQUEST_PREFIX]}],
+                [{"Key": "name", "Values": [RECOVERY_RESPONSE_PREFIX]}],
+            ],
+        )
+
+    def test_sweep_bounds_secret_deletions(self):
+        secrets_to_delete = [
+            secret(str(100000000 + index), created=NOW - timedelta(hours=2))
+            for index in range(broker_module.MAX_SECRET_DELETIONS_PER_SWEEP + 5)
+        ]
+        secrets = FakeSecrets(pages=[{"SecretList": secrets_to_delete}])
+
+        result = new_broker(FakeEC2(), secrets).sweep()
+
+        self.assertEqual(
+            len(result["deleted_secret_names"]),
+            broker_module.MAX_SECRET_DELETIONS_PER_SWEEP,
+        )
+        self.assertEqual(
+            len(secrets.deleted),
+            broker_module.MAX_SECRET_DELETIONS_PER_SWEEP,
+        )
 
 
 if __name__ == "__main__":

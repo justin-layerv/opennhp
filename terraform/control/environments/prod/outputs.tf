@@ -80,6 +80,11 @@ output "authority_proof_mutation_alias_arn" {
   value       = try(module.control.authority_selected_alias_targets.proof.mutate_proof_agent, null)
 }
 
+output "authority_proof_credential_recovery_alias_arn" {
+  description = "Exact selected-color ca-pcr alias granted only to the deterministic proof-controller role, or null while dark."
+  value       = try(module.control.authority_selected_alias_targets.proof.prepare_proof_credential_recovery, null)
+}
+
 output "authority_publisher_role_arn" {
   value = module.control.authority_publisher_role_arn
 }

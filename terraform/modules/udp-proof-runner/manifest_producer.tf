@@ -19,6 +19,7 @@ locals {
     "sandbox-cell1/nhp/server/blue-asg-name",
     "sandbox-cell1/nhp/server/green-asg-name",
     "sandbox/nhp/reverse-tunnel-server/asg-name",
+    "sandbox/nhp/qurl/relay-url",
     "sandbox/nhp/qurl-service/runtime-contract",
     "sandbox-cell1/nhp/qurl-service/runtime-contract",
   ]
@@ -48,6 +49,7 @@ locals {
     "layerv-nhp-sandbox-ca-icr",
     "layerv-nhp-sandbox-ca-iro-cell0",
     "layerv-nhp-sandbox-ca-iro-cell1",
+    "layerv-nhp-sandbox-ca-pcr",
     "layerv-nhp-sandbox-ca-pm",
     "layerv-nhp-sandbox-ca-ra",
   ]
@@ -74,6 +76,10 @@ locals {
     for cluster in local.manifest_ecs_clusters :
     "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:task/${cluster}/*"
   ]
+  # Exact cell0 state object used only to project the reviewed HTTP-lifecycle
+  # retirement addresses. The producer never uploads or logs raw state.
+  manifest_terraform_state_object_arn  = "arn:${data.aws_partition.current.partition}:s3:::layerv-terraform-state-${data.aws_caller_identity.current.account_id}/nhp/sandbox/terraform.tfstate"
+  manifest_terraform_state_kms_key_arn = "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/289dbe35-ab5a-4752-8564-4c96c607c9f4"
   # cell1's profile carries the DOUBLE "cell1" segment. The sandbox-cell1 root's
   # name_prefix already contains the cell id and modules/compute appends it
   # again, so the live profile is layerv-nhp-sandbox-cell1-cell1-server -- the
@@ -125,6 +131,12 @@ resource "aws_iam_role_policy" "manifest_producer_core" {
         Effect   = "Allow"
         Action   = "ssm:GetParameter"
         Resource = local.manifest_ssm_parameter_arns
+      },
+      {
+        Sid      = "DescribeExactProofKeys"
+        Effect   = "Allow"
+        Action   = "kms:DescribeKey"
+        Resource = var.proof_kms_key_arns
       },
       {
         Sid      = "ReadExactRepairDocument"
@@ -214,10 +226,13 @@ resource "aws_iam_role_policy" "manifest_producer_core" {
         Resource = local.manifest_instance_profile_arns
       },
       {
-        Sid      = "ReadExactPublicDNSZone"
-        Effect   = "Allow"
-        Action   = "route53:ListResourceRecordSets"
-        Resource = "arn:${data.aws_partition.current.partition}:route53:::hostedzone/Z10394893FM38A1RXLL32"
+        Sid    = "ReadExactPublicDNSZone"
+        Effect = "Allow"
+        Action = "route53:ListResourceRecordSets"
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:route53:::hostedzone/Z10394893FM38A1RXLL32",
+          "arn:${data.aws_partition.current.partition}:route53:::hostedzone/Z0583929NF6JQSC2XALS",
+        ]
       },
       {
         Sid    = "ReadRegionalFleetTopology"
@@ -249,6 +264,35 @@ resource "aws_iam_role_policy" "manifest_producer_core" {
         Effect   = "Allow"
         Action   = "sts:GetCallerIdentity"
         Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "manifest_producer_terraform_state" {
+  name = "udp-proof-terraform-state-read"
+  role = aws_iam_role.manifest_producer.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadExactSandboxTerraformState"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = local.manifest_terraform_state_object_arn
+      },
+      {
+        Sid      = "DecryptOnlyExactSandboxTerraformState"
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = local.manifest_terraform_state_kms_key_arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                   = "s3.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            "kms:EncryptionContext:aws:s3:arn" = local.manifest_terraform_state_object_arn
+          }
+        }
       },
     ]
   })

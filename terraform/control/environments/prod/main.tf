@@ -16,6 +16,8 @@ module "control" {
   hub_worker_enabled                               = var.hub_worker_enabled
   authority_proof_mutation_controls_enabled        = var.authority_proof_mutation_controls_enabled
   authority_proof_policy_consumers_staged          = var.authority_proof_policy_consumers_staged
+  authority_proof_policy_selected_color            = var.authority_proof_policy_selected_color
+  authority_proof_policy_prepared_color            = var.authority_proof_policy_prepared_color
   authority_proof_mutation_owner_id                = var.authority_proof_mutation_owner_id
   authority_proof_mutation_controller_role_arns    = var.authority_proof_mutation_controller_role_arns
   operator_alarm_topic_arns                        = var.operator_alarm_topic_arns

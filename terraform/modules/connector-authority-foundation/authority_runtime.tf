@@ -44,6 +44,47 @@ locals {
     if contains(local.authority_proof_policy_consumer_operations, fn.operation)
   }
 
+  # Release-critical attended-proof rollout only. The ordinary contract remains
+  # fixed on its reviewed blue selector; these two explicit colors own the
+  # bounded IA/RA/ICR + ca-pm rehearsal without generalising the complete
+  # eleven-function rollout system. Both must be null or both closed colors.
+  authority_proof_policy_rollout_active = (
+    var.authority_proof_policy_selected_color != null &&
+    var.authority_proof_policy_prepared_color != null
+  )
+  authority_proof_policy_effective_color = (
+    local.authority_proof_policy_rollout_active
+    ? var.authority_proof_policy_selected_color
+    : (
+      local.authority_runtime_contract_enabled
+      ? var.authority_runtime_contract.selected_authority_color
+      : "blue"
+    )
+  )
+  authority_proof_policy_standby_color = (
+    try(var.authority_runtime_contract.selected_authority_color == "blue", true)
+    ? "green"
+    : "blue"
+  )
+  authority_proof_policy_rollout_functions = merge(
+    local.authority_proof_policy_consumer_functions,
+    {
+      for function_name, fn in local.authority_runtime_functions :
+      function_name => fn
+      if fn.operation == "mutate_proof_agent"
+    },
+  )
+  authority_proof_policy_rollout_function_names = toset(
+    keys(local.authority_proof_policy_rollout_functions)
+  )
+  authority_proof_policy_rollout_alias_arns = local.authority_proof_policy_rollout_active ? {
+    for function_name, fn in local.authority_proof_policy_rollout_functions :
+    function_name => {
+      for color in local.authority_runtime_alias_colors :
+      color => "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}:${color}"
+    }
+  } : {}
+
   # Both closed deployment qualifiers are published up front. For this initial
   # dark bootstrap they intentionally target the same first published version;
   # only the selected color receives steady provisioned concurrency below.
@@ -104,7 +145,7 @@ locals {
   # Env-only axes (no principal grant): operations that consume the cell DNS
   # suffix (every op that mints or refreshes assignment endpoint data;
   # IssueRegistrationOTP intentionally excluded) and the admission-gated ops.
-  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "mutate_proof_agent"]
+  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "mutate_proof_agent", "prepare_proof_credential_recovery"]
   authority_admission_operations = ["activate_registration", "complete_registration"]
   # Attended-proof axis. ca-pm owns the mutation capability. IA/RA/ICR receive
   # a staged proof-aware version while both live aliases remain unchanged; a
@@ -197,6 +238,7 @@ locals {
     api_keys            = aws_dynamodb_table.api_keys.arn
     agent_keys          = aws_dynamodb_table.agent_keys.arn
     customers           = aws_dynamodb_table.customers.arn
+    api_key_idempotency = aws_dynamodb_table.api_key_idempotency.arn
     connector_authority = aws_dynamodb_table.connector_authority.arn
   }
 
@@ -238,10 +280,12 @@ locals {
   # resolution); api_keys and connector_authority are reached only by primary key
   # (GetItem / base-table Query), so they get no /index/* grant.
   authority_runtime_table_resources = {
-    api_keys            = [local.authority_runtime_table_arns.api_keys]
-    agent_keys          = [local.authority_runtime_table_arns.agent_keys, "${local.authority_runtime_table_arns.agent_keys}/index/*"]
-    customers           = [local.authority_runtime_table_arns.customers]
-    connector_authority = [local.authority_runtime_table_arns.connector_authority]
+    api_keys              = [local.authority_runtime_table_arns.api_keys]
+    api_keys_with_indexes = [local.authority_runtime_table_arns.api_keys, "${local.authority_runtime_table_arns.api_keys}/index/*"]
+    agent_keys            = [local.authority_runtime_table_arns.agent_keys, "${local.authority_runtime_table_arns.agent_keys}/index/*"]
+    customers             = [local.authority_runtime_table_arns.customers]
+    api_key_idempotency   = [local.authority_runtime_table_arns.api_key_idempotency]
+    connector_authority   = [local.authority_runtime_table_arns.connector_authority]
   }
 
   authority_runtime_ses_identity_arn   = "arn:${data.aws_partition.current.partition}:ses:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:identity/${local.otp_sender_domain}"
@@ -484,7 +528,7 @@ locals {
         Resource = local.authority_runtime_table_resources.connector_authority
       },
     ]
-  }, local.authority_runtime_proof_operation_statements)
+  }, local.authority_runtime_proof_mutation_operation_statements, local.authority_runtime_proof_recovery_operation_statements)
 
   authority_runtime_proof_policy_consumer_statements = [
     {
@@ -536,7 +580,7 @@ locals {
   #
   # DescribeTable is unconditioned because it is a table-level call that carries
   # no key context; every item-level action below is fenced.
-  authority_runtime_proof_operation_statements = length(local.authority_contract_proof_operation_suffixes) == 0 ? {} : {
+  authority_runtime_proof_mutation_operation_statements = length(local.authority_contract_proof_operation_suffixes) == 0 ? {} : {
     mutate_proof_agent = [
       {
         Sid      = "ProofVerifyTableEncryption"
@@ -616,6 +660,62 @@ locals {
     ]
   }
 
+  authority_runtime_proof_recovery_operation_statements = length(local.authority_contract_proof_operation_suffixes) == 0 ? {} : {
+    prepare_proof_credential_recovery = [
+      {
+        Sid    = "ProofRecoveryVerifyTableEncryption"
+        Effect = "Allow"
+        Action = ["dynamodb:DescribeTable"]
+        Resource = concat(
+          local.authority_runtime_table_resources.api_keys,
+          local.authority_runtime_table_resources.api_key_idempotency,
+          local.authority_runtime_table_resources.customers,
+          local.authority_runtime_table_resources.connector_authority,
+        )
+      },
+      {
+        Sid    = "ProofRecoveryCredentialReadWrite"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:ConditionCheckItem",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = local.authority_runtime_table_resources.api_keys_with_indexes
+      },
+      {
+        Sid      = "ProofRecoveryReplayReadWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Resource = local.authority_runtime_table_resources.api_key_idempotency
+      },
+      {
+        Sid      = "ProofRecoveryOwnerRead"
+        Effect   = "Allow"
+        Action   = ["dynamodb:ConditionCheckItem", "dynamodb:GetItem"]
+        Resource = local.authority_runtime_table_resources.customers
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [var.authority_proof_mutation_owner_id]
+          }
+        }
+      },
+      {
+        Sid      = "ProofRecoveryAssignmentReadWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [local.authority_proof_owner_partition_key]
+          }
+        }
+      },
+    ]
+  }
+
   # The two partitions the attended-proof control may both read and write: the
   # dedicated proof tenant's placement partition and the directive partition.
   # compact() keeps the list well-formed while the owner id is null (gate off),
@@ -666,8 +766,10 @@ locals {
       # lease may be. Both are also enforced by IAM (LeadingKeys) and by the
       # handler; the environment is the handler's copy, not the only fence.
       contains(local.authority_proof_operations, fn.operation) ? {
-        CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = var.authority_proof_mutation_owner_id
-        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = local.authority_proof_agent_id_prefix
+        CONNECTOR_AUTHORITY_PROOF_OWNER_ID        = var.authority_proof_mutation_owner_id
+        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX = local.authority_proof_agent_id_prefix
+      } : {},
+      fn.operation == "mutate_proof_agent" ? {
         CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = tostring(local.authority_proof_directive_ttl_seconds)
         CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = tostring(local.authority_proof_minimum_lease_seconds)
       } : {},
@@ -851,10 +953,15 @@ resource "aws_iam_role_policy" "authority_proof_controller_invoke" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid      = "InvokeSelectedProofMutationAlias"
-      Effect   = "Allow"
-      Action   = ["lambda:InvokeFunction"]
-      Resource = [local.authority_selected_alias_targets.proof.mutate_proof_agent]
+      Sid    = "InvokeSelectedProofMutationAlias"
+      Effect = "Allow"
+      Action = ["lambda:InvokeFunction"]
+      Resource = concat(
+        local.authority_proof_policy_rollout_active
+        ? sort(values(local.authority_proof_policy_rollout_alias_arns["${local.authority_function_prefix}-pm"]))
+        : [local.authority_selected_alias_targets.proof.mutate_proof_agent],
+        [local.authority_selected_alias_targets.proof.prepare_proof_credential_recovery],
+      )
     }]
   })
 
@@ -885,9 +992,15 @@ resource "aws_lambda_function" "authority" {
   memory_size = 512
   publish     = true
 
-  # One function-wide ceiling across every version and alias, pinned to the
-  # bound contract's steady reserved envelope.
-  reserved_concurrent_executions = each.value.spec.steady_reserved_concurrency
+  # The attended proof's four-function retained window raises the function-wide
+  # ceiling before the standby pool is requested. Every other function remains
+  # on its steady envelope.
+  reserved_concurrent_executions = (
+    local.authority_proof_policy_rollout_active &&
+    contains(local.authority_proof_policy_rollout_function_names, each.key)
+    ? each.value.spec.rollout_reserved_concurrency
+    : each.value.spec.steady_reserved_concurrency
+  )
 
   vpc_config {
     subnet_ids         = aws_subnet.isolated[*].id
@@ -938,24 +1051,33 @@ resource "aws_lambda_alias" "authority" {
   function_version = (
     var.authority_proof_mutation_controls_enabled &&
     contains(keys(local.authority_proof_policy_consumer_functions), each.value.function_name)
-    ? data.aws_lambda_alias.authority_proof_policy_live[each.key].function_version
+    ? (
+      local.authority_proof_policy_rollout_active &&
+      each.value.color == var.authority_proof_policy_prepared_color
+      ? aws_lambda_function.authority[each.value.function_name].version
+      : data.aws_lambda_alias.authority_proof_policy_live[each.key].function_version
+    )
     : aws_lambda_function.authority[each.value.function_name].version
   )
 }
 
-# Initial-bootstrap steady state: only the caller-selected color receives
-# provisioned capacity. The contract's rollout active/standby allocation and
-# rollback-retention fields are validation-only in this slice; NHP #3456 tracks
-# consuming them in the governed version-roll/alias-switch/rollback lifecycle.
+# Outside the attended rollout, only the caller-selected color receives
+# provisioned capacity. During the proof rollout, the fixed blue resource and
+# fixed green standby resource consume the contract's retained allocations.
 # The startup graph cannot fit inside the request path, so unprovisioned
 # authority work is forbidden; the handler additionally rejects any non
 # provisioned-concurrency initialization type.
 resource "aws_lambda_provisioned_concurrency_config" "authority" {
   for_each = local.authority_runtime_functions
 
-  function_name                     = aws_lambda_function.authority[each.key].function_name
-  qualifier                         = aws_lambda_alias.authority["${each.key}:${local.authority_runtime_selected_color}"].name
-  provisioned_concurrent_executions = each.value.spec.steady_provisioned_concurrency
+  function_name = aws_lambda_function.authority[each.key].function_name
+  qualifier     = aws_lambda_alias.authority["${each.key}:${local.authority_runtime_selected_color}"].name
+  provisioned_concurrent_executions = (
+    local.authority_proof_policy_rollout_active &&
+    contains(local.authority_proof_policy_rollout_function_names, each.key)
+    ? each.value.spec.rollout_active_provisioned_concurrency
+    : each.value.spec.steady_provisioned_concurrency
+  )
 
   # Provisioned-concurrency initialization runs the startup graph, which reaches
   # KMS (interface endpoint) and DynamoDB (gateway endpoint) through the Control
@@ -968,6 +1090,28 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
     aws_security_group.interface_endpoints,
     aws_security_group.authority_lambda,
   ]
+
+}
+
+# The first attended proof intentionally keeps the reviewed blue basis pool at
+# the existing resource address and adds only the fixed green standby pool for
+# IA/RA/ICR + ca-pm. Both pools remain allocated through promotion, rollback,
+# and re-promotion. Preparing blue later replaces only its inactive pool and
+# waits for READY before a rollback selector plan is admissible.
+resource "aws_lambda_provisioned_concurrency_config" "authority_proof_standby" {
+  for_each = local.authority_proof_policy_rollout_active ? local.authority_proof_policy_rollout_functions : {}
+
+  function_name                     = aws_lambda_function.authority[each.key].function_name
+  qualifier                         = aws_lambda_alias.authority["${each.key}:${local.authority_proof_policy_standby_color}"].name
+  provisioned_concurrent_executions = each.value.spec.rollout_standby_provisioned_concurrency
+
+  depends_on = [
+    aws_vpc_endpoint.dynamodb,
+    aws_vpc_endpoint.interface,
+    aws_security_group.interface_endpoints,
+    aws_security_group.authority_lambda,
+  ]
+
 }
 
 # The complete runtime alarm set — including the rollout-aborting

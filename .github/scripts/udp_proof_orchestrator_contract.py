@@ -59,7 +59,12 @@ ORCHESTRATOR_SCENARIO_KINDS = {
 # Exactly the rows this producer proves today.  Extending the producer means
 # adding a key here *and* a validator in ROW_VALIDATORS; nothing else in the
 # pipeline changes.
-PRODUCED_ROWS = ("retirement.nhp_registrar_surface_state",)
+PRODUCED_ROWS = (
+    "orchestrator.real_hub_authority_and_two_cells",
+    "retirement.generated_artifact_parity",
+    "retirement.nhp_registrar_surface_state",
+    "retirement.terraform_saved_plan_and_live_state",
+)
 
 # `retired_lifecycle_surface.json` in layervai/qurl-go is the human-reviewed,
 # digest-pinned contract both sides quote.  These are the two digests the
@@ -96,6 +101,156 @@ RETIRED_INTERNAL_HTTP_OPERATIONS = (
     {"method": "POST", "path": "/internal/v1/agent/otp"},
     {"method": "POST", "path": "/internal/v1/agent/register"},
 )
+
+GENERATED_ARTIFACT_SURFACES = (
+    (
+        "connector_tarball",
+        "qurl_connector",
+        ".github/workflows/build-binaries.yml",
+    ),
+    (
+        "distribution",
+        "qurl_connector",
+        ".github/workflows/docker-publish.yml",
+    ),
+    ("generated_config", "qurl_connector", "pkg/config/frpgen.go"),
+    ("go", "qurl_go", RETIRED_SURFACE_PATH),
+    ("integration_installer", "qurl_integrations", "scripts/install.sh"),
+    ("mcp", "qurl_mcp", "api-spec/qurls.yaml"),
+    ("python", "qurl_python", "src/layerv_qurl/client.py"),
+    ("typescript", "qurl_typescript", "contract/openapi.snapshot.yaml"),
+    ("website", "website", ".github/workflows/update-api-docs.yml"),
+)
+GENERATED_ARTIFACT_REPOSITORIES = dict(deployment.REPOSITORIES)
+PUBLIC_HTTP_LIFECYCLE_PATHS = (
+    "/v1/agent/bootstrap",
+    "/v1/agent/registration-info",
+    "/v1/agent/registration/complete",
+)
+ALL_RETIRED_EXPORT_MARKERS = (
+    *PUBLIC_HTTP_LIFECYCLE_PATHS,
+    *(operation["path"] for operation in RETIRED_INTERNAL_HTTP_OPERATIONS),
+    "relayknock.Exchange",
+    "relayknock.Send",
+    "relayknock.TypeListRequest",
+    "relayknock.TypeListResult",
+    "relayknock.TypeOTP",
+    "relayknock.TypeRegister",
+    "relayknock.TypeRegisterAck",
+)
+# Reviewed semantic anchors for each artifact class. A blob must contain every
+# stable anchor, plus every phase-specific anchor, before the producer may call
+# it `matches_contract`. Post-removal additionally rejects every retired export
+# marker (except the canonical Go contract, which intentionally preserves the
+# reviewed retirement inventory).
+GENERATED_ARTIFACT_SEMANTICS = {
+    "connector_tarball": {
+        "required": (
+            "binary_name=qurl-connector",
+            "archive_prefix=qurl-connector",
+            "qurl-connector Release Binaries",
+        ),
+        "pre_removal_required": (),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "distribution": {
+        "required": (
+            "REGISTRY: ghcr.io",
+            "IMAGE_NAME: layervai/qurl-connector",
+            "docker/build-push-action",
+        ),
+        "pre_removal_required": (),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "generated_config": {
+        "required": (
+            "MetaQURLKnockToken",
+            "GenerateFRPClientConfig",
+            "MetaResourceID",
+        ),
+        "pre_removal_required": (),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "go": {
+        "required": ('"gate": "udp_lifecycle_retirement"',),
+        "pre_removal_required": PUBLIC_HTTP_LIFECYCLE_PATHS,
+        "post_removal_forbidden": (),
+    },
+    "integration_installer": {
+        "required": (
+            'REPO="layervai/qurl-integrations"',
+            'BINARY="qurl"',
+            'ARCHIVE="qurl_${VERSION}_${OS}_${ARCH}.tar.gz"',
+        ),
+        "pre_removal_required": (),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "mcp": {
+        "required": ("openapi: 3.0.3", "qurl:agent"),
+        "pre_removal_required": ("/v1/agent/bootstrap",),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "python": {
+        "required": ("class QURLClient:", "/v1/resources/{resource_id}/qurls"),
+        "pre_removal_required": (),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "typescript": {
+        "required": (
+            "Minimal OpenAPI snapshot",
+            "title: QURL API",
+        ),
+        "pre_removal_required": ("/v1/agent/bootstrap",),
+        "post_removal_forbidden": ALL_RETIRED_EXPORT_MARKERS,
+    },
+    "website": {
+        "required": (
+            "repos/layervai/qurl-service/contents/api/openapi.yaml",
+            "public/docs/qurls.yaml",
+            "public/docs/qurls.json",
+            "public/docs/qurls.md",
+        ),
+        "pre_removal_required": (),
+        "post_removal_forbidden": (),
+    },
+}
+
+# Exact logical Terraform resource addresses whose only purpose is the retired
+# HTTP bootstrap/registration path.  The bootstrap ALB is represented by its
+# module instance address so the proof covers the entire module, including
+# newly added child resources, without maintaining a brittle child-resource
+# allowlist.
+TERRAFORM_RETIREMENT_RESOURCES = (
+    "module.nhp.aws_cloudwatch_log_metric_filter.agent_otp_rate_limited",
+    "module.nhp.aws_cloudwatch_log_metric_filter.agent_otp_send_failed",
+    "module.nhp.aws_cloudwatch_log_metric_filter.agent_register_attempts_exceeded",
+    "module.nhp.aws_cloudwatch_log_metric_filter.agent_register_credential_invalid",
+    "module.nhp.aws_cloudwatch_log_metric_filter.agent_register_rate_limited",
+    "module.nhp.aws_cloudwatch_log_metric_filter.bootstrap_rate_limited",
+    "module.nhp.aws_cloudwatch_log_metric_filter.bootstrap_unauthorized",
+    "module.nhp.aws_cloudwatch_metric_alarm.agent_otp_rate_limited_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.agent_otp_send_failed_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.agent_register_attempts_exceeded_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.agent_register_credential_invalid_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.agent_register_rate_limited_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.bootstrap_rate_limited_spike",
+    "module.nhp.aws_cloudwatch_metric_alarm.bootstrap_unauthorized_spike",
+    "module.nhp.aws_secretsmanager_secret.agent_otp_pepper",
+    "module.nhp.module.bootstrap_alb[0]",
+    "module.nhp.module.qurl_service[0].aws_iam_role_policy.task_agent_otp_ses",
+    "module.nhp.module.qurl_service[0].terraform_data.qurl_bootstrap_chain_inputs",
+    "module.nhp.terraform_data.agent_otp_pepper_seed",
+    "module.nhp.terraform_data.agent_otp_preconditions",
+    "module.nhp.terraform_data.agent_otp_registration_plugin_preconditions",
+    "module.nhp.terraform_data.agent_registration_preconditions",
+    "module.nhp.terraform_data.bootstrap_alb_dns_preconditions",
+    "module.nhp.terraform_data.qurl_bootstrap_activation_preconditions",
+    "module.nhp.terraform_data.qurl_bootstrap_chain_preconditions",
+)
+TERRAFORM_APPLY_RECEIPT_SCHEMA_VERSION = 1
+TERRAFORM_APPLY_WORKFLOW_PATH = ".github/workflows/build-and-push.yml"
+TERRAFORM_APPLY_RECEIPT_FILE = "udp-proof-terraform-apply-receipt.json"
+TERRAFORM_APPLY_RECEIPT_ARTIFACT_PREFIX = "udp-proof-terraform-apply"
 
 MAX_SURFACE_ENTRIES = 64
 # `state` describes only whether the reviewed declaration exists in the deployed
@@ -167,6 +322,433 @@ def canonical_bytes(value: Any) -> bytes:
     )
 
 
+def _canonical_sha256(value: Any, name: str) -> str:
+    return hashlib.sha256(
+        deployment.canonical_bytes(
+            value,
+            maximum=deployment.MAX_PROVENANCE_BYTES,
+            name=name,
+        )
+    ).hexdigest()
+
+
+def _validate_topology_surface(
+    value: Any,
+    *,
+    manifest: dict[str, Any],
+    runtime: dict[str, Any],
+    provenance: dict[str, Any],
+    **_: Any,
+) -> dict[str, Any]:
+    row = _exact(
+        value,
+        {
+            "kind",
+            "manifest_topology_sha256",
+            "runtime_topology_sha256",
+            "public_identities_sha256",
+            "workload_observations_sha256",
+            "hub",
+            "cells",
+            "authority",
+        },
+        "orchestrator topology row",
+    )
+    if (
+        row["kind"]
+        != ORCHESTRATOR_SCENARIO_KINDS["orchestrator.real_hub_authority_and_two_cells"]
+    ):
+        raise OrchestratorContractError("orchestrator topology row kind drift")
+
+    expected_digests = {
+        "manifest_topology_sha256": _canonical_sha256(
+            {"hub": manifest["hub"], "cells": manifest["cells"]},
+            "manifest topology",
+        ),
+        "runtime_topology_sha256": _canonical_sha256(
+            {"hub": runtime["hub"], "cells": runtime["cells"]},
+            "runtime topology",
+        ),
+        "public_identities_sha256": _canonical_sha256(
+            provenance["evidence"]["public_identities"],
+            "public identities",
+        ),
+        "workload_observations_sha256": _canonical_sha256(
+            provenance["evidence"]["workloads"],
+            "workload observations",
+        ),
+    }
+    for field, expected in expected_digests.items():
+        if _sha256(row[field], f"orchestrator topology {field}") != expected:
+            raise OrchestratorContractError(
+                f"orchestrator topology {field} is not the authenticated "
+                "deployment observation"
+            )
+
+    hub = _exact(
+        row["hub"],
+        {"host", "port", "server_public_key_sha256"},
+        "orchestrator topology hub",
+    )
+    cells = row["cells"]
+    if not isinstance(cells, list) or len(cells) != 2:
+        raise OrchestratorContractError(
+            "orchestrator topology cells must contain exactly cell0 and cell1"
+        )
+    try:
+        deployment._endpoint(
+            hub,
+            "orchestrator topology hub",
+            include_cell_id=False,
+            include_public_key=False,
+        )
+        for index, cell in enumerate(cells):
+            deployment._endpoint(
+                cell,
+                f"orchestrator topology cells[{index}]",
+                include_cell_id=True,
+                include_public_key=False,
+            )
+    except deployment.ContractError as exc:
+        raise OrchestratorContractError(str(exc)) from exc
+    if hub != manifest["hub"] or cells != manifest["cells"]:
+        raise OrchestratorContractError(
+            "orchestrator topology endpoints differ from the deployment manifest"
+        )
+    if [cell["cell_id"] for cell in cells] != ["cell0", "cell1"]:
+        raise OrchestratorContractError(
+            "orchestrator topology cells must be ordered cell0, cell1"
+        )
+    endpoint_hosts = [hub["host"], *(cell["host"] for cell in cells)]
+    endpoint_keys = [
+        hub["server_public_key_sha256"],
+        *(cell["server_public_key_sha256"] for cell in cells),
+    ]
+    if len(set(endpoint_hosts)) != 3 or len(set(endpoint_keys)) != 3:
+        raise OrchestratorContractError(
+            "Hub and both cells must have distinct hosts and server identities"
+        )
+
+    authority = _exact(
+        row["authority"],
+        {"source_sha", "image_digest", "proof_policy_consumers_active"},
+        "orchestrator topology authority",
+    )
+    authority_observation = provenance["evidence"]["workloads"][
+        "qurl_service_authority"
+    ]
+    if (
+        _sha(authority["source_sha"], "orchestrator topology authority.source_sha")
+        != manifest["repositories"]["qurl_service"]
+        or authority["source_sha"] != authority_observation["source_revision"]
+        or authority["image_digest"] != manifest["images"]["qurl_service_authority"]
+        or authority["image_digest"] != authority_observation["image_digest"]
+        or _bool(
+            authority["proof_policy_consumers_active"],
+            "orchestrator topology authority.proof_policy_consumers_active",
+        )
+        is not True
+        or authority["proof_policy_consumers_active"]
+        != authority_observation["proof_policy_consumers_active"]
+    ):
+        raise OrchestratorContractError(
+            "orchestrator topology authority differs from the authenticated "
+            "qurl-service authority deployment"
+        )
+    return row
+
+
+def _validate_generated_artifact_parity(
+    value: Any,
+    *,
+    proof_phase: str,
+    qurl_go_source_sha: str,
+    manifest: dict[str, Any],
+    **_: Any,
+) -> dict[str, Any]:
+    row = _exact(
+        value,
+        {
+            "kind",
+            "surface",
+            "phase",
+            "canonical_contract",
+            "artifacts",
+            "artifacts_sha256",
+        },
+        "generated artifact parity row",
+    )
+    if (
+        row["kind"]
+        != ORCHESTRATOR_SCENARIO_KINDS["retirement.generated_artifact_parity"]
+        or row["surface"] != "generated_artifact_parity"
+        or row["phase"] != proof_phase
+    ):
+        raise OrchestratorContractError(
+            "generated artifact parity identity or phase drift"
+        )
+    contract = _exact(
+        row["canonical_contract"],
+        {
+            "repository",
+            "path",
+            "source_sha",
+            "raw_sha256",
+            "canonical_sha256",
+        },
+        "generated artifact parity canonical_contract",
+    )
+    if contract != {
+        "repository": "layervai/qurl-go",
+        "path": RETIRED_SURFACE_PATH,
+        "source_sha": qurl_go_source_sha,
+        "raw_sha256": RETIRED_SURFACE_RAW_SHA256,
+        "canonical_sha256": RETIRED_SURFACE_CANONICAL_SHA256,
+    }:
+        raise OrchestratorContractError(
+            "generated artifact parity canonical contract drift"
+        )
+
+    artifacts = row["artifacts"]
+    if not isinstance(artifacts, list) or len(artifacts) != len(
+        GENERATED_ARTIFACT_SURFACES
+    ):
+        raise OrchestratorContractError(
+            "generated artifact parity must contain the exact reviewed surfaces"
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, expected in enumerate(GENERATED_ARTIFACT_SURFACES):
+        surface, repository_key, path = expected
+        artifact = _exact(
+            artifacts[index],
+            {
+                "surface",
+                "repository",
+                "source_sha",
+                "path",
+                "path_sha256",
+                "contract_sha256",
+                "state",
+            },
+            f"generated artifact parity artifacts[{index}]",
+        )
+        expected_repository = GENERATED_ARTIFACT_REPOSITORIES[repository_key]
+        _sha256(
+            artifact["path_sha256"],
+            f"generated artifact parity artifacts[{index}].path_sha256",
+        )
+        if (
+            artifact["surface"] != surface
+            or artifact["repository"] != expected_repository
+            or _sha(
+                artifact["source_sha"],
+                f"generated artifact parity artifacts[{index}].source_sha",
+            )
+            != manifest["repositories"][repository_key]
+            or artifact["path"] != path
+            or _repository_path(
+                artifact["path"],
+                f"generated artifact parity artifacts[{index}].path",
+            )
+            != path
+            or artifact["contract_sha256"] != RETIRED_SURFACE_CANONICAL_SHA256
+            or artifact["state"] != "matches_contract"
+        ):
+            raise OrchestratorContractError(
+                f"generated artifact parity artifacts[{index}] differs from "
+                "the reviewed repository surface"
+            )
+        normalized.append(artifact)
+    if _sha256(
+        row["artifacts_sha256"],
+        "generated artifact parity artifacts_sha256",
+    ) != _canonical_sha256(normalized, "generated artifact parity artifacts"):
+        raise OrchestratorContractError(
+            "generated artifact parity artifacts_sha256 is wrong"
+        )
+    return row
+
+
+def _validate_terraform_retirement(
+    value: Any,
+    *,
+    proof_phase: str,
+    **_: Any,
+) -> dict[str, Any]:
+    row = _exact(
+        value,
+        {"kind", "surface", "phase", "state", "plan", "row_sha256"},
+        "Terraform retirement row",
+    )
+    if (
+        row["kind"]
+        != ORCHESTRATOR_SCENARIO_KINDS["retirement.terraform_saved_plan_and_live_state"]
+        or row["surface"] != "terraform_retirement"
+        or row["phase"] != proof_phase
+    ):
+        raise OrchestratorContractError("Terraform retirement identity or phase drift")
+    state = _exact(
+        row["state"],
+        {"lineage", "serial", "observation_sha256", "resources"},
+        "Terraform retirement state",
+    )
+    lineage = _string(
+        state["lineage"], "Terraform retirement state.lineage", maximum=128
+    )
+    if lineage != lineage.strip():
+        raise OrchestratorContractError(
+            "Terraform retirement state.lineage must be trimmed"
+        )
+    try:
+        deployment._positive_int(state["serial"], "Terraform retirement state.serial")
+    except deployment.ContractError as exc:
+        raise OrchestratorContractError(str(exc)) from exc
+    resources = state["resources"]
+    if not isinstance(resources, list) or len(resources) != len(
+        TERRAFORM_RETIREMENT_RESOURCES
+    ):
+        raise OrchestratorContractError(
+            "Terraform retirement state must cover the exact reviewed resources"
+        )
+    normalized_resources: list[dict[str, Any]] = []
+    for index, expected_address in enumerate(TERRAFORM_RETIREMENT_RESOURCES):
+        resource = _exact(
+            resources[index],
+            {"address", "state"},
+            f"Terraform retirement resources[{index}]",
+        )
+        if resource["address"] != expected_address:
+            raise OrchestratorContractError(
+                f"Terraform retirement resources[{index}] address drift"
+            )
+        expected_state = "present" if proof_phase == "pre_removal" else "absent"
+        if resource["state"] != expected_state:
+            raise OrchestratorContractError(
+                f"Terraform retirement resources[{index}] must be {expected_state}"
+            )
+        normalized_resources.append(resource)
+    expected_observation_sha = _canonical_sha256(
+        {
+            "lineage": state["lineage"],
+            "serial": state["serial"],
+            "resources": normalized_resources,
+        },
+        "Terraform retirement state observation",
+    )
+    if (
+        _sha256(
+            state["observation_sha256"],
+            "Terraform retirement state.observation_sha256",
+        )
+        != expected_observation_sha
+    ):
+        raise OrchestratorContractError(
+            "Terraform retirement state observation digest is wrong"
+        )
+
+    plan = _exact(
+        row["plan"],
+        {"saved_plan_sha256", "apply_run_id", "approved_deletions"},
+        "Terraform retirement plan",
+    )
+    if proof_phase == "pre_removal":
+        if plan != {
+            "saved_plan_sha256": None,
+            "apply_run_id": None,
+            "approved_deletions": [],
+        }:
+            raise OrchestratorContractError(
+                "pre-removal Terraform evidence must not claim an applied plan"
+            )
+    else:
+        _sha256(
+            plan["saved_plan_sha256"],
+            "Terraform retirement plan.saved_plan_sha256",
+        )
+        try:
+            deployment._positive_int(
+                plan["apply_run_id"], "Terraform retirement plan.apply_run_id"
+            )
+        except deployment.ContractError as exc:
+            raise OrchestratorContractError(str(exc)) from exc
+        if plan["approved_deletions"] != list(TERRAFORM_RETIREMENT_RESOURCES):
+            raise OrchestratorContractError(
+                "post-removal Terraform evidence must bind the exact approved "
+                "deletion set"
+            )
+
+    expected_row_sha = _canonical_sha256(
+        {key: row[key] for key in ("kind", "surface", "phase", "state", "plan")},
+        "Terraform retirement row",
+    )
+    if (
+        _sha256(row["row_sha256"], "Terraform retirement row_sha256")
+        != expected_row_sha
+    ):
+        raise OrchestratorContractError("Terraform retirement row_sha256 is wrong")
+    return row
+
+
+def validate_terraform_apply_receipt(
+    value: Any,
+    *,
+    run_id: int,
+    run_attempt: int,
+    head_sha: str,
+) -> dict[str, Any]:
+    receipt = _exact(
+        value,
+        {
+            "schema_version",
+            "gate",
+            "phase",
+            "producer",
+            "saved_plan_sha256",
+            "approved_deletions",
+        },
+        "Terraform retirement apply receipt",
+    )
+    if (
+        receipt["schema_version"] != TERRAFORM_APPLY_RECEIPT_SCHEMA_VERSION
+        or type(receipt["schema_version"]) is not int
+        or receipt["gate"] != GATE
+        or receipt["phase"] != "post_removal"
+    ):
+        raise OrchestratorContractError(
+            "Terraform retirement apply receipt identity drift"
+        )
+    producer = _exact(
+        receipt["producer"],
+        {"repository", "workflow_path", "run_id", "run_attempt", "head_sha"},
+        "Terraform retirement apply receipt producer",
+    )
+    if producer != {
+        "repository": "layervai/nhp",
+        "workflow_path": TERRAFORM_APPLY_WORKFLOW_PATH,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+    }:
+        raise OrchestratorContractError(
+            "Terraform retirement apply receipt producer identity drift"
+        )
+    try:
+        deployment._positive_int(run_id, "Terraform retirement apply run_id")
+        deployment._positive_int(run_attempt, "Terraform retirement apply run_attempt")
+    except deployment.ContractError as exc:
+        raise OrchestratorContractError(str(exc)) from exc
+    _sha(head_sha, "Terraform retirement apply head_sha")
+    _sha256(
+        receipt["saved_plan_sha256"],
+        "Terraform retirement apply saved_plan_sha256",
+    )
+    if receipt["approved_deletions"] != list(TERRAFORM_RETIREMENT_RESOURCES):
+        raise OrchestratorContractError(
+            "Terraform retirement apply receipt deletion set drift"
+        )
+    return receipt
+
+
 def _validate_interface(
     entry: Any,
     name: str,
@@ -201,7 +783,9 @@ def _validate_interface(
         or not types
         or types != sorted(types)
         or len(types) != len(set(types))
-        or any(entry_type not in RETIRED_MESSAGE_TYPE_WIRE_VALUES for entry_type in types)
+        or any(
+            entry_type not in RETIRED_MESSAGE_TYPE_WIRE_VALUES for entry_type in types
+        )
     ):
         raise OrchestratorContractError(
             f"{name}.lifecycle_message_types must be a sorted unique non-empty "
@@ -244,8 +828,7 @@ def _validate_interface(
         return item
     if state != "absent":
         raise OrchestratorContractError(
-            f"{name} legacy registrar implementation is still present in "
-            "post_removal"
+            f"{name} legacy registrar implementation is still present in post_removal"
         )
     return item
 
@@ -255,6 +838,7 @@ def _validate_nhp_registrar_surface(
     *,
     proof_phase: str,
     nhp_source_sha: str,
+    **_: Any,
 ) -> dict[str, Any]:
     """Validate the deployed-NHP legacy registrar/runtime surface row.
 
@@ -281,7 +865,9 @@ def _validate_nhp_registrar_surface(
         },
         "nhp registrar surface row",
     )
-    expected_kind = ORCHESTRATOR_SCENARIO_KINDS["retirement.nhp_registrar_surface_state"]
+    expected_kind = ORCHESTRATOR_SCENARIO_KINDS[
+        "retirement.nhp_registrar_surface_state"
+    ]
     if row["kind"] != expected_kind:
         raise OrchestratorContractError("nhp registrar surface row kind drift")
     if row["surface"] != "nhp_registrar":
@@ -330,8 +916,7 @@ def _validate_nhp_registrar_surface(
         )
         if operation != RETIRED_INTERNAL_HTTP_OPERATIONS[index]:
             raise OrchestratorContractError(
-                "nhp registrar retired internal HTTP operation drift at index "
-                f"{index}"
+                f"nhp registrar retired internal HTTP operation drift at index {index}"
             )
 
     interfaces = row["interfaces"]
@@ -394,7 +979,10 @@ def _validate_nhp_registrar_surface(
 
 
 ROW_VALIDATORS = {
+    "orchestrator.real_hub_authority_and_two_cells": _validate_topology_surface,
+    "retirement.generated_artifact_parity": _validate_generated_artifact_parity,
     "retirement.nhp_registrar_surface_state": _validate_nhp_registrar_surface,
+    "retirement.terraform_saved_plan_and_live_state": _validate_terraform_retirement,
 }
 
 
@@ -402,8 +990,11 @@ def validate_orchestrator_evidence(
     value: Any,
     *,
     manifest: dict[str, Any],
+    runtime: dict[str, Any],
+    provenance: dict[str, Any],
     manifest_bytes: bytes,
     runtime_bytes: bytes,
+    provenance_bytes: bytes,
     proof_phase: str,
     producer_run_id: int,
     producer_run_attempt: int,
@@ -472,9 +1063,7 @@ def validate_orchestrator_evidence(
         "run_attempt": producer_run_attempt,
         "head_sha": producer_head_sha,
     }:
-        raise OrchestratorContractError(
-            "orchestrator evidence producer identity drift"
-        )
+        raise OrchestratorContractError("orchestrator evidence producer identity drift")
     try:
         deployment._positive_int(producer_run_id, "producer run_id")
         deployment._positive_int(producer_run_attempt, "producer run_attempt")
@@ -487,6 +1076,7 @@ def validate_orchestrator_evidence(
         {
             "deployment_manifest_sha256",
             "deployment_runtime_inputs_sha256",
+            "deployment_provenance_sha256",
             "nhp_source_sha",
             "qurl_go_source_sha",
             "retired_lifecycle_surface_path",
@@ -506,6 +1096,11 @@ def validate_orchestrator_evidence(
             "bindings.deployment_runtime_inputs_sha256",
         )
         != hashlib.sha256(runtime_bytes).hexdigest()
+        or _sha256(
+            bindings["deployment_provenance_sha256"],
+            "bindings.deployment_provenance_sha256",
+        )
+        != hashlib.sha256(provenance_bytes).hexdigest()
     ):
         raise OrchestratorContractError(
             "orchestrator evidence is not bound to this artifact's manifest files"
@@ -570,6 +1165,10 @@ def validate_orchestrator_evidence(
             rows[scenario_id],
             proof_phase=proof_phase,
             nhp_source_sha=nhp_source_sha,
+            qurl_go_source_sha=bindings["qurl_go_source_sha"],
+            manifest=manifest,
+            runtime=runtime,
+            provenance=provenance,
         )
     return document
 
@@ -578,8 +1177,11 @@ def validate_orchestrator_bytes(
     raw: bytes,
     *,
     manifest: dict[str, Any],
+    runtime: dict[str, Any],
+    provenance: dict[str, Any],
     manifest_bytes: bytes,
     runtime_bytes: bytes,
+    provenance_bytes: bytes,
     proof_phase: str,
     producer_run_id: int,
     producer_run_attempt: int,
@@ -599,8 +1201,11 @@ def validate_orchestrator_bytes(
     return validate_orchestrator_evidence(
         value,
         manifest=manifest,
+        runtime=runtime,
+        provenance=provenance,
         manifest_bytes=manifest_bytes,
         runtime_bytes=runtime_bytes,
+        provenance_bytes=provenance_bytes,
         proof_phase=proof_phase,
         producer_run_id=producer_run_id,
         producer_run_attempt=producer_run_attempt,

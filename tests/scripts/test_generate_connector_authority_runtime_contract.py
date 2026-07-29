@@ -256,8 +256,12 @@ class GitBindingTests(unittest.TestCase):
         expected: str | None = None,
         output: Path | None = None,
         runtime_functions_enabled: bool = False,
+        hub_edge_enabled: bool = False,
+        hub_worker_enabled: bool = False,
         proof_mutation_controls_enabled: bool = False,
         proof_policy_consumers_staged: bool = False,
+        proof_policy_selected_color: str | None = None,
+        proof_policy_prepared_color: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         destination = output or (self.root / "generated.tfvars.json")
         args = [
@@ -276,10 +280,22 @@ class GitBindingTests(unittest.TestCase):
         ]
         if runtime_functions_enabled:
             args.append("--runtime-functions-enabled")
+        if hub_edge_enabled:
+            args.append("--hub-edge-enabled")
+        if hub_worker_enabled:
+            args.append("--hub-worker-enabled")
         if proof_mutation_controls_enabled:
             args.append("--proof-mutation-controls-enabled")
         if proof_policy_consumers_staged:
             args.append("--proof-policy-consumers-staged")
+        if proof_policy_selected_color is not None:
+            args.extend(
+                ["--proof-policy-selected-color", proof_policy_selected_color]
+            )
+        if proof_policy_prepared_color is not None:
+            args.extend(
+                ["--proof-policy-prepared-color", proof_policy_prepared_color]
+            )
         return run(*args, cwd=self.root, check=False)
 
     def test_generates_stable_blob_owned_evidence_and_private_atomic_output(self) -> None:
@@ -390,7 +406,7 @@ class GitBindingTests(unittest.TestCase):
             proof_mutation_controls_enabled=True,
         )
         self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr)
-        self.assertEqual(json.loads(enabled_result.stdout)["function_count"], 12)
+        self.assertEqual(json.loads(enabled_result.stdout)["function_count"], 13)
 
         enabled = json.loads(enabled_output.read_text(encoding="utf-8"))
         contract = enabled["authority_runtime_contract"]
@@ -398,9 +414,16 @@ class GitBindingTests(unittest.TestCase):
             contract["global"]["caller_capacity"]["proof_controller"],
             {
                 "max_replicas": 1,
-                "preinvoke_limits": {"mutate_proof_agent": 1},
+                "preinvoke_limits": {
+                    "mutate_proof_agent": 1,
+                    "prepare_proof_credential_recovery": 1,
+                },
                 "preinvoke_rate_limits": {
                     "mutate_proof_agent": {
+                        "burst": 1,
+                        "refill_per_second": 1,
+                    },
+                    "prepare_proof_credential_recovery": {
                         "burst": 1,
                         "refill_per_second": 1,
                     }
@@ -423,13 +446,46 @@ class GitBindingTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            contract["functions"]["layerv-nhp-sandbox-ca-pcr"],
+            contract["functions"]["layerv-nhp-sandbox-ca-pm"],
+        )
+        self.assertEqual(
             set(contract["functions"]),
-            set(dark_contract["functions"]) | {"layerv-nhp-sandbox-ca-pm"},
+            set(dark_contract["functions"])
+            | {"layerv-nhp-sandbox-ca-pm", "layerv-nhp-sandbox-ca-pcr"},
         )
         self.assertIs(
             enabled["authority_proof_mutation_controls_enabled"],
             True,
         )
+
+        one_color = self.generate(
+            output=self.root / "proof-rollout-one-color.json",
+            runtime_functions_enabled=True,
+            hub_edge_enabled=True,
+            hub_worker_enabled=True,
+            proof_mutation_controls_enabled=True,
+            proof_policy_consumers_staged=True,
+            proof_policy_selected_color="blue",
+        )
+        self.assertNotEqual(one_color.returncode, 0)
+        self.assertIn("exact selected and prepared colors", one_color.stderr)
+
+        rollout_output = self.root / "proof-rollout.json"
+        rollout = self.generate(
+            output=rollout_output,
+            runtime_functions_enabled=True,
+            hub_edge_enabled=True,
+            hub_worker_enabled=True,
+            proof_mutation_controls_enabled=True,
+            proof_policy_consumers_staged=True,
+            proof_policy_selected_color="blue",
+            proof_policy_prepared_color="green",
+        )
+        self.assertEqual(rollout.returncode, 0, rollout.stderr)
+        rollout_payload = json.loads(rollout_output.read_text(encoding="utf-8"))
+        self.assertEqual(rollout_payload["authority_proof_policy_selected_color"], "blue")
+        self.assertEqual(rollout_payload["authority_proof_policy_prepared_color"], "green")
         self.assertEqual(
             enabled["authority_proof_mutation_owner_id"],
             CHECKER.EXPECTED_PROOF_OWNER_ID,

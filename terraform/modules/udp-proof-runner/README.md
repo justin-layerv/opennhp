@@ -58,13 +58,11 @@ remain proof consumers; neither should grow an AWS runner control plane.
   environment/purpose tags. Dynamic run IDs cannot narrow its static IAM
   policy, so per-run ownership is operationally bounded by the single active
   runner and serialized broker; the one-use secret is deleted before job code.
-  Its proof KMS surface is exact-key `DescribeKey`, Connector-only `Decrypt`,
-  and qurl-go-only `Encrypt`/`Decrypt`. Connector decrypt requires the
-  `qurl-agent-x25519-private-key` encryption context and an `aws-kms` or
-  `aws-nitro` provider. qurl-go use requires exactly the four reviewed sealed
-  state context keys (`qurl_purpose`, `qurl_envelope_version`,
-  `qurl_provider_id`, `qurl_agent_id`), the current v1 `aws-kms` domain, and
-  the attended `qurl-go-sandbox-*` identity namespace. It cannot list or read
+  Its proof KMS surface is exact-key `DescribeKey`/`Encrypt`/`Decrypt`.
+  Encrypt and decrypt are admitted only for one of two complete, exact
+  four-key contexts: qurl-go's `qurl_*` agent-state context with a
+  `qurl-go-sandbox-*` agent id, or Connector's unprefixed agent-state context
+  with a `connector-sandbox-*` agent id. It cannot list or read
   application secrets. This is a consciously accepted sandbox trust decision:
   any code in the attended job, including a compromised client transitive
   dependency, can use IMDS credentials to decrypt that sandbox Connector key
@@ -251,13 +249,17 @@ The composing PR must:
    The synchronous start response is pinned to exactly `action`,
    `instance_id`, and `status`; `instance_id` must be an EC2 instance id and
    `status` must be `launched` or `existing`. The stop response is pinned to
-   exactly `action`, `instances`, `secret_deleted`, and `status`;
+   exactly `action`, `instances`, `recovery_secrets_deleted`,
+   `secret_deleted`, and `status`;
    `status=terminated` requires one or more unique EC2 instance ids, while
    `status=absent` requires an empty instance list, and `secret_deleted` is
-   boolean in either case. Extra fields or status values fail the controller
-   closed. A red stop-schema check is therefore not by itself proof that
-   compute survived: verify the broker sweep and boot-relative hard deadline
-   before classifying a runner as stranded.
+   boolean in either case. `recovery_secrets_deleted` may contain only this
+   run's exact request and response mailbox names; an empty list means both
+   were already absent or proved to be in force-deletion. The broker validates
+   their exact name/tag binding before deletion. Extra fields, names, or status
+   values fail the controller closed. A red stop-schema check is therefore not
+   by itself proof that compute survived: verify the broker sweep and
+   boot-relative hard deadline before classifying a runner as stranded.
    Use a synchronous invoke with bounded retries for `TooManyRequestsException`:
    the intentionally serialized broker can briefly throttle while its
    five-minute sweep is running, and an asynchronous start would not prove the
@@ -265,6 +267,9 @@ The composing PR must:
    terminate an otherwise healthy runner because it can no longer certify the
    stable source. The composing runbook must classify that as an aborted proof
    and require a fresh attended controller run, never in-place continuation.
+   The same five-minute sweep removes expired JIT and recovery mailbox secrets,
+   with a hard cap of 20 deletion attempts per invocation; later invocations
+   drain any remaining backlog.
    Generic labels alone are not an isolation boundary.
 10. Record both NHP controller run identities, both external client workflow run
    identities, the runner AMI, archive digest, launch-template version, EIP `/32`,

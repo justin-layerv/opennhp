@@ -75,6 +75,7 @@ AUTHORITY_FUNCTIONS = [
     "layerv-nhp-sandbox-ca-icr",
     "layerv-nhp-sandbox-ca-iro-cell0",
     "layerv-nhp-sandbox-ca-iro-cell1",
+    "layerv-nhp-sandbox-ca-pcr",
     "layerv-nhp-sandbox-ca-pm",
     "layerv-nhp-sandbox-ca-ra",
 ]
@@ -85,6 +86,9 @@ AUTHORITY_PROOF_POLICY_CONSUMERS = frozenset(
         "layerv-nhp-sandbox-ca-ra",
     }
 )
+AUTHORITY_PROOF_ROLLOUT_FUNCTIONS = AUTHORITY_PROOF_POLICY_CONSUMERS | {
+    "layerv-nhp-sandbox-ca-pm"
+}
 AUTHORITY_PROOF_POLICY_ENVIRONMENT = {
     "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": "layerv-nhp-sandbox-udp-proof",
     "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
@@ -191,6 +195,7 @@ KMS_KEY_ARN_RE = re.compile(
     r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     r"|mrk-[0-9a-f]{32})$"
 )
+CONNECTOR_PROOF_KMS_ALIAS = "alias/layerv-nhp-sandbox-udp-proof-agent-seal"
 PUBLIC_EDGE_CONTRACTS = {
     "hub.nhp.layerv.xyz": {
         **contract.PROTECTED_EDGE_IDENTITIES["hub.nhp.layerv.xyz"],
@@ -386,6 +391,30 @@ def _aws(service: str, arguments: list[str], name: str) -> Any:
         ],
         name,
     )
+
+
+def _connector_proof_kms_key_arn() -> str:
+    response = _aws(
+        "kms",
+        ["describe-key", "--key-id", CONNECTOR_PROOF_KMS_ALIAS],
+        "Connector proof KMS key",
+    )
+    metadata = response.get("KeyMetadata") if isinstance(response, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("KeyManager") != "CUSTOMER"
+        or metadata.get("KeyState") != "Enabled"
+        or metadata.get("KeySpec") != "SYMMETRIC_DEFAULT"
+        or metadata.get("KeyUsage") != "ENCRYPT_DECRYPT"
+    ):
+        raise EvidenceError("Connector proof KMS key is not an enabled symmetric CMK")
+    key_arn = metadata.get("Arn")
+    if (
+        not isinstance(key_arn, str)
+        or not contract.CONNECTOR_PROOF_KMS_KEY_ARN_RE.fullmatch(key_arn)
+    ):
+        raise EvidenceError("Connector proof KMS key ARN is not canonical")
+    return key_arn
 
 
 def _exact(value: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -1922,6 +1951,7 @@ def _collect_ecs_workload(workload_key: str) -> dict[str, Any]:
 
 
 def _collect_authority_workload() -> dict[str, Any]:
+    selected_color = _hub_authority_selected_color()
     function_pairs = []
     proof_policy_consumers_active: list[bool] = []
     digest = None
@@ -1957,12 +1987,49 @@ def _collect_authority_workload() -> dict[str, Any]:
             and value.get("AllocatedProvisionedConcurrentExecutions")
             == value["RequestedProvisionedConcurrentExecutions"]
         ]
-        if len(ready) != 1:
+        expected_ready = 2 if function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS else 1
+        if len(ready) != expected_ready:
             raise EvidenceError(
-                f"{function_name} must expose one ready active deployment alias"
+                f"{function_name} must expose exactly {expected_ready} ready deployment alias(es)"
             )
-        alias_arn = ready[0].get("FunctionArn")
-        qualifier = alias_arn.rsplit(":", 1)[-1] if isinstance(alias_arn, str) else ""
+        by_qualifier = {}
+        for value in ready:
+            value_arn = value.get("FunctionArn")
+            value_qualifier = (
+                value_arn.rsplit(":", 1)[-1] if isinstance(value_arn, str) else ""
+            )
+            if value_qualifier not in {"blue", "green"}:
+                raise EvidenceError(
+                    f"{function_name} provisioned qualifier is not closed"
+                )
+            by_qualifier[value_qualifier] = value
+        expected_qualifiers = {"blue", "green"}
+        if function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+            qualifier = selected_color
+        elif len(by_qualifier) == 1:
+            qualifier = next(iter(by_qualifier))
+        else:
+            qualifier = ""
+        if (
+            function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+            and set(by_qualifier) != expected_qualifiers
+        ) or (
+            function_name not in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+            and len(by_qualifier) != 1
+        ):
+            raise EvidenceError(
+                f"{function_name} provisioned qualifier inventory differs"
+            )
+        if function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+            requested = {
+                value["RequestedProvisionedConcurrentExecutions"]
+                for value in by_qualifier.values()
+            }
+            if len(requested) != 1:
+                raise EvidenceError(
+                    f"{function_name} blue/green provisioned capacity differs"
+                )
+        alias_arn = by_qualifier[qualifier].get("FunctionArn")
         if qualifier not in {"blue", "green"}:
             raise EvidenceError(f"{function_name} active qualifier is not closed")
         alias = _aws(
@@ -2066,6 +2133,76 @@ def _collect_authority_workload() -> dict[str, Any]:
         "source_revision": source_revision,
         "source_evidence": source_evidence,
     }
+
+
+def _hub_authority_selected_color() -> str:
+    spec = ECS_WORKLOADS["nhp_hub"]
+    response = _aws(
+        "ecs",
+        [
+            "describe-services",
+            "--cluster",
+            spec["cluster"],
+            "--services",
+            spec["service"],
+        ],
+        "Hub service selector",
+    )
+    services = response.get("services") if isinstance(response, dict) else None
+    if not isinstance(services, list) or len(services) != 1:
+        raise EvidenceError("Hub service selector is incomplete")
+    task_definition_arn = services[0].get("taskDefinition")
+    contract._arn(task_definition_arn, "Hub selector task definition ARN")
+    task_response = _aws(
+        "ecs",
+        ["describe-task-definition", "--task-definition", task_definition_arn],
+        "Hub selector task definition",
+    )
+    task_definition = (
+        task_response.get("taskDefinition")
+        if isinstance(task_response, dict)
+        else None
+    )
+    containers = (
+        task_definition.get("containerDefinitions")
+        if isinstance(task_definition, dict)
+        else None
+    )
+    init = [
+        container
+        for container in containers or []
+        if isinstance(container, dict) and container.get("name") == "hub-init"
+    ]
+    if len(init) != 1:
+        raise EvidenceError("Hub selector task definition has no exact init container")
+    variables = {
+        value.get("name"): value.get("value")
+        for value in init[0].get("environment", [])
+        if isinstance(value, dict)
+    }
+    raw_config = variables.get("NHP_HUB_PUBLIC_CONFIG_JSON")
+    if not isinstance(raw_config, str):
+        raise EvidenceError("Hub public selector config is absent")
+    try:
+        config = json.loads(raw_config)
+    except json.JSONDecodeError as exc:
+        raise EvidenceError("Hub public selector config is invalid JSON") from exc
+    fields = (
+        "issue_assignment_alias_arn",
+        "refresh_assignment_alias_arn",
+        "issue_credential_recovery_alias_arn",
+    )
+    qualifiers = set()
+    for field in fields:
+        arn = config.get(field) if isinstance(config, dict) else None
+        contract._arn(arn, f"Hub selector {field}")
+        qualifier = arn.rsplit(":", 1)[-1]
+        if qualifier not in {"blue", "green"}:
+            raise EvidenceError(f"Hub selector {field} qualifier is not closed")
+        qualifiers.add(qualifier)
+    if len(qualifiers) != 1:
+        raise EvidenceError("Hub Authority selectors use mixed colors")
+    return qualifiers.pop()
 
 
 def _public_key_parameter() -> tuple[str, int, str]:
@@ -3937,6 +4074,7 @@ def collect_aws_and_build_snapshot(
         str(identity.get("Arn", ""))
     ):
         raise EvidenceError("producer did not assume the dedicated sandbox read role")
+    connector_proof_kms_key_arn = _connector_proof_kms_key_arn()
     proof_source = _proof_source_eip()
     ac_registration_cidrs = _ac_registration_eip_cidrs()
     hub_key, hub_key_version, hub_key_digest = _public_key_parameter()
@@ -4140,6 +4278,11 @@ def collect_aws_and_build_snapshot(
     }
     runtime = {
         "schema_version": 1,
+        "connector_sealed_state": {
+            "provider": "aws-kms",
+            "region": AWS_REGION,
+            "key_arn": connector_proof_kms_key_arn,
+        },
         "hub": {
             "host": "hub.nhp.layerv.xyz",
             "port": contract.UDP_PORT,

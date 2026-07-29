@@ -24,6 +24,7 @@ import test_udp_proof_deployment_contract as producer_fixture  # noqa: E402
 import test_udp_proof_orchestrator_contract as orchestrator_fixture  # noqa: E402
 import udp_proof_deployment_contract as contract  # noqa: E402
 import udp_proof_orchestrator_contract as orchestrator  # noqa: E402
+import udp_proof_retirement_targets_contract as retirement_targets  # noqa: E402
 
 
 VALIDATOR_PATH = SCRIPTS / "validate_udp_proof_producer_artifact.py"
@@ -118,15 +119,70 @@ def write_valid_triplet(directory: Path) -> dict[str, object]:
     ):
         (directory / name).write_bytes(raw)
     write_orchestrator_evidence(directory)
+    write_retirement_targets(directory)
     return snapshot
 
 
 def write_orchestrator_evidence(directory: Path) -> None:
     """Add the fourth canonical file the producer artifact must now carry."""
 
-    document, _, _, _ = orchestrator_fixture.build_document()
+    document, *_ = orchestrator_fixture.build_document()
     (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(
         orchestrator.canonical_bytes(document)
+    )
+
+
+def write_retirement_targets(directory: Path) -> None:
+    provenance_raw = (directory / "deployment-provenance.json").read_bytes()
+    route53 = lambda host, zone: {  # noqa: E731
+        "alias_dns_name": f"dualstack.{host}",
+        "record_name": host,
+        "zone_id": zone,
+    }
+    document = {
+        "gate": retirement_targets.GATE,
+        "http_operations": [
+            {
+                "host": host,
+                "method": method,
+                "path": path,
+                "route53": route53(host, zone),
+            }
+            for host, method, path, zone in retirement_targets.HTTP_OPERATIONS
+        ],
+        "observed_at": VALIDATION_TIME.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "phase": "pre_removal",
+        "producer": {
+            "deployment_provenance_sha256": hashlib.sha256(
+                provenance_raw
+            ).hexdigest(),
+            "head_sha": HEAD_SHA,
+            "run_attempt": RUN_ATTEMPT,
+            "run_id": RUN_ID,
+            "surface_contract_sha256": "a" * 64,
+        },
+        "relay": {
+            "aliases": [
+                {"cell_id": "cell0", "server_id": "AAAAAAAAAAA"},
+                {"cell_id": "cell1", "server_id": "BBBBBBBBBBB"},
+            ],
+            "base_url": retirement_targets.RELAY_BASE_URL,
+            "route53": route53(
+                "relay.qurl.link.layerv.xyz",
+                retirement_targets.PUBLIC_ZONE_ID,
+            ),
+            "ssm": {
+                "name": retirement_targets.RELAY_PARAMETER,
+                "value_sha256": hashlib.sha256(
+                    retirement_targets.RELAY_BASE_URL.encode("ascii")
+                ).hexdigest(),
+                "version": 2,
+            },
+        },
+        "schema_version": 1,
+    }
+    (directory / retirement_targets.ARTIFACT_FILE_NAME).write_bytes(
+        retirement_targets.canonical_bytes(document)
     )
 
 
@@ -159,6 +215,7 @@ def rewrite_snapshot(directory: Path, snapshot: dict[str, object]) -> None:
             name="deployment-provenance.json",
         )
     )
+    write_retirement_targets(directory)
 
 
 class MetadataTest(unittest.TestCase):
@@ -322,8 +379,43 @@ class FilesTest(unittest.TestCase):
                     (directory / "deployment-runtime-inputs.json").read_bytes()
                 ).hexdigest(),
             )
+            self.assertEqual(
+                outputs["proof_recovery_alias_arn"],
+                "arn:aws:lambda:us-east-2:767397897469:"
+                "function:layerv-nhp-sandbox-ca-pcr:blue",
+            )
             self.assertNotIn("connector_ref", outputs)
             self.assertNotIn("qurl_go_ref", outputs)
+
+    def test_rejects_missing_or_ambiguous_recovery_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            snapshot = write_valid_triplet(directory)
+            authority = snapshot["provenance"]["evidence"]["workloads"][  # type: ignore[index]
+                "qurl_service_authority"
+            ]
+            functions = authority["functions"]
+            pcr = functions.pop()
+            rewrite_snapshot(directory, snapshot)
+            with self.assertRaisesRegex(
+                validator.ArtifactValidationError,
+                "orchestrator evidence is not bound",
+            ):
+                self.validate(directory)
+
+            functions.append(pcr)
+            duplicate = copy.deepcopy(pcr)
+            duplicate["alias_arn"] = (
+                duplicate["alias_arn"].removesuffix(":blue") + ":green"
+            )
+            functions.append(duplicate)
+            functions.sort(key=lambda item: (item["alias_arn"], item["version_arn"]))
+            rewrite_snapshot(directory, snapshot)
+            with self.assertRaisesRegex(
+                validator.ArtifactValidationError,
+                "orchestrator evidence is not bound",
+            ):
+                self.validate(directory)
 
     def test_selects_qurl_go_ref_only_from_authenticated_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -424,7 +516,7 @@ class FilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             write_valid_triplet(directory)
-            document, _, _, _ = orchestrator_fixture.build_document()
+            document, *_ = orchestrator_fixture.build_document()
             document["bindings"]["deployment_manifest_sha256"] = "0" * 64
             (directory / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(
                 orchestrator.canonical_bytes(document)

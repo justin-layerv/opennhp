@@ -278,6 +278,14 @@ def valid_snapshot() -> dict[str, object]:
     }
     runtime = {
         "schema_version": 1,
+        "connector_sealed_state": {
+            "provider": "aws-kms",
+            "region": "us-east-2",
+            "key_arn": (
+                "arn:aws:kms:us-east-2:767397897469:key/"
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            ),
+        },
         "hub": {
             "host": "hub.nhp.layerv.xyz",
             "port": 62206,
@@ -496,6 +504,16 @@ def valid_snapshot() -> dict[str, object]:
                     "version_arn": (
                         "arn:aws:lambda:us-east-2:767397897469:"
                         "function:layerv-nhp-sandbox-ca-ia:1"
+                    ),
+                },
+                {
+                    "alias_arn": (
+                        "arn:aws:lambda:us-east-2:767397897469:"
+                        "function:layerv-nhp-sandbox-ca-pcr:blue"
+                    ),
+                    "version_arn": (
+                        "arn:aws:lambda:us-east-2:767397897469:"
+                        "function:layerv-nhp-sandbox-ca-pcr:2"
                     ),
                 }
             ],
@@ -904,12 +922,14 @@ class ProducerTest(unittest.TestCase):
             self.assertEqual(
                 {path.name for path in output.iterdir()}, producer.OUTPUT_FILES
             )
-            # The renderer owns exactly the deployment triplet; the orchestrator
-            # evidence file is added by its own collector before upload, so the
-            # loader is only exercised once the artifact is complete.
+            # The renderer owns exactly the deployment triplet. Independent
+            # collectors add the orchestrator evidence and retirement targets
+            # before upload, so the loader is exercised only once all five
+            # canonical files are present.
             with self.assertRaises(contract.ContractError):
                 contract.load_triplet_directory(output)
             (output / contract.ORCHESTRATOR_EVIDENCE_FILE).write_bytes(b"{}")
+            (output / contract.RETIREMENT_TARGETS_FILE).write_bytes(b"{}")
             loaded_manifest, loaded_runtime, loaded_provenance = (
                 contract.load_triplet_directory(output)
             )

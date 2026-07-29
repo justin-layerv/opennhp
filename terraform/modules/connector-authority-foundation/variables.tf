@@ -323,6 +323,46 @@ variable "authority_proof_policy_consumers_staged" {
   default     = false
 }
 
+variable "authority_proof_policy_selected_color" {
+  description = <<-EOT
+    Sandbox-only attended-proof selector for IA/RA/ICR and ca-pm. Null keeps
+    the ordinary Authority contract selector and steady single-color capacity.
+    A non-null value opens the bounded equal-pool rollback window and is changed
+    only by a checked saved-plan Terraform selector apply after both colors are
+    READY.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.authority_proof_policy_selected_color == null ||
+      contains(["blue", "green"], var.authority_proof_policy_selected_color)
+    )
+    error_message = "authority_proof_policy_selected_color must be null, blue, or green."
+  }
+}
+
+variable "authority_proof_policy_prepared_color" {
+  description = <<-EOT
+    Sandbox-only color whose inactive IA/RA/ICR aliases Terraform may retarget
+    to the staged proof-aware version. It is null outside the rollback window.
+    Changing the selected color never changes this value, so a selector plan
+    cannot retarget an alias. Preparing the former color is a separate saved
+    plan while that color is inactive.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.authority_proof_policy_prepared_color == null ||
+      contains(["blue", "green"], var.authority_proof_policy_prepared_color)
+    )
+    error_message = "authority_proof_policy_prepared_color must be null, blue, or green."
+  }
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = <<-EOT
     Owner identity of the dedicated sandbox proof tenant that owns every

@@ -7,6 +7,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -44,6 +45,23 @@ TIMESTAMP_RE = re.compile(
 PHASES = frozenset({"pre_removal", "post_removal"})
 ARM_LEASE_SECONDS = 2100
 EXPIRE_LEASE_SECONDS = 30
+PROOF_SOURCE_IP = "3.141.109.76"
+TRANSPORT_HTTP_HOSTS = [
+    "api.layerv.xyz",
+    "bootstrap.layerv.xyz",
+    "relay.qurl.link.layerv.xyz",
+]
+QURL_SERVICE_LOG_GROUPS = [
+    "/layerv/nhp/sandbox/cell0/qurl-api",
+    "/layerv/nhp/sandbox/cell1/qurl-api",
+]
+RELAY_LOG_GROUP = "/layerv/nhp/sandbox/relay"
+LEGACY_LIFECYCLE_HTTP_ROUTES = [
+    {"method": "GET", "path": "/v1/agent/registration-info"},
+    {"method": "POST", "path": "/v1/agent/bootstrap"},
+    {"method": "POST", "path": "/v1/agent/registration/complete"},
+]
+COUNTER_INGESTION_WAIT_SECONDS = 120
 
 
 class HandshakeError(RuntimeError):
@@ -229,6 +247,42 @@ def validate_descriptor(value: Any) -> dict[str, Any]:
     return descriptor
 
 
+def build_transport_descriptor(assignment: dict[str, Any]) -> dict[str, Any]:
+    prefix = (
+        f"handshake/v1/{assignment['controller_run_id']}/"
+        f"{assignment['controller_run_attempt']}/{assignment['channel_id']}"
+    )
+    return {
+        "version": 1,
+        "controller_run_id": assignment["controller_run_id"],
+        "controller_run_attempt": assignment["controller_run_attempt"],
+        "client": assignment["client"],
+        "proof_phase": assignment["proof_phase"],
+        "channel_id": assignment["channel_id"],
+        "correlation_id": assignment["correlation_id"],
+        "agent_id": assignment["agent_id"],
+        "bucket": assignment["bucket"],
+        "kms_key_arn": assignment["kms_key_arn"],
+        "checkpoint_key": f"{prefix}/transport-checkpoint.json",
+        "receipt_key": f"{prefix}/transport-receipt.json",
+        "proof_source_ip": PROOF_SOURCE_IP,
+        "lifecycle_http_hosts": TRANSPORT_HTTP_HOSTS,
+        "qurl_service_log_groups": QURL_SERVICE_LOG_GROUPS,
+        "relay_log_group": RELAY_LOG_GROUP,
+        "legacy_lifecycle_http_routes": LEGACY_LIFECYCLE_HTTP_ROUTES,
+    }
+
+
+def validate_transport_descriptor(
+    value: Any, assignment: dict[str, Any]
+) -> dict[str, Any]:
+    expected = build_transport_descriptor(assignment)
+    descriptor = _exact(value, set(expected), "transport descriptor")
+    if descriptor != expected:
+        raise HandshakeError("transport descriptor is not assignment-run-bound")
+    return descriptor
+
+
 def validate_mutation_response(
     value: Any,
     mutation: str,
@@ -366,6 +420,77 @@ def validate_checkpoint(
     if not valid:
         raise HandshakeError("client checkpoint does not bind this controller run")
     _timestamp(checkpoint["lease_expires_at"], "client checkpoint lease_expires_at")
+    return checkpoint
+
+
+def validate_transport_checkpoint(
+    value: Any,
+    descriptor: dict[str, Any],
+    *,
+    client_run_id: str,
+    client_sha: str,
+) -> dict[str, Any]:
+    checkpoint = _exact(
+        value,
+        {
+            "agent_id",
+            "capture_ended_at",
+            "capture_sha256",
+            "capture_started_at",
+            "capture_targets_sha256",
+            "captured_packet_count",
+            "channel_id",
+            "client_run_id",
+            "client_sha",
+            "controller_run_attempt",
+            "controller_run_id",
+            "correlation_id",
+            "http_trap_calls",
+            "nhp_udp_lifecycle_success",
+            "observed_cell_ids",
+            "udp_62206_inbound",
+            "udp_62206_outbound",
+            "version",
+        },
+        "transport checkpoint",
+    )
+    valid = (
+        checkpoint["version"] == 1
+        and checkpoint["controller_run_id"] == descriptor["controller_run_id"]
+        and checkpoint["controller_run_attempt"] == descriptor["controller_run_attempt"]
+        and checkpoint["channel_id"] == descriptor["channel_id"]
+        and checkpoint["client_run_id"] == client_run_id
+        and checkpoint["client_sha"] == client_sha
+        and checkpoint["correlation_id"] == descriptor["correlation_id"]
+        and checkpoint["agent_id"] == descriptor["agent_id"]
+        and isinstance(checkpoint["capture_sha256"], str)
+        and HEX64_RE.fullmatch(checkpoint["capture_sha256"]) is not None
+        and isinstance(checkpoint["capture_targets_sha256"], str)
+        and HEX64_RE.fullmatch(checkpoint["capture_targets_sha256"]) is not None
+        and type(checkpoint["captured_packet_count"]) is int
+        and checkpoint["captured_packet_count"] >= 2
+        and type(checkpoint["udp_62206_outbound"]) is int
+        and checkpoint["udp_62206_outbound"] >= 1
+        and type(checkpoint["udp_62206_inbound"]) is int
+        and checkpoint["udp_62206_inbound"] >= 1
+        and checkpoint["captured_packet_count"]
+        == checkpoint["udp_62206_outbound"] + checkpoint["udp_62206_inbound"]
+        and checkpoint["http_trap_calls"] == 0
+        and checkpoint["observed_cell_ids"] == ["cell0", "cell1"]
+        and checkpoint["nhp_udp_lifecycle_success"] is True
+    )
+    if not valid:
+        raise HandshakeError("transport checkpoint does not prove the exact UDP run")
+    started = _timestamp(checkpoint["capture_started_at"], "capture_started_at")
+    ended = _timestamp(checkpoint["capture_ended_at"], "capture_ended_at")
+    now = datetime.now(timezone.utc)
+    if (
+        ended < started
+        or (ended - started).total_seconds() > 3600
+        or (ended - now).total_seconds() > 30
+        or (now - ended).total_seconds() > 300
+    ):
+        raise HandshakeError("transport capture interval is invalid")
     return checkpoint
 
 
@@ -540,12 +665,209 @@ def _get_object(
             time.sleep(5)
 
 
+def _filter_log_events(
+    log_group: str,
+    *,
+    start_millis: int,
+    end_millis: int,
+    filter_pattern: str,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
+    token = ""
+    seen_tokens: set[str] = set()
+    for _ in range(100):
+        command = [
+            "aws",
+            "logs",
+            "filter-log-events",
+            "--region",
+            REGION,
+            "--log-group-name",
+            log_group,
+            "--start-time",
+            str(start_millis),
+            "--end-time",
+            str(end_millis),
+            "--filter-pattern",
+            filter_pattern,
+            "--limit",
+            "10000",
+            "--no-paginate",
+            "--output",
+            "json",
+        ]
+        if token:
+            command.extend(["--next-token", token])
+        page = _loads(_run(command, f"read {log_group}", timeout=90), log_group)
+        if not isinstance(page, dict) or not set(page).issubset(
+            {"events", "nextToken", "searchedLogStreams"}
+        ):
+            raise HandshakeError(f"{log_group} returned malformed log results")
+        page_events = page.get("events")
+        if not isinstance(page_events, list):
+            raise HandshakeError(f"{log_group} omitted log events")
+        for event in page_events:
+            event = _exact(
+                event,
+                {
+                    "eventId",
+                    "ingestionTime",
+                    "logStreamName",
+                    "message",
+                    "timestamp",
+                },
+                f"{log_group} event",
+            )
+            event_id = event["eventId"]
+            if (
+                not isinstance(event_id, str)
+                or not event_id
+                or event_id in seen_event_ids
+                or type(event["timestamp"]) is not int
+                or not start_millis <= event["timestamp"] <= end_millis
+                or type(event["ingestionTime"]) is not int
+                or not isinstance(event["logStreamName"], str)
+                or not event["logStreamName"]
+                or not isinstance(event["message"], str)
+            ):
+                raise HandshakeError(f"{log_group} event is malformed or duplicated")
+            seen_event_ids.add(event_id)
+            events.append(event)
+        next_token = page.get("nextToken", "")
+        if next_token == token or next_token == "":
+            return events
+        if (
+            not isinstance(next_token, str)
+            or not next_token
+            or next_token in seen_tokens
+            or len(next_token) > 8192
+        ):
+            raise HandshakeError(f"{log_group} pagination token is invalid")
+        seen_tokens.add(next_token)
+        token = next_token
+    raise HandshakeError(f"{log_group} pagination exceeded its bound")
+
+
+def _count_qurl_service_legacy_routes(
+    descriptor: dict[str, Any],
+    *,
+    start_millis: int,
+    end_millis: int,
+) -> int:
+    routes = {
+        (item["method"], item["path"])
+        for item in descriptor["legacy_lifecycle_http_routes"]
+    }
+    count = 0
+    filter_pattern = (
+        '{ $.msg = "http request" && $.client_ip = "'
+        + descriptor["proof_source_ip"]
+        + '" }'
+    )
+    for log_group in descriptor["qurl_service_log_groups"]:
+        for event in _filter_log_events(
+            log_group,
+            start_millis=start_millis,
+            end_millis=end_millis,
+            filter_pattern=filter_pattern,
+        ):
+            message = _loads(event["message"], f"{log_group} http request")
+            if not isinstance(message, dict):
+                raise HandshakeError("qurl-service HTTP request log is not an object")
+            method = message.get("method")
+            path = message.get("path")
+            if (
+                message.get("msg") != "http request"
+                or message.get("client_ip") != descriptor["proof_source_ip"]
+                or not isinstance(method, str)
+                or not isinstance(path, str)
+            ):
+                raise HandshakeError("qurl-service HTTP request log binding is malformed")
+            if (method, path.partition("?")[0]) in routes:
+                count += 1
+    return count
+
+
+def _count_relay_routes(
+    descriptor: dict[str, Any],
+    *,
+    start_millis: int,
+    end_millis: int,
+) -> int:
+    events = _filter_log_events(
+        descriptor["relay_log_group"],
+        start_millis=start_millis,
+        end_millis=end_millis,
+        filter_pattern=(
+            '"relay: proof request" "route=relay" "source_ip='
+            + descriptor["proof_source_ip"]
+            + '"'
+        ),
+    )
+    pattern = re.compile(
+        r"(?:^|\s)relay: proof request route=relay source_ip="
+        + re.escape(descriptor["proof_source_ip"])
+        + r"(?:\s|$)"
+    )
+    for event in events:
+        if pattern.search(event["message"]) is None:
+            raise HandshakeError("relay proof request log binding is malformed")
+    return len(events)
+
+
+def _observe_transport_counters(
+    descriptor: dict[str, Any], checkpoint: dict[str, Any]
+) -> tuple[int, int, str]:
+    ended = _timestamp(checkpoint["capture_ended_at"], "capture_ended_at")
+    deadline = ended.timestamp() + COUNTER_INGESTION_WAIT_SECONDS
+    remaining = deadline - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
+    started = _timestamp(checkpoint["capture_started_at"], "capture_started_at")
+    start_millis = int(started.timestamp() * 1000)
+    end_millis = int(ended.timestamp() * 1000) + 999
+    qurl_count = _count_qurl_service_legacy_routes(
+        descriptor,
+        start_millis=start_millis,
+        end_millis=end_millis,
+    )
+    relay_count = _count_relay_routes(
+        descriptor,
+        start_millis=start_millis,
+        end_millis=end_millis,
+    )
+    observed_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    return qurl_count, relay_count, observed_at
+
+
 def _write_output(path: Path, values: dict[str, str]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         for key, value in values.items():
             if "\n" in value or "\r" in value:
                 raise HandshakeError(f"output {key} contains a newline")
             stream.write(f"{key}={value}\n")
+
+
+def _write_once(path: Path, raw: bytes) -> None:
+    if not path.is_absolute() or path != path.resolve(strict=False):
+        raise HandshakeError("receipt output must be one canonical absolute path")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise HandshakeError("could not publish immutable proof receipt") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -610,7 +932,10 @@ def prepare(args: argparse.Namespace) -> None:
         "arm",
         descriptor,
     )
-    payload = {"descriptor": descriptor, "arm": arm}
+    transport = validate_transport_descriptor(
+        build_transport_descriptor(descriptor), descriptor
+    )
+    payload = {"descriptor": descriptor, "arm": arm, "transport": transport}
     encoded = base64.b64encode(_canonical(payload)).decode()
     _write_output(
         args.github_output,
@@ -625,16 +950,21 @@ def prepare(args: argparse.Namespace) -> None:
 def complete(args: argparse.Namespace) -> None:
     payload = _exact(
         _loads(_decode_b64(args.handshake_b64, "handshake"), "handshake"),
-        {"arm", "descriptor"},
+        {"arm", "descriptor", "transport"},
         "handshake",
     )
     descriptor = validate_descriptor(payload["descriptor"])
+    transport = validate_transport_descriptor(payload["transport"], descriptor)
     validate_mutation_response(payload["arm"], "arm", descriptor)
     if (
         RUN_RE.fullmatch(args.client_run_id) is None
         or SHA_RE.fullmatch(args.client_sha) is None
     ):
         raise HandshakeError("resolved client workflow run/SHA binding is invalid")
+    assignment_output = getattr(args, "assignment_receipt_output", None)
+    transport_output = getattr(args, "transport_receipt_output", None)
+    if (assignment_output is None) != (transport_output is None):
+        raise HandshakeError("both normalized receipt outputs must be supplied together")
     checkpoint_raw = _get_object(
         descriptor, descriptor["checkpoint_key"], timeout_seconds=args.timeout_seconds
     )
@@ -686,7 +1016,84 @@ def complete(args: argparse.Namespace) -> None:
         "move": move,
         "expire_lease": expire,
     }
-    _put_object(descriptor, descriptor["receipt_key"], _canonical(receipt))
+    receipt_raw = _canonical(receipt)
+    _put_object(descriptor, descriptor["receipt_key"], receipt_raw)
+    transport_checkpoint_raw = _get_object(
+        transport,
+        transport["checkpoint_key"],
+        timeout_seconds=args.timeout_seconds,
+    )
+    transport_checkpoint = validate_transport_checkpoint(
+        _loads(transport_checkpoint_raw, "transport checkpoint"),
+        transport,
+        client_run_id=args.client_run_id,
+        client_sha=args.client_sha,
+    )
+    qurl_count, relay_count, observed_at = _observe_transport_counters(
+        transport, transport_checkpoint
+    )
+    if qurl_count != 0 or relay_count != 0:
+        raise HandshakeError(
+            "exact qurl-go lifecycle touched a legacy HTTP or relay route"
+        )
+    transport_receipt = {
+        "version": 1,
+        "descriptor": transport,
+        "client_run_id": args.client_run_id,
+        "client_sha": args.client_sha,
+        "checkpoint_sha256": hashlib.sha256(
+            transport_checkpoint_raw
+        ).hexdigest(),
+        "capture_sha256": transport_checkpoint["capture_sha256"],
+        "capture_targets_sha256": transport_checkpoint[
+            "capture_targets_sha256"
+        ],
+        "capture_started_at": transport_checkpoint["capture_started_at"],
+        "capture_ended_at": transport_checkpoint["capture_ended_at"],
+        "nhp_udp_lifecycle_success": True,
+        "qurl_service_legacy_route_count": qurl_count,
+        "relay_route_count": relay_count,
+        "counters_observed_at": observed_at,
+    }
+    transport_receipt_raw = _canonical(transport_receipt)
+    _put_object(
+        transport,
+        transport["receipt_key"],
+        transport_receipt_raw,
+    )
+    if assignment_output is not None:
+        normalized_assignment = {
+            "agent_id_sha256": hashlib.sha256(
+                descriptor["agent_id"].encode("utf-8")
+            ).hexdigest(),
+            "assigned_cells": [
+                descriptor["pinned_cell_id"],
+                descriptor["target_cell_id"],
+            ],
+            "checkpoint_sha256": hashlib.sha256(checkpoint_raw).hexdigest(),
+            "client_run_id": int(args.client_run_id),
+            "client_sha": args.client_sha,
+            "correlation_id_sha256": hashlib.sha256(
+                descriptor["correlation_id"].encode("utf-8")
+            ).hexdigest(),
+            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
+        }
+        normalized_transport = {
+            "capture_ended_at": transport_checkpoint["capture_ended_at"],
+            "capture_sha256": transport_checkpoint["capture_sha256"],
+            "capture_started_at": transport_checkpoint["capture_started_at"],
+            "capture_targets_sha256": transport_checkpoint[
+                "capture_targets_sha256"
+            ],
+            "client_run_id": int(args.client_run_id),
+            "client_sha": args.client_sha,
+            "nhp_udp_lifecycle_success": True,
+            "qurl_service_legacy_route_count": qurl_count,
+            "receipt_sha256": hashlib.sha256(transport_receipt_raw).hexdigest(),
+            "relay_route_count": relay_count,
+        }
+        _write_once(assignment_output, _canonical(normalized_assignment))
+        _write_once(transport_output, _canonical(normalized_transport))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -703,6 +1110,8 @@ def parser() -> argparse.ArgumentParser:
     finish.add_argument("--handshake-b64", required=True)
     finish.add_argument("--client-run-id", required=True)
     finish.add_argument("--client-sha", required=True)
+    finish.add_argument("--assignment-receipt-output", type=Path)
+    finish.add_argument("--transport-receipt-output", type=Path)
     finish.add_argument("--timeout-seconds", type=int, default=3600, choices=range(30, 5401))
     finish.set_defaults(func=complete)
     return root

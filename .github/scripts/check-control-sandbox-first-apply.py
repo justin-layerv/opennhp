@@ -234,6 +234,7 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "authority_data_kms_key_arn",
         "authority_ecr_repository_url",
         "authority_image_digest_parameter_name",
+        "authority_proof_credential_recovery_alias_arn",
         "authority_proof_mutation_alias_arn",
         "authority_publisher_github_environment",
         "authority_publisher_role_arn",
@@ -843,6 +844,23 @@ AUTHORITY_PROOF_CONSUMER_BASE_UPDATE_ADDRESSES = frozenset(
         ),
     }
 )
+AUTHORITY_PROOF_ROLLOUT_FUNCTIONS = frozenset(
+    {*AUTHORITY_PROOF_CONSUMER_FUNCTIONS, AUTHORITY_PROOF_FUNCTION_NAME}
+)
+AUTHORITY_PROOF_ROLLOUT_RESOURCES = {
+    (
+        "module.control.aws_lambda_provisioned_concurrency_config."
+        f'authority_proof_standby["{function_name}"]'
+    ): "aws_lambda_provisioned_concurrency_config"
+    for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+}
+AUTHORITY_PROOF_ROLLOUT_SELECTOR_CHANGES = frozenset(
+    {
+        "module.control.terraform_data.foundation_contract",
+        "module.control.aws_ecs_task_definition.hub[0]",
+        "module.control.aws_ecs_service.hub[0]",
+    }
+)
 # The 11 already-live spillover alarms gain alarm_actions in place; every other
 # alarm address is a pure create.
 AUTHORITY_ALARM_UPDATE_ADDRESSES = frozenset(
@@ -1382,6 +1400,11 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws",
     ),
     "module.control.aws_lambda_provisioned_concurrency_config.authority": (
+        "managed",
+        "aws_lambda_provisioned_concurrency_config",
+        "aws",
+    ),
+    "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby": (
         "managed",
         "aws_lambda_provisioned_concurrency_config",
         "aws",
@@ -3369,12 +3392,27 @@ def _require_authority_runtime_binding(
     dark_keys = {"account_id", "control_table_prefix", "region"}
     if set(payload) == dark_keys:
         return False
-    if set(payload) != {
+    runtime_keys = {
         *dark_keys,
         "authority_image_uri",
         "authority_runtime_contract",
-    }:
+    }
+    staging_keys = {"authority_proof_policy_consumers_staged"}
+    rollout_keys = {
+        "authority_proof_policy_selected_color",
+        "authority_proof_policy_prepared_color",
+    }
+    extras = set(payload) - runtime_keys
+    if extras not in (set(), staging_keys, staging_keys | rollout_keys):
         raise ContractError("foundation runtime input keys are not exact")
+    if extras and payload.get("authority_proof_policy_consumers_staged") is not True:
+        raise ContractError("foundation proof-policy staging latch is not exact")
+    if extras == staging_keys | rollout_keys and (
+        payload.get("authority_proof_policy_selected_color") not in {"blue", "green"}
+        or payload.get("authority_proof_policy_prepared_color")
+        not in {"blue", "green"}
+    ):
+        raise ContractError("foundation proof-policy rollout colors are not exact")
     contract = payload.get("authority_runtime_contract")
     if not isinstance(contract, dict):
         raise ContractError("foundation runtime contract must be an object")
@@ -3480,6 +3518,71 @@ def _require_authority_runtime_binding(
     ):
         raise ContractError("foundation runtime evidence binding is not exact")
     return True
+
+
+def _authority_proof_rollout_colors(
+    foundation: dict[str, Any],
+) -> tuple[str, str] | None:
+    payload = foundation.get("input")
+    if not isinstance(payload, dict):
+        raise ContractError("foundation contract input must be an object")
+    selected = payload.get("authority_proof_policy_selected_color")
+    prepared = payload.get("authority_proof_policy_prepared_color")
+    if selected is None and prepared is None:
+        return None
+    if (
+        payload.get("authority_proof_policy_consumers_staged") is not True
+        or selected not in {"blue", "green"}
+        or prepared not in {"blue", "green"}
+    ):
+        raise ContractError("foundation proof-policy rollout binding is malformed")
+    contract = payload.get("authority_runtime_contract")
+    if (
+        not isinstance(contract, dict)
+        or contract.get("selected_authority_color") != "blue"
+    ):
+        raise ContractError("proof-policy rollout must retain the fixed blue basis")
+    return selected, prepared
+
+
+def _authority_proof_rollout_transition(
+    before: dict[str, Any], after: dict[str, Any]
+) -> str | None:
+    before_colors = _authority_proof_rollout_colors(before)
+    after_colors = _authority_proof_rollout_colors(after)
+    if after_colors is None:
+        return None
+    selected, prepared = after_colors
+    if selected != prepared:
+        if before_colors is None:
+            return "prepare" if (selected, prepared) == ("blue", "green") else None
+        before_selected, before_prepared = before_colors
+        if (
+            before_selected == selected
+            and before_prepared != prepared
+            and prepared != selected
+        ):
+            return "prepare"
+        return None
+    if before_colors is None:
+        return None
+    before_selected, before_prepared = before_colors
+    if (
+        before_selected != selected
+        and before_prepared == prepared
+        and selected == prepared
+    ):
+        return "selector"
+    return None
+
+
+def _hub_authority_alias_arns(rollout: bool) -> set[str]:
+    colors = ("blue", "green") if rollout else ("blue",)
+    return {
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{function_name}:{color}"
+        for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+        for color in colors
+    }
 
 
 def _is_exact_legacy_hub_runtime_expansion(
@@ -4177,6 +4280,7 @@ def _check_planned_security(
     catalog_mode: bool = False,
     runtime_mode: bool = False,
     proof_mode: bool = False,
+    proof_rollout_mode: bool = False,
     hub_worker_mode: bool = False,
     refresh_disabled: bool = False,
 ) -> None:
@@ -4539,7 +4643,9 @@ def _check_planned_security(
         elif runtime_mode and address == AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS:
             _check_authority_email_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
-            _check_hub_lambda_endpoint_policy(after, address)
+            _check_hub_lambda_endpoint_policy(
+                after, address, rollout=proof_rollout_mode
+            )
         elif (
             hub_worker_mode
             and not runtime_mode
@@ -5115,7 +5221,9 @@ def _endpoint_allow_statements(
     return by_sid
 
 
-def _check_hub_lambda_endpoint_policy(after: dict[str, Any], address: str) -> None:
+def _check_hub_lambda_endpoint_policy(
+    after: dict[str, Any], address: str, *, rollout: bool = False
+) -> None:
     # The opened lambda interface endpoint admits ONLY the Hub worker task role,
     # invoking ONLY the 3 selected-color authority aliases. Same Principal "*" +
     # aws:PrincipalArn shape as the runtime dependency endpoints -- a role-ARN
@@ -5131,11 +5239,11 @@ def _check_hub_lambda_endpoint_policy(after: dict[str, Any], address: str) -> No
         "lambda:InvokeFunction"
     }:
         raise ContractError(f"{address} action must be exactly lambda:InvokeFunction")
-    if _authority_string_set(stmt.get("Resource"), address, "Resource") != set(
-        HUB_AUTHORITY_ALIAS_ARNS
-    ):
+    if _authority_string_set(
+        stmt.get("Resource"), address, "Resource"
+    ) != _hub_authority_alias_arns(rollout):
         raise ContractError(
-            f"{address} resources must be exactly the 3 selected-color authority aliases"
+            f"{address} resources must be exactly the bounded Authority alias set"
         )
 
 
@@ -6115,6 +6223,8 @@ def _check_authority_runtime_resources(
     functions = contract.get("functions") if isinstance(contract, dict) else None
     image_uri = payload.get("authority_image_uri") if isinstance(payload, dict) else None
     selected = contract.get("selected_authority_color") if isinstance(contract, dict) else None
+    rollout_colors = _authority_proof_rollout_colors(foundation)
+    proof_rollout = rollout_colors is not None
     if not isinstance(functions, dict) or selected not in ("blue", "green"):
         raise ContractError("runtime slice cannot resolve the bound contract functions")
 
@@ -6135,12 +6245,15 @@ def _check_authority_runtime_resources(
             raise ContractError(f"{fn} must be Image-packaged")
         if function_after.get("image_uri") != image_uri:
             raise ContractError(f"{fn} image_uri must be the contract-pinned repository@digest")
-        if (
-            function_after.get("reserved_concurrent_executions")
-            != spec.get("steady_reserved_concurrency")
-        ):
+        proof_rollout_function = fn in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+        expected_reserved = spec.get(
+            "rollout_reserved_concurrency"
+            if proof_rollout and proof_rollout_function
+            else "steady_reserved_concurrency"
+        )
+        if function_after.get("reserved_concurrent_executions") != expected_reserved:
             raise ContractError(
-                f"{fn} reserved concurrency must equal the contract steady reserved envelope"
+                f"{fn} reserved concurrency does not match its retained envelope"
             )
         vpc_config = function_after.get("vpc_config")
         if not isinstance(vpc_config, list) or len(vpc_config) != 1:
@@ -6150,15 +6263,36 @@ def _check_authority_runtime_resources(
             by_address,
             f'module.control.aws_lambda_provisioned_concurrency_config.authority["{fn}"]',
         )
+        expected_provisioned = spec.get(
+            "rollout_active_provisioned_concurrency"
+            if proof_rollout and proof_rollout_function
+            else "steady_provisioned_concurrency"
+        )
         if (
             provisioned_after.get("provisioned_concurrent_executions")
-            != spec.get("steady_provisioned_concurrency")
+            != expected_provisioned
         ):
             raise ContractError(
-                f"{fn} provisioned concurrency must equal the contract steady provisioned envelope"
+                f"{fn} provisioned concurrency does not match its retained envelope"
             )
         if provisioned_after.get("qualifier") not in (selected, None):
             raise ContractError(f"{fn} provisioned concurrency must target the selected color")
+        if proof_rollout and proof_rollout_function:
+            standby_after = _authority_runtime_after(
+                by_address,
+                (
+                    "module.control.aws_lambda_provisioned_concurrency_config."
+                    f'authority_proof_standby["{fn}"]'
+                ),
+            )
+            if (
+                standby_after.get("qualifier") not in ("green", None)
+                or standby_after.get("provisioned_concurrent_executions")
+                != spec.get("rollout_standby_provisioned_concurrency")
+            ):
+                raise ContractError(
+                    f"{fn} standby provisioned concurrency is not exact green READY capacity"
+                )
 
         _check_authority_exec_role_trust(
             _authority_runtime_after(
@@ -6243,10 +6377,14 @@ def _check_authority_runtime_resources(
         controller_policy = _authority_runtime_after(
             by_address, AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
         )
-        selected_alias = (
-            f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
-            f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected}"
-        )
+        proof_colors = ("blue", "green") if proof_rollout else (selected,)
+        selected_aliases = [
+            (
+                f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+                f"{AUTHORITY_PROOF_FUNCTION_NAME}:{color}"
+            )
+            for color in proof_colors
+        ]
         if (
             controller_policy.get("name") != "connector-authority-proof-invoke"
             or controller_policy.get("role")
@@ -6261,7 +6399,7 @@ def _check_authority_runtime_resources(
                     {
                         "Action": ["lambda:InvokeFunction"],
                         "Effect": "Allow",
-                        "Resource": [selected_alias],
+                        "Resource": selected_aliases,
                         "Sid": "InvokeSelectedProofMutationAlias",
                     }
                 ],
@@ -6269,7 +6407,7 @@ def _check_authority_runtime_resources(
             }
         ):
             raise ContractError(
-                "Control must own exactly one selected ca-pm alias invoke policy "
+                "Control must own exactly the bounded ca-pm alias invoke policy "
                 "on the deterministic proof-controller role"
             )
 
@@ -7065,10 +7203,15 @@ def _check_authority_proof_steady_output(
         if isinstance(payload, dict)
         else None
     )
+    rollout_colors = _authority_proof_rollout_colors(foundation)
     selected_color = (
-        contract.get("selected_authority_color")
-        if isinstance(contract, dict)
-        else None
+        rollout_colors[0]
+        if rollout_colors is not None
+        else (
+            contract.get("selected_authority_color")
+            if isinstance(contract, dict)
+            else None
+        )
     )
     selected_alias = (
         f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
@@ -7086,17 +7229,32 @@ def _check_authority_proof_steady_output(
         != selected_alias
         or not isinstance(output_changes, dict)
         or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
-        or not _is_exact_output_change(
-            output_changes[AUTHORITY_PROOF_ALIAS_OUTPUT],
-            actions=["no-op"],
-            before=selected_alias,
-            after=selected_alias,
-        )
     ):
         raise ContractError(
             "steady attended-proof graph must retain the exact selected-color "
             "alias output"
         )
+    change = output_changes[AUTHORITY_PROOF_ALIAS_OUTPUT]
+    prefix = (
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+        f"{AUTHORITY_PROOF_FUNCTION_NAME}:"
+    )
+    other_alias = f"{prefix}{'green' if selected_color == 'blue' else 'blue'}"
+    if not (
+        _is_exact_output_change(
+            change,
+            actions=["no-op"],
+            before=selected_alias,
+            after=selected_alias,
+        )
+        or _is_exact_output_change(
+            change,
+            actions=["update"],
+            before=other_alias,
+            after=selected_alias,
+        )
+    ):
+        raise ContractError("attended-proof alias output action is invalid")
 
 
 def _check_authority_image_output_changes(
@@ -7617,6 +7775,141 @@ def _check_hub_worker_image_update(by_address: dict[str, Any]) -> None:
                 f"Hub worker task definition changed {key!r}; this lane admits an "
                 "image change and nothing else"
             )
+
+
+def _check_authority_proof_selector_update(
+    by_address: dict[str, Any], before_color: str, after_color: str
+) -> None:
+    item = by_address[HUB_WORKER_TASK_DEFINITION_ADDRESS]
+    change = item.get("change")
+    if (
+        item.get("type") != "aws_ecs_task_definition"
+        or item.get("mode") != "managed"
+        or not isinstance(change, dict)
+        or change.get("actions") != ["delete", "create"]
+        or change.get("replace_paths") != [["container_definitions"]]
+    ):
+        raise ContractError("proof selector must replace only the Hub task config")
+    before = change.get("before")
+    after = change.get("after")
+    after_unknown = change.get("after_unknown")
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or not isinstance(after_unknown, dict)
+    ):
+        raise ContractError("proof selector Hub task replacement is malformed")
+    expected_before_only = HUB_WORKER_TASK_DEFINITION_COMPUTED | {
+        "enable_fault_injection"
+    }
+    if set(after) - set(before) or set(before) - set(after) != expected_before_only:
+        raise ContractError("proof selector Hub task attribute set changed")
+    _check_hub_worker_provider_projections(before, after, after_unknown)
+    before_containers = _loads_container_definitions(before, "before")
+    after_containers = _loads_container_definitions(after, "after")
+    if (
+        [container.get("name") for container in before_containers] != ["hub", "hub-init"]
+        or [container.get("name") for container in after_containers] != ["hub", "hub-init"]
+    ):
+        raise ContractError("proof selector Hub container inventory changed")
+    if (
+        _normalize_hub_worker_container(before_containers[0])
+        != _normalize_hub_worker_container(after_containers[0])
+    ):
+        raise ContractError("proof selector changed the Hub runtime container")
+    before_init = _normalize_hub_worker_container(before_containers[1])
+    after_init = _normalize_hub_worker_container(after_containers[1])
+    before_environment = before_init.pop("environment", None)
+    after_environment = after_init.pop("environment", None)
+    if before_init != after_init:
+        raise ContractError("proof selector changed Hub init outside its environment")
+
+    def environment_map(value: Any) -> dict[str, Any]:
+        if not isinstance(value, list):
+            raise ContractError("proof selector Hub init environment is malformed")
+        result = {
+            entry.get("name"): entry.get("value")
+            for entry in value
+            if isinstance(entry, dict) and set(entry) == {"name", "value"}
+        }
+        if len(result) != len(value):
+            raise ContractError("proof selector Hub init environment is not unique")
+        return result
+
+    before_env = environment_map(before_environment)
+    after_env = environment_map(after_environment)
+    if set(before_env) != {"NHP_HUB_PUBLIC_CONFIG_JSON"} or set(after_env) != set(
+        before_env
+    ):
+        raise ContractError("proof selector Hub init environment surface changed")
+    try:
+        before_config = json.loads(before_env["NHP_HUB_PUBLIC_CONFIG_JSON"])
+        after_config = json.loads(after_env["NHP_HUB_PUBLIC_CONFIG_JSON"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ContractError("proof selector Hub config is not JSON") from error
+    alias_fields = {
+        "issue_assignment_alias_arn": "layerv-nhp-sandbox-ca-ia",
+        "refresh_assignment_alias_arn": "layerv-nhp-sandbox-ca-ra",
+        "issue_credential_recovery_alias_arn": "layerv-nhp-sandbox-ca-icr",
+    }
+    if not isinstance(before_config, dict) or not isinstance(after_config, dict):
+        raise ContractError("proof selector Hub config is not an object")
+    if set(before_config) != set(after_config):
+        raise ContractError("proof selector Hub config key set changed")
+    for key in before_config:
+        if key in alias_fields:
+            function_name = alias_fields[key]
+            prefix = (
+                f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{function_name}:"
+            )
+            if (
+                before_config[key] != f"{prefix}{before_color}"
+                or after_config[key] != f"{prefix}{after_color}"
+            ):
+                raise ContractError("proof selector Hub alias transition is not exact")
+        elif before_config[key] != after_config[key]:
+            raise ContractError("proof selector changed unrelated Hub config")
+    for key in before:
+        if key in (
+            *HUB_WORKER_TASK_DEFINITION_COMPUTED,
+            "container_definitions",
+            "enable_fault_injection",
+            "ipc_mode",
+            "pid_mode",
+            "volume",
+        ):
+            continue
+        if before[key] != after[key]:
+            raise ContractError("proof selector changed unrelated Hub task attributes")
+
+    service_change = by_address["module.control.aws_ecs_service.hub[0]"]["change"]
+    service_before = service_change.get("before")
+    service_after = service_change.get("after")
+    service_after_unknown = service_change.get("after_unknown")
+    if (
+        service_change.get("actions") != ["update"]
+        or not isinstance(service_before, dict)
+        or not isinstance(service_after, dict)
+        or (
+            service_before.get("task_definition")
+            == service_after.get("task_definition")
+            and not (
+                isinstance(service_after_unknown, dict)
+                and service_after_unknown.get("task_definition") is True
+            )
+        )
+        or {
+            key: value
+            for key, value in service_before.items()
+            if key != "task_definition"
+        }
+        != {
+            key: value
+            for key, value in service_after.items()
+            if key != "task_definition"
+        }
+    ):
+        raise ContractError("proof selector may update only the Hub task revision")
 
 
 def _normalize_hub_worker_container(container: dict[str, Any]) -> dict[str, Any]:
@@ -9811,6 +10104,10 @@ def check_plan(
     base_inventory = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     proof_extra = set(AUTHORITY_PROOF_RESOURCES)
+    proof_consumer_data_extra = set(
+        AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES
+    )
+    proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_inventory = set(by_address)
@@ -9825,11 +10122,19 @@ def check_plan(
         isinstance(by_address[address].get("change", {}).get("after"), dict)
         for address in actual_inventory & proof_extra
     )
+    proof_rollout_mode = bool(actual_inventory & proof_rollout_extra)
     hub_edge_mode = bool(actual_inventory & hub_edge_extra)
     hub_worker_mode = bool(actual_inventory & hub_worker_extra)
     if proof_mode and not runtime_mode:
         raise ContractError(
             "attended-proof Authority slice requires the complete runtime slice"
+        )
+    if proof_rollout_mode and not (
+        proof_mode and runtime_mode and hub_worker_mode
+    ):
+        raise ContractError(
+            "proof-policy rollout requires the complete attended-proof, "
+            "Authority runtime, and Hub worker slices"
         )
     if hub_worker_mode and not (hub_edge_mode and runtime_mode):
         raise ContractError(
@@ -9841,6 +10146,7 @@ def check_plan(
         | (catalog_extra if catalog_mode else set())
         | (runtime_extra if runtime_mode else set())
         | (proof_extra if proof_inventory_mode else set())
+        | (proof_rollout_extra if proof_rollout_mode else set())
         | (hub_edge_extra if hub_edge_mode else set())
         | (hub_worker_extra if hub_worker_mode else set())
     )
@@ -9980,6 +10286,76 @@ def check_plan(
         and authority_proof_consumer_disable_addresses is not None
         and changed == authority_proof_consumer_disable_addresses
         and all(actual_non_noop.get(address) == ["update"] for address in changed)
+    )
+    foundation_change = by_address[authority_contract_address]["change"]
+    authority_proof_rollout_transition_kind = (
+        _authority_proof_rollout_transition(
+            foundation_change.get("before", {}),
+            foundation_change.get("after", {}),
+        )
+        if authority_contract_address in changed
+        else None
+    )
+    rollout_after_colors = _authority_proof_rollout_colors(
+        foundation_change.get("after", {})
+    )
+    rollout_prepared_color = (
+        rollout_after_colors[1] if rollout_after_colors is not None else None
+    )
+    rollout_prepare_alias_changes = {
+        f'module.control.aws_lambda_alias.authority["{function_name}:{rollout_prepared_color}"]'
+        for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
+    }
+    rollout_initial_changes = {
+        authority_contract_address,
+        AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
+        "module.control.aws_iam_role_policy.hub_task[0]",
+        'module.control.aws_vpc_endpoint.interface["lambda"]',
+        *AUTHORITY_PROOF_ROLLOUT_RESOURCES,
+        *rollout_prepare_alias_changes,
+        *(
+            f'module.control.aws_lambda_function.authority["{function_name}"]'
+            for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+        ),
+    }
+    rollout_reprepare_changes = {
+        authority_contract_address,
+        *rollout_prepare_alias_changes,
+    }
+    rollout_before_absent = (
+        foundation_change.get("before", {})
+        .get("input", {})
+        .get("authority_proof_policy_selected_color")
+        is None
+    )
+    authority_proof_rollout_prepare_transition = (
+        proof_rollout_mode
+        and authority_proof_rollout_transition_kind == "prepare"
+        and changed
+        == (
+            rollout_initial_changes
+            if rollout_before_absent
+            else rollout_reprepare_changes
+        )
+        and all(
+            actual_non_noop.get(address)
+            == (
+                ["create"]
+                if address in AUTHORITY_PROOF_ROLLOUT_RESOURCES
+                else ["update"]
+            )
+            for address in changed
+        )
+    )
+    authority_proof_rollout_selector_transition = (
+        proof_rollout_mode
+        and authority_proof_rollout_transition_kind == "selector"
+        and changed == set(AUTHORITY_PROOF_ROLLOUT_SELECTOR_CHANGES)
+        and actual_non_noop.get(authority_contract_address) == ["update"]
+        and actual_non_noop.get("module.control.aws_ecs_service.hub[0]")
+        == ["update"]
+        and actual_non_noop.get(HUB_WORKER_TASK_DEFINITION_ADDRESS)
+        == ["delete", "create"]
     )
     provisioned_cell_catalog_transition = (
         changed == set(PROVISIONED_CELL_RESOURCES)
@@ -10598,6 +10974,26 @@ def check_plan(
     elif authority_proof_consumer_disable_transition:
         plan_mode = "authority-proof-consumers-disable"
         _check_authority_proof_consumer_transition(by_address, enabling=False)
+    elif authority_proof_rollout_prepare_transition:
+        plan_mode = "authority-proof-rollout-prepare"
+        _require_create_shapes(
+            set(AUTHORITY_PROOF_ROLLOUT_RESOURCES) & changed,
+            by_address,
+            "proof rollout standby pools must be new",
+        )
+    elif authority_proof_rollout_selector_transition:
+        plan_mode = "authority-proof-rollout-selector"
+        before_colors = _authority_proof_rollout_colors(
+            foundation_change.get("before", {})
+        )
+        after_colors = _authority_proof_rollout_colors(
+            foundation_change.get("after", {})
+        )
+        if before_colors is None or after_colors is None:
+            raise ContractError("proof selector colors are absent")
+        _check_authority_proof_selector_update(
+            by_address, before_colors[0], after_colors[0]
+        )
     elif authority_image_update_transition:
         plan_mode = "authority-image-update"
         _check_authority_image_update(changed, by_address, plan)
@@ -10718,7 +11114,7 @@ def check_plan(
             "Authority runtime slice or image update, the exact Authority alarm "
             "routing slice, the exact attended-proof enablement or rollback, the exact "
             "proof-policy consumer version staging or rollback with both live "
-            "aliases unchanged, the exact "
+            "aliases unchanged, the exact proof rollout prepare or selector apply, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
             "image update, Hub PrivateLink "
@@ -10752,6 +11148,7 @@ def check_plan(
         catalog_mode=catalog_mode,
         runtime_mode=runtime_mode,
         proof_mode=proof_mode,
+        proof_rollout_mode=proof_rollout_mode,
         hub_worker_mode=hub_worker_mode,
         refresh_disabled=refresh_disabled,
     )
@@ -10925,6 +11322,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     proof_consumer_data_extra = set(
         AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES
     )
+    proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
     # data sources (the published image digest and the keygen zip); presence is
@@ -10936,6 +11334,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     runtime_present = bool(addresses & runtime_extra)
     proof_present = bool(addresses & proof_extra)
     proof_alias_reads_present = bool(addresses & proof_consumer_data_extra)
+    proof_rollout_present = bool(addresses & proof_rollout_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
     if proof_present and not runtime_present:
@@ -10948,6 +11347,13 @@ def check_state_list(path: Path) -> dict[str, int]:
             "proof-policy consumer staging requires the complete runtime and "
             "attended-proof slices in state"
         )
+    if proof_rollout_present and not (
+        runtime_present and proof_present and hub_worker_present
+    ):
+        raise ContractError(
+            "proof-policy rollout state requires the complete runtime, "
+            "attended-proof, and Hub worker slices"
+        )
     if hub_worker_present and not (hub_edge_present and runtime_present):
         raise ContractError(
             "Hub worker slice requires both the Hub edge slice and the authority "
@@ -10958,6 +11364,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
         | (proof_extra if proof_present else set())
+        | (proof_rollout_extra if proof_rollout_present else set())
         | (proof_consumer_data_extra if proof_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
@@ -10984,6 +11391,7 @@ def check_state_list(path: Path) -> dict[str, int]:
             + (len(PROVISIONED_CELL_RESOURCES) if catalog_present else 0)
             + (len(AUTHORITY_RUNTIME_RESOURCES) if runtime_present else 0)
             + (len(AUTHORITY_PROOF_RESOURCES) if proof_present else 0)
+            + (len(AUTHORITY_PROOF_ROLLOUT_RESOURCES) if proof_rollout_present else 0)
             + (len(HUB_EDGE_RESOURCES) if hub_edge_present else 0)
             + (len(HUB_WORKER_RESOURCES) if hub_worker_present else 0)
         ),
@@ -11244,18 +11652,27 @@ def check_state(state: Any) -> dict[str, Any]:
     base_expected = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     proof_extra = set(AUTHORITY_PROOF_RESOURCES)
+    proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_addresses = set(by_address)
     catalog_present = bool(actual_addresses & catalog_extra)
     runtime_present = bool(actual_addresses & runtime_extra)
     proof_present = bool(actual_addresses & proof_extra)
+    proof_rollout_present = bool(actual_addresses & proof_rollout_extra)
     hub_edge_present = bool(actual_addresses & hub_edge_extra)
     hub_worker_present = bool(actual_addresses & hub_worker_extra)
     if proof_present and not runtime_present:
         raise ContractError(
             "attended-proof Authority slice requires the complete runtime slice "
             "in refreshed state"
+        )
+    if proof_rollout_present and not (
+        proof_present and runtime_present and hub_worker_present
+    ):
+        raise ContractError(
+            "proof-policy rollout state requires the complete runtime, "
+            "attended-proof, and Hub worker slices"
         )
     if hub_worker_present and not (hub_edge_present and runtime_present):
         raise ContractError(
@@ -11267,6 +11684,7 @@ def check_state(state: Any) -> dict[str, Any]:
         | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
         | (proof_extra if proof_present else set())
+        | (proof_rollout_extra if proof_rollout_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -11287,6 +11705,8 @@ def check_state(state: Any) -> dict[str, Any]:
         state_expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if proof_present:
         state_expected_resources.update(AUTHORITY_PROOF_RESOURCES)
+    if proof_rollout_present:
+        state_expected_resources.update(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     if hub_edge_present:
         state_expected_resources.update(HUB_EDGE_RESOURCES)
     if hub_worker_present:
@@ -11696,7 +12116,9 @@ def check_state(state: Any) -> dict[str, Any]:
         elif runtime_present and service == "email":
             _check_authority_email_endpoint_policy(item, address)
         elif hub_worker_present and service == "lambda":
-            _check_hub_lambda_endpoint_policy(item, address)
+            _check_hub_lambda_endpoint_policy(
+                item, address, rollout=proof_rollout_present
+            )
         elif hub_worker_present and not runtime_present and service == "secretsmanager":
             _check_hub_secretsmanager_endpoint_policy(item, address)
         elif hub_worker_present and service == "logs":

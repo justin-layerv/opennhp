@@ -22,12 +22,26 @@ locals {
   runner_name = "${var.name_prefix}-udp-proof-runner"
   runner_tags = merge(local.tags, { Name = local.runner_name })
 
-  ec2_arn_prefix           = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:"
-  jit_secret_prefix        = "${var.name_prefix}/udp-proof/jit/"
-  jit_secret_arn_pattern   = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.jit_secret_prefix}*"
-  proof_kms_key_arn_prefix = "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/"
-  secrets_kms_via_service  = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
-  vpc_resolver_cidr        = "${cidrhost(var.vpc_cidr, 2)}/32"
+  ec2_arn_prefix                       = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:"
+  jit_secret_prefix                    = "${var.name_prefix}/udp-proof/jit/"
+  jit_secret_arn_pattern               = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.jit_secret_prefix}*"
+  recovery_request_secret_prefix       = "${var.name_prefix}/udp-proof/recovery/request/"
+  recovery_response_secret_prefix      = "${var.name_prefix}/udp-proof/recovery/response/"
+  recovery_request_secret_arn_pattern  = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.recovery_request_secret_prefix}*"
+  recovery_response_secret_arn_pattern = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.recovery_response_secret_prefix}*"
+  proof_owner_id                       = "${var.name_prefix}-udp-proof"
+  proof_customers_table_name           = "${var.name_prefix}-control-qurl-customers"
+  proof_customers_table_arn            = "arn:${data.aws_partition.current.partition}:dynamodb:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:table/${local.proof_customers_table_name}"
+  proof_kms_key_arn_prefix             = "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/"
+  secrets_kms_via_service              = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+  vpc_resolver_cidr                    = "${cidrhost(var.vpc_cidr, 2)}/32"
+
+  authority_proof_rollout_function_names = [
+    "${var.name_prefix}-ca-ia",
+    "${var.name_prefix}-ca-ra",
+    "${var.name_prefix}-ca-icr",
+    "${var.name_prefix}-ca-pm",
+  ]
 }
 
 resource "aws_vpc" "runner" {

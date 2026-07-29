@@ -144,7 +144,9 @@ class WorkflowContractTest(unittest.TestCase):
         ).read_text()
         gate = workflow.split("jobs:\n  gate:\n", 1)[1].split("\n  proof:\n", 1)[0]
         proof = workflow.split("\n  proof:\n", 1)[1]
-        self.assertIn("\npermissions: {}\n", workflow.split("\njobs:\n", 1)[0])
+        workflow_header = workflow.split("\njobs:\n", 1)[0]
+        self.assertIn("\npermissions: {}\n", workflow_header)
+        self.assertNotIn("\nconcurrency:", workflow_header)
         self.assertIn("      actions: read\n", gate)
         self.assertIn("      contents: read\n", gate)
         self.assertIn("    timeout-minutes: 10\n", gate)
@@ -152,6 +154,12 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("id-token: write", gate)
         self.assertIn("      contents: read\n", proof)
         self.assertIn("      id-token: write\n", proof)
+        self.assertIn(
+            "    concurrency:\n"
+            "      group: udp-proof-controller\n"
+            "      cancel-in-progress: false\n",
+            proof,
+        )
         self.assertEqual(workflow.count("id-token: write"), 1)
         for required in (
             "client:",
@@ -171,8 +179,9 @@ class WorkflowContractTest(unittest.TestCase):
             "actions/runs/${PRODUCER_RUN_ID}/artifacts?per_page=100",
             "could not authenticate the producer run after bounded retries",
             "could not authenticate the producer artifact after bounded retries",
-            "PINNED_CONNECTOR_SHA: 29a0a7eba76187a915c29d7bd71f1a20cca7776f",
-            "PINNED_QURL_GO_SHA: 54f538e2da86ac7f89e1694fdeb247be752558bb",
+            "PINNED_CONNECTOR_SHA: b4244ddd6decbc9521a9d52672159a994a0295f3",
+            "PINNED_QURL_GO_SHA: 8d008270c911ae04ae8a82f62372c51e0d70b992",
+            "EXPECTED_AGENT_ID: qurl-go-sandbox-${{ github.run_id }}-${{ github.run_attempt }}",
             "producer artifact does not bind the frozen Connector head",
             "producer artifact does not bind the frozen qurl-go head",
             "invoke_udp_proof_broker.sh",
@@ -190,6 +199,10 @@ class WorkflowContractTest(unittest.TestCase):
             '-f "deployment_producer_head_sha=$DEPLOYMENT_PRODUCER_HEAD_SHA"',
             '-f "deployment_artifact_id=$DEPLOYMENT_ARTIFACT_ID"',
             '-f "deployment_artifact_digest=$DEPLOYMENT_ARTIFACT_DIGEST"',
+            '["key_arn", "provider", "region"]',
+            '.connector_sealed_state.provider == "aws-kms"',
+            '.connector_sealed_state.region == "us-east-2"',
+            '-f "connector_kms_key_id=$connector_kms_key_id"',
             '-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID"',
             '-f "dispatch_correlation_id=$correlation_id"',
             '--branch "$CLIENT_REF"',
@@ -227,14 +240,14 @@ class WorkflowContractTest(unittest.TestCase):
             "actions/artifacts/${CLIENT_ARTIFACT_ID}/zip",
             "could not authenticate the client artifact after bounded retries",
             "could not download the exact client artifact after bounded retries",
-            "--expected-digest \"$CLIENT_ARTIFACT_DIGEST\"",
-            "--dispatch-correlation-id \"$DISPATCH_CORRELATION_ID\"",
-            "--producer-artifact-digest \"$PRODUCER_ARTIFACT_DIGEST\"",
+            '--expected-digest "$CLIENT_ARTIFACT_DIGEST"',
+            '--dispatch-correlation-id "$DISPATCH_CORRELATION_ID"',
+            '--producer-artifact-digest "$PRODUCER_ARTIFACT_DIGEST"',
             "Client artifact: \\`${CLIENT_ARTIFACT_ID}\\` / \\`${CLIENT_ARTIFACT_DIGEST}\\`",
         ):
             self.assertIn(required, workflow)
         dispatch_inputs = workflow.split("    inputs:\n", 1)[1].split(
-            "\nconcurrency:", 1
+            "\npermissions:", 1
         )[0]
         self.assertNotIn("deployment_manifest_b64:", dispatch_inputs)
         self.assertNotIn("connector_ref:", dispatch_inputs)
@@ -243,11 +256,21 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("--created", workflow)
         self.assertNotIn("needs: connector", workflow)
         self.assertNotIn("mapfile -t repositories < <(\n            gh api", workflow)
-        self.assertEqual(workflow.count("secretsmanager create-secret"), 1)
+        self.assertEqual(workflow.count("secretsmanager create-secret"), 2)
+        self.assertIn('request_secret="${RECOVERY_REQUEST_PREFIX}', workflow)
+        self.assertIn('response_secret="${RECOVERY_RESPONSE_PREFIX}', workflow)
+        self.assertIn('--name "${response_secret}"', workflow)
+        self.assertNotIn('--name "${request_secret}"', workflow)
         self.assertEqual(workflow.count("generate-jitconfig"), 1)
         self.assertEqual(
             workflow.count("aws-actions/configure-aws-credentials@"),
-            2,
+            4,
+        )
+        self.assertLess(
+            workflow.index("Refresh AWS credentials after recovery checkpoint"),
+            workflow.index(
+                "Complete qurl-go assignment mutation after authenticated checkpoint"
+            ),
         )
         self.assertEqual(
             workflow.count('"$CLIENT_REPOSITORY" "$CLIENT_RUN_ID" 155 allow'),
@@ -290,7 +313,14 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("steps.app_wait2.outputs.token", cancellation_token)
         self.assertNotIn("steps.app.outputs.token", cancellation_token)
         self.assertNotIn('case "$CLIENT" in', workflow)
-        self.assertNotIn("aws lambda invoke", workflow)
+        self.assertEqual(workflow.count("aws lambda invoke"), 1)
+        self.assertIn('--function-name "${PROOF_RECOVERY_ALIAS_ARN}"', workflow)
+        self.assertLess(
+            workflow.index("Serve exact qurl-go device recovery control"),
+            workflow.index(
+                "Complete qurl-go assignment mutation after authenticated checkpoint"
+            ),
+        )
 
 
 class ShellHelperTest(unittest.TestCase):
@@ -325,6 +355,8 @@ class ShellHelperTest(unittest.TestCase):
                     "AWS_REGION": "us-east-2",
                     "BROKER_FUNCTION": "test-broker",
                     "BROKER_TEST_RESPONSE": response,
+                    "RECOVERY_REQUEST_PREFIX": "layerv-nhp-sandbox/udp-proof/recovery/request/",
+                    "RECOVERY_RESPONSE_PREFIX": "layerv-nhp-sandbox/udp-proof/recovery/response/",
                     "PATH": f"{bin_dir}:{env['PATH']}",
                 }
             )
@@ -356,7 +388,7 @@ class ShellHelperTest(unittest.TestCase):
                 if jq -e '.action == "start"' <<<"$payload" >/dev/null; then
                   printf '{"action":"start","status":"launched","instance_id":"i-123abc"}\n' >"$response_file"
                 else
-                  printf '{"action":"stop","status":"terminated","instances":["i-123abc"],"secret_deleted":true,"account_credential_secret_deleted":true}\n' >"$response_file"
+                  printf '{"action":"stop","status":"terminated","instances":["i-123abc"],"recovery_secrets_deleted":["layerv-nhp-sandbox/udp-proof/recovery/request/12345/1"],"secret_deleted":true,"account_credential_secret_deleted":true}\n' >"$response_file"
                 fi
                 printf '{"StatusCode":200}\n'
                 """,
@@ -366,16 +398,26 @@ class ShellHelperTest(unittest.TestCase):
                 {
                     "AWS_REGION": "us-east-2",
                     "BROKER_FUNCTION": "test-broker",
+                    "RECOVERY_REQUEST_PREFIX": "layerv-nhp-sandbox/udp-proof/recovery/request/",
+                    "RECOVERY_RESPONSE_PREFIX": "layerv-nhp-sandbox/udp-proof/recovery/response/",
                     "PATH": f"{bin_dir}:{env['PATH']}",
                 }
             )
             for action in ("start", "stop"):
+                output_path = bin_dir / "github-output"
+                command = ["bash", str(BROKER_SCRIPT), action, "12345", "1"]
+                if action == "start":
+                    command.append(str(output_path))
                 subprocess.run(
-                    ["bash", str(BROKER_SCRIPT), action, "12345", "1"],
+                    command,
                     check=True,
                     cwd=REPO_ROOT,
                     env=env,
                 )
+                if action == "start":
+                    self.assertEqual(
+                        output_path.read_text(), "instance_id=i-123abc\n"
+                    )
 
     def test_broker_helper_rejects_an_unrecognized_action_before_aws(self) -> None:
         result = subprocess.run(
@@ -403,22 +445,23 @@ class ShellHelperTest(unittest.TestCase):
 
     def test_broker_helper_accepts_exact_absent_stop_response(self) -> None:
         result = self.run_broker_with_response(
-            '{"action":"stop","status":"absent","instances":[],"secret_deleted":false,"account_credential_secret_deleted":false}',
+            '{"action":"stop","status":"absent","instances":[],"recovery_secrets_deleted":[],"secret_deleted":false,"account_credential_secret_deleted":false}',
             action="stop",
         )
         self.assertEqual(result.returncode, 0)
 
     def test_broker_helper_rejects_ambiguous_stop_instance_sets(self) -> None:
         responses = (
-            '{"action":"stop","status":"terminated","instances":["i-123abc","i-123abc"],"secret_deleted":true,"account_credential_secret_deleted":true}',
-            '{"action":"stop","status":"terminated","instances":["not-an-instance"],"secret_deleted":true,"account_credential_secret_deleted":true}',
+            '{"action":"stop","status":"terminated","instances":["i-123abc","i-123abc"],"recovery_secrets_deleted":[],"secret_deleted":true,"account_credential_secret_deleted":true}',
+            '{"action":"stop","status":"terminated","instances":["not-an-instance"],"recovery_secrets_deleted":[],"secret_deleted":true,"account_credential_secret_deleted":true}',
+            '{"action":"stop","status":"absent","instances":[],"recovery_secrets_deleted":["wrong-prefix/12345/1"],"secret_deleted":false,"account_credential_secret_deleted":false}',
         )
         for response in responses:
             with self.subTest(response=response):
                 result = self.run_broker_with_response(response, action="stop")
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
-                    "did not confirm exact runner/run-bound secret cleanup",
+                    "did not confirm exact runner/run-bound/recovery secret cleanup",
                     result.stdout,
                 )
 

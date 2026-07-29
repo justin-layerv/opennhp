@@ -48,10 +48,6 @@ on:
         required: false
         type: string
 
-concurrency:
-  group: udp-proof-controller
-  cancel-in-progress: false
-
 permissions: {}
 
 env:
@@ -59,6 +55,8 @@ env:
   CONTROLLER_ROLE_ARN: arn:aws:iam::767397897469:role/layerv-nhp-sandbox-udp-proof-controller
   BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
   JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
+  RECOVERY_REQUEST_PREFIX: layerv-nhp-sandbox/udp-proof/recovery/request/
+  RECOVERY_RESPONSE_PREFIX: layerv-nhp-sandbox/udp-proof/recovery/response/
   JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
   PROOF_ACCOUNT_SOURCE_SECRET: layerv-nhp-sandbox/udp-proof-account/credential
   PROOF_ACCOUNT_SHA_PARAMETER: /sandbox/nhp/udp-proof/account-credential-sha256
@@ -74,8 +72,8 @@ env:
   # and `repositories.qurl_go` from those live PR heads and the gate below
   # rejects any producer artifact that binds a different head. If either head
   # moves, re-run the producer and update both pins plus runner-group 5.
-  PINNED_CONNECTOR_SHA: 29a0a7eba76187a915c29d7bd71f1a20cca7776f
-  PINNED_QURL_GO_SHA: 54f538e2da86ac7f89e1694fdeb247be752558bb
+  PINNED_CONNECTOR_SHA: b4244ddd6decbc9521a9d52672159a994a0295f3
+  PINNED_QURL_GO_SHA: 8d008270c911ae04ae8a82f62372c51e0d70b992
 
 jobs:
   gate:
@@ -94,8 +92,12 @@ jobs:
       deployment_manifest_b64: ${{ steps.files.outputs.deployment_manifest_b64 }}
       deployment_runtime_inputs_b64: ${{ steps.files.outputs.deployment_runtime_inputs_b64 }}
       deployment_provenance_b64: ${{ steps.files.outputs.deployment_provenance_b64 }}
+      deployment_provenance_sha256: ${{ steps.files.outputs.deployment_provenance_sha256 }}
+      retirement_probe_targets_b64: ${{ steps.files.outputs.retirement_probe_targets_b64 }}
       deployment_manifest_sha256: ${{ steps.files.outputs.deployment_manifest_sha256 }}
       deployment_runtime_inputs_sha256: ${{ steps.files.outputs.deployment_runtime_inputs_sha256 }}
+      retirement_probe_targets_sha256: ${{ steps.files.outputs.retirement_probe_targets_sha256 }}
+      proof_recovery_alias_arn: ${{ steps.files.outputs.proof_recovery_alias_arn }}
       producer_run_id: ${{ steps.metadata.outputs.producer_run_id }}
       producer_run_attempt: ${{ steps.metadata.outputs.producer_run_attempt }}
       producer_head_sha: ${{ steps.metadata.outputs.producer_head_sha }}
@@ -209,6 +211,12 @@ jobs:
     name: ${{ inputs.client }} / ${{ inputs.proof_phase }}
     runs-on: ubuntu-latest
     timeout-minutes: 165
+    # Let both client gates authenticate the same still-fresh producer artifact
+    # in parallel. Serialize only the jobs that consume the singleton EIP and
+    # broker-managed one-use runner.
+    concurrency:
+      group: udp-proof-controller
+      cancel-in-progress: false
     environment: udp-proof-sandbox
     permissions:
       contents: read
@@ -365,10 +373,17 @@ jobs:
             --region "$AWS_REGION" >/dev/null
 
       - name: Start the broker
+        id: broker
         run: |
           set -euo pipefail
           bash .github/scripts/invoke_udp_proof_broker.sh \
-            start "${{ github.run_id }}" "${{ github.run_attempt }}"
+            start "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "$GITHUB_OUTPUT"
+
+      - name: Open qurl-go Authority evidence window
+        id: authority_window
+        if: inputs.client == 'qurl_go'
+        run: echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
 
       - name: Arm qurl-go assignment proof before dispatch
         id: assignment
@@ -393,6 +408,7 @@ jobs:
           PROOF_PHASE: ${{ inputs.proof_phase }}
           DEPLOYMENT_MANIFEST_B64: ${{ needs.gate.outputs.deployment_manifest_b64 }}
           DEPLOYMENT_RUNTIME_INPUTS_B64: ${{ needs.gate.outputs.deployment_runtime_inputs_b64 }}
+          RETIREMENT_PROBE_TARGETS_B64: ${{ needs.gate.outputs.retirement_probe_targets_b64 }}
           DEPLOYMENT_PRODUCER_RUN_ID: ${{ needs.gate.outputs.producer_run_id }}
           DEPLOYMENT_PRODUCER_RUN_ATTEMPT: ${{ needs.gate.outputs.producer_run_attempt }}
           DEPLOYMENT_PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
@@ -456,9 +472,29 @@ jobs:
           if [[ -n "$PRE_REMOVAL_RUN_ID" ]]; then
             dispatch_args+=(-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID")
           fi
+          if [[ "$CLIENT" == "connector" ]]; then
+            connector_kms_key_id="$(
+              printf '%s' "$DEPLOYMENT_RUNTIME_INPUTS_B64" |
+                base64 --decode |
+                jq -er '
+                  if
+                    (.connector_sealed_state | keys | sort) ==
+                      ["key_arn", "provider", "region"] and
+                    .connector_sealed_state.provider == "aws-kms" and
+                    .connector_sealed_state.region == "us-east-2" and
+                    (.connector_sealed_state.key_arn |
+                      test("^arn:aws:kms:us-east-2:767397897469:key/([0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$"))
+                  then .connector_sealed_state.key_arn
+                  else error("invalid Connector sealed-state runtime input")
+                  end
+                '
+            )"
+            dispatch_args+=(-f "connector_kms_key_id=$connector_kms_key_id")
+          fi
           if [[ "$CLIENT" == "qurl_go" ]]; then
             dispatch_args+=(
               -f "assignment_handshake_b64=$ASSIGNMENT_HANDSHAKE_B64"
+              -f "retirement_probe_targets_b64=$RETIREMENT_PROBE_TARGETS_B64"
             )
           fi
 
@@ -520,6 +556,158 @@ jobs:
           }
           echo "client_run_id=$run_id" >>"$GITHUB_OUTPUT"
 
+      - name: Serve exact qurl-go device recovery control
+        if: inputs.client == 'qurl_go'
+        env:
+          DISPATCH_CORRELATION_ID: ${{ steps.dispatch.outputs.dispatch_correlation_id }}
+          EXPECTED_AGENT_ID: qurl-go-sandbox-${{ github.run_id }}-${{ github.run_attempt }}
+          PROOF_RECOVERY_ALIAS_ARN: ${{ needs.gate.outputs.proof_recovery_alias_arn }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "${PROOF_RECOVERY_ALIAS_ARN}" =~ ^arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:(blue|green)$ ]] || {
+            echo "::error::producer did not attest the exact selected recovery-control alias"
+            exit 1
+          }
+          request_secret="${RECOVERY_REQUEST_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}"
+          response_secret="${RECOVERY_RESPONSE_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}"
+          request_file="${RUNNER_TEMP}/proof-recovery-request.json"
+          response_file="${RUNNER_TEMP}/proof-recovery-response.json"
+          metadata_file="${RUNNER_TEMP}/proof-recovery-invoke.json"
+          owner_file="${RUNNER_TEMP}/proof-recovery-owner.json"
+          trap 'rm -f "${request_file}" "${response_file}" "${metadata_file}" "${owner_file}"' EXIT
+
+          request_read=false
+          for _attempt in $(seq 1 240); do
+            if aws secretsmanager get-secret-value \
+              --secret-id "${request_secret}" \
+              --query SecretString --output text \
+              --region "${AWS_REGION}" >"${request_file}" 2>/dev/null; then
+              chmod 0600 "${request_file}"
+              request_read=true
+              break
+            fi
+            sleep 5
+          done
+          "${request_read}" || {
+            echo "::error::qurl-go did not publish its private recovery checkpoint in time"
+            exit 1
+          }
+          jq -e \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_attempt "${{ github.run_attempt }}" \
+            --arg correlation "${DISPATCH_CORRELATION_ID}" \
+            --arg agent_id "${EXPECTED_AGENT_ID}" '
+            (keys | sort) == [
+              "agent_id", "assignment_generation", "cell_id",
+              "controller_run_attempt", "controller_run_id",
+              "device_api_key_id", "grant_correlation_id", "version"
+            ] and
+            .version == 1 and
+            .controller_run_id == $run_id and
+            .controller_run_attempt == $run_attempt and
+            .grant_correlation_id == $correlation and
+            .agent_id == $agent_id and
+            (.device_api_key_id | type == "string" and test("^key_[A-Za-z0-9]{12}$")) and
+            (.cell_id | type == "string" and test("^[a-z0-9]+(?:-[a-z0-9]+)*$")) and
+            (.assignment_generation | type == "string" and test("^[1-9][0-9]{0,19}$"))
+          ' "${request_file}" >/dev/null || {
+            echo "::error::qurl-go recovery checkpoint was not bound to this controller run"
+            exit 1
+          }
+
+          owner_id="layerv-nhp-sandbox-udp-proof"
+          customers_table="layerv-nhp-sandbox-control-qurl-customers"
+          owner_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          aws dynamodb update-item \
+            --table-name "${customers_table}" \
+            --key '{"auth0_subject":{"S":"layerv-nhp-sandbox-udp-proof"}}' \
+            --update-expression 'SET #tier = :system, #updated = :now' \
+            --condition-expression \
+              'auth0_subject = :owner AND attribute_type(email, :type_s) AND size(email) > :zero AND attribute_type(#tier, :type_s) AND attribute_type(frozen, :type_bool) AND attribute_type(frozen_reason, :type_s) AND attribute_type(created_at, :type_s) AND attribute_type(#updated, :type_s) AND attribute_type(current_period_usage, :type_n) AND attribute_type(spending_cap_cents, :type_n) AND attribute_type(unit_price_cents, :type_n)' \
+            --expression-attribute-names \
+              '{"#tier":"tier","#updated":"updated_at"}' \
+            --expression-attribute-values \
+              "{\":system\":{\"S\":\"system\"},\":now\":{\"S\":\"${owner_now}\"},\":owner\":{\"S\":\"${owner_id}\"},\":type_s\":{\"S\":\"S\"},\":type_bool\":{\"S\":\"BOOL\"},\":type_n\":{\"S\":\"N\"},\":zero\":{\"N\":\"0\"}}" \
+            --return-values ALL_NEW \
+            --region "${AWS_REGION}" >"${owner_file}"
+          chmod 0600 "${owner_file}"
+          jq -e --arg owner "${owner_id}" --arg now "${owner_now}" '
+            .Attributes.auth0_subject.S == $owner and
+            (.Attributes.email.S | type == "string" and length > 0) and
+            .Attributes.tier.S == "system" and
+            .Attributes.frozen.BOOL == false and
+            (.Attributes.frozen_reason.S | type == "string") and
+            (.Attributes.created_at.S | type == "string" and length > 0) and
+            .Attributes.updated_at.S == $now and
+            (.Attributes.current_period_usage.N | test("^-?[0-9]+$")) and
+            (.Attributes.spending_cap_cents.N | test("^-?[0-9]+$")) and
+            (.Attributes.unit_price_cents.N | test("^-?[0-9]+$"))
+          ' "${owner_file}" >/dev/null || {
+            echo "::error::dedicated proof owner was not read back as a complete system tenant"
+            exit 1
+          }
+
+          if ! aws lambda invoke \
+            --function-name "${PROOF_RECOVERY_ALIAS_ARN}" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "fileb://${request_file}" \
+            --region "${AWS_REGION}" \
+            "${response_file}" >"${metadata_file}" 2>/dev/null ||
+            ! jq -e '.StatusCode == 200 and (has("FunctionError") | not)' "${metadata_file}" >/dev/null; then
+            echo "::error::could not invoke the selected private recovery-control alias"
+            exit 1
+          fi
+          chmod 0600 "${response_file}"
+          jq -e --slurpfile request "${request_file}" '
+            (keys | sort) == ["result", "version"] and
+            .version == 1 and
+            (.result | keys | sort) == [
+              "agent_id", "assignment_generation", "cell_id",
+              "controller_run_attempt", "controller_run_id",
+              "grant_correlation_id", "recovery_credential",
+              "recovery_credential_key_id", "revoked_at",
+              "revoked_device_api_key_id"
+            ] and
+            .result.controller_run_id == $request[0].controller_run_id and
+            .result.controller_run_attempt == $request[0].controller_run_attempt and
+            .result.grant_correlation_id == $request[0].grant_correlation_id and
+            .result.agent_id == $request[0].agent_id and
+            .result.revoked_device_api_key_id == $request[0].device_api_key_id and
+            .result.cell_id == $request[0].cell_id and
+            .result.assignment_generation == $request[0].assignment_generation and
+            (.result.recovery_credential | type == "string" and
+              test("^lv_(live|test)_[A-Za-z0-9_-]{43}$")) and
+            (.result.recovery_credential_key_id | type == "string" and
+              test("^key_[A-Za-z0-9]{12}$")) and
+            (.result.revoked_at | type == "string" and
+              test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+          ' "${response_file}" >/dev/null || {
+            echo "::error::private recovery control returned an invalid or mismatched receipt"
+            exit 1
+          }
+          aws secretsmanager create-secret \
+            --name "${response_secret}" \
+            --kms-key-id "${JIT_KMS_KEY_ARN}" \
+            --secret-string "file://${response_file}" \
+            --tags \
+              Key=Environment,Value=sandbox \
+              Key=Purpose,Value=udp-proof-recovery-response \
+              Key=GitHubRunId,Value=${{ github.run_id }} \
+              Key=GitHubRunAttempt,Value=${{ github.run_attempt }} \
+            --region "${AWS_REGION}" >/dev/null
+          aws secretsmanager delete-secret \
+            --secret-id "${request_secret}" \
+            --force-delete-without-recovery \
+            --region "${AWS_REGION}" >/dev/null
+
+      - name: Refresh AWS credentials after recovery checkpoint
+        if: inputs.client == 'qurl_go'
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Complete qurl-go assignment mutation after authenticated checkpoint
         if: inputs.client == 'qurl_go'
         env:
@@ -530,9 +718,13 @@ jobs:
             --handshake-b64 "$ASSIGNMENT_HANDSHAKE_B64" \
             --client-run-id "${{ steps.dispatch.outputs.client_run_id }}" \
             --client-sha "${{ steps.dispatch.outputs.client_sha }}" \
+            --assignment-receipt-output \
+              "${RUNNER_TEMP}/assignment-receipt.json" \
+            --transport-receipt-output \
+              "${RUNNER_TEMP}/transport-receipt.json" \
             --timeout-seconds 1800
 
-      - name: Refresh proof token after assignment checkpoint
+      - name: Refresh proof token after assignment and recovery checkpoints
         id: app_wait1
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -705,6 +897,9 @@ jobs:
           CLIENT_ARTIFACT_DIGEST: ${{ steps.verify.outputs.client_artifact_digest }}
           DEPLOYMENT_MANIFEST_SHA256: ${{ needs.gate.outputs.deployment_manifest_sha256 }}
           DEPLOYMENT_RUNTIME_INPUTS_SHA256: ${{ needs.gate.outputs.deployment_runtime_inputs_sha256 }}
+          DEPLOYMENT_PROVENANCE_SHA256: ${{ needs.gate.outputs.deployment_provenance_sha256 }}
+          RETIREMENT_PROBE_TARGETS_SHA256: ${{ needs.gate.outputs.retirement_probe_targets_sha256 }}
+          RETIREMENT_PROBE_TARGETS_B64: ${{ needs.gate.outputs.retirement_probe_targets_b64 }}
           PRODUCER_RUN_ID: ${{ needs.gate.outputs.producer_run_id }}
           PRODUCER_RUN_ATTEMPT: ${{ needs.gate.outputs.producer_run_attempt }}
           PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
@@ -755,6 +950,9 @@ jobs:
             --controller-run-attempt "${{ github.run_attempt }}" \
             --deployment-manifest-sha256 "$DEPLOYMENT_MANIFEST_SHA256" \
             --deployment-runtime-inputs-sha256 "$DEPLOYMENT_RUNTIME_INPUTS_SHA256" \
+            --deployment-provenance-sha256 "$DEPLOYMENT_PROVENANCE_SHA256" \
+            --retirement-probe-targets-sha256 "$RETIREMENT_PROBE_TARGETS_SHA256" \
+            --retirement-probe-targets-b64 "$RETIREMENT_PROBE_TARGETS_B64" \
             --producer-run-id "$PRODUCER_RUN_ID" \
             --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" \
             --producer-head-sha "$PRODUCER_HEAD_SHA" \
@@ -774,6 +972,144 @@ jobs:
             echo "- Client run: [${CLIENT_RUN_ID}](https://github.com/${CLIENT_REPOSITORY}/actions/runs/${CLIENT_RUN_ID})"
             echo "- Client artifact: \`${CLIENT_ARTIFACT_ID}\` / \`${CLIENT_ARTIFACT_DIGEST}\`"
           } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Refresh AWS credentials for qurl-go Authority evidence
+        if: inputs.client == 'qurl_go' && steps.result.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Collect exact post-probe server receipt
+        id: server_receipt
+        if: inputs.client == 'qurl_go' && steps.result.outcome == 'success'
+        env:
+          ASSIGNMENT_HANDSHAKE_B64: ${{ steps.assignment.outputs.handshake_b64 }}
+          RETIREMENT_PROBE_TARGETS_B64: ${{ needs.gate.outputs.retirement_probe_targets_b64 }}
+          RETIREMENT_PROBE_TARGETS_SHA256: ${{ needs.gate.outputs.retirement_probe_targets_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/collect_udp_proof_server_receipt.py \
+            --handshake-b64 "$ASSIGNMENT_HANDSHAKE_B64" \
+            --retirement-probe-targets-b64 "$RETIREMENT_PROBE_TARGETS_B64" \
+            --targets-sha256 "$RETIREMENT_PROBE_TARGETS_SHA256" \
+            --runtime-probe \
+              "${RUNNER_TEMP}/udp-proof-client-artifact/runtime-probe-observations.json" \
+            --client-run-id "${{ steps.dispatch.outputs.client_run_id }}" \
+            --client-run-attempt "${{ steps.verify.outputs.client_run_attempt }}" \
+            --client-sha "${{ steps.dispatch.outputs.client_sha }}" \
+            --output "${RUNNER_TEMP}/post-probe-server-receipt.json"
+
+      - name: Verify qurl-go Authority executed version and zero spill
+        if: inputs.client == 'qurl_go' && steps.result.outcome == 'success'
+        env:
+          DEPLOYMENT_PROVENANCE_B64: ${{ needs.gate.outputs.deployment_provenance_b64 }}
+          PROOF_STARTED_AT: ${{ steps.authority_window.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_udp_proof_authority_evidence.py evidence \
+            --deployment-provenance-b64 "$DEPLOYMENT_PROVENANCE_B64" \
+            --proof-start-time "$PROOF_STARTED_AT" \
+            >"${RUNNER_TEMP}/qurl-go-authority-evidence.json"
+          {
+            echo "- Authority proof: selected ExecutedVersion exact; blue/green pools READY; spillover/errors/throttles zero"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Build current-attempt controller attestation
+        if: >-
+          success() &&
+          steps.result.outcome == 'success' &&
+          (inputs.client == 'connector' || steps.server_receipt.outcome == 'success')
+        env:
+          CLIENT: ${{ inputs.client }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+          CONTROLLER_HEAD_SHA: ${{ github.sha }}
+          PRODUCER_RUN_ID: ${{ needs.gate.outputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ needs.gate.outputs.producer_run_attempt }}
+          PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
+          PRODUCER_ARTIFACT_ID: ${{ needs.gate.outputs.producer_artifact_id }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ needs.gate.outputs.producer_artifact_digest }}
+          CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
+          CLIENT_RUN_ATTEMPT: ${{ steps.verify.outputs.client_run_attempt }}
+          CLIENT_HEAD_SHA: ${{ steps.dispatch.outputs.client_sha }}
+          CLIENT_ARTIFACT_ID: ${{ steps.verify.outputs.client_artifact_id }}
+          CLIENT_ARTIFACT_DIGEST: ${{ steps.verify.outputs.client_artifact_digest }}
+          CLIENT_EVIDENCE_SHA256: ${{ steps.result.outputs.client_evidence_sha256 }}
+          CLIENT_TYPED_EVIDENCE_SHA256: ${{ steps.result.outputs.client_typed_evidence_sha256 }}
+          CLIENT_PACKET_CAPTURE_SHA256: ${{ steps.result.outputs.client_packet_capture_sha256 }}
+          RUNNER_INSTANCE_ID: ${{ steps.broker.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          bundle="${RUNNER_TEMP}/udp-proof-controller-attestation"
+          rm -rf "$bundle"
+          mkdir -p "$bundle/client-artifact"
+          cp -R "${RUNNER_TEMP}/udp-proof-client-artifact/." \
+            "$bundle/client-artifact/"
+          runtime_args=()
+          if [[ "$CLIENT" == "qurl_go" ]]; then
+            runtime_args=(
+              --assignment-receipt "${RUNNER_TEMP}/assignment-receipt.json"
+              --transport-receipt "${RUNNER_TEMP}/transport-receipt.json"
+              --runtime-probe \
+                "${RUNNER_TEMP}/udp-proof-client-artifact/runtime-probe-observations.json"
+              --server-receipt "${RUNNER_TEMP}/post-probe-server-receipt.json"
+            )
+          fi
+          python3 .github/scripts/collect_udp_proof_controller_attestation.py \
+            --client "$CLIENT" \
+            --proof-phase "$PROOF_PHASE" \
+            --producer-directory udp-proof-producer-artifact \
+            --client-directory "${RUNNER_TEMP}/udp-proof-client-artifact" \
+            --controller-run-id "${{ github.run_id }}" \
+            --controller-run-attempt "${{ github.run_attempt }}" \
+            --controller-head-sha "$CONTROLLER_HEAD_SHA" \
+            --producer-run-id "$PRODUCER_RUN_ID" \
+            --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" \
+            --producer-head-sha "$PRODUCER_HEAD_SHA" \
+            --producer-artifact-id "$PRODUCER_ARTIFACT_ID" \
+            --producer-artifact-digest "$PRODUCER_ARTIFACT_DIGEST" \
+            --client-run-id "$CLIENT_RUN_ID" \
+            --client-run-attempt "$CLIENT_RUN_ATTEMPT" \
+            --client-head-sha "$CLIENT_HEAD_SHA" \
+            --client-artifact-id "$CLIENT_ARTIFACT_ID" \
+            --client-artifact-digest "$CLIENT_ARTIFACT_DIGEST" \
+            --client-evidence-sha256 "$CLIENT_EVIDENCE_SHA256" \
+            --client-typed-evidence-sha256 "$CLIENT_TYPED_EVIDENCE_SHA256" \
+            --packet-capture-sha256 "$CLIENT_PACKET_CAPTURE_SHA256" \
+            --runner-instance-id "$RUNNER_INSTANCE_ID" \
+            "${runtime_args[@]}" \
+            --output "$bundle/controller-attestation.json"
+
+      - name: Upload current-attempt controller attestation
+        if: >-
+          success() &&
+          steps.result.outcome == 'success' &&
+          (inputs.client == 'connector' || steps.server_receipt.outcome == 'success')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: udp-proof-controller-attestation-${{ inputs.client }}-${{ inputs.proof_phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/udp-proof-controller-attestation
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
+      - name: Upload qurl-go Authority evidence
+        if: inputs.client == 'qurl_go' && steps.result.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qurl-go-authority-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qurl-go-authority-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload post-probe server receipt
+        if: inputs.client == 'qurl_go' && steps.result.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: post-probe-server-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/post-probe-server-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Refresh the narrow App token for failure cancellation
         id: app_cancel
@@ -944,5 +1280,8 @@ jobs:
         if: always() && steps.aws.outcome == 'success'
         run: |
           set -euo pipefail
+          # The broker owns JIT and both recovery mailboxes. Its helper retries
+          # five times and fails this always() step loudly if cleanup cannot be
+          # confirmed; the independent five-minute sweep remains the backstop.
           bash .github/scripts/invoke_udp_proof_broker.sh \
             stop "${{ github.run_id }}" "${{ github.run_attempt }}"

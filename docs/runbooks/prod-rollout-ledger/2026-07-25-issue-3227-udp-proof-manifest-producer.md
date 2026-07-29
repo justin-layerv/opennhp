@@ -49,10 +49,17 @@ or topology.
       read back `manifest_producer_role_arn`, and confirm its OIDC subject is
       exactly `repo:layervai/nhp:environment:udp-proof-manifest-sandbox`. Do not
       add runtime-attestation S3/KMS access until both exact ARNs are configured.
+      Confirm the separate Terraform-state projection policy grants only
+      `s3:GetObject` on
+      `layerv-terraform-state-767397897469/nhp/sandbox/terraform.tfstate` and
+      `kms:Decrypt` on its exact CMK through S3 with the exact object ARN
+      encryption context.
 - [ ] Post-rollout: dispatch the workflow from the current signed `main`, prove
       it uploads one `udp-proof-deployment-manifest-<run_id>-<run_attempt>`
-      artifact containing exactly the three canonical JSON files, and record
-      the successful run plus artifact digest on issue #3227.
+      artifact containing exactly the deployment triplet plus canonical
+      `orchestrator-evidence.json`, verify the Terraform row quotes the live
+      state lineage/serial and all reviewed pre-removal resources as present,
+      and record the successful run plus artifact digest on issue #3227.
 - [ ] Rollback: remove the environment's App credentials to stop new
       production immediately; preserve existing artifacts for investigation.
       If the AWS reader is no longer needed, remove its role in a reviewed

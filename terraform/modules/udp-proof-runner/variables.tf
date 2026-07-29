@@ -271,7 +271,7 @@ variable "runner_archive_sha256" {
 }
 
 variable "proof_kms_key_arns" {
-  description = "Exact sandbox CMK ARNs the runner may describe and decrypt for the sealed-state proof. Wildcards and aliases are rejected."
+  description = "Exact sandbox CMK ARNs the runner may describe, encrypt with, and decrypt with for the two context-bound sealed-state proofs. Wildcards and aliases are rejected."
   type        = set(string)
 
   validation {

@@ -169,6 +169,48 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
         self.assertIn("--no-paginate", command)
         self.assertLess(command.index("--no-paginate"), command.index("--region"))
 
+    def test_connector_proof_kms_key_requires_enabled_symmetric_cmk(self) -> None:
+        key_arn = (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        response = {
+            "KeyMetadata": {
+                "Arn": key_arn,
+                "KeyManager": "CUSTOMER",
+                "KeyState": "Enabled",
+                "KeySpec": "SYMMETRIC_DEFAULT",
+                "KeyUsage": "ENCRYPT_DECRYPT",
+            }
+        }
+        with mock.patch.object(collector, "_aws", return_value=response) as read:
+            self.assertEqual(collector._connector_proof_kms_key_arn(), key_arn)
+        read.assert_called_once_with(
+            "kms",
+            [
+                "describe-key",
+                "--key-id",
+                "alias/layerv-nhp-sandbox-udp-proof-agent-seal",
+            ],
+            "Connector proof KMS key",
+        )
+
+        for field, value in (
+            ("KeyManager", "AWS"),
+            ("KeyState", "Disabled"),
+            ("KeySpec", "RSA_2048"),
+            ("KeyUsage", "SIGN_VERIFY"),
+            ("Arn", "arn:aws:kms:us-east-2:111122223333:key/" + "a" * 36),
+        ):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(response)
+                invalid["KeyMetadata"][field] = value
+                with (
+                    mock.patch.object(collector, "_aws", return_value=invalid),
+                    self.assertRaises(collector.EvidenceError),
+                ):
+                    collector._connector_proof_kms_key_arn()
+
     def test_attestation_bucket_accepts_strict_multi_region_kms_key(self) -> None:
         kms_key_arn = (
             "arn:aws:kms:us-east-2:767397897469:key/"

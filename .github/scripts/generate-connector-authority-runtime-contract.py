@@ -78,8 +78,10 @@ EXPECTED_PROOF_CONTROLLER_ROLE_ARN = (
     "arn:aws:iam::767397897469:"
     "role/layerv-nhp-sandbox-udp-proof-controller"
 )
-EXPECTED_PROOF_FUNCTION = "layerv-nhp-sandbox-ca-pm"
-EXPECTED_PROOF_OPERATION = "mutate_proof_agent"
+EXPECTED_PROOF_FUNCTIONS = {
+    "layerv-nhp-sandbox-ca-pm": "mutate_proof_agent",
+    "layerv-nhp-sandbox-ca-pcr": "prepare_proof_credential_recovery",
+}
 TOP_KEYS = {"schema_version", "contract"}
 CONTRACT_KEYS = {
     "schema_version",
@@ -498,6 +500,8 @@ def generated_input(
     hub_worker_enabled: bool = False,
     proof_mutation_controls_enabled: bool = False,
     proof_policy_consumers_staged: bool = False,
+    proof_policy_selected_color: str | None = None,
+    proof_policy_prepared_color: str | None = None,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     if proof_mutation_controls_enabled:
@@ -509,25 +513,27 @@ def generated_input(
         generated["global"]["caller_capacity"]["proof_controller"] = {
             "max_replicas": 1,
             "preinvoke_limits": {
-                EXPECTED_PROOF_OPERATION: 1,
+                operation: 1 for operation in EXPECTED_PROOF_FUNCTIONS.values()
             },
             "preinvoke_rate_limits": {
-                EXPECTED_PROOF_OPERATION: {
+                operation: {
                     "burst": 1,
                     "refill_per_second": 1,
-                },
+                }
+                for operation in EXPECTED_PROOF_FUNCTIONS.values()
             },
         }
-        generated["functions"][EXPECTED_PROOF_FUNCTION] = {
-            "steady_provisioned_concurrency": 1,
-            "steady_reserved_concurrency": 1,
-            "rollout_active_provisioned_concurrency": 1,
-            "rollout_standby_provisioned_concurrency": 1,
-            "rollout_reserved_concurrency": 2,
-            "max_caller_in_flight": 1,
-            "max_caller_requests_per_second": 2,
-            "rollback_retention_seconds": 3600,
-        }
+        for function_name in EXPECTED_PROOF_FUNCTIONS:
+            generated["functions"][function_name] = {
+                "steady_provisioned_concurrency": 1,
+                "steady_reserved_concurrency": 1,
+                "rollout_active_provisioned_concurrency": 1,
+                "rollout_standby_provisioned_concurrency": 1,
+                "rollout_reserved_concurrency": 2,
+                "max_caller_in_flight": 1,
+                "max_caller_requests_per_second": 2,
+                "rollback_retention_seconds": 3600,
+            }
     generated["provisioned_cells_evidence"] = evidence
     generated["global"]["basis_evidence"] = evidence
     generated["global"]["result_evidence"] = None
@@ -573,6 +579,17 @@ def generated_input(
         if not proof_mutation_controls_enabled:
             fail("proof policy consumers require proof mutation controls")
         payload["authority_proof_policy_consumers_staged"] = True
+    rollout_colors = (proof_policy_selected_color, proof_policy_prepared_color)
+    if any(color is not None for color in rollout_colors):
+        if not all(color in {"blue", "green"} for color in rollout_colors):
+            fail("proof rollout requires exact selected and prepared colors")
+        if not proof_policy_consumers_staged or not hub_worker_enabled:
+            fail(
+                "proof rollout colors require staged proof consumers and the "
+                "live Hub worker"
+            )
+        payload["authority_proof_policy_selected_color"] = proof_policy_selected_color
+        payload["authority_proof_policy_prepared_color"] = proof_policy_prepared_color
     return payload
 
 
@@ -655,6 +672,22 @@ def main(argv: list[str] | None = None) -> int:
             "aliases. Requires --proof-mutation-controls-enabled."
         ),
     )
+    parser.add_argument(
+        "--proof-policy-selected-color",
+        choices=("blue", "green"),
+        help=(
+            "Select the attended-proof IA/RA/ICR + ca-pm color during the "
+            "retained equal-pool sandbox rollout window."
+        ),
+    )
+    parser.add_argument(
+        "--proof-policy-prepared-color",
+        choices=("blue", "green"),
+        help=(
+            "Name the inactive IA/RA/ICR color Terraform may prepare. It must "
+            "be supplied together with --proof-policy-selected-color."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -674,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
                 hub_worker_enabled=args.hub_worker_enabled,
                 proof_mutation_controls_enabled=args.proof_mutation_controls_enabled,
                 proof_policy_consumers_staged=args.proof_policy_consumers_staged,
+                proof_policy_selected_color=args.proof_policy_selected_color,
+                proof_policy_prepared_color=args.proof_policy_prepared_color,
             )
         )
         atomic_write(args.output, payload)
@@ -683,7 +718,8 @@ def main(argv: list[str] | None = None) -> int:
                     "environment": EXPECTED_ENVIRONMENT,
                     "function_count": (
                         len(contract["functions"])
-                        + int(args.proof_mutation_controls_enabled)
+                        + len(EXPECTED_PROOF_FUNCTIONS)
+                        * int(args.proof_mutation_controls_enabled)
                     ),
                     "manifest_path": evidence["path"],
                     "manifest_sha256": evidence["sha256"],

@@ -53,9 +53,11 @@ ARTIFACT_FILE_LIMITS = {
 # which imports this module; keeping only the name and byte bound here avoids a
 # circular import.
 ORCHESTRATOR_EVIDENCE_FILE = "orchestrator-evidence.json"
+RETIREMENT_TARGETS_FILE = "retirement-probe-targets.json"
 ARTIFACT_FILES = {
     **ARTIFACT_FILE_LIMITS,
     ORCHESTRATOR_EVIDENCE_FILE: MAX_ORCHESTRATOR_EVIDENCE_BYTES,
+    RETIREMENT_TARGETS_FILE: 32 * 1024,
 }
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -70,6 +72,10 @@ HOST_RE = re.compile(
 )
 PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+CONNECTOR_PROOF_KMS_KEY_ARN_RE = re.compile(
+    r"^arn:aws:kms:us-east-2:767397897469:key/"
+    r"(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$"
+)
 DECIMAL_WEIGHT_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 ECR_REPOSITORY_RE = re.compile(
     r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$"
@@ -253,14 +259,14 @@ def _require_artifact_directory(path: Path) -> None:
         or entries != set(ARTIFACT_FILES)
     ):
         raise ContractError(
-            "deployment artifact must contain exactly the four canonical files"
+            "deployment artifact must contain exactly the five canonical files"
         )
 
 
 def load_triplet_directory(path: Path) -> tuple[dict[str, Any], ...]:
     """Load only the exact three canonical deployment files from an artifact.
 
-    The directory must hold exactly the four canonical files; this loader
+    The directory must hold exactly the five canonical files; this loader
     returns the deployment triplet, and `load_orchestrator_file` returns the
     fourth so its own contract module can validate it.
     """
@@ -654,9 +660,27 @@ def validate_manifest(value: Any, proof_phase: str) -> dict[str, Any]:
 
 def validate_runtime_inputs(value: Any, manifest: dict[str, Any]) -> dict[str, Any]:
     runtime = _exact(
-        value, {"schema_version", "hub", "cells"}, "deployment runtime inputs"
+        value,
+        {"schema_version", "hub", "cells", "connector_sealed_state"},
+        "deployment runtime inputs",
     )
     _schema_version(runtime, "runtime inputs")
+    connector_sealed_state = _exact(
+        runtime["connector_sealed_state"],
+        {"provider", "region", "key_arn"},
+        "runtime connector_sealed_state",
+    )
+    if (
+        connector_sealed_state["provider"] != "aws-kms"
+        or connector_sealed_state["region"] != "us-east-2"
+        or not isinstance(connector_sealed_state["key_arn"], str)
+        or not CONNECTOR_PROOF_KMS_KEY_ARN_RE.fullmatch(
+            connector_sealed_state["key_arn"]
+        )
+    ):
+        raise ContractError(
+            "runtime connector_sealed_state must name the exact sandbox proof CMK"
+        )
     hub = _endpoint(
         runtime["hub"], "runtime hub", include_cell_id=False, include_public_key=True
     )

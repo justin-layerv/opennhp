@@ -36,7 +36,14 @@ locals {
   # authority_selected_alias_targets is non-null before the worker deploys); the
   # guard keeps this a plain empty list while the worker is dark so nothing
   # dereferences the nullable contract map.
-  hub_authority_alias_arns = local.hub_worker_deploy ? sort(values(local.authority_selected_alias_targets.hub)) : []
+  hub_authority_alias_arns = local.hub_worker_deploy ? (
+    local.authority_proof_policy_rollout_active
+    ? sort(flatten([
+      for function_name in keys(local.authority_proof_policy_consumer_functions) :
+      values(local.authority_proof_policy_rollout_alias_arns[function_name])
+    ]))
+    : sort(values(local.authority_selected_alias_targets.hub))
+  ) : []
 
   # The publisher-owned digest pin resolves the immutable image the worker runs.
   # UNPUBLISHED (or any non-sha256 value) is rejected by the task-definition

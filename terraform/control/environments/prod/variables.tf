@@ -198,6 +198,28 @@ variable "authority_proof_policy_consumers_staged" {
   }
 }
 
+variable "authority_proof_policy_selected_color" {
+  description = "Production proof-policy selector is permanently disabled."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.authority_proof_policy_selected_color == null
+    error_message = "Production Authority proof-policy selector must remain null."
+  }
+}
+
+variable "authority_proof_policy_prepared_color" {
+  description = "Production proof-policy preparation is permanently disabled."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.authority_proof_policy_prepared_color == null
+    error_message = "Production Authority proof-policy prepared color must remain null."
+  }
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = "Production proof tenant must remain unset; the mutation control cannot exist in production."
   type        = string

@@ -72,6 +72,67 @@ CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
 
+class AuthorityProofRolloutTransitionTests(unittest.TestCase):
+    @staticmethod
+    def foundation(selected=None, prepared=None):
+        value = {
+            "input": {
+                "authority_runtime_contract": {"selected_authority_color": "blue"},
+            }
+        }
+        if selected is not None or prepared is not None:
+            value["input"].update(
+                {
+                    "authority_proof_policy_consumers_staged": True,
+                    "authority_proof_policy_selected_color": selected,
+                    "authority_proof_policy_prepared_color": prepared,
+                }
+            )
+        return value
+
+    def test_prepare_promote_rollback_sequence_is_closed(self):
+        self.assertEqual(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation(), self.foundation("blue", "green")
+            ),
+            "prepare",
+        )
+        self.assertEqual(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation("blue", "green"),
+                self.foundation("green", "green"),
+            ),
+            "selector",
+        )
+        self.assertEqual(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation("green", "green"),
+                self.foundation("green", "blue"),
+            ),
+            "prepare",
+        )
+        self.assertEqual(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation("green", "blue"),
+                self.foundation("blue", "blue"),
+            ),
+            "selector",
+        )
+
+    def test_selector_cannot_skip_prepare_or_move_both_fields(self):
+        self.assertIsNone(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation(), self.foundation("green", "green")
+            )
+        )
+        self.assertIsNone(
+            CHECKER._authority_proof_rollout_transition(
+                self.foundation("blue", "green"),
+                self.foundation("green", "blue"),
+            )
+        )
+
+
 def applied_provisioned_cell_item(cell_id: str) -> str:
     """Render a catalog row the way a refreshed read renders it.
 

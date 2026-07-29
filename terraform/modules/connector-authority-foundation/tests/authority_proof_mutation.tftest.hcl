@@ -35,6 +35,7 @@ mock_provider "aws" {
   mock_data "aws_ssm_parameter" {
     defaults = {
       insecure_value = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      value          = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     }
   }
 
@@ -118,6 +119,12 @@ override_resource {
   target          = aws_dynamodb_table.agent_keys
   override_during = plan
   values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys" }
+}
+
+override_resource {
+  target          = aws_dynamodb_table.api_key_idempotency
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-apikey-idempotency" }
 }
 
 override_resource {
@@ -230,10 +237,12 @@ variables {
         proof_controller = {
           max_replicas = 1
           preinvoke_limits = {
-            mutate_proof_agent = 1
+            mutate_proof_agent                = 1
+            prepare_proof_credential_recovery = 1
           }
           preinvoke_rate_limits = {
-            mutate_proof_agent = { burst = 1, refill_per_second = 1 }
+            mutate_proof_agent                = { burst = 1, refill_per_second = 1 }
+            prepare_proof_credential_recovery = { burst = 1, refill_per_second = 1 }
           }
         }
       }
@@ -319,6 +328,24 @@ variables {
         }
         result_evidence = null
       }
+      "layerv-nhp-sandbox-ca-pcr" = {
+        steady_provisioned_concurrency          = 1
+        steady_reserved_concurrency             = 1
+        rollout_active_provisioned_concurrency  = 1
+        rollout_standby_provisioned_concurrency = 1
+        rollout_reserved_concurrency            = 2
+        max_caller_in_flight                    = 1
+        max_caller_requests_per_second          = 2
+        rollback_retention_seconds              = 3600
+        basis_evidence = {
+          repository     = "layervai/nhp"
+          source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+          sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          schema_version = 1
+        }
+        result_evidence = null
+      }
     }
   }
 }
@@ -328,7 +355,8 @@ run "sandbox_accepts_the_separate_proof_operation_family" {
 
   assert {
     condition = output.authority_selected_alias_targets.proof == {
-      mutate_proof_agent = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue"
+      mutate_proof_agent                = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue"
+      prepare_proof_credential_recovery = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue"
     }
     error_message = "The proof family must publish exactly its own same-color alias target."
   }
@@ -353,7 +381,7 @@ run "proof_alias_is_absent_from_every_runtime_caller_target" {
   assert {
     condition = length([
       for target in values(output.authority_selected_alias_targets.hub) :
-      target if strcontains(target, "-ca-pm:")
+      target if strcontains(target, "-ca-pm:") || strcontains(target, "-ca-pcr:")
     ]) == 0
     error_message = "The Hub caller target must never contain the proof mutation alias."
   }
@@ -362,7 +390,7 @@ run "proof_alias_is_absent_from_every_runtime_caller_target" {
     condition = length(flatten([
       for cell_targets in values(output.authority_selected_alias_targets.cells) : [
         for target in values(cell_targets) :
-        target if strcontains(target, "-ca-pm:")
+        target if strcontains(target, "-ca-pm:") || strcontains(target, "-ca-pcr:")
       ]
     ])) == 0
     error_message = "No cell caller target may ever contain the proof mutation alias."
@@ -544,10 +572,12 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
           proof_controller = {
             max_replicas = 2
             preinvoke_limits = {
-              mutate_proof_agent = 1
+              mutate_proof_agent                = 1
+              prepare_proof_credential_recovery = 1
             }
             preinvoke_rate_limits = {
-              mutate_proof_agent = { burst = 1, refill_per_second = 1 }
+              mutate_proof_agent                = { burst = 1, refill_per_second = 1 }
+              prepare_proof_credential_recovery = { burst = 1, refill_per_second = 1 }
             }
           }
         }
@@ -633,6 +663,24 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
           }
           result_evidence = null
         }
+        "layerv-nhp-sandbox-ca-pcr" = {
+          steady_provisioned_concurrency          = 1
+          steady_reserved_concurrency             = 1
+          rollout_active_provisioned_concurrency  = 1
+          rollout_standby_provisioned_concurrency = 1
+          rollout_reserved_concurrency            = 2
+          max_caller_in_flight                    = 1
+          max_caller_requests_per_second          = 2
+          rollback_retention_seconds              = 3600
+          basis_evidence = {
+            repository     = "layervai/nhp"
+            source_commit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            path           = "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            sha256         = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            schema_version = 1
+          }
+          result_evidence = null
+        }
       }
     }
   }
@@ -652,10 +700,13 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       length(aws_iam_role_policy.authority_proof_controller_invoke) == 1 &&
       aws_iam_role_policy.authority_proof_controller_invoke[0].role == "layerv-nhp-sandbox-udp-proof-controller" &&
       jsondecode(aws_iam_role_policy.authority_proof_controller_invoke[0].policy).Statement == [{
-        Sid      = "InvokeSelectedProofMutationAlias"
-        Effect   = "Allow"
-        Action   = ["lambda:InvokeFunction"]
-        Resource = ["arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue"]
+        Sid    = "InvokeSelectedProofMutationAlias"
+        Effect = "Allow"
+        Action = ["lambda:InvokeFunction"]
+        Resource = [
+          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue",
+          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue",
+        ]
       }]
     )
     error_message = "Control must atomically attach one exact selected ca-pm alias grant to the deterministic proof-controller role."
@@ -675,6 +726,17 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = "30"
     }
     error_message = "Only ca-pm must receive the exact four proof-policy environment variables."
+  }
+
+  assert {
+    condition = {
+      for key, value in aws_lambda_function.authority["layerv-nhp-sandbox-ca-pcr"].environment[0].variables :
+      key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      } == {
+      CONNECTOR_AUTHORITY_PROOF_OWNER_ID        = "layerv-nhp-sandbox-udp-proof"
+      CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX = "qurl-go-sandbox-"
+    }
+    error_message = "ca-pcr must receive only the exact proof owner and agent prefix."
   }
 
   assert {
@@ -701,6 +763,7 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       }) == 0
       if !contains([
         "layerv-nhp-sandbox-ca-pm",
+        "layerv-nhp-sandbox-ca-pcr",
       ], function_name)
     ])
     error_message = "Cell operations must never inherit the attended-proof policy environment."
@@ -845,10 +908,8 @@ run "selected_consumers_read_but_cannot_write_proof_policy" {
         for key, value in aws_lambda_function.authority[function_name].environment[0].variables :
         key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
         } == {
-        CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = "layerv-nhp-sandbox-udp-proof"
-        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = "qurl-go-sandbox-"
-        CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = "5400"
-        CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = "30"
+        CONNECTOR_AUTHORITY_PROOF_OWNER_ID        = "layerv-nhp-sandbox-udp-proof"
+        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX = "qurl-go-sandbox-"
       }
     ])
     error_message = "The selected IA/RA/ICR versions must receive exactly the proof-policy contract."
@@ -900,11 +961,103 @@ run "selected_consumers_read_but_cannot_write_proof_policy" {
       }) == 0
       if !contains([
         "layerv-nhp-sandbox-ca-pm",
+        "layerv-nhp-sandbox-ca-pcr",
         "layerv-nhp-sandbox-ca-ia",
         "layerv-nhp-sandbox-ca-ra",
         "layerv-nhp-sandbox-ca-icr",
       ], function_name)
     ])
     error_message = "No cell Authority function may inherit proof policy."
+  }
+}
+
+run "proof_rollout_prepares_green_without_moving_blue_selector" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_proof_policy_consumers_staged = true
+    authority_proof_policy_selected_color   = "blue"
+    authority_proof_policy_prepared_color   = "green"
+    hub_edge_enabled                        = true
+    hub_worker_enabled                      = true
+    hub_public_udp_ingress_cidrs            = ["198.51.100.42/32"]
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+        "layerv-nhp-sandbox-ca-pm",
+        ] : (
+        aws_lambda_function.authority[function_name].reserved_concurrent_executions ==
+        var.authority_runtime_contract.functions[function_name].rollout_reserved_concurrency &&
+        aws_lambda_provisioned_concurrency_config.authority[function_name].qualifier == "blue" &&
+        aws_lambda_provisioned_concurrency_config.authority[function_name].provisioned_concurrent_executions ==
+        var.authority_runtime_contract.functions[function_name].rollout_active_provisioned_concurrency &&
+        aws_lambda_provisioned_concurrency_config.authority_proof_standby[function_name].qualifier == "green" &&
+        aws_lambda_provisioned_concurrency_config.authority_proof_standby[function_name].provisioned_concurrent_executions ==
+        var.authority_runtime_contract.functions[function_name].rollout_standby_provisioned_concurrency
+      )
+    ])
+    error_message = "The proof rollout must raise each exact function ceiling and retain equal blue/green provisioned pools."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+        ] : (
+        aws_lambda_alias.authority["${function_name}:blue"].function_version == "6" &&
+        aws_lambda_alias.authority["${function_name}:green"].function_version == "7"
+      )
+    ])
+    error_message = "Preparation may retarget only the inactive green consumer aliases."
+  }
+
+  assert {
+    condition = (
+      output.authority_selected_alias_targets.hub.issue_assignment ==
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:blue" &&
+      output.authority_selected_alias_targets.proof.mutate_proof_agent ==
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue" &&
+      length(local.hub_authority_alias_arns) == 6 &&
+      toset(
+        ({ for statement in jsondecode(aws_iam_role_policy.authority_proof_controller_invoke[0].policy).Statement : statement.Sid => statement })["InvokeSelectedProofMutationAlias"].Resource
+        ) == toset([
+          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue",
+          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:green",
+          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue",
+      ])
+    )
+    error_message = "Preparation must keep blue selected while expanding only the bounded Hub/controller caller sets to both colors."
+  }
+}
+
+run "proof_rollout_promotes_green_without_moving_recovery_selector" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_proof_policy_consumers_staged = true
+    authority_proof_policy_selected_color   = "green"
+    authority_proof_policy_prepared_color   = "blue"
+    hub_edge_enabled                        = true
+    hub_worker_enabled                      = true
+    hub_public_udp_ingress_cidrs            = ["198.51.100.42/32"]
+  }
+
+  assert {
+    condition = (
+      output.authority_selected_alias_targets.proof.mutate_proof_agent ==
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:green" &&
+      output.authority_selected_alias_targets.proof.prepare_proof_credential_recovery ==
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue"
+    )
+    error_message = "Promotion may move only the provisioned proof-mutation selector; recovery remains on the contract-selected provisioned alias."
   }
 }

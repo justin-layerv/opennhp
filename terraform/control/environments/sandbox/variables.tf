@@ -215,6 +215,18 @@ variable "authority_proof_policy_consumers_staged" {
   default     = false
 }
 
+variable "authority_proof_policy_selected_color" {
+  description = "Selected sandbox IA/RA/ICR + ca-pm proof color during the retained equal-pool rollout window."
+  type        = string
+  default     = null
+}
+
+variable "authority_proof_policy_prepared_color" {
+  description = "Inactive sandbox IA/RA/ICR proof color prepared by a separate saved-plan apply."
+  type        = string
+  default     = null
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = "Dedicated sandbox proof tenant that owns every uniquely tagged ephemeral proof agent. Null until the mutation control is enabled."
   type        = string

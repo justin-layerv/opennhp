@@ -46,6 +46,18 @@ variable "runner_archive_sha256" {
   default     = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
 }
 
+variable "proof_kms_key_arns" {
+  description = <<-EOT
+    Exact sandbox CMK key/<uuid> ARNs the runner may DescribeKey + Encrypt +
+    Decrypt for qurl-go and Connector sealed-state proof. Each use is bound to
+    the client's exact four-key agent-state encryption context. The dedicated
+    proof CMK is always included; this optional set only extends the allowlist
+    for other proof clients. Aliases and wildcards are rejected by the module.
+  EOT
+  type        = set(string)
+  default     = null
+}
+
 variable "runtime_attestation_bucket_arn" {
   description = "Exact versioned sandbox runtime-attestation bucket ARN; null until the collector storage predecessor is provisioned."
   type        = string

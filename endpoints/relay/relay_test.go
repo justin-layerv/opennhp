@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -209,6 +210,12 @@ func withTestRelayResponseTimeout(timeout time.Duration) testRelayOption {
 	}
 }
 
+func withTestProofRequestLogger(logger func(string)) testRelayOption {
+	return func(rs *RelayServer) {
+		rs.proofRequestLogger = logger
+	}
+}
+
 func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAddrMode, opts ...testRelayOption) *RelayServer {
 	t.Helper()
 	cfg := &Config{
@@ -232,6 +239,92 @@ func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAdd
 	rs.startBackground()
 	t.Cleanup(func() { testStop(rs) })
 	return rs
+}
+
+func TestProofRequestLoggingIsBoundedAndEnvironmentGated(t *testing.T) {
+	t.Setenv("NHP_ENVIRONMENT", proofLoggingEnvironment)
+	serverPub := keyBytes(0x40)
+	var messages []string
+	rs := newTestRelay(
+		t,
+		serverPub,
+		62206,
+		SourceAddrModeRemoteAddr,
+		withTestProofRequestLogger(func(message string) {
+			messages = append(messages, message)
+		}),
+	)
+	if !rs.proofRequestLoggingEnabled {
+		t.Fatal("proof request logging disabled in sandbox")
+	}
+
+	attackerPath := "/relay/" + strings.Repeat("attacker-controlled-", 1024)
+	req := httptest.NewRequest(http.MethodPost, attackerPath, nil)
+	req.RemoteAddr = "203.0.113.9:4444"
+	rec := httptest.NewRecorder()
+	rs.handleRelay(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST unknown route status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("proof log count = %d, want 1", len(messages))
+	}
+	const want = "relay: proof request route=relay source_ip=203.0.113.9"
+	if messages[0] != want {
+		t.Fatalf("proof log = %q, want %q", messages[0], want)
+	}
+	if strings.Contains(messages[0], "attacker-controlled") {
+		t.Fatalf("proof log contains attacker-controlled path: %q", messages[0])
+	}
+
+	serverID := utils.PubKeyFingerprint(serverPub)
+	rs.servers[serverID].name = "cell0"
+	innerReply := makeInnerKnock(t, serverPub, 2442)
+	packet := &core.Packet{Content: innerReply}
+	_, payloadSize := packet.HeaderTypeAndSize()
+	packet.Header().SetTypeAndPayloadSize(core.NHP_LRT, payloadSize)
+	correlation := "nhp-123-1-qurl_go-post_removal-0123456789abcdef0123456789abcdef:relay:cell0:NHP_LRT"
+	req = httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerReply))
+	req.RemoteAddr = "203.0.113.9:4444"
+	req.Header.Set(proofCorrelationHeader, correlation)
+	rec = httptest.NewRecorder()
+	rs.handleRelay(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST unsupported proof type status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if len(messages) != 3 {
+		t.Fatalf("proof log count = %d, want request + rejection logs", len(messages))
+	}
+	correlationSHA256 := sha256.Sum256([]byte(correlation))
+	wantRejection := fmt.Sprintf(
+		"relay: proof rejection route=relay source_ip=203.0.113.9 cell_id=cell0 server_id=%s message_type=NHP_LRT correlation_id_sha256=%x outcome=unsupported_type_rejected before_waiter=true before_forward=true before_server_dispatch=true",
+		serverID,
+		correlationSHA256,
+	)
+	if messages[2] != wantRejection {
+		t.Fatalf("proof rejection log = %q, want %q", messages[2], wantRejection)
+	}
+	if pending := relayPendingCount(rs); pending != 0 {
+		t.Fatalf("pending request count after rejection = %d, want 0", pending)
+	}
+
+	rs.proofRequestLoggingEnabled = false
+	req = httptest.NewRequest(http.MethodPost, "/relay/another-unknown-route", nil)
+	req.RemoteAddr = "203.0.113.10:5555"
+	rs.handleRelay(httptest.NewRecorder(), req)
+	if len(messages) != 3 {
+		t.Fatalf("disabled proof log count = %d, want unchanged 3", len(messages))
+	}
+}
+
+func TestProofRequestLoggingIsDisabledOutsideSandbox(t *testing.T) {
+	t.Setenv("NHP_ENVIRONMENT", "prod")
+	serverPub := keyBytes(0x40)
+	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+	if rs.proofRequestLoggingEnabled {
+		t.Fatal("proof request logging enabled outside sandbox")
+	}
 }
 
 // makeRealAck has the server device decrypt the inner knock and emit a genuine

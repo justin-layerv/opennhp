@@ -99,10 +99,25 @@ run "browser_relay_contract" {
   assert {
     condition = (
       strcontains(base64decode(aws_launch_template.relay.user_data), "udp_listen_addr = \"0.0.0.0:62207\"") &&
+      strcontains(base64decode(aws_launch_template.relay.user_data), "-e NHP_ENVIRONMENT=sandbox") &&
       !strcontains(base64decode(aws_launch_template.relay.user_data), "native_listen_addr") &&
       !strcontains(base64decode(aws_launch_template.relay.user_data), "native_server")
     )
-    error_message = "Rendered relay bootstrap must configure only the private NHP_RLY return socket, not native SDK ingress."
+    error_message = "Rendered sandbox relay bootstrap must carry the proof-logging environment gate and only the private NHP_RLY return socket, not native SDK ingress."
+  }
+}
+
+run "production_disables_proof_request_logging" {
+  command = plan
+
+  variables {
+    environment             = "prod"
+    ssm_image_tag_parameter = "/prod/nhp/relay/image-tag"
+  }
+
+  assert {
+    condition     = strcontains(base64decode(aws_launch_template.relay.user_data), "-e NHP_ENVIRONMENT=prod")
+    error_message = "Production relay bootstrap must carry the non-sandbox environment that disables per-request proof telemetry."
   }
 }
 

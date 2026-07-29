@@ -24,6 +24,7 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -33,6 +34,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +69,16 @@ const MetricRelayOTPForward = "RelayOTPForward"
 // request ID is active but bound to a different configured server. Delivery is
 // still rejected; the counter makes version drift or a misbehaving cell visible.
 const MetricRelayReturnServerMismatch = "RelayReturnServerMismatch"
+
+const (
+	proofLoggingEnvironment = "sandbox"
+	proofRequestRoute       = "relay"
+	proofCorrelationHeader  = "X-LayerV-UDP-Proof-Correlation"
+)
+
+var proofRejectionCorrelationRE = regexp.MustCompile(
+	`^nhp-[1-9][0-9]{0,19}-[1-9][0-9]{0,19}-qurl_go-(?:pre_removal|post_removal)-[0-9a-f]{32}:relay:(cell[0-9]+):(NHP_(?:LRT|LST|OTP|REG))$`,
+)
 
 // dimNameCell is the CloudWatch dimension naming the cell a shed was routed to.
 // Its value is the relay's configured cell_servers[].Name; a per-cell relay shed
@@ -276,6 +288,9 @@ type RelayServer struct {
 	stopCh         chan struct{}
 	running        atomic.Bool
 	closeOnce      sync.Once // guards udpConn.Close (Stop may run with/without a prior Start)
+
+	proofRequestLoggingEnabled bool
+	proofRequestLogger         func(string)
 }
 
 // New builds a RelayServer from cfg. It decodes the relay key, creates the
@@ -399,6 +414,13 @@ func New(cfg *Config) (*RelayServer, error) {
 		pending:         make(map[string]relayPendingEntry),
 		responseTimeout: relayResponseTimeout,
 		stopCh:          make(chan struct{}),
+		// Per-request source-IP telemetry exists only for the attended sandbox
+		// native-UDP proof. NHP_ENVIRONMENT is rendered by Terraform and doubles
+		// as the relay metrics dimension; every other value fails closed to off.
+		proofRequestLoggingEnabled: os.Getenv("NHP_ENVIRONMENT") == proofLoggingEnvironment,
+		proofRequestLogger: func(message string) {
+			log.Info("%s", message)
+		},
 	}
 
 	// Boot the CloudWatch metrics publisher (#2649) — the relay's first metrics
@@ -582,6 +604,10 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	sourceAddr := rs.deriveSourceAddr(r)
+	if rs.proofRequestLoggingEnabled {
+		rs.proofRequestLogger(proofRequestLogMessage(sourceAddr.IP))
+	}
 	serverID := strings.TrimPrefix(r.URL.Path, "/relay/")
 	srv := rs.servers[serverID]
 	if srv == nil {
@@ -633,12 +659,16 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	// be rejected here instead of consuming a waiter and
 	// a relay/server round trip before the server drops them.
 	if !httpsAgentTypeAllowed(innerType) {
+		if rs.proofRequestLoggingEnabled {
+			if message, ok := proofRejectionLogMessage(r, sourceAddr.IP, srv, innerType); ok {
+				rs.proofRequestLogger(message)
+			}
+		}
 		log.Warning("relay: rejecting unsupported HTTPS inner type %s from %s", core.HeaderTypeToString(innerType), r.RemoteAddr)
 		http.Error(w, "unsupported packet type", http.StatusBadRequest)
 		return
 	}
 
-	sourceAddr := rs.deriveSourceAddr(r)
 	if innerType == core.NHP_OTP {
 		// OTP is fire-and-forget, so this ID is intentionally unreserved: there
 		// is no response waiter or return that could collide with an active ID.
@@ -682,6 +712,52 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server timeout", http.StatusGatewayTimeout)
 	case <-rs.stopCh:
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+	}
+}
+
+func proofRequestLogMessage(sourceIP net.IP) string {
+	return "relay: proof request route=" + proofRequestRoute + " source_ip=" + sourceIP.String()
+}
+
+func proofRejectionLogMessage(
+	r *http.Request,
+	sourceIP net.IP,
+	srv *serverRuntime,
+	innerType int,
+) (string, bool) {
+	correlation := r.Header.Get(proofCorrelationHeader)
+	if len(correlation) == 0 || len(correlation) > 192 {
+		return "", false
+	}
+	match := proofRejectionCorrelationRE.FindStringSubmatch(correlation)
+	messageType := proofLifecycleMessageType(innerType)
+	if len(match) != 3 || match[1] != srv.name || match[2] != messageType {
+		return "", false
+	}
+	correlationSHA256 := sha256.Sum256([]byte(correlation))
+	return fmt.Sprintf(
+		"relay: proof rejection route=%s source_ip=%s cell_id=%s server_id=%s message_type=%s correlation_id_sha256=%x outcome=unsupported_type_rejected before_waiter=true before_forward=true before_server_dispatch=true",
+		proofRequestRoute,
+		sourceIP.String(),
+		srv.name,
+		srv.id,
+		messageType,
+		correlationSHA256,
+	), true
+}
+
+func proofLifecycleMessageType(headerType int) string {
+	switch headerType {
+	case core.NHP_LRT:
+		return "NHP_LRT"
+	case core.NHP_LST:
+		return "NHP_LST"
+	case core.NHP_OTP:
+		return "NHP_OTP"
+	case core.NHP_REG:
+		return "NHP_REG"
+	default:
+		return ""
 	}
 }
 

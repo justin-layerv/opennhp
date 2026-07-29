@@ -39,6 +39,8 @@ resource "aws_lambda_function" "broker" {
       LAUNCH_TEMPLATE_ID               = aws_launch_template.runner.id
       LAUNCH_TEMPLATE_VERSION          = tostring(aws_launch_template.runner.latest_version)
       MAX_RUNTIME_SECONDS              = tostring(var.max_runtime_minutes * 60)
+      RECOVERY_REQUEST_SECRET_PREFIX   = local.recovery_request_secret_prefix
+      RECOVERY_RESPONSE_SECRET_PREFIX  = local.recovery_response_secret_prefix
     }
   }
 

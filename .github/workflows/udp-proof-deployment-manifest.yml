@@ -25,6 +25,11 @@ on:
         description: Successful trusted-main Connector canary workflow run ID
         required: true
         type: string
+      terraform_apply_run_id:
+        description: Successful trusted-main NHP retirement apply run (post-removal only)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -265,20 +270,52 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PROOF_PHASE: ${{ inputs.proof_phase }}
+          TERRAFORM_APPLY_RUN_ID: ${{ inputs.terraform_apply_run_id }}
         run: |
           set -euo pipefail
+          terraform_args=()
+          if [[ "${PROOF_PHASE}" == "post_removal" ]]; then
+            [[ "${TERRAFORM_APPLY_RUN_ID}" =~ ^[1-9][0-9]*$ ]] || {
+              echo "::error::post_removal requires a positive terraform_apply_run_id"
+              exit 1
+            }
+            terraform_args=(--terraform-apply-run-id "${TERRAFORM_APPLY_RUN_ID}")
+          elif [[ -n "${TERRAFORM_APPLY_RUN_ID}" ]]; then
+            echo "::error::pre_removal forbids terraform_apply_run_id"
+            exit 1
+          fi
           python3 .github/scripts/collect_udp_proof_orchestrator_evidence.py \
             --snapshot evidence/snapshot.json \
             --output artifact/orchestrator-evidence.json \
             --proof-phase "${PROOF_PHASE}" \
             --producer-run-id "${GITHUB_RUN_ID}" \
             --producer-run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --producer-head-sha "${GITHUB_SHA}"
+            --producer-head-sha "${GITHUB_SHA}" \
+            "${terraform_args[@]}"
           count="$(find artifact -mindepth 1 -maxdepth 1 -type f -print | wc -l)"
           nonfiles="$(find artifact -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
           [[ "${count}" = "4" && -z "${nonfiles}" ]] ||
             {
               echo "::error::Artifact output is not exactly four regular files."
+              exit 1
+            }
+
+      - name: Observe exact HTTP and relay retirement targets
+        env:
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/collect_udp_proof_retirement_targets.py \
+            --artifact-directory artifact \
+            --proof-phase "${PROOF_PHASE}" \
+            --producer-run-id "${GITHUB_RUN_ID}" \
+            --producer-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --producer-head-sha "${GITHUB_SHA}"
+          count="$(find artifact -mindepth 1 -maxdepth 1 -type f -print | wc -l)"
+          nonfiles="$(find artifact -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          [[ "${count}" = "5" && -z "${nonfiles}" ]] ||
+            {
+              echo "::error::Artifact output is not exactly five regular files."
               exit 1
             }
 

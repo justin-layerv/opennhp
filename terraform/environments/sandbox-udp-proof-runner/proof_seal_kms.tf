@@ -1,17 +1,18 @@
 # -----------------------------------------------------------------------------
 # Dedicated sandbox proof sealing CMK.
 #
-# The attended proof runs both clients against one sandbox-only sealing CMK:
-# Connector seals its x25519 private key under its existing
-# qurl-agent-x25519-private-key context, while qurl-go wraps only its
-# SealedFileAgentState data key under the separate qurl-go/agent-state context.
-# There is no pre-existing sandbox sealing key, so this root creates a dedicated,
-# purpose-built CMK for the proof:
-#   * Connector's attended setup points LAYERV_AWS_KMS_KEY_ID here to seal its
-#     private key, while qurl-go uses the stable Terraform-owned alias directly;
-#   * modules/udp-proof-runner grants only context-separated Connector decrypt
-#     and qurl-go sealed-state encrypt/decrypt on exactly this key (see
-#     proof_kms_key_arns in main.tf).
+# The attended proof runs the Connector agent, which seals its x25519 PRIVATE key
+# into a KMS blob (qurl-connector pkg/agentstate/keyprovider.go, key provider
+# aws-kms, encryption context purpose=qurl-agent-x25519-private-key) and unseals
+# it to run. There is no pre-existing sandbox sealing key — it is a proof-setup
+# value the agent is pointed at via LAYERV_AWS_KMS_KEY_ID. So this root creates a
+# dedicated, purpose-built CMK for the sandbox proof:
+#   * the attended setup points the proof agent's LAYERV_AWS_KMS_KEY_ID here to
+#     SEAL (encrypt) its private key once during onboarding;
+#   * modules/udp-proof-runner grants the runner role DescribeKey + Encrypt +
+#     Decrypt on
+#     exactly this key (see proof_kms_key_arns in main.tf) so the runner can
+#     UNSEAL it during the proof.
 # Both sides are governed by account IAM (the default-shape key policy below), and
 # the module additionally constrains every cryptographic operation to its
 # reviewed client-specific encryption context.
@@ -25,7 +26,7 @@ resource "aws_kms_key" "proof_agent_seal" {
   enable_key_rotation     = true
 
   # Default-shape policy: account root administers; principals get key use via
-  # their IAM policies (the runner's context-scoped client grants live in
+  # their IAM policies (the runner's scoped Encrypt + Decrypt grants live in
   # modules/udp-proof-runner/iam.tf).
   policy = jsonencode({
     Version = "2012-10-17"

@@ -44,25 +44,75 @@ resource "aws_iam_role_policy" "runner" {
         }
       },
       {
+        Sid      = "CreateBoundRecoveryRequest"
+        Effect   = "Allow"
+        Action   = "secretsmanager:CreateSecret"
+        Resource = local.recovery_request_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = "udp-proof-recovery-request"
+            "secretsmanager:KmsKeyArn"   = aws_kms_key.jit.arn
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
+      },
+      {
+        Sid      = "TagBoundRecoveryRequest"
+        Effect   = "Allow"
+        Action   = "secretsmanager:TagResource"
+        Resource = local.recovery_request_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = "udp-proof-recovery-request"
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
+      },
+      {
+        Sid      = "ReadAndDeleteBoundRecoveryResponse"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DeleteSecret"]
+        Resource = local.recovery_response_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = "udp-proof-recovery-response"
+          }
+        }
+      },
+      {
+        Sid      = "UseRecoveryMailboxEncryption"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = aws_kms_key.jit.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = local.secrets_kms_via_service
+          }
+        }
+      },
+      {
         Sid      = "DescribeProofKeys"
         Effect   = "Allow"
         Action   = "kms:DescribeKey"
         Resource = var.proof_kms_key_arns
       },
       {
-        Sid      = "DecryptBoundConnectorState"
-        Effect   = "Allow"
-        Action   = "kms:Decrypt"
-        Resource = var.proof_kms_key_arns
-        Condition = {
-          StringEquals = {
-            "kms:EncryptionContext:purpose"  = "qurl-agent-x25519-private-key"
-            "kms:EncryptionContext:provider" = ["aws-kms", "aws-nitro"]
-          }
-        }
-      },
-      {
-        Sid      = "UseBoundQURLGoSealedState"
+        Sid      = "UseBoundQURLGoAgentState"
         Effect   = "Allow"
         Action   = ["kms:Encrypt", "kms:Decrypt"]
         Resource = var.proof_kms_key_arns
@@ -81,6 +131,30 @@ resource "aws_iam_role_policy" "runner" {
               "qurl_envelope_version",
               "qurl_provider_id",
               "qurl_agent_id",
+            ]
+          }
+        }
+      },
+      {
+        Sid      = "UseBoundConnectorAgentState"
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt"]
+        Resource = var.proof_kms_key_arns
+        Condition = {
+          StringEquals = {
+            "kms:EncryptionContext:purpose"          = "qurl-go/agent-state-dek/qurl-go/agent-state"
+            "kms:EncryptionContext:envelope_version" = "1"
+            "kms:EncryptionContext:provider_id"      = "aws-kms"
+          }
+          StringLike = {
+            "kms:EncryptionContext:agent_id" = "connector-sandbox-*"
+          }
+          "ForAllValues:StringEquals" = {
+            "kms:EncryptionContextKeys" = [
+              "purpose",
+              "envelope_version",
+              "provider_id",
+              "agent_id",
             ]
           }
         }
@@ -118,10 +192,28 @@ resource "aws_iam_role_policy" "runner" {
         Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
       },
       {
+        Sid      = "WriteTransportProofCheckpoint"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-checkpoint.json"
+      },
+      {
+        Sid      = "ReadTransportProofReceipt"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-receipt.json"
+      },
+      {
         Sid      = "DenyAssignmentProofReceiptWrites"
         Effect   = "Deny"
         Action   = "s3:PutObject"
         Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
+      },
+      {
+        Sid      = "DenyTransportProofReceiptWrites"
+        Effect   = "Deny"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-receipt.json"
       },
       {
         Sid      = "EncryptAssignmentProofHandshake"
@@ -351,6 +443,40 @@ resource "aws_iam_role_policy" "controller" {
         }
       },
       {
+        Sid    = "ReadExactAuthorityProofConcurrency"
+        Effect = "Allow"
+        Action = [
+          "lambda:GetFunctionConcurrency",
+          "lambda:ListProvisionedConcurrencyConfigs",
+        ]
+        Resource = [
+          for function_name in local.authority_proof_rollout_function_names :
+          "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
+        ]
+      },
+      {
+        Sid    = "ReadExactAuthorityProofAliases"
+        Effect = "Allow"
+        Action = "lambda:GetAlias"
+        Resource = flatten([
+          for function_name in local.authority_proof_rollout_function_names : [
+            "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}:blue",
+            "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}:green",
+          ]
+        ])
+      },
+      {
+        Sid      = "ReadAuthorityProofMetrics"
+        Effect   = "Allow"
+        Action   = "cloudwatch:GetMetricStatistics"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.region
+          }
+        }
+      },
+      {
         Sid      = "ReadAssignmentProofCheckpoint"
         Effect   = "Allow"
         Action   = "s3:GetObject"
@@ -363,10 +489,38 @@ resource "aws_iam_role_policy" "controller" {
         Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
       },
       {
+        Sid      = "ReadTransportProofCheckpoint"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-checkpoint.json"
+      },
+      {
+        Sid      = "WriteTransportProofReceipt"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-receipt.json"
+      },
+      {
         Sid      = "DenyAssignmentProofCheckpointWrites"
         Effect   = "Deny"
         Action   = "s3:PutObject"
         Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/checkpoint.json"
+      },
+      {
+        Sid      = "DenyTransportProofCheckpointWrites"
+        Effect   = "Deny"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/transport-checkpoint.json"
+      },
+      {
+        Sid    = "ReadExactLifecycleRouteLogs"
+        Effect = "Allow"
+        Action = "logs:FilterLogEvents"
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/layerv/nhp/${var.environment}/cell0/qurl-api:*",
+          "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/layerv/nhp/${var.environment}/cell1/qurl-api:*",
+          "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/layerv/nhp/${var.environment}/relay:*",
+        ]
       },
       {
         Sid      = "EncryptAssignmentProofHandshake"
@@ -387,6 +541,68 @@ resource "aws_iam_role_policy" "controller" {
         Effect   = "Allow"
         Action   = "kms:DescribeKey"
         Resource = aws_kms_key.assignment_handshake.arn
+      },
+      {
+        Sid      = "ReadAndDeleteBoundRecoveryRequest"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DeleteSecret"]
+        Resource = local.recovery_request_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = "udp-proof-recovery-request"
+          }
+        }
+      },
+      {
+        Sid      = "PrepareExactUnlimitedProofOwner"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = local.proof_customers_table_arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [local.proof_owner_id]
+          }
+        }
+      },
+      {
+        Sid      = "CreateBoundRecoveryResponse"
+        Effect   = "Allow"
+        Action   = "secretsmanager:CreateSecret"
+        Resource = local.recovery_response_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = "udp-proof-recovery-response"
+            "secretsmanager:KmsKeyArn"   = aws_kms_key.jit.arn
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
+      },
+      {
+        Sid      = "TagBoundRecoveryResponse"
+        Effect   = "Allow"
+        Action   = "secretsmanager:TagResource"
+        Resource = local.recovery_response_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = "udp-proof-recovery-response"
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
       },
     ]
   })
@@ -504,10 +720,14 @@ resource "aws_iam_role_policy" "broker" {
         }
       },
       {
-        Sid      = "InspectJITSecretMetadata"
-        Effect   = "Allow"
-        Action   = "secretsmanager:DescribeSecret"
-        Resource = local.jit_secret_arn_pattern
+        Sid    = "InspectProofSecretMetadata"
+        Effect = "Allow"
+        Action = "secretsmanager:DescribeSecret"
+        Resource = [
+          local.jit_secret_arn_pattern,
+          local.recovery_request_secret_arn_pattern,
+          local.recovery_response_secret_arn_pattern,
+        ]
       },
       {
         Sid      = "DeleteExpiredJITSecrets"
@@ -534,9 +754,33 @@ resource "aws_iam_role_policy" "broker" {
         }
       },
       {
+        Sid      = "DeleteExpiredRecoveryRequests"
+        Effect   = "Allow"
+        Action   = "secretsmanager:DeleteSecret"
+        Resource = local.recovery_request_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = "udp-proof-recovery-request"
+          }
+        }
+      },
+      {
+        Sid      = "DeleteExpiredRecoveryResponses"
+        Effect   = "Allow"
+        Action   = "secretsmanager:DeleteSecret"
+        Resource = local.recovery_response_secret_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = "udp-proof-recovery-response"
+          }
+        }
+      },
+      {
         # ListSecrets returns metadata, not SecretString. The broker filters by
-        # the exact module prefix and cannot GetSecretValue.
-        Sid      = "FindOrphanedJITSecretMetadata"
+        # exact module prefixes and cannot GetSecretValue.
+        Sid      = "FindOrphanedProofSecretMetadata"
         Effect   = "Allow"
         Action   = "secretsmanager:ListSecrets"
         Resource = "*"

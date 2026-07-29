@@ -17,6 +17,9 @@ ACTIVE_STATES = ("pending", "running", "stopping", "stopped")
 COMPONENT = "udp-proof-runner"
 PURPOSE = "udp-proof"
 ACCOUNT_CREDENTIAL_PURPOSE = "udp-proof-account-credential-run"
+RECOVERY_REQUEST_PURPOSE = "udp-proof-recovery-request"
+RECOVERY_RESPONSE_PURPOSE = "udp-proof-recovery-response"
+MAX_SECRET_DELETIONS_PER_SWEEP = 20
 
 
 class ContractError(ValueError):
@@ -51,8 +54,16 @@ class Broker:
         max_runtime_seconds: int,
         secret_prefix: str,
         account_credential_secret_prefix: str,
+        recovery_request_secret_prefix: str,
+        recovery_response_secret_prefix: str,
         now: Any = None,
     ) -> None:
+        secret_prefixes = (
+            secret_prefix,
+            account_credential_secret_prefix,
+            recovery_request_secret_prefix,
+            recovery_response_secret_prefix,
+        )
         if (
             environment != "sandbox"
             or not eip_allocation_id.startswith("eipalloc-")
@@ -62,8 +73,9 @@ class Broker:
             # validation in variables.tf (MAX_RUNTIME_SECONDS = minutes * 60).
             or max_runtime_seconds < 1800
             or max_runtime_seconds > 14400
-            or not secret_prefix.endswith("/")
             or account_credential_secret_prefix != f"{secret_prefix}credential/"
+            or any(not prefix.endswith("/") for prefix in secret_prefixes)
+            or len(set(secret_prefixes)) != len(secret_prefixes)
         ):
             raise RuntimeError("invalid broker configuration")
         self.ec2 = ec2
@@ -75,6 +87,10 @@ class Broker:
         self.max_runtime = timedelta(seconds=max_runtime_seconds)
         self.secret_prefix = secret_prefix
         self.account_credential_secret_prefix = account_credential_secret_prefix
+        self.recovery_secret_contracts = (
+            (recovery_request_secret_prefix, RECOVERY_REQUEST_PURPOSE),
+            (recovery_response_secret_prefix, RECOVERY_RESPONSE_PURPOSE),
+        )
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     def dispatch(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +120,10 @@ class Broker:
 
     def _account_credential_secret_name(self, run_id: str, run_attempt: str) -> str:
         return f"{self.account_credential_secret_prefix}{run_id}/{run_attempt}"
+
+    @staticmethod
+    def _bound_secret_name(prefix: str, run_id: str, run_attempt: str) -> str:
+        return f"{prefix}{run_id}/{run_attempt}"
 
     def _instances(self, run_id: str | None = None, run_attempt: str | None = None) -> list[dict[str, Any]]:
         if (run_id is None) != (run_attempt is None):
@@ -239,7 +259,16 @@ class Broker:
             raise
         return {"action": "start", "status": "launched", "instance_id": instance_id}
 
-    def _delete_secret_name(self, secret_name: str, purpose: str) -> bool:
+    def _delete_secret_name(
+        self,
+        secret_name: str,
+        *,
+        purpose: str = PURPOSE,
+        run_id: str | None = None,
+        run_attempt: str | None = None,
+    ) -> bool:
+        if (run_id is None) != (run_attempt is None):
+            raise RuntimeError("run ID and attempt must be supplied together")
         try:
             secret = self.secrets.describe_secret(SecretId=secret_name)
         except self.secrets.exceptions.ResourceNotFoundException:
@@ -251,8 +280,22 @@ class Broker:
             secret.get("Name") != secret_name
             or tags.get("Environment") != self.environment
             or tags.get("Purpose") != purpose
+            or (
+                run_id is not None
+                and (
+                    set(tags)
+                    != {
+                        "Environment",
+                        "Purpose",
+                        "GitHubRunId",
+                        "GitHubRunAttempt",
+                    }
+                    or tags.get("GitHubRunId") != run_id
+                    or tags.get("GitHubRunAttempt") != run_attempt
+                )
+            )
         ):
-            raise ContractError("run-bound secret failed its ownership contract")
+            raise ContractError("proof secret failed its ownership contract")
 
         try:
             self.secrets.delete_secret(
@@ -279,15 +322,29 @@ class Broker:
         instance_ids = sorted(instance["InstanceId"] for instance in self._instances(run_id, run_attempt))
         if instance_ids:
             self.ec2.terminate_instances(InstanceIds=instance_ids)
-        secret_deleted = self._delete_secret_name(self._secret_name(run_id, run_attempt), PURPOSE)
+        secret_deleted = self._delete_secret_name(
+            self._secret_name(run_id, run_attempt),
+            purpose=PURPOSE,
+        )
         account_credential_secret_deleted = self._delete_secret_name(
             self._account_credential_secret_name(run_id, run_attempt),
-            ACCOUNT_CREDENTIAL_PURPOSE,
+            purpose=ACCOUNT_CREDENTIAL_PURPOSE,
         )
+        recovery_secrets_deleted: list[str] = []
+        for prefix, purpose in self.recovery_secret_contracts:
+            secret_name = self._bound_secret_name(prefix, run_id, run_attempt)
+            if self._delete_secret_name(
+                secret_name,
+                purpose=purpose,
+                run_id=run_id,
+                run_attempt=run_attempt,
+            ):
+                recovery_secrets_deleted.append(secret_name)
         return {
             "action": "stop",
             "status": "terminated" if instance_ids else "absent",
             "instances": instance_ids,
+            "recovery_secrets_deleted": recovery_secrets_deleted,
             "secret_deleted": secret_deleted,
             "account_credential_secret_deleted": account_credential_secret_deleted,
         }
@@ -317,6 +374,54 @@ class Broker:
                 ):
                     secrets.append((name, purpose))
         return sorted(set(secrets))
+
+    @staticmethod
+    def _secret_binding(prefix: str, name: str) -> tuple[str, str] | None:
+        if not name.startswith(prefix):
+            return None
+        parts = name[len(prefix) :].split("/")
+        if (
+            len(parts) != 2
+            or not RUN_ID_RE.fullmatch(parts[0])
+            or not RUN_ATTEMPT_RE.fullmatch(parts[1])
+        ):
+            return None
+        return parts[0], parts[1]
+
+    def _expired_recovery_secrets(
+        self,
+        cutoff: datetime,
+    ) -> list[tuple[str, str, str, str]]:
+        expired: set[tuple[str, str, str, str]] = set()
+        paginator = self.secrets.get_paginator("list_secrets")
+        for prefix, purpose in self.recovery_secret_contracts:
+            for page in paginator.paginate(
+                Filters=[{"Key": "name", "Values": [prefix]}],
+                IncludePlannedDeletion=False,
+            ):
+                for secret in page.get("SecretList", []):
+                    name = secret.get("Name", "")
+                    created = secret.get("CreatedDate")
+                    binding = self._secret_binding(prefix, name)
+                    if binding is None or not isinstance(created, datetime) or created > cutoff:
+                        continue
+                    run_id, run_attempt = binding
+                    tags = _tags(secret.get("Tags"))
+                    if (
+                        set(tags)
+                        == {
+                            "Environment",
+                            "Purpose",
+                            "GitHubRunId",
+                            "GitHubRunAttempt",
+                        }
+                        and tags.get("Environment") == self.environment
+                        and tags.get("Purpose") == purpose
+                        and tags.get("GitHubRunId") == run_id
+                        and tags.get("GitHubRunAttempt") == run_attempt
+                    ):
+                        expired.add((name, purpose, run_id, run_attempt))
+        return sorted(expired)
 
     def sweep(self) -> dict[str, Any]:
         now = self.now()
@@ -348,9 +453,26 @@ class Broker:
         if terminate:
             self.ec2.terminate_instances(InstanceIds=sorted(terminate))
 
+        cutoff = now - self.max_runtime
+        orphaned_secrets = [
+            (secret_name, purpose, None, None)
+            for secret_name, purpose in self._expired_secrets(cutoff)
+        ]
+        orphaned_secrets.extend(self._expired_recovery_secrets(cutoff))
+
+        # Secrets Manager force deletion can retry internally, so cap every
+        # sweep's delete calls to stay inside the Lambda's 30-second budget.
+        # The five-minute schedule drains any remaining backlog.
         deleted_secrets: list[str] = []
-        for secret_name, purpose in self._expired_secrets(now - self.max_runtime):
-            if self._delete_secret_name(secret_name, purpose):
+        for secret_name, purpose, run_id, run_attempt in sorted(orphaned_secrets)[
+            :MAX_SECRET_DELETIONS_PER_SWEEP
+        ]:
+            if self._delete_secret_name(
+                secret_name,
+                purpose=purpose,
+                run_id=run_id,
+                run_attempt=run_attempt,
+            ):
                 deleted_secrets.append(secret_name)
 
         return {
@@ -376,5 +498,7 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         max_runtime_seconds=int(_required_env("MAX_RUNTIME_SECONDS")),
         secret_prefix=_required_env("JIT_SECRET_PREFIX"),
         account_credential_secret_prefix=_required_env("ACCOUNT_CREDENTIAL_SECRET_PREFIX"),
+        recovery_request_secret_prefix=_required_env("RECOVERY_REQUEST_SECRET_PREFIX"),
+        recovery_response_secret_prefix=_required_env("RECOVERY_RESPONSE_SECRET_PREFIX"),
     )
     return broker.dispatch(event)

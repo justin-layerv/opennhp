@@ -47,20 +47,73 @@ def local_blob_reader(surface_bytes: bytes | None = None):
             if path != orchestrator.RETIRED_SURFACE_PATH:
                 raise collector.OrchestratorEvidenceError(f"unexpected path {path}")
             return surface
-        if repository != collector.NHP_REPOSITORY:
-            raise collector.OrchestratorEvidenceError(
-                f"unexpected repository {repository}"
+        if repository == collector.NHP_REPOSITORY:
+            return (ROOT / path).read_bytes()
+        expected = {
+            (
+                orchestrator.GENERATED_ARTIFACT_REPOSITORIES[repository_key],
+                artifact_path,
+            ): surface_name
+            for surface_name, repository_key, artifact_path in (
+                orchestrator.GENERATED_ARTIFACT_SURFACES
             )
-        return (ROOT / path).read_bytes()
+        }
+        surface_name = expected.get((repository, path))
+        if surface_name is None:
+            raise collector.OrchestratorEvidenceError(
+                f"unexpected generated artifact {repository}/{path}"
+            )
+        semantics = orchestrator.GENERATED_ARTIFACT_SEMANTICS[surface_name]
+        markers = [
+            *semantics["required"],
+            *semantics["pre_removal_required"],
+        ]
+        return ("\n".join(markers) + "\n").encode()
 
     return read_blob
+
+
+def local_terraform_state() -> dict[str, object]:
+    resources = []
+    for address in orchestrator.TERRAFORM_RETIREMENT_RESOURCES:
+        if address == "module.nhp.module.bootstrap_alb[0]":
+            resources.append(
+                {
+                    "module": address,
+                    "type": "aws_lb",
+                    "name": "this",
+                }
+            )
+            continue
+        module, resource_type, name = address.rsplit(".", 2)
+        resources.append(
+            {
+                "module": module,
+                "type": resource_type,
+                "name": name,
+            }
+        )
+    return {
+        "version": 4,
+        "lineage": "dd031dd9-540a-3083-00a5-730b0e3b2bb0",
+        "serial": 3280,
+        "resources": resources,
+    }
 
 
 def build_document(
     *,
     proof_phase: str = "pre_removal",
     read_blob_fn=None,
-) -> tuple[dict[str, object], dict[str, object], bytes, bytes]:
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    bytes,
+    bytes,
+    bytes,
+]:
     """Run the real producer against the working tree and return its output."""
 
     snapshot = deployment_fixture.valid_snapshot()
@@ -85,7 +138,7 @@ def build_document(
                 ),
             )
         }
-    manifest_bytes, runtime_bytes, _ = deployment.validate_triplet(
+    manifest_bytes, runtime_bytes, provenance_bytes = deployment.validate_triplet(
         snapshot["manifest"],
         snapshot["runtime"],
         snapshot["provenance"],
@@ -106,8 +159,17 @@ def build_document(
             producer_head_sha=HEAD_SHA,
             observed_at=VALIDATION_TIME,
             read_blob_fn=read_blob_fn or local_blob_reader(),
+            read_terraform_state_fn=local_terraform_state,
         )
-    return json.loads(raw), snapshot["manifest"], manifest_bytes, runtime_bytes
+    return (
+        json.loads(raw),
+        snapshot["manifest"],
+        snapshot["runtime"],
+        snapshot["provenance"],
+        manifest_bytes,
+        runtime_bytes,
+        provenance_bytes,
+    )
 
 
 class ReviewedContractLockstepTest(unittest.TestCase):
@@ -150,9 +212,10 @@ class ReviewedContractLockstepTest(unittest.TestCase):
     def test_live_packet_source_still_declares_the_pinned_wire_values(self) -> None:
         blob = (ROOT / orchestrator.MESSAGE_TYPE_SOURCE_PATH).read_bytes()
         wire_values = collector.parse_message_type_wire_values(blob)
-        for message_type, expected in (
-            orchestrator.RETIRED_MESSAGE_TYPE_WIRE_VALUES.items()
-        ):
+        for (
+            message_type,
+            expected,
+        ) in orchestrator.RETIRED_MESSAGE_TYPE_WIRE_VALUES.items():
             self.assertEqual(wire_values[message_type], expected, message_type)
 
     def test_every_reviewed_anchor_still_exists_in_the_working_tree(self) -> None:
@@ -212,9 +275,9 @@ class MessageTypeParserTest(unittest.TestCase):
             "two blocks": (
                 "\tNHP_KPL = iota\n\tNHP_LST\n)\n\tNHP_KPL = iota\n\tNHP_LST\n)\n"
             ).encode("utf-8"),
-            "missing retired type": (
-                "\tNHP_KPL = iota\n\tNHP_KNK\n)\n"
-            ).encode("utf-8"),
+            "missing retired type": ("\tNHP_KPL = iota\n\tNHP_KNK\n)\n").encode(
+                "utf-8"
+            ),
             "not utf-8": b"\xff\xfe\x00",
         }
         for name, source in cases.items():
@@ -266,12 +329,74 @@ class InterfaceObservationTest(unittest.TestCase):
         self.assertFalse(relay["dispatches_lifecycle_work"])
 
 
+class GeneratedArtifactObservationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = deployment_fixture.valid_snapshot()["manifest"]
+        self.identities = {
+            (
+                orchestrator.GENERATED_ARTIFACT_REPOSITORIES[repository_key],
+                path,
+            ): surface
+            for surface, repository_key, path in (
+                orchestrator.GENERATED_ARTIFACT_SURFACES
+            )
+        }
+
+    @staticmethod
+    def semantic_blob(surface: str, phase: str) -> bytes:
+        semantics = orchestrator.GENERATED_ARTIFACT_SEMANTICS[surface]
+        markers = list(semantics["required"])
+        if phase == "pre_removal":
+            markers.extend(semantics["pre_removal_required"])
+        return ("\n".join(markers) + "\n").encode()
+
+    def test_arbitrary_content_cannot_claim_any_matching_surface(self) -> None:
+        for rejected_surface in orchestrator.GENERATED_ARTIFACT_SEMANTICS:
+            with self.subTest(surface=rejected_surface):
+
+                def read_blob(repository, path, _ref):
+                    surface = self.identities[(repository, path)]
+                    if surface == rejected_surface:
+                        return b"arbitrary content\n"
+                    return self.semantic_blob(surface, "pre_removal")
+
+                with self.assertRaises(deployment.ContractError):
+                    collector.observe_generated_artifacts(
+                        manifest=self.manifest,
+                        proof_phase="pre_removal",
+                        read_blob_fn=read_blob,
+                    )
+
+    def test_post_removal_rejects_a_stale_export(self) -> None:
+        def read_blob(repository, path, _ref):
+            surface = self.identities[(repository, path)]
+            blob = self.semantic_blob(surface, "post_removal")
+            if surface == "mcp":
+                blob += b"/v1/agent/bootstrap\n"
+            return blob
+
+        with self.assertRaisesRegex(
+            deployment.ContractError, "still exports retired lifecycle"
+        ):
+            collector.observe_generated_artifacts(
+                manifest=self.manifest,
+                proof_phase="post_removal",
+                read_blob_fn=read_blob,
+            )
+
+
 class ProducerTest(unittest.TestCase):
     def test_pre_removal_document_validates_against_its_own_artifact(self) -> None:
-        document, manifest, manifest_bytes, runtime_bytes = build_document()
-        self.assertEqual(
-            document["produced_rows"], sorted(orchestrator.PRODUCED_ROWS)
-        )
+        (
+            document,
+            manifest,
+            runtime,
+            provenance,
+            manifest_bytes,
+            runtime_bytes,
+            provenance_bytes,
+        ) = build_document()
+        self.assertEqual(document["produced_rows"], sorted(orchestrator.PRODUCED_ROWS))
         row = document["rows"]["retirement.nhp_registrar_surface_state"]
         self.assertEqual(row["kind"], "surface_inventory")
         self.assertEqual(
@@ -282,8 +407,11 @@ class ProducerTest(unittest.TestCase):
         orchestrator.validate_orchestrator_evidence(
             copy.deepcopy(document),
             manifest=manifest,
+            runtime=runtime,
+            provenance=provenance,
             manifest_bytes=manifest_bytes,
             runtime_bytes=runtime_bytes,
+            provenance_bytes=provenance_bytes,
             proof_phase="pre_removal",
             producer_run_id=RUN_ID,
             producer_run_attempt=RUN_ATTEMPT,
@@ -312,15 +440,21 @@ class ValidatorFailClosedTest(unittest.TestCase):
         (
             cls.document,
             cls.manifest,
+            cls.runtime,
+            cls.provenance,
             cls.manifest_bytes,
             cls.runtime_bytes,
+            cls.provenance_bytes,
         ) = build_document()
 
     def validate(self, document: dict[str, object], **overrides: object) -> None:
         values: dict[str, object] = {
             "manifest": self.manifest,
+            "runtime": self.runtime,
+            "provenance": self.provenance,
             "manifest_bytes": self.manifest_bytes,
             "runtime_bytes": self.runtime_bytes,
+            "provenance_bytes": self.provenance_bytes,
             "proof_phase": "pre_removal",
             "producer_run_id": RUN_ID,
             "producer_run_attempt": RUN_ATTEMPT,
@@ -346,7 +480,9 @@ class ValidatorFailClosedTest(unittest.TestCase):
             document["produced_rows"] = []
 
         def extra_row(document):
-            document["rows"]["negative.wrong_caller"] = {"kind": "rejection_observation"}
+            document["rows"]["negative.wrong_caller"] = {
+                "kind": "rejection_observation"
+            }
             document["produced_rows"] = sorted(document["rows"])
 
         def unknown_row(document):
@@ -429,9 +565,7 @@ class ValidatorFailClosedTest(unittest.TestCase):
         }.items():
             with self.subTest(name=name):
                 with self.assertRaises(deployment.ContractError):
-                    self.validate(
-                        copy.deepcopy(self.document), validation_time=moment
-                    )
+                    self.validate(copy.deepcopy(self.document), validation_time=moment)
 
     def test_rejects_noncanonical_bytes(self) -> None:
         canonical = orchestrator.canonical_bytes(self.document)
@@ -445,8 +579,11 @@ class ValidatorFailClosedTest(unittest.TestCase):
                     orchestrator.validate_orchestrator_bytes(
                         raw,
                         manifest=self.manifest,
+                        runtime=self.runtime,
+                        provenance=self.provenance,
                         manifest_bytes=self.manifest_bytes,
                         runtime_bytes=self.runtime_bytes,
+                        provenance_bytes=self.provenance_bytes,
                         proof_phase="pre_removal",
                         producer_run_id=RUN_ID,
                         producer_run_attempt=RUN_ATTEMPT,
@@ -458,8 +595,11 @@ class ValidatorFailClosedTest(unittest.TestCase):
         orchestrator.validate_orchestrator_bytes(
             orchestrator.canonical_bytes(self.document),
             manifest=self.manifest,
+            runtime=self.runtime,
+            provenance=self.provenance,
             manifest_bytes=self.manifest_bytes,
             runtime_bytes=self.runtime_bytes,
+            provenance_bytes=self.provenance_bytes,
             proof_phase="pre_removal",
             producer_run_id=RUN_ID,
             producer_run_attempt=RUN_ATTEMPT,
