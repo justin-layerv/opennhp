@@ -32,3 +32,23 @@ output "launch_template_id" {
   description = "The hardened runner launch template id."
   value       = module.udp_proof_runner.launch_template_id
 }
+
+output "proof_account_credential_secret_arn" {
+  description = "Stable empty secret container to seed out of band before enabling qurl-go OTP proof."
+  value       = module.udp_proof_runner.proof_account_credential_secret_arn
+}
+
+output "proof_otp_mailbox_recipient" {
+  description = "Exact private SES recipient for the attended qurl-go OTP proof."
+  value       = module.udp_proof_runner.proof_otp_mailbox_recipient
+}
+
+output "proof_otp_mailbox_queue_url" {
+  description = "Exact private SQS queue consumed by the proof runner."
+  value       = module.udp_proof_runner.proof_otp_mailbox_queue_url
+}
+
+output "proof_otp_mailbox_bucket" {
+  description = "Private one-day SES receipt bucket consumed by the proof runner."
+  value       = module.udp_proof_runner.proof_otp_mailbox_bucket
+}

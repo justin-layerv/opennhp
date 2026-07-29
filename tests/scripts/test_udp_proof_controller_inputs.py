@@ -19,6 +19,9 @@ VALIDATOR_PATH = (
 )
 BROKER_SCRIPT = REPO_ROOT / ".github" / "scripts" / "invoke_udp_proof_broker.sh"
 WAIT_SCRIPT = REPO_ROOT / ".github" / "scripts" / "wait_for_action_run.sh"
+PROOF_ACCOUNT_SCRIPT = (
+    REPO_ROOT / ".github" / "scripts" / "manage_udp_proof_account.sh"
+)
 SPEC = importlib.util.spec_from_file_location(
     "udp_proof_controller_inputs", VALIDATOR_PATH
 )
@@ -126,6 +129,20 @@ class ValidatorTest(unittest.TestCase):
             self.select_dispatch(client="other")
         with self.assertRaisesRegex(validator.ValidationError, "proof_phase"):
             self.select_dispatch(proof_phase="other")
+
+
+class ProofAccountContractTest(unittest.TestCase):
+    def test_owner_is_exact_system_unlimited_and_key_is_counterless(self) -> None:
+        script = PROOF_ACCOUNT_SCRIPT.read_text()
+        self.assertIn('"tier":{"S":"system"}', script)
+        self.assertIn('"tier": {"S": "system"}', script)
+        self.assertNotIn('"tier":{"S":"free"}', script)
+        self.assertIn('"has_counter":{"BOOL":false}', script)
+        self.assertIn('"has_agent_counter":{"BOOL":false}', script)
+        self.assertIn(
+            "proof customer must already be the exact system/unlimited owner",
+            script,
+        )
 
 
 class WorkflowContractTest(unittest.TestCase):
@@ -349,7 +366,7 @@ class ShellHelperTest(unittest.TestCase):
                 if jq -e '.action == "start"' <<<"$payload" >/dev/null; then
                   printf '{"action":"start","status":"launched","instance_id":"i-123abc"}\n' >"$response_file"
                 else
-                  printf '{"action":"stop","status":"terminated","instances":["i-123abc"],"secret_deleted":true}\n' >"$response_file"
+                  printf '{"action":"stop","status":"terminated","instances":["i-123abc"],"secret_deleted":true,"account_credential_secret_deleted":true}\n' >"$response_file"
                 fi
                 printf '{"StatusCode":200}\n'
                 """,
@@ -396,22 +413,22 @@ class ShellHelperTest(unittest.TestCase):
 
     def test_broker_helper_accepts_exact_absent_stop_response(self) -> None:
         result = self.run_broker_with_response(
-            '{"action":"stop","status":"absent","instances":[],"secret_deleted":false}',
+            '{"action":"stop","status":"absent","instances":[],"secret_deleted":false,"account_credential_secret_deleted":false}',
             action="stop",
         )
         self.assertEqual(result.returncode, 0)
 
     def test_broker_helper_rejects_ambiguous_stop_instance_sets(self) -> None:
         responses = (
-            '{"action":"stop","status":"terminated","instances":["i-123abc","i-123abc"],"secret_deleted":true}',
-            '{"action":"stop","status":"terminated","instances":["not-an-instance"],"secret_deleted":true}',
+            '{"action":"stop","status":"terminated","instances":["i-123abc","i-123abc"],"secret_deleted":true,"account_credential_secret_deleted":true}',
+            '{"action":"stop","status":"terminated","instances":["not-an-instance"],"secret_deleted":true,"account_credential_secret_deleted":true}',
         )
         for response in responses:
             with self.subTest(response=response):
                 result = self.run_broker_with_response(response, action="stop")
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
-                    "did not confirm exact runner/JIT cleanup",
+                    "did not confirm exact runner/run-bound secret cleanup",
                     result.stdout,
                 )
 

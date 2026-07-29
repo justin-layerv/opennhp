@@ -678,6 +678,33 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
         "s3:GetBucketNotification",
         "s3:PutBucketNotification",
     ],
+    # internal/service/sqs/queue_policy.go — the standalone policy resource
+    # reads the queue Policy attribute and uses SetQueueAttributes to install,
+    # replace, or remove it.
+    "aws_sqs_queue_policy": [
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+    ],
+    # Classic SES inbound receipt resources used only by the private sandbox
+    # UDP OTP mailbox. These APIs do not support resource-level IAM, so the
+    # matching apply-role statement is account/region bounded by the role and
+    # uses Resource="*".
+    "aws_ses_receipt_rule_set": [
+        "ses:CreateReceiptRuleSet",
+        "ses:DescribeReceiptRuleSet",
+        "ses:DeleteReceiptRuleSet",
+    ],
+    "aws_ses_receipt_rule": [
+        "ses:CreateReceiptRule",
+        "ses:DescribeReceiptRule",
+        "ses:SetReceiptRulePosition",
+        "ses:UpdateReceiptRule",
+        "ses:DeleteReceiptRule",
+    ],
+    "aws_ses_active_receipt_rule_set": [
+        "ses:DescribeActiveReceiptRuleSet",
+        "ses:SetActiveReceiptRuleSet",
+    ],
     # Agent-registration email OTP (T1), terraform/agent_otp_ses.tf.
     # internal/service/sesv2/email_identity.go — CreateEmailIdentity on create,
     # GetEmailIdentity on read, DeleteEmailIdentity on destroy,

@@ -3016,6 +3016,19 @@ resource "aws_iam_policy" "terraform_apply_ses" {
           "ses:UpdateConfigurationSetEventDestination",
           "ses:DeleteConfigurationSetEventDestination",
           "ses:GetConfigurationSetEventDestinations",
+          # Classic SES inbound receipt-rule control for the private sandbox
+          # qurl-go OTP mailbox. The same dedicated policy already carries the
+          # SES sender-plane grants and has ample document-size headroom.
+          "ses:CreateReceiptRuleSet",
+          "ses:DescribeReceiptRuleSet",
+          "ses:DeleteReceiptRuleSet",
+          "ses:CreateReceiptRule",
+          "ses:DescribeReceiptRule",
+          "ses:SetReceiptRulePosition",
+          "ses:UpdateReceiptRule",
+          "ses:DeleteReceiptRule",
+          "ses:DescribeActiveReceiptRuleSet",
+          "ses:SetActiveReceiptRuleSet",
           "ses:TagResource",
           "ses:UntagResource",
           "ses:ListTagsForResource"

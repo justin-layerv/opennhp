@@ -151,6 +151,17 @@ def secret(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, created=NOW):
         "Tags": tags(run_id, run_attempt),
     }
 
+def account_secret(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, created=NOW):
+    value = secret(run_id, run_attempt, created)
+    name = PREFIX + "credential/" + run_id + "/" + run_attempt
+    value["Name"] = name
+    value["ARN"] = "arn:aws:secretsmanager:us-east-2:767397897469:secret:" + name + "-abc123"
+    value["Tags"] = [
+        tag if tag["Key"] != "Purpose" else {"Key": "Purpose", "Value": "udp-proof-account-credential-run"}
+        for tag in value["Tags"]
+    ]
+    return value
+
 
 def new_broker(ec2=None, secrets=None):
     return broker_module.Broker(
@@ -162,6 +173,7 @@ def new_broker(ec2=None, secrets=None):
         launch_template_version="7",
         max_runtime_seconds=3600,
         secret_prefix=PREFIX,
+        account_credential_secret_prefix=PREFIX + "credential/",
         now=lambda: NOW,
     )
 
@@ -222,6 +234,7 @@ class BrokerTest(unittest.TestCase):
             "LAUNCH_TEMPLATE_VERSION": "7",
             "MAX_RUNTIME_SECONDS": "3600",
             "JIT_SECRET_PREFIX": PREFIX,
+            "ACCOUNT_CREDENTIAL_SECRET_PREFIX": PREFIX + "credential/",
         }
         with (
             patch.dict(os.environ, environment, clear=True),
@@ -263,6 +276,7 @@ class BrokerTest(unittest.TestCase):
             "launch_template_version": "7",
             "max_runtime_seconds": 3600,
             "secret_prefix": PREFIX,
+            "account_credential_secret_prefix": PREFIX + "credential/",
         }
         invalid_values = (
             ("environment", "production"),
@@ -272,6 +286,7 @@ class BrokerTest(unittest.TestCase):
             ("max_runtime_seconds", 1799),
             ("max_runtime_seconds", 14401),
             ("secret_prefix", PREFIX.rstrip("/")),
+            ("account_credential_secret_prefix", PREFIX + "other/"),
         )
         for field, value in invalid_values:
             with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
@@ -480,6 +495,14 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(secrets.deleted, [{"SecretId": name, "ForceDeleteWithoutRecovery": True}])
         self.assertTrue(result["secret_deleted"])
+        self.assertFalse(result["account_credential_secret_deleted"])
+
+    def test_stop_deletes_only_the_same_run_account_credential_secret(self):
+        name = PREFIX + "credential/" + RUN_ID + "/" + RUN_ATTEMPT
+        secrets = FakeSecrets({name: account_secret()})
+        result = new_broker(FakeEC2(), secrets).stop(RUN_ID, RUN_ATTEMPT)
+        self.assertEqual(secrets.deleted, [{"SecretId": name, "ForceDeleteWithoutRecovery": True}])
+        self.assertTrue(result["account_credential_secret_deleted"])
 
     def test_stop_accepts_only_proved_already_deleting_secret(self):
         name = PREFIX + RUN_ID + "/" + RUN_ATTEMPT
@@ -559,16 +582,25 @@ class BrokerTest(unittest.TestCase):
             {"Key": "Environment", "Value": "production"},
             {"Key": "Purpose", "Value": "udp-proof"},
         ]
-        pages = [{"SecretList": [expired, fresh, malformed_owned, foreign]}]
+        expired_account = account_secret(created=NOW - timedelta(hours=2))
+        pages = [{"SecretList": [expired, fresh, malformed_owned, foreign, expired_account]}]
         secrets = FakeSecrets(pages=pages)
         result = new_broker(FakeEC2(), secrets).sweep()
         self.assertEqual(
             result["deleted_secret_names"],
-            [PREFIX + RUN_ID + "/" + RUN_ATTEMPT, PREFIX + "invalid/" + RUN_ATTEMPT],
+            [
+                PREFIX + RUN_ID + "/" + RUN_ATTEMPT,
+                PREFIX + "credential/" + RUN_ID + "/" + RUN_ATTEMPT,
+                PREFIX + "invalid/" + RUN_ATTEMPT,
+            ],
         )
         self.assertEqual(
             [deleted["SecretId"] for deleted in secrets.deleted],
-            [PREFIX + RUN_ID + "/" + RUN_ATTEMPT, PREFIX + "invalid/" + RUN_ATTEMPT],
+            [
+                PREFIX + RUN_ID + "/" + RUN_ATTEMPT,
+                PREFIX + "credential/" + RUN_ID + "/" + RUN_ATTEMPT,
+                PREFIX + "invalid/" + RUN_ATTEMPT,
+            ],
         )
         self.assertEqual(secrets.paginator.calls[0]["Filters"], [{"Key": "name", "Values": [PREFIX]}])
 

@@ -56,7 +56,7 @@ for attempt in 1 2 3 4 5; do
         (.status == "launched" or .status == "existing") and
         (.instance_id | type == "string" and test("^i-[0-9a-f]+$"))
       else
-        (keys | sort) == ["action", "instances", "secret_deleted", "status"] and
+        (keys | sort) == ["account_credential_secret_deleted", "action", "instances", "secret_deleted", "status"] and
         .action == "stop" and
         (.status == "terminated" or .status == "absent") and
         (.instances | type == "array") and
@@ -67,7 +67,8 @@ for attempt in 1 2 3 4 5; do
         else
           (.instances | length) == 0
         end) and
-        (.secret_deleted | type == "boolean")
+        (.secret_deleted | type == "boolean") and
+        (.account_credential_secret_deleted | type == "boolean")
       end
     ' "$response_file" >/dev/null; then
     exit 0
@@ -82,6 +83,6 @@ done
 if [[ "$action" == "start" ]]; then
   echo "::error::broker did not confirm an exact ready runner"
 else
-  echo "::error::broker did not confirm exact runner/JIT cleanup"
+  echo "::error::broker did not confirm exact runner/run-bound secret cleanup"
 fi
 exit 1

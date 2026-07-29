@@ -32,6 +32,18 @@ resource "aws_iam_role_policy" "runner" {
         }
       },
       {
+        Sid      = "ReadAndDeleteRunBoundProofCredential"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DeleteSecret"]
+        Resource = local.proof_account_jit_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = local.proof_account_jit_purpose
+          }
+        }
+      },
+      {
         Sid      = "DescribeProofKeys"
         Effect   = "Allow"
         Action   = "kms:DescribeKey"
@@ -72,6 +84,26 @@ resource "aws_iam_role_policy" "runner" {
             ]
           }
         }
+      },
+      {
+        Sid    = "ConsumeExactProofOTPMailboxQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ReceiveMessage",
+        ]
+        Resource = aws_sqs_queue.proof_otp_mailbox.arn
+      },
+      {
+        Sid    = "ConsumeExactProofOTPMailboxObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:DeleteObject",
+          "s3:GetObject",
+        ]
+        Resource = "${aws_s3_bucket.proof_otp_mailbox.arn}/${local.proof_mailbox_object_prefix}*"
       },
     ]
   })
@@ -190,6 +222,101 @@ resource "aws_iam_role_policy" "controller" {
         Effect   = "Allow"
         Action   = "lambda:InvokeFunction"
         Resource = aws_lambda_function.broker.arn
+      },
+      {
+        Sid      = "ReadBoundProofAccountCredential"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_secretsmanager_secret.proof_account_credential.arn
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = "udp-proof-account-credential"
+          }
+        }
+      },
+      {
+        Sid      = "ReadBoundProofAccountCredentialDigest"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = local.proof_account_sha_parameter_arn
+      },
+      {
+        Sid      = "ConvergeExactProofCustomer"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Resource = local.proof_control_customers_table_arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [local.proof_account_owner_id]
+          }
+        }
+      },
+      {
+        Sid    = "ConvergeAndRemoveExactProofAccountKey"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:DeleteItem",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+        ]
+        Resource = local.proof_control_api_keys_table_arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [local.proof_account_credential_hash]
+          }
+        }
+      },
+      {
+        Sid      = "DeleteRunBoundProofCredential"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:DeleteSecret"]
+        Resource = local.proof_account_jit_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = local.proof_account_jit_purpose
+          }
+        }
+      },
+      {
+        Sid      = "CreateRunBoundProofCredential"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:CreateSecret"]
+        Resource = local.proof_account_jit_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = local.proof_account_jit_purpose
+            "secretsmanager:KmsKeyArn"   = aws_kms_key.jit.arn
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
+      },
+      {
+        Sid      = "TagRunBoundProofCredential"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:TagResource"]
+        Resource = local.proof_account_jit_arn_pattern
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/Environment" = var.environment
+            "aws:RequestTag/Purpose"     = local.proof_account_jit_purpose
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["Environment", "Purpose", "GitHubRunId", "GitHubRunAttempt"]
+          }
+          Null = {
+            "aws:RequestTag/GitHubRunId"      = "false"
+            "aws:RequestTag/GitHubRunAttempt" = "false"
+          }
+        }
       },
     ]
   })
@@ -321,6 +448,18 @@ resource "aws_iam_role_policy" "broker" {
           StringEquals = {
             "secretsmanager:ResourceTag/Environment" = var.environment
             "secretsmanager:ResourceTag/Purpose"     = local.purpose
+          }
+        }
+      },
+      {
+        Sid      = "DeleteExpiredProofAccountCredentials"
+        Effect   = "Allow"
+        Action   = "secretsmanager:DeleteSecret"
+        Resource = local.proof_account_jit_arn_pattern
+        Condition = {
+          StringEquals = {
+            "secretsmanager:ResourceTag/Environment" = var.environment
+            "secretsmanager:ResourceTag/Purpose"     = local.proof_account_jit_purpose
           }
         }
       },

@@ -32,12 +32,13 @@ resource "aws_lambda_function" "broker" {
 
   environment {
     variables = {
-      ENVIRONMENT             = var.environment
-      EIP_ALLOCATION_ID       = aws_eip.source.id
-      JIT_SECRET_PREFIX       = local.jit_secret_prefix
-      LAUNCH_TEMPLATE_ID      = aws_launch_template.runner.id
-      LAUNCH_TEMPLATE_VERSION = tostring(aws_launch_template.runner.latest_version)
-      MAX_RUNTIME_SECONDS     = tostring(var.max_runtime_minutes * 60)
+      ENVIRONMENT                      = var.environment
+      EIP_ALLOCATION_ID                = aws_eip.source.id
+      JIT_SECRET_PREFIX                = local.jit_secret_prefix
+      ACCOUNT_CREDENTIAL_SECRET_PREFIX = local.proof_account_jit_secret_prefix
+      LAUNCH_TEMPLATE_ID               = aws_launch_template.runner.id
+      LAUNCH_TEMPLATE_VERSION          = tostring(aws_launch_template.runner.latest_version)
+      MAX_RUNTIME_SECONDS              = tostring(var.max_runtime_minutes * 60)
     }
   }
 

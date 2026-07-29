@@ -165,6 +165,49 @@ variable "runtime_attestation_kms_key_arn" {
   }
 }
 
+variable "proof_account_credential_sha256" {
+  description = <<-EOT
+    Canonical SHA-256 hex of the out-of-band seeded sandbox proof account
+    credential. Null keeps account-OTP proof setup disabled while the mailbox
+    and Secrets Manager container are provisioned. Once set, the attended
+    controller may materialize only this exact credential row.
+  EOT
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.proof_account_credential_sha256 == null ||
+      can(regex("^[0-9a-f]{64}$", var.proof_account_credential_sha256))
+    )
+    error_message = "proof_account_credential_sha256 must be null or canonical lowercase SHA-256 hex."
+  }
+}
+
+variable "proof_mailbox_route53_zone_id" {
+  description = "Same-account public Route53 zone that owns the sandbox proof mailbox MX record."
+  type        = string
+
+  validation {
+    condition     = can(regex("^Z[A-Z0-9]{8,}$", var.proof_mailbox_route53_zone_id))
+    error_message = "proof_mailbox_route53_zone_id must be a valid Route53 hosted zone ID."
+  }
+}
+
+variable "proof_mailbox_domain" {
+  description = "Sandbox-only SES receiving subdomain dedicated to qurl-go OTP proof."
+  type        = string
+
+  validation {
+    condition = (
+      var.proof_mailbox_domain == lower(var.proof_mailbox_domain) &&
+      can(regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", var.proof_mailbox_domain))
+    )
+    error_message = "proof_mailbox_domain must be a canonical lowercase DNS name."
+  }
+}
+
 variable "provisioned_cell_catalog_kms_key_arn" {
   description = <<-EOT
     Exact CMK ARN encrypting the provisioned-cell catalog table

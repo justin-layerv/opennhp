@@ -74,6 +74,16 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "external" {
+  mock_data "external" {
+    defaults = {
+      result = {
+        name = ""
+      }
+    }
+  }
+}
+
 variables {
   environment              = "sandbox"
   name_prefix              = "layerv-nhp-sandbox"
@@ -90,6 +100,9 @@ variables {
   runtime_attestation_bucket_arn       = "arn:aws:s3:::layerv-nhp-sandbox-runtime-attestations"
   runtime_attestation_kms_key_arn      = "arn:aws:kms:us-east-2:767397897469:key/33333333-aaaa-bbbb-cccc-444444444444"
   provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/55555555-aaaa-bbbb-cccc-666666666666"
+  proof_account_credential_sha256      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  proof_mailbox_route53_zone_id        = "Z10394893FM38A1RXLL32"
+  proof_mailbox_domain                 = "proof.notify.layerv.xyz"
 }
 
 run "secure_ephemeral_runner_contract" {
@@ -371,9 +384,15 @@ run "secure_ephemeral_runner_contract" {
         "TagOneTimeJITConfiguration",
         "PrepareOneTimeJITEncryption",
         "InvokeBoundedRunnerBroker",
+        "ReadBoundProofAccountCredential",
+        "ReadBoundProofAccountCredentialDigest",
+        "ConvergeExactProofCustomer",
+        "ConvergeAndRemoveExactProofAccountKey",
+        "DeleteRunBoundProofCredential",
+        "CreateRunBoundProofCredential",
+        "TagRunBoundProofCredential",
       ]) &&
       !strcontains(aws_iam_role_policy.controller.policy, "ec2:") &&
-      !strcontains(aws_iam_role_policy.controller.policy, "secretsmanager:GetSecretValue") &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Action == "secretsmanager:CreateSecret" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Condition.StringEquals["secretsmanager:KmsKeyArn"] == aws_kms_key.jit.arn &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Condition.StringEquals["aws:RequestTag/Environment"] == var.environment &&
@@ -389,9 +408,18 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["TagOneTimeJITConfiguration"].Condition.Null["aws:RequestTag/GitHubRunAttempt"] == "false" &&
       toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Action) == toset(["kms:Decrypt", "kms:GenerateDataKey"]) &&
       keys(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Condition) == ["StringEquals"] &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Condition.StringEquals["kms:ViaService"] == local.secrets_kms_via_service
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["PrepareOneTimeJITEncryption"].Condition.StringEquals["kms:ViaService"] == local.secrets_kms_via_service &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadBoundProofAccountCredential"].Resource == aws_secretsmanager_secret.proof_account_credential.arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadBoundProofAccountCredential"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == "udp-proof-account-credential" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadBoundProofAccountCredentialDigest"].Resource == local.proof_account_sha_parameter_arn &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Action) == toset(["dynamodb:GetItem", "dynamodb:PutItem"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [local.proof_account_owner_id] &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeAndRemoveExactProofAccountKey"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [var.proof_account_credential_sha256] &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Condition.StringEquals["aws:RequestTag/Purpose"] == local.proof_account_jit_purpose &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern
     )
-    error_message = "The workflow controller must create exactly tagged, dedicated-key JIT metadata and invoke the broker; it gets no EC2 or secret-read surface."
+    error_message = "The workflow controller must retain no EC2 surface and may touch only exact tagged run metadata, the bound proof account, and its digest-fenced Control rows."
   }
 
   assert {
@@ -427,7 +455,11 @@ run "secure_ephemeral_runner_contract" {
         "qurl_envelope_version",
         "qurl_provider_id",
         "qurl_agent_id",
-      ])
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == local.proof_account_jit_purpose &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxQueue"].Resource == aws_sqs_queue.proof_otp_mailbox.arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxObjects"].Resource == "${aws_s3_bucket.proof_otp_mailbox.arn}/${local.proof_mailbox_object_prefix}*"
     )
     error_message = "Proof KMS access must be exact-key and encryption-context bound separately to Connector decrypt and qurl-go sealed-state use."
   }

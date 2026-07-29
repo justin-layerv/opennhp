@@ -81,6 +81,30 @@ variable "provisioned_cell_catalog_kms_key_arn" {
   nullable    = true
 }
 
+variable "proof_account_credential_sha256" {
+  description = "SHA-256 hex of the out-of-band seeded proof account credential; null keeps account-OTP setup disabled."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.proof_account_credential_sha256 == null || can(regex("^[0-9a-f]{64}$", var.proof_account_credential_sha256))
+    error_message = "proof_account_credential_sha256 must be null or canonical lowercase SHA-256 hex."
+  }
+}
+
+variable "proof_mailbox_route53_zone_id" {
+  description = "Same-account layerv.xyz Route53 public hosted zone ID."
+  type        = string
+  default     = "Z10394893FM38A1RXLL32"
+}
+
+variable "proof_mailbox_domain" {
+  description = "Sandbox-only SES receiving subdomain for the qurl-go OTP proof account."
+  type        = string
+  default     = "proof.notify.layerv.xyz"
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

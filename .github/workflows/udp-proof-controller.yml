@@ -64,6 +64,14 @@ env:
   BROKER_FUNCTION: layerv-nhp-sandbox-udp-proof-runner-broker
   JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/
   JIT_KMS_KEY_ARN: arn:aws:kms:us-east-2:767397897469:key/2dc8590c-cf7e-4427-bf48-ea442a3f79d6
+  PROOF_ACCOUNT_SOURCE_SECRET: layerv-nhp-sandbox/udp-proof-account/credential
+  PROOF_ACCOUNT_SHA_PARAMETER: /sandbox/nhp/udp-proof/account-credential-sha256
+  PROOF_ACCOUNT_KEY_TABLE: layerv-nhp-sandbox-control-qurl-api-keys
+  PROOF_ACCOUNT_CUSTOMER_TABLE: layerv-nhp-sandbox-control-qurl-customers
+  PROOF_ACCOUNT_OWNER_ID: layerv-nhp-sandbox-udp-proof
+  PROOF_ACCOUNT_KEY_ID: key_UdpProofOtp1
+  PROOF_ACCOUNT_EMAIL: qurl-go@proof.notify.layerv.xyz
+  PROOF_ACCOUNT_JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/credential/
   # Frozen client candidate heads. These MUST equal the live head SHAs of the
   # open qurl-connector/qurl-go candidate PRs at the moment the trusted-main
   # producer runs, because the producer resolves `repositories.qurl_connector`
@@ -300,6 +308,13 @@ jobs:
         with:
           role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare the run-bound qurl-go proof account
+        if: inputs.client == 'qurl_go'
+        run: |
+          set -euo pipefail
+          bash .github/scripts/manage_udp_proof_account.sh \
+            prepare "${{ github.run_id }}" "${{ github.run_attempt }}"
 
       - name: Mint the one-use JIT config
         id: jit
@@ -878,6 +893,13 @@ jobs:
         with:
           role-to-assume: ${{ env.CONTROLLER_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Remove the run-bound qurl-go proof account
+        if: always() && inputs.client == 'qurl_go' && steps.aws.outcome == 'success'
+        run: |
+          set -euo pipefail
+          bash .github/scripts/manage_udp_proof_account.sh \
+            cleanup "${{ github.run_id }}" "${{ github.run_attempt }}"
 
       - name: Stop the broker (always)
         if: always() && steps.aws.outcome == 'success'

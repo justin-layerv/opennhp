@@ -56,6 +56,9 @@ module "udp_proof_runner" {
   # The catalog table is SSE-KMS, so the producer's dynamodb:GetItem is dead
   # without a DynamoDB-scoped kms:Decrypt on this Control-owned CMK.
   provisioned_cell_catalog_kms_key_arn = var.provisioned_cell_catalog_kms_key_arn
+  proof_account_credential_sha256      = var.proof_account_credential_sha256
+  proof_mailbox_route53_zone_id        = var.proof_mailbox_route53_zone_id
+  proof_mailbox_domain                 = var.proof_mailbox_domain
 
   tags = local.common_tags
 }

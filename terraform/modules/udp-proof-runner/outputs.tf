@@ -47,3 +47,23 @@ output "required_jit_labels" {
   description = "Exact labels each client JIT configuration must carry, plus the dynamic run-<NHP controller github_run_id>-attempt-<github_run_attempt> label."
   value       = ["self-hosted", "Linux", "X64", "udp-proof", var.environment]
 }
+
+output "proof_account_credential_secret_arn" {
+  description = "Stable empty secret container that an operator seeds out of band with the sandbox proof account credential."
+  value       = aws_secretsmanager_secret.proof_account_credential.arn
+}
+
+output "proof_otp_mailbox_recipient" {
+  description = "Exact private SES recipient used only by qurl-go's attended NHP_OTP proof."
+  value       = local.proof_mailbox_recipient
+}
+
+output "proof_otp_mailbox_queue_url" {
+  description = "Exact private SQS queue consumed by the qurl-go proof runner."
+  value       = aws_sqs_queue.proof_otp_mailbox.url
+}
+
+output "proof_otp_mailbox_bucket" {
+  description = "Private one-day S3 mailbox containing the SES receipt objects referenced by the proof queue."
+  value       = aws_s3_bucket.proof_otp_mailbox.id
+}

@@ -16,6 +16,7 @@ ACTIVE_STATES = ("pending", "running", "stopping", "stopped")
 # local.purpose on the Terraform side; both are fixed for this module.
 COMPONENT = "udp-proof-runner"
 PURPOSE = "udp-proof"
+ACCOUNT_CREDENTIAL_PURPOSE = "udp-proof-account-credential-run"
 
 
 class ContractError(ValueError):
@@ -49,6 +50,7 @@ class Broker:
         launch_template_version: str,
         max_runtime_seconds: int,
         secret_prefix: str,
+        account_credential_secret_prefix: str,
         now: Any = None,
     ) -> None:
         if (
@@ -61,6 +63,7 @@ class Broker:
             or max_runtime_seconds < 1800
             or max_runtime_seconds > 14400
             or not secret_prefix.endswith("/")
+            or account_credential_secret_prefix != f"{secret_prefix}credential/"
         ):
             raise RuntimeError("invalid broker configuration")
         self.ec2 = ec2
@@ -71,6 +74,7 @@ class Broker:
         self.launch_template_version = launch_template_version
         self.max_runtime = timedelta(seconds=max_runtime_seconds)
         self.secret_prefix = secret_prefix
+        self.account_credential_secret_prefix = account_credential_secret_prefix
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     def dispatch(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -97,6 +101,9 @@ class Broker:
 
     def _secret_name(self, run_id: str, run_attempt: str) -> str:
         return f"{self.secret_prefix}{run_id}/{run_attempt}"
+
+    def _account_credential_secret_name(self, run_id: str, run_attempt: str) -> str:
+        return f"{self.account_credential_secret_prefix}{run_id}/{run_attempt}"
 
     def _instances(self, run_id: str | None = None, run_attempt: str | None = None) -> list[dict[str, Any]]:
         if (run_id is None) != (run_attempt is None):
@@ -232,7 +239,7 @@ class Broker:
             raise
         return {"action": "start", "status": "launched", "instance_id": instance_id}
 
-    def _delete_secret_name(self, secret_name: str) -> bool:
+    def _delete_secret_name(self, secret_name: str, purpose: str) -> bool:
         try:
             secret = self.secrets.describe_secret(SecretId=secret_name)
         except self.secrets.exceptions.ResourceNotFoundException:
@@ -243,9 +250,9 @@ class Broker:
         if (
             secret.get("Name") != secret_name
             or tags.get("Environment") != self.environment
-            or tags.get("Purpose") != PURPOSE
+            or tags.get("Purpose") != purpose
         ):
-            raise ContractError("JIT configuration secret failed its ownership contract")
+            raise ContractError("run-bound secret failed its ownership contract")
 
         try:
             self.secrets.delete_secret(
@@ -272,16 +279,21 @@ class Broker:
         instance_ids = sorted(instance["InstanceId"] for instance in self._instances(run_id, run_attempt))
         if instance_ids:
             self.ec2.terminate_instances(InstanceIds=instance_ids)
-        secret_deleted = self._delete_secret_name(self._secret_name(run_id, run_attempt))
+        secret_deleted = self._delete_secret_name(self._secret_name(run_id, run_attempt), PURPOSE)
+        account_credential_secret_deleted = self._delete_secret_name(
+            self._account_credential_secret_name(run_id, run_attempt),
+            ACCOUNT_CREDENTIAL_PURPOSE,
+        )
         return {
             "action": "stop",
             "status": "terminated" if instance_ids else "absent",
             "instances": instance_ids,
             "secret_deleted": secret_deleted,
+            "account_credential_secret_deleted": account_credential_secret_deleted,
         }
 
-    def _expired_secret_names(self, cutoff: datetime) -> list[str]:
-        names: list[str] = []
+    def _expired_secrets(self, cutoff: datetime) -> list[tuple[str, str]]:
+        secrets: list[tuple[str, str]] = []
         paginator = self.secrets.get_paginator("list_secrets")
         for page in paginator.paginate(
             Filters=[{"Key": "name", "Values": [self.secret_prefix]}],
@@ -293,12 +305,18 @@ class Broker:
                 if not name.startswith(self.secret_prefix) or not isinstance(created, datetime) or created > cutoff:
                     continue
                 tags = _tags(secret.get("Tags"))
-                if (
-                    tags.get("Environment") == self.environment
-                    and tags.get("Purpose") == PURPOSE
+                purpose = tags.get("Purpose")
+                if tags.get("Environment") != self.environment:
+                    continue
+                if purpose == ACCOUNT_CREDENTIAL_PURPOSE and name.startswith(
+                    self.account_credential_secret_prefix
                 ):
-                    names.append(name)
-        return sorted(set(names))
+                    secrets.append((name, purpose))
+                elif purpose == PURPOSE and not name.startswith(
+                    self.account_credential_secret_prefix
+                ):
+                    secrets.append((name, purpose))
+        return sorted(set(secrets))
 
     def sweep(self) -> dict[str, Any]:
         now = self.now()
@@ -331,8 +349,8 @@ class Broker:
             self.ec2.terminate_instances(InstanceIds=sorted(terminate))
 
         deleted_secrets: list[str] = []
-        for secret_name in self._expired_secret_names(now - self.max_runtime):
-            if self._delete_secret_name(secret_name):
+        for secret_name, purpose in self._expired_secrets(now - self.max_runtime):
+            if self._delete_secret_name(secret_name, purpose):
                 deleted_secrets.append(secret_name)
 
         return {
@@ -357,5 +375,6 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         launch_template_version=_required_env("LAUNCH_TEMPLATE_VERSION"),
         max_runtime_seconds=int(_required_env("MAX_RUNTIME_SECONDS")),
         secret_prefix=_required_env("JIT_SECRET_PREFIX"),
+        account_credential_secret_prefix=_required_env("ACCOUNT_CREDENTIAL_SECRET_PREFIX"),
     )
     return broker.dispatch(event)
