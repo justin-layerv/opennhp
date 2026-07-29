@@ -8,6 +8,13 @@ replacement. Do not attempt an in-place `set-security-groups` workaround.
 This runbook is sandbox-only. Production compute keeps its existing edge shape,
 and the production Hub remains dark.
 
+If cell0's NLB replacement has already converged but AC registration is blocked
+by its proof-runner-only ingress, the corrective plan is intentionally smaller:
+seven `server_nlb_registration` creates, one for each managed AC EIP, with every
+previous source-fence participant an exact no-op. The same temporary migration
+gate admits that bounded remainder; it must not replace the NLB or listener
+again.
+
 Cell1's reviewed `10.102.0.0/16` to `10.104.0.0/16` relocation (NHP PR #3459) is
 already applied: cell1 runs in `10.104.0.0/16` today. There is therefore no
 combined relocation-plus-fence plan to build, and
@@ -27,6 +34,8 @@ cell1; a VPC move is no longer pending.
    replacement listener derives its create-time target from that managed record
    and exposes no operator-supplied target override. The checker pins the exact
    Terraform 1.14.3/AWS provider 6.54.0 green-to-green listener envelope.
+   Confirm the cell0 AC EIP pool contains exactly seven unique, tagged public
+   addresses: three blue, three green, and the rolling-refresh spare.
 2. Apply the sandbox main root from a reviewed saved plan. It must create the
    replacement cell0 NLB with one SG attached, perform the bounded UDP listener
    handoff, and retire the old NLB. The listener is intentionally
@@ -53,9 +62,11 @@ cell1; a VPC move is no longer pending.
    trusted source-fence checker that gates cell0 gates this plan; no relocation
    invariants apply. Cell1 DNS follows that root's replacement-NLB output
    directly.
-6. Read back all three NLBs. Each must have exactly one SG. That SG must admit
-   only UDP 62206 from `3.141.109.76/32`; target and health egress must be only
-   UDP 62206 and TCP 8888 (cells) or TCP 62207 (Hub) to the target SG.
+6. Read back all three NLBs. Each must have exactly one SG. The Hub and cell1
+   SGs must admit only UDP 62206 from `3.141.109.76/32`. The cell0 SG must admit
+   that proof source plus exactly the seven managed AC EIPs as `/32`s. Target
+   and health egress must be only UDP 62206 and TCP 8888 (cells) or TCP 62207
+   (Hub) to the target SG.
 7. Prove a UDP lifecycle succeeds from the proof runner and times out from an
    unrelated public source. Confirm every target remains healthy, the cell0
    listener still names the exact green target group, and the managed active

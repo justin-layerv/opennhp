@@ -547,6 +547,19 @@ variable "enable_egress_eips" {
   default     = false
 }
 
+variable "server_nlb_source_fenced" {
+  description = "Whether the AC registration endpoint is a source-fenced public NHP NLB. When true, every managed AC egress EIP is admitted to that NLB on UDP 62206."
+  type        = bool
+  default     = false
+}
+
+variable "server_nlb_security_group_id" {
+  description = "Dedicated security group attached to the source-fenced public NHP NLB. Required when server_nlb_source_fenced is true."
+  type        = string
+  default     = ""
+  nullable    = false
+}
+
 # ============================================================================
 # Deployment Configuration
 # ============================================================================

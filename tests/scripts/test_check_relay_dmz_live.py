@@ -152,6 +152,15 @@ def good_snapshot() -> dict:
     endpoint_sg = "sg-endpoint"
     server_sg = "sg-server"
     server_nlb_sg = "sg-server-nlb"
+    ac_public_ips = (
+        "3.151.137.194",
+        "3.151.252.67",
+        "3.136.14.164",
+        "52.14.228.233",
+        "18.225.44.103",
+        "52.14.199.249",
+        "16.58.119.85",
+    )
     relay_cidrs = ["10.101.10.0/24", "10.101.11.0/24", "10.101.12.0/24"]
     main_cidrs = ["10.100.10.0/24", "10.100.11.0/24", "10.100.12.0/24"]
     local_route = route("10.101.0.0/16", "gateway", "local")
@@ -305,6 +314,10 @@ def good_snapshot() -> dict:
             "vpc_id": main_vpc,
             "inbound": [
                 rule("udp", 62206, 62206, "cidr_ipv4", "3.141.109.76/32"),
+                *(
+                    rule("udp", 62206, 62206, "cidr_ipv4", f"{address}/32")
+                    for address in ac_public_ips
+                ),
             ],
             "outbound": [
                 rule("udp", 62206, 62206, "security_group", server_sg),
@@ -438,6 +451,25 @@ def good_snapshot() -> dict:
             "alb_ids": [alb_sg],
             "server_ids": [server_sg],
             "server_nlb_ids": [server_nlb_sg],
+            "ac_registration_eips": [
+                {
+                    "allocation_id": f"eipalloc-ac-{index}",
+                    "public_ip": address,
+                    "association_id": (
+                        None if index == 4 else f"eipassoc-ac-{index}"
+                    ),
+                    "instance_id": None if index == 4 else f"i-ac-{index}",
+                    "tags": {
+                        "Environment": "sandbox",
+                        "Component": "ac",
+                        "Service": "nhp-ac",
+                        "EIPPool": checker.SANDBOX_AC_EIP_POOL,
+                        "ManagedBy": "terraform",
+                        "Name": f"layerv-nhp-sandbox-ac-eip-{index}",
+                    },
+                }
+                for index, address in enumerate(ac_public_ips)
+            ],
             "by_id": by_id,
         },
         "endpoints": endpoints,
@@ -1386,6 +1418,47 @@ class RecordedStructuralAws:
                     for arn in args[1:]
                 ]
             }
+        if (service, operation) == ("ec2", "describe-addresses"):
+            public_ips = (
+                "3.151.137.194",
+                "3.151.252.67",
+                "3.136.14.164",
+                "52.14.228.233",
+                "18.225.44.103",
+                "52.14.199.249",
+                "16.58.119.85",
+            )
+            return {
+                "Addresses": [
+                    {
+                        "AllocationId": f"eipalloc-ac-recorded-{index}",
+                        "PublicIp": public_ip,
+                        "AssociationId": (
+                            None
+                            if index == 4
+                            else f"eipassoc-ac-recorded-{index}"
+                        ),
+                        "InstanceId": (
+                            None if index == 4 else f"i-ac-recorded-{index}"
+                        ),
+                        "Tags": [
+                            {"Key": "Environment", "Value": "sandbox"},
+                            {"Key": "Component", "Value": "ac"},
+                            {"Key": "Service", "Value": "nhp-ac"},
+                            {
+                                "Key": "EIPPool",
+                                "Value": checker.SANDBOX_AC_EIP_POOL,
+                            },
+                            {"Key": "ManagedBy", "Value": "terraform"},
+                            {
+                                "Key": "Name",
+                                "Value": f"layerv-nhp-sandbox-ac-eip-{index}",
+                            },
+                        ],
+                    }
+                    for index, public_ip in enumerate(public_ips)
+                ]
+            }
         if (service, operation) == ("ec2", "describe-security-groups"):
             if "--group-ids" not in args:
                 return {"SecurityGroups": [{"GroupId": "sg-legacy-recorded"}]}
@@ -1436,7 +1509,19 @@ class RecordedStructuralAws:
                                             "FromPort": 62206,
                                             "ToPort": 62206,
                                             "IpRanges": [
-                                                {"CidrIp": "3.141.109.76/32"}
+                                                {"CidrIp": "3.141.109.76/32"},
+                                                *(
+                                                    {"CidrIp": f"{address}/32"}
+                                                    for address in (
+                                                        "3.151.137.194",
+                                                        "3.151.252.67",
+                                                        "3.136.14.164",
+                                                        "52.14.228.233",
+                                                        "18.225.44.103",
+                                                        "52.14.199.249",
+                                                        "16.58.119.85",
+                                                    )
+                                                ),
                                             ],
                                         }
                                     ]
@@ -3707,7 +3792,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
                     "inbound"
                 ][0].update({"source": "0.0.0.0/0"}),
-                "server NLB SG ingress is not exactly proof-runner /32 UDP 62206",
+                "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 62206",
             ),
             "NLB target egress": (
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
@@ -3731,6 +3816,33 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 snapshot = good_snapshot()
                 mutate(snapshot)
                 self.assertIn(expected, checker.validate_structural(snapshot))
+
+    def test_ac_registration_pool_and_nlb_rules_must_move_together(self) -> None:
+        missing_pool_member = good_snapshot()
+        missing_pool_member["security_groups"]["ac_registration_eips"].pop()
+        errors = checker.validate_structural(missing_pool_member)
+        self.assertTrue(
+            any("exactly seven unique managed public /32s" in error for error in errors),
+            errors,
+        )
+
+        missing_rule = good_snapshot()
+        missing_rule["security_groups"]["by_id"]["sg-server-nlb"]["inbound"].pop()
+        errors = checker.validate_structural(missing_rule)
+        self.assertTrue(
+            any("complete managed AC EIP pool" in error for error in errors),
+            errors,
+        )
+
+        foreign_identity = good_snapshot()
+        foreign_identity["security_groups"]["ac_registration_eips"][0]["tags"][
+            "EIPPool"
+        ] = "foreign"
+        errors = checker.validate_structural(foreign_identity)
+        self.assertTrue(
+            any("exact Terraform-managed pool identity" in error for error in errors),
+            errors,
+        )
 
     def test_missing_inventory_primary_errors_do_not_cascade(self) -> None:
         snapshot = good_snapshot()

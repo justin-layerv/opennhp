@@ -73,8 +73,10 @@ from typing import Any
 # adds the active-color internal relay NLB target/ASG/SG proof and inventories
 # every public main-VPC NLB to detect a second NHP-owned edge. Version 9 resolves
 # IP targets and expands NHP ownership evidence to canonical server ASG, SG, and
-# private-IP identity. Increment for incompatible snapshot changes.
-SCHEMA_VERSION = 9
+# private-IP identity. Version 10 binds the protected cell0 NLB ingress to the
+# complete Terraform-managed AC EIP pool, including its rolling-refresh spare.
+# Increment for incompatible snapshot changes.
+SCHEMA_VERSION = 10
 EXPECTED_INTERFACE_SERVICES = {
     "ecr.api",
     "ecr.dkr",
@@ -173,6 +175,8 @@ RELAY_HEALTH_PATH = "/health/live"
 # EXPECTED_SANDBOX_PROOF_SOURCE_CIDR pin in the sibling plan checker; re-homing
 # both to the proof-runner remote-state output is a tracked follow-up.
 SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+SANDBOX_AC_EIP_COUNT = 7
+SANDBOX_AC_EIP_POOL = "layerv-nhp-sandbox-ac"
 
 
 def _expected_server_lb_name(environment: str) -> str:
@@ -1470,6 +1474,39 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
         normalized_groups.update(
             {group["GroupId"]: _normalize_sg(group) for group in server_nlb_groups}
         )
+    ac_registration_eips: list[dict[str, Any]] = []
+    if environment == "sandbox":
+        ac_response = aws.call(
+            "ec2",
+            "describe-addresses",
+            "--filters",
+            "Name=tag:Environment,Values=sandbox",
+            "Name=tag:Component,Values=ac",
+            "Name=tag:Service,Values=nhp-ac",
+            f"Name=tag:EIPPool,Values={SANDBOX_AC_EIP_POOL}",
+            "Name=tag:ManagedBy,Values=terraform",
+        )
+        ac_addresses = (
+            ac_response.get("Addresses")
+            if isinstance(ac_response, dict)
+            else None
+        )
+        if not isinstance(ac_addresses, list) or any(
+            not isinstance(address, dict) for address in ac_addresses
+        ):
+            raise InventoryError(
+                "sandbox AC registration EIP inventory is malformed"
+            )
+        ac_registration_eips = [
+            {
+                "allocation_id": address.get("AllocationId"),
+                "public_ip": address.get("PublicIp"),
+                "association_id": address.get("AssociationId"),
+                "instance_id": address.get("InstanceId"),
+                "tags": _tags(address.get("Tags")),
+            }
+            for address in ac_addresses
+        ]
 
     listeners_raw = aws.call(
         "elbv2", "describe-listeners", "--load-balancer-arn", lb["LoadBalancerArn"]
@@ -1780,6 +1817,10 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             "alb_ids": sorted(alb_sg_ids),
             "server_ids": sorted(server_sg_ids),
             "server_nlb_ids": sorted(server_nlb_sg_ids),
+            "ac_registration_eips": sorted(
+                ac_registration_eips,
+                key=lambda item: str(item.get("allocation_id")),
+            ),
             "by_id": normalized_groups,
         },
         "endpoints": endpoints,
@@ -2753,6 +2794,58 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
     alb_ids = security.get("alb_ids", [])
     server_ids = security.get("server_ids", [])
     server_nlb_ids = security.get("server_nlb_ids", [])
+    ac_registration_eips = security.get("ac_registration_eips", [])
+    ac_registration_cidrs: set[str] = set()
+    if environment == "sandbox":
+        allocation_ids: set[str] = set()
+        ac_names: set[str] = set()
+        for address in (
+            ac_registration_eips
+            if isinstance(ac_registration_eips, list)
+            else []
+        ):
+            if not isinstance(address, dict):
+                errors.append("sandbox AC registration EIP inventory is malformed")
+                continue
+            allocation_id = address.get("allocation_id")
+            public_ip = address.get("public_ip")
+            raw_tags = address.get("tags")
+            tags = raw_tags if isinstance(raw_tags, dict) else {}
+            if isinstance(allocation_id, str) and allocation_id:
+                allocation_ids.add(allocation_id)
+            try:
+                parsed_ip = ipaddress.ip_address(public_ip)
+            except (TypeError, ValueError):
+                parsed_ip = None
+            if isinstance(parsed_ip, ipaddress.IPv4Address) and parsed_ip.is_global:
+                ac_registration_cidrs.add(f"{parsed_ip}/32")
+            name = tags.get("Name")
+            if isinstance(name, str):
+                ac_names.add(name)
+            if not (
+                tags.get("Environment") == "sandbox"
+                and tags.get("Component") == "ac"
+                and tags.get("Service") == "nhp-ac"
+                and tags.get("EIPPool") == SANDBOX_AC_EIP_POOL
+                and tags.get("ManagedBy") == "terraform"
+            ):
+                errors.append(
+                    "sandbox AC registration EIP is outside the exact Terraform-managed pool identity"
+                )
+        expected_ac_names = {
+            f"layerv-nhp-sandbox-ac-eip-{index}"
+            for index in range(SANDBOX_AC_EIP_COUNT)
+        }
+        if not (
+            isinstance(ac_registration_eips, list)
+            and len(ac_registration_eips) == SANDBOX_AC_EIP_COUNT
+            and len(allocation_ids) == SANDBOX_AC_EIP_COUNT
+            and len(ac_registration_cidrs) == SANDBOX_AC_EIP_COUNT
+            and ac_names == expected_ac_names
+        ):
+            errors.append(
+                "sandbox AC registration EIP pool must be exactly seven unique managed public /32s including the rolling-refresh spare"
+            )
     if not (
         len(relay_ids) == len(alb_ids) == len(endpoint_sg_ids) == len(server_ids) == 1
         and (environment != "sandbox" or len(server_nlb_ids) == 1)
@@ -2916,6 +3009,15 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                     "source_type": "cidr_ipv4",
                     "source": SANDBOX_PROOF_SOURCE_CIDR,
                 }
+            ] + [
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "cidr_ipv4",
+                    "source": source,
+                }
+                for source in sorted(ac_registration_cidrs)
             ]
             expected_nlb_out = [
                 {
@@ -2935,7 +3037,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             ]
             if not _rules_equal(nlb_group.get("inbound", []), expected_nlb_in):
                 errors.append(
-                    "server NLB SG ingress is not exactly proof-runner /32 UDP 62206"
+                    "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 62206"
                 )
             if not _rules_equal(nlb_group.get("outbound", []), expected_nlb_out):
                 errors.append(

@@ -93,9 +93,11 @@ public UDP load balancer or UDP listener.
 
 Upcoming UDP SDKs bypass the relay. After control-plane assignment, an SDK
 connects directly to the public NHP server NLB for its assigned cell. That NLB
-has exactly one public UDP listener: 62206. During the sandbox proof it admits
-only the persistent proof-runner EIP `/32`; its target SG trusts only the NLB
-SG identity. UDP 62207 must never be exposed on the public NHP edge.
+has exactly one public UDP listener: 62206. During the sandbox proof, cell0
+admits the persistent proof-runner EIP `/32` plus the complete
+Terraform-managed AC EIP pool as exact `/32`s; its target SG trusts only the
+NLB SG identity. The spare AC EIP is included so rolling refresh cannot strand
+registration. UDP 62207 must never be exposed on the public NHP edge.
 
 For browser traffic, the relay authenticates and wraps opaque knocks in
 `NHP_RLY`, then sends them over the private peered path to server UDP 62206.

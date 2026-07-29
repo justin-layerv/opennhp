@@ -20,6 +20,11 @@ output "nlb_zone_id" {
   value       = one(aws_lb.server[*].zone_id)
 }
 
+output "nlb_security_group_id" {
+  description = "Dedicated public cell NLB security group ID when source fencing is enabled; null for the legacy SG-less NLB shape."
+  value       = one(aws_security_group.server_nlb[*].id)
+}
+
 # Internal NLB DNS name for the relay -> cell-server UDP hop (#2208 #8 / #2628;
 # closes #2626). The root module's `module "relay"` cell_servers[].host points
 # here so the relay forwards NHP_RLY to a stable, load-balanced, churn-resilient

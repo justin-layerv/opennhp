@@ -46,3 +46,25 @@ resource "aws_eip" "ac" {
     EIPPool   = local.eip_pool_tag
   })
 }
+
+# AC cloud registration uses the cell's public NHP endpoint. A source-fenced
+# NLB must therefore admit the complete managed AC EIP pool as well as the
+# external proof source. Index keys keep the for_each shape plan-known on a
+# first apply while the EIP addresses themselves are still provider-unknown.
+resource "aws_vpc_security_group_ingress_rule" "server_nlb_registration" {
+  for_each = var.server_nlb_source_fenced ? {
+    for index, address in aws_eip.ac :
+    tostring(index) => "${address.public_ip}/32"
+  } : {}
+
+  security_group_id = var.server_nlb_security_group_id
+  description       = "NHP AC registration source ${each.value}"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = each.value
+
+  tags = {
+    Name = "${var.name_prefix}-nlb-ac-registration-${each.key}"
+  }
+}

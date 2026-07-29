@@ -1,4 +1,13 @@
-mock_provider "aws" {}
+mock_provider "aws" {
+  mock_resource "aws_eip" {
+    override_during = plan
+
+    defaults = {
+      id        = "eipalloc-0123456789abcdef0"
+      public_ip = "198.51.100.42"
+    }
+  }
+}
 mock_provider "aws" {
   alias = "us_east_1"
 }
@@ -78,4 +87,61 @@ run "render_enabled_gate_in_ac_user_data" {
     condition     = length(terraform_data.ac_user_data_qurl_router_render_check) == 1
     error_message = "Expected one AC qurl-router render-check resource so its enabled-gate preconditions run during plan."
   }
+}
+
+run "source_fenced_registration_admits_complete_managed_eip_pool" {
+  command = plan
+
+  variables {
+    enable_blue_green            = true
+    enable_egress_eips           = true
+    ac_max_capacity              = 3
+    server_nlb_source_fenced     = true
+    server_nlb_security_group_id = "sg-0123456789abcdef0"
+  }
+
+  assert {
+    condition     = length(aws_eip.ac) == 7
+    error_message = "Blue/green AC capacity 3 must retain six fleet EIPs plus one rolling-refresh slack EIP."
+  }
+
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.server_nlb_registration) == 7
+    error_message = "Every managed AC EIP, including the rolling-refresh slack address, must receive one NLB registration rule."
+  }
+
+  assert {
+    condition = alltrue([
+      for rule in aws_vpc_security_group_ingress_rule.server_nlb_registration :
+      rule.security_group_id == "sg-0123456789abcdef0" &&
+      rule.ip_protocol == "udp" &&
+      rule.from_port == 62206 &&
+      rule.to_port == 62206 &&
+      rule.cidr_ipv4 == "198.51.100.42/32"
+    ])
+    error_message = "Managed AC registration rules must be exact EIP /32 UDP 62206 ingress on only the assigned public NLB SG."
+  }
+}
+
+run "source_fenced_registration_requires_managed_eips" {
+  command = plan
+
+  variables {
+    enable_egress_eips           = false
+    server_nlb_source_fenced     = true
+    server_nlb_security_group_id = "sg-0123456789abcdef0"
+  }
+
+  expect_failures = [aws_launch_template.ac]
+}
+
+run "source_fenced_registration_requires_nlb_security_group" {
+  command = plan
+
+  variables {
+    enable_egress_eips       = true
+    server_nlb_source_fenced = true
+  }
+
+  expect_failures = [aws_launch_template.ac]
 }

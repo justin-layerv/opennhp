@@ -4,7 +4,14 @@
 - **Source:** [NHP PR #3453](https://github.com/layervai/nhp/pull/3453)
 
 Replace the three sandbox SG-less public UDP NLBs with SG-attached,
-proof-runner-only edges. Production remains unchanged and dark.
+source-fenced edges. Hub and cell1 remain proof-runner-only; cell0 additionally
+admits the exact managed AC EIP pool required for registration. Production
+remains unchanged and dark.
+
+Cell0's NLB replacement is already converged. Its corrective remainder is the
+seven exact managed-AC EIP `/32` ingress creates required for AC registration;
+the reviewed gate must show every original replacement participant as a no-op
+and no NLB or listener replacement.
 
 - [ ] Pre-rollout: after the unrelated Control Authority/catalog transitions
       converge, produce complete Terraform 1.14.3 saved plans for sandbox main,
@@ -18,6 +25,8 @@ proof-runner-only edges. Production remains unchanged and dark.
       cell0 blue/green lane and prove the managed active-color parameter,
       Terraform state, and live public listener all identify the exact green
       UDP target group before sealing the cell0 plan.
+      Confirm the cell0 AC EIP pool contains exactly seven unique managed
+      addresses (three blue, three green, and the rolling-refresh spare).
 - [ ] Rollout: follow
       [`sandbox-udp-source-fence-replacement.md`](../sandbox-udp-source-fence-replacement.md)
       from the merged commit, applying only its reviewed cell0, Control, cell1,
@@ -30,7 +39,10 @@ proof-runner-only edges. Production remains unchanged and dark.
       edits/imports, or a widened checker.
 - [ ] Post-rollout: read back exactly one security group on every public UDP
       NLB, NLB-SG-only target ingress, healthy targets, successful UDP lifecycle
-      from the proof runner, and timeout from an unrelated public source. Record
+      from the proof runner, and timeout from an unrelated public source.
+      Confirm cell0 ingress is exactly the proof-runner `/32` plus all seven
+      managed AC EIP `/32`s, while Hub and cell1 retain proof-runner-only
+      ingress. Record
       that cell0 remains green-to-green across replacement, then resume normal
       blue/green ownership. Record
       a refresh-enabled no-op for every applied root using the permanent

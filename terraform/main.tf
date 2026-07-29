@@ -1433,8 +1433,10 @@ module "ac" {
   resource_ids    = var.ac_resource_ids
   # AC registration remains on the cell's public NHP NLB and is independent of
   # whether browser knocks enter through the relay ALB.
-  server_endpoint   = module.compute.nlb_dns_name
-  server_secret_arn = module.compute.server_secret_arn
+  server_endpoint              = module.compute.nlb_dns_name
+  server_secret_arn            = module.compute.server_secret_arn
+  server_nlb_source_fenced     = var.public_nhp_udp_ingress_cidrs != null
+  server_nlb_security_group_id = module.compute.nlb_security_group_id
 
   # L3 flush-on-expiry (active session teardown).
   enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry

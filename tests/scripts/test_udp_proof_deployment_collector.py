@@ -236,6 +236,56 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
         ):
             collector._proof_source_eip()
 
+    def test_ac_registration_eip_pool_is_complete_and_exact(self) -> None:
+        public_ips = (
+            "3.151.137.194",
+            "3.151.252.67",
+            "3.136.14.164",
+            "52.14.228.233",
+            "18.225.44.103",
+            "52.14.199.249",
+            "16.58.119.85",
+        )
+        response = {
+            "Addresses": [
+                {
+                    "AllocationId": f"eipalloc-{index + 1:017x}",
+                    "PublicIp": public_ip,
+                    "Domain": "vpc",
+                    "NetworkBorderGroup": "us-east-2",
+                    "Tags": [
+                        {"Key": "Environment", "Value": "sandbox"},
+                        {"Key": "Component", "Value": "ac"},
+                        {"Key": "Service", "Value": "nhp-ac"},
+                        {
+                            "Key": "EIPPool",
+                            "Value": collector.AC_REGISTRATION_EIP_POOL,
+                        },
+                        {"Key": "ManagedBy", "Value": "terraform"},
+                        {
+                            "Key": "Name",
+                            "Value": f"layerv-nhp-sandbox-ac-eip-{index}",
+                        },
+                    ],
+                }
+                for index, public_ip in enumerate(public_ips)
+            ]
+        }
+        with mock.patch.object(collector, "_aws", return_value=response):
+            self.assertEqual(
+                {f"{public_ip}/32" for public_ip in public_ips},
+                set(collector._ac_registration_eip_cidrs()),
+            )
+        response["Addresses"].pop()
+        with (
+            mock.patch.object(collector, "_aws", return_value=response),
+            self.assertRaisesRegex(
+                collector.EvidenceError,
+                "missing or ambiguous",
+            ),
+        ):
+            collector._ac_registration_eip_cidrs()
+
     def test_protected_edge_security_group_contract_is_fail_closed(self) -> None:
         edge_contract = collector.PUBLIC_EDGE_CONTRACTS["hub.nhp.layerv.xyz"]
         nlb, backend = protected_hub_groups()
@@ -248,6 +298,13 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
 
         cell_nlb = copy.deepcopy(nlb)
         cell_backend = copy.deepcopy(backend)
+        ac_registration_cidrs = (
+            "3.151.137.194/32",
+            "18.225.44.103/32",
+        )
+        cell_nlb["IpPermissions"][0]["IpRanges"].extend(
+            {"CidrIp": cidr} for cidr in ac_registration_cidrs
+        )
         cell_nlb["IpPermissionsEgress"][1] = security_group_permission(
             "tcp",
             8888,
@@ -276,6 +333,7 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
             edge_contract=collector.PUBLIC_EDGE_CONTRACTS[
                 "cell0.nhp.layerv.xyz"
             ],
+            registration_source_cidrs=ac_registration_cidrs,
         )
 
         mutations = {

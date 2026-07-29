@@ -170,6 +170,8 @@ QRTS_VERIFIED_ATTESTATIONS_MAX_COUNT = 32
 COMMAND_STDERR_MAX_BYTES = 64 * 1024
 JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 PROOF_SOURCE_CIDR = contract.PROOF_SOURCE_CIDR
+AC_REGISTRATION_EIP_COUNT = 7
+AC_REGISTRATION_EIP_POOL = "layerv-nhp-sandbox-ac"
 KMS_KEY_ARN_RE = re.compile(
     rf"^arn:aws:kms:{AWS_REGION}:{AWS_ACCOUNT_ID}:key/"
     r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -2156,6 +2158,77 @@ def _proof_source_eip() -> dict[str, str]:
     }
 
 
+def _ac_registration_eip_cidrs() -> tuple[str, ...]:
+    response = _aws(
+        "ec2",
+        [
+            "describe-addresses",
+            "--filters",
+            "Name=tag:Environment,Values=sandbox",
+            "Name=tag:Component,Values=ac",
+            "Name=tag:Service,Values=nhp-ac",
+            f"Name=tag:EIPPool,Values={AC_REGISTRATION_EIP_POOL}",
+            "Name=tag:ManagedBy,Values=terraform",
+        ],
+        "managed AC registration EIP pool",
+    )
+    addresses = response.get("Addresses") if isinstance(response, dict) else None
+    if not isinstance(addresses, list) or len(addresses) != AC_REGISTRATION_EIP_COUNT:
+        raise EvidenceError(
+            "managed AC registration EIP pool is missing or ambiguous"
+        )
+    cidrs: set[str] = set()
+    allocation_ids: set[str] = set()
+    names: set[str] = set()
+    for address in addresses:
+        tags_list = address.get("Tags") if isinstance(address, dict) else None
+        tags = {
+            str(tag.get("Key")): str(tag.get("Value"))
+            for tag in tags_list or []
+            if isinstance(tag, dict)
+            and isinstance(tag.get("Key"), str)
+            and isinstance(tag.get("Value"), str)
+        }
+        try:
+            public_ip = ipaddress.ip_address(
+                address.get("PublicIp") if isinstance(address, dict) else None
+            )
+        except (TypeError, ValueError):
+            public_ip = None
+        allocation_id = (
+            address.get("AllocationId") if isinstance(address, dict) else None
+        )
+        if (
+            not isinstance(address, dict)
+            or not isinstance(tags_list, list)
+            or not isinstance(public_ip, ipaddress.IPv4Address)
+            or not public_ip.is_global
+            or address.get("Domain") != "vpc"
+            or address.get("NetworkBorderGroup") != AWS_REGION
+            or not re.fullmatch(r"eipalloc-[0-9a-f]{17}", str(allocation_id or ""))
+            or tags.get("Environment") != "sandbox"
+            or tags.get("Component") != "ac"
+            or tags.get("Service") != "nhp-ac"
+            or tags.get("EIPPool") != AC_REGISTRATION_EIP_POOL
+            or tags.get("ManagedBy") != "terraform"
+        ):
+            raise EvidenceError("managed AC registration EIP identity drift")
+        cidrs.add(f"{public_ip}/32")
+        allocation_ids.add(allocation_id)
+        names.add(tags.get("Name", ""))
+    expected_names = {
+        f"layerv-nhp-sandbox-ac-eip-{index}"
+        for index in range(AC_REGISTRATION_EIP_COUNT)
+    }
+    if (
+        len(cidrs) != AC_REGISTRATION_EIP_COUNT
+        or len(allocation_ids) != AC_REGISTRATION_EIP_COUNT
+        or names != expected_names
+    ):
+        raise EvidenceError("managed AC registration EIP identity drift")
+    return tuple(sorted(cidrs))
+
+
 def _permission_covers(
     permission: dict[str, Any],
     protocol: str,
@@ -2276,6 +2349,7 @@ def _verify_edge_security_groups(
     nlb_group: dict[str, Any],
     target_group: dict[str, Any],
     edge_contract: dict[str, Any],
+    registration_source_cidrs: tuple[str, ...] = (),
 ) -> None:
     nlb_group_id = nlb_group["GroupId"]
     target_group_id = target_group["GroupId"]
@@ -2285,7 +2359,10 @@ def _verify_edge_security_groups(
         raise EvidenceError(f"{host} NLB ingress is not the exact one-rule contract")
     if not isinstance(nlb_egress, list) or len(nlb_egress) != 2:
         raise EvidenceError(f"{host} NLB egress is not the exact two-rule contract")
-    expected_ingress = [("ipv4", PROOF_SOURCE_CIDR)]
+    expected_ingress = sorted(
+        [("ipv4", PROOF_SOURCE_CIDR)]
+        + [("ipv4", cidr) for cidr in registration_source_cidrs]
+    )
     if (
         _permission_sources(
             nlb_ingress,
@@ -2296,7 +2373,7 @@ def _verify_edge_security_groups(
         != expected_ingress
     ):
         raise EvidenceError(
-            f"{host} NLB UDP ingress is not the stable proof-runner /32"
+            f"{host} NLB UDP ingress is not the stable proof-runner plus reviewed registration /32 sources"
         )
     if (
         _permission_sources(
@@ -2529,7 +2606,11 @@ def _verify_route53_alias_record(
         raise EvidenceError(f"{host} Route53 alias does not target the exact NLB")
 
 
-def _verify_dns_alias(host: str) -> dict[str, Any]:
+def _verify_dns_alias(
+    host: str,
+    *,
+    registration_source_cidrs: tuple[str, ...] = (),
+) -> dict[str, Any]:
     edge_contract = PUBLIC_EDGE_CONTRACTS.get(host)
     if edge_contract is None:
         raise EvidenceError(f"{host} has no protected-edge contract")
@@ -2573,6 +2654,7 @@ def _verify_dns_alias(host: str) -> dict[str, Any]:
         nlb_group=nlb_group,
         target_group=backend_group,
         edge_contract=edge_contract,
+        registration_source_cidrs=registration_source_cidrs,
     )
     listeners_response = _aws(
         "elbv2",
@@ -3806,11 +3888,15 @@ def collect_aws_and_build_snapshot(
     ):
         raise EvidenceError("producer did not assume the dedicated sandbox read role")
     proof_source = _proof_source_eip()
+    ac_registration_cidrs = _ac_registration_eip_cidrs()
     hub_key, hub_key_version, hub_key_digest = _public_key_parameter()
     runtime_cells, catalog_evidence = _catalog_cells()
     hub_edge = _verify_dns_alias("hub.nhp.layerv.xyz")
     cell_edges = {
-        "cell0": _verify_dns_alias("cell0.nhp.layerv.xyz"),
+        "cell0": _verify_dns_alias(
+            "cell0.nhp.layerv.xyz",
+            registration_source_cidrs=ac_registration_cidrs,
+        ),
         "cell1": _verify_dns_alias("cell1.nhp.layerv.xyz"),
     }
 

@@ -1557,6 +1557,16 @@ BOOTSTRAP
     create_before_destroy = true
 
     precondition {
+      condition     = !var.server_nlb_source_fenced || var.enable_egress_eips
+      error_message = "server_nlb_source_fenced requires enable_egress_eips so every AC registration source has a stable exact /32."
+    }
+
+    precondition {
+      condition     = !var.server_nlb_source_fenced || var.server_nlb_security_group_id != ""
+      error_message = "server_nlb_security_group_id is required when server_nlb_source_fenced is true."
+    }
+
+    precondition {
       condition     = !var.centralized_cert_enabled || length(var.centralized_cert_domains) > 0
       error_message = "centralized_cert_domains must not be empty when centralized_cert_enabled is true."
     }
