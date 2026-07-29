@@ -783,8 +783,18 @@ def _validate_canary_provenance(
         },
         "canary FRP module",
     )
+    # The upstream FRP version the reviewed candidate declares in its go.mod.
+    # This is a deliberate review gate, not incidental: the canary's LayerV FRP
+    # build carries the InitialRunID hook that binds one native NHP admission
+    # cycle to the matching FRP Login, so which upstream it derives from is a
+    # supply-chain fact worth pinning by hand.
+    #
+    # It therefore MOVES WITH THE CANDIDATE and must be updated whenever the
+    # connector bumps FRP -- qurl-connector #452 went v0.70.0 -> v0.70.1, which
+    # is what this now tracks. A mismatch means the canary built against an
+    # upstream nobody reviewed for this proof, and still fails closed.
     if (
-        frp["required_version"] != "v0.70.0"
+        frp["required_version"] != "v0.70.1"
         or not isinstance(frp["version"], str)
         or not MODULE_VERSION_RE.fullmatch(frp["version"])
         or frp["replacement"] != "./frp"
