@@ -1,0 +1,520 @@
+name: UDP Proof Runner Sandbox Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build a saved plan, apply one exact saved plan, or verify convergence.
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - verify
+      source_plan_run_id:
+        description: Apply only; successful plan workflow run ID.
+        required: false
+        type: string
+      planned_commit_sha:
+        description: Apply only; exact commit from the plan summary.
+        required: false
+        type: string
+      plan_sha256:
+        description: Apply only; exact saved-plan SHA-256 from the plan summary.
+        required: false
+        type: string
+      planned_state_version_id:
+        description: Apply only; exact state VersionId from the plan summary.
+        required: false
+        type: string
+      planned_state_serial:
+        description: Apply only; exact state serial from the plan summary.
+        required: false
+        type: string
+      planned_state_sha256:
+        description: Apply only; exact state SHA-256 from the plan summary.
+        required: false
+        type: string
+      confirmation:
+        description: PLAN_SANDBOX_UDP_PROOF_RUNNER, APPLY_SANDBOX_UDP_PROOF_RUNNER, or VERIFY_SANDBOX_UDP_PROOF_RUNNER.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: deploy-sandbox-infra
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: "1.14.3"
+  TF_ROOT: terraform/environments/sandbox-udp-proof-runner
+  PROOF_ACCOUNT_SHA_PARAMETER: /sandbox/nhp/udp-proof/account-credential-sha256
+
+jobs:
+  guard:
+    name: Require trusted main and exact operation
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_run_attempt: ${{ steps.source.outputs.source_run_attempt }}
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+    steps:
+      - name: Check dispatch contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+          PLANNED_STATE_VERSION_ID: ${{ inputs.planned_state_version_id }}
+          PLANNED_STATE_SERIAL: ${{ inputs.planned_state_serial }}
+          PLANNED_STATE_SHA256: ${{ inputs.planned_state_sha256 }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          test "$GITHUB_SHA" = "$main_sha"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" \
+            --jq '.commit.verification | .verified == true and .reason == "valid"' |
+            grep -qx true
+
+          selectors="${SOURCE_PLAN_RUN_ID}${PLANNED_COMMIT_SHA}${PLAN_SHA256}${PLANNED_STATE_VERSION_ID}${PLANNED_STATE_SERIAL}${PLANNED_STATE_SHA256}"
+          case "$OPERATION" in
+            plan)
+              test "$CONFIRMATION" = PLAN_SANDBOX_UDP_PROOF_RUNNER
+              test -z "$selectors"
+              ;;
+            apply)
+              test "$CONFIRMATION" = APPLY_SANDBOX_UDP_PROOF_RUNNER
+              test "$GITHUB_RUN_ATTEMPT" = 1
+              [[ "$SOURCE_PLAN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+              [[ "$PLANNED_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              test -n "$PLANNED_STATE_VERSION_ID"
+              [[ "$PLANNED_STATE_SERIAL" =~ ^(0|[1-9][0-9]*)$ ]]
+              [[ "$PLANNED_STATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              test "$GITHUB_SHA" = "$PLANNED_COMMIT_SHA"
+              ;;
+            verify)
+              test "$CONFIRMATION" = VERIFY_SANDBOX_UDP_PROOF_RUNNER
+              test -z "$selectors"
+              ;;
+            *)
+              exit 2
+              ;;
+          esac
+
+      - name: Authenticate exact source plan run
+        id: source
+        if: inputs.operation == 'apply'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_PLAN_RUN_ID}")
+          jq -e \
+            --argjson id "$SOURCE_PLAN_RUN_ID" \
+            --arg sha "$PLANNED_COMMIT_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" '
+              .id == $id and
+              .run_attempt >= 1 and
+              .event == "workflow_dispatch" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_branch == "main" and
+              .head_sha == $sha and
+              .name == "UDP Proof Runner Sandbox Update" and
+              .path == ".github/workflows/udp-proof-runner-sandbox-update.yml" and
+              .repository.full_name == $repository
+            ' <<<"$run" >/dev/null
+          attempt=$(jq -er '.run_attempt' <<<"$run")
+          artifact_name="udp-proof-runner-plan-${SOURCE_PLAN_RUN_ID}-${attempt}"
+          artifacts=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_PLAN_RUN_ID}/artifacts?per_page=100")
+          jq -e --arg name "$artifact_name" '
+            [.artifacts[] | select(.name == $name and .expired == false)] |
+            length == 1 and
+            (.[0].digest | test("^sha256:[0-9a-f]{64}$"))
+          ' <<<"$artifacts" >/dev/null
+          {
+            echo "source_run_attempt=$attempt"
+            echo "artifact_name=$artifact_name"
+          } >>"$GITHUB_OUTPUT"
+
+  plan:
+    name: Build immutable runner plan
+    if: inputs.operation == 'plan'
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: sandbox
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure sandbox apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: udp-proof-runner-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load the existing proof-account binding
+        id: proof-account
+        run: |
+          set -euo pipefail
+          value=$(aws ssm get-parameter \
+            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
+            --query Parameter.Value --output text)
+          [[ "$value" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$value" >>"$GITHUB_OUTPUT"
+
+      - name: Initialize isolated runner state
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init -reconfigure -input=false
+
+      - name: Capture exact state before planning
+        run: scripts/capture-sandbox-udp-proof-runner-state.sh "$RUNNER_TEMP/state-before"
+
+      - name: Build saved plan
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          TF_VAR_proof_account_credential_sha256: ${{ steps.proof-account.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -input=false -lock-timeout=5m -no-color \
+            -out=tfplan | tee tfplan.txt
+          terraform show -json tfplan >tfplan.json
+          jq -e '
+            [
+              .resource_changes[]? |
+              select(.change.actions != ["no-op"])
+            ] as $changed |
+            all(
+              $changed[];
+              (
+                .address | test(
+                  "^(module\\.udp_proof_runner\\.|aws_kms_(key|alias)\\.proof_agent_seal$|data\\.)"
+                )
+              ) and
+              (
+                .change.actions == ["create"] or
+                .change.actions == ["read"] or
+                .change.actions == ["update"]
+              )
+            )
+          ' tfplan.json >/dev/null
+
+      - name: Require unchanged state after planning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/capture-sandbox-udp-proof-runner-state.sh "$RUNNER_TEMP/state-after"
+          cmp "$RUNNER_TEMP/state-before/state-summary.json" \
+            "$RUNNER_TEMP/state-after/state-summary.json"
+          scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Build exact plan metadata
+        id: metadata
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          PROOF_ACCOUNT_SHA256: ${{ steps.proof-account.outputs.sha256 }}
+          STATE_SUMMARY: ${{ runner.temp }}/state-before/state-summary.json
+        run: |
+          set -euo pipefail
+          plan_sha256=$(sha256sum tfplan | awk '{print $1}')
+          broker_zip="$GITHUB_WORKSPACE/terraform/modules/udp-proof-runner/lambda/broker.zip"
+          test -s "$broker_zip"
+          broker_zip_sha256=$(sha256sum "$broker_zip" | awk '{print $1}')
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson planned_at_epoch "$(date -u +%s)" \
+            --arg plan_sha256 "$plan_sha256" \
+            --arg broker_zip_sha256 "$broker_zip_sha256" \
+            --arg proof_account_sha256 "$PROOF_ACCOUNT_SHA256" \
+            --slurpfile state "$STATE_SUMMARY" \
+            '{
+              schema_version: 1,
+              repository: $repository,
+              workflow_ref: $workflow_ref,
+              commit_sha: $commit_sha,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              planned_at_epoch: $planned_at_epoch,
+              plan_sha256: $plan_sha256,
+              broker_zip_sha256: $broker_zip_sha256,
+              proof_account_sha256: $proof_account_sha256,
+              state: $state[0]
+            }' >plan-metadata.json
+          rm -rf artifact
+          mkdir -m 700 artifact
+          cp tfplan tfplan.json tfplan.txt plan-metadata.json artifact/
+          cp "$broker_zip" artifact/broker.zip
+          {
+            echo "plan_sha256=$plan_sha256"
+            echo "state_version_id=$(jq -er '.version_id' "$STATE_SUMMARY")"
+            echo "state_serial=$(jq -er '.serial' "$STATE_SUMMARY")"
+            echo "state_sha256=$(jq -er '.sha256' "$STATE_SUMMARY")"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload immutable saved plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: udp-proof-runner-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TF_ROOT }}/artifact
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Record exact apply selectors
+        env:
+          PLAN_SHA256: ${{ steps.metadata.outputs.plan_sha256 }}
+          STATE_VERSION_ID: ${{ steps.metadata.outputs.state_version_id }}
+          STATE_SERIAL: ${{ steps.metadata.outputs.state_serial }}
+          STATE_SHA256: ${{ steps.metadata.outputs.state_sha256 }}
+        run: |
+          {
+            echo "### UDP proof runner saved plan"
+            echo
+            echo "- Source plan run: \`${GITHUB_RUN_ID}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Plan SHA-256: \`${PLAN_SHA256}\`"
+            echo "- State VersionId: \`${STATE_VERSION_ID}\`"
+            echo "- State serial: \`${STATE_SERIAL}\`"
+            echo "- State SHA-256: \`${STATE_SHA256}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply exact saved runner plan
+    if: inputs.operation == 'apply'
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: sandbox
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download authenticated saved plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.guard.outputs.artifact_name }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_plan_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/saved-plan
+          digest-mismatch: error
+
+      - name: Validate exact saved plan files and metadata
+        env:
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.guard.outputs.source_run_attempt }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+          PLANNED_STATE_VERSION_ID: ${{ inputs.planned_state_version_id }}
+          PLANNED_STATE_SERIAL: ${{ inputs.planned_state_serial }}
+          PLANNED_STATE_SHA256: ${{ inputs.planned_state_sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/saved-plan"
+          test "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" = 5
+          test -f tfplan
+          test -f tfplan.json
+          test -f tfplan.txt
+          test -f plan-metadata.json
+          test -f broker.zip
+          test "$(sha256sum tfplan | awk '{print $1}')" = "$PLAN_SHA256"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow_ref "${GITHUB_REPOSITORY}/.github/workflows/udp-proof-runner-sandbox-update.yml@refs/heads/main" \
+            --arg commit_sha "$PLANNED_COMMIT_SHA" \
+            --argjson run_id "$SOURCE_PLAN_RUN_ID" \
+            --argjson run_attempt "$SOURCE_RUN_ATTEMPT" \
+            --arg plan_sha256 "$PLAN_SHA256" \
+            --arg state_version_id "$PLANNED_STATE_VERSION_ID" \
+            --argjson state_serial "$PLANNED_STATE_SERIAL" \
+            --arg state_sha256 "$PLANNED_STATE_SHA256" '
+              keys == [
+                "broker_zip_sha256",
+                "commit_sha",
+                "plan_sha256",
+                "planned_at_epoch",
+                "proof_account_sha256",
+                "repository",
+                "run_attempt",
+                "run_id",
+                "schema_version",
+                "state",
+                "workflow_ref"
+              ] and
+              .schema_version == 1 and
+              .repository == $repository and
+              .workflow_ref == $workflow_ref and
+              .commit_sha == $commit_sha and
+              .run_id == $run_id and
+              .run_attempt == $run_attempt and
+              .plan_sha256 == $plan_sha256 and
+              .broker_zip_sha256 == (
+                $broker_zip_sha256
+              ) and
+              .state.version_id == $state_version_id and
+              .state.serial == $state_serial and
+              .state.sha256 == $state_sha256 and
+              .planned_at_epoch >= 1 and
+              .planned_at_epoch <= now and
+              (now - .planned_at_epoch) <= 86400 and
+              (.proof_account_sha256 | test("^[0-9a-f]{64}$"))
+            ' \
+            --arg broker_zip_sha256 "$(sha256sum broker.zip | awk '{print $1}')" \
+            plan-metadata.json >/dev/null
+          install -m 0644 broker.zip \
+            "$GITHUB_WORKSPACE/terraform/modules/udp-proof-runner/lambda/broker.zip"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure sandbox apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: udp-proof-runner-apply-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Re-bind proof account and Terraform state
+        env:
+          PLANNED_STATE_VERSION_ID: ${{ inputs.planned_state_version_id }}
+          PLANNED_STATE_SERIAL: ${{ inputs.planned_state_serial }}
+          PLANNED_STATE_SHA256: ${{ inputs.planned_state_sha256 }}
+        run: |
+          set -euo pipefail
+          value=$(aws ssm get-parameter \
+            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
+            --query Parameter.Value --output text)
+          test "$value" = "$(jq -er '.proof_account_sha256' "$RUNNER_TEMP/saved-plan/plan-metadata.json")"
+          echo "TF_VAR_proof_account_credential_sha256=$value" >>"$GITHUB_ENV"
+          scripts/capture-sandbox-udp-proof-runner-state.sh "$RUNNER_TEMP/state-current"
+          jq -e \
+            --arg version_id "$PLANNED_STATE_VERSION_ID" \
+            --argjson serial "$PLANNED_STATE_SERIAL" \
+            --arg sha256 "$PLANNED_STATE_SHA256" '
+              .version_id == $version_id and
+              .serial == $serial and
+              .sha256 == $sha256
+            ' "$RUNNER_TEMP/state-current/state-summary.json" >/dev/null
+
+      - name: Initialize isolated runner state
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init -reconfigure -input=false
+
+      - name: Apply the authenticated saved plan
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform apply -input=false -auto-approve "$RUNNER_TEMP/saved-plan/tfplan"
+
+      - name: Require exact convergence
+        working-directory: ${{ env.TF_ROOT }}
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -input=false -lock-timeout=5m -no-color \
+            -out=verify.tfplan | tee verify.txt
+          terraform show -json verify.tfplan >verify.json
+          jq -e '
+            [
+              .resource_changes[]? |
+              select(.change.actions != ["no-op"])
+            ] | length == 0
+          ' verify.json >/dev/null
+
+      - name: Re-read live main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+  verify:
+    name: Verify runner convergence
+    if: inputs.operation == 'verify'
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: sandbox
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure sandbox read/apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: udp-proof-runner-verify-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Bind proof account
+        run: |
+          set -euo pipefail
+          value=$(aws ssm get-parameter \
+            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
+            --query Parameter.Value --output text)
+          [[ "$value" =~ ^[0-9a-f]{64}$ ]]
+          echo "TF_VAR_proof_account_credential_sha256=$value" >>"$GITHUB_ENV"
+
+      - name: Require exact Terraform convergence
+        working-directory: ${{ env.TF_ROOT }}
+        run: |
+          set -euo pipefail
+          terraform init -reconfigure -input=false
+          terraform plan \
+            -input=false -lock-timeout=5m -no-color \
+            -out=verify.tfplan | tee verify.txt
+          terraform show -json verify.tfplan >verify.json
+          jq -e '
+            [
+              .resource_changes[]? |
+              select(.change.actions != ["no-op"])
+            ] | length == 0
+          ' verify.json >/dev/null
+
+      - name: Re-read live main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
