@@ -7372,8 +7372,38 @@ class PlanContractTests(unittest.TestCase):
         policy = json.loads(ddb["after"]["policy"])
         policy["Statement"][0]["Resource"].append(
             f"arn:aws:dynamodb:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:table/"
+            f"{CHECKER.CONTROL_PREFIX}-qurl-foreign-idempotency"
+        )
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_accepts_actual_api_key_idempotency_table_name(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        actual_arn = (
+            f"arn:aws:dynamodb:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:table/"
             f"{CHECKER.CONTROL_PREFIX}-qurl-apikey-idempotency"
         )
+        self.assertIn(actual_arn, json.loads(ddb["after"]["policy"])["Statement"][0]["Resource"])
+        CHECKER.check_plan(candidate)
+
+    def test_authority_runtime_rejects_hyphenated_api_key_idempotency_table_name(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        actual_arn = CHECKER.AUTHORITY_RUNTIME_TABLE_ARNS["api_key_idempotency"]
+        wrong_arn = (
+            f"arn:aws:dynamodb:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:table/"
+            f"{CHECKER.CONTROL_PREFIX}-qurl-api-key-idempotency"
+        )
+        policy["Statement"][0]["Resource"] = [
+            wrong_arn if resource == actual_arn else resource
+            for resource in policy["Statement"][0]["Resource"]
+        ]
         ddb["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
 

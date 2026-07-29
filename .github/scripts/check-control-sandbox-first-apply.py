@@ -1528,7 +1528,7 @@ AUTHORITY_RUNTIME_TABLE_ARNS = {
     ),
     "api_key_idempotency": (
         f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
-        f"{CONTROL_PREFIX}-qurl-api-key-idempotency"
+        f"{CONTROL_PREFIX}-qurl-apikey-idempotency"
     ),
     "connector_authority": (
         f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
