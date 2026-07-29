@@ -954,6 +954,9 @@ AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES = frozenset(
     for address, resource_type in AUTHORITY_PROOF_RESOURCES.items()
     if resource_type == "aws_lambda_provisioned_concurrency_config"
 )
+AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND = (
+    "authority-proof-concurrency-recovery"
+)
 # The historical live Hub predecessor sat at ONE of the two reviewed endpoints
 # of its original Authority image transition, and at no other basis:
 #   * FROM (d535970977.../388a22f7a) -- the expansion plans before the reviewed
@@ -8419,6 +8422,108 @@ def _check_authority_image_update(
     )
 
 
+def _check_authority_proof_concurrency_recovery_drift(
+    drift: list[dict[str, Any]],
+    by_address: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Prove the exact state-1 -> live-0 PM/PCR failure observation.
+
+    The stale image left the proof Lambdas unable to initialize. Terraform state
+    still records each configured blue pool at one, while the refreshed provider
+    read reports zero and the taint produces the separately validated
+    delete/create replacement. Admit only those exact two proof-pool identities
+    and only when the plan carries the same replacement set.
+    """
+    addresses = [item.get("address") for item in drift]
+    if not all(isinstance(address, str) for address in addresses):
+        raise _unexpected_drift_error(drift)
+    address_set = set(addresses)
+    if (
+        not drift
+        or len(address_set) != len(addresses)
+        or not address_set <= set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+    ):
+        raise _unexpected_drift_error(drift)
+
+    if by_address is not None:
+        planned_replacements = {
+            address
+            for address in AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+            if (
+                isinstance(by_address.get(address), dict)
+                and isinstance(by_address[address].get("change"), dict)
+                and by_address[address]["change"].get("actions")
+                == ["delete", "create"]
+            )
+        }
+        if address_set != planned_replacements:
+            raise ContractError(
+                "proof concurrency drift must exactly match the planned "
+                "PM/PCR recovery replacements"
+            )
+
+    expected_value_keys = {
+        "function_name",
+        "id",
+        "provisioned_concurrent_executions",
+        "qualifier",
+        "skip_destroy",
+        "timeouts",
+    }
+    for item in drift:
+        address = item["address"]
+        function_name = address.rsplit('["', 1)[1][:-2]
+        change = item.get("change")
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if (
+            item.get("mode") != "managed"
+            or item.get("module_address") != "module.control"
+            or item.get("name") != "authority"
+            or item.get("provider_name")
+            != "registry.terraform.io/hashicorp/aws"
+            or item.get("type")
+            != "aws_lambda_provisioned_concurrency_config"
+            or item.get("index") != function_name
+            or item.get("deposed") is not None
+            or not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["update"]
+            or not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or set(before) != expected_value_keys
+            or set(after) != expected_value_keys
+            or before.get("function_name") != function_name
+            or after.get("function_name") != function_name
+            or before.get("id") != f"{function_name},blue"
+            or after.get("id") != f"{function_name},blue"
+            or before.get("provisioned_concurrent_executions") != 1
+            or after.get("provisioned_concurrent_executions") != 0
+            or before.get("qualifier") != "blue"
+            or after.get("qualifier") != "blue"
+            or before.get("skip_destroy") is not False
+            or after.get("skip_destroy") is not False
+            or before.get("timeouts") is not None
+            or after.get("timeouts") is not None
+            or {
+                key: value
+                for key, value in before.items()
+                if key != "provisioned_concurrent_executions"
+            }
+            != {
+                key: value
+                for key, value in after.items()
+                if key != "provisioned_concurrent_executions"
+            }
+            or change.get("after_unknown") != {}
+            or change.get("before_sensitive") != {}
+            or change.get("after_sensitive") != {}
+        ):
+            raise ContractError(
+                f"{address} is not the exact failed proof concurrency drift"
+            )
+
+
 def _require_normalization_plan_mode(
     normalization_drift_kind: str, plan_mode: str, plan: dict[str, Any]
 ) -> None:
@@ -8489,6 +8594,15 @@ def _check_state_normalization_drift(
     # reviewed-kind matcher below sees exactly that. Rejection diagnostics
     # therefore name only the entries that actually carry a signal.
     addresses = tuple(item.get("address") for item in drift)
+    if (
+        all(isinstance(address, str) for address in addresses)
+        and set(addresses)
+        and set(addresses) <= set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+    ):
+        _check_authority_proof_concurrency_recovery_drift(drift, by_address)
+        return AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
+    if not all(isinstance(address, str) for address in addresses):
+        raise _unexpected_drift_error(drift)
     if addresses == _REDIS_PASSWORD_NORMALIZATION_ADDRESSES:
         if not refresh_only:
             raise ContractError(
@@ -11527,6 +11641,15 @@ def check_plan(
                 "authority runtime-slice state normalization is admitted only for "
                 "the runtime-slice completion transition or a steady no-op re-read"
             )
+    if (
+        normalization_drift_kind
+        == AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
+        and plan_mode != "authority-image-update"
+    ):
+        raise ContractError(
+            "proof concurrency recovery drift may accompany only the exact "
+            "Authority image recovery transition"
+        )
 
     expected_applyable = plan_mode != "no-op" or (
         normalization_drift_count > 0 and "resource_changes" not in plan
@@ -11820,6 +11943,54 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         # narrow mode, because the enablement's unapplied output change means the
         # full refresh-only ``check_plan`` contract cannot describe the observation.
         return _check_authority_enablement_normalization_drift(drift, prior_state)
+    proof_recovery_addresses = [item.get("address") for item in drift]
+    if (
+        all(isinstance(address, str) for address in proof_recovery_addresses)
+        and set(proof_recovery_addresses)
+        and set(proof_recovery_addresses)
+        <= set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+    ):
+        _check_authority_proof_concurrency_recovery_drift(drift)
+        if (
+            not isinstance(prior_state, dict)
+            or prior_state.get("format_version") != "1.0"
+            or prior_state.get("terraform_version") != TF_VERSION
+        ):
+            raise ContractError(
+                f"normalization observation requires exact Terraform "
+                f"{TF_VERSION} state JSON"
+            )
+        state_values = prior_state.get("values")
+        root = (
+            state_values.get("root_module")
+            if isinstance(state_values, dict)
+            else None
+        )
+        for item in drift:
+            address = item["address"]
+            matches = [
+                resource
+                for resource in _iter_resources(root)
+                if resource.get("mode") == "managed"
+                and resource.get("address") == address
+            ]
+            if (
+                len(matches) != 1
+                or matches[0].get("type")
+                != "aws_lambda_provisioned_concurrency_config"
+                or matches[0].get("values") != item["change"]["before"]
+            ):
+                raise ContractError(
+                    "proof concurrency recovery drift does not match captured "
+                    f"state for {address}"
+                )
+        return {
+            "normalization_drift_count": len(drift),
+            "normalization_drift_kind": (
+                AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
+            ),
+            "normalization_drift_sha256": _normalization_drift_sha256(drift),
+        }
     slice_drift_addresses = [item.get("address") for item in drift]
     if all(isinstance(a, str) for a in slice_drift_addresses) and set(
         slice_drift_addresses

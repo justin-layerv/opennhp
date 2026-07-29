@@ -2793,6 +2793,74 @@ def authority_image_update_fixture(
     return result
 
 
+def authority_proof_concurrency_recovery_drift(
+    addresses: set[str] | None = None,
+) -> list[dict]:
+    """Exact stored-one to live-zero PM/PCR failure observation."""
+    selected = (
+        set(CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+        if addresses is None
+        else addresses
+    )
+    assert selected
+    assert selected <= set(CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+    result = []
+    for address in sorted(selected):
+        function_name = address.rsplit('["', 1)[1][:-2]
+        before = {
+            "function_name": function_name,
+            "id": f"{function_name},blue",
+            "provisioned_concurrent_executions": 1,
+            "qualifier": "blue",
+            "skip_destroy": False,
+            "timeouts": None,
+        }
+        result.append(
+            {
+                "address": address,
+                "index": function_name,
+                "mode": "managed",
+                "module_address": "module.control",
+                "name": "authority",
+                "provider_name": "registry.terraform.io/hashicorp/aws",
+                "type": "aws_lambda_provisioned_concurrency_config",
+                "change": {
+                    "actions": ["update"],
+                    "after": {
+                        **copy.deepcopy(before),
+                        "provisioned_concurrent_executions": 0,
+                    },
+                    "after_sensitive": {},
+                    "after_unknown": {},
+                    "before": before,
+                    "before_sensitive": {},
+                },
+            }
+        )
+    return result
+
+
+def authority_proof_concurrency_recovery_normalization_fixture(
+    addresses: set[str] | None = None,
+) -> tuple[dict, dict]:
+    """Build the pre-apply refresh-only observation and captured state."""
+    selected = (
+        set(CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+        if addresses is None
+        else addresses
+    )
+    candidate = authority_image_update_fixture(recovery_replaces=selected)
+    candidate["resource_drift"] = authority_proof_concurrency_recovery_drift(
+        selected
+    )
+    prior_state = terraform_1_14_refresh_only_golden(candidate)
+    for item in candidate["resource_drift"]:
+        state_resource(prior_state, item["address"])["values"] = copy.deepcopy(
+            item["change"]["before"]
+        )
+    return candidate, prior_state
+
+
 def authority_runtime_partial_retry_fixture(applied_addresses: set[str]) -> dict:
     """A partial-apply RETRY of the runtime slice: every address in
     ``applied_addresses`` already applied on an earlier attempt and now replans
@@ -6972,6 +7040,164 @@ class PlanContractTests(unittest.TestCase):
             }
         )
         self.assert_rejected(foreign)
+
+    def test_authority_image_recovery_admits_exact_proof_concurrency_drift(
+        self,
+    ) -> None:
+        recovery_addresses = set(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+        )
+        candidate = authority_image_update_fixture(
+            recovery_replaces=recovery_addresses,
+        )
+        candidate["resource_drift"] = (
+            authority_proof_concurrency_recovery_drift(recovery_addresses)
+        )
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-image-update")
+        self.assertEqual(summary["normalization_drift_count"], 2)
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            CHECKER.AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND,
+        )
+
+        singleton = {next(iter(recovery_addresses))}
+        partial = authority_image_update_fixture(
+            pending_addresses=set(),
+            foundation_pending=False,
+            recovery_replaces=singleton,
+        )
+        partial["resource_drift"] = (
+            authority_proof_concurrency_recovery_drift(singleton)
+        )
+        self.assertEqual(
+            CHECKER.check_plan(partial)["normalization_drift_count"],
+            1,
+        )
+
+        reversed_candidate = copy.deepcopy(candidate)
+        reversed_candidate["resource_drift"].reverse()
+        self.assertEqual(
+            CHECKER.check_plan(reversed_candidate)[
+                "normalization_drift_sha256"
+            ],
+            summary["normalization_drift_sha256"],
+        )
+
+    def test_proof_concurrency_drift_requires_exact_recovery_pairing(
+        self,
+    ) -> None:
+        recovery_addresses = set(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+        )
+        missing = authority_image_update_fixture(
+            recovery_replaces=recovery_addresses,
+        )
+        missing["resource_drift"] = (
+            authority_proof_concurrency_recovery_drift(
+                {next(iter(recovery_addresses))}
+            )
+        )
+        self.assert_rejected(missing)
+
+        no_replacement = authority_image_update_fixture()
+        no_replacement["resource_drift"] = (
+            authority_proof_concurrency_recovery_drift(recovery_addresses)
+        )
+        self.assert_rejected(no_replacement)
+
+        steady = authority_proof_steady_fixture()
+        steady["resource_drift"] = (
+            authority_proof_concurrency_recovery_drift(recovery_addresses)
+        )
+        self.assert_rejected(steady)
+
+    def test_proof_concurrency_recovery_drift_is_exact(self) -> None:
+        recovery_addresses = set(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+        )
+
+        def assert_rejected(mutate) -> None:
+            candidate = authority_image_update_fixture(
+                recovery_replaces=recovery_addresses,
+            )
+            candidate["resource_drift"] = (
+                authority_proof_concurrency_recovery_drift(recovery_addresses)
+            )
+            mutate(candidate["resource_drift"][0])
+            self.assert_rejected(candidate)
+
+        mutations = {
+            "wrong address": lambda item: item.update(
+                {
+                    "address": (
+                        "module.control."
+                        'aws_lambda_provisioned_concurrency_config.authority["foreign"]'
+                    )
+                }
+            ),
+            "unhashable address": lambda item: item.update(
+                {"address": {"malformed": True}}
+            ),
+            "wrong id": lambda item: item["change"]["after"].update(
+                {"id": "wrong,blue"}
+            ),
+            "wrong qualifier": lambda item: item["change"]["after"].update(
+                {"qualifier": "green"}
+            ),
+            "wrong before count": lambda item: item["change"]["before"].update(
+                {"provisioned_concurrent_executions": 2}
+            ),
+            "wrong after count": lambda item: item["change"]["after"].update(
+                {"provisioned_concurrent_executions": 1}
+            ),
+            "wrong action": lambda item: item["change"].update(
+                {"actions": ["delete", "create"]}
+            ),
+            "wrong type": lambda item: item.update(
+                {"type": "aws_lambda_function"}
+            ),
+            "wrong mode": lambda item: item.update({"mode": "data"}),
+            "wrong provider": lambda item: item.update(
+                {"provider_name": "example.invalid/aws"}
+            ),
+            "deposed": lambda item: item.update({"deposed": "deadbeef"}),
+            "unknown": lambda item: item["change"].update(
+                {"after_unknown": {"id": True}}
+            ),
+            "sensitive": lambda item: item["change"].update(
+                {"after_sensitive": {"id": True}}
+            ),
+            "extra state field": lambda item: item["change"]["after"].update(
+                {"region": CHECKER.AWS_REGION}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                assert_rejected(mutate)
+
+    def test_proof_concurrency_recovery_live_reproof_binds_captured_state(
+        self,
+    ) -> None:
+        candidate, prior_state = (
+            authority_proof_concurrency_recovery_normalization_fixture()
+        )
+        summary = CHECKER.check_normalization_drift(candidate, prior_state)
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            CHECKER.AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND,
+        )
+        self.assertEqual(summary["normalization_drift_count"], 2)
+
+        moved, moved_state = (
+            authority_proof_concurrency_recovery_normalization_fixture()
+        )
+        address = moved["resource_drift"][0]["address"]
+        state_resource(moved_state, address)["values"][
+            "provisioned_concurrent_executions"
+        ] = 2
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_normalization_drift(moved, moved_state)
 
     def test_authority_image_update_rejects_unpinned_source_and_alias_drift(
         self,

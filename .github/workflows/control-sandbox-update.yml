@@ -716,7 +716,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-proof-concurrency-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -781,7 +781,7 @@ jobs:
                 exit 1
               }
               ;;
-            authority-digest|hub-digest|authority-and-hub-digest|authority-enablement-normalization)
+            authority-digest|hub-digest|authority-and-hub-digest|authority-enablement-normalization|authority-proof-concurrency-recovery)
               # The externally owned digest kinds and the Authority enablement
               # drift pair (Hub-publisher-role reflection + authority-digest roll)
               # accompany a config change or an unapplied output change, so the
