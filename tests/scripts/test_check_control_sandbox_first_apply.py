@@ -11641,112 +11641,153 @@ class ComposedTransitionTest(unittest.TestCase):
     """Composition must PARTITION the change set, never widen it.
 
     Every transition in the dispatch matches `changed == <its exact set>`. That
-    is correct for one transition and wrong the moment two legitimately land in
-    one plan -- a Hub image deploy while a reviewed exec-policy edit is pending
-    -- which rejects a plan whose halves are each already admitted.
+    is right for one transition and wrong the moment two legitimately land in
+    one plan -- enabling attended proof while a reviewed Hub image deploy is
+    pending -- which rejects a plan whose halves are each already admitted.
 
-    These pin the composition ALGEBRA. The per-slice validators keep their own
-    tests, so the hub lane is stubbed here; what matters is that composition
-    calls it, and refuses whenever the partition is not exact.
+    These pin the ALGEBRA against a synthetic registry, so they keep testing the
+    partitioning rules no matter which lanes are registered; the real lanes keep
+    their own validators and tests.
     """
 
-    HUB = "module.control.aws_ecs_task_definition.hub[0]"
-    POL = 'module.control.aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-ia"]'
+    A, B, C = "addr.a", "addr.b", "addr.c"
+    SHARED = "module.control.terraform_data.foundation_contract"
 
-    def hub_item(self):
-        return {
-            "address": self.HUB,
-            "mode": "managed",
-            "deposed": None,
-            "type": "aws_ecs_task_definition",
-            "change": {"actions": ["delete", "create"], "before": {}, "after": {}},
-        }
+    def registry(self, *, a_raises=None, claim_shared=False):
+        def claim_a(changed, actual, by_address):
+            want = {self.A} | ({self.SHARED} if claim_shared else set())
+            return frozenset(want) if want <= changed else None
 
-    def policy_item(self, actions=("update",), moved_role=False):
-        return {
-            "address": self.POL,
-            "mode": "managed",
-            "deposed": None,
-            "type": "aws_iam_role_policy",
-            "change": {
-                "actions": list(actions),
-                "before": {"name": "exec", "role": "r1", "policy": "{}"},
-                "after": {
-                    "name": "exec",
-                    "role": "r2" if moved_role else "r1",
-                    "policy": '{"a":1}',
-                },
-            },
-        }
+        def claim_b(changed, actual, by_address):
+            want = {self.B} | ({self.SHARED} if claim_shared else set())
+            return frozenset(want) if want <= changed else None
 
-    def compose(self, by_address, deposed=None, changed=None, hub_raises=None):
-        changed = set(by_address) if changed is None else changed
-        actual = {a: list(i["change"]["actions"]) for a, i in by_address.items()}
+        def validate_a(claimed, by_address, plan):
+            if a_raises:
+                raise CHECKER.ContractError(a_raises)
 
-        def stub(_by):
-            if hub_raises:
-                raise CHECKER.ContractError(hub_raises)
+        def validate_b(claimed, by_address, plan):
+            return None
 
-        with mock.patch.object(CHECKER, "_check_hub_worker_image_update", stub):
+        return (("lane-a", claim_a, validate_a), ("lane-b", claim_b, validate_b))
+
+    def compose(self, changed, deposed=None, **kw):
+        by = {a: {"change": {"actions": ["update"]}} for a in changed}
+        with mock.patch.object(CHECKER, "_COMPOSABLE_TRANSITIONS", self.registry(**kw)):
             return CHECKER._compose_admitted_transitions(
-                changed, actual, by_address, deposed or {}, {}
+                set(changed), {}, by, deposed or {}, {}
             )
 
     def test_two_reviewed_transitions_compose(self) -> None:
-        mode = self.compose({self.HUB: self.hub_item(), self.POL: self.policy_item()})
-        self.assertIsNotNone(mode)
-        self.assertIn("hub-worker-image-update", mode)
-        self.assertIn("authority-hub-exec-policy-update", mode)
+        mode = self.compose({self.A, self.B})
+        self.assertEqual(mode, "composed-lane-a-with-lane-b")
 
     def test_a_single_transition_does_not_compose(self) -> None:
         """One claim must fall through to the stricter dispatch above."""
-        self.assertIsNone(self.compose({self.HUB: self.hub_item()}))
-        self.assertIsNone(self.compose({self.POL: self.policy_item()}))
+        self.assertIsNone(self.compose({self.A}))
 
     def test_an_unclaimed_address_refuses_composition(self) -> None:
         """One stray change and the whole plan falls through to rejection."""
-        by = {
-            self.HUB: self.hub_item(),
-            self.POL: self.policy_item(),
-            "module.control.aws_s3_bucket.stray": {
-                "address": "module.control.aws_s3_bucket.stray",
-                "mode": "managed",
-                "deposed": None,
-                "type": "aws_s3_bucket",
-                "change": {"actions": ["delete"], "before": {}, "after": None},
-            },
-        }
-        self.assertIsNone(self.compose(by))
+        self.assertIsNone(self.compose({self.A, self.B, self.C}))
 
     def test_deposed_objects_never_compose(self) -> None:
-        by = {self.HUB: self.hub_item(), self.POL: self.policy_item()}
-        self.assertIsNone(self.compose(by, deposed={"x": {"actions": ["delete"]}}))
+        self.assertIsNone(
+            self.compose({self.A, self.B}, deposed={"x": {"actions": ["delete"]}})
+        )
 
     def test_each_slice_still_runs_its_own_validator(self) -> None:
-        """A slice failure inside a COMPOSED plan must still fail closed."""
-        by = {self.HUB: self.hub_item(), self.POL: self.policy_item()}
-        with self.assertRaisesRegex(CHECKER.ContractError, "stub rejection"):
-            self.compose(by, hub_raises="stub rejection")
+        with self.assertRaisesRegex(CHECKER.ContractError, "slice rejected"):
+            self.compose({self.A, self.B}, a_raises="slice rejected")
 
-    def test_a_created_exec_policy_is_not_claimed(self) -> None:
-        """Only in-place updates are claimable; a create is a different shape."""
-        by = {self.HUB: self.hub_item(), self.POL: self.policy_item(actions=("create",))}
-        self.assertIsNone(self.compose(by))
+    def test_overlapping_claims_refuse(self) -> None:
+        """Two lanes claiming one ordinary address is ambiguous ownership."""
 
-    def test_a_moved_role_fails_the_composed_slice(self) -> None:
-        by = {self.HUB: self.hub_item(), self.POL: self.policy_item(moved_role=True)}
-        with self.assertRaisesRegex(CHECKER.ContractError, "moved 'role'"):
-            self.compose(by)
+        def claim_both(changed, actual, by_address):
+            return frozenset({self.A, self.B})
 
-    def test_an_unreviewed_exec_policy_is_not_claimed(self) -> None:
-        """Scoped to the reviewed legacy Hub set, not any exec policy."""
-        foreign = 'module.control.aws_iam_role_policy.authority_exec["some-other-fn"]'
-        item = self.policy_item()
-        item["address"] = foreign
-        self.assertIsNone(self.compose({self.HUB: self.hub_item(), foreign: item}))
+        registry = (
+            ("lane-a", claim_both, lambda c, b, p: None),
+            ("lane-b", claim_both, lambda c, b, p: None),
+        )
+        by = {a: {"change": {"actions": ["update"]}} for a in (self.A, self.B)}
+        with mock.patch.object(CHECKER, "_COMPOSABLE_TRANSITIONS", registry):
+            self.assertIsNone(
+                CHECKER._compose_admitted_transitions(
+                    {self.A, self.B}, {}, by, {}, {}
+                )
+            )
 
-    def test_a_replaced_hub_task_definition_is_required(self) -> None:
-        """An in-place hub update is a different shape and is not claimed."""
-        hub = self.hub_item()
-        hub["change"]["actions"] = ["update"]
-        self.assertIsNone(self.compose({self.HUB: hub, self.POL: self.policy_item()}))
+    def test_the_foundation_contract_may_be_shared(self) -> None:
+        """Every config-changing transition updates it by construction.
+
+        Requiring it to belong to exactly one claim would make any two
+        config-changing transitions permanently uncomposable.
+        """
+        mode = self.compose({self.A, self.B, self.SHARED}, claim_shared=True)
+        self.assertEqual(mode, "composed-lane-a-with-lane-b")
+
+    def test_only_the_allowlisted_address_may_be_shared(self) -> None:
+        self.assertEqual(
+            CHECKER._COMPOSABLE_SHARED_ADDRESSES,
+            frozenset({"module.control.terraform_data.foundation_contract"}),
+        )
+
+    def test_the_real_registry_carries_the_expected_lanes(self) -> None:
+        names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
+        self.assertEqual(
+            names,
+            {
+                "hub-worker-image-update",
+                "authority-proof-enable",
+                "authority-proof-consumer-staging",
+                "authority-hub-exec-policy-update",
+            },
+        )
+
+
+class ExecPolicyLanePrecedenceTest(unittest.TestCase):
+    """The exec-policy lane must stand down when staging claims the same rows.
+
+    Consumer staging resolves the SAME exec policies as part of a strictly
+    larger, more deeply validated slice. Two lanes claiming one address is
+    ambiguous ownership, which fails composition closed -- so precedence is
+    explicit rather than incidental.
+    """
+
+    POLICIES = frozenset(
+        f'module.control.aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-{s}"]'
+        for s in ("ia", "ra", "icr")
+    )
+
+    def claim(self, changed, staged):
+        actual = {a: ["update"] for a in changed}
+        with mock.patch.object(
+            CHECKER,
+            "_claim_authority_proof_consumer_staging",
+            lambda *a, **k: frozenset(staged) if staged else None,
+        ):
+            return CHECKER._claim_authority_hub_exec_policy_update(
+                set(changed), actual, {}
+            )
+
+    def test_claims_the_policies_when_staging_is_absent(self) -> None:
+        claimed = self.claim(self.POLICIES, staged=None)
+        self.assertEqual(claimed, self.POLICIES)
+
+    def test_stands_down_when_staging_claims_them(self) -> None:
+        self.assertIsNone(self.claim(self.POLICIES, staged=self.POLICIES))
+
+    def test_ignores_exec_policies_outside_the_reviewed_set(self) -> None:
+        foreign = 'module.control.aws_iam_role_policy.authority_exec["other-fn"]'
+        self.assertIsNone(self.claim({foreign}, staged=None))
+
+    def test_ignores_non_update_actions(self) -> None:
+        changed = set(self.POLICIES)
+        with mock.patch.object(
+            CHECKER, "_claim_authority_proof_consumer_staging", lambda *a, **k: None
+        ):
+            self.assertIsNone(
+                CHECKER._claim_authority_hub_exec_policy_update(
+                    changed, {a: ["create"] for a in changed}, {}
+                )
+            )

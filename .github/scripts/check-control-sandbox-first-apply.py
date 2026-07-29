@@ -7266,10 +7266,17 @@ def _claim_authority_hub_exec_policy_update(
 ) -> frozenset[str] | None:
     """Claim update-only Hub function exec policies.
 
+    Precedence over the consumer-staging lane is deliberate and explicit. When
+    the staged proof-policy binding is present, that lane resolves the SAME exec
+    policies as part of a strictly larger, more deeply validated slice, and two
+    lanes claiming one address is ambiguous ownership that fails composition
+    closed. So this lane stands down whenever staging claims them, and covers
+    only the case where the exec policies move on their own.
+
     Scoped to the reviewed legacy Hub resource set, so an exec policy belonging
-    to any other function is never claimed and still falls through to the
-    terminal rejection.
+    to any other function is never claimed.
     """
+    staged = _claim_authority_proof_consumer_staging(changed, actual_non_noop, by_address)
     claimed = {
         address
         for address in changed
@@ -7277,7 +7284,77 @@ def _claim_authority_hub_exec_policy_update(
         and address.startswith("module.control.aws_iam_role_policy.authority_exec[")
         and (actual_non_noop.get(address) or ()) == ["update"]
     }
+    if staged and (claimed & set(staged)):
+        return None
     return frozenset(claimed) or None
+
+
+def _validate_authority_hub_exec_policy_update(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    """Pin the SHAPE; policy CONTENT is validated unconditionally elsewhere.
+
+    _check_planned_security runs outside the transition dispatch for every plan,
+    so the statements these policies carry are already checked in full. What
+    composition must add is that nothing but an in-place update reached this
+    claim, and that the policy stayed attached to the same role.
+    """
+    for address in claimed:
+        change = (by_address.get(address) or {}).get("change")
+        if not isinstance(change, dict):
+            raise ContractError(f"composed exec-policy {address} change is malformed")
+        if list(change.get("actions") or ()) != ["update"]:
+            raise ContractError(f"composed exec-policy {address} is not an update")
+        before, after = change.get("before"), change.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ContractError(f"composed exec-policy {address} has no before/after")
+        for key in ("name", "role"):
+            if before.get(key) != after.get(key):
+                raise ContractError(
+                    f"composed exec-policy {address} moved {key!r}; only the "
+                    "policy document may change"
+                )
+
+
+def _claim_authority_proof_enable(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> frozenset[str] | None:
+    """Claim the attended-proof enablement slice when its exact shape is present."""
+    scope = set(AUTHORITY_PROOF_ENABLE_ALL_CHANGES)
+    if not scope <= changed:
+        return None
+    if not all(
+        (actual_non_noop.get(address) or ()) == ["create"]
+        for address in AUTHORITY_PROOF_RESOURCES
+    ):
+        return None
+    if not all(
+        (actual_non_noop.get(address) or ()) == ["update"]
+        for address in AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES
+    ):
+        return None
+    return frozenset(scope)
+
+
+def _claim_authority_proof_consumer_staging(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> frozenset[str] | None:
+    """Claim the proof-policy consumer staging slice.
+
+    Reuses the transition's own binding resolver, so the claim is exactly the
+    set that resolver proves belongs to a staging (or rollback) move -- never a
+    hand-rolled address guess.
+    """
+    for enabling in (True, False):
+        try:
+            addresses = _authority_proof_consumer_transition_addresses(
+                by_address, enabling=enabling
+            )
+        except Exception:
+            addresses = None
+        if addresses and set(addresses) <= changed:
+            return frozenset(addresses)
+    return None
 
 
 def _validate_hub_worker_image_update(
@@ -7286,40 +7363,28 @@ def _validate_hub_worker_image_update(
     _check_hub_worker_image_update(by_address)
 
 
-def _validate_authority_hub_exec_policy_update(
+def _validate_authority_proof_enable(
     claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
 ) -> None:
-    """Pin the SHAPE; the policy CONTENT is validated unconditionally elsewhere.
+    _require_create_shapes(
+        set(AUTHORITY_PROOF_RESOURCES),
+        by_address,
+        "attended-proof Authority resources must be new",
+    )
+    _check_authority_proof_enable_transition(plan, by_address)
 
-    _check_planned_security runs outside the transition dispatch for every plan,
-    so the statements these policies end up carrying are already checked in full.
-    What composition must add is that nothing but an in-place update reached this
-    claim -- a create, a replace or a delete on an exec policy is a different
-    transition and must not be admitted here.
-    """
-    for address in claimed:
-        item = by_address.get(address)
-        change = item.get("change") if isinstance(item, dict) else None
-        if not isinstance(change, dict):
-            raise ContractError(
-                f"composed exec-policy update {address} has a malformed change"
-            )
-        if list(change.get("actions") or ()) != ["update"]:
-            raise ContractError(
-                f"composed exec-policy claim {address} is not an in-place update"
-            )
-        before = change.get("before")
-        after = change.get("after")
-        if not isinstance(before, dict) or not isinstance(after, dict):
-            raise ContractError(
-                f"composed exec-policy update {address} has no before/after state"
-            )
-        for key in ("name", "role"):
-            if before.get(key) != after.get(key):
-                raise ContractError(
-                    f"composed exec-policy update {address} moved {key!r}; only "
-                    "the policy document may change"
-                )
+
+def _validate_authority_proof_consumer_staging(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    for enabling in (True, False):
+        addresses = _authority_proof_consumer_transition_addresses(
+            by_address, enabling=enabling
+        )
+        if addresses and set(addresses) == set(claimed):
+            _check_authority_proof_consumer_transition(by_address, enabling=enabling)
+            return
+    raise ContractError("composed proof-policy consumer claim is not a valid staging")
 
 
 # Transitions that may appear TOGETHER in one plan. Each entry claims a disjoint
@@ -7331,10 +7396,36 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         _validate_hub_worker_image_update,
     ),
     (
+        "authority-proof-enable",
+        _claim_authority_proof_enable,
+        _validate_authority_proof_enable,
+    ),
+    (
+        "authority-proof-consumer-staging",
+        _claim_authority_proof_consumer_staging,
+        _validate_authority_proof_consumer_staging,
+    ),
+    (
         "authority-hub-exec-policy-update",
         _claim_authority_hub_exec_policy_update,
         _validate_authority_hub_exec_policy_update,
     ),
+)
+
+# Addresses more than one transition may legitimately claim at once.
+#
+# terraform_data.foundation_contract is the single record of the foundation's
+# DECLARED configuration, so every transition that changes a flag updates it by
+# construction. Requiring it to belong to exactly one claim would make any two
+# config-changing transitions permanently uncomposable. Each claiming lane
+# validates its own binding of that contract -- proof-enable through
+# _check_authority_proof_enable_transition, consumer staging through the
+# resolver that produced its claim -- so sharing it costs no validation.
+#
+# It is an explicit one-address allowlist, not a general relaxation: every other
+# address must still be claimed by exactly one transition.
+_COMPOSABLE_SHARED_ADDRESSES = frozenset(
+    {"module.control.terraform_data.foundation_contract"}
 )
 
 
@@ -7388,7 +7479,7 @@ def _compose_admitted_transitions(
         return None
     seen: set[str] = set()
     for _, claimed, _ in claims:
-        if seen & claimed:
+        if (seen & claimed) - _COMPOSABLE_SHARED_ADDRESSES:
             return None
         seen |= claimed
     if seen != set(changed):
