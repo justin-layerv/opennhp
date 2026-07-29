@@ -279,6 +279,11 @@ jobs:
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
 
+      - name: Test sandbox UDP proof runner update contract
+        run: |
+          shellcheck scripts/capture-sandbox-udp-proof-account-binding.sh
+          python3 tests/scripts/test_udp_proof_runner_update_workflow.py
+
       - name: Test UDP proof deployment-manifest contracts
         run: |
           python3 -m unittest -v \

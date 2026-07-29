@@ -49,6 +49,7 @@ class UDPProofRunnerUpdateWorkflowTest(unittest.TestCase):
             inputs["operation"]["options"],
             ["plan", "apply", "verify"],
         )
+        self.assertNotIn("Seed the proof account", inputs["operation"]["description"])
         for phrase in (
             "PLAN_SANDBOX_UDP_PROOF_RUNNER",
             "APPLY_SANDBOX_UDP_PROOF_RUNNER",
@@ -234,6 +235,19 @@ fi
                     )
                 else:
                     self.assertFalse((output / "binding.json").exists())
+
+    def test_first_binding_plan_allows_only_digest_and_iam_updates(self) -> None:
+        for exact in (
+            '$binding.state == "configured"',
+            '$binding.parameter_state == "missing"',
+            'address: "module.udp_proof_runner.aws_iam_role_policy.controller"',
+            'address: "module.udp_proof_runner.aws_ssm_parameter.'
+            'proof_account_credential_sha256[0]"',
+            'actions: ["update"]',
+            'actions: ["create"]',
+        ):
+            self.assertIn(exact, self.raw)
+        self.assertIn('select(.mode == "managed")', self.raw)
 
     def test_state_capture_pins_account_object_and_kms_identity(self) -> None:
         for exact in (

@@ -519,6 +519,8 @@ lint-workflows:
 	@python3 tests/scripts/test_verify_relay_dmz_flow_evidence.py
 	@terraform -chdir=terraform/modules/relay-network init -backend=false >/dev/null
 	@terraform -chdir=terraform/modules/relay-network test
+	@shellcheck scripts/capture-sandbox-udp-proof-account-binding.sh
+	@python3 tests/scripts/test_udp_proof_runner_update_workflow.py
 	@shellcheck terraform/modules/udp-proof-runner/user_data.sh.tpl
 	@python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
 	@terraform -chdir=terraform/modules/udp-proof-runner init -backend=false >/dev/null

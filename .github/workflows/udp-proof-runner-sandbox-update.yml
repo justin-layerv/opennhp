@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Seed the proof account, build/apply one saved plan, or verify convergence.
+        description: Build a saved plan, apply one exact saved plan, or verify convergence.
         required: true
         type: choice
         options:
@@ -198,24 +198,49 @@ jobs:
             -var-file="$RUNNER_TEMP/proof-account/terraform.tfvars.json" \
             -out=tfplan | tee tfplan.txt
           terraform show -json tfplan >tfplan.json
-          jq -e '
+          jq -e \
+            --slurpfile binding "$RUNNER_TEMP/proof-account/binding.json" '
+            $binding[0] as $binding |
             [
               .resource_changes[]? |
               select(.change.actions != ["no-op"])
             ] as $changed |
-            all(
-              $changed[];
-              (
-                .address | test(
-                  "^(module\\.udp_proof_runner\\.|aws_kms_(key|alias)\\.proof_agent_seal$|data\\.)"
+            if (
+              $binding.state == "configured" and
+              $binding.parameter_state == "missing"
+            ) then
+              [
+                $changed[] |
+                select(.mode == "managed") |
+                {
+                  address,
+                  actions: .change.actions
+                }
+              ] | sort_by(.address) == [
+                {
+                  address: "module.udp_proof_runner.aws_iam_role_policy.controller",
+                  actions: ["update"]
+                },
+                {
+                  address: "module.udp_proof_runner.aws_ssm_parameter.proof_account_credential_sha256[0]",
+                  actions: ["create"]
+                }
+              ]
+            else
+              all(
+                $changed[];
+                (
+                  .address | test(
+                    "^(module\\.udp_proof_runner\\.|aws_kms_(key|alias)\\.proof_agent_seal$|data\\.)"
+                  )
+                ) and
+                (
+                  .change.actions == ["create"] or
+                  .change.actions == ["read"] or
+                  .change.actions == ["update"]
                 )
-              ) and
-              (
-                .change.actions == ["create"] or
-                .change.actions == ["read"] or
-                .change.actions == ["update"]
               )
-            )
+            end
           ' tfplan.json >/dev/null
 
       - name: Require unchanged state after planning
