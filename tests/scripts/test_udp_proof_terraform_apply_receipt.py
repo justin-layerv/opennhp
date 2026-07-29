@@ -99,7 +99,30 @@ class SavedPlanReceiptTest(unittest.TestCase):
                 head_sha=HEAD_SHA,
             )
 
-    def test_every_unapproved_delete_action_fails_closed(self) -> None:
+    def test_normal_non_retirement_deletes_emit_nothing(self) -> None:
+        for actions in (["delete"], ["delete", "create"], ["create", "delete"]):
+            with self.subTest(actions=actions):
+                self.assertIsNone(
+                    producer.build_receipt(
+                        {
+                            "resource_changes": [
+                                change(
+                                    "module.nhp.module.qurl_service[0]."
+                                    "aws_ecs_task_definition.qurl",
+                                    actions,
+                                )
+                            ]
+                        },
+                        saved_plan_sha256=PLAN_SHA256,
+                        run_id=RUN_ID,
+                        run_attempt=RUN_ATTEMPT,
+                        head_sha=HEAD_SHA,
+                    )
+                )
+
+    def test_retirement_with_every_unapproved_delete_action_fails_closed(
+        self,
+    ) -> None:
         for actions in (["delete"], ["delete", "create"], ["create", "delete"]):
             with self.subTest(actions=actions):
                 with self.assertRaisesRegex(
@@ -108,8 +131,12 @@ class SavedPlanReceiptTest(unittest.TestCase):
                 ):
                     producer.build_receipt(
                         {
-                            "resource_changes": [
-                                change("module.nhp.aws_s3_bucket.unrelated", actions)
+                            "resource_changes": exact_retirement_changes()
+                            + [
+                                change(
+                                    "module.nhp.aws_s3_bucket.unrelated",
+                                    actions,
+                                )
                             ]
                         },
                         saved_plan_sha256=PLAN_SHA256,

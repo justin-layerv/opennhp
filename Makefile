@@ -521,6 +521,7 @@ lint-workflows:
 	@terraform -chdir=terraform/modules/relay-network test
 	@shellcheck scripts/capture-sandbox-udp-proof-account-binding.sh
 	@python3 tests/scripts/test_udp_proof_runner_update_workflow.py
+	@python3 -m unittest -v tests.scripts.test_udp_proof_terraform_apply_receipt
 	@shellcheck terraform/modules/udp-proof-runner/user_data.sh.tpl
 	@python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
 	@terraform -chdir=terraform/modules/udp-proof-runner init -backend=false >/dev/null

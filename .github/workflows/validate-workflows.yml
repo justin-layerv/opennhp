@@ -289,7 +289,8 @@ jobs:
           python3 -m unittest -v \
             tests.scripts.test_udp_proof_deployment_collector \
             tests.scripts.test_udp_proof_deployment_contract \
-            tests.scripts.test_udp_proof_deployment_workflow
+            tests.scripts.test_udp_proof_deployment_workflow \
+            tests.scripts.test_udp_proof_terraform_apply_receipt
 
       # Both Claude entry points must use the same proven action SHA and explicit
       # model. Automatic review must remain a default-branch-trusted

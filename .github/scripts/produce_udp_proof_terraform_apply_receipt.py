@@ -65,8 +65,7 @@ def build_receipt(
             "Terraform plan JSON must contain resource_changes"
         )
 
-    approved: set[str] = set()
-    unapproved_deletions: list[str] = []
+    deletions: list[tuple[str, list[str], str | None]] = []
     for index, raw_change in enumerate(changes):
         if not isinstance(raw_change, dict):
             raise TerraformApplyReceiptError(
@@ -88,6 +87,17 @@ def build_receipt(
         if "delete" not in actions:
             continue
         logical = _logical_retirement_address(address)
+        deletions.append((address, actions, logical))
+
+    # This producer runs on every sandbox apply, but only governs the exact
+    # one-time UDP retirement. Ordinary Terraform replacements may include a
+    # delete action and are outside this receipt's scope.
+    if not any(logical is not None for _, _, logical in deletions):
+        return None
+
+    approved: set[str] = set()
+    unapproved_deletions: list[str] = []
+    for address, actions, logical in deletions:
         if logical is None:
             unapproved_deletions.append(address)
         elif actions == ["delete"]:
@@ -102,8 +112,6 @@ def build_receipt(
             "Terraform plan includes unapproved deletion actions "
             f"{sorted(unapproved_deletions)}"
         )
-    if not approved:
-        return None
     expected = set(orchestrator.TERRAFORM_RETIREMENT_RESOURCES)
     if approved != expected:
         missing = sorted(expected - approved)
