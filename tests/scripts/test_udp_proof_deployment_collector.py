@@ -2882,3 +2882,71 @@ class RevisionOnDefaultBranchTest(unittest.TestCase):
             with self.subTest(comparison=comparison):
                 with self.assertRaises(collector.EvidenceError):
                     self.check(comparison)
+
+
+class DeployedRevisionContainmentTest(unittest.TestCase):
+    """Components must be built FROM main, not pinned to one shared commit.
+
+    Requiring `len(revisions) == 1` per family was a coherence claim, not a
+    trust property, and unsatisfiable in steady state: cell0's image is
+    redeployed on every merge while the Hub image only advances on a manual,
+    approval-gated publish. Three cadences are equal only by luck -- and this
+    manifest gates the attended SDK proof runs.
+    """
+
+    TIP = "4" * 40
+    A, B = "a" * 40, "b" * 40
+
+    def check(self, revision, comparison):
+        with mock.patch.object(collector, "_gh", return_value=comparison):
+            collector._require_revision_on_default_branch(
+                revision, self.TIP, "nhp_cell0", repository_key="nhp"
+            )
+
+    def test_differing_revisions_are_allowed_when_each_is_on_main(self) -> None:
+        """The whole point: cell0 and hub may legitimately differ."""
+        for revision in (self.A, self.B):
+            self.check(revision, {"status": "ahead", "behind_by": 0, "ahead_by": 7})
+
+    def test_the_branch_tip_short_circuits_without_an_api_call(self) -> None:
+        with mock.patch.object(collector, "_gh") as gh:
+            collector._require_revision_on_default_branch(
+                self.TIP, self.TIP, "nhp_hub", repository_key="nhp"
+            )
+        gh.assert_not_called()
+
+    def test_a_revision_not_on_main_still_fails_closed(self) -> None:
+        """A fork, an unmerged PR, or a rewritten history must still fail."""
+        for comparison in (
+            {"status": "diverged", "behind_by": 3, "ahead_by": 1},
+            {"status": "behind", "behind_by": 1, "ahead_by": 0},
+        ):
+            with self.subTest(comparison=comparison):
+                with self.assertRaisesRegex(
+                    collector.EvidenceError, "not a commit on trusted main"
+                ):
+                    self.check(self.A, comparison)
+
+    def test_an_unreadable_comparison_fails_closed(self) -> None:
+        for comparison in ({}, None, {"status": "ahead"}, {"behind_by": 0}):
+            with self.subTest(comparison=comparison):
+                with self.assertRaises(collector.EvidenceError):
+                    self.check(self.A, comparison)
+
+    def test_each_family_is_compared_against_its_own_repository(self) -> None:
+        """nhp components compare against nhp; qurl-service against its own."""
+        seen = []
+
+        def fake_gh(path, _name):
+            seen.append(path)
+            return {"status": "ahead", "behind_by": 0, "ahead_by": 1}
+
+        with mock.patch.object(collector, "_gh", side_effect=fake_gh):
+            collector._require_revision_on_default_branch(
+                self.A, self.TIP, "nhp_cell0", repository_key="nhp"
+            )
+            collector._require_revision_on_default_branch(
+                self.A, self.TIP, "qurl_service_cell0", repository_key="qurl_service"
+            )
+        self.assertIn("repos/layervai/nhp/compare/", seen[0])
+        self.assertIn("repos/layervai/qurl-service/compare/", seen[1])

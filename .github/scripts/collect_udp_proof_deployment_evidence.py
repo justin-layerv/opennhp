@@ -1198,7 +1198,10 @@ def _oci_revision(
 
 
 def _require_revision_on_default_branch(
-    revision: str, default_branch_head: str, name: str
+    revision: str,
+    default_branch_head: str,
+    name: str,
+    repository_key: str = "qurl_reverse_tunnel_server",
 ) -> None:
     """Prove a revision is a commit on the default branch, not merely its tip.
 
@@ -1214,7 +1217,7 @@ def _require_revision_on_default_branch(
     if revision == default_branch_head:
         return
     comparison = _gh(
-        f"repos/{contract.REPOSITORIES['qurl_reverse_tunnel_server']}"
+        f"repos/{contract.REPOSITORIES[repository_key]}"
         f"/compare/{revision}...{default_branch_head}",
         f"{name} default-branch containment",
     )
@@ -3985,20 +3988,47 @@ def collect_aws_and_build_snapshot(
         "canary_artifact_digest": canary["artifact_digest"],
     }
 
-    nhp_revisions = {
-        workloads[key]["source_revision"]
-        for key in ("nhp_cell0", "nhp_cell1", "nhp_hub")
-    }
-    qurl_service_revisions = {
-        workloads[key]["source_revision"]
-        for key in (
+    # Each deployed component must be built FROM TRUSTED MAIN. It must NOT be
+    # required to be the same commit as its siblings.
+    #
+    # Requiring one shared revision per family was a coherence claim, not a trust
+    # property, and it is unsatisfiable in steady state here. cell0's server image
+    # is redeployed by build-and-push on EVERY merge to main, while the Hub image
+    # only advances when an operator dispatches publish-hub-image.yml behind an
+    # approval gate. Three components on three independent cadences are equal only
+    # by luck, so on a repository where a team merges, this manifest could
+    # essentially never be produced -- and it gates the attended SDK proof runs,
+    # which is a lot of blocking for a provenance artifact.
+    #
+    # Containment is the property that actually matters and is stable: a fork
+    # commit, an unmerged PR commit, or a rewritten history still fails closed.
+    # The manifest RECORDS every component's revision either way, so what was
+    # deployed remains fully attributable -- the record is what makes it
+    # provenance, not the coincidence that the numbers matched.
+    revision_families = {
+        "nhp": ("nhp_cell0", "nhp_cell1", "nhp_hub"),
+        "qurl_service": (
             "qurl_service_authority",
             "qurl_service_cell0",
             "qurl_service_cell1",
-        )
+        ),
     }
-    if len(nhp_revisions) != 1 or len(qurl_service_revisions) != 1:
-        raise EvidenceError("deployed NHP or qurl-service source revisions are mixed")
+    for repository_key, workload_keys in revision_families.items():
+        head = contract._sha(
+            github_evidence["default_branches"][repository_key]["sha"],
+            f"{repository_key} default branch head",
+        )
+        for workload_key in workload_keys:
+            revision = contract._sha(
+                workloads[workload_key]["source_revision"],
+                f"{workload_key} deployed source revision",
+            )
+            _require_revision_on_default_branch(
+                revision,
+                head,
+                workload_key,
+                repository_key=repository_key,
+            )
     repository_shas = {
         "frp": canary["frp_sha"],
         "nhp": next(iter(nhp_revisions)),
