@@ -7895,6 +7895,40 @@ def _check_authority_image_update(
     )
 
 
+def _require_normalization_plan_mode(
+    normalization_drift_kind: str, plan_mode: str, plan: dict[str, Any]
+) -> None:
+    """Gate which transition the combined digest normalization may accompany.
+
+    A refresh-only absorb, OR the Hub image update that the Hub digest write is
+    precisely what causes. This mirrors the authority-digest rule, which already
+    admits "authority-image-update" for exactly that reason.
+
+    Without it the pair deadlocks: a refresh-only absorb is the only other
+    route, and any SSM write re-drifts the parameter on version, so the drift is
+    back by the time the transition plan runs.
+
+    The drift itself is unaffected -- _check_digest_normalization still pins each
+    parameter's identity, description, ARN, an immutable sha256 value that
+    actually changed, and a planned no-op on the parameter -- and the Hub image
+    transition remains separately proven image-only.
+    """
+    if normalization_drift_kind != "authority-and-hub-digest":
+        return
+    allowed = plan_mode in ("no-op", "hub-worker-image-update") or (
+        plan_mode.startswith("composed-") and "hub-worker-image-update" in plan_mode
+    )
+    if not allowed:
+        raise ContractError(
+            "combined Authority and Hub digest normalization may accompany "
+            "only a refresh-only plan or the reviewed Hub worker image update"
+        )
+    if plan_mode == "no-op" and "resource_changes" in plan:
+        raise ContractError(
+            "combined digest-only state normalization requires a refresh-only plan"
+        )
+
+
 def _check_state_normalization_drift(
     drift: list[dict[str, Any]],
     by_address: dict[str, dict[str, Any]],
@@ -10799,16 +10833,7 @@ def check_plan(
                 "Hub digest state normalization requires a refresh-only plan"
             )
     if normalization_drift_kind == "authority-and-hub-digest":
-        # The STRICTER of the two kinds it combines. Absorbing both publisher
-        # digests is a pure state normalization, so it may carry no resource
-        # transition at all -- which is also precisely how the deadlock clears:
-        # one refresh-only apply absorbs both, and the ordinary transition plan
-        # that follows then sees no drift.
-        if plan_mode != "no-op" or "resource_changes" in plan:
-            raise ContractError(
-                "combined Authority and Hub digest normalization requires a "
-                "refresh-only plan"
-            )
+        _require_normalization_plan_mode(normalization_drift_kind, plan_mode, plan)
     if normalization_drift_kind == "redis-passwords" and plan_mode != "no-op":
         raise ContractError(
             "Redis password projection normalization cannot be combined with "

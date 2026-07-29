@@ -11906,3 +11906,35 @@ class DualDigestNormalizationTest(unittest.TestCase):
                 CHECKER._check_state_normalization_drift(
                     self.drift([self.AUTH, self.HUB]), {}, refresh_only=True
                 )
+
+
+class DualDigestPlanModeGateTest(unittest.TestCase):
+    """The pair may ride the Hub image update it causes -- and nothing else."""
+
+    def gate(self, plan_mode, plan=None):
+        return CHECKER._require_normalization_plan_mode(
+            "authority-and-hub-digest", plan_mode, plan if plan is not None else {}
+        )
+
+    def test_refresh_only_no_op_is_allowed(self) -> None:
+        self.gate("no-op")
+
+    def test_the_hub_image_update_is_allowed(self) -> None:
+        self.gate("hub-worker-image-update", {"resource_changes": []})
+
+    def test_a_composed_plan_carrying_it_is_allowed(self) -> None:
+        self.gate(
+            "composed-authority-hub-exec-policy-update-with-hub-worker-image-update",
+            {"resource_changes": []},
+        )
+
+    def test_an_unrelated_transition_is_rejected(self) -> None:
+        for mode in ("redis-split-transition", "authority-image-update",
+                     "composed-authority-proof-enable-with-authority-proof-consumer-staging"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(CHECKER.ContractError, "may accompany only"):
+                    self.gate(mode, {"resource_changes": []})
+
+    def test_a_no_op_with_resource_changes_still_requires_refresh_only(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "refresh-only"):
+            self.gate("no-op", {"resource_changes": []})
