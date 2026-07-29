@@ -26,7 +26,7 @@ locals {
 
   # DynamoDB gateway endpoint: allow exactly the complete runtime execution-role
   # set the union of the exact per-op actions (reads incl. DescribeTable; replay
-  # and registration/recovery writes) on the four canonical BASE tables.
+  # and registration/recovery writes) on the five canonical BASE tables.
   # Gateway VPC-endpoint
   # policies are TABLE-GRANULAR: DynamoDB rejects a /index/* sub-resource here
   # with InvalidPolicyDocument, and a Query against agent_keys' pubkey GSI is
@@ -54,7 +54,7 @@ locals {
         local.authority_runtime_ddb_recovery_write_actions,
       )
       Resource = [
-        for name in ["api_keys", "agent_keys", "customers", "connector_authority"] :
+        for name in ["api_keys", "agent_keys", "customers", "api_key_idempotency", "connector_authority"] :
         local.authority_runtime_table_arns[name]
       ]
       Condition = {

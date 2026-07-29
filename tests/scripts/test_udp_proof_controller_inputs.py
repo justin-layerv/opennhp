@@ -199,10 +199,6 @@ class WorkflowContractTest(unittest.TestCase):
             '-f "deployment_producer_head_sha=$DEPLOYMENT_PRODUCER_HEAD_SHA"',
             '-f "deployment_artifact_id=$DEPLOYMENT_ARTIFACT_ID"',
             '-f "deployment_artifact_digest=$DEPLOYMENT_ARTIFACT_DIGEST"',
-            '["key_arn", "provider", "region"]',
-            '.connector_sealed_state.provider == "aws-kms"',
-            '.connector_sealed_state.region == "us-east-2"',
-            '-f "connector_kms_key_id=$connector_kms_key_id"',
             '-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID"',
             '-f "dispatch_correlation_id=$correlation_id"',
             '--branch "$CLIENT_REF"',
@@ -246,6 +242,8 @@ class WorkflowContractTest(unittest.TestCase):
             "Client artifact: \\`${CLIENT_ARTIFACT_ID}\\` / \\`${CLIENT_ARTIFACT_DIGEST}\\`",
         ):
             self.assertIn(required, workflow)
+        self.assertNotIn("connector_kms_key_id", workflow)
+        self.assertNotIn(".connector_sealed_state", workflow)
         dispatch_inputs = workflow.split("    inputs:\n", 1)[1].split(
             "\npermissions:", 1
         )[0]

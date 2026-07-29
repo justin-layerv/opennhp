@@ -230,8 +230,9 @@ locals {
     },
   ] : []
 
-  # The 4 canonical tables reached by the complete runtime. api_key_idempotency
-  # is intentionally excluded: no Authority constructor reaches it. Ungated so
+  # The 5 canonical tables reached by the complete runtime. The attended proof
+  # recovery constructor uses api_key_idempotency for replay-safe credential
+  # minting. Ungated so
   # the dependency-endpoint policy locals in endpoints.tf can reference them
   # even while the runtime is dark; they are only ever selected when deploying.
   authority_runtime_table_arns = {

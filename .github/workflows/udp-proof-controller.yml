@@ -472,25 +472,6 @@ jobs:
           if [[ -n "$PRE_REMOVAL_RUN_ID" ]]; then
             dispatch_args+=(-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID")
           fi
-          if [[ "$CLIENT" == "connector" ]]; then
-            connector_kms_key_id="$(
-              printf '%s' "$DEPLOYMENT_RUNTIME_INPUTS_B64" |
-                base64 --decode |
-                jq -er '
-                  if
-                    (.connector_sealed_state | keys | sort) ==
-                      ["key_arn", "provider", "region"] and
-                    .connector_sealed_state.provider == "aws-kms" and
-                    .connector_sealed_state.region == "us-east-2" and
-                    (.connector_sealed_state.key_arn |
-                      test("^arn:aws:kms:us-east-2:767397897469:key/([0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$"))
-                  then .connector_sealed_state.key_arn
-                  else error("invalid Connector sealed-state runtime input")
-                  end
-                '
-            )"
-            dispatch_args+=(-f "connector_kms_key_id=$connector_kms_key_id")
-          fi
           if [[ "$CLIENT" == "qurl_go" ]]; then
             dispatch_args+=(
               -f "assignment_handshake_b64=$ASSIGNMENT_HANDSHAKE_B64"
