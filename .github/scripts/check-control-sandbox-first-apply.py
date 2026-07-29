@@ -911,49 +911,51 @@ AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES = frozenset(
 AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES = frozenset(
     {AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS}
 )
-# The reviewed image migration retags resources that ALREADY EXIST live, and the
-# live Authority is the Hub-only graph: both pinned endpoints of the transition
-# -- the FROM basis (sha d535970977.../388a22f7a) and the TO basis
-# (sha b44ee0ca10.../38c11ec13) -- publish exactly the three Hub functions. The
-# per-cell functions this branch adds are pending CREATES
-# (AUTHORITY_RUNTIME_LEGACY_EXPANSION_CREATE_ADDRESSES), and a resource that does
-# not exist cannot be updated from FROM_URI to TO_URI. Deriving this set from the
-# full runtime inventory instead would admit 24 lambda actions that the reviewed
-# transition provably does not contain, so intersect with the legacy Hub
-# addresses to keep the admitted set at exactly the reviewed nine.
+# The reviewed image migration retags every Authority function that exists in
+# the complete sandbox graph. The target image is the first published artifact
+# containing the attended-proof PM/PCR operations, so the two proof functions
+# participate alongside the eleven steady runtime functions. Keep the admitted
+# set to immutable-image function and alias updates only.
 AUTHORITY_IMAGE_UPDATE_RESOURCES = {
     address: resource_type
-    for address, resource_type in AUTHORITY_RUNTIME_RESOURCES.items()
+    for address, resource_type in {
+        **AUTHORITY_RUNTIME_RESOURCES,
+        **AUTHORITY_PROOF_RESOURCES,
+    }.items()
     if resource_type in {"aws_lambda_alias", "aws_lambda_function"}
-    and address in AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
 }
 AUTHORITY_IMAGE_UPDATE_FROM_URI = (
     f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
     "layerv/qurl-connector-authority@"
-    "sha256:d50ec8ee0153b4ac62491209a03442e12ca484b9ca88a72daf70a3880d77c070"
+    "sha256:65421ee9675dc2261b7b44af13748997a4ae06f00191849261df8ab48a9f7b9a"
 )
 AUTHORITY_IMAGE_UPDATE_TO_URI = (
     f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
     "layerv/qurl-connector-authority@"
-    "sha256:65421ee9675dc2261b7b44af13748997a4ae06f00191849261df8ab48a9f7b9a"
+    "sha256:e147b20e41e7372f62d8f5f02e9d3390c1a18579ff13370a7de8871b378c33fb"
 )
 AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS = (
     "module.control.terraform_data.foundation_contract"
 )
 AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256 = (
-    "d535970977ba3b31da2b224c01897c535786ff802a91edbe8319884c23924eff"
+    "bfe274736e5c84ab29cb1a5b49690683b0de03970d638788ebbf707882dc6872"
 )
 AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE = (
-    "388a22f7a5333a246e623a19dd5ca3793bd89f60"
+    "e26704161d83ccf88042b54c2a34b8b41332e652"
 )
 AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256 = (
-    "b44ee0ca10d555db931713f2809b1e45c149c0382d5aaee2a5bf1cf252b55056"
+    "3f9d99ea8aaddea2511d802dc7000b3d371d8d1debef2580001fcc88925df91f"
 )
 AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE = (
-    "38c11ec130f7443339581eb42692f3577812f904"
+    "156fd29a94bfe6955ca2a201b7f9a33b1be64665"
 )
-# The live legacy Hub predecessor sits at ONE of the two reviewed endpoints of
-# the Authority image transition, and at no other basis:
+AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES = frozenset(
+    address
+    for address, resource_type in AUTHORITY_PROOF_RESOURCES.items()
+    if resource_type == "aws_lambda_provisioned_concurrency_config"
+)
+# The historical live Hub predecessor sat at ONE of the two reviewed endpoints
+# of its original Authority image transition, and at no other basis:
 #   * FROM (d535970977.../388a22f7a) -- the expansion plans before the reviewed
 #     image update applies. This IS AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE.
 #   * TO   (b44ee0ca10.../38c11ec13) -- the reviewed image update ALREADY applied
@@ -962,12 +964,10 @@ AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE = (
 #     after-state. This is the observed sandbox state: the image apply converged
 #     the contract and every function's $LATEST, then failed on
 #     lambda:PublishVersion, leaving the alias rebind pending.
-# Both endpoints are already reviewed, pinned constants in this file, and the
-# sha/commit pair of each is taken from those constants rather than restated, so
-# the endpoints cannot silently drift apart. Enumerating exactly these two keeps
-# the admitted predecessor set closed: a basis that is neither -- including any
-# mixture of the two across the four evidence slots -- still fails, because each
-# candidate is reconstructed and compared whole.
+# These historical endpoints deliberately remain independent of the current
+# full-graph image migration pins above. Enumerating exactly these two keeps the
+# admitted predecessor set closed: a basis that is neither -- including any
+# mixture across the evidence slots -- still fails.
 AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES = tuple(
     {
         **AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE,
@@ -976,12 +976,12 @@ AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES = tuple(
     }
     for sha256, source_commit in (
         (
-            AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256,
-            AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE,
+            "d535970977ba3b31da2b224c01897c535786ff802a91edbe8319884c23924eff",
+            "388a22f7a5333a246e623a19dd5ca3793bd89f60",
         ),
         (
-            AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256,
-            AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE,
+            "b44ee0ca10d555db931713f2809b1e45c149c0382d5aaee2a5bf1cf252b55056",
+            "38c11ec130f7443339581eb42692f3577812f904",
         ),
     )
 )
@@ -7476,51 +7476,29 @@ def _check_authority_image_output_changes(
         raise ContractError("Authority image root-output inventory is not exact")
 
     image_change = output_changes["authority_image_uri"]
-    catalog_change = output_changes["provisioned_cells"]
     exact_image_transition = _is_exact_output_change(
         image_change,
         actions=["update"],
         before=AUTHORITY_IMAGE_UPDATE_FROM_URI,
         after=AUTHORITY_IMAGE_UPDATE_TO_URI,
     )
-    exact_catalog_transition = _is_exact_output_change(
-        catalog_change,
-        actions=["create"],
-        before=None,
-        after={},
-    )
     if full_transition:
-        if not exact_image_transition or not exact_catalog_transition:
+        if not exact_image_transition:
             raise ContractError(
-                "full Authority image migration must update the image output "
-                "and create the exact empty catalog output"
+                "full Authority image migration must update the exact image output"
             )
-    elif (
-        not exact_image_transition
-        and not _is_exact_output_change(
+    elif not exact_image_transition and not _is_exact_output_change(
             image_change,
             actions=["no-op"],
             before=AUTHORITY_IMAGE_UPDATE_TO_URI,
             after=AUTHORITY_IMAGE_UPDATE_TO_URI,
-        )
-    ) or (
-        not exact_catalog_transition
-        and not _is_exact_output_change(
-            catalog_change,
-            actions=["no-op"],
-            before={},
-            after={},
-        )
-    ):
+        ):
         raise ContractError(
             "Authority image recovery output changes are outside the bounded "
             "transition/no-op envelope"
         )
 
-    for output_name in EXPECTED_CONTROL_OUTPUTS - {
-        "authority_image_uri",
-        "provisioned_cells",
-    }:
+    for output_name in EXPECTED_CONTROL_OUTPUTS - {"authority_image_uri"}:
         change = output_changes[output_name]
         if (
             not isinstance(change, dict)
@@ -8280,10 +8258,13 @@ def _check_authority_image_update(
     changed: set[str],
     by_address: dict[str, dict[str, Any]],
     plan: dict[str, Any],
+    *,
+    refresh_disabled: bool,
 ) -> None:
-    """Admit only the one reviewed d50 -> 97d sandbox image migration."""
+    """Admit only the reviewed 65421e -> e147b2 sandbox image migration."""
     foundation_changed = AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS in changed
     image_changed = changed & set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
+    recovery_replaces = changed & set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
     if foundation_changed:
         _check_authority_image_foundation_update(by_address)
     else:
@@ -8292,6 +8273,49 @@ def _check_authority_image_update(
         by_address,
         set(AUTHORITY_IMAGE_UPDATE_RESOURCES) - image_changed,
     )
+    for address in recovery_replaces:
+        item = by_address[address]
+        change = item.get("change")
+        function_name = address.rsplit('["', 1)[1][:-2]
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if (
+            item.get("mode") != "managed"
+            or item.get("type")
+            != "aws_lambda_provisioned_concurrency_config"
+            or not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or change.get("actions") != ["delete", "create"]
+            or before.get("function_name") != function_name
+            or after.get("function_name") != function_name
+            or before.get("id") != f"{function_name},blue"
+            or "id" in after
+            or before.get("provisioned_concurrent_executions")
+            != (1 if refresh_disabled else 0)
+            or after.get("provisioned_concurrent_executions") != 1
+            or before.get("qualifier") != "blue"
+            or after.get("qualifier") != "blue"
+            or before.get("skip_destroy") is not False
+            or after.get("skip_destroy") is not False
+            or before.get("timeouts") is not None
+            or after.get("timeouts") is not None
+            or {
+                key: value
+                for key, value in before.items()
+                if key not in {"id", "provisioned_concurrent_executions"}
+            }
+            != {
+                key: value
+                for key, value in after.items()
+                if key != "provisioned_concurrent_executions"
+            }
+            or change.get("after_unknown") != {"id": True}
+            or change.get("before_sensitive") != change.get("after_sensitive")
+            or _has_unknown_value(change.get("before_sensitive"))
+        ):
+            raise ContractError(
+                f"{address} must be the exact failed proof concurrency replacement"
+            )
 
     for address in image_changed:
         item = by_address[address]
@@ -8360,7 +8384,7 @@ def _check_authority_image_update(
                 or not re.fullmatch(r"[1-9][0-9]*", str(before.get("version")))
             ):
                 raise ContractError(
-                    "Authority function update is not the exact d50-to-97d "
+                    "Authority function update is not the exact 65421e-to-e147b2 "
                     "immutable image/version migration"
                 )
             continue
@@ -10852,22 +10876,30 @@ def check_plan(
     )
 
     # Immutable Authority image refresh. Terraform publishes one new version of
-    # the foundation binding, publishes one new version of each of the three
-    # Hub-facing functions, and advances both closed aliases to that version.
-    # Admit only update-only work on those exact ten addresses; a nonempty
-    # subset is the bounded recovery shape after a partial apply.
+    # every function in the complete runtime plus proof graph and advances both
+    # closed aliases to that version. The failed stale-image first apply left
+    # the two proof provisioned-concurrency resources tainted; only their exact
+    # replacements may accompany the migration.
     # Existing runtime/config checks below still validate every function and
     # alias against the contract-pinned image and exact Terraform references.
     authority_image_update_addresses = set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
     authority_image_update_scope = {
         *authority_image_update_addresses,
         AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
+        *AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES,
     }
     authority_image_update_transition = (
         runtime_mode
         and bool(changed)
         and changed.issubset(authority_image_update_scope)
-        and all(actual_non_noop.get(address) == ["update"] for address in changed)
+        and all(
+            actual_non_noop.get(address) == ["delete", "create"]
+            for address in changed & set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+        )
+        and all(
+            actual_non_noop.get(address) == ["update"]
+            for address in changed - set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
+        )
     )
 
     # The Hub public edge slice (5a): every edge resource is a pending create (or
@@ -11207,7 +11239,12 @@ def check_plan(
         )
     elif authority_image_update_transition:
         plan_mode = "authority-image-update"
-        _check_authority_image_update(changed, by_address, plan)
+        _check_authority_image_update(
+            changed,
+            by_address,
+            plan,
+            refresh_disabled=refresh_disabled,
+        )
     elif authority_runtime_legacy_expansion:
         plan_mode_parts = ["authority-runtime-legacy-expansion"]
         if hub_identity_changed:

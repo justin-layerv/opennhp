@@ -113,10 +113,14 @@ if [[ -n "$plan_json" ]]; then
     exit 1
   fi
 
-  # Three exact replacements are intentional:
+  # Four exact replacement classes are intentional:
   #
   # * a tainted Connector Authority FUNCTION replan recreates a function left
   #   Failed by an earlier partial apply;
+  # * the two attended-proof provisioned-concurrency configs may be tainted by
+  #   a failed Lambda initialization. This shell fence admits only their exact
+  #   addresses/action class; the Python convergence checker immediately after
+  #   this gate proves the complete before/after envelope and image transition;
   # * the one-time Authority function-SG generation change removes the live
   #   predecessor's inline VPC-CIDR rule. Omitting that rule from configuration
   #   would leave it unmanaged, so the clean SG must replace it;
@@ -222,6 +226,17 @@ if [[ -n "$plan_json" ]]; then
             (.change.actions == ["delete", "create"])
             or (.change.actions == ["create", "delete"])
           )
+        ) or (
+          (
+            .address
+              == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pm\"]"
+            or .address
+              == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pcr\"]"
+          )
+          and .type == "aws_lambda_provisioned_concurrency_config"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete", "create"]
         ) or (
           .address == "module.control.aws_security_group.authority_lambda[0]"
           and .type == "aws_security_group"
