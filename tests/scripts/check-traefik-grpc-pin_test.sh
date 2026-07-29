@@ -38,15 +38,16 @@ expect_fail() {
 
 cat >"$ROOT/good" <<'EOF'
 FROM golang:1.26.5 AS traefik-builder
-RUN curl https://github.com/traefik/traefik/releases/download/v3.6.23/traefik-v3.6.23.src.tar.gz \
-    && echo "c8a0fcd1916ad69d8c38707975bc4ab0ed3ffc0abfbaee0a8fdb41cb6289bad2  /tmp/traefik-src.tar.gz" | sha256sum -c - \
-    && git fetch --depth=1 origin 84d4e8b139d1ac5e5b2d250fff95baed5ba0584f \
-    && test "$(git rev-parse HEAD)" = 84d4e8b139d1ac5e5b2d250fff95baed5ba0584f \
-    && go get google.golang.org/grpc@v1.82.1 \
+RUN curl https://github.com/traefik/traefik/releases/download/v3.6.24/traefik-v3.6.24.src.tar.gz \
+    && echo "bdd5ac1d6d8a046a518d7f4493f15d0b4a919fab51654852c9e75c54720edbcf  /tmp/traefik-src.tar.gz" | sha256sum -c - \
+    && git fetch --depth=1 origin cc336581846996ffbd01b1290fd5b44787bad324 \
+    && test "$(git rev-parse HEAD)" = cc336581846996ffbd01b1290fd5b44787bad324 \
+    && go get google.golang.org/grpc@v1.82.1 golang.org/x/text@v0.39.0 \
     && go build -buildvcs=true \
     && awk -v want=v1.82.1 '$1 == "dep" && $3 == want { grpc = 1 }' /tmp/build-info \
-    && awk '$3 == "v3.6.23+dirty" { module = 1 } \
-             $2 == "vcs.revision=84d4e8b139d1ac5e5b2d250fff95baed5ba0584f" { revision = 1 } \
+    && awk -v want=v0.39.0 '$1 == "dep" && $3 == want { text = 1 }' /tmp/build-info \
+    && awk '$3 == "v3.6.24+dirty" { module = 1 } \
+             $2 == "vcs.revision=cc336581846996ffbd01b1290fd5b44787bad324" { revision = 1 } \
              $2 == "vcs.modified=true" { modified = 1 }' /tmp/build-info
 EOF
 expect_pass "fixed literal and metadata assertion pass" "$ROOT/good"
@@ -55,23 +56,38 @@ cp "$ROOT/good" "$ROOT/overridable"
 printf '\nARG TRAEFIK_GRPC_VERSION=1.82.1\n' >>"$ROOT/overridable"
 expect_fail "caller-overridable floor fails" "$ROOT/overridable" "must not be caller-overridable"
 
+# The ARG ban is name-agnostic (see check-traefik-grpc-pin.sh): it rejects any
+# ARG regardless of name, so a per-floor named case adds no coverage over the
+# grpc-named case above plus the arbitrary-name case below, which together span
+# "security-named ARG rejected" and "any ARG rejected".
+cp "$ROOT/good" "$ROOT/unrelated-arg"
+printf '\nARG FOO=bar\n' >>"$ROOT/unrelated-arg"
+expect_fail "differently named ARG fails" "$ROOT/unrelated-arg" "must not be caller-overridable"
+
 sed 's/grpc@v1\.82\.1/grpc@v1.81.1/' "$ROOT/good" >"$ROOT/vulnerable"
 expect_fail "vulnerable literal fails" "$ROOT/vulnerable" "grpc-go v1.82.1 selection"
+
+sed 's|x/text@v0\.39\.0|x/text@v0.37.0|' "$ROOT/good" >"$ROOT/vulnerable-x-text"
+expect_fail "vulnerable x/text literal fails" "$ROOT/vulnerable-x-text" "x/text v0.39.0 selection"
 
 sed '/awk -v want=v1\.82\.1/d' "$ROOT/good" >"$ROOT/no-assertion"
 expect_fail "missing binary assertion fails" "$ROOT/no-assertion" "embedded grpc-go v1.82.1 assertion"
 
-cat >"$ROOT/comments-only" <<'EOF'
-# https://github.com/traefik/traefik/releases/download/v3.6.23/traefik-v3.6.23.src.tar.gz
-# c8a0fcd1916ad69d8c38707975bc4ab0ed3ffc0abfbaee0a8fdb41cb6289bad2  /tmp/traefik-src.tar.gz
-# go get google.golang.org/grpc@v1.82.1
-EOF
-expect_fail "comments cannot satisfy the pin" "$ROOT/comments-only" "pinned Traefik v3.6.23 source URL"
+sed '/awk -v want=v0\.39\.0/d' "$ROOT/good" >"$ROOT/no-x-text-assertion"
+expect_fail "missing x/text binary assertion fails" "$ROOT/no-x-text-assertion" "embedded x/text v0.39.0 assertion"
 
-sed '/v3\.6\.23+dirty/d' "$ROOT/good" >"$ROOT/devel-main"
+cat >"$ROOT/comments-only" <<'EOF'
+# https://github.com/traefik/traefik/releases/download/v3.6.24/traefik-v3.6.24.src.tar.gz
+# bdd5ac1d6d8a046a518d7f4493f15d0b4a919fab51654852c9e75c54720edbcf  /tmp/traefik-src.tar.gz
+# go get google.golang.org/grpc@v1.82.1
+# go get golang.org/x/text@v0.39.0
+EOF
+expect_fail "comments cannot satisfy the pin" "$ROOT/comments-only" "pinned Traefik v3.6.24 source URL"
+
+sed '/v3\.6\.24+dirty/d' "$ROOT/good" >"$ROOT/devel-main"
 expect_fail "devel main-module metadata fails" "$ROOT/devel-main" "versioned Traefik main-module assertion"
 
-sed '/c8a0fcd1916ad69d8c38707975bc4ab0ed3ffc0abfbaee0a8fdb41cb6289bad2/d' "$ROOT/good" >"$ROOT/no-source-sha"
+sed '/bdd5ac1d6d8a046a518d7f4493f15d0b4a919fab51654852c9e75c54720edbcf/d' "$ROOT/good" >"$ROOT/no-source-sha"
 expect_fail "missing source checksum fails" "$ROOT/no-source-sha" "pinned Traefik source SHA256 check"
 
 sed 's/ | sha256sum -c -//' "$ROOT/good" >"$ROOT/no-checksum-verifier"
