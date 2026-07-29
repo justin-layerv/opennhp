@@ -299,8 +299,10 @@ jobs:
       # Control state has BOTH the Connector Authority runtime contract bound
       # (Step 3) AND the runtime-slice functions enabled (Step 4). Regenerate the
       # same verified ephemeral tfvars that control-sandbox-update.yml plans with,
-      # including --runtime-functions-enabled, so this PR-time convergence plan
-      # reflects the live-enabled slice instead of planning to destroy it. (Prod
+      # including the runtime, Hub, and dark proof-mutation controls, so this
+      # PR-time convergence plan reflects the live-enabled slices instead of
+      # planning to destroy them. Proof-policy consumers and rollout colors remain
+      # deliberately disabled until their separate governed transitions. (Prod
       # stays dark: this workflow is sandbox-only, and the prod var validation
       # forbids the flag.) The generator is deterministic from the committed basis
       # and the full Git history (fetch-depth: 0 above) and needs no AWS access;
@@ -318,7 +320,8 @@ jobs:
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
             --runtime-functions-enabled \
             --hub-edge-enabled \
-            --hub-worker-enabled
+            --hub-worker-enabled \
+            --proof-mutation-controls-enabled
 
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'

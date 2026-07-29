@@ -2378,9 +2378,10 @@ def with_legacy_predecessor_at_image_update_basis(candidate: dict) -> dict:
     FROM basis.
     """
     result = copy.deepcopy(candidate)
+    historical_target = CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES[1]
     for evidence in legacy_expansion_evidence_slots(result):
-        evidence["sha256"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
-        evidence["source_commit"] = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+        evidence["sha256"] = historical_target["sha256"]
+        evidence["source_commit"] = historical_target["source_commit"]
     return result
 
 
@@ -2552,22 +2553,20 @@ def authority_image_update_fixture(
     pending_addresses: set[str] | None = None,
     *,
     foundation_pending: bool | None = None,
+    recovery_replaces: set[str] | None = None,
+    refresh_disabled: bool = False,
 ) -> dict:
-    """Exact foundation/runtime d50-to-97d migration with catalog held back.
+    """Exact full-graph 65421e-to-e147b2 image migration.
 
     ``pending_addresses`` models a partial-apply completion: already-applied
     function/alias addresses are exact no-ops at the new version, while the
     supplied subset remains update-only. By default the full migration includes
     the foundation update; an explicit subset defaults to foundation-applied.
+    ``recovery_replaces`` models the proof pools tainted by the stale-image
+    failed apply.
     """
-    result = authority_runtime_steady_fixture()
+    result = authority_proof_steady_fixture()
     result["applyable"] = True
-    result["resource_changes"] = [
-        item
-        for item in result["resource_changes"]
-        if item["address"] not in CHECKER.PROVISIONED_CELL_RESOURCES
-    ]
-    result["planned_values"]["outputs"]["provisioned_cells"]["value"] = {}
     changes = {item["address"]: item["change"] for item in result["resource_changes"]}
 
     image_addresses = set(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES)
@@ -2578,7 +2577,11 @@ def authority_image_update_fixture(
     elif foundation_pending is None:
         foundation_pending = False
     assert pending_addresses <= image_addresses
-    assert pending_addresses or foundation_pending
+    recovery_replaces = recovery_replaces or set()
+    assert recovery_replaces <= set(
+        CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+    )
+    assert pending_addresses or foundation_pending or recovery_replaces
 
     foundation = changes["module.control.terraform_data.foundation_contract"]
     new_input = copy.deepcopy(foundation["after"]["input"])
@@ -2657,15 +2660,8 @@ def authority_image_update_fixture(
             }
         )
 
-    # Every function the contract carries must sit at the contract-pinned image
-    # (_check_authority_runtime_resources enforces that across all of
-    # AUTHORITY_RUNTIME_FUNCTIONS), so normalize the whole graph to the target
-    # here. Only the Hub addresses can appear in ``pending_addresses`` -- they
-    # are the sole members of AUTHORITY_IMAGE_UPDATE_RESOURCES -- so the per-cell
-    # functions always land as exact no-ops already at the new image. That models
-    # the reachable recovery state where an expansion apply created the per-cell
-    # functions at the new digest but the Hub retag had not yet landed.
-    for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+    # Every function the contract carries must sit at the contract-pinned image.
+    for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF:
         function_address = (
             f'module.control.aws_lambda_function.authority["{fn}"]'
         )
@@ -2743,7 +2739,30 @@ def authority_image_update_fixture(
                 alias["after"].pop("function_version")
                 alias["after_unknown"] = {"function_version": True}
 
-    outputs = control_outputs_fixture()
+    for address in recovery_replaces:
+        change = changes[address]
+        function_name = address.rsplit('["', 1)[1][:-2]
+        change["actions"] = ["delete", "create"]
+        change["before"] = {
+            "function_name": function_name,
+            "id": f"{function_name},blue",
+            "provisioned_concurrent_executions": 1 if refresh_disabled else 0,
+            "qualifier": "blue",
+            "skip_destroy": False,
+            "timeouts": None,
+        }
+        change["after"] = {
+            "function_name": function_name,
+            "provisioned_concurrent_executions": 1,
+            "qualifier": "blue",
+            "skip_destroy": False,
+            "timeouts": None,
+        }
+        change["after_unknown"] = {"id": True}
+        change["before_sensitive"] = {}
+        change["after_sensitive"] = {}
+
+    outputs = copy.deepcopy(result["planned_values"]["outputs"])
     result["output_changes"] = {
         name: {
             "actions": ["no-op"],
@@ -2763,18 +2782,12 @@ def authority_image_update_fixture(
                 "after": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
             }
         )
-        result["output_changes"]["provisioned_cells"].update(
-            {"actions": ["create"], "before": None, "after": {}}
-        )
     else:
         result["output_changes"]["authority_image_uri"].update(
             {
                 "before": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
                 "after": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
             }
-        )
-        result["output_changes"]["provisioned_cells"].update(
-            {"before": {}, "after": {}}
         )
 
     return result
@@ -6669,17 +6682,13 @@ class PlanContractTests(unittest.TestCase):
             [
                 {
                     **shared,
-                    "sha256": CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256,
-                    "source_commit": (
-                        CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
-                    ),
+                    "sha256": "d535970977ba3b31da2b224c01897c535786ff802a91edbe8319884c23924eff",
+                    "source_commit": "388a22f7a5333a246e623a19dd5ca3793bd89f60",
                 },
                 {
                     **shared,
-                    "sha256": CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256,
-                    "source_commit": (
-                        CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
-                    ),
+                    "sha256": "b44ee0ca10d555db931713f2809b1e45c149c0382d5aaee2a5bf1cf252b55056",
+                    "source_commit": "38c11ec130f7443339581eb42692f3577812f904",
                 },
             ],
         )
@@ -6704,10 +6713,13 @@ class PlanContractTests(unittest.TestCase):
         self,
     ) -> None:
         """Neither endpoint may be forged, blended, or partially applied."""
-        from_sha = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SHA256
-        from_source = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_EVIDENCE_SOURCE
-        to_sha = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SHA256
-        to_source = CHECKER.AUTHORITY_IMAGE_UPDATE_TO_EVIDENCE_SOURCE
+        from_basis, to_basis = (
+            CHECKER.AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES
+        )
+        from_sha = from_basis["sha256"]
+        from_source = from_basis["source_commit"]
+        to_sha = to_basis["sha256"]
+        to_source = to_basis["source_commit"]
 
         def unreviewed_third_basis(candidate: dict) -> None:
             for evidence in legacy_expansion_evidence_slots(candidate):
@@ -6814,68 +6826,39 @@ class PlanContractTests(unittest.TestCase):
         )
         self.change(candidate, address)["actions"] = ["update"]
         self.assert_rejected(candidate)
-    def test_authority_image_update_admits_exactly_the_live_hub_lambdas(
+    def test_authority_image_update_admits_exactly_the_full_function_graph(
         self,
     ) -> None:
-        """Pin the admitted image-update action set to the reviewed nine.
-
-        The migration retags resources that already exist live, and both pinned
-        endpoints of the transition publish the Hub-only graph. Deriving the set
-        from the full runtime inventory instead silently grows it with every
-        added cell/operation, so assert the exact membership rather than a count
-        so a re-widening cannot pass as a refactor.
-        """
-        hub_functions = set(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+        """Pin the migration to every function and its two closed aliases."""
+        functions = set(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF)
         expected = {
             f'module.control.aws_lambda_function.authority["{fn}"]':
                 "aws_lambda_function"
-            for fn in hub_functions
+            for fn in functions
         }
         expected.update({
             f'module.control.aws_lambda_alias.authority["{fn}:{color}"]':
                 "aws_lambda_alias"
-            for fn in hub_functions
+            for fn in functions
             for color in ("blue", "green")
         })
         self.assertEqual(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES, expected)
-        self.assertEqual(len(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES), 9)
-        # No per-cell function may appear in the admitted set: those are pending
-        # creates in the expansion, and a resource that does not exist cannot be
-        # retagged from FROM_URI to TO_URI.
-        self.assertTrue(CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS)
-        for fn in CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS:
-            for address in (
-                f'module.control.aws_lambda_function.authority["{fn}"]',
-                f'module.control.aws_lambda_alias.authority["{fn}:blue"]',
-                f'module.control.aws_lambda_alias.authority["{fn}:green"]',
-            ):
-                self.assertIn(address, CHECKER.AUTHORITY_RUNTIME_RESOURCES)
-                self.assertNotIn(
-                    address, CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES
-                )
+        self.assertEqual(len(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES), 39)
 
-    def test_authority_image_update_rejects_per_cell_lambda_movement(
+    def test_authority_image_update_rejects_non_image_runtime_movement(
         self,
     ) -> None:
-        """A per-cell lambda may not ride the Hub image-update envelope."""
-        cell_function = next(iter(CHECKER.AUTHORITY_RUNTIME_CELL_FUNCTIONS))
-        for address in (
-            f'module.control.aws_lambda_function.authority["{cell_function}"]',
-            f'module.control.aws_lambda_alias.authority["{cell_function}:blue"]',
-        ):
-            with self.subTest(address=address):
-                candidate = authority_image_update_fixture()
-                self.change(candidate, address)["actions"] = ["update"]
-                self.assert_rejected(candidate)
-
-        # The per-cell complements stay bound to the contract-pinned image even
-        # though they are outside the admitted action set.
-        drifted = authority_image_update_fixture()
-        self.change(
-            drifted,
-            f'module.control.aws_lambda_function.authority["{cell_function}"]',
-        )["after"]["image_uri"] = CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI
-        self.assert_rejected(drifted)
+        role_address = next(
+            address
+            for address, resource_type in {
+                **CHECKER.AUTHORITY_RUNTIME_RESOURCES,
+                **CHECKER.AUTHORITY_PROOF_RESOURCES,
+            }.items()
+            if resource_type == "aws_iam_role"
+        )
+        candidate = authority_image_update_fixture()
+        self.change(candidate, role_address)["actions"] = ["update"]
+        self.assert_rejected(candidate)
 
     def test_exact_authority_image_update_and_partial_completion_pass(self) -> None:
         exact = authority_image_update_fixture()
@@ -6883,7 +6866,7 @@ class PlanContractTests(unittest.TestCase):
         self.assertEqual(summary["plan_mode"], "authority-image-update")
         self.assertEqual(
             summary["resource_count"],
-            49 + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+            len(exact["resource_changes"]),
         )
 
         alias_only = {
@@ -6907,6 +6890,89 @@ class PlanContractTests(unittest.TestCase):
             "authority-image-update",
         )
 
+        recovery = authority_image_update_fixture(
+            recovery_replaces=set(CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES),
+        )
+        self.assertEqual(
+            CHECKER.check_plan(recovery)["plan_mode"],
+            "authority-image-update",
+        )
+        pr_recovery = authority_image_update_fixture(
+            recovery_replaces=set(CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES),
+            refresh_disabled=True,
+        )
+        self.assertEqual(
+            CHECKER.check_plan(
+                pr_recovery,
+                refresh_disabled=True,
+            )["plan_mode"],
+            "authority-image-update",
+        )
+
+    def test_authority_image_update_rejects_unobserved_concurrency_recovery(
+        self,
+    ) -> None:
+        recovery_addresses = set(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+        )
+        for actions in (["create"], ["update"]):
+            with self.subTest(actions=actions):
+                candidate = authority_image_update_fixture(
+                    recovery_replaces=recovery_addresses,
+                )
+                address = next(iter(recovery_addresses))
+                change = self.change(candidate, address)
+                change["actions"] = actions
+                self.assert_rejected(candidate)
+
+        singleton = authority_image_update_fixture(
+            recovery_replaces=recovery_addresses,
+        )
+        settled_address = next(iter(recovery_addresses))
+        settled = self.change(singleton, settled_address)
+        settled["actions"] = ["no-op"]
+        settled["before"] = copy.deepcopy(settled["after"])
+        settled["after_unknown"] = {}
+        settled["before_sensitive"] = {}
+        settled["after_sensitive"] = {}
+        self.assertEqual(
+            CHECKER.check_plan(singleton)["plan_mode"],
+            "authority-image-update",
+        )
+
+        foreign = authority_image_update_fixture()
+        foreign_address = next(
+            address
+            for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items()
+            if resource_type == "aws_lambda_provisioned_concurrency_config"
+        )
+        function_name = foreign_address.rsplit('["', 1)[1][:-2]
+        change = self.change(foreign, foreign_address)
+        change.update(
+            {
+                "actions": ["delete", "create"],
+                "before": {
+                    "function_name": function_name,
+                    "id": f"{function_name},blue",
+                    "provisioned_concurrent_executions": 0,
+                    "qualifier": "blue",
+                    "skip_destroy": False,
+                    "timeouts": None,
+                },
+                "after": {
+                    "function_name": function_name,
+                    "provisioned_concurrent_executions": 1,
+                    "qualifier": "blue",
+                    "skip_destroy": False,
+                    "timeouts": None,
+                },
+                "after_unknown": {"id": True},
+                "before_sensitive": {},
+                "after_sensitive": {},
+            }
+        )
+        self.assert_rejected(foreign)
+
     def test_authority_image_update_rejects_unpinned_source_and_alias_drift(
         self,
     ) -> None:
@@ -6924,7 +6990,7 @@ class PlanContractTests(unittest.TestCase):
                 "layerv/qurl-connector-authority:latest"
             ),
             CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI.replace(
-                "d50ec8ee0153b4ac62491209a03442e12ca484b9ca88a72daf70a3880d77c070",
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI.rsplit("@sha256:", 1)[1],
                 "0" * 64,
             ),
         ):

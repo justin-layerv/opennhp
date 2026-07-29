@@ -247,6 +247,41 @@ expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_r
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["delete","create"],"after":{"function_name":"layerv-nhp-sandbox-ca-ia"}}}]}' >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 
+# The two exact attended-proof provisioned-concurrency replacements recover
+# configs tainted when the old image failed Lambda initialization. The shell
+# fence owns only address/type/action admission; the workflow's Python checker
+# proves their complete before/after state and the accompanying image update.
+proof_pc_plan='{"resource_changes":[{"address":"module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pm\"]","type":"aws_lambda_provisioned_concurrency_config","mode":"managed","change":{"actions":["delete","create"],"before":{"function_name":"layerv-nhp-sandbox-ca-pm","id":"layerv-nhp-sandbox-ca-pm,blue","provisioned_concurrent_executions":1,"qualifier":"blue","skip_destroy":false,"timeouts":null},"after":{"function_name":"layerv-nhp-sandbox-ca-pm","provisioned_concurrent_executions":1,"qualifier":"blue","skip_destroy":false,"timeouts":null},"after_unknown":{"id":true}}}]}'
+printf '%s\n' "$proof_pc_plan" >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' "$proof_pc_plan" \
+  | jq '.resource_changes[0].address = "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pcr\"]"' \
+  >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# No other provisioned-concurrency config, action order, deposed object, or
+# resource type can borrow the recovery exception.
+printf '%s\n' "$proof_pc_plan" \
+  | jq '.resource_changes[0].address = "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-lrt\"]"' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_pc_plan" \
+  | jq '.resource_changes[0].change.actions = ["create", "delete"]' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_pc_plan" \
+  | jq '.resource_changes[0].deposed = "4a2844f4"' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_pc_plan" \
+  | jq '.resource_changes[0].type = "aws_lambda_function"' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 # A PURE delete of an authority function (not a replace) is still destructive.
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["delete"],"after":null}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
