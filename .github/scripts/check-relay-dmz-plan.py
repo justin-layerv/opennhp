@@ -38,6 +38,7 @@ import argparse
 import base64
 import copy
 import hashlib
+import ipaddress
 import json
 import re
 import sys
@@ -81,6 +82,21 @@ EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
 # migration gate must move in lockstep with #3453's
 # public_nhp_udp_ingress_cidrs input if the proof-runner EIP is replaced.
 EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# Pin the reviewed sandbox AC pool: blue/green max_capacity=3 needs 2x plus
+# one refresh-slack EIP. Move this with modules/ac/eip.tf's eip_count contract.
+EXPECTED_SANDBOX_AC_EIP_COUNT = 7
+# Managed AC EIP pool identity, pinned in lockstep with modules/ac/eip.tf.
+EXPECTED_SANDBOX_AC_EIP_POOL = "layerv-nhp-sandbox-ac"
+EXPECTED_SANDBOX_AC_EIP_NAME_PREFIX = "layerv-nhp-sandbox-ac-eip-"
+# Alternate source selectors that must never appear on the managed AC
+# registration rule; the CIDR /32 is the only admitted source. Checked against
+# both the authored HCL expressions and the planned rule values.
+AC_REGISTRATION_FORBIDDEN_SOURCE_FIELDS = (
+    "cidr_ipv6",
+    "prefix_list_id",
+    "referenced_security_group_id",
+    "source_security_group_id",
+)
 EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
 EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
 # One captured envelope per managed active color. cell0's listener default
@@ -403,6 +419,11 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
         r"(?:\[|$)"
     ),
     re.compile(
+        r"(?:^|\.)module\.ac(?:\[[^]]+\])?\."
+        r"aws_vpc_security_group_ingress_rule\.server_nlb_registration"
+        r"(?:\[|$)"
+    ),
+    re.compile(
         r"(?:^|\.)module\.ecr(?:\[[^]]+\])?\."
         r"(?:aws_iam_role_policy\.context_lookups|"
         r"aws_iam_role_policy\.context_lookups_relay_ssm|"
@@ -432,6 +453,10 @@ def is_dmz_boundary_address(address: str) -> bool:
 
 
 EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX = "module.nhp.module.compute"
+# Sandbox's assigned cell has exactly one reviewed AC instance; its migration
+# actions pin this fully-qualified prefix the way the compute actions above pin
+# EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX.
+EXPECTED_UDP_SOURCE_FENCE_AC_PREFIX = "module.nhp.module.ac[0]"
 
 UDP_SOURCE_FENCE_NLB_REPLACEMENT = "public NLB replacement"
 UDP_SOURCE_FENCE_LISTENER_REPLACEMENT = "public UDP listener replacement"
@@ -445,6 +470,13 @@ UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE = "proof-runner UDP ingress creation"
 UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE = "NLB target UDP egress creation"
 UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE = (
     "NLB target health egress creation"
+)
+# Boundary discovery above is deliberately broad enough to notice any module.ac
+# instance. This one-time migration allowlist is narrower: sandbox's assigned
+# cell has exactly the reviewed module.nhp.module.ac[0] instance.
+UDP_SOURCE_FENCE_AC_REGISTRATION_CREATES = tuple(
+    f"AC registration ingress creation {index}"
+    for index in range(EXPECTED_SANDBOX_AC_EIP_COUNT)
 )
 
 
@@ -530,6 +562,17 @@ UDP_SOURCE_FENCE_MIGRATION_ACTIONS = (
         ),
         ("create",),
     ),
+) + tuple(
+    (
+        key,
+        re.compile(
+            rf"^{re.escape(EXPECTED_UDP_SOURCE_FENCE_AC_PREFIX)}\."
+            r"aws_vpc_security_group_ingress_rule\.server_nlb_registration"
+            rf'\["{index}"\]$'
+        ),
+        ("create",),
+    )
+    for index, key in enumerate(UDP_SOURCE_FENCE_AC_REGISTRATION_CREATES)
 )
 UDP_SOURCE_FENCE_MIGRATION_KEYS = tuple(
     key for key, _, _ in UDP_SOURCE_FENCE_MIGRATION_ACTIONS
@@ -917,6 +960,7 @@ def validate_udp_source_fence_transition(
         UDP_SOURCE_FENCE_PROOF_INGRESS_CREATE,
         UDP_SOURCE_FENCE_NLB_UDP_EGRESS_CREATE,
         UDP_SOURCE_FENCE_NLB_HEALTH_EGRESS_CREATE,
+        *UDP_SOURCE_FENCE_AC_REGISTRATION_CREATES,
     ):
         if key not in steps_by_key:
             continue
@@ -4318,6 +4362,25 @@ def validate_plan(
         "legacy aws_security_group_rule resources are forbidden in the assigned-cell compute module",
     )
     if source_fenced_topology:
+        # Scoped to the fenced branch: these are the only consumers, so the
+        # full-resources scan and config-tree walk stay off the ordinary path.
+        ac_parent = child_module_prefix(parent_prefix, "module.ac[0]")
+        ac = [
+            resource
+            for resource in resources
+            if address_is_scoped_resource(
+                resource.address,
+                ac_parent,
+                resource.resource_type,
+                resource.name,
+            )
+        ]
+        ac_config_suffix = (
+            f"{parent_config_suffix}.module.ac"
+            if parent_config_suffix
+            else "module.ac"
+        )
+        ac_config = config_module(v, plan, ac_config_suffix)
         nlb_security_group = resources_named(compute, "aws_security_group", "server_nlb")
         v.require(
             len(nlb_security_group) == 1,
@@ -4419,17 +4482,200 @@ def validate_plan(
             actual_nlb_rule_config == expected_nlb_rule_config,
             "assigned cell public NLB SG standalone ingress/egress inventory must be exactly proof UDP plus target UDP and health egress",
         )
+
+        ac_registration_config = config_resource(
+            v,
+            ac_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nlb_registration",
+        )
+        ac_registration_expressions = (
+            (ac_registration_config or {}).get("expressions") or {}
+        )
+        ac_sg_rule_config = [
+            configured
+            for configured in (ac_config or {}).get("resources", [])
+            if str(configured.get("type", "")) in SG_RULE_RESOURCE_TYPES
+        ]
+        v.require(
+            ac_config is not None
+            and ac_registration_config is not None
+            and all(
+                (
+                    str(configured.get("type", "")),
+                    str(configured.get("name", "")),
+                )
+                == (
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_nlb_registration",
+                )
+                or references_exact_resources(
+                    expression_refs(configured, "security_group_id"),
+                    {"aws_security_group.ac"},
+                )
+                for configured in ac_sg_rule_config
+            )
+            and references(
+                ac_registration_config.get("for_each_expression")
+            )
+            == {"var.server_nlb_source_fenced", "aws_eip.ac"}
+            and expression_refs(ac_registration_config, "security_group_id")
+            == {"var.server_nlb_security_group_id"}
+            and expression_refs(ac_registration_config, "cidr_ipv4")
+            == {"each.value"}
+            and not any(
+                field in ac_registration_expressions
+                for field in AC_REGISTRATION_FORBIDDEN_SOURCE_FIELDS
+            )
+            and (ac_registration_expressions.get("ip_protocol") or {}).get(
+                "constant_value"
+            )
+            == "udp"
+            and (ac_registration_expressions.get("from_port") or {}).get(
+                "constant_value"
+            )
+            == EXPECTED_NHP_SERVER_PORT
+            and (ac_registration_expressions.get("to_port") or {}).get(
+                "constant_value"
+            )
+            == EXPECTED_NHP_SERVER_PORT,
+            "assigned cell AC authored NLB SG rule inventory must be exactly the complete managed EIP registration pool on UDP 62206",
+        )
+
+        def resources_by_index(
+            index_resources: list[PlannedResource],
+            index_re: re.Pattern[str],
+        ) -> dict[int, PlannedResource]:
+            """Bucket resources by their numeric address index; rogue
+            non-numeric keys are dropped so cardinality checks catch them."""
+            by_index: dict[int, PlannedResource] = {}
+            for index_resource in index_resources:
+                match = index_re.fullmatch(index_resource.address)
+                if match:
+                    by_index[int(match.group(1))] = index_resource
+            return by_index
+
+        expected_ac_indexes = set(range(EXPECTED_SANDBOX_AC_EIP_COUNT))
+        ac_eip_resources = resources_named(ac, "aws_eip", "ac")
+        ac_eips_by_index = resources_by_index(
+            ac_eip_resources,
+            re.compile(rf"{re.escape(ac_parent)}\.aws_eip\.ac\[(\d+)\]"),
+        )
+        v.require(
+            len(ac_eip_resources) == EXPECTED_SANDBOX_AC_EIP_COUNT
+            and set(ac_eips_by_index) == expected_ac_indexes,
+            "assigned cell AC managed EIP pool must contain exactly indexes "
+            f"0 through {EXPECTED_SANDBOX_AC_EIP_COUNT - 1}",
+        )
+
+        ac_registration_resources = resources_named(
+            ac,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nlb_registration",
+        )
+        ac_registration_by_index = resources_by_index(
+            ac_registration_resources,
+            re.compile(
+                rf'{re.escape(ac_parent)}\.aws_vpc_security_group_ingress_rule'
+                rf'\.server_nlb_registration\["(\d+)"\]'
+            ),
+        )
+        v.require(
+            len(ac_registration_resources) == EXPECTED_SANDBOX_AC_EIP_COUNT
+            and set(ac_registration_by_index) == expected_ac_indexes,
+            "assigned cell NLB must admit exactly one registration rule for "
+            f"each of the {EXPECTED_SANDBOX_AC_EIP_COUNT} managed AC EIPs",
+        )
+
+        # Identity that every pool member shares; only Name varies by index.
+        expected_ac_eip_base_tags = {
+            "Environment": "sandbox",
+            "Component": "ac",
+            "Service": "nhp-ac",
+            "EIPPool": EXPECTED_SANDBOX_AC_EIP_POOL,
+            "ManagedBy": "terraform",
+        }
+        resolved_ac_ips: set[str] = set()
+        for index in range(EXPECTED_SANDBOX_AC_EIP_COUNT):
+            eip = ac_eips_by_index.get(index)
+            rule = ac_registration_by_index.get(index)
+            if eip is None or rule is None:
+                continue
+            public_ip = eip.values.get("public_ip")
+            eip_unknown = (eip.after_unknown or {}).get("public_ip") is True
+            try:
+                public_address = ipaddress.ip_address(public_ip)
+            except (TypeError, ValueError):
+                public_address = None
+            resolved = isinstance(public_address, ipaddress.IPv4Address)
+            raw_eip_tags = eip.values.get("tags")
+            eip_tags = raw_eip_tags if isinstance(raw_eip_tags, dict) else {}
+            v.require(
+                not ({"delete", "forget"} & set(eip.actions))
+                and (eip.actions != ("create",) or eip.before is None),
+                f"assigned cell AC EIP {index} must not be destroyed, replaced, or forgotten",
+            )
+            v.require(
+                (resolved and public_address.is_global)
+                or (public_ip in (None, "") and eip_unknown),
+                f"assigned cell AC EIP {index} must be a resolved public IPv4 address or an explicitly unknown first-apply value",
+            )
+            if resolved:
+                resolved_ac_ips.add(str(public_address))
+            v.require(
+                eip_tags.get("Name")
+                == f"{EXPECTED_SANDBOX_AC_EIP_NAME_PREFIX}{index}"
+                and all(
+                    eip_tags.get(key) == value
+                    for key, value in expected_ac_eip_base_tags.items()
+                ),
+                f"assigned cell AC EIP {index} must retain the exact managed sandbox pool identity",
+            )
+            cidr_ok = exact_sg_reference(
+                rule, "cidr_ipv4", f"{public_address}/32" if resolved else None
+            )
+            v.require(
+                exact_sg_reference(
+                    rule, "security_group_id", nlb_security_group_id
+                )
+                and rule.values.get("ip_protocol") == "udp"
+                and rule.values.get("from_port") == EXPECTED_NHP_SERVER_PORT
+                and rule.values.get("to_port") == EXPECTED_NHP_SERVER_PORT
+                and cidr_ok
+                and all(
+                    rule.values.get(field) in (None, "")
+                    and (rule.after_unknown or {}).get(field) in (None, False)
+                    for field in AC_REGISTRATION_FORBIDDEN_SOURCE_FIELDS
+                ),
+                f"assigned cell AC registration rule {index} must admit only its matching managed EIP /32 on UDP 62206",
+            )
+        v.require(
+            len(resolved_ac_ips) in (0, EXPECTED_SANDBOX_AC_EIP_COUNT),
+            "assigned cell AC managed EIP pool must resolve atomically with no duplicate or partially-known public addresses",
+        )
+
         if isinstance(nlb_security_group_id, str) and nlb_security_group_id:
-            actual_nlb_planned_rule_list = [
+            actual_nlb_planned_rule_counts = Counter(
                 (resource.resource_type, resource.name)
                 for resource in resources
                 if resource.resource_type in SG_RULE_RESOURCE_TYPES
                 and resource.values.get("security_group_id") == nlb_security_group_id
-            ]
+            )
+            # The three proof/target/health rules are the same identities pinned
+            # by expected_nlb_rule_config above (each exactly once); derive from
+            # it so a rename can't let the two inventories drift apart.
             v.require(
-                len(actual_nlb_planned_rule_list) == 3
-                and set(actual_nlb_planned_rule_list) == expected_nlb_rule_config,
-                "global planned rule inventory targeting the assigned cell public NLB SG must be exactly proof UDP plus target UDP and health egress",
+                actual_nlb_planned_rule_counts
+                == Counter({rule: 1 for rule in expected_nlb_rule_config})
+                + Counter(
+                    {
+                        (
+                            "aws_vpc_security_group_ingress_rule",
+                            "server_nlb_registration",
+                        ): EXPECTED_SANDBOX_AC_EIP_COUNT,
+                    }
+                ),
+                "global planned rule inventory targeting the assigned cell public NLB SG must be exactly proof and managed-AC registration UDP ingress plus target UDP and health egress",
             )
         nlb_public_ingress = resources_named(
             compute, "aws_vpc_security_group_ingress_rule", "server_nlb_udp"
@@ -4639,6 +4885,12 @@ def validate_plan(
             resource.address
             for resource in resources
             if resource.address not in compute_addresses
+            and not address_is_scoped_resource(
+                resource.address,
+                ac_parent,
+                "aws_vpc_security_group_ingress_rule",
+                "server_nlb_registration",
+            )
             and resource.resource_type in SG_RULE_RESOURCE_TYPES
             and any(
                 (resource.after_unknown or {}).get(field) is True

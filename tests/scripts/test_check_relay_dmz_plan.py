@@ -2184,9 +2184,40 @@ def source_fenced_plan() -> dict[str, Any]:
     public_listener_config["expressions"]["default_action"]["references"] = list(
         MANAGED_ACTIVE_COLOR_LISTENER_REFS
     )
-    compute_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+    nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
         "module"
-    ]["module_calls"]["compute"]["module"]["resources"]
+    ]
+    compute_resources = nhp_module["module_calls"]["compute"]["module"]["resources"]
+    nhp_module["module_calls"]["ac"] = {
+        "module": {
+            "resources": [
+                config_resource(
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_nlb_registration",
+                    {
+                        "for_each": {
+                            "references": [
+                                "var.server_nlb_source_fenced",
+                                "aws_eip.ac",
+                            ]
+                        },
+                        "cidr_ipv4": {"references": ["each.value"]},
+                        "description": {"references": ["each.value"]},
+                        "from_port": {
+                            "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                        },
+                        "ip_protocol": {"constant_value": "udp"},
+                        "security_group_id": {
+                            "references": ["var.server_nlb_security_group_id"]
+                        },
+                        "to_port": {
+                            "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                        },
+                    },
+                )
+            ]
+        }
+    }
 
     public_nlb_config = next(
         item
@@ -2400,6 +2431,49 @@ def source_fenced_plan() -> dict[str, Any]:
         "server_nlb",
         {"id": "sg-server-nlb"},
     )
+    ac_public_ips = (
+        "3.151.137.194",
+        "3.151.252.67",
+        "3.136.14.164",
+        "52.14.228.233",
+        "18.225.44.103",
+        "52.14.199.249",
+        "16.58.119.85",
+    )
+    for index, public_ip in enumerate(ac_public_ips):
+        add(
+            f"module.nhp.module.ac[0].aws_eip.ac[{index}]",
+            "aws_eip",
+            "ac",
+            {
+                "public_ip": public_ip,
+                "tags": {
+                    "Environment": "sandbox",
+                    "Component": "ac",
+                    "Service": "nhp-ac",
+                    "EIPPool": "layerv-nhp-sandbox-ac",
+                    "ManagedBy": "terraform",
+                    "Name": f"layerv-nhp-sandbox-ac-eip-{index}",
+                },
+            },
+        )
+        ac_eip = plan["resource_changes"][-1]
+        ac_eip["change"]["actions"] = ["no-op"]
+        ac_eip["change"]["before"] = copy.deepcopy(ac_eip["change"]["after"])
+        add(
+            "module.nhp.module.ac[0]."
+            "aws_vpc_security_group_ingress_rule."
+            f'server_nlb_registration["{index}"]',
+            "aws_vpc_security_group_ingress_rule",
+            "server_nlb_registration",
+            {
+                "security_group_id": "sg-server-nlb",
+                "ip_protocol": "udp",
+                "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+                "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+                "cidr_ipv4": f"{public_ip}/32",
+            },
+        )
     for change in plan["resource_changes"]:
         if (
             change.get("name") == "server_nhp_udp_additional"
@@ -2501,6 +2575,10 @@ def source_fence_migration_plan() -> dict[str, Any]:
         "aws_vpc_security_group_ingress_rule.server_nlb_health[0]",
         "aws_vpc_security_group_egress_rule.server_nlb_udp[0]",
         "aws_vpc_security_group_egress_rule.server_nlb_health[0]",
+    ) + tuple(
+        "aws_vpc_security_group_ingress_rule."
+        f'server_nlb_registration["{index}"]'
+        for index in range(checker.EXPECTED_SANDBOX_AC_EIP_COUNT)
     )
     for suffix in exact_create_suffixes:
         change = next(
@@ -2530,6 +2608,14 @@ def source_fence_migration_plan() -> dict[str, Any]:
         (
             ".aws_vpc_security_group_egress_rule.server_nlb_health[0]",
             "security_group_id",
+        ),
+        *(
+            (
+                ".aws_vpc_security_group_ingress_rule."
+                f'server_nlb_registration["{index}"]',
+                "security_group_id",
+            )
+            for index in range(checker.EXPECTED_SANDBOX_AC_EIP_COUNT)
         ),
     ):
         dependent = resource(plan, suffix)
@@ -2880,6 +2966,14 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 ".aws_vpc_security_group_egress_rule.server_nlb_health[0]",
                 "security_group_id",
             ),
+            *(
+                (
+                    ".aws_vpc_security_group_ingress_rule."
+                    f'server_nlb_registration["{index}"]',
+                    "security_group_id",
+                )
+                for index in range(checker.EXPECTED_SANDBOX_AC_EIP_COUNT)
+            ),
         )
         for suffix, field in unknown_fields:
             change = resource(plan, suffix)["change"]
@@ -2929,6 +3023,287 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
         self.assertTrue(
             any("existing canonical server SG" in error for error in errors), errors
+        )
+
+    def test_source_fenced_topology_requires_complete_exact_ac_registration_pool(
+        self,
+    ) -> None:
+        missing = source_fenced_plan()
+        missing["resource_changes"] = [
+            change
+            for change in missing["resource_changes"]
+            if not change["address"].endswith('server_nlb_registration["6"]')
+        ]
+        errors = checker.validate_plan(
+            missing, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("exactly one registration rule" in error for error in errors),
+            errors,
+        )
+
+        mismatched = source_fenced_plan()
+        registration = resource(
+            mismatched,
+            '.server_nlb_registration["4"]',
+        )
+        registration["change"]["after"]["cidr_ipv4"] = "198.51.100.4/32"
+        errors = checker.validate_plan(
+            mismatched, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("matching managed EIP /32" in error for error in errors),
+            errors,
+        )
+
+        duplicate_ip = source_fenced_plan()
+        duplicate_eip = resource(duplicate_ip, ".aws_eip.ac[6]")["change"]
+        duplicate_eip["after"]["public_ip"] = "52.14.199.249"
+        duplicate_eip["before"]["public_ip"] = "52.14.199.249"
+        duplicate_rule = resource(
+            duplicate_ip, '.server_nlb_registration["6"]'
+        )["change"]
+        duplicate_rule["after"]["cidr_ipv4"] = "52.14.199.249/32"
+        errors = checker.validate_plan(
+            duplicate_ip, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("resolve atomically" in error for error in errors),
+            errors,
+        )
+
+        partially_known = source_fenced_plan()
+        unknown_eip = resource(partially_known, ".aws_eip.ac[6]")["change"]
+        unknown_eip["actions"] = ["create"]
+        unknown_eip["before"] = None
+        unknown_eip["after"]["public_ip"] = None
+        unknown_eip["after_unknown"]["public_ip"] = True
+        unknown_rule = resource(
+            partially_known, '.server_nlb_registration["6"]'
+        )["change"]
+        unknown_rule["after"]["cidr_ipv4"] = None
+        unknown_rule["after_unknown"]["cidr_ipv4"] = True
+        errors = checker.validate_plan(
+            partially_known, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("resolve atomically" in error for error in errors),
+            errors,
+        )
+
+        foreign = source_fenced_plan()
+        rogue = copy.deepcopy(
+            resource(foreign, '.server_nlb_registration["4"]')
+        )
+        rogue["address"] = rogue["address"].replace(
+            'server_nlb_registration["4"]',
+            'server_nlb_registration["7"]',
+        )
+        foreign["resource_changes"].append(rogue)
+        errors = checker.validate_plan(
+            foreign, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("exactly one registration rule" in error for error in errors),
+            errors,
+        )
+
+        extra_eip = source_fenced_plan()
+        rogue_eip = copy.deepcopy(resource(extra_eip, ".aws_eip.ac[4]"))
+        rogue_eip["address"] = rogue_eip["address"].replace(
+            "aws_eip.ac[4]",
+            'aws_eip.ac["rogue"]',
+        )
+        extra_eip["resource_changes"].append(rogue_eip)
+        errors = checker.validate_plan(
+            extra_eip, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("managed EIP pool" in error for error in errors),
+            errors,
+        )
+
+        nonnumeric = source_fence_migration_plan()
+        rogue = copy.deepcopy(
+            resource(nonnumeric, '.server_nlb_registration["4"]')
+        )
+        rogue["address"] = rogue["address"].replace(
+            'server_nlb_registration["4"]',
+            'server_nlb_registration["rogue"]',
+        )
+        rogue["change"]["after"]["cidr_ipv4"] = "0.0.0.0/0"
+        rogue["change"]["after_unknown"].pop("cidr_ipv4", None)
+        nonnumeric["resource_changes"].append(rogue)
+        errors = checker.validate_plan(
+            nonnumeric, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("exactly one registration rule" in error for error in errors),
+            errors,
+        )
+
+    def test_source_fenced_topology_rejects_alternate_ac_registration_sources(
+        self,
+    ) -> None:
+        for field, value in (
+            ("cidr_ipv6", "::/0"),
+            ("prefix_list_id", "pl-0123456789abcdef0"),
+            ("referenced_security_group_id", "sg-unreviewed"),
+            ("source_security_group_id", "sg-unreviewed"),
+        ):
+            with self.subTest(field=field):
+                plan = source_fenced_plan()
+                registration = resource(
+                    plan,
+                    '.server_nlb_registration["4"]',
+                )
+                registration["change"]["after"][field] = value
+                errors = checker.validate_plan(
+                    plan, require_udp_source_fenced_topology=True
+                )
+                self.assertTrue(
+                    any("matching managed EIP /32" in error for error in errors),
+                    errors,
+                )
+
+        for field, expression in (
+            ("cidr_ipv6", {"constant_value": "::/0"}),
+            ("prefix_list_id", {"constant_value": "pl-0123456789abcdef0"}),
+            (
+                "referenced_security_group_id",
+                {"references": ["aws_security_group.unreviewed.id"]},
+            ),
+            (
+                "source_security_group_id",
+                {"references": ["aws_security_group.unreviewed.id"]},
+            ),
+        ):
+            with self.subTest(authored_field=field):
+                plan = source_fenced_plan()
+                configured = configured_resource(
+                    plan,
+                    "ac",
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_nlb_registration",
+                )
+                configured["expressions"][field] = expression
+                errors = checker.validate_plan(
+                    plan, require_udp_source_fenced_topology=True
+                )
+                self.assertTrue(
+                    any(
+                        "AC authored NLB SG rule inventory" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_source_fenced_topology_rejects_alternate_ac_registration_for_each(
+        self,
+    ) -> None:
+        plan = source_fenced_plan()
+        configured = configured_resource(
+            plan,
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "server_nlb_registration",
+        )
+        configured["for_each_expression"]["references"] = [
+            "var.server_nlb_source_fenced",
+            "aws_eip.unreviewed",
+        ]
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "AC authored NLB SG rule inventory" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_source_fenced_topology_rejects_extra_authored_ac_nlb_rule(
+        self,
+    ) -> None:
+        for target_ref in (
+            "var.server_nlb_security_group_id",
+            "local.server_nlb_security_group_id",
+        ):
+            with self.subTest(target_ref=target_ref):
+                plan = source_fenced_plan()
+                ac_resources = plan["configuration"]["root_module"][
+                    "module_calls"
+                ]["nhp"]["module"]["module_calls"]["ac"]["module"]["resources"]
+                ac_resources.append(
+                    config_resource(
+                        "aws_vpc_security_group_ingress_rule",
+                        "server_nlb_backdoor",
+                        {
+                            "cidr_ipv4": {"constant_value": "0.0.0.0/0"},
+                            "from_port": {
+                                "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                            },
+                            "ip_protocol": {"constant_value": "udp"},
+                            "security_group_id": {
+                                "references": [target_ref]
+                            },
+                            "to_port": {
+                                "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                            },
+                        },
+                    )
+                )
+
+                errors = checker.validate_plan(
+                    plan, require_udp_source_fenced_topology=True
+                )
+                self.assertTrue(
+                    any(
+                        "AC authored NLB SG rule inventory" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_source_fenced_topology_rejects_ac_eip_replacement(self) -> None:
+        plan = source_fenced_plan()
+        for index in range(checker.EXPECTED_SANDBOX_AC_EIP_COUNT):
+            eip_change = resource(plan, f".aws_eip.ac[{index}]")["change"]
+            eip_change["actions"] = ["delete", "create"]
+            eip_change["after"]["public_ip"] = None
+            eip_change["after_unknown"]["public_ip"] = True
+
+            registration_change = resource(
+                plan, f'.server_nlb_registration["{index}"]'
+            )["change"]
+            registration_change["after"]["cidr_ipv4"] = None
+            registration_change["after_unknown"]["cidr_ipv4"] = True
+
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertEqual(
+            checker.EXPECTED_SANDBOX_AC_EIP_COUNT,
+            sum(
+                "must not be destroyed, replaced, or forgotten" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        impure_create = source_fenced_plan()
+        eip_change = resource(impure_create, ".aws_eip.ac[4]")["change"]
+        eip_change["actions"] = ["create"]
+        errors = checker.validate_plan(
+            impure_create, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "must not be destroyed, replaced, or forgotten" in error
+                for error in errors
+            ),
+            errors,
         )
 
     def test_source_fenced_topology_rejects_unreviewed_server_udp_ingress(
@@ -3223,7 +3598,10 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             if checker.is_dmz_boundary_address(change["address"])
             and change["change"]["actions"] != ["no-op"]
         ]
-        self.assertEqual(9, len(migration_changes))
+        self.assertEqual(
+            9 + checker.EXPECTED_SANDBOX_AC_EIP_COUNT,
+            len(migration_changes),
+        )
         for omitted in migration_changes:
             with self.subTest(omitted=omitted["address"]):
                 candidate = copy.deepcopy(plan)
@@ -3455,6 +3833,20 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         plan = source_fence_migration_plan()
         nlb_sg = resource(plan, ".aws_security_group.server_nlb[0]")
         nlb_sg["change"]["before"] = {"id": "sg-existing"}
+        errors = checker.validate_dmz_boundary_noop(
+            plan, allow_udp_source_fence_replacement=True
+        )
+        self.assertTrue(any("must be a pure create" in error for error in errors), errors)
+
+        plan = source_fence_migration_plan()
+        ac_registration = resource(plan, '.server_nlb_registration["4"]')
+        ac_registration["change"]["before"] = {
+            "security_group_id": "sg-existing",
+            "cidr_ipv4": "198.51.100.4/32",
+            "ip_protocol": "udp",
+            "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+        }
         errors = checker.validate_dmz_boundary_noop(
             plan, allow_udp_source_fence_replacement=True
         )
