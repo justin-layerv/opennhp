@@ -10626,6 +10626,20 @@ def check_plan(
         # endpoint -- no create shape to assert. The corrected after-state is
         # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
     elif (
+        _exec_policy_only := _claim_authority_hub_exec_policy_update(
+            changed, actual_non_noop, by_address
+        )
+    ) is not None and set(_exec_policy_only) == changed and not deposed_by_address:
+        # The Hub function exec policies moving on their own. Composition needs
+        # two or more claims by design, so this shape -- one reviewed lane and
+        # nothing else -- would otherwise fall through to the terminal reject
+        # even though the very same claim and validator are already trusted
+        # inside a composed plan.
+        plan_mode = "authority-hub-exec-policy-update"
+        _validate_authority_hub_exec_policy_update(
+            _exec_policy_only, by_address, plan
+        )
+    elif (
         _composed_plan_mode := _compose_admitted_transitions(
             changed, actual_non_noop, by_address, deposed_by_address, plan
         )

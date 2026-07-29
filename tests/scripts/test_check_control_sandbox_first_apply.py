@@ -11791,3 +11791,56 @@ class ExecPolicyLanePrecedenceTest(unittest.TestCase):
                     changed, {a: ["create"] for a in changed}, {}
                 )
             )
+
+
+class StandaloneExecPolicyLaneTest(unittest.TestCase):
+    """The exec policies moving alone must be admissible too.
+
+    Composition requires two or more claims by design, so a plan whose entire
+    pending work is the three reviewed exec-policy updates would otherwise be
+    rejected -- even though the identical claim and validator are already
+    trusted inside a composed plan.
+    """
+
+    POLICIES = tuple(
+        f'module.control.aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-{s}"]'
+        for s in ("ia", "ra", "icr")
+    )
+
+    def by_address(self, moved_role=False, actions=("update",)):
+        return {
+            address: {
+                "address": address,
+                "mode": "managed",
+                "deposed": None,
+                "type": "aws_iam_role_policy",
+                "change": {
+                    "actions": list(actions),
+                    "before": {"name": "p", "role": "r1", "policy": "{}"},
+                    "after": {
+                        "name": "p",
+                        "role": "r2" if moved_role else "r1",
+                        "policy": '{"a":1}',
+                    },
+                },
+            }
+            for address in self.POLICIES
+        }
+
+    def test_the_standalone_shape_validates(self) -> None:
+        by = self.by_address()
+        CHECKER._validate_authority_hub_exec_policy_update(
+            frozenset(self.POLICIES), by, {}
+        )
+
+    def test_a_moved_role_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "moved 'role'"):
+            CHECKER._validate_authority_hub_exec_policy_update(
+                frozenset(self.POLICIES), self.by_address(moved_role=True), {}
+            )
+
+    def test_a_non_update_action_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ContractError, "is not an update"):
+            CHECKER._validate_authority_hub_exec_policy_update(
+                frozenset(self.POLICIES), self.by_address(actions=("create",)), {}
+            )
