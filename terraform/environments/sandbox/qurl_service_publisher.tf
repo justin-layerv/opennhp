@@ -18,6 +18,8 @@ locals {
   qurl_service_publisher_repository_name   = "layerv/nhp-qurl"
   qurl_service_publisher_repository_arn    = "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${local.qurl_service_publisher_repository_name}"
   qurl_service_runtime_contract_path       = "/${var.environment}/nhp/qurl-service/runtime-contract"
+  qurl_service_live_env_lock_path          = "/layerv-nhp-sandbox/qurl-live-env-lock"
+  qurl_service_live_env_lock_arn           = "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter${local.qurl_service_live_env_lock_path}"
 
   qurl_service_publisher_name      = "${local.name_prefix}-${var.cell_id}-qurl-service-publisher"
   qurl_service_runtime_name        = "${local.name_prefix}-${var.cell_id}-qurl-api"
@@ -77,7 +79,7 @@ resource "aws_ssm_parameter" "qurl_service_runtime_contract" {
 resource "aws_iam_role" "qurl_service_publisher" {
   name                 = local.qurl_service_publisher_name
   description          = "Promote and deploy the cell0 qurl-service runtime"
-  max_session_duration = 3600
+  max_session_duration = 10800
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -174,6 +176,23 @@ resource "aws_iam_role_policy" "qurl_service_publisher" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = aws_ssm_parameter.qurl_service_runtime_contract.arn
+      },
+      {
+        Sid      = "CoordinateSharedSandboxMutation"
+        Effect   = "Allow"
+        Action   = ["ssm:DeleteParameter", "ssm:GetParameter", "ssm:PutParameter"]
+        Resource = local.qurl_service_live_env_lock_arn
+      },
+      {
+        Sid      = "EmitSandboxLockFailureMetric"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/QURLServiceCI"
+          }
+        }
       },
       {
         Sid      = "ReadCell0Service"

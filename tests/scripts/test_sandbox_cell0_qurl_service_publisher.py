@@ -23,9 +23,12 @@ class SandboxCell0QurlServicePublisherContractTest(unittest.TestCase):
             'qurl_service_publisher_source_repository = "layervai/qurl-service"',
             'qurl_service_publisher_repository_name = "layerv/nhp-qurl"',
             'qurl_service_runtime_contract_path = "/${var.environment}/nhp/qurl-service/runtime-contract"',
+            'qurl_service_live_env_lock_path = "/layerv-nhp-sandbox/qurl-live-env-lock"',
+            'qurl_service_live_env_lock_arn = "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter${local.qurl_service_live_env_lock_path}"',
             'qurl_service_publisher_name = "${local.name_prefix}-${var.cell_id}-qurl-service-publisher"',
             'qurl_service_runtime_name = "${local.name_prefix}-${var.cell_id}-qurl-api"',
             '"token.actions.githubusercontent.com:sub" = "repo:${local.qurl_service_publisher_source_repository}:ref:refs/heads/main"',
+            "max_session_duration = 10800",
         ):
             self.assertIn(expected, NORMALIZED)
 
@@ -56,6 +59,23 @@ class SandboxCell0QurlServicePublisherContractTest(unittest.TestCase):
             "ecr:Delete",
         ):
             self.assertNotIn(forbidden, SOURCE)
+
+    def test_shared_sandbox_lock_access_is_exact_and_metric_scoped(self) -> None:
+        self.assertIn(
+            'Sid = "CoordinateSharedSandboxMutation" Effect = "Allow" '
+            'Action = ["ssm:DeleteParameter", "ssm:GetParameter", '
+            '"ssm:PutParameter"] Resource = local.qurl_service_live_env_lock_arn',
+            NORMALIZED,
+        )
+        self.assertIn(
+            'Sid = "EmitSandboxLockFailureMetric" Effect = "Allow" '
+            'Action = ["cloudwatch:PutMetricData"] Resource = "*" Condition = { '
+            'StringEquals = { "cloudwatch:namespace" = "LayerV/QURLServiceCI" } }',
+            NORMALIZED,
+        )
+        self.assertEqual(SOURCE.count('"ssm:DeleteParameter"'), 1)
+        self.assertEqual(SOURCE.count('"cloudwatch:PutMetricData"'), 1)
+        self.assertEqual(SOURCE.count('"cloudwatch:namespace"'), 1)
 
     def test_ecs_deployment_is_cell0_shape_and_resource_scoped(self) -> None:
         for expected in (

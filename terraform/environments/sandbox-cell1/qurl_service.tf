@@ -23,6 +23,8 @@ locals {
   qurl_service_repository_name       = "layerv/nhp-qurl"
   qurl_service_source_repository     = "layervai/qurl-service"
   qurl_service_runtime_contract_path = "/${var.environment}/nhp/qurl-service/runtime-contract"
+  qurl_service_live_env_lock_path    = "/layerv-nhp-sandbox/qurl-live-env-lock"
+  qurl_service_live_env_lock_arn     = "arn:aws:ssm:${data.aws_region.current.region}:${var.aws_account_id}:parameter${local.qurl_service_live_env_lock_path}"
   qurl_service_private_dns_name      = "qurl-api.${aws_service_discovery_private_dns_namespace.cell1.name}"
   qurl_service_private_origin        = "http://${local.qurl_service_private_dns_name}"
   # The environment root's name_prefix already contains "cell1" because it
@@ -265,7 +267,7 @@ resource "terraform_data" "qurl_service_runtime_image" {
 resource "aws_iam_role" "qurl_service_publisher" {
   name                 = "${local.name_prefix}-qurl-service-publisher"
   description          = "Promote and deploy the private cell1 qurl-service runtime"
-  max_session_duration = 3600
+  max_session_duration = 10800
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -322,6 +324,23 @@ resource "aws_iam_role_policy" "qurl_service_publisher" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = aws_ssm_parameter.qurl_service_runtime_contract.arn
+      },
+      {
+        Sid      = "CoordinateSharedSandboxMutation"
+        Effect   = "Allow"
+        Action   = ["ssm:DeleteParameter", "ssm:GetParameter", "ssm:PutParameter"]
+        Resource = local.qurl_service_live_env_lock_arn
+      },
+      {
+        Sid      = "EmitSandboxLockFailureMetric"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/QURLServiceCI"
+          }
+        }
       },
       {
         Sid      = "ReadCell1ECS"

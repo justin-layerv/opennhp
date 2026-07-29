@@ -8231,8 +8231,8 @@ def _check_state_normalization_drift(
     """Admit one exact, reviewed state-only normalization kind.
 
     Terraform marks that delta applyable for ``-refresh-only``. An ordinary
-    refresh-enabled plan with no configuration changes is not applyable and is
-    rejected by ``check_plan`` below, independent of the workflow operation.
+    refresh-enabled plan with no configuration changes is not applyable; both
+    plan shapes are admitted only when their exact applyability matches below.
 
     Pure first projections (``_drift_is_first_projection_only``) are filtered
     FIRST and carry no signal, so they never need a reviewed kind. Whatever
@@ -11256,11 +11256,14 @@ def check_plan(
         # Benign refresh re-projection of already-applied slice resources (and
         # the dependency endpoints being opened) during a partial-apply RETRY.
         # Admitted only for the runtime-slice completion transition itself, or a
-        # refresh-only steady re-read of the same objects (the immediate
-        # pre-apply convergence and the verify lane). Each drifted address was
-        # confined to the slice in ``_check_state_normalization_drift``; here we
-        # bind it to the exact plan shapes it may accompany and fail closed on
-        # anything else (e.g. a config-changing no-op or a non-slice transition).
+        # steady no-op re-read of the same objects. The steady re-read may be an
+        # applyable refresh-only plan (the immediate pre-apply convergence lane)
+        # or an ordinary non-applyable refresh-enabled plan (the post-apply
+        # verifier). Each drifted address was confined to the slice in
+        # ``_check_state_normalization_drift``; the ordinary plan's complete
+        # after-state has already passed every security validator above. Bind
+        # the drift to these exact plan modes and reject any unrelated resource
+        # transition.
         if plan_mode not in (
             "authority-runtime-slice",
             "authority-runtime-slice-retry",
@@ -11271,11 +11274,10 @@ def check_plan(
                 "authority-runtime-legacy-expansion-hub-identity-"
                 "provisioned-cell-catalog"
             ),
-        ) and not (plan_mode == "no-op" and "resource_changes" not in plan):
+        ) and plan_mode != "no-op":
             raise ContractError(
                 "authority runtime-slice state normalization is admitted only for "
-                "the runtime-slice completion transition or a refresh-only steady "
-                "re-read"
+                "the runtime-slice completion transition or a steady no-op re-read"
             )
 
     expected_applyable = plan_mode != "no-op" or (

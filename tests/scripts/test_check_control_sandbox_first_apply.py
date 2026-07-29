@@ -2705,6 +2705,32 @@ def _substantive_refresh_drift(address: str, resource_type: str) -> dict:
     }
 
 
+def add_runtime_role_state_normalization(candidate: dict) -> None:
+    """Attach a substantive, configuration-converged runtime-role refresh."""
+    item = next(
+        resource
+        for resource in candidate["resource_changes"]
+        if resource["type"] == "aws_iam_role"
+        and resource["address"] in CHECKER.AUTHORITY_RUNTIME_RESOURCES
+    )
+    after = copy.deepcopy(item["change"]["after"])
+    before = copy.deepcopy(after)
+    before["max_session_duration"] = 7200
+    candidate["resource_drift"] = [
+        {
+            "address": item["address"],
+            "mode": "managed",
+            "type": item["type"],
+            "change": {
+                "actions": ["update"],
+                "before": before,
+                "after": after,
+                "after_unknown": {},
+            },
+        }
+    ]
+
+
 def authority_runtime_retry_fixture() -> dict:
     """A recovery re-plan after a partial apply left the 3 hub functions Failed:
     Terraform auto-taints them (replace = ["delete","create"]) and the exec-role
@@ -6901,6 +6927,34 @@ class PlanContractTests(unittest.TestCase):
             summary["resource_count"],
             len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
+
+    def test_authority_runtime_steady_noop_admits_confined_state_normalization(
+        self,
+    ) -> None:
+        """The post-apply lane is an ordinary refresh-enabled no-op plan."""
+        candidate = authority_runtime_steady_fixture()
+        add_runtime_role_state_normalization(candidate)
+
+        summary = CHECKER.check_plan(candidate)
+
+        self.assertEqual(summary["plan_mode"], "no-op")
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            "authority-runtime-slice-normalization",
+        )
+        self.assertEqual(summary["normalization_drift_count"], 1)
+
+    def test_authority_runtime_state_normalization_rejects_unrelated_transition(
+        self,
+    ) -> None:
+        candidate = authority_proof_enable_fixture()
+        add_runtime_role_state_normalization(candidate)
+
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "runtime-slice state normalization is admitted only",
+        ):
+            CHECKER.check_plan(candidate)
 
     def test_authority_runtime_steady_state_admits_applied_standalone_egress(
         self,
