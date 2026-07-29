@@ -102,6 +102,8 @@ locals {
   authority_admission_operations = ["activate_registration", "complete_registration"]
   # Attended-proof axis. Empty unless the sandbox-only gate is on, so with the
   # gate off no function matches and no proof environment key is ever rendered.
+  # Consumer operations stay untouched in this dark capability slice; wiring
+  # IA/RA/ICR to proof policy requires the later governed selected-alias rollout.
   authority_proof_operations = keys(local.authority_contract_proof_operation_suffixes)
 
   # The uniquely tagged ephemeral agent namespace the control may address. It
@@ -435,9 +437,11 @@ locals {
 
   # MutateProofAgent: the attended-proof mutation control. It is the ONLY
   # Authority operation that writes an AGENT# placement row after activation, so
-  # its execution policy carries the tightest fence in the module: every action
-  # is constrained by dynamodb:LeadingKeys to exactly two partitions -- the
-  # dedicated proof tenant's owner partition and the PROOF directive partition.
+  # its execution policy carries the tightest fence in the module. Placement and
+  # directive actions are constrained by dynamodb:LeadingKeys to exactly two
+  # partitions -- the dedicated proof tenant's owner partition and the PROOF
+  # directive partition. Replay actions have a separate, operation-scoped
+  # HUB_REQUEST#MutateProofAgent#* fence.
   #
   # That fence is what makes the control safe independently of the handler. Even
   # a wholly incorrect MutateProofAgent build cannot read or write any other
@@ -500,6 +504,21 @@ locals {
           }
         }
       },
+      {
+        # MutateProofAgent uses the same durable, request-id-scoped replay
+        # protocol as the Hub operations. Keep it separate from the placement
+        # fence: StringLike applies only to this operation's replay namespace,
+        # never to generic HUB_REQUEST rows.
+        Sid      = "ProofReplayReadWrite"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = local.authority_runtime_proof_replay_leading_keys
+          }
+        }
+      },
     ]
   }
 
@@ -514,6 +533,9 @@ locals {
   # Catalog resolution only. REGISTRY is absent from the write fence above, so
   # cell provisioning stays exclusively Terraform-owned.
   authority_runtime_proof_registry_leading_keys = ["REGISTRY"]
+  # Request replay only. The operation name is part of the partition prefix, so
+  # ca-pm cannot read or mutate another Authority operation's replay rows.
+  authority_runtime_proof_replay_leading_keys = ["HUB_REQUEST#MutateProofAgent#*"]
 
   authority_runtime_environment = local.authority_runtime_functions_deploy ? {
     for function_name, fn in local.authority_runtime_functions :
@@ -716,6 +738,33 @@ resource "aws_iam_role_policy" "authority_exec" {
       local.authority_runtime_operation_statements[each.value.operation],
     )
   })
+}
+
+# Control owns the controller capability in the same saved plan as the selected
+# ca-pm alias. The role itself is pre-created by the udp-proof-runner root, but
+# that root owns no Authority policy, alias input, or cross-state output. Using
+# the alias resource (rather than a supplied ARN) gives Terraform an explicit
+# dependency: rollback removes this grant before deleting the alias.
+resource "aws_iam_role_policy" "authority_proof_controller_invoke" {
+  count = (
+    local.authority_runtime_functions_deploy &&
+    var.authority_proof_mutation_controls_enabled
+  ) ? 1 : 0
+
+  name = "connector-authority-proof-invoke"
+  role = local.authority_proof_controller_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "InvokeSelectedProofMutationAlias"
+      Effect   = "Allow"
+      Action   = ["lambda:InvokeFunction"]
+      Resource = [local.authority_selected_alias_targets.proof.mutate_proof_agent]
+    }]
+  })
+
+  depends_on = [aws_lambda_alias.authority]
 }
 
 resource "aws_lambda_function" "authority" {

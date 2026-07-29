@@ -256,6 +256,7 @@ class GitBindingTests(unittest.TestCase):
         expected: str | None = None,
         output: Path | None = None,
         runtime_functions_enabled: bool = False,
+        proof_mutation_controls_enabled: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         destination = output or (self.root / "generated.tfvars.json")
         args = [
@@ -274,6 +275,8 @@ class GitBindingTests(unittest.TestCase):
         ]
         if runtime_functions_enabled:
             args.append("--runtime-functions-enabled")
+        if proof_mutation_controls_enabled:
+            args.append("--proof-mutation-controls-enabled")
         return run(*args, cwd=self.root, check=False)
 
     def test_generates_stable_blob_owned_evidence_and_private_atomic_output(self) -> None:
@@ -349,6 +352,111 @@ class GitBindingTests(unittest.TestCase):
         self.assertEqual(
             enabled_output.read_text(encoding="utf-8"), canonical(enabled_generated)
         )
+
+    def test_proof_opt_in_adds_exact_caller_function_and_root_inputs(self) -> None:
+        dark_output = self.root / "proof-dark.tfvars.json"
+        dark_result = self.generate(
+            output=dark_output,
+            runtime_functions_enabled=True,
+        )
+        self.assertEqual(dark_result.returncode, 0, dark_result.stderr)
+        dark = json.loads(dark_output.read_text(encoding="utf-8"))
+        dark_contract = dark["authority_runtime_contract"]
+        self.assertNotIn(
+            "proof_controller",
+            dark_contract["global"]["caller_capacity"],
+        )
+        self.assertNotIn(
+            "layerv-nhp-sandbox-ca-pm",
+            dark_contract["functions"],
+        )
+        self.assertNotIn(
+            "authority_proof_mutation_controls_enabled",
+            dark,
+        )
+        self.assertNotIn("authority_proof_mutation_owner_id", dark)
+        self.assertNotIn(
+            "authority_proof_mutation_controller_role_arns",
+            dark,
+        )
+
+        enabled_output = self.root / "proof-enabled.tfvars.json"
+        enabled_result = self.generate(
+            output=enabled_output,
+            runtime_functions_enabled=True,
+            proof_mutation_controls_enabled=True,
+        )
+        self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr)
+        self.assertEqual(json.loads(enabled_result.stdout)["function_count"], 12)
+
+        enabled = json.loads(enabled_output.read_text(encoding="utf-8"))
+        contract = enabled["authority_runtime_contract"]
+        self.assertEqual(
+            contract["global"]["caller_capacity"]["proof_controller"],
+            {
+                "max_replicas": 1,
+                "preinvoke_limits": {"mutate_proof_agent": 1},
+                "preinvoke_rate_limits": {
+                    "mutate_proof_agent": {
+                        "burst": 1,
+                        "refill_per_second": 1,
+                    }
+                },
+            },
+        )
+        self.assertEqual(
+            contract["functions"]["layerv-nhp-sandbox-ca-pm"],
+            {
+                "basis_evidence": contract["global"]["basis_evidence"],
+                "max_caller_in_flight": 1,
+                "max_caller_requests_per_second": 2,
+                "result_evidence": None,
+                "rollback_retention_seconds": 3600,
+                "rollout_active_provisioned_concurrency": 1,
+                "rollout_reserved_concurrency": 2,
+                "rollout_standby_provisioned_concurrency": 1,
+                "steady_provisioned_concurrency": 1,
+                "steady_reserved_concurrency": 1,
+            },
+        )
+        self.assertEqual(
+            set(contract["functions"]),
+            set(dark_contract["functions"]) | {"layerv-nhp-sandbox-ca-pm"},
+        )
+        self.assertIs(
+            enabled["authority_proof_mutation_controls_enabled"],
+            True,
+        )
+        self.assertEqual(
+            enabled["authority_proof_mutation_owner_id"],
+            CHECKER.EXPECTED_PROOF_OWNER_ID,
+        )
+        self.assertEqual(
+            enabled["authority_proof_mutation_controller_role_arns"],
+            [CHECKER.EXPECTED_PROOF_CONTROLLER_ROLE_ARN],
+        )
+        self.assertEqual(
+            set(enabled) - set(dark),
+            {
+                "authority_proof_mutation_controller_role_arns",
+                "authority_proof_mutation_controls_enabled",
+                "authority_proof_mutation_owner_id",
+            },
+        )
+        self.assertEqual(
+            enabled_output.read_text(encoding="utf-8"),
+            canonical(enabled),
+        )
+
+    def test_proof_inputs_are_closed_around_the_explicit_gate(
+        self,
+    ) -> None:
+        without_runtime = self.generate(
+            output=self.root / "proof-without-runtime.json",
+            proof_mutation_controls_enabled=True,
+        )
+        self.assertNotEqual(without_runtime.returncode, 0)
+        self.assertIn("runtime functions", without_runtime.stderr)
 
     def test_rejects_mode_path_checkout_and_byte_mismatch(self) -> None:
         cases = {

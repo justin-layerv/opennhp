@@ -25,6 +25,16 @@ STATE_KMS_KEY_ARN = (
 TF_VERSION = "1.14.3"
 CONTROL_PREFIX = "layerv-nhp-sandbox-control"
 PROOF_SOURCE_CIDR = "3.141.109.76/32"
+AUTHORITY_PROOF_OWNER_ID = "layerv-nhp-sandbox-udp-proof"
+AUTHORITY_PROOF_CONTROLLER_ROLE_ARN = (
+    f"arn:aws:iam::{ACCOUNT_ID}:role/layerv-nhp-sandbox-udp-proof-controller"
+)
+AUTHORITY_PROOF_FUNCTION_NAME = "layerv-nhp-sandbox-ca-pm"
+AUTHORITY_PROOF_OPERATION = "mutate_proof_agent"
+AUTHORITY_PROOF_ALIAS_OUTPUT = "authority_proof_mutation_alias_arn"
+AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS = (
+    "module.control.aws_iam_role_policy.authority_proof_controller_invoke[0]"
+)
 # The single reviewed deposed object left by the Authority function-SG
 # generation change: its create-before-destroy replacement applied, but the
 # generation-1 delete could not complete while published function versions still
@@ -224,6 +234,7 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "authority_data_kms_key_arn",
         "authority_ecr_repository_url",
         "authority_image_digest_parameter_name",
+        "authority_proof_mutation_alias_arn",
         "authority_publisher_github_environment",
         "authority_publisher_role_arn",
         "authority_publisher_role_name",
@@ -535,6 +546,13 @@ AUTHORITY_RUNTIME_FUNCTIONS = {
     **AUTHORITY_RUNTIME_HUB_FUNCTIONS,
     **AUTHORITY_RUNTIME_CELL_FUNCTIONS,
 }
+AUTHORITY_PROOF_FUNCTIONS = {
+    AUTHORITY_PROOF_FUNCTION_NAME: AUTHORITY_PROOF_OPERATION,
+}
+AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF = {
+    **AUTHORITY_RUNTIME_FUNCTIONS,
+    **AUTHORITY_PROOF_FUNCTIONS,
+}
 AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE = {
     "path": "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json",
     "repository": "layervai/nhp",
@@ -612,6 +630,7 @@ AUTHORITY_OPERATION_CONFORMANCE_NAME = {
     "activate_registration": "ActivateRegistration",
     "complete_registration": "CompleteRegistration",
     "complete_credential_recovery": "CompleteCredentialRecovery",
+    "mutate_proof_agent": "MutateProofAgent",
 }
 # The reviewed Lambda timeout is 10s; the duration alarm pages at 80% of it.
 AUTHORITY_ALARM_LAMBDA_TIMEOUT_SECONDS = 10
@@ -660,7 +679,7 @@ AUTHORITY_ALARM_DIMENSIONS: dict[str, dict[str, str]] = {}
 
 def _authority_alarm_identity_dimensions(function_name: str) -> dict[str, str]:
     """The EMF publisher's identity dimension prefix for one function."""
-    operation = AUTHORITY_RUNTIME_FUNCTIONS[function_name]
+    operation = AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF[function_name]
     dimensions = {
         "EnvironmentID": CONTROL_PREFIX.removeprefix("layerv-nhp-").removesuffix(
             "-control"
@@ -672,11 +691,15 @@ def _authority_alarm_identity_dimensions(function_name: str) -> dict[str, str]:
     return dimensions
 
 
-for _fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
+AUTHORITY_ALARM_ADDRESSES_BY_FUNCTION: dict[str, set[str]] = {}
+for _fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF.items():
+    _function_alarm_addresses: set[str] = set()
     # AWS/Lambda platform alarms key on the published function-wide dim set.
-    AUTHORITY_ALARM_DIMENSIONS[
+    _spillover_address = (
         f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
-    ] = {"FunctionName": _fn}
+    )
+    AUTHORITY_ALARM_DIMENSIONS[_spillover_address] = {"FunctionName": _fn}
+    _function_alarm_addresses.add(_spillover_address)
     for _family in AUTHORITY_ALARM_LAMBDA_FAMILIES:
         _address = (
             "module.control.aws_cloudwatch_metric_alarm."
@@ -684,10 +707,13 @@ for _fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
         )
         AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
         AUTHORITY_ALARM_DIMENSIONS[_address] = {"FunctionName": _fn}
-    AUTHORITY_ALARM_RESOURCES[
+        _function_alarm_addresses.add(_address)
+    _composite_address = (
         "module.control.aws_cloudwatch_composite_alarm."
         f'authority_non_provisioned_initialization["{_fn}"]'
-    ] = "aws_cloudwatch_composite_alarm"
+    )
+    AUTHORITY_ALARM_RESOURCES[_composite_address] = "aws_cloudwatch_composite_alarm"
+    _function_alarm_addresses.add(_composite_address)
     for _outcome in AUTHORITY_ALARM_TERMINAL_OUTCOMES:
         _address = (
             "module.control.aws_cloudwatch_metric_alarm."
@@ -698,42 +724,100 @@ for _fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
             **_authority_alarm_identity_dimensions(_fn),
             "Outcome": _outcome,
         }
-    if _operation not in AUTHORITY_ADMISSION_OPERATIONS:
-        continue
-    for _outcome in AUTHORITY_ALARM_ADMISSION_OUTCOMES:
+        _function_alarm_addresses.add(_address)
+    if _operation in AUTHORITY_ADMISSION_OPERATIONS:
+        for _outcome in AUTHORITY_ALARM_ADMISSION_OUTCOMES:
+            _address = (
+                "module.control.aws_cloudwatch_metric_alarm."
+                f'authority_admission_rejected["{_fn}:{_outcome}"]'
+            )
+            AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+            AUTHORITY_ALARM_DIMENSIONS[_address] = {
+                **_authority_alarm_identity_dimensions(_fn),
+                "Outcome": _outcome,
+            }
+            _function_alarm_addresses.add(_address)
+        for _resource in (
+            "authority_adapter_contract_violation",
+            "authority_adapter_late_result",
+        ):
+            _address = (
+                f'module.control.aws_cloudwatch_metric_alarm.{_resource}["{_fn}"]'
+            )
+            AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
+            # These two counters carry NO dynamic dimension.
+            AUTHORITY_ALARM_DIMENSIONS[_address] = (
+                _authority_alarm_identity_dimensions(_fn)
+            )
+            _function_alarm_addresses.add(_address)
+    if _operation == "complete_registration":
         _address = (
             "module.control.aws_cloudwatch_metric_alarm."
-            f'authority_admission_rejected["{_fn}:{_outcome}"]'
+            f'authority_completion_identity_rejected["{_fn}"]'
         )
         AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
         AUTHORITY_ALARM_DIMENSIONS[_address] = {
             **_authority_alarm_identity_dimensions(_fn),
-            "Outcome": _outcome,
+            "Cause": AUTHORITY_ALARM_COMPLETION_CAUSE,
         }
-    for _resource in (
-        "authority_adapter_contract_violation",
-        "authority_adapter_late_result",
-    ):
-        _address = (
-            f'module.control.aws_cloudwatch_metric_alarm.{_resource}["{_fn}"]'
-        )
-        AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
-        # These two counters carry NO dynamic dimension.
-        AUTHORITY_ALARM_DIMENSIONS[_address] = _authority_alarm_identity_dimensions(
-            _fn
-        )
-    if _operation != "complete_registration":
-        continue
-    _address = (
-        "module.control.aws_cloudwatch_metric_alarm."
-        f'authority_completion_identity_rejected["{_fn}"]'
-    )
-    AUTHORITY_ALARM_RESOURCES[_address] = "aws_cloudwatch_metric_alarm"
-    AUTHORITY_ALARM_DIMENSIONS[_address] = {
-        **_authority_alarm_identity_dimensions(_fn),
-        "Cause": AUTHORITY_ALARM_COMPLETION_CAUSE,
-    }
+        _function_alarm_addresses.add(_address)
+    AUTHORITY_ALARM_ADDRESSES_BY_FUNCTION[_fn] = _function_alarm_addresses
+
+AUTHORITY_PROOF_ALARM_RESOURCES = {
+    address: AUTHORITY_ALARM_RESOURCES[address]
+    for address in AUTHORITY_ALARM_ADDRESSES_BY_FUNCTION[
+        AUTHORITY_PROOF_FUNCTION_NAME
+    ]
+    if address in AUTHORITY_ALARM_RESOURCES
+}
+AUTHORITY_ALARM_RESOURCES = {
+    address: resource_type
+    for address, resource_type in AUTHORITY_ALARM_RESOURCES.items()
+    if address not in AUTHORITY_PROOF_ALARM_RESOURCES
+}
 AUTHORITY_RUNTIME_RESOURCES.update(AUTHORITY_ALARM_RESOURCES)
+AUTHORITY_PROOF_RESOURCES: dict[str, str] = {
+    **AUTHORITY_PROOF_ALARM_RESOURCES,
+    AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS: "aws_iam_role_policy",
+}
+for _fn in AUTHORITY_PROOF_FUNCTIONS:
+    AUTHORITY_PROOF_RESOURCES.update(
+        {
+            f'module.control.aws_lambda_function.authority["{_fn}"]': (
+                "aws_lambda_function"
+            ),
+            f'module.control.aws_lambda_alias.authority["{_fn}:blue"]': (
+                "aws_lambda_alias"
+            ),
+            f'module.control.aws_lambda_alias.authority["{_fn}:green"]': (
+                "aws_lambda_alias"
+            ),
+            (
+                "module.control.aws_lambda_provisioned_concurrency_config."
+                f'authority["{_fn}"]'
+            ): "aws_lambda_provisioned_concurrency_config",
+            f'module.control.aws_iam_role.authority_exec["{_fn}"]': "aws_iam_role",
+            f'module.control.aws_iam_role_policy.authority_exec["{_fn}"]': (
+                "aws_iam_role_policy"
+            ),
+            f'module.control.aws_cloudwatch_log_group.authority["{_fn}"]': (
+                "aws_cloudwatch_log_group"
+            ),
+            (
+                "module.control.aws_cloudwatch_metric_alarm."
+                f'authority_spillover["{_fn}"]'
+            ): "aws_cloudwatch_metric_alarm",
+        }
+    )
+AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES = frozenset(
+    {
+        "module.control.terraform_data.foundation_contract",
+        "module.control.aws_vpc_endpoint.dynamodb",
+    }
+)
+AUTHORITY_PROOF_ENABLE_ALL_CHANGES = frozenset(
+    set(AUTHORITY_PROOF_RESOURCES) | set(AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES)
+)
 # The 11 already-live spillover alarms gain alarm_actions in place; every other
 # alarm address is a pure create.
 AUTHORITY_ALARM_UPDATE_ADDRESSES = frozenset(
@@ -1278,6 +1362,11 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws_iam_role_policy",
         "aws",
     ),
+    "module.control.aws_iam_role_policy.authority_proof_controller_invoke": (
+        "managed",
+        "aws_iam_role_policy",
+        "aws",
+    ),
     "module.control.aws_cloudwatch_log_group.authority": (
         "managed",
         "aws_cloudwatch_log_group",
@@ -1356,6 +1445,10 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
 AUTHORITY_RUNTIME_EXEC_ROLE_ARNS = frozenset(
     f"arn:aws:iam::{ACCOUNT_ID}:role/{name}-exec"
     for name in AUTHORITY_RUNTIME_FUNCTIONS
+)
+AUTHORITY_PROOF_EXEC_ROLE_ARNS = frozenset(
+    f"arn:aws:iam::{ACCOUNT_ID}:role/{name}-exec"
+    for name in AUTHORITY_PROOF_FUNCTIONS
 )
 AUTHORITY_RUNTIME_TABLE_ARNS = {
     "api_keys": (
@@ -3231,7 +3324,9 @@ def _require_hub_publisher_identity(
     )
 
 
-def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
+def _require_authority_runtime_binding(
+    values: dict[str, Any], *, proof_enabled: bool | None = None
+) -> bool:
     """Require the generated contract to bind one immutable ECR image URI.
 
     The exact-main generator owns byte/schema validation. This independent plan
@@ -3257,17 +3352,67 @@ def _require_authority_runtime_binding(values: dict[str, Any]) -> bool:
     functions = contract.get("functions")
     catalog = contract.get("provisioned_cells")
     evidence = contract.get("provisioned_cells_evidence")
+    function_names = set(functions) if isinstance(functions, dict) else set()
+    inferred_proof_enabled = (
+        function_names == set(AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF)
+    )
     if (
         contract.get("schema_version") != 1
         or contract.get("phase") != "measurement"
         or contract.get("selected_authority_color") not in ("blue", "green")
         or not isinstance(global_contract, dict)
         or not isinstance(functions, dict)
-        or set(functions) != set(AUTHORITY_RUNTIME_FUNCTIONS)
+        or function_names
+        not in (
+            set(AUTHORITY_RUNTIME_FUNCTIONS),
+            set(AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF),
+        )
         or not isinstance(catalog, dict)
         or set(catalog) != set(AUTHORITY_CELLS)
     ):
         raise ContractError("foundation runtime contract graph is not exact measurement")
+    if proof_enabled is not None and inferred_proof_enabled is not proof_enabled:
+        raise ContractError(
+            "foundation attended-proof graph does not match the required gate state"
+        )
+    caller_capacity = global_contract.get("caller_capacity")
+    if not isinstance(caller_capacity, dict):
+        raise ContractError("foundation runtime caller capacity is malformed")
+    expected_proof_capacity = {
+        "max_replicas": 1,
+        "preinvoke_limits": {AUTHORITY_PROOF_OPERATION: 1},
+        "preinvoke_rate_limits": {
+            AUTHORITY_PROOF_OPERATION: {
+                "burst": 1,
+                "refill_per_second": 1,
+            }
+        },
+    }
+    if inferred_proof_enabled:
+        if (
+            caller_capacity.get("proof_controller") != expected_proof_capacity
+            or functions.get(AUTHORITY_PROOF_FUNCTION_NAME)
+            != {
+                "basis_evidence": evidence,
+                "max_caller_in_flight": 1,
+                "max_caller_requests_per_second": 2,
+                "result_evidence": None,
+                "rollback_retention_seconds": 3600,
+                "rollout_active_provisioned_concurrency": 1,
+                "rollout_reserved_concurrency": 2,
+                "rollout_standby_provisioned_concurrency": 1,
+                "steady_provisioned_concurrency": 1,
+                "steady_reserved_concurrency": 1,
+            }
+        ):
+            raise ContractError(
+                "foundation attended-proof caller/function capacity is not exact"
+            )
+    elif "proof_controller" in caller_capacity:
+        raise ContractError(
+            "foundation runtime carries proof-controller capacity while the proof "
+            "function is absent"
+        )
     digest = global_contract.get("authority_image_digest")
     repository = global_contract.get("authority_repository_url")
     image_uri = payload.get("authority_image_uri")
@@ -4001,6 +4146,7 @@ def _check_planned_security(
     *,
     catalog_mode: bool = False,
     runtime_mode: bool = False,
+    proof_mode: bool = False,
     hub_worker_mode: bool = False,
     refresh_disabled: bool = False,
 ) -> None:
@@ -4016,7 +4162,9 @@ def _check_planned_security(
     foundation, foundation_unknown = values(
         "module.control.terraform_data.foundation_contract"
     )
-    enabled = _require_authority_runtime_binding(foundation)
+    enabled = _require_authority_runtime_binding(
+        foundation, proof_enabled=proof_mode if runtime_mode else None
+    )
     _require_foundation_input_known(foundation_unknown, enabled=enabled)
     if catalog_mode:
         for address in PROVISIONED_CELL_RESOURCES:
@@ -4349,7 +4497,9 @@ def _check_planned_security(
         # deny-all
         # and fails closed here otherwise.
         if runtime_mode and address == AUTHORITY_RUNTIME_DYNAMODB_ADDRESS:
-            _check_authority_dynamodb_endpoint_policy(after, address)
+            _check_authority_dynamodb_endpoint_policy(
+                after, address, proof_enabled=proof_mode
+            )
         elif runtime_mode and address == AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS:
             _check_authority_kms_endpoint_policy(after, address)
         elif runtime_mode and address == AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS:
@@ -4783,12 +4933,15 @@ def _authority_string_set(value: Any, address: str, field: str) -> set[str]:
 
 
 def _check_authority_dynamodb_endpoint_policy(
-    after: dict[str, Any], address: str
+    after: dict[str, Any], address: str, *, proof_enabled: bool = False
 ) -> None:
     stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsData")
-    if _authority_principalarn_condition(stmt, address) != set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS):
+    expected_principals = set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS)
+    if proof_enabled:
+        expected_principals.update(AUTHORITY_PROOF_EXEC_ROLE_ARNS)
+    if _authority_principalarn_condition(stmt, address) != expected_principals:
         raise ContractError(
-            f"{address} principals must be exactly the eleven execution roles"
+            f"{address} principals must be exactly the enabled Authority execution roles"
         )
     if _authority_string_set(stmt.get("Action"), address, "Action") != set(
         AUTHORITY_RUNTIME_DYNAMODB_ACTIONS
@@ -5275,6 +5428,9 @@ def _check_authority_exec_role_policy(
     exact verbs, KMS Sign only for IssueAssignment, and no wildcard resource
     outside the single AWS-required ENI statement.
     """
+    if operation == AUTHORITY_PROOF_OPERATION:
+        _check_authority_proof_exec_role_policy(after, fn)
+        return
     if operation in AUTHORITY_RUNTIME_CELL_OPERATION_IAM:
         _check_authority_cell_exec_role_policy(after, fn, operation)
         return
@@ -5369,6 +5525,121 @@ def _check_authority_exec_role_policy(
         resources = _authority_string_set(sign.get("Resource"), fn, "Sign Resource")
         if len(resources) != 1 or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None:
             raise ContractError(f"{fn} Sign statement must target exactly the qat1 key")
+
+
+def _check_authority_proof_exec_role_policy(
+    after: dict[str, Any], fn: str
+) -> None:
+    """Pin ca-pm to the proof tenant/directive/catalog/replay namespaces."""
+    if fn != AUTHORITY_PROOF_FUNCTION_NAME:
+        raise ContractError("proof execution policy is attached to a foreign function")
+    policy = _authority_decode_policy(after, fn)
+    if not isinstance(policy, dict) or policy.get("Version") != "2012-10-17":
+        raise ContractError(f"{fn} execution policy is not a 2012-10-17 document")
+    statements = policy.get("Statement")
+    if not isinstance(statements, list):
+        raise ContractError(f"{fn} execution policy Statement must be a list")
+    by_sid: dict[str, dict[str, Any]] = {}
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            raise ContractError(f"{fn} execution statements must all be Allow objects")
+        if any(
+            key in stmt
+            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal")
+        ):
+            raise ContractError(f"{fn} execution statement uses a forbidden element")
+        sid = stmt.get("Sid")
+        if not isinstance(sid, str) or sid in by_sid:
+            raise ContractError(f"{fn} execution statement Sid missing or duplicated")
+        by_sid[sid] = stmt
+
+    expected_sids = {
+        "LambdaVpcEni",
+        "OwnLogStream",
+        "ProofVerifyTableEncryption",
+        "ProofFencedPlacementRead",
+        "ProofRegistryRead",
+        "ProofFencedPlacementWrite",
+        "ProofReplayReadWrite",
+    }
+    if set(by_sid) != expected_sids:
+        raise ContractError(f"{fn} proof execution statement set drifted")
+
+    eni = by_sid["LambdaVpcEni"]
+    if _authority_string_set(eni.get("Action"), fn, "ENI Action") != set(
+        AUTHORITY_RUNTIME_ENI_ACTIONS
+    ) or eni.get("Resource") not in ("*", ["*"]):
+        raise ContractError(f"{fn} ENI statement drifted")
+    if "Condition" in eni:
+        raise ContractError(f"{fn} ENI statement may not carry a condition")
+
+    log_stmt = by_sid["OwnLogStream"]
+    expected_log = (
+        f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/aws/lambda/{fn}:*"
+    )
+    if _authority_string_set(log_stmt.get("Action"), fn, "log Action") != set(
+        AUTHORITY_RUNTIME_LOG_ACTIONS
+    ) or _authority_string_set(log_stmt.get("Resource"), fn, "log Resource") != {
+        expected_log
+    } or "Condition" in log_stmt:
+        raise ContractError(f"{fn} own-log statement drifted")
+
+    table_resources = set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"])
+    owner_partition = (
+        "OWNER#"
+        + hashlib.sha256(AUTHORITY_PROOF_OWNER_ID.encode("utf-8")).hexdigest()
+    )
+    expected = {
+        "ProofVerifyTableEncryption": (
+            {"dynamodb:DescribeTable"},
+            None,
+            None,
+        ),
+        "ProofFencedPlacementRead": (
+            set(AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS)
+            - {"dynamodb:DescribeTable"},
+            "ForAllValues:StringEquals",
+            [owner_partition, "PROOF"],
+        ),
+        "ProofRegistryRead": (
+            set(AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS)
+            - {"dynamodb:DescribeTable"},
+            "ForAllValues:StringEquals",
+            ["REGISTRY"],
+        ),
+        "ProofFencedPlacementWrite": (
+            {"dynamodb:PutItem", "dynamodb:UpdateItem"},
+            "ForAllValues:StringEquals",
+            [owner_partition, "PROOF"],
+        ),
+        "ProofReplayReadWrite": (
+            {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"},
+            "ForAllValues:StringLike",
+            ["HUB_REQUEST#MutateProofAgent#*"],
+        ),
+    }
+    for sid, (actions, operator, leading_keys) in expected.items():
+        stmt = by_sid[sid]
+        if (
+            _authority_string_set(stmt.get("Action"), fn, f"{sid} Action")
+            != actions
+            or _authority_string_set(stmt.get("Resource"), fn, f"{sid} Resource")
+            != table_resources
+        ):
+            raise ContractError(f"{fn} {sid} actions/resources drifted")
+        if operator is None:
+            if "Condition" in stmt:
+                raise ContractError(f"{fn} {sid} must be unconditioned")
+            continue
+        condition = stmt.get("Condition")
+        if (
+            not isinstance(condition, dict)
+            or set(condition) != {operator}
+            or not isinstance(condition[operator], dict)
+            or condition[operator]
+            != {"dynamodb:LeadingKeys": leading_keys}
+        ):
+            raise ContractError(f"{fn} {sid} LeadingKeys fence drifted")
 
 
 def _check_authority_cell_exec_role_policy(
@@ -5584,7 +5855,18 @@ def _check_authority_alarm_routing(
     operator destination, a function omitted from any per-function alarm family,
     a weakened threshold, and a dimension set the publisher does not emit.
     """
-    expected = set(AUTHORITY_ALARM_DIMENSIONS) | set(AUTHORITY_ALARM_RESOURCES)
+    expected = set().union(
+        *(
+            AUTHORITY_ALARM_ADDRESSES_BY_FUNCTION[fn]
+            for fn in functions
+            if fn in AUTHORITY_ALARM_ADDRESSES_BY_FUNCTION
+        )
+    )
+    if set(functions) not in (
+        set(AUTHORITY_RUNTIME_FUNCTIONS),
+        set(AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF),
+    ):
+        raise ContractError("Authority alarm function graph is not exact")
     present = {address for address in expected if address in by_address}
     if present != expected:
         missing = sorted(expected - present)
@@ -5639,7 +5921,7 @@ def _check_authority_alarm_routing(
             f"reviewed operator destination set; got {sorted(destinations)}"
         )
 
-    for fn in AUTHORITY_RUNTIME_FUNCTIONS:
+    for fn in functions:
         spillover_address = (
             "module.control.aws_cloudwatch_metric_alarm."
             f'authority_spillover["{fn}"]'
@@ -5730,7 +6012,12 @@ def _check_authority_runtime_resources(
     if not isinstance(functions, dict) or selected not in ("blue", "green"):
         raise ContractError("runtime slice cannot resolve the bound contract functions")
 
-    for fn, _operation in AUTHORITY_RUNTIME_FUNCTIONS.items():
+    operations = (
+        AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+        if AUTHORITY_PROOF_FUNCTION_NAME in functions
+        else AUTHORITY_RUNTIME_FUNCTIONS
+    )
+    for fn, _operation in operations.items():
         spec = functions.get(fn)
         if not isinstance(spec, dict):
             raise ContractError(f"runtime function {fn} is absent from the bound contract")
@@ -5793,6 +6080,74 @@ def _check_authority_runtime_resources(
             raise ContractError(
                 f"{fn} may not declare a dead_letter_config; the Authority is a "
                 "synchronous RequestResponse contract"
+            )
+
+    proof_environment = {
+        "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": AUTHORITY_PROOF_OWNER_ID,
+        "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
+        "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
+        "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
+    }
+    proof_environment_functions = set(AUTHORITY_PROOF_FUNCTIONS)
+    for fn in operations:
+        function_after = _authority_runtime_after(
+            by_address, f'module.control.aws_lambda_function.authority["{fn}"]'
+        )
+        environment = function_after.get("environment")
+        variables = (
+            environment[0].get("variables")
+            if isinstance(environment, list)
+            and len(environment) == 1
+            and isinstance(environment[0], dict)
+            and isinstance(environment[0].get("variables"), dict)
+            else {}
+        )
+        observed = {
+            key: value
+            for key, value in variables.items()
+            if key.startswith("CONNECTOR_AUTHORITY_PROOF_")
+        }
+        expected = (
+            proof_environment
+            if AUTHORITY_PROOF_FUNCTION_NAME in functions
+            and fn in proof_environment_functions
+            else {}
+        )
+        if observed != expected:
+            raise ContractError(f"{fn} attended-proof environment fence drifted")
+
+    if AUTHORITY_PROOF_FUNCTION_NAME in functions:
+        controller_policy = _authority_runtime_after(
+            by_address, AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )
+        selected_alias = (
+            f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+            f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected}"
+        )
+        if (
+            controller_policy.get("name") != "connector-authority-proof-invoke"
+            or controller_policy.get("role")
+            != "layerv-nhp-sandbox-udp-proof-controller"
+            or _decode_exact_json(
+                controller_policy.get("policy"),
+                "policy",
+                AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
+            )
+            != {
+                "Statement": [
+                    {
+                        "Action": ["lambda:InvokeFunction"],
+                        "Effect": "Allow",
+                        "Resource": [selected_alias],
+                        "Sid": "InvokeSelectedProofMutationAlias",
+                    }
+                ],
+                "Version": "2012-10-17",
+            }
+        ):
+            raise ContractError(
+                "Control must own exactly one selected ca-pm alias invoke policy "
+                "on the deterministic proof-controller role"
             )
 
     _check_authority_alarm_routing(by_address, functions)
@@ -6260,6 +6615,305 @@ def _is_exact_output_change(
         and _json_equal(change.get("before"), before)
         and _json_equal(change.get("after"), after)
     )
+
+
+def _check_authority_proof_enable_transition(
+    plan: dict[str, Any], by_address: dict[str, dict[str, Any]]
+) -> None:
+    """Prove the one attended sandbox gate-off -> proof-on transition."""
+    foundation_address = "module.control.terraform_data.foundation_contract"
+    foundation_change = by_address[foundation_address]["change"]
+    before_foundation = foundation_change.get("before")
+    after_foundation = foundation_change.get("after")
+    before_input = (
+        before_foundation.get("input")
+        if isinstance(before_foundation, dict)
+        else None
+    )
+    after_input = (
+        after_foundation.get("input")
+        if isinstance(after_foundation, dict)
+        else None
+    )
+    if (
+        not isinstance(before_input, dict)
+        or not isinstance(after_input, dict)
+        or not _require_authority_runtime_binding(
+            {"input": before_input}, proof_enabled=False
+        )
+        or not _require_authority_runtime_binding(
+            {"input": after_input}, proof_enabled=True
+        )
+    ):
+        raise ContractError(
+            "attended-proof enablement must update the exact dark runtime binding"
+        )
+    stripped_after = copy.deepcopy(after_input)
+    stripped_contract = stripped_after["authority_runtime_contract"]
+    stripped_contract["functions"].pop(AUTHORITY_PROOF_FUNCTION_NAME)
+    stripped_contract["global"]["caller_capacity"].pop("proof_controller")
+    if not _json_equal(stripped_after, before_input):
+        raise ContractError(
+            "attended-proof foundation update contains changes beyond the exact "
+            "proof caller/function addition"
+        )
+
+    ddb_address = "module.control.aws_vpc_endpoint.dynamodb"
+    ddb_change = by_address[ddb_address]["change"]
+    ddb_before = ddb_change.get("before")
+    ddb_after = ddb_change.get("after")
+    if not isinstance(ddb_before, dict) or not isinstance(ddb_after, dict):
+        raise ContractError("attended-proof DynamoDB endpoint update is malformed")
+    _check_authority_dynamodb_endpoint_policy(
+        ddb_before, ddb_address, proof_enabled=False
+    )
+    _check_authority_dynamodb_endpoint_policy(
+        ddb_after, ddb_address, proof_enabled=True
+    )
+    if {
+        key: value for key, value in ddb_before.items() if key != "policy"
+    } != {
+        key: value for key, value in ddb_after.items() if key != "policy"
+    }:
+        raise ContractError(
+            "attended-proof DynamoDB endpoint may change only its exact principal set"
+        )
+
+    output_changes = plan.get("output_changes")
+    planned_outputs = plan.get("planned_values", {}).get("outputs")
+    selected_color = after_input["authority_runtime_contract"][
+        "selected_authority_color"
+    ]
+    selected_alias = (
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+        f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected_color}"
+    )
+    if (
+        not isinstance(output_changes, dict)
+        or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
+        or not isinstance(planned_outputs, dict)
+        or not _is_exact_nonsensitive_output_entry(
+            planned_outputs.get(AUTHORITY_PROOF_ALIAS_OUTPUT)
+        )
+        or planned_outputs[AUTHORITY_PROOF_ALIAS_OUTPUT].get("value")
+        != selected_alias
+        or not _is_exact_output_change(
+            output_changes[AUTHORITY_PROOF_ALIAS_OUTPUT],
+            actions=["create"],
+            before=None,
+            after=selected_alias,
+        )
+    ):
+        raise ContractError(
+            "attended-proof enablement must create the exact selected-color alias output"
+        )
+    for output_name in EXPECTED_CONTROL_OUTPUTS - {
+        AUTHORITY_PROOF_ALIAS_OUTPUT
+    }:
+        change = output_changes[output_name]
+        if (
+            not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["no-op"]
+            or change.get("after_unknown") is not False
+            or change.get("before_sensitive") is not False
+            or change.get("after_sensitive") is not False
+            or not _json_equal(change.get("before"), change.get("after"))
+        ):
+            raise ContractError(
+                f"attended-proof enablement may not change root output {output_name}"
+            )
+
+
+def _check_authority_proof_disable_transition(
+    plan: dict[str, Any], by_address: dict[str, dict[str, Any]]
+) -> None:
+    """Prove the exact attended sandbox proof-on -> gate-off rollback."""
+    foundation_address = "module.control.terraform_data.foundation_contract"
+    foundation_change = by_address[foundation_address]["change"]
+    before_foundation = foundation_change.get("before")
+    after_foundation = foundation_change.get("after")
+    before_input = (
+        before_foundation.get("input")
+        if isinstance(before_foundation, dict)
+        else None
+    )
+    after_input = (
+        after_foundation.get("input")
+        if isinstance(after_foundation, dict)
+        else None
+    )
+    if (
+        not isinstance(before_input, dict)
+        or not isinstance(after_input, dict)
+        or not _require_authority_runtime_binding(
+            {"input": before_input}, proof_enabled=True
+        )
+        or not _require_authority_runtime_binding(
+            {"input": after_input}, proof_enabled=False
+        )
+    ):
+        raise ContractError(
+            "attended-proof rollback must update the exact enabled runtime binding"
+        )
+    stripped_before = copy.deepcopy(before_input)
+    stripped_contract = stripped_before["authority_runtime_contract"]
+    stripped_contract["functions"].pop(AUTHORITY_PROOF_FUNCTION_NAME)
+    stripped_contract["global"]["caller_capacity"].pop("proof_controller")
+    if not _json_equal(stripped_before, after_input):
+        raise ContractError(
+            "attended-proof rollback contains foundation changes beyond removing "
+            "the exact proof caller/function"
+        )
+
+    ddb_address = "module.control.aws_vpc_endpoint.dynamodb"
+    ddb_change = by_address[ddb_address]["change"]
+    ddb_before = ddb_change.get("before")
+    ddb_after = ddb_change.get("after")
+    if not isinstance(ddb_before, dict) or not isinstance(ddb_after, dict):
+        raise ContractError("attended-proof rollback DynamoDB endpoint is malformed")
+    _check_authority_dynamodb_endpoint_policy(
+        ddb_before, ddb_address, proof_enabled=True
+    )
+    _check_authority_dynamodb_endpoint_policy(
+        ddb_after, ddb_address, proof_enabled=False
+    )
+    if {
+        key: value for key, value in ddb_before.items() if key != "policy"
+    } != {
+        key: value for key, value in ddb_after.items() if key != "policy"
+    }:
+        raise ContractError(
+            "attended-proof rollback may remove only the ca-pm endpoint principal"
+        )
+
+    for address in AUTHORITY_PROOF_RESOURCES:
+        item = by_address[address]
+        change = item.get("change")
+        if (
+            item.get("deposed") is not None
+            or not isinstance(change, dict)
+            or change.get("actions") != ["delete"]
+            or not isinstance(change.get("before"), dict)
+            or change.get("after") is not None
+            or change.get("after_unknown") not in (None, {})
+        ):
+            raise ContractError(
+                f"{address} must be an exact attended-proof resource delete"
+            )
+
+    # Validate the entire enabled before-state with the same security checker
+    # used for a steady proof-on graph. This binds ca-pm replay IAM, alarms,
+    # execution trust, concurrency, selected invoke grant, aliases, and proof
+    # environment
+    # before any of it may be removed.
+    before_view = copy.deepcopy(by_address)
+    for address in (
+        set(AUTHORITY_PROOF_RESOURCES)
+        | set(AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES)
+    ):
+        change = before_view[address]["change"]
+        before = change.get("before")
+        if not isinstance(before, dict):
+            raise ContractError(
+                f"{address} attended-proof rollback before-state is malformed"
+            )
+        change["actions"] = ["no-op"]
+        change["after"] = copy.deepcopy(before)
+        change["after_unknown"] = {}
+    _check_authority_runtime_resources(
+        before_view,
+        before_view[foundation_address]["change"]["after"],
+    )
+
+    output_changes = plan.get("output_changes")
+    planned_outputs = plan.get("planned_values", {}).get("outputs")
+    selected_color = before_input["authority_runtime_contract"][
+        "selected_authority_color"
+    ]
+    selected_alias = (
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+        f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected_color}"
+    )
+    if (
+        not isinstance(output_changes, dict)
+        or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
+        or not isinstance(planned_outputs, dict)
+        or set(planned_outputs)
+        != EXPECTED_CONTROL_OUTPUTS - {AUTHORITY_PROOF_ALIAS_OUTPUT}
+        or not _is_exact_output_change(
+            output_changes[AUTHORITY_PROOF_ALIAS_OUTPUT],
+            actions=["delete"],
+            before=selected_alias,
+            after=None,
+        )
+    ):
+        raise ContractError(
+            "attended-proof rollback must destroy and omit only the selected "
+            "proof alias output"
+        )
+    for output_name in EXPECTED_CONTROL_OUTPUTS - {
+        AUTHORITY_PROOF_ALIAS_OUTPUT
+    }:
+        change = output_changes[output_name]
+        planned = planned_outputs.get(output_name)
+        if (
+            not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["no-op"]
+            or change.get("after_unknown") is not False
+            or change.get("before_sensitive") is not False
+            or change.get("after_sensitive") is not False
+            or not _json_equal(change.get("before"), change.get("after"))
+            or not _is_exact_nonsensitive_output_entry(planned)
+            or not _json_equal(planned.get("value"), change.get("after"))
+        ):
+            raise ContractError(
+                f"attended-proof rollback may not change root output {output_name}"
+            )
+
+
+def _check_authority_proof_steady_output(
+    plan: dict[str, Any], foundation: dict[str, Any]
+) -> None:
+    payload = foundation.get("input")
+    contract = (
+        payload.get("authority_runtime_contract")
+        if isinstance(payload, dict)
+        else None
+    )
+    selected_color = (
+        contract.get("selected_authority_color")
+        if isinstance(contract, dict)
+        else None
+    )
+    selected_alias = (
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+        f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected_color}"
+    )
+    planned_outputs = plan.get("planned_values", {}).get("outputs")
+    output_changes = plan.get("output_changes")
+    if (
+        selected_color not in ("blue", "green")
+        or not isinstance(planned_outputs, dict)
+        or not _is_exact_nonsensitive_output_entry(
+            planned_outputs.get(AUTHORITY_PROOF_ALIAS_OUTPUT)
+        )
+        or planned_outputs[AUTHORITY_PROOF_ALIAS_OUTPUT].get("value")
+        != selected_alias
+        or not isinstance(output_changes, dict)
+        or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
+        or not _is_exact_output_change(
+            output_changes[AUTHORITY_PROOF_ALIAS_OUTPUT],
+            actions=["no-op"],
+            before=selected_alias,
+            after=selected_alias,
+        )
+    ):
+        raise ContractError(
+            "steady attended-proof graph must retain the exact selected-color "
+            "alias output"
+        )
 
 
 def _check_authority_image_output_changes(
@@ -7616,14 +8270,18 @@ def _check_refresh_only_outputs(
         not isinstance(planned_outputs, dict)
         or set(planned_outputs) != EXPECTED_CONTROL_OUTPUTS
         or not isinstance(state_outputs, dict)
-        or set(state_outputs) != EXPECTED_CONTROL_OUTPUTS
+        or set(state_outputs)
+        not in (
+            set(EXPECTED_CONTROL_OUTPUTS),
+            set(EXPECTED_CONTROL_OUTPUTS) - {AUTHORITY_PROOF_ALIAS_OUTPUT},
+        )
     ):
         raise ContractError(
             f"refresh-only Terraform {TF_VERSION} output inventory is malformed; "
             f"{_refresh_only_value_shape(planned_values)}"
         )
 
-    for output_name in EXPECTED_CONTROL_OUTPUTS:
+    for output_name in set(state_outputs):
         planned_output = planned_outputs[output_name]
         state_output = state_outputs[output_name]
         # Terraform 1.14.3 collapses non-sensitive scalar and complex root
@@ -7637,6 +8295,15 @@ def _check_refresh_only_outputs(
             raise ContractError(
                 f"refresh-only Terraform {TF_VERSION} outputs do not match captured state; "
                 f"{_refresh_only_value_shape(planned_values)}"
+            )
+    if AUTHORITY_PROOF_ALIAS_OUTPUT not in state_outputs:
+        proof_output = planned_outputs[AUTHORITY_PROOF_ALIAS_OUTPUT]
+        if (
+            not _is_exact_nonsensitive_output_entry(proof_output)
+            or proof_output.get("value") is not None
+        ):
+            raise ContractError(
+                "refresh-only omitted proof alias state output must plan as null"
             )
 
     output_changes = plan.get("output_changes")
@@ -8658,13 +9325,27 @@ def check_plan(
     catalog_extra = set(PROVISIONED_CELL_RESOURCES)
     base_inventory = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    proof_extra = set(AUTHORITY_PROOF_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_inventory = set(by_address)
     catalog_mode = bool(actual_inventory & catalog_extra)
     runtime_mode = bool(actual_inventory & runtime_extra)
+    # Deleted resources remain in resource_changes even though they are absent
+    # from the planned after-state. Keep that pre-apply inventory available for
+    # exact type/delete validation, while deriving proof_mode from the target
+    # state so the rollback can be checked against the dark security contract.
+    proof_inventory_mode = bool(actual_inventory & proof_extra)
+    proof_mode = proof_inventory_mode and any(
+        isinstance(by_address[address].get("change", {}).get("after"), dict)
+        for address in actual_inventory & proof_extra
+    )
     hub_edge_mode = bool(actual_inventory & hub_edge_extra)
     hub_worker_mode = bool(actual_inventory & hub_worker_extra)
+    if proof_mode and not runtime_mode:
+        raise ContractError(
+            "attended-proof Authority slice requires the complete runtime slice"
+        )
     if hub_worker_mode and not (hub_edge_mode and runtime_mode):
         raise ContractError(
             "Hub worker slice requires both the Hub edge slice and the authority "
@@ -8674,6 +9355,7 @@ def check_plan(
         base_inventory
         | (catalog_extra if catalog_mode else set())
         | (runtime_extra if runtime_mode else set())
+        | (proof_extra if proof_inventory_mode else set())
         | (hub_edge_extra if hub_edge_mode else set())
         | (hub_worker_extra if hub_worker_mode else set())
     )
@@ -8693,6 +9375,8 @@ def check_plan(
         expected_resources.update(PROVISIONED_CELL_RESOURCES)
     if runtime_mode:
         expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
+    if proof_inventory_mode:
+        expected_resources.update(AUTHORITY_PROOF_RESOURCES)
     if hub_edge_mode:
         expected_resources.update(HUB_EDGE_RESOURCES)
     if hub_worker_mode:
@@ -8763,6 +9447,31 @@ def check_plan(
         )
         and _require_authority_runtime_binding(
             by_address[authority_contract_address]["change"].get("after", {})
+        )
+    )
+    authority_proof_enable_transition = (
+        proof_mode
+        and changed == set(AUTHORITY_PROOF_ENABLE_ALL_CHANGES)
+        and all(
+            actual_non_noop.get(address) == ["create"]
+            for address in AUTHORITY_PROOF_RESOURCES
+        )
+        and all(
+            actual_non_noop.get(address) == ["update"]
+            for address in AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES
+        )
+    )
+    authority_proof_disable_transition = (
+        proof_inventory_mode
+        and not proof_mode
+        and changed == set(AUTHORITY_PROOF_ENABLE_ALL_CHANGES)
+        and all(
+            actual_non_noop.get(address) == ["delete"]
+            for address in AUTHORITY_PROOF_RESOURCES
+        )
+        and all(
+            actual_non_noop.get(address) == ["update"]
+            for address in AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES
         )
     )
     provisioned_cell_catalog_transition = (
@@ -9365,6 +10074,17 @@ def check_plan(
     # updates), so the ambiguous shape must land here. Any plan that still has a
     # pending create/replace, or that moves a dependency-open address, is not a
     # subset of authority_image_update_scope and falls through unchanged.
+    elif authority_proof_enable_transition:
+        plan_mode = "authority-proof-enable"
+        _require_create_shapes(
+            set(AUTHORITY_PROOF_RESOURCES),
+            by_address,
+            "attended-proof Authority resources must be new",
+        )
+        _check_authority_proof_enable_transition(plan, by_address)
+    elif authority_proof_disable_transition:
+        plan_mode = "authority-proof-disable"
+        _check_authority_proof_disable_transition(plan, by_address)
     elif authority_image_update_transition:
         plan_mode = "authority-image-update"
         _check_authority_image_update(changed, by_address, plan)
@@ -9462,7 +10182,7 @@ def check_plan(
             "contract binding, the exact provisioned-cell catalog create, the exact "
             "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact Authority alarm "
-            "routing slice, the exact "
+            "routing slice, the exact attended-proof enablement or rollback, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
             "image update, Hub PrivateLink "
@@ -9480,6 +10200,14 @@ def check_plan(
         # applyability below, and binds the mode into the contract summary.
         plan_mode = "legacy-otp-user-delete"
 
+    if proof_mode and plan_mode != "authority-proof-enable":
+        _check_authority_proof_steady_output(
+            plan,
+            by_address[
+                "module.control.terraform_data.foundation_contract"
+            ]["change"]["after"],
+        )
+
     # runtime_mode / hub_worker_mode with no non-no-op change is the steady
     # post-slice state; the scoped policies, endpoint opens, and SG ingress are
     # still validated below regardless of transition vs steady.
@@ -9487,6 +10215,7 @@ def check_plan(
         by_address,
         catalog_mode=catalog_mode,
         runtime_mode=runtime_mode,
+        proof_mode=proof_mode,
         hub_worker_mode=hub_worker_mode,
         refresh_disabled=refresh_disabled,
     )
@@ -9541,11 +10270,19 @@ def check_plan(
             # value, and the image transition remains pinned to its exact
             # reviewed from/to URIs and evidence.
             "authority-image-update",
+            # The publisher-owned digest may have advanced since the last
+            # Control apply. The attended-proof transition binds the freshly
+            # generated contract to that same immutable digest, while the
+            # normalization checker still requires the SSM resource itself to
+            # remain an exact no-op at the refreshed value.
+            "authority-proof-enable",
+            "authority-proof-disable",
         ):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "
                 "Redis split, the legacy OTP Redis user delete, contract "
-                "binding, or authority image transition"
+                "binding, authority image transition, or attended-proof "
+                "enablement/rollback"
             )
         if plan_mode == "no-op" and "resource_changes" in plan:
             raise ContractError(
@@ -9644,6 +10381,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     catalog_extra = set(PROVISIONED_CELL_RESOURCES)
     base_expected = (set(EXPECTED_RESOURCES) - catalog_extra) | data_expected
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    proof_extra = set(AUTHORITY_PROOF_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
     # data sources (the published image digest and the keygen zip); presence is
@@ -9653,8 +10391,14 @@ def check_state_list(path: Path) -> dict[str, int]:
     hub_worker_extra = hub_worker_managed | set(HUB_WORKER_DATA_RESOURCES)
     catalog_present = bool(addresses & catalog_extra)
     runtime_present = bool(addresses & runtime_extra)
+    proof_present = bool(addresses & proof_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
+    if proof_present and not runtime_present:
+        raise ContractError(
+            "attended-proof Authority slice requires the complete runtime slice "
+            "in state"
+        )
     if hub_worker_present and not (hub_edge_present and runtime_present):
         raise ContractError(
             "Hub worker slice requires both the Hub edge slice and the authority "
@@ -9664,6 +10408,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         base_expected
         | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
+        | (proof_extra if proof_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -9683,6 +10428,7 @@ def check_state_list(path: Path) -> dict[str, int]:
             - len(PROVISIONED_CELL_RESOURCES)
             + (len(PROVISIONED_CELL_RESOURCES) if catalog_present else 0)
             + (len(AUTHORITY_RUNTIME_RESOURCES) if runtime_present else 0)
+            + (len(AUTHORITY_PROOF_RESOURCES) if proof_present else 0)
             + (len(HUB_EDGE_RESOURCES) if hub_edge_present else 0)
             + (len(HUB_WORKER_RESOURCES) if hub_worker_present else 0)
         ),
@@ -9942,13 +10688,20 @@ def check_state(state: Any) -> dict[str, Any]:
     catalog_extra = set(PROVISIONED_CELL_RESOURCES)
     base_expected = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
+    proof_extra = set(AUTHORITY_PROOF_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
     actual_addresses = set(by_address)
     catalog_present = bool(actual_addresses & catalog_extra)
     runtime_present = bool(actual_addresses & runtime_extra)
+    proof_present = bool(actual_addresses & proof_extra)
     hub_edge_present = bool(actual_addresses & hub_edge_extra)
     hub_worker_present = bool(actual_addresses & hub_worker_extra)
+    if proof_present and not runtime_present:
+        raise ContractError(
+            "attended-proof Authority slice requires the complete runtime slice "
+            "in refreshed state"
+        )
     if hub_worker_present and not (hub_edge_present and runtime_present):
         raise ContractError(
             "Hub worker slice requires both the Hub edge slice and the authority "
@@ -9958,6 +10711,7 @@ def check_state(state: Any) -> dict[str, Any]:
         base_expected
         | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
+        | (proof_extra if proof_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -9976,6 +10730,8 @@ def check_state(state: Any) -> dict[str, Any]:
         state_expected_resources.update(PROVISIONED_CELL_RESOURCES)
     if runtime_present:
         state_expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
+    if proof_present:
+        state_expected_resources.update(AUTHORITY_PROOF_RESOURCES)
     if hub_edge_present:
         state_expected_resources.update(HUB_EDGE_RESOURCES)
     if hub_worker_present:
@@ -9989,7 +10745,9 @@ def check_state(state: Any) -> dict[str, Any]:
 
     values = {address: item["values"] for address, item in by_address.items()}
     foundation = values["module.control.terraform_data.foundation_contract"]
-    if not _require_authority_runtime_binding(foundation):
+    if not _require_authority_runtime_binding(
+        foundation, proof_enabled=proof_present
+    ):
         raise ContractError("refreshed state is missing the Authority runtime binding")
     if catalog_present:
         for address in PROVISIONED_CELL_RESOURCES:
@@ -10019,6 +10777,33 @@ def check_state(state: Any) -> dict[str, Any]:
     ):
         raise ContractError(
             "refreshed state provisioned-cell catalog output is not exact"
+        )
+    proof_alias_output = (
+        outputs.get(AUTHORITY_PROOF_ALIAS_OUTPUT)
+        if isinstance(outputs, dict)
+        else None
+    )
+    selected_color = foundation["input"]["authority_runtime_contract"][
+        "selected_authority_color"
+    ]
+    expected_proof_alias = (
+        f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+        f"{AUTHORITY_PROOF_FUNCTION_NAME}:{selected_color}"
+    )
+    if proof_present:
+        if (
+            not _is_exact_nonsensitive_output_entry(proof_alias_output)
+            or proof_alias_output.get("value") != expected_proof_alias
+        ):
+            raise ContractError(
+                "refreshed state attended-proof alias output is not exact"
+            )
+    elif proof_alias_output is not None and (
+        not _is_exact_nonsensitive_output_entry(proof_alias_output)
+        or proof_alias_output.get("value") is not None
+    ):
+        raise ContractError(
+            "dark refreshed state proof alias output must be omitted or null"
         )
     vpc_id = values["module.control.aws_vpc.control"].get("id")
     if (
@@ -10378,7 +11163,9 @@ def check_state(state: Any) -> dict[str, Any]:
         raise ContractError("dark DynamoDB endpoint contract failed")
     if runtime_present:
         _check_authority_dynamodb_endpoint_policy(
-            dynamodb, "module.control.aws_vpc_endpoint.dynamodb"
+            dynamodb,
+            "module.control.aws_vpc_endpoint.dynamodb",
+            proof_enabled=proof_present,
         )
     elif json.loads(dynamodb.get("policy", "{}")) != deny_policy:
         raise ContractError("dark DynamoDB endpoint contract failed")
@@ -10706,6 +11493,7 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
     # named constants and each is matched whole, so this admits two exact live
     # shapes rather than relaxing the check to a subset or prefix test.
     complete_authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS)
+    proof_authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF)
     legacy_authority_functions = set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)
     if live_lambda_names not in (
         set(),
@@ -10713,12 +11501,15 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
         legacy_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
         complete_authority_functions,
         complete_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
+        proof_authority_functions,
+        proof_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
     ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "3 legacy Hub-facing Authority functions or the exact 11 complete "
-            "Authority functions (either optionally plus the Hub keygen once the "
-            "worker slice is live) are admitted"
+            "3 legacy Hub-facing Authority functions, the exact 11 complete "
+            "Authority functions, or the exact 12-function attended-proof graph "
+            "(each optionally plus the Hub keygen once the worker slice is live) "
+            "are admitted"
         )
     # The Hub public UDP edge (slice 5a) is the authority's only load balancer,
     # and it exists in lockstep with the tagged public-edge route table proven

@@ -289,10 +289,10 @@ variable "authority_proof_mutation_controls_enabled" {
          into the hub or cell graphs. They never appear in
          authority_selected_alias_targets.hub or .cells, so neither the Hub task
          role nor any cell server role can name the alias in its invoke policy.
-      3. caller: only the attended proof controller identity supplied through
-         authority_proof_mutation_controller_role_arns may invoke the alias.
-         That identity is a protected GitHub environment role, not a runtime
-         caller, and no ordinary UDP traffic path reaches it.
+      3. caller: Control attaches one exact selected-alias invoke policy to the
+         deterministic pre-created sandbox proof-controller role in the same
+         saved plan. The proof-runner state owns the role only; it cannot supply
+         or retain an inactive alias grant.
       4. data: the execution role is fenced by dynamodb:LeadingKeys to exactly
          the dedicated proof owner partition plus the PROOF directive
          partition, so the control cannot read or write any other tenant's
@@ -332,15 +332,11 @@ variable "authority_proof_mutation_owner_id" {
 
 variable "authority_proof_mutation_controller_role_arns" {
   description = <<-EOT
-    Exact IAM role ARNs of the attended proof controller identities permitted to
-    invoke the mutation control alias. Empty unless
-    authority_proof_mutation_controls_enabled is true.
-
-    These must be the NHP-owned protected GitHub environment controller roles
-    (terraform/modules/udp-proof-runner controller), never the proof runner
-    instance role, never the Hub task role, and never a cell server role. The
-    module rejects any ARN outside the current partition and account, and any
-    role whose name matches a Hub or cell server runtime role.
+    Closed contract mirror for the deterministic attended proof-controller role
+    whose selected ca-pm alias policy Control owns. Empty while dark; when the
+    gate is on it must contain exactly
+    arn:<partition>:iam::<account>:role/layerv-nhp-<environment>-udp-proof-controller.
+    Arbitrary additional or alternate roles are rejected.
   EOT
   type        = list(string)
   default     = []

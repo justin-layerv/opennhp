@@ -126,6 +126,22 @@ rollback-retention fields are validation-only until
       ingress, timeout, response-write, Redis denial, and SES failure cases.
       Run this only after both NHP and qurl-service are healthy in each tested
       cell. Keep customer traffic disabled unless every failure is fail closed.
+- [ ] Rollout/rollback (DARK CA-PM CAPABILITY, sandbox only): first apply the
+      proof-runner root to establish its deterministic controller role; that
+      state owns no Authority policy, alias input, or cross-state alias output.
+      Then apply the exact Control `authority-proof-enable` saved plan. Control
+      must create ca-pm and attach one inline policy to
+      `layerv-nhp-sandbox-udp-proof-controller` whose only action is
+      `lambda:InvokeFunction` and only resource is Control's selected qualified
+      ca-pm alias. IA/RA/ICR and all six aliases must remain no-ops: this slice
+      is not the attended proof and must not bypass the later governed zero-spill
+      consumer rollout. Rollback is the exact Control
+      `authority-proof-disable` plan; its alias dependency removes the
+      controller policy before deleting the ca-pm graph, proof
+      caller/function, endpoint principal, and alias output. Finish with
+      Control state/live checks and a refresh-enabled dark no-op. Partial
+      deletion, foreign drift, a retained/inactive alias grant, or any
+      IA/RA/ICR movement blocks the operation.
 - [ ] Production: remains blocked. Prod `authority_runtime_contract`,
       `authority_runtime_contract_evidence_verified`, and
       `authority_runtime_functions_enabled` are validation-locked to

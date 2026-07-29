@@ -2,12 +2,14 @@
 
 ## Status
 
-The NHP Terraform half is implemented and dark. `authority_proof_mutation_controls_enabled`
-defaults false in both Control roots and is validation-locked false in prod, so
-no resource is created and no prod surface exists. The substantive behaviour is
-qurl-service work and is specified — not built — below. The gate must stay false
-until the qurl-service `MutateProofAgent` operation and its qurl-conformance
-operation constant ship.
+The NHP Terraform slice implemented here is dark ca-pm capability only.
+`authority_proof_mutation_controls_enabled` defaults false in both Control
+roots and is validation-locked false in prod, so no resource is created and no
+prod surface exists. Enabling the sandbox gate creates ca-pm and atomically
+attaches its selected-alias invoke policy to the deterministic pre-created
+proof-controller role; it does not modify IA/RA/ICR or make the attended proof
+operational. The substantive qurl-service behaviour and the governed consumer
+alias rollout are specified — not built — below.
 
 This unblocks the `nhp-orchestrator` inventory row
 `orchestrator.real_hub_authority_and_two_cells`, whose requirement ends with
@@ -104,21 +106,26 @@ production and away from ordinary traffic.
    policy from `.cells`, so **no runtime caller can name the alias**. A test
    asserts the alias is absent from both.
 
-3. **Only an attended controller may invoke it.** `authority_proof_mutation_controller_role_arns`
-   must be non-empty, in-partition, in-account, distinct, and is rejected if it
-   names the Hub task role or any cell server role. The module keeps the
-   no-`aws_lambda_permission` posture, so invoke authority is caller identity
-   policy only.
+3. **Only the deterministic attended controller may invoke it.** The
+   proof-runner root pre-creates
+   `layerv-nhp-sandbox-udp-proof-controller` but owns no Authority policy or
+   alias input. The Control saved plan creates one inline policy on that exact
+   role whose only action is `lambda:InvokeFunction` and whose only resource is
+   Control's selected qualified ca-pm alias. The alias and policy therefore move
+   atomically; an operator cannot retain or supply an inactive alias ARN. The
+   module keeps the no-`aws_lambda_permission` posture.
 
-4. **IAM confines the data.** The execution role's every item-level DynamoDB
-   action is conditioned on `dynamodb:LeadingKeys` restricted to exactly the
-   dedicated proof tenant partition (`OWNER#` + SHA-256 of the proof owner id,
-   derived in Terraform exactly as `agentPlacementOwnerPK` derives it) plus the
-   `PROOF` directive partition. `REGISTRY` is readable but not writable, so cell
-   provisioning stays Terraform-owned. `api_keys`, `agent_keys`, and `customers`
-   are absent entirely, and `dynamodb:DeleteItem` is never granted. **A wholly
-   incorrect handler still cannot touch another tenant**, because IAM denies the
-   request before DynamoDB evaluates it.
+4. **IAM confines the data.** Placement item actions are conditioned on
+   `dynamodb:LeadingKeys` restricted to exactly the dedicated proof tenant
+   partition (`OWNER#` + SHA-256 of the proof owner id, derived in Terraform
+   exactly as `agentPlacementOwnerPK` derives it) plus the `PROOF` directive
+   partition. Replay Get/Put/Update has its own `StringLike` fence restricted to
+   `HUB_REQUEST#MutateProofAgent#*`; a generic `HUB_REQUEST#*` grant is never
+   admitted. `REGISTRY` is readable but not writable, so cell provisioning stays
+   Terraform-owned. `api_keys`, `agent_keys`, and `customers` are absent
+   entirely, and `dynamodb:DeleteItem` is never granted. **A wholly incorrect
+   handler still cannot touch another tenant or operation's replay state**,
+   because IAM denies the request before DynamoDB evaluates it.
 
 5. **Capacity is one attended call.** The contract rejects a proof controller
    whose replicas, preinvoke limit, burst, or refill exceed one.
@@ -136,7 +143,9 @@ directive TTL, but those are defence in depth, not the fence.
 | Separate `proof` alias target, absent from hub/cell | **nhp** | implemented |
 | Execution-role `LeadingKeys` data fence | **nhp** | implemented |
 | Fence contract tests | **nhp** | implemented |
-| Controller invoke grant on the proof alias | **nhp** (`udp-proof-runner`) | follow-up, needs the alias ARN |
+| Generated proof caller/function and root inputs | **nhp** | implemented, explicit sandbox opt-in only |
+| Controller invoke grant on the proof alias | **nhp** (Control) | implemented atomically with selected ca-pm alias; proof-runner owns role only |
+| IA/RA/ICR proof-policy rollout | **nhp + qurl-service** | later governed selected-alias rollout; intentionally absent here |
 | `MoveAssignment` cross-cell transaction | **qurl-service** | specified below |
 | Proof directive store and lease override | **qurl-service** | specified below |
 | `MutateProofAgent` operation, handler, codec | **qurl-service** | specified below |
@@ -183,10 +192,16 @@ It must not appear in any production dispatch table or NHP numeric-code mapping.
 - `dynamodb_sse.go`: the operation's closed table set is exactly
   `connector-authority`.
 
-New environment variables, all rendered by the module:
+New environment variables, rendered by this dark capability slice for
+MutateProofAgent only:
 `CONNECTOR_AUTHORITY_PROOF_OWNER_ID`, `CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX`,
 `CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL`, `CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS`,
 plus the existing `CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX`.
+
+IA, RA, and ICR deliberately receive none of these variables in this PR. Their
+directive-consumer implementation and environment must land later through the
+governed zero-spill selected-alias rollout; directly republishing and retargeting
+both aliases here would bypass that controller.
 
 ### 3. Wire contract (`internal/connectorauthority/lambda_wire.go`)
 
@@ -243,8 +258,10 @@ for an agent inside the proof tenant whose id carries the proof prefix:
   `agent_credential_recovery_issue.go`). The recovery replay verifier recomputes
   the lease from `GrantIssuedAt + AgentAssignmentLeaseLifetime` and **must be
   updated in lockstep**, or the shortened lease will fail its own replay check.
-- Every other tenant and every non-prefixed agent id is completely unaffected;
-  the lookup must be skipped entirely, not merely ignored.
+- Every other tenant and every non-prefixed agent id keeps the same request
+  semantics; the lookup must be skipped entirely, not merely ignored. In this
+  dark capability PR, IA/RA/ICR are not republished and neither of their aliases
+  advances. The later governed rollout must preserve that zero-spill invariant.
 
 ### 6. The cross-cell move — the substantive work
 
@@ -302,16 +319,36 @@ create or destroy one.
 1. qurl-conformance v0.10.0 exports the operation constant.
 2. qurl-service implements the operation, the move, and the directive store, and
    publishes a new Authority image digest.
-3. NHP binds a contract that budgets `layerv-nhp-sandbox-ca-pm` and flips
-   `authority_proof_mutation_controls_enabled` in the sandbox root only.
-4. The `udp-proof-runner` controller gains `lambda:InvokeFunction` on the exact
-   qualified proof alias ARN.
-5. The attended proof arms a directive, runs the strict workflow, and the three
-   observers are cross-checked.
-6. Only then may qurl-go's blocked rows move off `todo`, together with the
+3. Apply `sandbox-udp-proof-runner` to establish the deterministic
+   `controller_role_arn`. That state owns the role only and accepts no
+   Authority alias input.
+4. Dispatch the Control sandbox workflow with runtime functions and attended
+   proof mutation explicitly enabled. The generator adds exactly
+   `proof_controller` capacity and `layerv-nhp-sandbox-ca-pm`, and emits the
+   canonical proof owner/controller root variables. In that same saved plan,
+   Control creates the selected qualified alias and attaches the controller's
+   exact invoke policy. IA/RA/ICR and both aliases remain unchanged.
+5. Land the separate qurl-service consumer implementation and governed
+   zero-spill IA/RA/ICR selected-alias rollout. This is still required before
+   any attended mutation proof may run.
+6. Only after that rollout, the attended proof arms a directive, runs the strict
+   workflow, and cross-checks the three observers.
+7. Only then may qurl-go's blocked rows move off `todo`, together with the
    `implemented`/`blocking` gate literal and the reviewed inventory mapping
    digest in all seven places.
 
 Steps 1 through 5 change no qurl-go scenario status. Nothing in this design
 weakens a fail-closed check or converts an unavailable operation into a
 simulated green result.
+
+## Rollback ordering
+
+Rollback is one exact Control saved plan because Control owns both capability
+ends. Dispatch with runtime functions still enabled and attended proof mutation
+disabled. The strict `authority-proof-disable` plan first removes the
+controller's inline invoke policy through its explicit alias dependency, then
+removes exactly `proof_controller` and ca-pm from the foundation, ca-pm from the
+DynamoDB endpoint principals, the complete ca-pm resource/alarm graph, and the
+proof alias output. IA/RA/ICR and all six aliases remain exact no-ops. Verify the
+Control state/live lanes without the proof slice and require a refresh-enabled
+dark no-op before considering rollback complete.

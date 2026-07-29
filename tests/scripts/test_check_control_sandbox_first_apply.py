@@ -1016,11 +1016,44 @@ def authority_runtime_input_with_concurrency() -> dict:
     return payload
 
 
-def runtime_scoped_endpoint_policies() -> tuple[str, str, str, str]:
+def authority_runtime_input_with_proof() -> dict:
+    payload = authority_runtime_input_with_concurrency()
+    contract = payload["authority_runtime_contract"]
+    evidence = copy.deepcopy(contract["global"]["basis_evidence"])
+    contract["global"]["caller_capacity"]["proof_controller"] = {
+        "max_replicas": 1,
+        "preinvoke_limits": {CHECKER.AUTHORITY_PROOF_OPERATION: 1},
+        "preinvoke_rate_limits": {
+            CHECKER.AUTHORITY_PROOF_OPERATION: {
+                "burst": 1,
+                "refill_per_second": 1,
+            }
+        },
+    }
+    contract["functions"][CHECKER.AUTHORITY_PROOF_FUNCTION_NAME] = {
+        "basis_evidence": evidence,
+        "max_caller_in_flight": 1,
+        "max_caller_requests_per_second": 2,
+        "result_evidence": None,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 1,
+        "rollout_reserved_concurrency": 2,
+        "rollout_standby_provisioned_concurrency": 1,
+        "steady_provisioned_concurrency": 1,
+        "steady_reserved_concurrency": 1,
+    }
+    return payload
+
+
+def runtime_scoped_endpoint_policies(
+    *, proof_enabled: bool = False
+) -> tuple[str, str, str, str]:
     # VPC endpoint policies do not match an assumed-role session against a
     # role-ARN Principal, so the runtime grants use Principal "*" scoped by an
     # exact aws:PrincipalArn condition. Keep this fixture in that shape.
     roles = sorted(CHECKER.AUTHORITY_RUNTIME_EXEC_ROLE_ARNS)
+    if proof_enabled:
+        roles.extend(sorted(CHECKER.AUTHORITY_PROOF_EXEC_ROLE_ARNS))
     dynamodb = json.dumps(
         {
             "Version": "2012-10-17",
@@ -1242,6 +1275,97 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                 "Resource": sorted(CHECKER.AUTHORITY_RUNTIME_SES_RESOURCES),
             }
         )
+    return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
+
+def proof_runtime_exec_policy() -> str:
+    fn = CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+    table = sorted(
+        CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+    )
+    owner_partition = (
+        "OWNER#"
+        + __import__("hashlib")
+        .sha256(CHECKER.AUTHORITY_PROOF_OWNER_ID.encode("utf-8"))
+        .hexdigest()
+    )
+    read_actions = sorted(
+        set(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS)
+        - {"dynamodb:DescribeTable"}
+    )
+    statements = [
+        {
+            "Sid": "LambdaVpcEni",
+            "Effect": "Allow",
+            "Action": sorted(CHECKER.AUTHORITY_RUNTIME_ENI_ACTIONS),
+            "Resource": "*",
+        },
+        {
+            "Sid": "OwnLogStream",
+            "Effect": "Allow",
+            "Action": sorted(CHECKER.AUTHORITY_RUNTIME_LOG_ACTIONS),
+            "Resource": [
+                f"arn:aws:logs:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                f"log-group:/aws/lambda/{fn}:*"
+            ],
+        },
+        {
+            "Sid": "ProofVerifyTableEncryption",
+            "Effect": "Allow",
+            "Action": ["dynamodb:DescribeTable"],
+            "Resource": table,
+        },
+        {
+            "Sid": "ProofFencedPlacementRead",
+            "Effect": "Allow",
+            "Action": read_actions,
+            "Resource": table,
+            "Condition": {
+                "ForAllValues:StringEquals": {
+                    "dynamodb:LeadingKeys": [owner_partition, "PROOF"]
+                }
+            },
+        },
+        {
+            "Sid": "ProofRegistryRead",
+            "Effect": "Allow",
+            "Action": read_actions,
+            "Resource": table,
+            "Condition": {
+                "ForAllValues:StringEquals": {
+                    "dynamodb:LeadingKeys": ["REGISTRY"]
+                }
+            },
+        },
+        {
+            "Sid": "ProofFencedPlacementWrite",
+            "Effect": "Allow",
+            "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+            "Resource": table,
+            "Condition": {
+                "ForAllValues:StringEquals": {
+                    "dynamodb:LeadingKeys": [owner_partition, "PROOF"]
+                }
+            },
+        },
+        {
+            "Sid": "ProofReplayReadWrite",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            ],
+            "Resource": table,
+            "Condition": {
+                "ForAllValues:StringLike": {
+                    "dynamodb:LeadingKeys": [
+                        "HUB_REQUEST#MutateProofAgent#*"
+                    ]
+                }
+            },
+        },
+    ]
     return json.dumps({"Version": "2012-10-17", "Statement": statements})
 
 
@@ -1589,6 +1713,171 @@ def _runtime_resource_changes() -> list[dict]:
     return changes
 
 
+def _proof_environment() -> dict[str, str]:
+    return {
+        "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": CHECKER.AUTHORITY_PROOF_OWNER_ID,
+        "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
+        "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
+        "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
+    }
+
+
+def _proof_resource_changes(payload: dict) -> list[dict]:
+    fn = CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+    spec = payload["authority_runtime_contract"]["functions"][fn]
+    functions = payload["authority_runtime_contract"]["functions"]
+    changes = [
+        {
+            "address": address,
+            "mode": "managed",
+            "type": resource_type,
+            "change": _runtime_create(_authority_alarm_after(address, functions)),
+        }
+        for address, resource_type in CHECKER.AUTHORITY_PROOF_ALARM_RESOURCES.items()
+    ]
+    changes.extend(
+        [
+            {
+                "address": CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
+                "mode": "managed",
+                "type": "aws_iam_role_policy",
+                "change": _runtime_create(
+                    {
+                        "name": "connector-authority-proof-invoke",
+                        "role": "layerv-nhp-sandbox-udp-proof-controller",
+                        "policy": json.dumps(
+                            {
+                                "Statement": [
+                                    {
+                                        "Action": ["lambda:InvokeFunction"],
+                                        "Effect": "Allow",
+                                        "Resource": [
+                                            (
+                                                "arn:aws:lambda:us-east-2:"
+                                                "767397897469:function:"
+                                                "layerv-nhp-sandbox-ca-pm:blue"
+                                            )
+                                        ],
+                                        "Sid": "InvokeSelectedProofMutationAlias",
+                                    }
+                                ],
+                                "Version": "2012-10-17",
+                            }
+                        ),
+                    }
+                ),
+            },
+            {
+                "address": f'module.control.aws_lambda_function.authority["{fn}"]',
+                "mode": "managed",
+                "type": "aws_lambda_function",
+                "change": _runtime_create(
+                    {
+                        "function_name": fn,
+                        "package_type": "Image",
+                        "image_uri": payload["authority_image_uri"],
+                        "reserved_concurrent_executions": spec[
+                            "steady_reserved_concurrency"
+                        ],
+                        "vpc_config": [
+                            {"subnet_ids": [], "security_group_ids": []}
+                        ],
+                        "environment": [{"variables": _proof_environment()}],
+                    }
+                ),
+            },
+            *[
+                {
+                    "address": (
+                        f'module.control.aws_lambda_alias.authority["{fn}:{color}"]'
+                    ),
+                    "mode": "managed",
+                    "type": "aws_lambda_alias",
+                    "change": _runtime_create(
+                        {
+                            "function_name": fn,
+                            "name": color,
+                            "routing_config": [],
+                        }
+                    ),
+                }
+                for color in ("blue", "green")
+            ],
+            {
+                "address": (
+                    "module.control.aws_lambda_provisioned_concurrency_config."
+                    f'authority["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_lambda_provisioned_concurrency_config",
+                "change": _runtime_create(
+                    {
+                        "provisioned_concurrent_executions": spec[
+                            "steady_provisioned_concurrency"
+                        ],
+                        "qualifier": "blue",
+                    }
+                ),
+            },
+            {
+                "address": f'module.control.aws_iam_role.authority_exec["{fn}"]',
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": _runtime_create(
+                    {
+                        "assume_role_policy": runtime_exec_trust(fn),
+                        "managed_policy_arns": [],
+                        "max_session_duration": 3600,
+                        "permissions_boundary": None,
+                    }
+                ),
+            },
+            {
+                "address": (
+                    f'module.control.aws_iam_role_policy.authority_exec["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_iam_role_policy",
+                "change": _runtime_create(
+                    {
+                        "name": "connector-authority-mutate_proof_agent",
+                        "policy": proof_runtime_exec_policy(),
+                    }
+                ),
+            },
+            {
+                "address": (
+                    f'module.control.aws_cloudwatch_log_group.authority["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_cloudwatch_log_group",
+                "change": _runtime_create({"name": f"/aws/lambda/{fn}"}),
+            },
+        ]
+    )
+    spillover_address = (
+        "module.control.aws_cloudwatch_metric_alarm."
+        f'authority_spillover["{fn}"]'
+    )
+    changes.append(
+        {
+            "address": spillover_address,
+            "mode": "managed",
+            "type": "aws_cloudwatch_metric_alarm",
+            "change": _runtime_create(
+                {
+                    "alarm_name": f"{fn}-provisioned-concurrency-spillover",
+                    **_authority_alarm_after(spillover_address, functions),
+                }
+            ),
+        }
+    )
+    assert {item["address"] for item in changes} == set(
+        CHECKER.AUTHORITY_PROOF_RESOURCES
+    )
+    return changes
+
+
 def authority_runtime_transition_fixture() -> dict:
     """The full runtime graph plus its exact dependency endpoint/SG opens."""
     result = plan_fixture()
@@ -1892,6 +2181,129 @@ def authority_runtime_steady_fixture() -> dict:
         # Steady state: the applied value is both before and after.
         change["before"] = copy.deepcopy(change["after"])
         change["after_unknown"] = {}
+    return result
+
+
+def authority_proof_enable_fixture() -> dict:
+    """Exact attended gate-off -> proof-on Control plan."""
+    result = authority_runtime_steady_fixture()
+    result["applyable"] = True
+    changes = {
+        item["address"]: item["change"] for item in result["resource_changes"]
+    }
+    before_payload = authority_runtime_input_with_concurrency()
+    after_payload = authority_runtime_input_with_proof()
+
+    foundation = changes["module.control.terraform_data.foundation_contract"]
+    foundation["actions"] = ["update"]
+    foundation["before"] = {
+        "input": copy.deepcopy(before_payload),
+        "output": copy.deepcopy(before_payload),
+    }
+    foundation["after"] = {
+        "input": copy.deepcopy(after_payload),
+        "output": copy.deepcopy(after_payload),
+    }
+    foundation["after_unknown"] = {}
+
+    ddb = changes[CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS]
+    dark_ddb, _, _, _ = runtime_scoped_endpoint_policies()
+    proof_ddb, _, _, _ = runtime_scoped_endpoint_policies(proof_enabled=True)
+    ddb["actions"] = ["update"]
+    ddb["before"] = {**copy.deepcopy(ddb["after"]), "policy": dark_ddb}
+    ddb["after"] = {**copy.deepcopy(ddb["after"]), "policy": proof_ddb}
+
+    result["resource_changes"].extend(_proof_resource_changes(after_payload))
+
+    outputs = control_outputs_fixture()
+    selected_alias = (
+        f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:function:"
+        f"{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:blue"
+    )
+    outputs[CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT] = {
+        "sensitive": False,
+        "type": "string",
+        "value": selected_alias,
+    }
+    result["planned_values"]["outputs"] = copy.deepcopy(outputs)
+    result["output_changes"] = {
+        name: {
+            "actions": ["no-op"],
+            "after": copy.deepcopy(output["value"]),
+            "after_sensitive": False,
+            "after_unknown": False,
+            "before": copy.deepcopy(output["value"]),
+            "before_sensitive": False,
+        }
+        for name, output in outputs.items()
+    }
+    result["output_changes"][CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT].update(
+        {"actions": ["create"], "before": None}
+    )
+    return result
+
+
+def authority_proof_disable_fixture() -> dict:
+    """Exact attended proof-on -> gate-off Control rollback plan."""
+    result = authority_proof_enable_fixture()
+    changes = {
+        item["address"]: item["change"] for item in result["resource_changes"]
+    }
+
+    foundation = changes["module.control.terraform_data.foundation_contract"]
+    foundation["before"], foundation["after"] = (
+        copy.deepcopy(foundation["after"]),
+        copy.deepcopy(foundation["before"]),
+    )
+
+    ddb = changes[CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS]
+    ddb["before"], ddb["after"] = (
+        copy.deepcopy(ddb["after"]),
+        copy.deepcopy(ddb["before"]),
+    )
+
+    for address in CHECKER.AUTHORITY_PROOF_RESOURCES:
+        change = changes[address]
+        change.update(
+            {
+                "actions": ["delete"],
+                "before": copy.deepcopy(change["after"]),
+                "after": None,
+                "after_unknown": {},
+            }
+        )
+
+    selected_alias = result["output_changes"][
+        CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+    ]["after"]
+    del result["planned_values"]["outputs"][
+        CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+    ]
+    result["output_changes"][CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT].update(
+        {
+            "actions": ["delete"],
+            "before": selected_alias,
+            "after": None,
+        }
+    )
+    return result
+
+
+def authority_proof_steady_fixture() -> dict:
+    result = authority_proof_enable_fixture()
+    result["applyable"] = False
+    for item in result["resource_changes"]:
+        change = item["change"]
+        if change["actions"] == ["no-op"]:
+            continue
+        change["actions"] = ["no-op"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+    proof_output = result["output_changes"][
+        CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+    ]
+    proof_output["actions"] = ["no-op"]
+    proof_output["before"] = copy.deepcopy(proof_output["after"])
     return result
 
 
@@ -4570,6 +4982,31 @@ class PlanContractTests(unittest.TestCase):
         wrong_before["output_changes"][output_name]["before"] = "different"
         self.assert_rejected(wrong_before, wrong_before_state)
 
+        dark_proof, dark_proof_state = publisher_refresh_candidate()
+        dark_proof["planned_values"]["outputs"][
+            CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+        ] = {
+            "sensitive": False,
+            "type": "dynamic",
+            "value": None,
+        }
+        dark_proof["output_changes"][CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT].update(
+            {"before": None, "after": None}
+        )
+        del dark_proof_state["values"]["outputs"][
+            CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+        ]
+        self.assertEqual(
+            CHECKER.check_plan(dark_proof, dark_proof_state)["plan_mode"],
+            "no-op",
+        )
+
+        omitted_live, omitted_live_state = publisher_refresh_candidate()
+        del omitted_live_state["values"]["outputs"][
+            CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+        ]
+        self.assert_rejected(omitted_live, omitted_live_state)
+
         sentinel = "super-secret-output-value-7f510f845f8e"
         extra_output, extra_output_state = publisher_refresh_candidate()
         extra_output["planned_values"]["outputs"][sentinel] = {
@@ -5484,6 +5921,227 @@ class PlanContractTests(unittest.TestCase):
             len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
         self.assertEqual(summary["bootstrap_create_count"], 0)
+
+    def test_exact_authority_proof_enablement_passes(self) -> None:
+        candidate = authority_proof_enable_fixture()
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-proof-enable")
+        self.assertEqual(
+            summary["resource_count"],
+            len(CHECKER.EXPECTED_RESOURCES)
+            + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
+            + len(CHECKER.AUTHORITY_PROOF_RESOURCES),
+        )
+        self.assertEqual(
+            {
+                item["address"]
+                for item in candidate["resource_changes"]
+                if item["change"]["actions"] != ["no-op"]
+            },
+            set(CHECKER.AUTHORITY_PROOF_ENABLE_ALL_CHANGES),
+        )
+        self.assertEqual(
+            CHECKER.check_plan(authority_proof_steady_fixture())["plan_mode"],
+            "no-op",
+        )
+
+    def test_exact_authority_proof_disable_passes_and_dark_remains_noop(
+        self,
+    ) -> None:
+        summary = CHECKER.check_plan(authority_proof_disable_fixture())
+        self.assertEqual(summary["plan_mode"], "authority-proof-disable")
+        self.assertEqual(
+            CHECKER.check_plan(authority_runtime_steady_fixture())["plan_mode"],
+            "no-op",
+        )
+
+    def test_authority_proof_disable_rejects_partial_foreign_or_extra_graph(
+        self,
+    ) -> None:
+        partial = authority_proof_disable_fixture()
+        removed = next(iter(CHECKER.AUTHORITY_PROOF_RESOURCES))
+        partial["resource_changes"] = [
+            item for item in partial["resource_changes"]
+            if item["address"] != removed
+        ]
+        self.assert_rejected(partial)
+
+        foreign = authority_proof_disable_fixture()
+        foundation = self.change(
+            foreign, "module.control.terraform_data.foundation_contract"
+        )
+        foundation["after"]["input"]["authority_image_uri"] = (
+            "public.ecr.aws/foreign/authority@sha256:" + "f" * 64
+        )
+        foundation["after"]["output"] = copy.deepcopy(
+            foundation["after"]["input"]
+        )
+        self.assert_rejected(foreign)
+
+        extra = authority_proof_disable_fixture()
+        unrelated = self.change(
+            extra, "module.control.aws_security_group.interface_endpoints"
+        )
+        unrelated["actions"] = ["update"]
+        unrelated["before"] = {
+            **copy.deepcopy(unrelated["after"]),
+            "description": "foreign drift",
+        }
+        self.assert_rejected(extra)
+
+    def test_authority_proof_disable_rejects_output_env_or_iam_drift(
+        self,
+    ) -> None:
+        output = authority_proof_disable_fixture()
+        output["planned_values"]["outputs"][
+            CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT
+        ] = {
+            "sensitive": False,
+            "type": "dynamic",
+            "value": None,
+        }
+        self.assert_rejected(output)
+
+        environment = authority_proof_disable_fixture()
+        function_change = self.change(
+            environment,
+            (
+                "module.control.aws_lambda_function.authority"
+                f'["{next(iter(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS))}"]'
+            ),
+        )
+        function_change["actions"] = ["update"]
+        function_change["before"] = copy.deepcopy(function_change["after"])
+        function_change["after"] = {
+            **copy.deepcopy(function_change["after"]),
+            "environment": [{"variables": _proof_environment()}],
+        }
+        self.assert_rejected(environment)
+
+        endpoint = authority_proof_disable_fixture()
+        ddb = self.change(endpoint, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        proof_policy = json.loads(ddb["before"]["policy"])
+        ddb["after"]["policy"] = json.dumps(proof_policy)
+        self.assert_rejected(endpoint)
+
+        replay = authority_proof_disable_fixture()
+        policy_change = self.change(
+            replay,
+            (
+                "module.control.aws_iam_role_policy.authority_exec"
+                f'["{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}"]'
+            ),
+        )
+        policy = json.loads(policy_change["before"]["policy"])
+        replay_statement = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ProofReplayReadWrite"
+        )
+        replay_statement["Condition"]["ForAllValues:StringLike"][
+            "dynamodb:LeadingKeys"
+        ] = ["HUB_REQUEST#*"]
+        policy_change["before"]["policy"] = json.dumps(policy)
+        self.assert_rejected(replay)
+
+        controller = authority_proof_disable_fixture()
+        controller_policy = self.change(
+            controller, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )
+        invoke = json.loads(controller_policy["before"]["policy"])
+        invoke["Statement"][0]["Resource"] = [
+            (
+                f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                f"function:{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"
+            )
+        ]
+        controller_policy["before"]["policy"] = json.dumps(invoke)
+        self.assert_rejected(controller)
+
+    def test_authority_proof_enablement_rejects_partial_or_foreign_graph(
+        self,
+    ) -> None:
+        partial = authority_proof_enable_fixture()
+        removed = next(iter(CHECKER.AUTHORITY_PROOF_RESOURCES))
+        partial["resource_changes"] = [
+            item for item in partial["resource_changes"]
+            if item["address"] != removed
+        ]
+        self.assert_rejected(partial)
+
+        foreign = authority_proof_enable_fixture()
+        foundation = self.change(
+            foreign, "module.control.terraform_data.foundation_contract"
+        )
+        functions = foundation["after"]["input"]["authority_runtime_contract"][
+            "functions"
+        ]
+        functions["layerv-nhp-sandbox-ca-pm-foreign"] = functions.pop(
+            CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+        )
+        self.assert_rejected(foreign)
+
+    def test_authority_proof_enablement_rejects_security_or_output_drift(
+        self,
+    ) -> None:
+        replay = authority_proof_enable_fixture()
+        policy_change = self.change(
+            replay,
+            (
+                "module.control.aws_iam_role_policy.authority_exec"
+                f'["{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}"]'
+            ),
+        )
+        policy = json.loads(policy_change["after"]["policy"])
+        replay_statement = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ProofReplayReadWrite"
+        )
+        replay_statement["Condition"]["ForAllValues:StringLike"][
+            "dynamodb:LeadingKeys"
+        ] = ["HUB_REQUEST#*"]
+        policy_change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(replay)
+
+        environment = authority_proof_enable_fixture()
+        function_change = self.change(
+            environment,
+            (
+                "module.control.aws_lambda_function.authority"
+                f'["{next(iter(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS))}"]'
+            ),
+        )
+        function_change["actions"] = ["update"]
+        function_change["before"] = copy.deepcopy(function_change["after"])
+        function_change["after"] = {
+            **copy.deepcopy(function_change["after"]),
+            "environment": [{"variables": _proof_environment()}],
+        }
+        self.assert_rejected(environment)
+
+        controller = authority_proof_enable_fixture()
+        controller_policy = self.change(
+            controller, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )
+        invoke = json.loads(controller_policy["after"]["policy"])
+        invoke["Statement"][0]["Resource"] = [
+            (
+                f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                f"function:{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"
+            )
+        ]
+        controller_policy["after"]["policy"] = json.dumps(invoke)
+        self.assert_rejected(controller)
+
+        output = authority_proof_enable_fixture()
+        output["output_changes"][CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT][
+            "after"
+        ] = (
+            f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+            f"function:{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"
+        )
+        self.assert_rejected(output)
 
     def test_exact_legacy_hub_runtime_expansion_passes(self) -> None:
         candidate = authority_runtime_legacy_expansion_fixture()

@@ -73,6 +73,13 @@ EXPECTED_CELL_OPERATION_SUFFIXES = {
     "complete_registration": "cr",
     "complete_credential_recovery": "ccr",
 }
+EXPECTED_PROOF_OWNER_ID = "layerv-nhp-sandbox-udp-proof"
+EXPECTED_PROOF_CONTROLLER_ROLE_ARN = (
+    "arn:aws:iam::767397897469:"
+    "role/layerv-nhp-sandbox-udp-proof-controller"
+)
+EXPECTED_PROOF_FUNCTION = "layerv-nhp-sandbox-ca-pm"
+EXPECTED_PROOF_OPERATION = "mutate_proof_agent"
 TOP_KEYS = {"schema_version", "contract"}
 CONTRACT_KEYS = {
     "schema_version",
@@ -489,8 +496,37 @@ def generated_input(
     runtime_functions_enabled: bool = False,
     hub_edge_enabled: bool = False,
     hub_worker_enabled: bool = False,
+    proof_mutation_controls_enabled: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
+    if proof_mutation_controls_enabled:
+        if not runtime_functions_enabled:
+            fail(
+                "proof mutation controls require authority runtime functions "
+                "to be enabled"
+            )
+        generated["global"]["caller_capacity"]["proof_controller"] = {
+            "max_replicas": 1,
+            "preinvoke_limits": {
+                EXPECTED_PROOF_OPERATION: 1,
+            },
+            "preinvoke_rate_limits": {
+                EXPECTED_PROOF_OPERATION: {
+                    "burst": 1,
+                    "refill_per_second": 1,
+                },
+            },
+        }
+        generated["functions"][EXPECTED_PROOF_FUNCTION] = {
+            "steady_provisioned_concurrency": 1,
+            "steady_reserved_concurrency": 1,
+            "rollout_active_provisioned_concurrency": 1,
+            "rollout_standby_provisioned_concurrency": 1,
+            "rollout_reserved_concurrency": 2,
+            "max_caller_in_flight": 1,
+            "max_caller_requests_per_second": 2,
+            "rollback_retention_seconds": 3600,
+        }
     generated["provisioned_cells_evidence"] = evidence
     generated["global"]["basis_evidence"] = evidence
     generated["global"]["result_evidence"] = None
@@ -522,6 +558,16 @@ def generated_input(
     # live authority runtime.
     if hub_worker_enabled:
         payload["hub_worker_enabled"] = True
+    # Fifth, independent sandbox-only dark mutation capability. The exact caller
+    # capacity, ca-pm function, owner, and controller identity are generated as
+    # one closed unit. Omitting the opt-in leaves every proof key and graph node
+    # absent, preserving the current non-proof tfvars byte-for-byte.
+    if proof_mutation_controls_enabled:
+        payload["authority_proof_mutation_controls_enabled"] = True
+        payload["authority_proof_mutation_owner_id"] = EXPECTED_PROOF_OWNER_ID
+        payload["authority_proof_mutation_controller_role_arns"] = [
+            EXPECTED_PROOF_CONTROLLER_ROLE_ARN
+        ]
     return payload
 
 
@@ -584,6 +630,17 @@ def main(argv: list[str] | None = None) -> int:
             "Requires hub_edge_enabled and a live authority runtime."
         ),
     )
+    parser.add_argument(
+        "--proof-mutation-controls-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Also add the exact sandbox proof_controller capacity and ca-pm "
+            "function to the generated contract, and emit the dark capability "
+            "gate, owner, and deterministic controller root variable. This does "
+            "not wire IA/RA/ICR or run proof. Requires --runtime-functions-enabled."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -601,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_functions_enabled=args.runtime_functions_enabled,
                 hub_edge_enabled=args.hub_edge_enabled,
                 hub_worker_enabled=args.hub_worker_enabled,
+                proof_mutation_controls_enabled=args.proof_mutation_controls_enabled,
             )
         )
         atomic_write(args.output, payload)
@@ -608,7 +666,10 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "environment": EXPECTED_ENVIRONMENT,
-                    "function_count": len(contract["functions"]),
+                    "function_count": (
+                        len(contract["functions"])
+                        + int(args.proof_mutation_controls_enabled)
+                    ),
                     "manifest_path": evidence["path"],
                     "manifest_sha256": evidence["sha256"],
                     "source_commit": evidence["source_commit"],

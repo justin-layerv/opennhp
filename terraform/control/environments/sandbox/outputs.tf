@@ -75,6 +75,11 @@ output "authority_image_digest_parameter_name" {
   value = module.control.authority_image_digest_parameter_name
 }
 
+output "authority_proof_mutation_alias_arn" {
+  description = "Exact selected-color ca-pm alias Control grants atomically to the deterministic proof-controller role, or null while dark."
+  value       = try(module.control.authority_selected_alias_targets.proof.mutate_proof_agent, null)
+}
+
 output "authority_publisher_role_arn" {
   value = module.control.authority_publisher_role_arn
 }

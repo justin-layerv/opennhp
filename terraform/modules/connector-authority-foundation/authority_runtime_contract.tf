@@ -608,16 +608,11 @@ locals {
   # partition so the same LeadingKeys fence covers it.
   authority_proof_directive_partition_key = "PROOF"
 
-  # Runtime caller roles that must never be able to reach the control. The Hub
-  # task role and every cell server role are constructed exactly as their own
-  # modules construct them.
-  authority_proof_forbidden_caller_role_arns = toset(concat(
-    ["arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/${local.name_prefix}-hub-task"],
-    [
-      for cell_id in keys(local.authority_contract_cells) :
-      "arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/${cell_id == "cell0" ? "layerv-nhp-${var.environment}-server" : "layerv-nhp-${var.environment}-${cell_id}-server"}"
-    ],
-  ))
+  # The proof-runner root pre-creates this deterministic protected-environment
+  # role. Control owns the role's ca-pm inline policy so selection and grant are
+  # one atomic saved plan; no operator-supplied alias crosses state boundaries.
+  authority_proof_controller_role_name = "layerv-nhp-${var.environment}-udp-proof-controller"
+  authority_proof_controller_role_arn  = "arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/${local.authority_proof_controller_role_name}"
 
   authority_proof_mutation_fence_valid = !var.authority_proof_mutation_controls_enabled || try(
     # 1. Sandbox only. prod can never plan this function.
@@ -626,15 +621,10 @@ locals {
     # 2. The dedicated proof tenant must be named, so the data fence is real.
     var.authority_proof_mutation_owner_id != null &&
     local.authority_proof_owner_partition_key != null &&
-    # 3. At least one attended controller, every one of them in this exact
-    #    partition and account, and none of them a runtime caller role.
-    length(var.authority_proof_mutation_controller_role_arns) > 0 &&
-    length(toset(var.authority_proof_mutation_controller_role_arns)) == length(var.authority_proof_mutation_controller_role_arns) &&
-    alltrue([
-      for role_arn in var.authority_proof_mutation_controller_role_arns :
-      startswith(role_arn, "arn:${data.aws_partition.current.partition}:iam::${var.aws_account_id}:role/") &&
-      !contains(local.authority_proof_forbidden_caller_role_arns, role_arn)
-    ]) &&
+    # 3. The only admitted controller identity is the deterministic role whose
+    #    selected-alias policy Control owns in this same plan.
+    length(var.authority_proof_mutation_controller_role_arns) == 1 &&
+    one(var.authority_proof_mutation_controller_role_arns) == local.authority_proof_controller_role_arn &&
     # 4. The control may only exist on top of a bound contract that actually
     #    budgets it, so it can never be enabled ahead of reviewed capacity.
     local.authority_runtime_contract_enabled &&

@@ -184,7 +184,7 @@ resource "terraform_data" "foundation_contract" {
       # identity that is not a runtime caller role, and it must sit on a bound
       # contract that already budgets it.
       condition     = local.authority_proof_mutation_fence_valid
-      error_message = "authority_proof_mutation_controls_enabled requires environment sandbox, a non-null authority_proof_mutation_owner_id, at least one distinct in-account attended controller role ARN that is neither the Hub task role nor a cell server role, and a bound contract listing the proof function."
+      error_message = "authority_proof_mutation_controls_enabled requires environment sandbox, a non-null authority_proof_mutation_owner_id, exactly the deterministic in-account proof-controller role ARN, and a bound contract listing the proof function."
     }
 
     precondition {

@@ -529,6 +529,22 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
   }
 
   assert {
+    condition = alltrue([
+      for function in values(aws_lambda_function.authority) :
+      length({
+        for key, value in function.environment[0].variables :
+        key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      }) == 0
+    ])
+    error_message = "A contract without the sandbox proof gate must render no proof-policy environment key on any function."
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.authority_proof_controller_invoke) == 0
+    error_message = "The dark runtime must attach no proof-controller invoke policy."
+  }
+
+  assert {
     condition = (
       # The qat1 interface endpoint permits GetPublicKey only to IA/IRO/AR,
       # while Sign remains exclusive to IA. No operation receives kms:Verify.

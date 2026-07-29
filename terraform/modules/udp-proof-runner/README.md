@@ -75,6 +75,10 @@ remain proof consumers; neither should grow an AWS runner control plane.
   key through Secrets Manager, and the controller has no `GetSecretValue`
   permission with which to turn its service-bound decrypt grant into a secret
   read path.
+- This root owns only the proof-controller role and its existing broker/JIT
+  capabilities. The Control root owns any selected ca-pm invoke policy on that
+  deterministic role, atomically with the selected alias; this module accepts
+  no Authority alias input and cannot retain an inactive-alias grant.
 - The distinct deployment-manifest producer is trusted only for
   `repo:layervai/nhp:environment:udp-proof-manifest-sandbox`. It is read-only:
   exact public SSM parameters, catalog rows, runtime images/functions/tasks,
@@ -138,7 +142,11 @@ The composing PR must:
    there. That App is installed on the producer's exact repository set with
    Actions, Attestations, Contents, Packages, and Pull requests read
    permissions; it has no write permission and is not reused as the JIT App.
-4. Create a dedicated `udp-proof-sandbox` organization runner group with
+4. Apply this root to establish the deterministic `controller_role_arn`. A
+   later reviewed Control saved plan creates ca-pm and attaches the exact
+   selected-alias invoke policy to that role atomically. Never add an Authority
+   policy or alias input to this root.
+5. Create a dedicated `udp-proof-sandbox` organization runner group with
    `visibility=selected` and repository access restricted to exactly private
    `layervai/qurl-connector` plus public `layervai/qurl-go`. Because qurl-go is
    public, `allows_public_repositories=true` is unavoidable; bind and read back
@@ -169,7 +177,7 @@ The composing PR must:
    [`restricted_to_workflows=true` with both full-SHA workflow identities](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/larger-runners/control-access).
    Fail before minting a JIT configuration or dispatching a client workflow if
    any read-back value differs; the attended proof must not repair group access.
-5. Install the JIT GitHub App narrowly: organization self-hosted-runners write
+6. Install the JIT GitHub App narrowly: organization self-hosted-runners write
    for the exact two-repository runner-group check, plus Actions dispatch/read.
    Each controller run mints its Actions token for only the selected
    `layervai/qurl-connector` or `layervai/qurl-go` repository; the second
@@ -177,7 +185,7 @@ The composing PR must:
    verification/cancellation fallback, and failure cancellation request
    Actions write. It needs no client contents write, no AWS permission, and no
    Actions permission in NHP. A PAT is forbidden.
-6. Update the client workflows in their own reviewed PRs before composing this
+7. Update the client workflows in their own reviewed PRs before composing this
    module. Each strict `workflow_dispatch` path must accept the required
    canonical `deployment_manifest_b64` and `deployment_runtime_inputs_b64`
    bytes plus the authenticated producer run ID, run attempt, head SHA,
@@ -201,7 +209,7 @@ The composing PR must:
    `direct UDP lifecycle` dispatch job moves from `ubuntu-latest` to the same
    exact group-plus-derived-label contract. Neither workflow may fall back to
    generic self-hosted labels.
-7. Use two separate, attended NHP controller runs under one non-canceling
+8. Use two separate, attended NHP controller runs under one non-canceling
    workflow-level concurrency group:
 
    - Connector first. Mint a JIT configuration whose labels are exactly
@@ -227,7 +235,7 @@ The composing PR must:
 
    One JIT runner handles one client workflow; do not try to reuse a consumed
    runner or one NHP run across both clients.
-8. For each NHP controller run, create
+9. For each NHP controller run, create
    `<jit_secret_prefix><github_run_id>/<github_run_attempt>` using
    `jit_kms_key_arn` and the exact tags `Environment=sandbox`,
    `Purpose=udp-proof`, `GitHubRunId=<github_run_id>`, and
@@ -253,13 +261,13 @@ The composing PR must:
    stable source. The composing runbook must classify that as an aborted proof
    and require a fresh attended controller run, never in-place continuation.
    Generic labels alone are not an isolation boundary.
-9. Record both NHP controller run identities, both external client workflow run
+10. Record both NHP controller run identities, both external client workflow run
    identities, the runner AMI, archive digest, launch-template version, EIP `/32`,
    instance IDs, and tool versions in the later redacted proof manifest. Never
    treat module tests, a skipped runner job, or a successful launch as a UDP
    scenario result. Restrict packet captures to UDP 62206 and use short-lived,
    encrypted artifact retention; do not capture IMDS, JIT, or HTTPS traffic.
-10. If the foundation is retired, remove every Hub/cell ingress reference to
+11. If the foundation is retired, remove every Hub/cell ingress reference to
    `stable_source_cidr` before releasing the EIP and verify that ordering in the
    saved destroy plan. Never release an address while its `/32` remains
    allowlisted; a later AWS customer could receive that public address.

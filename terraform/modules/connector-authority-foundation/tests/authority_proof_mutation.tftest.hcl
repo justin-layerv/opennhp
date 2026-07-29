@@ -307,6 +307,7 @@ run "sandbox_accepts_the_separate_proof_operation_family" {
     }
     error_message = "The proof family must publish exactly its own same-color alias target."
   }
+
 }
 
 run "proof_alias_is_absent_from_every_runtime_caller_target" {
@@ -621,11 +622,69 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
     authority_runtime_functions_enabled = true
   }
 
-  # The single strongest fence: every item-level DynamoDB action the mutation
-  # control can take is constrained by dynamodb:LeadingKeys to the dedicated
-  # proof tenant partition (OWNER# + sha256 of the proof owner id) plus the
-  # PROOF directive partition. This is what makes a wrong handler unable to
-  # touch another tenant.
+  assert {
+    condition = (
+      length(aws_iam_role_policy.authority_proof_controller_invoke) == 1 &&
+      aws_iam_role_policy.authority_proof_controller_invoke[0].role == "layerv-nhp-sandbox-udp-proof-controller" &&
+      jsondecode(aws_iam_role_policy.authority_proof_controller_invoke[0].policy).Statement == [{
+        Sid      = "InvokeSelectedProofMutationAlias"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue"]
+      }]
+    )
+    error_message = "Control must atomically attach one exact selected ca-pm alias grant to the deterministic proof-controller role."
+  }
+
+  # This PR is dark ca-pm capability only. The consumer functions remain byte-
+  # for-byte on their governed selected-alias versions until the later attended
+  # proof rollout; only the mutation handler receives proof policy.
+  assert {
+    condition = {
+      for key, value in aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"].environment[0].variables :
+      key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      } == {
+      CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = "layerv-nhp-sandbox-udp-proof"
+      CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = "qurl-go-sandbox-"
+      CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = "5400"
+      CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = "30"
+    }
+    error_message = "Only ca-pm must receive the exact four proof-policy environment variables."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+      ] :
+      length({
+        for key, value in aws_lambda_function.authority[function_name].environment[0].variables :
+        key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      }) == 0
+    ])
+    error_message = "IA, RA, and ICR must remain free of proof policy in the dark capability slice."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name, function in aws_lambda_function.authority :
+      length({
+        for key, value in function.environment[0].variables :
+        key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      }) == 0
+      if !contains([
+        "layerv-nhp-sandbox-ca-pm",
+      ], function_name)
+    ])
+    error_message = "Cell operations must never inherit the attended-proof policy environment."
+  }
+
+  # Placement item actions are constrained to the dedicated proof tenant
+  # partition (OWNER# + sha256 of the proof owner id), the PROOF directive
+  # partition, or the read-only REGISTRY partition. This makes a wrong handler
+  # unable to touch another tenant.
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
@@ -639,6 +698,65 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       if startswith(try(statement.Sid, ""), "ProofFenced") || try(statement.Sid, "") == "ProofRegistryRead"
     ])
     error_message = "Every fenced proof statement must pin dynamodb:LeadingKeys to the proof tenant or the registry partition."
+  }
+
+  # Replay access is separately operation-scoped. Exact equality is
+  # intentional: it rejects a generic HUB_REQUEST#* or bare HUB_REQUEST grant.
+  assert {
+    condition = (
+      toset({ for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofReplayReadWrite"].Action) == toset([
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+      ]) &&
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofReplayReadWrite"].Resource == [
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority",
+      ] &&
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofReplayReadWrite"].Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        "HUB_REQUEST#MutateProofAgent#*",
+      ]
+    )
+    error_message = "MutateProofAgent replay must be exact Get/Put/Update on its own HUB_REQUEST#MutateProofAgent#* namespace."
+  }
+
+  # The Hub functions must be able to read proof placement/lease state from the
+  # connector-authority table, and the gateway endpoint must admit that read
+  # plus ca-pm's exact replay writes for their exact execution principals.
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+      ] :
+      contains(
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["AuthorityReads"].Action,
+        "dynamodb:GetItem",
+        ) && contains(
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["AuthorityReads"].Resource,
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority",
+      )
+    ])
+    error_message = "IA, RA, and ICR must retain GetItem access to connector-authority for proof placement and lease policy."
+  }
+
+  assert {
+    condition = (
+      contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:GetItem") &&
+      contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:PutItem") &&
+      contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:UpdateItem") &&
+      contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority") &&
+      alltrue([
+        for role_arn in [
+          "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec",
+          "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ra-exec",
+          "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-icr-exec",
+          "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-pm-exec",
+        ] :
+        contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], role_arn)
+      ])
+    )
+    error_message = "The DynamoDB endpoint must carry the exact proof read/replay actions, connector-authority table, and IA/RA/ICR/PM principals."
   }
 
   # The control reaches only the placement table. Absent api_keys and agent_keys

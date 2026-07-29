@@ -36,6 +36,14 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      proof_mutation_controls_enabled:
+        description: 'Sandbox-only dark MutateProofAgent capability. true adds exactly proof_controller capacity + ca-pm and emits the canonical proof owner/controller variables; it does not wire IA/RA/ICR or run proof. Requires enable_runtime_functions=true. Pass the SAME value to plan, apply, and verify.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -94,6 +102,8 @@ jobs:
       - name: Check dispatch boundary
         env:
           OPERATION: ${{ inputs.operation }}
+          ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
+          PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
           PLAN_SHA256: ${{ inputs.plan_sha256 }}
@@ -103,6 +113,10 @@ jobs:
           CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
+          if [[ "$PROOF_MUTATION_CONTROLS_ENABLED" == 'true' && "$ENABLE_RUNTIME_FUNCTIONS" != 'true' ]]; then
+            echo '::error::Dark proof mutation capability requires the Authority runtime functions gate.'
+            exit 1
+          fi
           if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
             echo '::error::Sandbox Control updates run only from refs/heads/main.'
             exit 1
@@ -213,6 +227,7 @@ jobs:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
+          PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -227,6 +242,12 @@ jobs:
           if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
             hub_worker_flag=(--hub-worker-enabled)
           fi
+          proof_mutation_flags=()
+          if [[ "$PROOF_MUTATION_CONTROLS_ENABLED" == 'true' ]]; then
+            proof_mutation_flags=(
+              --proof-mutation-controls-enabled
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -235,7 +256,8 @@ jobs:
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
-            "${hub_worker_flag[@]}"
+            "${hub_worker_flag[@]}" \
+            "${proof_mutation_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -504,6 +526,7 @@ jobs:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
+          PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -518,6 +541,12 @@ jobs:
           if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
             hub_worker_flag=(--hub-worker-enabled)
           fi
+          proof_mutation_flags=()
+          if [[ "$PROOF_MUTATION_CONTROLS_ENABLED" == 'true' ]]; then
+            proof_mutation_flags=(
+              --proof-mutation-controls-enabled
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -526,7 +555,8 @@ jobs:
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
-            "${hub_worker_flag[@]}"
+            "${hub_worker_flag[@]}" \
+            "${proof_mutation_flags[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -868,6 +898,7 @@ jobs:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
+          PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -882,6 +913,12 @@ jobs:
           if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
             hub_worker_flag=(--hub-worker-enabled)
           fi
+          proof_mutation_flags=()
+          if [[ "$PROOF_MUTATION_CONTROLS_ENABLED" == 'true' ]]; then
+            proof_mutation_flags=(
+              --proof-mutation-controls-enabled
+            )
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -890,7 +927,8 @@ jobs:
             --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
-            "${hub_worker_flag[@]}"
+            "${hub_worker_flag[@]}" \
+            "${proof_mutation_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

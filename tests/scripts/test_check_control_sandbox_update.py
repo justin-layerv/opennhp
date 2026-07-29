@@ -673,6 +673,8 @@ class WorkflowContractTests(unittest.TestCase):
             "-var-file=authority-runtime.generated.tfvars.json",
             '-var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json"',
             "Verified Authority runtime input differs from the reviewed plan input",
+            "proof_mutation_controls_enabled",
+            "Dark proof mutation capability requires the Authority runtime functions gate.",
         ):
             self.assertIn(marker, workflow)
         self.assertEqual(workflow.count("fetch-depth: 0"), 3)
@@ -680,6 +682,12 @@ class WorkflowContractTests(unittest.TestCase):
             workflow.count("generate-connector-authority-runtime-contract.py"),
             3,
         )
+        self.assertEqual(
+            workflow.count("--proof-mutation-controls-enabled"),
+            3,
+        )
+        self.assertNotIn("--proof-controller-role-arn", workflow)
+        self.assertNotIn("AUTHORITY_PROOF_CONTROLLER_ROLE_ARN", workflow)
         self.assertEqual(workflow.count("environment: sandbox"), 3)
         self.assertEqual(workflow.count("persist-credentials: false"), 3)
         self.assertNotIn("persist-credentials: true", workflow)
