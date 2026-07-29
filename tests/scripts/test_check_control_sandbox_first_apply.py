@@ -3413,6 +3413,17 @@ def authority_digest_refresh_candidate(*, hub: bool = False) -> tuple[dict, dict
     return candidate, prior_state
 
 
+def dual_digest_refresh_candidate() -> tuple[dict, dict]:
+    candidate, prior_state = authority_digest_refresh_candidate()
+    hub_candidate, _ = authority_digest_refresh_candidate(hub=True)
+    hub_drift = copy.deepcopy(hub_candidate["resource_drift"][0])
+    candidate["resource_drift"].append(hub_drift)
+    state_resource(
+        prior_state, CHECKER._HUB_DIGEST_ADDRESS
+    )["values"] = copy.deepcopy(hub_drift["change"]["before"])
+    return candidate, prior_state
+
+
 def redis_password_refresh_candidate() -> tuple[dict, dict]:
     candidate = plan_fixture()
     candidate["applyable"] = True
@@ -4538,6 +4549,89 @@ class PlanContractTests(unittest.TestCase):
         CHECKER.check_normalization_drift(
             first_publication, first_publication_state
         )
+
+    def test_dual_digest_normalization_reproof_matches_plan(self) -> None:
+        candidate, prior_state = dual_digest_refresh_candidate()
+        plan_summary = CHECKER.check_plan(candidate, prior_state)
+
+        for order in ("forward", "reverse"):
+            with self.subTest(order=order):
+                live_candidate = copy.deepcopy(candidate)
+                if order == "reverse":
+                    live_candidate["resource_drift"].reverse()
+                observation = CHECKER.check_normalization_drift(
+                    live_candidate, prior_state
+                )
+                self.assertEqual(
+                    observation,
+                    {
+                        "normalization_drift_count": 2,
+                        "normalization_drift_kind": "authority-and-hub-digest",
+                        "normalization_drift_sha256": plan_summary[
+                            "normalization_drift_sha256"
+                        ],
+                    },
+                )
+
+    def test_dual_digest_normalization_reproof_fails_closed(self) -> None:
+        candidate, prior_state = dual_digest_refresh_candidate()
+        for missing_address in (
+            CHECKER._AUTHORITY_DIGEST_ADDRESS,
+            CHECKER._HUB_DIGEST_ADDRESS,
+        ):
+            with self.subTest(missing_address=missing_address):
+                incomplete = [
+                    item
+                    for item in candidate["resource_drift"]
+                    if item["address"] != missing_address
+                ]
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_dual_digest_normalization_drift(
+                        incomplete, prior_state
+                    )
+
+        def assert_rejected(mutate) -> None:
+            candidate, prior_state = dual_digest_refresh_candidate()
+            mutate(candidate, prior_state)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_normalization_drift(candidate, prior_state)
+
+        def mix_extra(candidate, _prior_state) -> None:
+            candidate["resource_drift"].append(
+                _substantive_refresh_drift(
+                    "module.control.aws_kms_key.authority_data",
+                    "aws_kms_key",
+                )
+            )
+
+        def replace_hub(candidate, _prior_state) -> None:
+            candidate["resource_drift"][1] = _substantive_refresh_drift(
+                "module.control.aws_kms_key.authority_data",
+                "aws_kms_key",
+            )
+
+        def wrong_mode(candidate, _prior_state) -> None:
+            candidate["resource_changes"] = []
+
+        def moved_state(_candidate, prior_state) -> None:
+            state_resource(
+                prior_state, CHECKER._HUB_DIGEST_ADDRESS
+            )["values"]["version"] = 999
+
+        def wrong_state_type(_candidate, prior_state) -> None:
+            state_resource(
+                prior_state, CHECKER._HUB_DIGEST_ADDRESS
+            )["type"] = "aws_secretsmanager_secret"
+
+        for name, mutate in (
+            ("mixed_extra", mix_extra),
+            ("missing_hub", replace_hub),
+            ("wrong_mode", wrong_mode),
+            ("moved_state", moved_state),
+            ("wrong_state_type", wrong_state_type),
+        ):
+            with self.subTest(case=name):
+                assert_rejected(mutate)
 
     def test_authority_enablement_pair_normalization_drift_reproof_passes(
         self,

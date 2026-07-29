@@ -808,6 +808,7 @@ class WorkflowContractTests(unittest.TestCase):
             'cmp "$RUNNER_TEMP/expected-refresh-drift-summary.json"'
         )
         self.assertEqual(authority_drift_case.count("jq -cS"), 2)
+        self.assertNotIn("exit 0", authority_drift_case)
         self.assertLess(
             authority_drift_case.index("normalization-drift"),
             authority_drift_case.index(raw_summary),

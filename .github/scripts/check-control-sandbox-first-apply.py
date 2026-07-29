@@ -11469,6 +11469,43 @@ def _check_authority_enablement_normalization_drift(
     }
 
 
+def _check_dual_digest_normalization_drift(
+    drift: list[dict[str, Any]],
+    prior_state: Any,
+) -> dict[str, str | int]:
+    """Re-prove the exact Authority+Hub digest pair against captured state."""
+    if (
+        len(drift) != 2
+        or {item.get("address") for item in drift}
+        != {_AUTHORITY_DIGEST_ADDRESS, _HUB_DIGEST_ADDRESS}
+    ):
+        raise _unexpected_drift_error(drift)
+    if (
+        not isinstance(prior_state, dict)
+        or prior_state.get("format_version") != "1.0"
+        or prior_state.get("terraform_version") != TF_VERSION
+    ):
+        raise ContractError(
+            f"normalization observation requires exact Terraform {TF_VERSION} state JSON"
+        )
+    reconstructed = _reconstruct_refresh_only_changes(prior_state, drift)
+    for address in (_AUTHORITY_DIGEST_ADDRESS, _HUB_DIGEST_ADDRESS):
+        matches = [item for item in reconstructed if item.get("address") == address]
+        if len(matches) != 1 or matches[0].get("type") != "aws_ssm_parameter":
+            raise ContractError(
+                f"captured state does not contain the exact digest parameter: {address}"
+            )
+    by_address = {item["address"]: item for item in reconstructed}
+    kind = _check_state_normalization_drift(drift, by_address, refresh_only=True)
+    if kind != "authority-and-hub-digest":
+        raise _unexpected_drift_error(drift)
+    return {
+        "normalization_drift_count": 2,
+        "normalization_drift_kind": kind,
+        "normalization_drift_sha256": _normalization_drift_sha256(drift),
+    }
+
+
 def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | int]:
     """Bind a live refresh observation to the externally owned digest drift.
 
@@ -11516,6 +11553,12 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
             "normalization_drift_kind": "first-projection",
             "normalization_drift_sha256": _normalization_drift_sha256(drift),
         }
+    if (
+        len(drift) == 2
+        and {item.get("address") for item in drift}
+        == {_AUTHORITY_DIGEST_ADDRESS, _HUB_DIGEST_ADDRESS}
+    ):
+        return _check_dual_digest_normalization_drift(drift, prior_state)
     if (
         len(drift) == 2
         and {item.get("address") for item in drift}
