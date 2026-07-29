@@ -12,14 +12,10 @@ availability_zone = "us-east-2a"
 runner_archive_url    = "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz"
 runner_archive_sha256 = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
 
-# proof_kms_key_arns: OPTIONAL override. Unset (null) → the runner uses the
-# dedicated proof sealing CMK this root creates (proof_seal_kms.tf,
-# alias/layerv-nhp-sandbox-udp-proof-agent-seal). The attended setup points the
-# proof agent's LAYERV_AWS_KMS_KEY_ID at that alias to seal its x25519 private key.
-# Set this only to redirect the runner's Decrypt grant at a qurl-connector-
-# confirmed key instead (it is NOT authority-data — that's the DDB/ECR data-plane
-# key with no qurl-agent-x25519-private-key encryption context).
-# proof_kms_key_arns = ["arn:aws:kms:us-east-2:767397897469:key/<confirmed-uuid>"]
+# The runner uses the dedicated proof sealing CMK this root creates
+# (proof_seal_kms.tf, alias/layerv-nhp-sandbox-udp-proof-agent-seal).
+# Connector's LAYERV_AWS_KMS_KEY_ID and qurl-go's attended sealed-state proof use
+# that alias under separate exact encryption contexts.
 
 # Connector Authority data CMK (alias/layerv-nhp-sandbox-authority-data), created
 # by the Control root. It encrypts layerv-nhp-sandbox-control-connector-authority,

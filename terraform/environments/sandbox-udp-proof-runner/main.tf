@@ -45,9 +45,10 @@ module "udp_proof_runner" {
   runner_archive_url       = var.runner_archive_url
   runner_archive_sha256    = var.runner_archive_sha256
 
-  # Default to the dedicated proof sealing CMK this root creates; a caller may
-  # override with the qurl-connector-confirmed key(s) via proof_kms_key_arns.
-  proof_kms_key_arns = var.proof_kms_key_arns != null ? var.proof_kms_key_arns : [aws_kms_key.proof_agent_seal.arn]
+  # Both client proofs use this sandbox-only CMK under separate exact encryption
+  # contexts. Keeping the key non-overridable prevents the stable qurl-go alias,
+  # Connector setup, and runner IAM from silently diverging.
+  proof_kms_key_arns = [aws_kms_key.proof_agent_seal.arn]
 
   runtime_attestation_bucket_arn  = var.runtime_attestation_bucket_arn
   runtime_attestation_kms_key_arn = var.runtime_attestation_kms_key_arn

@@ -46,28 +46,6 @@ variable "runner_archive_sha256" {
   default     = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
 }
 
-variable "proof_kms_key_arns" {
-  description = <<-EOT
-    Exact sandbox CMK key/<uuid> ARNs the runner may DescribeKey + Decrypt for
-    the sealed-state proof (encryption context purpose=qurl-agent-x25519-private-key,
-    set by the external layervai/qurl-connector app). Aliases and wildcards are
-    rejected by the module.
-
-    OPTIONAL override. When null (default), this root uses the dedicated proof
-    sealing CMK it creates (aws_kms_key.proof_agent_seal, proof_seal_kms.tf).
-
-    The exact sealing CMK is a proof-setup value — qurl-connector's aws-kms key
-    provider reads it from LAYERV_AWS_KMS_KEY_ID at runtime, and no pre-existing
-    sandbox key exists (a live KMS check refuted the authority-data candidate: it
-    is the DDB/ECR data-plane key with no qurl-agent-x25519-private-key encryption
-    context). Set this only to point the runner's Decrypt grant at a
-    qurl-connector-confirmed key instead of the dedicated one; both a wrong key and
-    a mismatched agent key-provider config fail safe (the attended decrypt fails).
-  EOT
-  type        = set(string)
-  default     = null
-}
-
 variable "runtime_attestation_bucket_arn" {
   description = "Exact versioned sandbox runtime-attestation bucket ARN; null until the collector storage predecessor is provisioned."
   type        = string
@@ -94,7 +72,7 @@ variable "provisioned_cell_catalog_kms_key_arn" {
     have separate state and this root reads no remote state; verified against the
     live table with `aws dynamodb describe-table`.
 
-    Distinct from proof_kms_key_arns: that is the runner's sealed-agent-state key
+    Distinct from the dedicated proof sealing key: that is the runner's sealed-agent-state key
     with a purpose=qurl-agent-x25519-private-key encryption context, not the
     DynamoDB/ECR data-plane key.
   EOT

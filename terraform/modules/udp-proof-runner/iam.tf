@@ -49,6 +49,30 @@ resource "aws_iam_role_policy" "runner" {
           }
         }
       },
+      {
+        Sid      = "UseBoundQURLGoSealedState"
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt"]
+        Resource = var.proof_kms_key_arns
+        Condition = {
+          StringEquals = {
+            "kms:EncryptionContext:qurl_purpose"          = "qurl-go/agent-state"
+            "kms:EncryptionContext:qurl_envelope_version" = "1"
+            "kms:EncryptionContext:qurl_provider_id"      = "aws-kms"
+          }
+          StringLike = {
+            "kms:EncryptionContext:qurl_agent_id" = "qurl-go-sandbox-*"
+          }
+          "ForAllValues:StringEquals" = {
+            "kms:EncryptionContextKeys" = [
+              "qurl_purpose",
+              "qurl_envelope_version",
+              "qurl_provider_id",
+              "qurl_agent_id",
+            ]
+          }
+        }
+      },
     ]
   })
 

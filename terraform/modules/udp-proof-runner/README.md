@@ -58,9 +58,13 @@ remain proof consumers; neither should grow an AWS runner control plane.
   environment/purpose tags. Dynamic run IDs cannot narrow its static IAM
   policy, so per-run ownership is operationally bounded by the single active
   runner and serialized broker; the one-use secret is deleted before job code.
-  Its proof KMS surface is exact-key `DescribeKey`/`Decrypt`; decrypt
-  additionally requires Connector's `qurl-agent-x25519-private-key` encryption
-  context and an `aws-kms` or `aws-nitro` provider. It cannot list or read
+  Its proof KMS surface is exact-key `DescribeKey`, Connector-only `Decrypt`,
+  and qurl-go-only `Encrypt`/`Decrypt`. Connector decrypt requires the
+  `qurl-agent-x25519-private-key` encryption context and an `aws-kms` or
+  `aws-nitro` provider. qurl-go use requires exactly the four reviewed sealed
+  state context keys (`qurl_purpose`, `qurl_envelope_version`,
+  `qurl_provider_id`, `qurl_agent_id`), the current v1 `aws-kms` domain, and
+  the attended `qurl-go-sandbox-*` identity namespace. It cannot list or read
   application secrets. This is a consciously accepted sandbox trust decision:
   any code in the attended job, including a compromised client transitive
   dependency, can use IMDS credentials to decrypt that sandbox Connector key

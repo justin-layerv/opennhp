@@ -411,9 +411,25 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Resource) == var.proof_kms_key_arns &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Action == "kms:Decrypt" &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Condition.StringEquals["kms:EncryptionContext:purpose"] == "qurl-agent-x25519-private-key" &&
-      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Condition.StringEquals["kms:EncryptionContext:provider"]) == toset(["aws-kms", "aws-nitro"])
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DecryptBoundConnectorState"].Condition.StringEquals["kms:EncryptionContext:provider"]) == toset(["aws-kms", "aws-nitro"]) &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Resource) == var.proof_kms_key_arns &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Action) == toset(["kms:Encrypt", "kms:Decrypt"]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition.StringEquals == {
+        "kms:EncryptionContext:qurl_purpose"          = "qurl-go/agent-state"
+        "kms:EncryptionContext:qurl_envelope_version" = "1"
+        "kms:EncryptionContext:qurl_provider_id"      = "aws-kms"
+      } &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition.StringLike == {
+        "kms:EncryptionContext:qurl_agent_id" = "qurl-go-sandbox-*"
+      } &&
+      toset(({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["UseBoundQURLGoSealedState"].Condition["ForAllValues:StringEquals"]["kms:EncryptionContextKeys"]) == toset([
+        "qurl_purpose",
+        "qurl_envelope_version",
+        "qurl_provider_id",
+        "qurl_agent_id",
+      ])
     )
-    error_message = "Proof KMS access must be exact-key Describe/Decrypt only and encryption-context bound to Connector sealed state."
+    error_message = "Proof KMS access must be exact-key and encryption-context bound separately to Connector decrypt and qurl-go sealed-state use."
   }
 
   assert {
