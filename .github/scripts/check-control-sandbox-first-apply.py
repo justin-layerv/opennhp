@@ -8057,6 +8057,34 @@ def _check_state_normalization_drift(
         if digest_drift:
             return "provider-reprojection-with-authority-digest"
         return "provider-reprojection"
+    # BOTH publisher-owned digests drifting at once.
+    #
+    # Each is already an admitted normalization on its own, and they are
+    # independent: the Authority publisher and the Hub publisher advance their
+    # own parameter with no relation to each other. Handling only one at a time
+    # deadlocks -- reducing two drifts to one requires an apply to absorb the
+    # other, and the apply is exactly what this check gates. Any SSM write also
+    # bumps the parameter version, so even rewriting a value back to what is
+    # deployed re-drifts it rather than clearing it.
+    #
+    # This admits nothing new about either drift. Each is still validated by the
+    # same _check_digest_normalization against its OWN spec, so a digest that is
+    # not a clean value-plus-version projection still fails closed. What changes
+    # is only that two independently reviewed normalizations may land together.
+    if len(drift) == 2:
+        by_drift_address = {item.get("address"): item for item in drift}
+        if set(by_drift_address) == {_AUTHORITY_DIGEST_ADDRESS, _HUB_DIGEST_ADDRESS}:
+            _check_digest_normalization(
+                by_drift_address[_AUTHORITY_DIGEST_ADDRESS],
+                by_address,
+                spec=_AUTHORITY_DIGEST_SPEC,
+            )
+            _check_digest_normalization(
+                by_drift_address[_HUB_DIGEST_ADDRESS],
+                by_address,
+                spec=_HUB_DIGEST_SPEC,
+            )
+            return "authority-and-hub-digest"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
@@ -10769,6 +10797,17 @@ def check_plan(
         if plan_mode != "no-op" or "resource_changes" in plan:
             raise ContractError(
                 "Hub digest state normalization requires a refresh-only plan"
+            )
+    if normalization_drift_kind == "authority-and-hub-digest":
+        # The STRICTER of the two kinds it combines. Absorbing both publisher
+        # digests is a pure state normalization, so it may carry no resource
+        # transition at all -- which is also precisely how the deadlock clears:
+        # one refresh-only apply absorbs both, and the ordinary transition plan
+        # that follows then sees no drift.
+        if plan_mode != "no-op" or "resource_changes" in plan:
+            raise ContractError(
+                "combined Authority and Hub digest normalization requires a "
+                "refresh-only plan"
             )
     if normalization_drift_kind == "redis-passwords" and plan_mode != "no-op":
         raise ContractError(

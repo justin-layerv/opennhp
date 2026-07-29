@@ -11844,3 +11844,65 @@ class StandaloneExecPolicyLaneTest(unittest.TestCase):
             CHECKER._validate_authority_hub_exec_policy_update(
                 frozenset(self.POLICIES), self.by_address(actions=("create",)), {}
             )
+
+
+class DualDigestNormalizationTest(unittest.TestCase):
+    """Both publisher-owned digests may drift at once, and must be absorbable.
+
+    Each is already an admitted normalization alone, and they are independent --
+    the Authority and Hub publishers advance their own parameter. Handling one
+    at a time deadlocks: reducing two drifts to one needs an apply to absorb the
+    other, and the apply is what this check gates. Any SSM write also bumps the
+    version, so rewriting a value back to what is deployed re-drifts it.
+    """
+
+    AUTH = "module.control.aws_ssm_parameter.authority_image_digest"
+    HUB = "module.control.aws_ssm_parameter.hub_image_digest"
+
+    def drift(self, addresses):
+        return [{"address": a, "change": {"before": {}, "after": {}}} for a in addresses]
+
+    def test_both_digests_are_admitted_together(self) -> None:
+        seen = []
+        with (
+            mock.patch.object(
+                CHECKER, "_partition_first_projection_drift",
+                lambda d: ([], d),
+            ),
+            mock.patch.object(
+                CHECKER, "_check_digest_normalization",
+                lambda item, by, spec: seen.append(item["address"]),
+            ),
+        ):
+            kind = CHECKER._check_state_normalization_drift(
+                self.drift([self.AUTH, self.HUB]), {}, refresh_only=True
+            )
+        self.assertEqual(kind, "authority-and-hub-digest")
+        # Each drift is still validated against its OWN spec.
+        self.assertEqual(sorted(seen), sorted([self.AUTH, self.HUB]))
+
+    def test_an_unrelated_second_drift_still_fails_closed(self) -> None:
+        with mock.patch.object(
+            CHECKER, "_partition_first_projection_drift", lambda d: ([], d)
+        ):
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_state_normalization_drift(
+                    self.drift([self.AUTH, "module.control.aws_s3_bucket.stray"]),
+                    {},
+                    refresh_only=True,
+                )
+
+    def test_a_failing_digest_still_fails_closed(self) -> None:
+        def boom(item, by, spec):
+            raise CHECKER.ContractError("digest identity is wrong")
+
+        with (
+            mock.patch.object(
+                CHECKER, "_partition_first_projection_drift", lambda d: ([], d)
+            ),
+            mock.patch.object(CHECKER, "_check_digest_normalization", boom),
+        ):
+            with self.assertRaisesRegex(CHECKER.ContractError, "digest identity"):
+                CHECKER._check_state_normalization_drift(
+                    self.drift([self.AUTH, self.HUB]), {}, refresh_only=True
+                )
