@@ -46,6 +46,7 @@ on:
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
       - "scripts/capture-control-sandbox-update-state.sh"
+      - "scripts/capture-sandbox-udp-proof-account-binding.sh"
       - "scripts/check-control-sandbox-aws-identity.sh"
       - "scripts/check-live-main-ref.sh"
       - "scripts/check-no-checkout-credentials.sh"

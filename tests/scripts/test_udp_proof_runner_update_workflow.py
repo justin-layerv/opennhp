@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import hashlib
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +16,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "udp-proof-runner-sandbox-update.yml"
 CAPTURE = ROOT / "scripts" / "capture-sandbox-udp-proof-runner-state.sh"
+BINDING_CAPTURE = (
+    ROOT / "scripts" / "capture-sandbox-udp-proof-account-binding.sh"
+)
 
 
 class UDPProofRunnerUpdateWorkflowTest(unittest.TestCase):
@@ -19,6 +27,7 @@ class UDPProofRunnerUpdateWorkflowTest(unittest.TestCase):
         cls.raw = WORKFLOW.read_text(encoding="utf-8")
         cls.workflow = yaml.load(cls.raw, Loader=yaml.BaseLoader)
         cls.capture = CAPTURE.read_text(encoding="utf-8")
+        cls.binding_capture = BINDING_CAPTURE.read_text(encoding="utf-8")
 
     def test_dispatch_is_closed_to_plan_apply_verify(self) -> None:
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
@@ -84,14 +93,147 @@ class UDPProofRunnerUpdateWorkflowTest(unittest.TestCase):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
         self.assertNotIn("proof_account", inputs)
         self.assertIn(
+            "PROOF_ACCOUNT_SOURCE_SECRET: layerv-nhp-sandbox/udp-proof-account/credential",
+            self.raw,
+        )
+        self.assertIn(
             "PROOF_ACCOUNT_SHA_PARAMETER: /sandbox/nhp/udp-proof/account-credential-sha256",
             self.raw,
         )
         self.assertEqual(
-            self.raw.count("aws ssm get-parameter"),
+            self.raw.count("capture-sandbox-udp-proof-account-binding.sh"),
             3,
         )
-        self.assertIn("TF_VAR_proof_account_credential_sha256", self.raw)
+        self.assertNotIn("TF_VAR_proof_account_credential_sha256", self.raw)
+        self.assertIn("aws secretsmanager get-secret-value", self.binding_capture)
+        self.assertIn("ResourceNotFoundException", self.binding_capture)
+        self.assertIn("aws ssm get-parameter", self.binding_capture)
+        self.assertIn("ParameterNotFound", self.binding_capture)
+        self.assertIn('state:\"unconfigured\"', self.binding_capture)
+        self.assertIn(
+            '{proof_account_credential_sha256:$sha256}',
+            self.binding_capture,
+        )
+        self.assertIn('"proof_account_binding"', self.raw)
+        self.assertIn(".schema_version == 2", self.raw)
+
+    def test_proof_account_capture_has_exact_bootstrap_states(self) -> None:
+        credential = f"lv_test_{'A' * 43}"
+        digest = hashlib.sha256(credential.encode()).hexdigest()
+        secret_version = "proof-secret-version-1"
+        cases = (
+            (
+                "configured",
+                0,
+                {
+                    "parameter_state": "configured",
+                    "parameter_version": 1,
+                    "secret_version_id": secret_version,
+                    "sha256": digest,
+                    "state": "configured",
+                },
+                {"proof_account_credential_sha256": digest},
+            ),
+            (
+                "seeded_without_parameter",
+                0,
+                {
+                    "parameter_state": "missing",
+                    "parameter_version": None,
+                    "secret_version_id": secret_version,
+                    "sha256": digest,
+                    "state": "configured",
+                },
+                {"proof_account_credential_sha256": digest},
+            ),
+            (
+                "both_missing",
+                0,
+                {
+                    "parameter_state": "missing",
+                    "parameter_version": None,
+                    "secret_version_id": None,
+                    "sha256": None,
+                    "state": "unconfigured",
+                },
+                {},
+            ),
+            ("mismatch", 1, None, None),
+            ("denied_secret", 1, None, None),
+            ("malformed_secret", 1, None, None),
+            ("parameter_without_secret", 1, None, None),
+        )
+        for mode, expected_code, expected_binding, expected_tfvars in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                fake_bin = tmp_path / "bin"
+                fake_bin.mkdir()
+                fake_aws = fake_bin / "aws"
+                fake_aws.write_text(
+                    f"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "secretsmanager" ]]; then
+  case "${{FAKE_AWS_MODE}}" in
+    configured|seeded_without_parameter|mismatch)
+      printf '%s\\n' '{{"SecretString":"{credential}","VersionId":"{secret_version}"}}'
+      ;;
+    malformed_secret) printf '%s\\n' '{{"SecretString":"wrong"}}' ;;
+    denied_secret)
+      echo 'An error occurred (AccessDeniedException) when calling GetSecretValue' >&2
+      exit 254
+      ;;
+    both_missing|parameter_without_secret)
+      echo 'An error occurred (ResourceNotFoundException) when calling GetSecretValue' >&2
+      exit 254
+      ;;
+  esac
+elif [[ "$1" == "ssm" ]]; then
+  case "${{FAKE_AWS_MODE}}" in
+    configured|parameter_without_secret)
+      printf '%s\\n' '{{"Parameter":{{"Value":"{digest}","Version":1}}}}'
+      ;;
+    mismatch)
+      printf '%s\\n' '{{"Parameter":{{"Value":"{"b" * 64}","Version":2}}}}'
+      ;;
+    seeded_without_parameter|both_missing|malformed_secret)
+      echo 'An error occurred (ParameterNotFound) when calling GetParameter' >&2
+      exit 254
+      ;;
+  esac
+fi
+""",
+                    encoding="utf-8",
+                )
+                fake_aws.chmod(0o755)
+                output = tmp_path / "capture"
+                result = subprocess.run(
+                    [str(BINDING_CAPTURE), str(output)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "AWS_REGION": "us-east-2",
+                        "PROOF_ACCOUNT_SOURCE_SECRET": "test/proof-account",
+                        "PROOF_ACCOUNT_SHA_PARAMETER": "/test/proof-account",
+                        "FAKE_AWS_MODE": mode,
+                        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    },
+                )
+                self.assertEqual(expected_code, result.returncode, result.stderr)
+                if expected_code == 0:
+                    self.assertEqual(
+                        expected_binding,
+                        json.loads((output / "binding.json").read_text()),
+                    )
+                    self.assertEqual(
+                        expected_tfvars,
+                        json.loads(
+                            (output / "terraform.tfvars.json").read_text()
+                        ),
+                    )
+                else:
+                    self.assertFalse((output / "binding.json").exists())
 
     def test_state_capture_pins_account_object_and_kms_identity(self) -> None:
         for exact in (

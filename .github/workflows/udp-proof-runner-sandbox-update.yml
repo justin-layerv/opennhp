@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build a saved plan, apply one exact saved plan, or verify convergence.
+        description: Seed the proof account, build/apply one saved plan, or verify convergence.
         required: true
         type: choice
         options:
@@ -50,6 +50,7 @@ env:
   AWS_REGION: us-east-2
   TF_VERSION: "1.14.3"
   TF_ROOT: terraform/environments/sandbox-udp-proof-runner
+  PROOF_ACCOUNT_SOURCE_SECRET: layerv-nhp-sandbox/udp-proof-account/credential
   PROOF_ACCOUNT_SHA_PARAMETER: /sandbox/nhp/udp-proof/account-credential-sha256
 
 jobs:
@@ -176,15 +177,10 @@ jobs:
           role-session-name: udp-proof-runner-plan-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Load the existing proof-account binding
-        id: proof-account
+      - name: Capture the proof-account binding
         run: |
-          set -euo pipefail
-          value=$(aws ssm get-parameter \
-            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
-            --query Parameter.Value --output text)
-          [[ "$value" =~ ^[0-9a-f]{64}$ ]]
-          echo "sha256=$value" >>"$GITHUB_OUTPUT"
+          scripts/capture-sandbox-udp-proof-account-binding.sh \
+            "$RUNNER_TEMP/proof-account"
 
       - name: Initialize isolated runner state
         working-directory: ${{ env.TF_ROOT }}
@@ -195,12 +191,11 @@ jobs:
 
       - name: Build saved plan
         working-directory: ${{ env.TF_ROOT }}
-        env:
-          TF_VAR_proof_account_credential_sha256: ${{ steps.proof-account.outputs.sha256 }}
         run: |
           set -euo pipefail
           terraform plan \
             -input=false -lock-timeout=5m -no-color \
+            -var-file="$RUNNER_TEMP/proof-account/terraform.tfvars.json" \
             -out=tfplan | tee tfplan.txt
           terraform show -json tfplan >tfplan.json
           jq -e '
@@ -237,7 +232,7 @@ jobs:
         id: metadata
         working-directory: ${{ env.TF_ROOT }}
         env:
-          PROOF_ACCOUNT_SHA256: ${{ steps.proof-account.outputs.sha256 }}
+          PROOF_ACCOUNT_BINDING: ${{ runner.temp }}/proof-account/binding.json
           STATE_SUMMARY: ${{ runner.temp }}/state-before/state-summary.json
         run: |
           set -euo pipefail
@@ -254,10 +249,10 @@ jobs:
             --argjson planned_at_epoch "$(date -u +%s)" \
             --arg plan_sha256 "$plan_sha256" \
             --arg broker_zip_sha256 "$broker_zip_sha256" \
-            --arg proof_account_sha256 "$PROOF_ACCOUNT_SHA256" \
+            --slurpfile proof_account_binding "$PROOF_ACCOUNT_BINDING" \
             --slurpfile state "$STATE_SUMMARY" \
             '{
-              schema_version: 1,
+              schema_version: 2,
               repository: $repository,
               workflow_ref: $workflow_ref,
               commit_sha: $commit_sha,
@@ -266,7 +261,7 @@ jobs:
               planned_at_epoch: $planned_at_epoch,
               plan_sha256: $plan_sha256,
               broker_zip_sha256: $broker_zip_sha256,
-              proof_account_sha256: $proof_account_sha256,
+              proof_account_binding: $proof_account_binding[0],
               state: $state[0]
             }' >plan-metadata.json
           rm -rf artifact
@@ -368,7 +363,7 @@ jobs:
                 "commit_sha",
                 "plan_sha256",
                 "planned_at_epoch",
-                "proof_account_sha256",
+                "proof_account_binding",
                 "repository",
                 "run_attempt",
                 "run_id",
@@ -376,7 +371,7 @@ jobs:
                 "state",
                 "workflow_ref"
               ] and
-              .schema_version == 1 and
+              .schema_version == 2 and
               .repository == $repository and
               .workflow_ref == $workflow_ref and
               .commit_sha == $commit_sha and
@@ -392,7 +387,46 @@ jobs:
               .planned_at_epoch >= 1 and
               .planned_at_epoch <= now and
               (now - .planned_at_epoch) <= 86400 and
-              (.proof_account_sha256 | test("^[0-9a-f]{64}$"))
+              (
+                .proof_account_binding |
+                keys == [
+                  "parameter_state",
+                  "parameter_version",
+                  "secret_version_id",
+                  "sha256",
+                  "state"
+                ]
+              ) and
+              (
+                (
+                  .proof_account_binding.state == "unconfigured" and
+                  .proof_account_binding.sha256 == null and
+                  .proof_account_binding.secret_version_id == null and
+                  .proof_account_binding.parameter_state == "missing" and
+                  .proof_account_binding.parameter_version == null
+                ) or
+                (
+                  .proof_account_binding.state == "configured" and
+                  (.proof_account_binding.sha256 | test("^[0-9a-f]{64}$")) and
+                  (
+                    .proof_account_binding.secret_version_id |
+                    type == "string" and length >= 1 and length <= 256
+                  ) and
+                  (
+                    (
+                      .proof_account_binding.parameter_state == "missing" and
+                      .proof_account_binding.parameter_version == null
+                    ) or
+                    (
+                      .proof_account_binding.parameter_state == "configured" and
+                      (
+                        .proof_account_binding.parameter_version |
+                        type == "number" and . >= 1 and floor == .
+                      )
+                    )
+                  )
+                )
+              )
             ' \
             --arg broker_zip_sha256 "$(sha256sum broker.zip | awk '{print $1}')" \
             plan-metadata.json >/dev/null
@@ -418,11 +452,13 @@ jobs:
           PLANNED_STATE_SHA256: ${{ inputs.planned_state_sha256 }}
         run: |
           set -euo pipefail
-          value=$(aws ssm get-parameter \
-            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
-            --query Parameter.Value --output text)
-          test "$value" = "$(jq -er '.proof_account_sha256' "$RUNNER_TEMP/saved-plan/plan-metadata.json")"
-          echo "TF_VAR_proof_account_credential_sha256=$value" >>"$GITHUB_ENV"
+          scripts/capture-sandbox-udp-proof-account-binding.sh \
+            "$RUNNER_TEMP/proof-account"
+          jq -S '.proof_account_binding' \
+            "$RUNNER_TEMP/saved-plan/plan-metadata.json" \
+            >"$RUNNER_TEMP/planned-proof-account-binding.json"
+          cmp "$RUNNER_TEMP/planned-proof-account-binding.json" \
+            "$RUNNER_TEMP/proof-account/binding.json"
           scripts/capture-sandbox-udp-proof-runner-state.sh "$RUNNER_TEMP/state-current"
           jq -e \
             --arg version_id "$PLANNED_STATE_VERSION_ID" \
@@ -447,6 +483,7 @@ jobs:
           set -euo pipefail
           terraform plan \
             -input=false -lock-timeout=5m -no-color \
+            -var-file="$RUNNER_TEMP/proof-account/terraform.tfvars.json" \
             -out=verify.tfplan | tee verify.txt
           terraform show -json verify.tfplan >verify.json
           jq -e '
@@ -489,14 +526,10 @@ jobs:
           role-session-name: udp-proof-runner-verify-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Bind proof account
+      - name: Capture the proof-account binding
         run: |
-          set -euo pipefail
-          value=$(aws ssm get-parameter \
-            --name "$PROOF_ACCOUNT_SHA_PARAMETER" \
-            --query Parameter.Value --output text)
-          [[ "$value" =~ ^[0-9a-f]{64}$ ]]
-          echo "TF_VAR_proof_account_credential_sha256=$value" >>"$GITHUB_ENV"
+          scripts/capture-sandbox-udp-proof-account-binding.sh \
+            "$RUNNER_TEMP/proof-account"
 
       - name: Require exact Terraform convergence
         working-directory: ${{ env.TF_ROOT }}
@@ -505,6 +538,7 @@ jobs:
           terraform init -reconfigure -input=false
           terraform plan \
             -input=false -lock-timeout=5m -no-color \
+            -var-file="$RUNNER_TEMP/proof-account/terraform.tfvars.json" \
             -out=verify.tfplan | tee verify.txt
           terraform show -json verify.tfplan >verify.json
           jq -e '
