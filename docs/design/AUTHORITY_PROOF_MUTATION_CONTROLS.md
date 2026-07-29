@@ -198,10 +198,12 @@ MutateProofAgent only:
 `CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL`, `CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS`,
 plus the existing `CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX`.
 
-IA, RA, and ICR deliberately receive none of these variables in this PR. Their
-directive-consumer implementation and environment must land later through the
-governed zero-spill selected-alias rollout; directly republishing and retargeting
-both aliases here would bypass that controller.
+The independent consumer-staging gate publishes a new IA, RA, and ICR version
+with these variables plus read-only `GetItem` access to the `PROOF` partition
+and an explicit write deny. It reads and preserves both live alias versions
+byte-for-byte. Staging is not activation: the attended proof remains blocked by
+authenticated deployment evidence until the separate governed zero-spill
+selected-alias rollout activates all three consumers.
 
 ### 3. Wire contract (`internal/connectorauthority/lambda_wire.go`)
 
@@ -328,9 +330,10 @@ create or destroy one.
    canonical proof owner/controller root variables. In that same saved plan,
    Control creates the selected qualified alias and attaches the controller's
    exact invoke policy. IA/RA/ICR and both aliases remain unchanged.
-5. Land the separate qurl-service consumer implementation and governed
-   zero-spill IA/RA/ICR selected-alias rollout. This is still required before
-   any attended mutation proof may run.
+5. Apply the consumer-staging gate, then run the separate governed zero-spill
+   IA/RA/ICR selected-alias activation. Staging alone is insufficient and the
+   authenticated deployment evidence reports the consumers not ready until all
+   three selected aliases expose the exact proof-policy environment.
 6. Only after that rollout, the attended proof arms a directive, runs the strict
    workflow, and cross-checks the three observers.
 7. Only then may qurl-go's blocked rows move off `todo`, together with the
@@ -343,12 +346,18 @@ simulated green result.
 
 ## Rollback ordering
 
-Rollback is one exact Control saved plan because Control owns both capability
-ends. Dispatch with runtime functions still enabled and attended proof mutation
-disabled. The strict `authority-proof-disable` plan first removes the
+Rollback uses the governed alias controller plus two exact Control saved plans.
+First return IA/RA/ICR to the prior warm versions, then disable the
+consumer-staging gate while both aliases remain unchanged. Publish and warm the
+resulting non-proof version through the governed controller and point both
+aliases at it; this exact convergence is required before the proof-control gate
+may close. Only then dispatch with runtime functions still enabled and attended
+proof mutation disabled. The strict
+`authority-proof-disable` plan removes the
 controller's inline invoke policy through its explicit alias dependency, then
 removes exactly `proof_controller` and ca-pm from the foundation, ca-pm from the
 DynamoDB endpoint principals, the complete ca-pm resource/alarm graph, and the
-proof alias output. IA/RA/ICR and all six aliases remain exact no-ops. Verify the
+proof alias output. IA/RA/ICR and all six aliases remain exact no-ops in this
+final plan. Verify the
 Control state/live lanes without the proof slice and require a refresh-enabled
 dark no-op before considering rollback complete.

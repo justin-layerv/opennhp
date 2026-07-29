@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -1191,6 +1192,16 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
         },
     ]
     if operation in CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM:
+        expected_write_keys = {
+            "issue_assignment": ["HUB_REQUEST#IssueAssignment#*"],
+            "refresh_assignment": ["HUB_REQUEST#RefreshAssignment#*"],
+            "issue_credential_recovery": [
+                "CREDENTIAL_RECOVERY_GRANT#*",
+                "CREDENTIAL_RECOVERY_ISSUE#*",
+                "HUB_REQUEST#IssueCredentialRecovery#*",
+                "OWNER#*",
+            ],
+        }[operation]
         statements.append(
             {
                 "Sid": spec["write_sid"],
@@ -1201,6 +1212,12 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                         "connector_authority"
                     ]
                 ),
+                "Condition": {
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": expected_write_keys,
+                    },
+                    "Null": {"dynamodb:LeadingKeys": "false"},
+                },
             }
         )
     else:
@@ -1323,7 +1340,8 @@ def proof_runtime_exec_policy() -> str:
             "Condition": {
                 "ForAllValues:StringEquals": {
                     "dynamodb:LeadingKeys": [owner_partition, "PROOF"]
-                }
+                },
+                "Null": {"dynamodb:LeadingKeys": "false"},
             },
         },
         {
@@ -1334,7 +1352,8 @@ def proof_runtime_exec_policy() -> str:
             "Condition": {
                 "ForAllValues:StringEquals": {
                     "dynamodb:LeadingKeys": ["REGISTRY"]
-                }
+                },
+                "Null": {"dynamodb:LeadingKeys": "false"},
             },
         },
         {
@@ -1345,7 +1364,8 @@ def proof_runtime_exec_policy() -> str:
             "Condition": {
                 "ForAllValues:StringEquals": {
                     "dynamodb:LeadingKeys": [owner_partition, "PROOF"]
-                }
+                },
+                "Null": {"dynamodb:LeadingKeys": "false"},
             },
         },
         {
@@ -1362,7 +1382,8 @@ def proof_runtime_exec_policy() -> str:
                     "dynamodb:LeadingKeys": [
                         "HUB_REQUEST#MutateProofAgent#*"
                     ]
-                }
+                },
+                "Null": {"dynamodb:LeadingKeys": "false"},
             },
         },
     ]
@@ -11614,3 +11635,118 @@ class HubWorkerImageUpdateLaneTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ComposedTransitionTest(unittest.TestCase):
+    """Composition must PARTITION the change set, never widen it.
+
+    Every transition in the dispatch matches `changed == <its exact set>`. That
+    is correct for one transition and wrong the moment two legitimately land in
+    one plan -- a Hub image deploy while a reviewed exec-policy edit is pending
+    -- which rejects a plan whose halves are each already admitted.
+
+    These pin the composition ALGEBRA. The per-slice validators keep their own
+    tests, so the hub lane is stubbed here; what matters is that composition
+    calls it, and refuses whenever the partition is not exact.
+    """
+
+    HUB = "module.control.aws_ecs_task_definition.hub[0]"
+    POL = 'module.control.aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-ia"]'
+
+    def hub_item(self):
+        return {
+            "address": self.HUB,
+            "mode": "managed",
+            "deposed": None,
+            "type": "aws_ecs_task_definition",
+            "change": {"actions": ["delete", "create"], "before": {}, "after": {}},
+        }
+
+    def policy_item(self, actions=("update",), moved_role=False):
+        return {
+            "address": self.POL,
+            "mode": "managed",
+            "deposed": None,
+            "type": "aws_iam_role_policy",
+            "change": {
+                "actions": list(actions),
+                "before": {"name": "exec", "role": "r1", "policy": "{}"},
+                "after": {
+                    "name": "exec",
+                    "role": "r2" if moved_role else "r1",
+                    "policy": '{"a":1}',
+                },
+            },
+        }
+
+    def compose(self, by_address, deposed=None, changed=None, hub_raises=None):
+        changed = set(by_address) if changed is None else changed
+        actual = {a: list(i["change"]["actions"]) for a, i in by_address.items()}
+
+        def stub(_by):
+            if hub_raises:
+                raise CHECKER.ContractError(hub_raises)
+
+        with mock.patch.object(CHECKER, "_check_hub_worker_image_update", stub):
+            return CHECKER._compose_admitted_transitions(
+                changed, actual, by_address, deposed or {}, {}
+            )
+
+    def test_two_reviewed_transitions_compose(self) -> None:
+        mode = self.compose({self.HUB: self.hub_item(), self.POL: self.policy_item()})
+        self.assertIsNotNone(mode)
+        self.assertIn("hub-worker-image-update", mode)
+        self.assertIn("authority-hub-exec-policy-update", mode)
+
+    def test_a_single_transition_does_not_compose(self) -> None:
+        """One claim must fall through to the stricter dispatch above."""
+        self.assertIsNone(self.compose({self.HUB: self.hub_item()}))
+        self.assertIsNone(self.compose({self.POL: self.policy_item()}))
+
+    def test_an_unclaimed_address_refuses_composition(self) -> None:
+        """One stray change and the whole plan falls through to rejection."""
+        by = {
+            self.HUB: self.hub_item(),
+            self.POL: self.policy_item(),
+            "module.control.aws_s3_bucket.stray": {
+                "address": "module.control.aws_s3_bucket.stray",
+                "mode": "managed",
+                "deposed": None,
+                "type": "aws_s3_bucket",
+                "change": {"actions": ["delete"], "before": {}, "after": None},
+            },
+        }
+        self.assertIsNone(self.compose(by))
+
+    def test_deposed_objects_never_compose(self) -> None:
+        by = {self.HUB: self.hub_item(), self.POL: self.policy_item()}
+        self.assertIsNone(self.compose(by, deposed={"x": {"actions": ["delete"]}}))
+
+    def test_each_slice_still_runs_its_own_validator(self) -> None:
+        """A slice failure inside a COMPOSED plan must still fail closed."""
+        by = {self.HUB: self.hub_item(), self.POL: self.policy_item()}
+        with self.assertRaisesRegex(CHECKER.ContractError, "stub rejection"):
+            self.compose(by, hub_raises="stub rejection")
+
+    def test_a_created_exec_policy_is_not_claimed(self) -> None:
+        """Only in-place updates are claimable; a create is a different shape."""
+        by = {self.HUB: self.hub_item(), self.POL: self.policy_item(actions=("create",))}
+        self.assertIsNone(self.compose(by))
+
+    def test_a_moved_role_fails_the_composed_slice(self) -> None:
+        by = {self.HUB: self.hub_item(), self.POL: self.policy_item(moved_role=True)}
+        with self.assertRaisesRegex(CHECKER.ContractError, "moved 'role'"):
+            self.compose(by)
+
+    def test_an_unreviewed_exec_policy_is_not_claimed(self) -> None:
+        """Scoped to the reviewed legacy Hub set, not any exec policy."""
+        foreign = 'module.control.aws_iam_role_policy.authority_exec["some-other-fn"]'
+        item = self.policy_item()
+        item["address"] = foreign
+        self.assertIsNone(self.compose({self.HUB: self.hub_item(), foreign: item}))
+
+    def test_a_replaced_hub_task_definition_is_required(self) -> None:
+        """An in-place hub update is a different shape and is not claimed."""
+        hub = self.hub_item()
+        hub["change"]["actions"] = ["update"]
+        self.assertIsNone(self.compose({self.HUB: hub, self.POL: self.policy_item()}))

@@ -209,6 +209,12 @@ variable "authority_proof_mutation_controls_enabled" {
   default     = false
 }
 
+variable "authority_proof_policy_consumers_staged" {
+  description = "Stages proof-aware IA/RA/ICR versions and read-only policy without moving either live alias. Requires the mutation control."
+  type        = bool
+  default     = false
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = "Dedicated sandbox proof tenant that owns every uniquely tagged ephemeral proof agent. Null until the mutation control is enabled."
   type        = string

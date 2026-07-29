@@ -38,6 +38,12 @@ locals {
 
   authority_runtime_selected_color = local.authority_runtime_functions_deploy ? var.authority_runtime_contract.selected_authority_color : null
 
+  authority_proof_policy_consumer_functions = {
+    for function_name, fn in local.authority_runtime_functions :
+    function_name => fn
+    if contains(local.authority_proof_policy_consumer_operations, fn.operation)
+  }
+
   # Both closed deployment qualifiers are published up front. For this initial
   # dark bootstrap they intentionally target the same first published version;
   # only the selected color receives steady provisioned concurrency below.
@@ -100,11 +106,18 @@ locals {
   # IssueRegistrationOTP intentionally excluded) and the admission-gated ops.
   authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "mutate_proof_agent"]
   authority_admission_operations = ["activate_registration", "complete_registration"]
-  # Attended-proof axis. Empty unless the sandbox-only gate is on, so with the
-  # gate off no function matches and no proof environment key is ever rendered.
-  # Consumer operations stay untouched in this dark capability slice; wiring
-  # IA/RA/ICR to proof policy requires the later governed selected-alias rollout.
-  authority_proof_operations = keys(local.authority_contract_proof_operation_suffixes)
+  # Attended-proof axis. ca-pm owns the mutation capability. IA/RA/ICR receive
+  # a staged proof-aware version while both live aliases remain unchanged; a
+  # separate governed zero-spill rollout must activate that version.
+  authority_proof_policy_consumer_operations = [
+    "issue_assignment",
+    "refresh_assignment",
+    "issue_credential_recovery",
+  ]
+  authority_proof_operations = distinct(concat(
+    keys(local.authority_contract_proof_operation_suffixes),
+    var.authority_proof_policy_consumers_staged ? local.authority_proof_policy_consumer_operations : [],
+  ))
 
   # The uniquely tagged ephemeral agent namespace the control may address. It
   # matches the attended proof harness's generated identity
@@ -271,7 +284,7 @@ locals {
     # IssueAssignment: reads the credential (api_keys) + authority placement rows
     # (connector_authority); writes only its single-item replay tombstone (Put)
     # to connector_authority; signs the assignment ticket with qat1.
-    issue_assignment = [
+    issue_assignment = concat([
       {
         Sid      = "AuthorityReads"
         Effect   = "Allow"
@@ -283,6 +296,14 @@ locals {
         Effect   = "Allow"
         Action   = local.authority_runtime_ddb_replay_write_actions
         Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["HUB_REQUEST#IssueAssignment#*"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
       },
       {
         Sid      = "Qat1Sign"
@@ -290,12 +311,15 @@ locals {
         Action   = ["kms:GetPublicKey", "kms:Sign"]
         Resource = [aws_kms_key.qat1_signing.arn]
       },
-    ]
+      ], [
+      for statement in local.authority_runtime_proof_policy_consumer_statements :
+      statement if var.authority_proof_policy_consumers_staged
+    ])
     # RefreshAssignment: strong agent-identity (agent_keys, incl. its pubkey GSI)
     # and authority-placement reads; writes only its single-item replay tombstone
     # (Put) to connector_authority. It builds NO KMS client (read-only domain
     # service; ticket verification is local p256, not kms:Verify).
-    refresh_assignment = [
+    refresh_assignment = concat([
       {
         Sid      = "AuthorityReads"
         Effect   = "Allow"
@@ -307,13 +331,24 @@ locals {
         Effect   = "Allow"
         Action   = local.authority_runtime_ddb_replay_write_actions
         Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["HUB_REQUEST#RefreshAssignment#*"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
       },
-    ]
+      ], [
+      for statement in local.authority_runtime_proof_policy_consumer_statements :
+      statement if var.authority_proof_policy_consumers_staged
+    ])
     # IssueCredentialRecovery: api-key/agent/authority reads; its recovery
     # transaction WRITES only connector_authority (replay + grant Puts, first-grant
     # head-anchor Update). api_keys/agent_keys are touched only via ConditionCheck,
     # authorized by dynamodb:ConditionCheckItem in the read set. It builds NO KMS client.
-    issue_credential_recovery = [
+    issue_credential_recovery = concat([
       {
         Sid    = "AuthorityReads"
         Effect = "Allow"
@@ -329,8 +364,24 @@ locals {
         Effect   = "Allow"
         Action   = local.authority_runtime_ddb_recovery_write_actions
         Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = [
+              "CREDENTIAL_RECOVERY_GRANT#*",
+              "CREDENTIAL_RECOVERY_ISSUE#*",
+              "HUB_REQUEST#IssueCredentialRecovery#*",
+              "OWNER#*",
+            ]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
       },
-    ]
+      ], [
+      for statement in local.authority_runtime_proof_policy_consumer_statements :
+      statement if var.authority_proof_policy_consumers_staged
+    ])
     issue_registration_otp = concat(
       [
         {
@@ -435,6 +486,37 @@ locals {
     ]
   }, local.authority_runtime_proof_operation_statements)
 
+  authority_runtime_proof_policy_consumer_statements = [
+    {
+      Sid      = "ProofPolicyRead"
+      Effect   = "Allow"
+      Action   = ["dynamodb:GetItem"]
+      Resource = local.authority_runtime_table_resources.connector_authority
+      Condition = {
+        "ForAllValues:StringEquals" = {
+          "dynamodb:LeadingKeys" = [local.authority_proof_directive_partition_key]
+        }
+        Null = {
+          "dynamodb:LeadingKeys" = "false"
+        }
+      }
+    },
+    {
+      Sid      = "DenyProofPolicyWrite"
+      Effect   = "Deny"
+      Action   = ["dynamodb:DeleteItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+      Resource = local.authority_runtime_table_resources.connector_authority
+      Condition = {
+        "ForAnyValue:StringEquals" = {
+          "dynamodb:LeadingKeys" = [local.authority_proof_directive_partition_key]
+        }
+        Null = {
+          "dynamodb:LeadingKeys" = "false"
+        }
+      }
+    },
+  ]
+
   # MutateProofAgent: the attended-proof mutation control. It is the ONLY
   # Authority operation that writes an AGENT# placement row after activation, so
   # its execution policy carries the tightest fence in the module. Placement and
@@ -471,6 +553,9 @@ locals {
           "ForAllValues:StringEquals" = {
             "dynamodb:LeadingKeys" = local.authority_runtime_proof_leading_keys
           }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
         }
       },
       {
@@ -487,6 +572,9 @@ locals {
           "ForAllValues:StringEquals" = {
             "dynamodb:LeadingKeys" = local.authority_runtime_proof_registry_leading_keys
           }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
         }
       },
       {
@@ -502,6 +590,9 @@ locals {
           "ForAllValues:StringEquals" = {
             "dynamodb:LeadingKeys" = local.authority_runtime_proof_leading_keys
           }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
         }
       },
       {
@@ -516,6 +607,9 @@ locals {
         Condition = {
           "ForAllValues:StringLike" = {
             "dynamodb:LeadingKeys" = local.authority_runtime_proof_replay_leading_keys
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
           }
         }
       },
@@ -824,13 +918,29 @@ resource "aws_lambda_function" "authority" {
   })
 }
 
+data "aws_lambda_alias" "authority_proof_policy_live" {
+  for_each = var.authority_proof_mutation_controls_enabled ? {
+    for key, alias in local.authority_runtime_aliases :
+    key => alias
+    if contains(keys(local.authority_proof_policy_consumer_functions), alias.function_name)
+  } : {}
+
+  function_name = each.value.function_name
+  name          = each.value.color
+}
+
 resource "aws_lambda_alias" "authority" {
   for_each = local.authority_runtime_aliases
 
-  name             = each.value.color
-  description      = "Closed ${each.value.color} deployment qualifier"
-  function_name    = aws_lambda_function.authority[each.value.function_name].function_name
-  function_version = aws_lambda_function.authority[each.value.function_name].version
+  name          = each.value.color
+  description   = "Closed ${each.value.color} deployment qualifier"
+  function_name = aws_lambda_function.authority[each.value.function_name].function_name
+  function_version = (
+    var.authority_proof_mutation_controls_enabled &&
+    contains(keys(local.authority_proof_policy_consumer_functions), each.value.function_name)
+    ? data.aws_lambda_alias.authority_proof_policy_live[each.key].function_version
+    : aws_lambda_function.authority[each.value.function_name].version
+  )
 }
 
 # Initial-bootstrap steady state: only the caller-selected color receives

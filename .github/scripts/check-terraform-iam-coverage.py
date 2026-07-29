@@ -390,6 +390,10 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
     # internal/service/lambda/invocation_data_source.go invokes the named
     # function during Read.
     "aws_lambda_invocation": ["lambda:InvokeFunction"],
+    # internal/service/lambda/alias_data_source.go calls lambda:GetAlias during
+    # Read. Reading an alias needs only the alias itself; it does not resolve
+    # the function's configuration, so GetFunction is deliberately not listed.
+    "aws_lambda_alias": ["lambda:GetAlias"],
     # internal/service/ec2/availability_zones_data_source.go calls
     # ec2:DescribeAvailabilityZones.
     "aws_availability_zones": ["ec2:DescribeAvailabilityZones"],

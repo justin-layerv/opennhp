@@ -283,7 +283,6 @@ class FilesTest(unittest.TestCase):
     def validate(self, directory: Path, **overrides: object) -> dict[str, str]:
         values: dict[str, object] = {
             "client": "connector",
-            "connector_proof_run_id": "",
             "pre_removal_run_id": "",
             "producer_head_sha": HEAD_SHA,
             "producer_run_attempt": str(RUN_ATTEMPT),
@@ -333,7 +332,6 @@ class FilesTest(unittest.TestCase):
             outputs = self.validate(
                 directory,
                 client="qurl_go",
-                connector_proof_run_id="12345",
             )
             self.assertEqual(
                 outputs["client_ref"],

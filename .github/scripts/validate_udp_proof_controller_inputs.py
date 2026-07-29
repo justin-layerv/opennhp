@@ -43,23 +43,12 @@ def select_dispatch(
     proof_phase: str,
     manifest: dict[str, Any],
     candidates: dict[str, Any],
-    connector_proof_run_id: str,
     pre_removal_run_id: str,
 ) -> dict[str, str]:
     if client not in CLIENT_TARGETS:
         raise ValidationError("client must be connector or qurl_go")
     if proof_phase not in {"pre_removal", "post_removal"}:
         raise ValidationError("proof_phase must be pre_removal or post_removal")
-
-    if client == "qurl_go":
-        if not RUN_ID_RE.fullmatch(connector_proof_run_id):
-            raise ValidationError(
-                "qurl_go requires an exact successful Connector proof run ID"
-            )
-    elif connector_proof_run_id:
-        raise ValidationError(
-            "connector_proof_run_id must be empty for a Connector proof"
-        )
 
     if proof_phase == "post_removal":
         if not RUN_ID_RE.fullmatch(pre_removal_run_id):

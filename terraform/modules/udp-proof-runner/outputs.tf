@@ -67,3 +67,13 @@ output "proof_otp_mailbox_bucket" {
   description = "Private one-day S3 mailbox containing the SES receipt objects referenced by the proof queue."
   value       = aws_s3_bucket.proof_otp_mailbox.id
 }
+
+output "assignment_handshake_bucket" {
+  description = "Versioned one-day checkpoint/receipt channel used only by the attended assignment proof."
+  value       = aws_s3_bucket.assignment_handshake.bucket
+}
+
+output "assignment_handshake_kms_key_arn" {
+  description = "Exact KMS key ARN clients must name explicitly when writing handshake objects."
+  value       = aws_kms_key.assignment_handshake.arn
+}

@@ -75,8 +75,22 @@ AUTHORITY_FUNCTIONS = [
     "layerv-nhp-sandbox-ca-icr",
     "layerv-nhp-sandbox-ca-iro-cell0",
     "layerv-nhp-sandbox-ca-iro-cell1",
+    "layerv-nhp-sandbox-ca-pm",
     "layerv-nhp-sandbox-ca-ra",
 ]
+AUTHORITY_PROOF_POLICY_CONSUMERS = frozenset(
+    {
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-icr",
+        "layerv-nhp-sandbox-ca-ra",
+    }
+)
+AUTHORITY_PROOF_POLICY_ENVIRONMENT = {
+    "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": "layerv-nhp-sandbox-udp-proof",
+    "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
+    "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
+    "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
+}
 
 
 class ECSWorkloadSpec(TypedDict):
@@ -1896,6 +1910,7 @@ def _collect_ecs_workload(workload_key: str) -> dict[str, Any]:
 
 def _collect_authority_workload() -> dict[str, Any]:
     function_pairs = []
+    proof_policy_consumers_active: list[bool] = []
     digest = None
     repository = "layerv/qurl-connector-authority"
     for function_name in AUTHORITY_FUNCTIONS:
@@ -1983,6 +1998,23 @@ def _collect_authority_workload() -> dict[str, Any]:
             or configuration.get("LastUpdateStatus") != "Successful"
         ):
             raise EvidenceError(f"{function_name} active version is not an image")
+        environment = configuration.get("Environment")
+        variables = (
+            environment.get("Variables")
+            if isinstance(environment, dict)
+            and isinstance(environment.get("Variables"), dict)
+            else {}
+        )
+        proof_variables = {
+            key: value
+            for key, value in variables.items()
+            if isinstance(key, str)
+            and key.startswith("CONNECTOR_AUTHORITY_PROOF_")
+        }
+        if function_name in AUTHORITY_PROOF_POLICY_CONSUMERS:
+            proof_policy_consumers_active.append(
+                proof_variables == AUTHORITY_PROOF_POLICY_ENVIRONMENT
+            )
         image_uri = contract._string(
             code.get("ResolvedImageUri"),
             f"{function_name} active image URI",
@@ -2011,6 +2043,11 @@ def _collect_authority_workload() -> dict[str, Any]:
     return {
         "kind": "lambda_image_set",
         "functions": function_pairs,
+        "proof_policy_consumers_active": (
+            len(proof_policy_consumers_active)
+            == len(AUTHORITY_PROOF_POLICY_CONSUMERS)
+            and all(proof_policy_consumers_active)
+        ),
         "image_repository": repository,
         "image_digest": digest,
         "source_revision": source_revision,

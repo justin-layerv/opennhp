@@ -52,3 +52,13 @@ output "proof_otp_mailbox_bucket" {
   description = "Private one-day SES receipt bucket consumed by the proof runner."
   value       = module.udp_proof_runner.proof_otp_mailbox_bucket
 }
+
+output "assignment_handshake_bucket" {
+  description = "One-run assignment proof checkpoint/receipt bucket."
+  value       = module.udp_proof_runner.assignment_handshake_bucket
+}
+
+output "assignment_handshake_kms_key_arn" {
+  description = "KMS key ARN required on assignment proof checkpoint/receipt writes."
+  value       = module.udp_proof_runner.assignment_handshake_kms_key_arn
+}

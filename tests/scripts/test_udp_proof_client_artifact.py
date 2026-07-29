@@ -143,7 +143,6 @@ def evidence(
     *,
     phase: str = "pre_removal",
     pre_removal_run_id: str = "",
-    connector_proof_run_id: str = "777",
 ) -> dict[str, object]:
     selected = target(client)
     value: dict[str, object] = {
@@ -205,8 +204,6 @@ def evidence(
     else:
         value.update(
             {
-                "connector_attestation_sha256": "8" * 64,
-                "connector_proof_run_id": connector_proof_run_id,
                 "inventory_mapping_sha256": "9" * 64,
                 "retired_lifecycle_surface_sha256": "a" * 64,
                 "strict_outcome": "success",
@@ -225,7 +222,6 @@ def write_client_files(
     *,
     phase: str = "pre_removal",
     pre_removal_run_id: str = "",
-    connector_proof_run_id: str = "777",
 ) -> tuple[bytes, bytes]:
     snapshot = producer_fixture.valid_snapshot()
     snapshot["manifest"]["phase"] = phase
@@ -271,7 +267,6 @@ def write_client_files(
                 runtime_raw,
                 phase=phase,
                 pre_removal_run_id=pre_removal_run_id,
-                connector_proof_run_id=connector_proof_run_id,
             ),
             validator.MAX_EVIDENCE_BYTES,
             "native-udp-sandbox.evidence.json",
@@ -289,7 +284,6 @@ def validate_files(
     *,
     phase: str = "pre_removal",
     pre_removal_run_id: str = "",
-    connector_proof_run_id: str = "777",
 ) -> dict[str, str]:
     selected = target(client)
     return validator.validate_files(
@@ -310,9 +304,6 @@ def validate_files(
         producer_head_sha=PRODUCER_HEAD_SHA,
         producer_artifact_id=str(PRODUCER_ARTIFACT_ID),
         producer_artifact_digest=PRODUCER_ARTIFACT_DIGEST,
-        connector_proof_run_id=(
-            connector_proof_run_id if client == "qurl_go" else ""
-        ),
         pre_removal_run_id=pre_removal_run_id,
     )
 
@@ -447,12 +438,12 @@ class ArchiveTest(unittest.TestCase):
 class FilesTest(unittest.TestCase):
     def test_accepts_exact_connector_and_qurl_go_results(self) -> None:
         cases = (
-            ("connector", "pre_removal", "", "777"),
-            ("connector", "post_removal", "111", "777"),
-            ("qurl_go", "pre_removal", "", "777"),
-            ("qurl_go", "post_removal", "222", "777"),
+            ("connector", "pre_removal", ""),
+            ("connector", "post_removal", "111"),
+            ("qurl_go", "pre_removal", ""),
+            ("qurl_go", "post_removal", "222"),
         )
-        for client, phase, pre_run, connector_run in cases:
+        for client, phase, pre_run in cases:
             with self.subTest(client=client, phase=phase), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 manifest_raw, runtime_raw = write_client_files(
@@ -460,7 +451,6 @@ class FilesTest(unittest.TestCase):
                     client,
                     phase=phase,
                     pre_removal_run_id=pre_run,
-                    connector_proof_run_id=connector_run,
                 )
                 outputs = validate_files(
                     directory,
@@ -469,7 +459,6 @@ class FilesTest(unittest.TestCase):
                     runtime_raw,
                     phase=phase,
                     pre_removal_run_id=pre_run,
-                    connector_proof_run_id=connector_run,
                 )
                 self.assertEqual(
                     outputs["client_manifest_sha256"],
@@ -512,7 +501,7 @@ class FilesTest(unittest.TestCase):
                         runtime_raw,
                     )
 
-    def test_rejects_manifest_bytes_and_qurl_go_connector_lineage_drift(self) -> None:
+    def test_rejects_manifest_bytes_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             manifest_raw, runtime_raw = write_client_files(directory, "connector")
@@ -522,18 +511,6 @@ class FilesTest(unittest.TestCase):
                     "connector",
                     b"{}",
                     runtime_raw,
-                )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            manifest_raw, runtime_raw = write_client_files(directory, "qurl_go")
-            with self.assertRaises(validator.ClientArtifactError):
-                validate_files(
-                    directory,
-                    "qurl_go",
-                    manifest_raw,
-                    runtime_raw,
-                    connector_proof_run_id="778",
                 )
 
     def test_rejects_missing_extra_and_noncanonical_files(self) -> None:

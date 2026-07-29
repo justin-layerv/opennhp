@@ -228,14 +228,15 @@ The composing PR must:
      Record the resulting Connector workflow run ID. An `if: always()`
      finalizer stops the broker even when mint, dispatch, proof, or verification
      fails.
-   - qurl-go second. Require the verified Connector workflow run ID as
-     `connector_proof_run_id`. Mint a distinct JIT configuration and secret
-     keyed by this second NHP run and attempt, start the broker, dispatch the
-     exact qurl-go workflow with that NHP run's
-     `nhp_controller_run_id`/`nhp_controller_run_attempt` pair and the Connector
-     run ID, then perform the same external-run and artifact verification before
-     accepting evidence. Its independent `if: always()` finalizer also stops
-     the broker.
+   - qurl-go second. Mint a distinct JIT configuration and secret keyed by this
+     second NHP run and attempt, start the broker, arm the controller-bound
+     assignment handshake, and dispatch the exact qurl-go workflow with that NHP
+     run's `nhp_controller_run_id`/`nhp_controller_run_attempt` pair. The
+     qurl-go proof is independent and carries no Connector workflow lineage.
+     Resolve its exact workflow run ID and pinned candidate SHA, require both in
+     the authenticated checkpoint and receipt, then perform the same
+     external-run and artifact verification before accepting evidence. Its
+     independent `if: always()` finalizer also stops the broker.
 
    One JIT runner handles one client workflow; do not try to reuse a consumed
    runner or one NHP run across both clients.

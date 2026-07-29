@@ -497,6 +497,7 @@ def generated_input(
     hub_edge_enabled: bool = False,
     hub_worker_enabled: bool = False,
     proof_mutation_controls_enabled: bool = False,
+    proof_policy_consumers_staged: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     if proof_mutation_controls_enabled:
@@ -568,6 +569,10 @@ def generated_input(
         payload["authority_proof_mutation_controller_role_arns"] = [
             EXPECTED_PROOF_CONTROLLER_ROLE_ARN
         ]
+    if proof_policy_consumers_staged:
+        if not proof_mutation_controls_enabled:
+            fail("proof policy consumers require proof mutation controls")
+        payload["authority_proof_policy_consumers_staged"] = True
     return payload
 
 
@@ -641,6 +646,15 @@ def main(argv: list[str] | None = None) -> int:
             "not wire IA/RA/ICR or run proof. Requires --runtime-functions-enabled."
         ),
     )
+    parser.add_argument(
+        "--proof-policy-consumers-staged",
+        action="store_true",
+        default=False,
+        help=(
+            "Publish read-only attended-proof policy to the selected IA/RA/ICR "
+            "aliases. Requires --proof-mutation-controls-enabled."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -659,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                 hub_edge_enabled=args.hub_edge_enabled,
                 hub_worker_enabled=args.hub_worker_enabled,
                 proof_mutation_controls_enabled=args.proof_mutation_controls_enabled,
+                proof_policy_consumers_staged=args.proof_policy_consumers_staged,
             )
         )
         atomic_write(args.output, payload)

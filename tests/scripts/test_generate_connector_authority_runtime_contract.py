@@ -257,6 +257,7 @@ class GitBindingTests(unittest.TestCase):
         output: Path | None = None,
         runtime_functions_enabled: bool = False,
         proof_mutation_controls_enabled: bool = False,
+        proof_policy_consumers_staged: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         destination = output or (self.root / "generated.tfvars.json")
         args = [
@@ -277,6 +278,8 @@ class GitBindingTests(unittest.TestCase):
             args.append("--runtime-functions-enabled")
         if proof_mutation_controls_enabled:
             args.append("--proof-mutation-controls-enabled")
+        if proof_policy_consumers_staged:
+            args.append("--proof-policy-consumers-staged")
         return run(*args, cwd=self.root, check=False)
 
     def test_generates_stable_blob_owned_evidence_and_private_atomic_output(self) -> None:
@@ -457,6 +460,29 @@ class GitBindingTests(unittest.TestCase):
         )
         self.assertNotEqual(without_runtime.returncode, 0)
         self.assertIn("runtime functions", without_runtime.stderr)
+
+        consumers_without_mutation = self.generate(
+            output=self.root / "proof-consumers-without-mutation.json",
+            runtime_functions_enabled=True,
+            proof_policy_consumers_staged=True,
+        )
+        self.assertNotEqual(consumers_without_mutation.returncode, 0)
+        self.assertIn("require proof mutation controls", consumers_without_mutation.stderr)
+
+        consumers_output = self.root / "proof-consumers-enabled.json"
+        consumers = self.generate(
+            output=consumers_output,
+            runtime_functions_enabled=True,
+            proof_mutation_controls_enabled=True,
+            proof_policy_consumers_staged=True,
+        )
+        self.assertEqual(consumers.returncode, 0, consumers.stderr)
+        self.assertIs(
+            json.loads(consumers_output.read_text(encoding="utf-8"))[
+                "authority_proof_policy_consumers_staged"
+            ],
+            True,
+        )
 
     def test_rejects_mode_path_checkout_and_byte_mismatch(self) -> None:
         cases = {

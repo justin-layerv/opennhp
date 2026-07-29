@@ -105,6 +105,38 @@ resource "aws_iam_role_policy" "runner" {
         ]
         Resource = "${aws_s3_bucket.proof_otp_mailbox.arn}/${local.proof_mailbox_object_prefix}*"
       },
+      {
+        Sid      = "WriteAssignmentProofCheckpoint"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/checkpoint.json"
+      },
+      {
+        Sid      = "ReadAssignmentProofReceipt"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
+      },
+      {
+        Sid      = "DenyAssignmentProofReceiptWrites"
+        Effect   = "Deny"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
+      },
+      {
+        Sid      = "EncryptAssignmentProofHandshake"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = aws_kms_key.assignment_handshake.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = local.assignment_handshake_s3_via_service
+          }
+          StringLike = {
+            "kms:EncryptionContext:aws:s3:arn" = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*"
+          }
+        }
+      },
     ]
   })
 
@@ -317,6 +349,44 @@ resource "aws_iam_role_policy" "controller" {
             "aws:RequestTag/GitHubRunAttempt" = "false"
           }
         }
+      },
+      {
+        Sid      = "ReadAssignmentProofCheckpoint"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/checkpoint.json"
+      },
+      {
+        Sid      = "WriteAssignmentProofReceipt"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/receipt.json"
+      },
+      {
+        Sid      = "DenyAssignmentProofCheckpointWrites"
+        Effect   = "Deny"
+        Action   = "s3:PutObject"
+        Resource = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*/checkpoint.json"
+      },
+      {
+        Sid      = "EncryptAssignmentProofHandshake"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = aws_kms_key.assignment_handshake.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = local.assignment_handshake_s3_via_service
+          }
+          StringLike = {
+            "kms:EncryptionContext:aws:s3:arn" = "${local.assignment_handshake_bucket_arn}/${local.assignment_handshake_prefix}*"
+          }
+        }
+      },
+      {
+        Sid      = "ResolveAssignmentProofHandshakeKey"
+        Effect   = "Allow"
+        Action   = "kms:DescribeKey"
+        Resource = aws_kms_key.assignment_handshake.arn
       },
     ]
   })

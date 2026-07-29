@@ -306,6 +306,23 @@ variable "authority_proof_mutation_controls_enabled" {
   default     = false
 }
 
+variable "authority_proof_policy_consumers_staged" {
+  description = <<-EOT
+    Sandbox-only staging gate that publishes a new proof-policy-aware
+    IssueAssignment, RefreshAssignment, and IssueCredentialRecovery version.
+    Both live aliases retain their existing versions byte-for-byte. The three
+    consumers receive read-only access to the PROOF partition; an explicit IAM
+    deny prevents writes even if a future broader statement is introduced.
+
+    This gate requires authority_proof_mutation_controls_enabled and a live
+    Authority runtime. It does not activate the staged versions; a separate
+    governed zero-spill rollout is required. It never creates a production
+    capability and defaults false in every root.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = <<-EOT
     Owner identity of the dedicated sandbox proof tenant that owns every

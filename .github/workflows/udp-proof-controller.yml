@@ -3,9 +3,9 @@
 # One controller run mints one JIT configuration, launches one EIP-pinned
 # one-job runner, dispatches one exact client candidate, verifies that external
 # run, and always asks the broker to reap the runner. Run Connector first, then
-# start a distinct attended qurl-go controller run with the verified Connector
-# run ID. This preserves the one-secret/one-runner contract and gives each
-# client independent controller provenance.
+# start a distinct attended qurl-go controller run. This preserves the
+# one-secret/one-runner contract and gives each client independent controller
+# provenance.
 #
 # The operator supplies only one successful trusted-main producer run ID. The
 # gate authenticates that exact run and its unique current-attempt artifact,
@@ -43,10 +43,6 @@ on:
         description: Successful trusted-main deployment-manifest producer run ID
         required: true
         type: string
-      connector_proof_run_id:
-        description: Required for qurl_go; successful same-phase Connector proof run ID
-        required: false
-        type: string
       pre_removal_run_id:
         description: Required for post_removal; selected client's successful pre-removal run ID
         required: false
@@ -79,7 +75,7 @@ env:
   # rejects any producer artifact that binds a different head. If either head
   # moves, re-run the producer and update both pins plus runner-group 5.
   PINNED_CONNECTOR_SHA: 29a0a7eba76187a915c29d7bd71f1a20cca7776f
-  PINNED_QURL_GO_SHA: e9004a8a07fbc30de8d5f7b95f6c169016c03e95
+  PINNED_QURL_GO_SHA: 54f538e2da86ac7f89e1694fdeb247be752558bb
 
 jobs:
   gate:
@@ -97,6 +93,7 @@ jobs:
       client_sha: ${{ steps.files.outputs.client_sha }}
       deployment_manifest_b64: ${{ steps.files.outputs.deployment_manifest_b64 }}
       deployment_runtime_inputs_b64: ${{ steps.files.outputs.deployment_runtime_inputs_b64 }}
+      deployment_provenance_b64: ${{ steps.files.outputs.deployment_provenance_b64 }}
       deployment_manifest_sha256: ${{ steps.files.outputs.deployment_manifest_sha256 }}
       deployment_runtime_inputs_sha256: ${{ steps.files.outputs.deployment_runtime_inputs_sha256 }}
       producer_run_id: ${{ steps.metadata.outputs.producer_run_id }}
@@ -177,7 +174,6 @@ jobs:
         env:
           CLIENT: ${{ inputs.client }}
           PROOF_PHASE: ${{ inputs.proof_phase }}
-          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
           PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
         run: |
           set -euo pipefail
@@ -188,7 +184,6 @@ jobs:
             --producer-run-id "${{ steps.metadata.outputs.producer_run_id }}" \
             --producer-run-attempt "${{ steps.metadata.outputs.producer_run_attempt }}" \
             --producer-head-sha "${{ steps.metadata.outputs.producer_head_sha }}" \
-            --connector-proof-run-id "$CONNECTOR_PROOF_RUN_ID" \
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
 
@@ -375,6 +370,21 @@ jobs:
           bash .github/scripts/invoke_udp_proof_broker.sh \
             start "${{ github.run_id }}" "${{ github.run_attempt }}"
 
+      - name: Arm qurl-go assignment proof before dispatch
+        id: assignment
+        if: inputs.client == 'qurl_go'
+        env:
+          DEPLOYMENT_PROVENANCE_B64: ${{ needs.gate.outputs.deployment_provenance_b64 }}
+          PROOF_PHASE: ${{ inputs.proof_phase }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/udp_proof_assignment_handshake.py prepare \
+            --controller-run-id "${{ github.run_id }}" \
+            --controller-run-attempt "${{ github.run_attempt }}" \
+            --proof-phase "$PROOF_PHASE" \
+            --deployment-provenance-b64 "$DEPLOYMENT_PROVENANCE_B64" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Dispatch exact client candidate and resolve run
         id: dispatch
         env:
@@ -392,23 +402,31 @@ jobs:
           CLIENT_WORKFLOW: ${{ needs.gate.outputs.client_workflow }}
           CLIENT_REF: ${{ needs.gate.outputs.client_ref }}
           CLIENT_SHA: ${{ needs.gate.outputs.client_sha }}
-          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
           PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
+          ASSIGNMENT_HANDSHAKE_B64: ${{ steps.assignment.outputs.handshake_b64 }}
+          ASSIGNMENT_CORRELATION_ID: ${{ steps.assignment.outputs.correlation_id }}
         run: |
           set -euo pipefail
-          nonce="$(openssl rand -hex 16)"
-          [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || {
-            echo "::error::could not generate an exact dispatch correlation nonce"
+          correlation_id="$ASSIGNMENT_CORRELATION_ID"
+          if [[ "$CLIENT" != "qurl_go" ]]; then
+            nonce="$(openssl rand -hex 16)"
+            [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || {
+              echo "::error::could not generate an exact dispatch correlation nonce"
+              exit 1
+            }
+            correlation_id="$(
+              printf 'nhp-%s-%s-%s-%s-%s' \
+                "${{ github.run_id }}" \
+                "${{ github.run_attempt }}" \
+                "$CLIENT" \
+                "$PROOF_PHASE" \
+                "$nonce"
+            )"
+          fi
+          [[ "$correlation_id" =~ ^nhp-[1-9][0-9]*-[1-9][0-9]*-(connector|qurl_go)-(pre_removal|post_removal)-[0-9a-f]{32}$ ]] || {
+            echo "::error::dispatch correlation is not controller-bound"
             exit 1
           }
-          correlation_id="$(
-            printf 'nhp-%s-%s-%s-%s-%s' \
-              "${{ github.run_id }}" \
-              "${{ github.run_attempt }}" \
-              "$CLIENT" \
-              "$PROOF_PHASE" \
-              "$nonce"
-          )"
           expected_title="UDP proof [corr:${correlation_id}]"
           # Persist the exact lookup envelope before dispatch. If GitHub accepts
           # the dispatch but its list API does not surface the run within the
@@ -439,7 +457,9 @@ jobs:
             dispatch_args+=(-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID")
           fi
           if [[ "$CLIENT" == "qurl_go" ]]; then
-            dispatch_args+=(-f "connector_proof_run_id=$CONNECTOR_PROOF_RUN_ID")
+            dispatch_args+=(
+              -f "assignment_handshake_b64=$ASSIGNMENT_HANDSHAKE_B64"
+            )
           fi
 
           gh workflow run "$CLIENT_WORKFLOW" \
@@ -500,20 +520,41 @@ jobs:
           }
           echo "client_run_id=$run_id" >>"$GITHUB_OUTPUT"
 
+      - name: Complete qurl-go assignment mutation after authenticated checkpoint
+        if: inputs.client == 'qurl_go'
+        env:
+          ASSIGNMENT_HANDSHAKE_B64: ${{ steps.assignment.outputs.handshake_b64 }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/udp_proof_assignment_handshake.py complete \
+            --handshake-b64 "$ASSIGNMENT_HANDSHAKE_B64" \
+            --client-run-id "${{ steps.dispatch.outputs.client_run_id }}" \
+            --client-sha "${{ steps.dispatch.outputs.client_sha }}" \
+            --timeout-seconds 1800
+
+      - name: Refresh proof token after assignment checkpoint
+        id: app_wait1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: ${{ inputs.client == 'connector' && 'qurl-connector' || 'qurl-go' }}
+          permission-actions: write
+
       # Installation tokens expire after one hour, while the longest client
       # proof has a 90-minute job budget that starts only after its JIT runner
-      # accepts the job. Use three independent 155-poll windows so runner boot,
-      # GitHub scheduling, the full client budget, and artifact finalization
-      # have about 115.5 minutes of sleep intervals from dispatch without any
-      # token nearing expiry. Per-attempt API latency extends that real polling
-      # window. The 165-minute controller cap leaves the remainder for bounded
-      # setup, cancellation, and cleanup while still ending before the runner's
-      # independent 180-minute boot-relative hard deadline.
+      # accepts the job. Assignment checkpointing is separately capped at
+      # 30 minutes under its 35-minute arm lease. Mint the first wait token only
+      # after that checkpoint, then use three independent 155-poll windows so
+      # the remaining client work and artifact finalization have about 115.5
+      # minutes of sleep intervals without any token nearing expiry. Together,
+      # those bounds remain below the 165-minute controller cap.
       # A failure-only cancellation step mints another token below instead of
       # spending the final verification token's tail.
       - name: Wait for client proof (first token window)
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app_wait1.outputs.token }}
           CLIENT_RUN_ID: ${{ steps.dispatch.outputs.client_run_id }}
           CLIENT_REPOSITORY: ${{ steps.dispatch.outputs.client_repository }}
         run: |
@@ -669,7 +710,6 @@ jobs:
           PRODUCER_HEAD_SHA: ${{ needs.gate.outputs.producer_head_sha }}
           PRODUCER_ARTIFACT_ID: ${{ needs.gate.outputs.producer_artifact_id }}
           PRODUCER_ARTIFACT_DIGEST: ${{ needs.gate.outputs.producer_artifact_digest }}
-          CONNECTOR_PROOF_RUN_ID: ${{ inputs.connector_proof_run_id }}
           PRE_REMOVAL_RUN_ID: ${{ inputs.pre_removal_run_id }}
         run: |
           set -euo pipefail
@@ -720,7 +760,6 @@ jobs:
             --producer-head-sha "$PRODUCER_HEAD_SHA" \
             --producer-artifact-id "$PRODUCER_ARTIFACT_ID" \
             --producer-artifact-digest "$PRODUCER_ARTIFACT_DIGEST" \
-            --connector-proof-run-id "$CONNECTOR_PROOF_RUN_ID" \
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
 

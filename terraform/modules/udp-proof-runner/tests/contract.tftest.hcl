@@ -267,7 +267,7 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactRuntimeImages"].Action) == toset(["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]) &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Action == "ecr:GetAuthorizationToken" &&
       ({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadECRAuthorizationToken"].Condition.StringEquals["aws:RequestedRegion"] == "us-east-2" &&
-      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactAuthorityFunctions"].Resource) == 22 &&
+      length(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactAuthorityFunctions"].Resource) == 24 &&
       toset(({ for statement in jsondecode(aws_iam_role_policy.manifest_producer_core.policy).Statement : statement.Sid => statement })["ReadExactECSDeployments"].Resource) == toset([
         "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-control-hub/layerv-nhp-sandbox-control-hub",
         "arn:aws:ecs:us-east-2:767397897469:service/layerv-nhp-sandbox-cell0-qurl-api/layerv-nhp-sandbox-cell0-qurl-api",
@@ -371,7 +371,7 @@ run "secure_ephemeral_runner_contract" {
       strcontains(file("${path.module}/README.md"), "process lifetime") &&
       strcontains(file("${path.module}/README.md"), "sustained `DescribeAddresses` failure") &&
       strcontains(file("${path.module}/README.md"), "Use two separate, attended NHP controller runs") &&
-      strcontains(file("${path.module}/README.md"), "connector_proof_run_id") &&
+      strcontains(file("${path.module}/README.md"), "carries no Connector workflow lineage") &&
       !strcontains(file("${path.module}/README.md"), "runner group restricted to the NHP repository")
     )
     error_message = "The composition contract must keep NHP as controller-only and bind the organization JIT runners to exact Connector/qurl-go workflows in two serialized client proofs."
@@ -391,6 +391,11 @@ run "secure_ephemeral_runner_contract" {
         "DeleteRunBoundProofCredential",
         "CreateRunBoundProofCredential",
         "TagRunBoundProofCredential",
+        "ReadAssignmentProofCheckpoint",
+        "WriteAssignmentProofReceipt",
+        "DenyAssignmentProofCheckpointWrites",
+        "EncryptAssignmentProofHandshake",
+        "ResolveAssignmentProofHandshakeKey",
       ]) &&
       !strcontains(aws_iam_role_policy.controller.policy, "ec2:") &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateOneTimeJITConfiguration"].Action == "secretsmanager:CreateSecret" &&
@@ -417,7 +422,18 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeAndRemoveExactProofAccountKey"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [var.proof_account_credential_sha256] &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Condition.StringEquals["aws:RequestTag/Purpose"] == local.proof_account_jit_purpose &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAssignmentProofCheckpoint"].Action == "s3:GetObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ReadAssignmentProofCheckpoint"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/checkpoint.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["WriteAssignmentProofReceipt"].Action == "s3:PutObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["WriteAssignmentProofReceipt"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DenyAssignmentProofCheckpointWrites"].Effect == "Deny" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DenyAssignmentProofCheckpointWrites"].Action == "s3:PutObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DenyAssignmentProofCheckpointWrites"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/checkpoint.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["EncryptAssignmentProofHandshake"].Resource == aws_kms_key.assignment_handshake.arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ResolveAssignmentProofHandshakeKey"].Action == "kms:DescribeKey" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ResolveAssignmentProofHandshakeKey"].Resource == aws_kms_key.assignment_handshake.arn &&
+      output.assignment_handshake_kms_key_arn == aws_kms_key.assignment_handshake.arn
     )
     error_message = "The workflow controller must retain no EC2 surface and may touch only exact tagged run metadata, the bound proof account, and its digest-fenced Control rows."
   }
@@ -459,7 +475,15 @@ run "secure_ephemeral_runner_contract" {
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAndDeleteRunBoundProofCredential"].Condition.StringEquals["secretsmanager:ResourceTag/Purpose"] == local.proof_account_jit_purpose &&
       ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxQueue"].Resource == aws_sqs_queue.proof_otp_mailbox.arn &&
-      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxObjects"].Resource == "${aws_s3_bucket.proof_otp_mailbox.arn}/${local.proof_mailbox_object_prefix}*"
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ConsumeExactProofOTPMailboxObjects"].Resource == "${aws_s3_bucket.proof_otp_mailbox.arn}/${local.proof_mailbox_object_prefix}*" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["WriteAssignmentProofCheckpoint"].Action == "s3:PutObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["WriteAssignmentProofCheckpoint"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/checkpoint.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAssignmentProofReceipt"].Action == "s3:GetObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["ReadAssignmentProofReceipt"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Effect == "Deny" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Action == "s3:PutObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["DenyAssignmentProofReceiptWrites"].Resource == "arn:aws:s3:::layerv-nhp-sandbox-udp-proof-handshake-767397897469/handshake/v1/*/receipt.json" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.runner.policy).Statement : statement.Sid => statement })["EncryptAssignmentProofHandshake"].Resource == aws_kms_key.assignment_handshake.arn
     )
     error_message = "Proof KMS access must be exact-key and encryption-context bound separately to Connector decrypt and qurl-go sealed-state use."
   }

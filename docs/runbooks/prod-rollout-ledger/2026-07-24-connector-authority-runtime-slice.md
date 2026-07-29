@@ -142,6 +142,21 @@ rollback-retention fields are validation-only until
       Control state/live checks and a refresh-enabled dark no-op. Partial
       deletion, foreign drift, a retained/inactive alias grant, or any
       IA/RA/ICR movement blocks the operation.
+- [ ] Rollout/rollback (PROOF CONSUMER STAGING, sandbox only): after ca-pm is
+      live, apply the consumer-staging gate. The saved plan may publish new
+      IA/RA/ICR versions and update their exact execution policies, but both
+      blue and green aliases for all three functions must remain byte-for-byte
+      unchanged. Confirm the selected aliases still report
+      `proof_policy_consumers_active=false`; the attended qurl-go handshake must
+      fail closed with the governed-rollout-required error. Activate the staged
+      versions only through the separate zero-spill controller, with
+      provisioned concurrency READY and spillover remaining zero, then require
+      authenticated deployment evidence to report
+      `proof_policy_consumers_active=true` before the proof may arm. Roll back
+      in reverse: governed alias rollback first, consumer-staging gate second,
+      then govern both aliases onto the newly published non-proof version
+      before disabling ca-pm. Any alias delta in the ca-pm-disable plan blocks
+      that final operation.
 - [ ] Production: remains blocked. Prod `authority_runtime_contract`,
       `authority_runtime_contract_evidence_verified`, and
       `authority_runtime_functions_enabled` are validation-locked to

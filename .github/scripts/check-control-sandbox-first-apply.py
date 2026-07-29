@@ -818,6 +818,31 @@ AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES = frozenset(
 AUTHORITY_PROOF_ENABLE_ALL_CHANGES = frozenset(
     set(AUTHORITY_PROOF_RESOURCES) | set(AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES)
 )
+AUTHORITY_PROOF_CONSUMER_FUNCTIONS = frozenset(
+    {
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+    }
+)
+AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES = frozenset(
+    f'module.control.data.aws_lambda_alias.authority_proof_policy_live["{function_name}:{color}"]'
+    for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
+    for color in ("blue", "green")
+)
+AUTHORITY_PROOF_CONSUMER_BASE_UPDATE_ADDRESSES = frozenset(
+    {
+        "module.control.terraform_data.foundation_contract",
+        *(
+            address
+            for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
+            for address in (
+                f'module.control.aws_lambda_function.authority["{function_name}"]',
+                f'module.control.aws_iam_role_policy.authority_exec["{function_name}"]',
+            )
+        ),
+    }
+)
 # The 11 already-live spillover alarms gain alarm_actions in place; every other
 # alarm address is a pure create.
 AUTHORITY_ALARM_UPDATE_ADDRESSES = frozenset(
@@ -1341,6 +1366,11 @@ HUB_ECR_PULL_ACTIONS = frozenset(
 HUB_S3_LAYER_BUCKET_ARN = f"arn:aws:s3:::prod-{AWS_REGION}-starport-layer-bucket/*"
 
 AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
+    "module.control.data.aws_lambda_alias.authority_proof_policy_live": (
+        "data",
+        "aws_lambda_alias",
+        "aws",
+    ),
     "module.control.aws_lambda_function.authority": (
         "managed",
         "aws_lambda_function",
@@ -5417,7 +5447,11 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
 
 
 def _check_authority_exec_role_policy(
-    after: dict[str, Any], fn: str, operation: str
+    after: dict[str, Any],
+    fn: str,
+    operation: str,
+    *,
+    proof_policy_consumer: bool = False,
 ) -> None:
     """Validate one function's per-operation execution (identity) policy.
 
@@ -5445,11 +5479,14 @@ def _check_authority_exec_role_policy(
         raise ContractError(f"{fn} execution policy Statement must be a list")
     by_sid: dict[str, dict[str, Any]] = {}
     for stmt in statements:
-        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
-            raise ContractError(f"{fn} execution statements must all be Allow objects")
+        if not isinstance(stmt, dict):
+            raise ContractError(f"{fn} execution statements must all be objects")
+        effect = stmt.get("Effect")
+        if effect not in {"Allow", "Deny"}:
+            raise ContractError(f"{fn} execution statement effect is invalid")
         if any(
             key in stmt
-            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal", "Condition")
+            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal")
         ):
             raise ContractError(f"{fn} execution statement uses a forbidden element")
         sid = stmt.get("Sid")
@@ -5460,11 +5497,19 @@ def _check_authority_exec_role_policy(
     expected_sids = {"LambdaVpcEni", "OwnLogStream", "AuthorityReads", spec["write_sid"]}
     if spec["signs"]:
         expected_sids.add("Qat1Sign")
+    if proof_policy_consumer:
+        expected_sids.update({"ProofPolicyRead", "DenyProofPolicyWrite"})
     if set(by_sid) != expected_sids:
         raise ContractError(
             f"{fn} execution policy statement set drifted: "
             f"{sorted(by_sid)} != {sorted(expected_sids)}"
         )
+    if any(
+        statement.get("Effect") != "Allow"
+        for sid, statement in by_sid.items()
+        if sid != "DenyProofPolicyWrite"
+    ):
+        raise ContractError(f"{fn} carries a non-Allow ordinary execution statement")
 
     # ENI lifecycle: the ONLY statement permitted a wildcard resource.
     eni = by_sid["LambdaVpcEni"]
@@ -5514,6 +5559,66 @@ def _check_authority_exec_role_policy(
         AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
     ):
         raise ContractError(f"{fn} writes must be scoped to connector_authority only")
+    expected_write_keys = {
+        "issue_assignment": ["HUB_REQUEST#IssueAssignment#*"],
+        "refresh_assignment": ["HUB_REQUEST#RefreshAssignment#*"],
+        "issue_credential_recovery": [
+            "CREDENTIAL_RECOVERY_GRANT#*",
+            "CREDENTIAL_RECOVERY_ISSUE#*",
+            "HUB_REQUEST#IssueCredentialRecovery#*",
+            "OWNER#*",
+        ],
+    }[operation]
+    if write.get("Condition") != {
+        "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": expected_write_keys,
+        },
+        "Null": {"dynamodb:LeadingKeys": "false"},
+    }:
+        raise ContractError(f"{fn} ordinary writes are not partition-fenced")
+
+    unconditional_sids = {
+        "LambdaVpcEni",
+        "OwnLogStream",
+        "AuthorityReads",
+        *(["Qat1Sign"] if spec["signs"] else []),
+    }
+    if any("Condition" in by_sid[sid] for sid in unconditional_sids):
+        raise ContractError(f"{fn} carries a condition on an unconditioned statement")
+
+    if proof_policy_consumer:
+        proof_read = by_sid["ProofPolicyRead"]
+        proof_deny = by_sid["DenyProofPolicyWrite"]
+        table_resources = set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"])
+        expected_condition = {
+            "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": ["PROOF"],
+            },
+            "Null": {"dynamodb:LeadingKeys": "false"},
+        }
+        if (
+            proof_read.get("Effect") != "Allow"
+            or _authority_string_set(proof_read.get("Action"), fn, "proof read")
+            != {"dynamodb:GetItem"}
+            or _authority_string_set(proof_read.get("Resource"), fn, "proof read")
+            != table_resources
+            or proof_read.get("Condition") != expected_condition
+            or proof_deny.get("Effect") != "Deny"
+            or _authority_string_set(proof_deny.get("Action"), fn, "proof deny")
+            != {
+                "dynamodb:DeleteItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+            }
+            or _authority_string_set(proof_deny.get("Resource"), fn, "proof deny")
+            != table_resources
+            or proof_deny.get("Condition") != expected_condition
+        ):
+            raise ContractError(
+                f"{fn} proof policy must be exact GetItem plus an explicit write deny"
+            )
+    elif any(sid in by_sid for sid in ("ProofPolicyRead", "DenyProofPolicyWrite")):
+        raise ContractError(f"{fn} carries proof policy while its rollout gate is dark")
 
     # KMS Sign: IssueAssignment alone (GetPublicKey + Sign on exactly the qat1 key).
     if spec["signs"]:
@@ -5634,10 +5739,11 @@ def _check_authority_proof_exec_role_policy(
         condition = stmt.get("Condition")
         if (
             not isinstance(condition, dict)
-            or set(condition) != {operator}
+            or set(condition) != {operator, "Null"}
             or not isinstance(condition[operator], dict)
             or condition[operator]
             != {"dynamodb:LeadingKeys": leading_keys}
+            or condition["Null"] != {"dynamodb:LeadingKeys": "false"}
         ):
             raise ContractError(f"{fn} {sid} LeadingKeys fence drifted")
 
@@ -6067,6 +6173,15 @@ def _check_authority_runtime_resources(
             ),
             fn,
             _operation,
+            proof_policy_consumer=(
+                payload.get("authority_proof_policy_consumers_staged") is True
+                and _operation
+                in {
+                    "issue_assignment",
+                    "refresh_assignment",
+                    "issue_credential_recovery",
+                }
+            ),
         )
 
         for color in ("blue", "green"):
@@ -6089,6 +6204,14 @@ def _check_authority_runtime_resources(
         "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
     }
     proof_environment_functions = set(AUTHORITY_PROOF_FUNCTIONS)
+    if payload.get("authority_proof_policy_consumers_staged") is True:
+        proof_environment_functions.update(
+            {
+                "layerv-nhp-sandbox-ca-ia",
+                "layerv-nhp-sandbox-ca-ra",
+                "layerv-nhp-sandbox-ca-icr",
+            }
+        )
     for fn in operations:
         function_after = _authority_runtime_after(
             by_address, f'module.control.aws_lambda_function.authority["{fn}"]'
@@ -6725,6 +6848,66 @@ def _check_authority_proof_enable_transition(
             )
 
 
+def _authority_proof_consumer_transition_addresses(
+    by_address: dict[str, dict[str, Any]], *, enabling: bool
+) -> set[str] | None:
+    foundation = by_address.get("module.control.terraform_data.foundation_contract")
+    change = foundation.get("change") if isinstance(foundation, dict) else None
+    before = change.get("before") if isinstance(change, dict) else None
+    after = change.get("after") if isinstance(change, dict) else None
+    before_input = before.get("input") if isinstance(before, dict) else None
+    after_input = after.get("input") if isinstance(after, dict) else None
+    if not isinstance(before_input, dict) or not isinstance(after_input, dict):
+        return None
+    disabled = before_input if enabling else after_input
+    enabled = after_input if enabling else before_input
+    if (
+        enabled.get("authority_proof_policy_consumers_staged") is not True
+        or disabled.get("authority_proof_policy_consumers_staged") not in (None, False)
+        or not _require_authority_runtime_binding(
+            {"input": enabled}, proof_enabled=True
+        )
+        or not _require_authority_runtime_binding(
+            {"input": disabled}, proof_enabled=True
+        )
+    ):
+        return None
+    stripped = copy.deepcopy(enabled)
+    stripped.pop("authority_proof_policy_consumers_staged", None)
+    if not _json_equal(stripped, disabled):
+        return None
+    return set(AUTHORITY_PROOF_CONSUMER_BASE_UPDATE_ADDRESSES)
+
+
+def _check_authority_proof_consumer_transition(
+    by_address: dict[str, dict[str, Any]], *, enabling: bool
+) -> None:
+    addresses = _authority_proof_consumer_transition_addresses(
+        by_address, enabling=enabling
+    )
+    if addresses is None:
+        raise ContractError("proof-policy consumer transition binding is invalid")
+    for address in addresses:
+        change = by_address[address]["change"]
+        if change.get("actions") != ["update"]:
+            raise ContractError(f"{address} must be an in-place proof-policy update")
+    for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS:
+        live_alias_addresses = {
+            f'module.control.aws_lambda_alias.authority["{function_name}:blue"]',
+            f'module.control.aws_lambda_alias.authority["{function_name}:green"]',
+        }
+        for address in live_alias_addresses:
+            change = by_address[address]["change"]
+            if (
+                change.get("actions") != ["no-op"]
+                or change.get("before") != change.get("after")
+            ):
+                raise ContractError(
+                    f"{address} live alias must remain byte-for-byte unchanged; "
+                    "consumer activation requires the separate governed rollout"
+                )
+
+
 def _check_authority_proof_disable_transition(
     plan: dict[str, Any], by_address: dict[str, dict[str, Any]]
 ) -> None:
@@ -7064,6 +7247,155 @@ HUB_WORKER_TASK_DEFINITION_ADDRESS = "module.control.aws_ecs_task_definition.hub
 HUB_WORKER_TASK_DEFINITION_COMPUTED = frozenset(
     {"arn", "arn_without_revision", "id", "revision"}
 )
+
+
+def _claim_hub_worker_image_update(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> frozenset[str] | None:
+    """Claim the Hub worker task definition when it is a pure replacement."""
+    address = HUB_WORKER_TASK_DEFINITION_ADDRESS
+    if address not in changed:
+        return None
+    if sorted(actual_non_noop.get(address) or ()) != ["create", "delete"]:
+        return None
+    return frozenset({address})
+
+
+def _claim_authority_hub_exec_policy_update(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> frozenset[str] | None:
+    """Claim update-only Hub function exec policies.
+
+    Scoped to the reviewed legacy Hub resource set, so an exec policy belonging
+    to any other function is never claimed and still falls through to the
+    terminal rejection.
+    """
+    claimed = {
+        address
+        for address in changed
+        if address in AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
+        and address.startswith("module.control.aws_iam_role_policy.authority_exec[")
+        and (actual_non_noop.get(address) or ()) == ["update"]
+    }
+    return frozenset(claimed) or None
+
+
+def _validate_hub_worker_image_update(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    _check_hub_worker_image_update(by_address)
+
+
+def _validate_authority_hub_exec_policy_update(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    """Pin the SHAPE; the policy CONTENT is validated unconditionally elsewhere.
+
+    _check_planned_security runs outside the transition dispatch for every plan,
+    so the statements these policies end up carrying are already checked in full.
+    What composition must add is that nothing but an in-place update reached this
+    claim -- a create, a replace or a delete on an exec policy is a different
+    transition and must not be admitted here.
+    """
+    for address in claimed:
+        item = by_address.get(address)
+        change = item.get("change") if isinstance(item, dict) else None
+        if not isinstance(change, dict):
+            raise ContractError(
+                f"composed exec-policy update {address} has a malformed change"
+            )
+        if list(change.get("actions") or ()) != ["update"]:
+            raise ContractError(
+                f"composed exec-policy claim {address} is not an in-place update"
+            )
+        before = change.get("before")
+        after = change.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ContractError(
+                f"composed exec-policy update {address} has no before/after state"
+            )
+        for key in ("name", "role"):
+            if before.get(key) != after.get(key):
+                raise ContractError(
+                    f"composed exec-policy update {address} moved {key!r}; only "
+                    "the policy document may change"
+                )
+
+
+# Transitions that may appear TOGETHER in one plan. Each entry claims a disjoint
+# slice of the changed set and validates that slice on its own.
+_COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "hub-worker-image-update",
+        _claim_hub_worker_image_update,
+        _validate_hub_worker_image_update,
+    ),
+    (
+        "authority-hub-exec-policy-update",
+        _claim_authority_hub_exec_policy_update,
+        _validate_authority_hub_exec_policy_update,
+    ),
+)
+
+
+def _compose_admitted_transitions(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+    deposed_by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> str | None:
+    """Admit a PARTITION of the changed set into independently reviewed slices.
+
+    Every transition above encodes a single reviewed shape and matches with
+    `changed == <its exact set>`. That is correct for one transition at a time
+    and wrong the moment two legitimately land together -- a Hub image deploy
+    while a reviewed exec-policy edit is pending, say. The plan is then rejected
+    even though BOTH halves are individually admitted, which is how a contract
+    ends up blocking the ordinary act of shipping.
+
+    Composition here is deliberately partitioning, never permissive:
+
+      * deposed objects never compose -- they are a pending-destroy continuation
+        whose ordering matters, so any deposed entry refuses composition
+        outright;
+      * at least TWO claims are required, so this can never quietly become an
+        alternative route for a single transition that the chain above already
+        judges on stricter terms;
+      * claims must be pairwise DISJOINT -- an address claimed twice is
+        ambiguous about which validator owns it, and ambiguity fails closed;
+      * the union of claims must equal `changed` EXACTLY -- one unclaimed
+        address and the whole plan falls through to the terminal rejection, so
+        composition can never widen a plan by absorbing a stray change;
+      * each slice still runs its own deep validator.
+
+    Content security is unaffected: _check_planned_security runs outside this
+    dispatch for every plan, so policies, endpoint policies and SG ingress are
+    validated whether a plan composes or not. What composition decides is only
+    whether the SHAPE of the change set is fully accounted for by reviewed
+    transitions.
+
+    Returns the composed plan mode, or None to fall through unchanged.
+    """
+    if deposed_by_address:
+        return None
+    claims: list[tuple[str, frozenset[str], Any]] = []
+    for name, claim_fn, validate_fn in _COMPOSABLE_TRANSITIONS:
+        claimed = claim_fn(changed, actual_non_noop, by_address)
+        if claimed:
+            claims.append((name, claimed, validate_fn))
+    if len(claims) < 2:
+        return None
+    seen: set[str] = set()
+    for _, claimed, _ in claims:
+        if seen & claimed:
+            return None
+        seen |= claimed
+    if seen != set(changed):
+        return None
+    for _, claimed, validate_fn in claims:
+        validate_fn(claimed, by_address, plan)
+    return "composed-" + "-with-".join(sorted(name for name, _, _ in claims))
 
 
 def _check_hub_worker_image_update(by_address: dict[str, Any]) -> None:
@@ -9474,6 +9806,28 @@ def check_plan(
             for address in AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES
         )
     )
+    authority_proof_consumer_enable_addresses = (
+        _authority_proof_consumer_transition_addresses(
+            by_address, enabling=True
+        )
+    )
+    authority_proof_consumer_enable_transition = (
+        proof_mode
+        and authority_proof_consumer_enable_addresses is not None
+        and changed == authority_proof_consumer_enable_addresses
+        and all(actual_non_noop.get(address) == ["update"] for address in changed)
+    )
+    authority_proof_consumer_disable_addresses = (
+        _authority_proof_consumer_transition_addresses(
+            by_address, enabling=False
+        )
+    )
+    authority_proof_consumer_disable_transition = (
+        proof_mode
+        and authority_proof_consumer_disable_addresses is not None
+        and changed == authority_proof_consumer_disable_addresses
+        and all(actual_non_noop.get(address) == ["update"] for address in changed)
+    )
     provisioned_cell_catalog_transition = (
         changed == set(PROVISIONED_CELL_RESOURCES)
         and all(
@@ -10085,6 +10439,12 @@ def check_plan(
     elif authority_proof_disable_transition:
         plan_mode = "authority-proof-disable"
         _check_authority_proof_disable_transition(plan, by_address)
+    elif authority_proof_consumer_enable_transition:
+        plan_mode = "authority-proof-consumers-enable"
+        _check_authority_proof_consumer_transition(by_address, enabling=True)
+    elif authority_proof_consumer_disable_transition:
+        plan_mode = "authority-proof-consumers-disable"
+        _check_authority_proof_consumer_transition(by_address, enabling=False)
     elif authority_image_update_transition:
         plan_mode = "authority-image-update"
         _check_authority_image_update(changed, by_address, plan)
@@ -10174,6 +10534,13 @@ def check_plan(
         # A single in-place policy update on the already-created hub_s3 gateway
         # endpoint -- no create shape to assert. The corrected after-state is
         # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
+    elif (
+        _composed_plan_mode := _compose_admitted_transitions(
+            changed, actual_non_noop, by_address, deposed_by_address, plan
+        )
+    ) is not None:
+        # Two or more individually reviewed transitions landing in one plan.
+        plan_mode = _composed_plan_mode
     elif changed or deposed_by_address:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
@@ -10183,6 +10550,8 @@ def check_plan(
             "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact Authority alarm "
             "routing slice, the exact attended-proof enablement or rollback, the exact "
+            "proof-policy consumer version staging or rollback with both live "
+            "aliases unchanged, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
             "image update, Hub PrivateLink "
@@ -10277,6 +10646,8 @@ def check_plan(
             # remain an exact no-op at the refreshed value.
             "authority-proof-enable",
             "authority-proof-disable",
+            "authority-proof-consumers-enable",
+            "authority-proof-consumers-disable",
         ):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "
@@ -10382,6 +10753,9 @@ def check_state_list(path: Path) -> dict[str, int]:
     base_expected = (set(EXPECTED_RESOURCES) - catalog_extra) | data_expected
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     proof_extra = set(AUTHORITY_PROOF_RESOURCES)
+    proof_consumer_data_extra = set(
+        AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES
+    )
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
     # data sources (the published image digest and the keygen zip); presence is
@@ -10392,12 +10766,18 @@ def check_state_list(path: Path) -> dict[str, int]:
     catalog_present = bool(addresses & catalog_extra)
     runtime_present = bool(addresses & runtime_extra)
     proof_present = bool(addresses & proof_extra)
+    proof_alias_reads_present = bool(addresses & proof_consumer_data_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
     if proof_present and not runtime_present:
         raise ContractError(
             "attended-proof Authority slice requires the complete runtime slice "
             "in state"
+        )
+    if proof_alias_reads_present and not (runtime_present and proof_present):
+        raise ContractError(
+            "proof-policy consumer staging requires the complete runtime and "
+            "attended-proof slices in state"
         )
     if hub_worker_present and not (hub_edge_present and runtime_present):
         raise ContractError(
@@ -10409,6 +10789,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         | (catalog_extra if catalog_present else set())
         | (runtime_extra if runtime_present else set())
         | (proof_extra if proof_present else set())
+        | (proof_consumer_data_extra if proof_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -10421,6 +10802,11 @@ def check_state_list(path: Path) -> dict[str, int]:
     return {
         "data_resource_count": (
             len(EXPECTED_DATA_RESOURCES)
+            + (
+                len(AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES)
+                if proof_present
+                else 0
+            )
             + (len(HUB_WORKER_DATA_RESOURCES) if hub_worker_present else 0)
         ),
         "managed_resource_count": (

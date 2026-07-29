@@ -69,7 +69,6 @@ class ValidatorTest(unittest.TestCase):
             "proof_phase": "pre_removal",
             "manifest": valid_manifest(),
             "candidates": valid_candidates(),
-            "connector_proof_run_id": "",
             "pre_removal_run_id": "",
         }
         values.update(overrides)
@@ -94,7 +93,6 @@ class ValidatorTest(unittest.TestCase):
             client="qurl_go",
             proof_phase="post_removal",
             manifest=valid_manifest("post_removal"),
-            connector_proof_run_id="12345",
             pre_removal_run_id="67890",
         )
         self.assertEqual(outputs["client_repository"], "layervai/qurl-go")
@@ -110,12 +108,6 @@ class ValidatorTest(unittest.TestCase):
         )
 
     def test_rejects_missing_or_cross_client_linkage(self) -> None:
-        with self.assertRaisesRegex(
-            validator.ValidationError, "Connector proof run ID"
-        ):
-            self.select_dispatch(client="qurl_go")
-        with self.assertRaisesRegex(validator.ValidationError, "must be empty"):
-            self.select_dispatch(connector_proof_run_id="123")
         with self.assertRaisesRegex(validator.ValidationError, "pre-removal run ID"):
             self.select_dispatch(
                 proof_phase="post_removal",
@@ -165,7 +157,6 @@ class WorkflowContractTest(unittest.TestCase):
             "client:",
             "proof_phase:",
             "deployment_producer_run_id:",
-            "connector_proof_run_id:",
             "pre_removal_run_id:",
             "validate_udp_proof_producer_artifact.py metadata",
             "validate_udp_proof_producer_artifact.py files",
@@ -181,7 +172,7 @@ class WorkflowContractTest(unittest.TestCase):
             "could not authenticate the producer run after bounded retries",
             "could not authenticate the producer artifact after bounded retries",
             "PINNED_CONNECTOR_SHA: 29a0a7eba76187a915c29d7bd71f1a20cca7776f",
-            "PINNED_QURL_GO_SHA: e9004a8a07fbc30de8d5f7b95f6c169016c03e95",
+            "PINNED_QURL_GO_SHA: 54f538e2da86ac7f89e1694fdeb247be752558bb",
             "producer artifact does not bind the frozen Connector head",
             "producer artifact does not bind the frozen qurl-go head",
             "invoke_udp_proof_broker.sh",
@@ -200,7 +191,6 @@ class WorkflowContractTest(unittest.TestCase):
             '-f "deployment_artifact_id=$DEPLOYMENT_ARTIFACT_ID"',
             '-f "deployment_artifact_digest=$DEPLOYMENT_ARTIFACT_DIGEST"',
             '-f "pre_removal_run_id=$PRE_REMOVAL_RUN_ID"',
-            '-f "connector_proof_run_id=$CONNECTOR_PROOF_RUN_ID"',
             '-f "dispatch_correlation_id=$correlation_id"',
             '--branch "$CLIENT_REF"',
             "--limit 100",
@@ -278,14 +268,14 @@ class WorkflowContractTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(workflow.count("permission-actions: write"), 3)
+        self.assertEqual(workflow.count("permission-actions: write"), 4)
         self.assertEqual(workflow.count("permission-actions: read"), 1)
         self.assertEqual(
             workflow.count(
                 "repositories: ${{ inputs.client == 'connector' && "
                 "'qurl-connector' || 'qurl-go' }}"
             ),
-            4,
+            5,
         )
         self.assertEqual(
             workflow.count("permission-organization-self-hosted-runners: write"),

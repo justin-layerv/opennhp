@@ -44,6 +44,14 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      proof_policy_consumers_staged:
+        description: 'Sandbox-only staging of read-only PROOF policy on a new IA/RA/ICR version. Both live aliases remain unchanged; governed activation is a separate required rollout. Requires proof_mutation_controls_enabled=true.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -104,6 +112,7 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
+          PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
           SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
           PLAN_SHA256: ${{ inputs.plan_sha256 }}
@@ -115,6 +124,10 @@ jobs:
           set -euo pipefail
           if [[ "$PROOF_MUTATION_CONTROLS_ENABLED" == 'true' && "$ENABLE_RUNTIME_FUNCTIONS" != 'true' ]]; then
             echo '::error::Dark proof mutation capability requires the Authority runtime functions gate.'
+            exit 1
+          fi
+          if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' && "$PROOF_MUTATION_CONTROLS_ENABLED" != 'true' ]]; then
+            echo '::error::Proof policy consumers require the attended-proof mutation control.'
             exit 1
           fi
           if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
@@ -228,6 +241,7 @@ jobs:
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
+          PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -248,6 +262,10 @@ jobs:
               --proof-mutation-controls-enabled
             )
           fi
+          proof_policy_consumer_stage_flags=()
+          if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
+            proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -257,7 +275,8 @@ jobs:
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
-            "${proof_mutation_flags[@]}"
+            "${proof_mutation_flags[@]}" \
+            "${proof_policy_consumer_stage_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -527,6 +546,7 @@ jobs:
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
+          PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -547,6 +567,10 @@ jobs:
               --proof-mutation-controls-enabled
             )
           fi
+          proof_policy_consumer_stage_flags=()
+          if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
+            proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -556,7 +580,8 @@ jobs:
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
-            "${proof_mutation_flags[@]}"
+            "${proof_mutation_flags[@]}" \
+            "${proof_policy_consumer_stage_flags[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -899,6 +924,7 @@ jobs:
           HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
+          PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
         run: |
           set -euo pipefail
           runtime_functions_flag=()
@@ -919,6 +945,10 @@ jobs:
               --proof-mutation-controls-enabled
             )
           fi
+          proof_policy_consumer_stage_flags=()
+          if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
+            proof_policy_consumer_stage_flags=(--proof-policy-consumers-staged)
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
@@ -928,7 +958,8 @@ jobs:
             "${runtime_functions_flag[@]}" \
             "${hub_edge_flag[@]}" \
             "${hub_worker_flag[@]}" \
-            "${proof_mutation_flags[@]}"
+            "${proof_mutation_flags[@]}" \
+            "${proof_policy_consumer_stage_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

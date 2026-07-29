@@ -48,6 +48,7 @@ locals {
     "layerv-nhp-sandbox-ca-icr",
     "layerv-nhp-sandbox-ca-iro-cell0",
     "layerv-nhp-sandbox-ca-iro-cell1",
+    "layerv-nhp-sandbox-ca-pm",
     "layerv-nhp-sandbox-ca-ra",
   ]
   manifest_authority_function_arns = flatten([

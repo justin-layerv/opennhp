@@ -1320,6 +1320,7 @@ def _validate_lambda_workload(
             "functions",
             "image_repository",
             "image_digest",
+            "proof_policy_consumers_active",
             "source_revision",
             "source_evidence",
         },
@@ -1327,6 +1328,10 @@ def _validate_lambda_workload(
     )
     if workload["kind"] != "lambda_image_set":
         raise ContractError(f"{name}.kind must be lambda_image_set")
+    if type(workload["proof_policy_consumers_active"]) is not bool:
+        raise ContractError(
+            f"{name}.proof_policy_consumers_active must be an exact boolean"
+        )
     functions = workload["functions"]
     if (
         not isinstance(functions, list)

@@ -633,6 +633,16 @@ locals {
     false,
   )
 
+  authority_proof_policy_consumers_fence_valid = !var.authority_proof_policy_consumers_staged || try(
+    var.environment == "sandbox" &&
+    !local.is_prod &&
+    var.authority_proof_mutation_controls_enabled &&
+    local.authority_runtime_contract_enabled &&
+    var.authority_runtime_functions_enabled &&
+    length(local.authority_expected_proof_names) == 1,
+    false,
+  )
+
   # With the gate off, no proof function may appear in the contract at all. The
   # expected-set subtraction in authority_contract_graph_valid already rejects
   # it; this states the invariant independently so a future refactor of that

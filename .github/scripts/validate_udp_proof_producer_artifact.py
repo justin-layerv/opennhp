@@ -196,7 +196,6 @@ def validate_files(
     producer_run_id: str,
     producer_run_attempt: str,
     producer_head_sha: str,
-    connector_proof_run_id: str,
     pre_removal_run_id: str,
     client: str,
     validation_time: datetime | None = None,
@@ -208,7 +207,7 @@ def validate_files(
     now = validation_time or datetime.now(timezone.utc)
     try:
         manifest, runtime, provenance = deployment.load_triplet_directory(directory)
-        manifest_raw, runtime_raw, _ = deployment.validate_triplet(
+        manifest_raw, runtime_raw, provenance_raw = deployment.validate_triplet(
             manifest,
             runtime,
             provenance,
@@ -244,7 +243,6 @@ def validate_files(
             proof_phase=proof_phase,
             manifest=manifest,
             candidates=candidates,
-            connector_proof_run_id=connector_proof_run_id,
             pre_removal_run_id=pre_removal_run_id,
         )
     except controller.ValidationError as exc:
@@ -253,6 +251,9 @@ def validate_files(
         {
             "deployment_manifest_b64": manifest_b64,
             "deployment_runtime_inputs_b64": base64.b64encode(runtime_raw).decode(
+                "ascii"
+            ),
+            "deployment_provenance_b64": base64.b64encode(provenance_raw).decode(
                 "ascii"
             ),
             "deployment_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
@@ -309,7 +310,6 @@ def main() -> int:
     files.add_argument("--producer-run-id", required=True)
     files.add_argument("--producer-run-attempt", required=True)
     files.add_argument("--producer-head-sha", required=True)
-    files.add_argument("--connector-proof-run-id", default="")
     files.add_argument("--pre-removal-run-id", default="")
     files.add_argument("--github-output", type=Path, required=True)
     args = parser.parse_args()
@@ -328,7 +328,6 @@ def main() -> int:
                 producer_run_id=args.producer_run_id,
                 producer_run_attempt=args.producer_run_attempt,
                 producer_head_sha=args.producer_head_sha,
-                connector_proof_run_id=args.connector_proof_run_id,
                 pre_removal_run_id=args.pre_removal_run_id,
                 client=args.client,
             )

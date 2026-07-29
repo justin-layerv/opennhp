@@ -89,8 +89,6 @@ COMMON_EVIDENCE_KEYS = {
 }
 CONNECTOR_EVIDENCE_KEYS = COMMON_EVIDENCE_KEYS | {"input_outcome"}
 QURL_GO_EVIDENCE_KEYS = COMMON_EVIDENCE_KEYS | {
-    "connector_attestation_sha256",
-    "connector_proof_run_id",
     "inventory_mapping_sha256",
     "retired_lifecycle_surface_sha256",
     "strict_outcome",
@@ -455,7 +453,6 @@ def validate_files(
     producer_head_sha: str,
     producer_artifact_id: str,
     producer_artifact_digest: str,
-    connector_proof_run_id: str,
     pre_removal_run_id: str,
 ) -> dict[str, str]:
     """Reconcile canonical client evidence with the exact controller dispatch."""
@@ -644,32 +641,14 @@ def validate_files(
         )
 
     if client == "connector":
-        if connector_proof_run_id:
-            raise ClientArtifactError(
-                "Connector result cannot carry qurl-go Connector-proof lineage"
-            )
         if (
             evidence["input_outcome"] != "success"
             or not isinstance(evidence["typed_evidence_contract_sha256"], str)
         ):
             raise ClientArtifactError("Connector evidence outcome is incomplete")
     else:
-        _positive_int_string(
-            connector_proof_run_id, "same-phase Connector proof run ID"
-        )
-        if evidence["connector_proof_run_id"] != connector_proof_run_id:
-            raise ClientArtifactError(
-                "qurl-go evidence same-phase Connector lineage drift"
-            )
-        if (
-            evidence["strict_outcome"] != "success"
-            or not isinstance(evidence["connector_attestation_sha256"], str)
-        ):
+        if evidence["strict_outcome"] != "success":
             raise ClientArtifactError("qurl-go evidence outcome is incomplete")
-        _sha256(
-            evidence["connector_attestation_sha256"],
-            "Connector attestation SHA-256",
-        )
 
     return {
         "client_evidence_sha256": hashlib.sha256(
@@ -728,7 +707,6 @@ def main() -> int:
     files.add_argument("--producer-head-sha", required=True)
     files.add_argument("--producer-artifact-id", required=True)
     files.add_argument("--producer-artifact-digest", required=True)
-    files.add_argument("--connector-proof-run-id", default="")
     files.add_argument("--pre-removal-run-id", default="")
     files.add_argument("--github-output", type=Path, required=True)
     args = parser.parse_args()
@@ -775,7 +753,6 @@ def main() -> int:
                 producer_head_sha=args.producer_head_sha,
                 producer_artifact_id=args.producer_artifact_id,
                 producer_artifact_digest=args.producer_artifact_digest,
-                connector_proof_run_id=args.connector_proof_run_id,
                 pre_removal_run_id=args.pre_removal_run_id,
             )
             _write_outputs(args.github_output, outputs)

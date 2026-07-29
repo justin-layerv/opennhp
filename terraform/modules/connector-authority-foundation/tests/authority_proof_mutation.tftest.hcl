@@ -44,6 +44,13 @@ mock_provider "aws" {
       image_uri    = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority@sha256:1111111111111111111111111111111111111111111111111111111111111111"
     }
   }
+
+  mock_data "aws_lambda_alias" {
+    defaults = {
+      function_version = "6"
+    }
+  }
+
 }
 
 override_resource {
@@ -52,6 +59,24 @@ override_resource {
   values = {
     repository_url = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
   }
+}
+
+override_resource {
+  target          = aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"]
+  override_during = plan
+  values          = { version = "7" }
+}
+
+override_resource {
+  target          = aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"]
+  override_during = plan
+  values          = { version = "7" }
+}
+
+override_resource {
+  target          = aws_lambda_function.authority["layerv-nhp-sandbox-ca-icr"]
+  override_during = plan
+  values          = { version = "7" }
 }
 
 override_resource {
@@ -688,13 +713,15 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement :
-      contains(
-        try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
-        "OWNER#${sha256("layerv-nhp-sandbox-udp-proof")}",
-        ) || contains(
-        try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
-        "REGISTRY",
-      )
+      (
+        contains(
+          try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
+          "OWNER#${sha256("layerv-nhp-sandbox-udp-proof")}",
+          ) || contains(
+          try(statement.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"], []),
+          "REGISTRY",
+        )
+      ) && try(statement.Condition.Null["dynamodb:LeadingKeys"], "") == "false"
       if startswith(try(statement.Sid, ""), "ProofFenced") || try(statement.Sid, "") == "ProofRegistryRead"
     ])
     error_message = "Every fenced proof statement must pin dynamodb:LeadingKeys to the proof tenant or the registry partition."
@@ -714,7 +741,8 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       ] &&
       { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofReplayReadWrite"].Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
         "HUB_REQUEST#MutateProofAgent#*",
-      ]
+      ] &&
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofReplayReadWrite"].Condition.Null["dynamodb:LeadingKeys"] == "false"
     )
     error_message = "MutateProofAgent replay must be exact Get/Put/Update on its own HUB_REQUEST#MutateProofAgent#* namespace."
   }
@@ -796,5 +824,87 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
       )) > 0
     ]) == 0
     error_message = "The registry partition must remain read-only to the proof mutation control."
+  }
+}
+
+run "selected_consumers_read_but_cannot_write_proof_policy" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_proof_policy_consumers_staged = true
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+        ] : {
+        for key, value in aws_lambda_function.authority[function_name].environment[0].variables :
+        key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+        } == {
+        CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = "layerv-nhp-sandbox-udp-proof"
+        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = "qurl-go-sandbox-"
+        CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = "5400"
+        CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = "30"
+      }
+    ])
+    error_message = "The selected IA/RA/ICR versions must receive exactly the proof-policy contract."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+        ] : (
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["ProofPolicyRead"].Action == ["dynamodb:GetItem"] &&
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["ProofPolicyRead"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == ["PROOF"] &&
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["ProofPolicyRead"].Condition.Null["dynamodb:LeadingKeys"] == "false" &&
+        toset({ for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["DenyProofPolicyWrite"].Action) == toset([
+          "dynamodb:DeleteItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]) &&
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["DenyProofPolicyWrite"].Effect == "Deny" &&
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["DenyProofPolicyWrite"].Condition["ForAnyValue:StringEquals"]["dynamodb:LeadingKeys"] == ["PROOF"] &&
+        { for statement in jsondecode(aws_iam_role_policy.authority_exec[function_name].policy).Statement : statement.Sid => statement }["DenyProofPolicyWrite"].Condition.Null["dynamodb:LeadingKeys"] == "false"
+      )
+    ])
+    error_message = "Proof-policy consumers must have exact GetItem and an explicit PROOF-partition write deny."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name in [
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+        ] : (
+        aws_lambda_alias.authority["${function_name}:blue"].function_version == "6" &&
+        aws_lambda_alias.authority["${function_name}:green"].function_version == "6"
+      )
+    ])
+    error_message = "Staging must publish the proof-aware version without moving either live consumer alias."
+  }
+
+  assert {
+    condition = alltrue([
+      for function_name, function in aws_lambda_function.authority :
+      length({
+        for key, value in function.environment[0].variables :
+        key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
+      }) == 0
+      if !contains([
+        "layerv-nhp-sandbox-ca-pm",
+        "layerv-nhp-sandbox-ca-ia",
+        "layerv-nhp-sandbox-ca-ra",
+        "layerv-nhp-sandbox-ca-icr",
+      ], function_name)
+    ])
+    error_message = "No cell Authority function may inherit proof policy."
   }
 }

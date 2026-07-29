@@ -187,6 +187,17 @@ variable "authority_proof_mutation_controls_enabled" {
   }
 }
 
+variable "authority_proof_policy_consumers_staged" {
+  description = "Production proof-policy consumer staging is permanently disabled."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.authority_proof_policy_consumers_staged
+    error_message = "Production Authority proof-policy consumer staging must remain permanently disabled."
+  }
+}
+
 variable "authority_proof_mutation_owner_id" {
   description = "Production proof tenant must remain unset; the mutation control cannot exist in production."
   type        = string

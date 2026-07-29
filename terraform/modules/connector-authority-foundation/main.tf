@@ -193,6 +193,11 @@ resource "terraform_data" "foundation_contract" {
     }
 
     precondition {
+      condition     = local.authority_proof_policy_consumers_fence_valid
+      error_message = "authority_proof_policy_consumers_staged is sandbox-only and requires the live attended-proof mutation control and Authority runtime."
+    }
+
+    precondition {
       # Proof operations must never acquire a hub or cell caller budget. The
       # capacity closures are keyed on the hub/cell suffix maps, so an overlap
       # would silently give a runtime caller a preinvoke allowance for a

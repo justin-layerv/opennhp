@@ -486,6 +486,7 @@ def valid_snapshot() -> dict[str, object]:
         },
         "qurl_service_authority": {
             "kind": "lambda_image_set",
+            "proof_policy_consumers_active": True,
             "functions": [
                 {
                     "alias_arn": (
