@@ -8467,6 +8467,7 @@ def _check_authority_proof_concurrency_recovery_drift(
         "id",
         "provisioned_concurrent_executions",
         "qualifier",
+        "region",
         "skip_destroy",
         "timeouts",
     }
@@ -8501,6 +8502,8 @@ def _check_authority_proof_concurrency_recovery_drift(
             or after.get("provisioned_concurrent_executions") != 0
             or before.get("qualifier") != "blue"
             or after.get("qualifier") != "blue"
+            or before.get("region") != AWS_REGION
+            or after.get("region") != AWS_REGION
             or before.get("skip_destroy") is not False
             or after.get("skip_destroy") is not False
             or before.get("timeouts") is not None

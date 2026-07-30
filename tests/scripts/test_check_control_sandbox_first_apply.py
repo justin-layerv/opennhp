@@ -2812,6 +2812,7 @@ def authority_proof_concurrency_recovery_drift(
             "id": f"{function_name},blue",
             "provisioned_concurrent_executions": 1,
             "qualifier": "blue",
+            "region": CHECKER.AWS_REGION,
             "skip_destroy": False,
             "timeouts": None,
         }
@@ -7168,8 +7169,11 @@ class PlanContractTests(unittest.TestCase):
             "sensitive": lambda item: item["change"].update(
                 {"after_sensitive": {"id": True}}
             ),
+            "wrong region": lambda item: item["change"]["after"].update(
+                {"region": "us-west-2"}
+            ),
             "extra state field": lambda item: item["change"]["after"].update(
-                {"region": CHECKER.AWS_REGION}
+                {"unexpected": "value"}
             ),
         }
         for label, mutate in mutations.items():
