@@ -273,7 +273,7 @@ resource "aws_iam_role_policy" "controller" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = concat([
+    Statement = [
       {
         Sid      = "CreateOneTimeJITConfiguration"
         Effect   = "Allow"
@@ -391,20 +391,6 @@ resource "aws_iam_role_policy" "controller" {
           }
         }
       },
-      ], var.provisioned_cell_catalog_kms_key_arn == null ? [] : [{
-        # The Control proof-account rows share the same customer-managed CMK
-        # as the provisioned-cell catalog. DynamoDB performs decrypt under the
-        # controller identity, so table permissions alone are insufficient.
-        Sid      = "DecryptOnlyProofAccountTables"
-        Effect   = "Allow"
-        Action   = "kms:Decrypt"
-        Resource = var.provisioned_cell_catalog_kms_key_arn
-        Condition = {
-          StringEquals = {
-            "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
-          }
-        }
-      }], [
       {
         Sid      = "DeleteRunBoundProofCredential"
         Effect   = "Allow"
@@ -618,8 +604,49 @@ resource "aws_iam_role_policy" "controller" {
           }
         }
       },
-    ])
+    ]
   })
+}
+
+resource "aws_iam_policy" "controller_control_data_decrypt" {
+  count = var.provisioned_cell_catalog_kms_key_arn == null ? 0 : 1
+
+  name        = "${var.name_prefix}-udp-proof-controller-control-data-decrypt"
+  description = "DynamoDB-only decrypt for the exact Control proof-account data key"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "DecryptOnlyProofAccountTables"
+      Effect   = "Allow"
+      Action   = "kms:Decrypt"
+      Resource = var.provisioned_cell_catalog_kms_key_arn
+      Condition = {
+        StringEquals = {
+          "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+        }
+      }
+    }]
+  })
+
+  tags = local.tags
+
+  lifecycle {
+    precondition {
+      condition = startswith(
+        var.provisioned_cell_catalog_kms_key_arn,
+        "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/",
+      )
+      error_message = "The Control data CMK must be a current-account, current-region KMS key ARN."
+    }
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "controller_control_data_decrypt" {
+  count = var.provisioned_cell_catalog_kms_key_arn == null ? 0 : 1
+
+  role       = aws_iam_role.controller.name
+  policy_arn = aws_iam_policy.controller_control_data_decrypt[0].arn
 }
 
 resource "aws_iam_role" "broker" {

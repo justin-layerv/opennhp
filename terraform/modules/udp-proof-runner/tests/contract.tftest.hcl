@@ -60,6 +60,12 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_iam_policy" {
+    defaults = {
+      arn = "arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-udp-proof-mock"
+    }
+  }
+
   mock_resource "aws_iam_instance_profile" {
     defaults = {
       arn = "arn:aws:iam::767397897469:instance-profile/layerv-nhp-sandbox-udp-proof-runner"
@@ -408,7 +414,6 @@ run "secure_ephemeral_runner_contract" {
         "ReadBoundProofAccountCredentialDigest",
         "ConvergeExactProofCustomer",
         "ConvergeAndRemoveExactProofAccountKey",
-        "DecryptOnlyProofAccountTables",
         "DeleteRunBoundProofCredential",
         "CreateRunBoundProofCredential",
         "TagRunBoundProofCredential",
@@ -456,9 +461,6 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Action) == toset(["dynamodb:GetItem", "dynamodb:PutItem"]) &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [local.proof_account_owner_id] &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeAndRemoveExactProofAccountKey"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [var.proof_account_credential_sha256] &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Action == "kms:Decrypt" &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Resource == var.provisioned_cell_catalog_kms_key_arn &&
-      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Condition.StringEquals["kms:ViaService"] == "dynamodb.us-east-2.amazonaws.com" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Condition.StringEquals["aws:RequestTag/Purpose"] == local.proof_account_jit_purpose &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
@@ -491,6 +493,20 @@ run "secure_ephemeral_runner_contract" {
       ])
     )
     error_message = "The workflow controller must retain no EC2 surface and may touch only exact tagged run metadata, the bound proof account, and its digest-fenced Control rows."
+  }
+
+  assert {
+    condition = (
+      length(aws_iam_policy.controller_control_data_decrypt) == 1 &&
+      length(aws_iam_role_policy_attachment.controller_control_data_decrypt) == 1 &&
+      aws_iam_role_policy_attachment.controller_control_data_decrypt[0].role == aws_iam_role.controller.name &&
+      aws_iam_role_policy_attachment.controller_control_data_decrypt[0].policy_arn == aws_iam_policy.controller_control_data_decrypt[0].arn &&
+      toset([for statement in jsondecode(aws_iam_policy.controller_control_data_decrypt[0].policy).Statement : statement.Sid]) == toset(["DecryptOnlyProofAccountTables"]) &&
+      jsondecode(aws_iam_policy.controller_control_data_decrypt[0].policy).Statement[0].Action == "kms:Decrypt" &&
+      jsondecode(aws_iam_policy.controller_control_data_decrypt[0].policy).Statement[0].Resource == var.provisioned_cell_catalog_kms_key_arn &&
+      jsondecode(aws_iam_policy.controller_control_data_decrypt[0].policy).Statement[0].Condition.StringEquals["kms:ViaService"] == "dynamodb.us-east-2.amazonaws.com"
+    )
+    error_message = "The proof-account decrypt must be one exact-key, DynamoDB-only managed policy attached only to the controller role."
   }
 
   assert {
@@ -610,8 +626,12 @@ run "omit_catalog_decrypt_until_cmk_is_pinned" {
   }
 
   assert {
-    condition     = length(aws_iam_role_policy.manifest_producer_catalog_decrypt) == 0
-    error_message = "The manifest producer must receive no wildcard or placeholder catalog-CMK decrypt before the exact key is pinned."
+    condition = (
+      length(aws_iam_role_policy.manifest_producer_catalog_decrypt) == 0 &&
+      length(aws_iam_policy.controller_control_data_decrypt) == 0 &&
+      length(aws_iam_role_policy_attachment.controller_control_data_decrypt) == 0
+    )
+    error_message = "No manifest or proof-account decrypt may exist before the exact Control data key is pinned."
   }
 }
 
@@ -622,7 +642,10 @@ run "reject_cross_account_catalog_cmk" {
     provisioned_cell_catalog_kms_key_arn = "arn:aws:kms:us-east-2:111122223333:key/55555555-aaaa-bbbb-cccc-666666666666"
   }
 
-  expect_failures = [aws_iam_role_policy.manifest_producer_catalog_decrypt]
+  expect_failures = [
+    aws_iam_policy.controller_control_data_decrypt,
+    aws_iam_role_policy.manifest_producer_catalog_decrypt,
+  ]
 }
 
 run "reject_catalog_cmk_reused_from_attestation_storage" {
