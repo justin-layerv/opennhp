@@ -160,7 +160,11 @@ def instance(
         "LaunchTime": launched,
         "LaunchTemplate": {"LaunchTemplateId": template_id, "Version": version},
         "State": {"Name": state},
-        "Tags": tags(run_id, run_attempt),
+        "Tags": tags(run_id, run_attempt)
+        + [
+            {"Key": "aws:ec2launchtemplate:id", "Value": template_id},
+            {"Key": "aws:ec2launchtemplate:version", "Value": version},
+        ],
     }
 
 
@@ -689,6 +693,16 @@ class BrokerTest(unittest.TestCase):
         ec2 = UnreadableAddressEC2([unverifiable])
         result = new_broker(ec2, FakeSecrets()).sweep()
         self.assertEqual(result["terminated_instances"], [unverifiable["InstanceId"]])
+
+    def test_sweep_accepts_aws_launch_template_tags_when_object_is_omitted(self):
+        current = instance()
+        del current["LaunchTemplate"]
+        ec2 = FakeEC2([current])
+
+        result = new_broker(ec2, FakeSecrets()).sweep()
+
+        self.assertEqual(result["terminated_instances"], [])
+        self.assertEqual(ec2.describe_address_ids, ["eipalloc-0123456789abcdef0"])
 
     def test_sweep_terminates_every_runner_on_concurrency_violation(self):
         first = instance(RUN_ID)

@@ -30,6 +30,10 @@ AUTHORITY_PROOF_CONTROLLER_ROLE_ARN = (
     f"arn:aws:iam::{ACCOUNT_ID}:role/layerv-nhp-sandbox-udp-proof-controller"
 )
 AUTHORITY_PROOF_FUNCTION_NAME = "layerv-nhp-sandbox-ca-pm"
+AUTHORITY_PROOF_EXEC_POLICY_ADDRESS = (
+    'module.control.aws_iam_role_policy.authority_exec["'
+    f'{AUTHORITY_PROOF_FUNCTION_NAME}"]'
+)
 AUTHORITY_PROOF_OPERATION = "mutate_proof_agent"
 AUTHORITY_PROOF_ALIAS_OUTPUT = "authority_proof_mutation_alias_arn"
 AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME = "layerv-nhp-sandbox-ca-pcr"
@@ -6192,6 +6196,7 @@ def _check_authority_proof_exec_role_policy(
         "LambdaVpcEni",
         "OwnLogStream",
         "ProofVerifyTableEncryption",
+        "ProofDynamoDBDecrypt",
         "ProofFencedPlacementRead",
         "ProofRegistryRead",
         "ProofFencedPlacementWrite",
@@ -6220,6 +6225,26 @@ def _check_authority_proof_exec_role_policy(
         raise ContractError(f"{fn} own-log statement drifted")
 
     table_resources = set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"])
+    decrypt = by_sid["ProofDynamoDBDecrypt"]
+    decrypt_resources = _authority_string_set(
+        decrypt.get("Resource"), fn, "ProofDynamoDBDecrypt Resource"
+    )
+    if (
+        _authority_string_set(
+            decrypt.get("Action"), fn, "ProofDynamoDBDecrypt Action"
+        )
+        != {"kms:Decrypt"}
+        or len(decrypt_resources) != 1
+        or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(next(iter(decrypt_resources))) is None
+        or decrypt.get("Condition")
+        != {
+            "StringEquals": {
+                "kms:ViaService": f"dynamodb.{AWS_REGION}.amazonaws.com"
+            }
+        }
+    ):
+        raise ContractError(f"{fn} DynamoDB decrypt grant drifted")
+
     owner_partition = (
         "OWNER#"
         + hashlib.sha256(AUTHORITY_PROOF_OWNER_ID.encode("utf-8")).hexdigest()
@@ -8079,6 +8104,105 @@ def _validate_authority_hub_exec_policy_update(
                     f"composed exec-policy {address} moved {key!r}; only the "
                     "policy document may change"
                 )
+
+
+def _check_authority_proof_mutation_decrypt_update(
+    by_address: dict[str, Any],
+) -> None:
+    """Admit only adding the exact DynamoDB-via-KMS decrypt statement to ca-pm."""
+    item = by_address.get(AUTHORITY_PROOF_EXEC_POLICY_ADDRESS)
+    if (
+        not isinstance(item, dict)
+        or item.get("mode") != "managed"
+        or item.get("type") != "aws_iam_role_policy"
+        or item.get("deposed") is not None
+    ):
+        raise ContractError("proof mutation decrypt update identity drifted")
+    change = item.get("change")
+    if (
+        not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["update"]
+        or _has_unknown_value(change.get("after_unknown"))
+        or change.get("before_sensitive") != change.get("after_sensitive")
+        or _has_unknown_value(change.get("before_sensitive"))
+    ):
+        raise ContractError("proof mutation decrypt update envelope drifted")
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError("proof mutation decrypt update has no before/after")
+    if set(before) != set(after) or any(
+        not _json_equal(before[key], after[key])
+        for key in before
+        if key != "policy"
+    ):
+        raise ContractError(
+            "proof mutation decrypt update may change only the policy document"
+        )
+
+    before_policy = _authority_decode_policy(before, AUTHORITY_PROOF_FUNCTION_NAME)
+    after_policy = _authority_decode_policy(after, AUTHORITY_PROOF_FUNCTION_NAME)
+    if (
+        not isinstance(before_policy, dict)
+        or not isinstance(after_policy, dict)
+        or set(before_policy) != {"Version", "Statement"}
+        or set(after_policy) != {"Version", "Statement"}
+        or before_policy.get("Version") != "2012-10-17"
+        or after_policy.get("Version") != "2012-10-17"
+        or not isinstance(before_policy.get("Statement"), list)
+        or not isinstance(after_policy.get("Statement"), list)
+    ):
+        raise ContractError("proof mutation decrypt policy envelope drifted")
+
+    expected = {
+        "Sid": "ProofDynamoDBDecrypt",
+        "Effect": "Allow",
+        "Action": ["kms:Decrypt"],
+        "Resource": None,
+        "Condition": {
+            "StringEquals": {
+                "kms:ViaService": f"dynamodb.{AWS_REGION}.amazonaws.com"
+            }
+        },
+    }
+    added = [
+        statement
+        for statement in after_policy["Statement"]
+        if isinstance(statement, dict)
+        and statement.get("Sid") == "ProofDynamoDBDecrypt"
+    ]
+    if len(added) != 1:
+        raise ContractError("proof mutation decrypt update must add one exact statement")
+    resource = added[0].get("Resource")
+    if (
+        not isinstance(resource, list)
+        or len(resource) != 1
+        or not isinstance(resource[0], str)
+        or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(resource[0]) is None
+    ):
+        raise ContractError("proof mutation decrypt update key resource drifted")
+    expected["Resource"] = resource
+    if added[0] != expected:
+        raise ContractError("proof mutation decrypt statement drifted")
+    if any(
+        isinstance(statement, dict)
+        and statement.get("Sid") == "ProofDynamoDBDecrypt"
+        for statement in before_policy["Statement"]
+    ) or before_policy["Statement"] != [
+        statement
+        for statement in after_policy["Statement"]
+        if not (
+            isinstance(statement, dict)
+            and statement.get("Sid") == "ProofDynamoDBDecrypt"
+        )
+    ]:
+        raise ContractError(
+            "proof mutation decrypt update changed more than the reviewed statement"
+        )
+
+    _check_authority_proof_exec_role_policy(
+        after, AUTHORITY_PROOF_FUNCTION_NAME
+    )
 
 
 def _claim_authority_proof_enable(
@@ -12078,6 +12202,13 @@ def check_plan(
         # endpoint -- no create shape to assert. The corrected after-state is
         # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
     elif (
+        changed == {AUTHORITY_PROOF_EXEC_POLICY_ADDRESS}
+        and actual_non_noop.get(AUTHORITY_PROOF_EXEC_POLICY_ADDRESS) == ["update"]
+        and not deposed_by_address
+    ):
+        plan_mode = "authority-proof-mutation-decrypt-update"
+        _check_authority_proof_mutation_decrypt_update(by_address)
+    elif (
         _exec_policy_only := _claim_authority_hub_exec_policy_update(
             changed, actual_non_noop, by_address
         )
@@ -12110,6 +12241,7 @@ def check_plan(
             "proof-policy consumer version staging or rollback with both live "
             "aliases unchanged, the exact proof rollout prepare or selector apply, the exact "
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
+            "exact proof-mutation DynamoDB decrypt grant, the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
             "image update, Hub PrivateLink "
             "inbound-rule enforcement, or Hub UDP source-fence "

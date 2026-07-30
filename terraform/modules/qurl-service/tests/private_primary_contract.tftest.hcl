@@ -498,3 +498,76 @@ run "private_primary_rejects_wrong_repository" {
     var.image_uri,
   ]
 }
+
+run "retired_http_agent_runtime_is_detached" {
+  command = apply
+
+  variables {
+    deploy_qurl_bootstrap_chain = true
+    enable_qurl_agent_bootstrap = true
+    nhp_server_public_key_b64   = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    nhp_server_host             = "cell0.nhp.layerv.xyz"
+    qurl_browser_relay_base_url = "https://relay.layerv.xyz"
+    agent_registration_enabled  = true
+    agent_otp_enabled           = true
+    agent_otp_email_from        = "noreply@notify.layerv.xyz"
+    agent_otp_relay_base_url    = "https://relay.layerv.xyz"
+    agent_otp_pepper_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:agent-otp-pepper-AbCdEf"
+    agent_otp_config_set_name   = "layerv-nhp-sandbox-agent-otp"
+  }
+
+  assert {
+    condition = length(setintersection(
+      toset([
+        for item in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment :
+        item.name
+      ]),
+      toset([
+        "NHP_SERVER_HOST",
+        "NHP_SERVER_PORT",
+        "QURL_AGENT_BOOTSTRAP_ENABLED",
+        "QURL_AGENT_REGISTRATION_ENABLED",
+        "QURL_NHP_RELAY_BASE_URL",
+        "QURL_AGENT_OTP_ENABLED",
+        "QURL_AGENT_OTP_EMAIL_FROM",
+      ]),
+    )) == 0
+    error_message = "The qurl-service task definition must not render retired HTTP bootstrap, registration, relay, or OTP environment variables."
+  }
+
+  assert {
+    condition = alltrue([
+      for item in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].secrets :
+      item.name != "QURL_AGENT_OTP_PEPPER"
+    ])
+    error_message = "The qurl-service task definition must not resolve the retired HTTP OTP pepper."
+  }
+
+  assert {
+    condition = !strcontains(
+      aws_iam_role_policy.execution_secrets.policy,
+      var.agent_otp_pepper_secret_arn,
+    )
+    error_message = "The qurl-service execution role must not retain read access to the retired HTTP OTP pepper."
+  }
+
+  assert {
+    condition = (
+      contains(
+        jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment,
+        {
+          name  = "NHP_SERVER_PUBLIC_KEY_B64"
+          value = var.nhp_server_public_key_b64
+        },
+      )
+      && contains(
+        jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment,
+        {
+          name  = "QURL_BROWSER_RELAY_BASE_URL"
+          value = var.qurl_browser_relay_base_url
+        },
+      )
+    )
+    error_message = "HTTP lifecycle retirement must retain the browser relay URL and its pinned NHP server identity."
+  }
+}

@@ -126,6 +126,11 @@ override_resource {
   values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys" }
 }
 override_resource {
+  target          = aws_dynamodb_table.api_key_idempotency
+  override_during = plan
+  values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-apikey-idempotency" }
+}
+override_resource {
   target          = aws_dynamodb_table.customers
   override_during = plan
   values          = { arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-customers" }
@@ -416,10 +421,10 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
 
   assert {
     condition = (
-      jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Effect == "Allow" &&
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Effect == "Allow" &&
-      jsondecode(aws_vpc_endpoint.interface["secretsmanager"].policy).Statement[0].Effect == "Allow" &&
-      jsondecode(aws_vpc_endpoint.interface["email"].policy).Statement[0].Effect == "Allow"
+      jsondecode(local.dynamodb_endpoint_policy).Statement[0].Effect == "Allow" &&
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Effect == "Allow" &&
+      jsondecode(local.interface_endpoint_policies["secretsmanager"]).Statement[0].Effect == "Allow" &&
+      jsondecode(local.interface_endpoint_policies["email"]).Statement[0].Effect == "Allow"
     )
     error_message = "The complete runtime must open its scoped DynamoDB, KMS, Secrets Manager, and SES dependency endpoints."
   }
@@ -551,19 +556,19 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
       # VPC endpoint policies do not match a role-ARN Principal against an
       # assumed-role session, so scoping lives in Principal "*" + an exact
       # aws:PrincipalArn condition (the DynamoDB gateway is the same shape).
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Principal == "*" &&
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[1].Principal == "*" &&
-      jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Principal == "*" &&
-      length(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"]) == 5 &&
-      contains(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec") &&
-      contains(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-iro-cell1-exec") &&
-      contains(jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ar-cell0-exec") &&
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[0].Action == ["kms:GetPublicKey"] &&
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[1].Condition.StringEquals["aws:PrincipalArn"] == ["arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec"] &&
-      jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement[1].Action == ["kms:Sign"] &&
-      contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:DescribeTable") &&
-      !contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:DeleteItem") &&
-      !contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Action, "dynamodb:TransactWriteItems")
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Principal == "*" &&
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[1].Principal == "*" &&
+      jsondecode(local.dynamodb_endpoint_policy).Statement[0].Principal == "*" &&
+      length(jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Condition.StringEquals["aws:PrincipalArn"]) == 5 &&
+      contains(jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec") &&
+      contains(jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-iro-cell1-exec") &&
+      contains(jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Condition.StringEquals["aws:PrincipalArn"], "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ar-cell0-exec") &&
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[0].Action == ["kms:GetPublicKey"] &&
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[1].Condition.StringEquals["aws:PrincipalArn"] == ["arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-ia-exec"] &&
+      jsondecode(local.interface_endpoint_policies["kms"]).Statement[1].Action == ["kms:Sign"] &&
+      contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:DescribeTable") &&
+      !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:DeleteItem") &&
+      !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:TransactWriteItems")
     )
     error_message = "KMS endpoint must separate exact public-key and sign principals; DynamoDB must include DescribeTable without Delete/Transact*."
   }
@@ -571,19 +576,20 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
   assert {
     condition = (
       # Gateway VPC-endpoint policies are TABLE-GRANULAR: the DynamoDB endpoint
-      # Resource must be EXACTLY the four base tables. A /index/* sub-resource
+      # Resource must be EXACTLY the five base tables. A /index/* sub-resource
       # is InvalidPolicyDocument at ModifyVpcEndpoint (the apply-time failure this
       # guards). The finer pubkey-GSI grant lives on the RefreshAssignment
       # identity policy (asserted above), never on this coarse network gate.
-      toset(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Resource) == toset([
+      toset(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Resource) == toset([
         "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
         "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-apikey-idempotency",
         "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-customers",
         "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority",
       ]) &&
-      !contains(jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement[0].Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys/index/*")
+      !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys/index/*")
     )
-    error_message = "The DynamoDB gateway-endpoint policy must list only the four base-table ARNs (table-granular); a /index/* sub-resource is invalid at apply."
+    error_message = "The DynamoDB gateway-endpoint policy must list only the five base-table ARNs (table-granular); a /index/* sub-resource is invalid at apply."
   }
 }
 

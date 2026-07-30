@@ -1804,6 +1804,19 @@ def proof_runtime_exec_policy() -> str:
             "Resource": table,
         },
         {
+            "Sid": "ProofDynamoDBDecrypt",
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt"],
+            "Resource": [RUNTIME_AUTHORITY_DATA_KEY_ARN],
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": (
+                        f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                    )
+                }
+            },
+        },
+        {
             "Sid": "ProofFencedPlacementRead",
             "Effect": "Allow",
             "Action": read_actions,
@@ -13122,6 +13135,76 @@ class StandaloneExecPolicyLaneTest(unittest.TestCase):
             CHECKER._validate_authority_hub_exec_policy_update(
                 frozenset(self.POLICIES), self.by_address(actions=("create",)), {}
             )
+
+
+class ProofMutationDecryptUpdateTest(unittest.TestCase):
+    """The one-off ca-pm policy lane admits only the exact decrypt addition."""
+
+    def by_address(self):
+        after_policy = json.loads(proof_runtime_exec_policy())
+        before_policy = copy.deepcopy(after_policy)
+        before_policy["Statement"] = [
+            statement
+            for statement in before_policy["Statement"]
+            if statement["Sid"] != "ProofDynamoDBDecrypt"
+        ]
+        address = CHECKER.AUTHORITY_PROOF_EXEC_POLICY_ADDRESS
+        return {
+            address: {
+                "address": address,
+                "mode": "managed",
+                "deposed": None,
+                "type": "aws_iam_role_policy",
+                "change": {
+                    "actions": ["update"],
+                    "before": {
+                        "name": "ca-pm",
+                        "role": "ca-pm",
+                        "policy": json.dumps(before_policy),
+                    },
+                    "after": {
+                        "name": "ca-pm",
+                        "role": "ca-pm",
+                        "policy": json.dumps(after_policy),
+                    },
+                    "before_sensitive": {},
+                    "after_sensitive": {},
+                    "after_unknown": {},
+                },
+            }
+        }
+
+    def test_exact_decrypt_addition_passes(self) -> None:
+        CHECKER._check_authority_proof_mutation_decrypt_update(self.by_address())
+
+    def test_extra_policy_change_fails_closed(self) -> None:
+        by_address = self.by_address()
+        change = by_address[CHECKER.AUTHORITY_PROOF_EXEC_POLICY_ADDRESS]["change"]
+        policy = json.loads(change["after"]["policy"])
+        policy["Statement"][0]["Action"].append("ec2:DescribeInstances")
+        change["after"]["policy"] = json.dumps(policy)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "changed more than the reviewed statement"
+        ):
+            CHECKER._check_authority_proof_mutation_decrypt_update(by_address)
+
+    def test_decrypt_condition_drift_fails_closed(self) -> None:
+        by_address = self.by_address()
+        change = by_address[CHECKER.AUTHORITY_PROOF_EXEC_POLICY_ADDRESS]["change"]
+        policy = json.loads(change["after"]["policy"])
+        decrypt = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ProofDynamoDBDecrypt"
+        )
+        decrypt["Condition"]["StringEquals"]["kms:ViaService"] = (
+            "secretsmanager.us-east-2.amazonaws.com"
+        )
+        change["after"]["policy"] = json.dumps(policy)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "decrypt statement drifted"
+        ):
+            CHECKER._check_authority_proof_mutation_decrypt_update(by_address)
 
 
 class DualDigestNormalizationTest(unittest.TestCase):

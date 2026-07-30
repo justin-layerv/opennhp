@@ -609,6 +609,20 @@ locals {
         Resource = local.authority_runtime_table_resources.connector_authority
       },
       {
+        # The connector-authority table uses the Control data CMK. DynamoDB
+        # decrypts rows on the caller's behalf, so the proof function needs this
+        # grant before its first replay GetItem can reach an absent-item result.
+        Sid      = "ProofDynamoDBDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [aws_kms_key.authority_data.arn]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+          }
+        }
+      },
+      {
         Sid      = "ProofFencedPlacementRead"
         Effect   = "Allow"
         Action   = local.authority_runtime_ddb_read_actions_without_describe

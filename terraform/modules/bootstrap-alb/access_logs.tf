@@ -86,27 +86,14 @@ locals {
 resource "aws_s3_bucket" "alb_access_logs" {
   bucket = local.alb_access_logs_bucket_name
 
-  # `force_destroy = false` in BOTH envs — bootstrap forensics are
-  # irrecoverable, and the cost asymmetry of destroying logs vs
-  # rebuilding the sandbox env doesn't favor cheap-destroy here. A
-  # sandbox teardown that genuinely needs to purge the bucket can flip
-  # this to true in a one-commit PR before the destroy plan, then revert.
-  force_destroy = false
+  # The retired HTTP bootstrap surface is being removed from sandbox. Keep this
+  # change in an applied preparation revision before setting
+  # deploy_bootstrap_alb=false: the provider must persist force_destroy in state
+  # before the module instance (and its non-empty versioned bucket) disappears
+  # from configuration.
+  force_destroy = true
 
   tags = merge(local.tags, { Name = local.alb_access_logs_bucket_name })
-
-  # Belt-and-suspenders on the forensics-asymmetry argument:
-  # `prevent_destroy = true` blocks Terraform from destroying the
-  # bucket even when the bucket is empty (which `force_destroy =
-  # false` doesn't prevent — an operator who manually empties the
-  # bucket can still destroy it without this fence). Both fences in
-  # place means a deliberate sandbox teardown requires (1) flipping
-  # `force_destroy = true` AND (2) commenting out this lifecycle
-  # block in a one-commit PR, then reverting. Prod should never
-  # touch this path.
-  lifecycle {
-    prevent_destroy = true
-  }
 }
 
 resource "aws_s3_bucket_versioning" "alb_access_logs" {

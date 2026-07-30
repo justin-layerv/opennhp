@@ -317,8 +317,8 @@ locals {
   )
 
   # Runtime secret ARNs the ECS execution role resolves (and KMS-decrypts) at
-  # task launch: the always-present trio plus the optional Grafana Cloud secret
-  # and agent-OTP pepper. Hoisted so the private-boundary secret read, the
+  # task launch: the always-present trio plus the optional Grafana Cloud secret.
+  # Hoisted so the private-boundary secret read, the
   # private-boundary KMS EncryptionContext condition, and the execution_secrets
   # policy below all reference one list and cannot drift.
   execution_runtime_secret_arns = concat(
@@ -329,9 +329,6 @@ locals {
     ],
     # Grafana Cloud secret when the ADOT sidecar is enabled.
     var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : [],
-    # Agent OTP pepper (T1) — only when the OTP path is enabled (root passes a
-    # non-empty ARN). Off → no grant.
-    var.agent_otp_pepper_secret_arn != "" ? [var.agent_otp_pepper_secret_arn] : [],
   )
 
   # Container environment variables
@@ -479,30 +476,13 @@ locals {
       { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
       { name = "NHP_KNOCK_TIMEOUT", value = tostring(var.nhp_knock_timeout_seconds) },
     ] : [],
-    # QURL agent → nhp-server bootstrap chain (Wave 5 dark-launch). Threaded
-    # directly from module.compute at the root
-    # (server_public_key_b64 for the server-identity pubkey, nlb_dns_name
-    # for the host) so the agent's view of the responder can never drift
-    # from what nhp-server actually publishes. Same wiring shape as
-    # NHP_SERVER_INTERNAL_URL above — TF-injected env vars on the task
-    # def, no second config-fetch mechanism (no ssm:GetParameter at
-    # runtime), no IAM surface for these statics. The values change only
-    # on TF apply (NLB DNS rotation, server-secret keypair rotation,
-    # constant port). Gate is var.deploy_qurl_bootstrap_chain;
-    # the chain is activated via a separate
-    # var.enable_qurl_agent_bootstrap tfvars flip per environment —
-    # matches the established dark-launch pattern in this tree
-    # (deploy_frps, deploy_qurl_service, deploy_bootstrap_alb).
-    var.deploy_qurl_bootstrap_chain || var.qurl_browser_relay_base_url != "" ? [
+    # Browser relay still needs the server identity. The retired HTTP agent
+    # bootstrap host/port/activation tuple is intentionally no longer rendered.
+    var.qurl_browser_relay_base_url != "" ? [
       { name = "NHP_SERVER_PUBLIC_KEY_B64", value = var.nhp_server_public_key_b64 },
     ] : [],
     var.qurl_browser_relay_base_url != "" ? [
       { name = "QURL_BROWSER_RELAY_BASE_URL", value = var.qurl_browser_relay_base_url },
-    ] : [],
-    var.deploy_qurl_bootstrap_chain ? [
-      { name = "NHP_SERVER_HOST", value = var.nhp_server_host },
-      { name = "NHP_SERVER_PORT", value = var.nhp_server_port },
-      { name = "QURL_AGENT_BOOTSTRAP_ENABLED", value = var.enable_qurl_agent_bootstrap ? "true" : "false" },
     ] : [],
     # FRPS integration (#1499). qurl-service hashes OwnerID to a
     # suffix and emits `frps-${suffix}.${domain}:${port}` as `upstream_addr`
@@ -597,50 +577,18 @@ locals {
       { name = "QURL_V2_RELAY_URL", value = var.qurl_v2_relay_url },
     ] : [],
 
-    # ==================== Agent registration + email OTP (T1) ====================
-    # Two flag-gated blocks with a dependency order matched to qurl-service's
-    # boot-time Config.Validate (fail-closed), so a dark env's task def is
-    # byte-identical to today:
-    #   REGISTRATION_ENABLED ⇒ bootstrap-enabled (QURL_AGENT_BOOTSTRAP_ENABLED,
-    #     emitted by the deploy_qurl_bootstrap_chain block above) + a relay URL.
-    #   OTP_ENABLED          ⇒ REGISTRATION_ENABLED + EMAIL_FROM + PEPPER (secret,
-    #     in container_secrets below).
-    # PATH A (registration) can be flipped on alone for the internal
-    # credential-exchange smoke; PATH B (OTP) layers the email flow on top. The
-    # pepper is the only secret and rides container_secrets — everything here is
-    # a plain env var. Emitting REGISTRATION_ENABLED and the relay URL together
-    # keeps the root from having to reason about the two vars separately: the
-    # root's precondition (see main.tf) fails plan if registration is on without
-    # a relay URL, matching the qurl-service validator.
-    var.agent_registration_enabled ? [
-      { name = "QURL_AGENT_REGISTRATION_ENABLED", value = "true" },
-      { name = "QURL_NHP_RELAY_BASE_URL", value = var.agent_otp_relay_base_url },
-    ] : [],
-    var.agent_otp_enabled ? [
-      { name = "QURL_AGENT_OTP_ENABLED", value = "true" },
-      { name = "QURL_AGENT_OTP_EMAIL_FROM", value = var.agent_otp_email_from },
-    ] : [],
   )
 
   # Secrets and SSM parameters resolved by ECS at task launch time.
   # Despite the field name, ECS "secrets" supports both Secrets Manager ARNs
   # and SSM Parameter Store ARNs — it's the mechanism for dynamic value resolution.
-  container_secrets = concat([
+  container_secrets = [
     { name = "QURL_JWT_SECRET", valueFrom = var.jwt_secret_arn },
     { name = "QURL_INTERNAL_SERVICE_TOKEN", valueFrom = var.internal_service_token_arn },
     { name = "QURL_AC_ID", valueFrom = aws_ssm_parameter.default_ac_id.arn },
     # Shared HMAC secret — signer side of the /nhp/internal/knock contract with nhp-server.
     { name = "NHP_INTERNAL_AUTH_SECRET", valueFrom = var.nhp_internal_auth_secret_arn },
-    ],
-    # Agent OTP pepper (T1). valueFrom the Secrets Manager ARN the root creates +
-    # seeds; ECS resolves it at task launch. Gated on a non-empty ARN so a dark
-    # env references no secret and the execution role gains no GetSecretValue grant
-    # for it (see aws_iam_role_policy.execution_secrets below). The ARN is passed
-    # only when agent_otp_enabled = true at the root.
-    var.agent_otp_pepper_secret_arn != "" ? [
-      { name = "QURL_AGENT_OTP_PEPPER", valueFrom = var.agent_otp_pepper_secret_arn },
-    ] : [],
-  )
+  ]
 }
 
 # ==================== CloudWatch Log Group ====================

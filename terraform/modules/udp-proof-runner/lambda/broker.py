@@ -147,9 +147,21 @@ class Broker:
 
     def _is_expected_instance(self, instance: dict[str, Any]) -> bool:
         template = instance.get("LaunchTemplate") or {}
+        if template:
+            return (
+                template.get("LaunchTemplateId") == self.launch_template_id
+                and str(template.get("Version", "")) == self.launch_template_version
+            )
+
+        # EC2 can omit the LaunchTemplate object from DescribeInstances even
+        # though it retains the AWS-reserved, immutable launch-template tags.
+        # A scheduled sweep must not reap a healthy in-flight proof for that
+        # response shape, but still fails closed on any partial or mismatched
+        # identity.
+        instance_tags = _tags(instance.get("Tags"))
         return (
-            template.get("LaunchTemplateId") == self.launch_template_id
-            and str(template.get("Version", "")) == self.launch_template_version
+            instance_tags.get("aws:ec2launchtemplate:id") == self.launch_template_id
+            and instance_tags.get("aws:ec2launchtemplate:version") == self.launch_template_version
         )
 
     def _is_reusable_instance(self, instance: dict[str, Any]) -> bool:

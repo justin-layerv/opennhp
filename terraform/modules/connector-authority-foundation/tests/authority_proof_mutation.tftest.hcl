@@ -816,6 +816,25 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
     error_message = "MutateProofAgent replay must be exact Get/Put/Update on its own HUB_REQUEST#MutateProofAgent#* namespace."
   }
 
+  # DynamoDB decrypts SSE-KMS rows on the caller's behalf. Keep the required
+  # grant confined to the exact Control data CMK and the DynamoDB service path.
+  assert {
+    condition = (
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofDynamoDBDecrypt"].Action == [
+        "kms:Decrypt",
+      ] &&
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofDynamoDBDecrypt"].Resource == [
+        "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000002",
+      ] &&
+      { for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-pm"].policy).Statement : statement.Sid => statement }["ProofDynamoDBDecrypt"].Condition == {
+        StringEquals = {
+          "kms:ViaService" = "dynamodb.us-east-2.amazonaws.com"
+        }
+      }
+    )
+    error_message = "MutateProofAgent must decrypt only the exact Control data CMK and only through DynamoDB."
+  }
+
   # The Hub functions must be able to read proof placement/lease state from the
   # connector-authority table, and the gateway endpoint must admit that read
   # plus ca-pm's exact replay writes for their exact execution principals.

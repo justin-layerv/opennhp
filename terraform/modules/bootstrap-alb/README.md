@@ -586,31 +586,22 @@ A `terraform destroy` (flipping `deploy_bootstrap_alb=false` in
 tfvars then re-applying) of this module has two non-obvious gotchas
 the operator needs to handle manually:
 
-### 1. Access-log bucket has TWO destroy fences
+### 1. Access-log bucket teardown is a two-apply operation
 
-`aws_s3_bucket.alb_access_logs` carries BOTH:
+The retired bootstrap surface has deliberately armed the access-log bucket for
+removal with `force_destroy = true` and no `prevent_destroy` lifecycle rule.
+Terraform must apply that preparation while the module still exists before a
+later apply sets `deploy_bootstrap_alb=false`. This records the destroy behavior
+in state before the resource disappears from configuration.
 
-1. `force_destroy = false` — destroy fails with `BucketNotEmpty`
-   unless the bucket is manually emptied first.
-2. `lifecycle.prevent_destroy = true` — destroy fails even when the
-   bucket IS empty (catches the "operator empties it manually then
-   runs destroy" case).
-
-Both fences are deliberate (bootstrap forensics are irrecoverable;
-see `access_logs.tf`). A genuine sandbox teardown requires a
-one-commit PR that flips BOTH:
-
-```sh
-# In modules/bootstrap-alb/access_logs.tf:
-#   1. force_destroy = false  →  force_destroy = true
-#   2. comment out the `lifecycle { prevent_destroy = true }` block
-# Apply, destroy, then revert in a follow-up commit.
-AWS_PROFILE=<NHP_PROFILE> terraform apply
-AWS_PROFILE=<NHP_PROFILE> terraform destroy \
-  -target='module.bootstrap_alb[0]'
-```
-
-Prod should NEVER reach this path under normal operations.
+Do not combine the preparation and removal into one unapplied revision, and do
+not use a targeted destroy. Apply reviewed `main` once with the module present,
+then merge the separate sandbox retirement revision and apply its normal saved
+plan. This preparation revision is sandbox-only: do not run a production
+Terraform apply while its temporary source-level fences are relaxed. The
+separate retirement revision restores `force_destroy=false` and
+`prevent_destroy=true` for the still-live production module in the same commit
+that removes the prepared sandbox instance.
 
 ### 2. Orphaned ACM cert (`provision_certificate = false` paths)
 
