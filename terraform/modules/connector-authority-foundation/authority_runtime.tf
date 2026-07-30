@@ -224,15 +224,15 @@ locals {
   #
   # RECONCILED against the live handler in layervai/qurl-service (origin/main
   # internal/connectorauthorityruntime + internal/connectorauthority +
-  # internal/repository/dynamodb). DynamoDB SSE with the authority data CMK is
-  # applied by the DynamoDB service under the table grant, so an execution role
-  # needs NO KMS permission for table access; each op still needs
-  # dynamodb:DescribeTable to READ and verify that SSE key at cold start. KMS on
-  # the identity layer is the qat1 assignment-ticket key for IssueAssignment
-  # ONLY (GetPublicKey to load the key, Sign to mint the ticket); RefreshAssignment
-  # and IssueCredentialRecovery construct no KMS client at all. ENI lifecycle
-  # keeps the AWS-required Resource="*" (plan-sanctioned); no other statement
-  # uses that escape.
+  # internal/repository/dynamodb). DynamoDB invokes the authority data CMK with
+  # the caller's execution-role credentials, so every operation needs
+  # kms:Decrypt on that exact key through DynamoDB in addition to its exact
+  # table-scoped DynamoDB grant. Each op also needs dynamodb:DescribeTable to
+  # read and verify that SSE key at cold start. KMS on the identity layer is the
+  # separate qat1 assignment-ticket key for IssueAssignment only (GetPublicKey
+  # to load the key, Sign to mint the ticket). ENI lifecycle keeps the
+  # AWS-required Resource="*" (plan-sanctioned); no other statement uses that
+  # escape.
   # ----------------------------------------------------------------------------
   authority_runtime_common_exec_statements = local.authority_runtime_functions_deploy ? [
     {
@@ -248,6 +248,24 @@ locals {
       Resource = "*"
     },
   ] : []
+
+  # DynamoDB performs the CMK call on behalf of the Lambda execution role. Keep
+  # this distinct from direct KMS use: the exact authority-data key is usable
+  # only when the request comes through DynamoDB, while the operation's
+  # table-scoped DynamoDB statements remain the finer data boundary. ca-pm
+  # retains its separately named proof grant because its policy is independently
+  # byte-checked as an attended mutation capability.
+  authority_runtime_dynamodb_decrypt_statements = local.authority_runtime_functions_deploy ? [{
+    Sid      = "AuthorityDynamoDBDecrypt"
+    Effect   = "Allow"
+    Action   = ["kms:Decrypt"]
+    Resource = [aws_kms_key.authority_data.arn]
+    Condition = {
+      StringEquals = {
+        "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+      }
+    }
+  }] : []
 
   # The 5 canonical tables reached by the complete runtime. The attended proof
   # recovery constructor uses api_key_idempotency for replay-safe credential
@@ -381,8 +399,9 @@ locals {
     ])
     # RefreshAssignment: strong agent-identity (agent_keys, incl. its pubkey GSI)
     # and authority-placement reads; writes only its single-item replay tombstone
-    # (Put) to connector_authority. It builds NO KMS client (read-only domain
-    # service; ticket verification is local p256, not kms:Verify).
+    # (Put) to connector_authority. It builds no direct KMS client (ticket
+    # verification is local p256); the DynamoDB-mediated decrypt grant above
+    # still applies to its encrypted table reads.
     refresh_assignment = concat([
       {
         Sid      = "AuthorityReads"
@@ -411,7 +430,8 @@ locals {
     # IssueCredentialRecovery: api-key/agent/authority reads; its recovery
     # transaction WRITES only connector_authority (replay + grant Puts, first-grant
     # head-anchor Update). api_keys/agent_keys are touched only via ConditionCheck,
-    # authorized by dynamodb:ConditionCheckItem in the read set. It builds NO KMS client.
+    # authorized by dynamodb:ConditionCheckItem in the read set. It builds no
+    # direct KMS client; the DynamoDB-mediated decrypt grant above still applies.
     issue_credential_recovery = concat([
       {
         Sid    = "AuthorityReads"
@@ -954,6 +974,7 @@ resource "aws_iam_role_policy" "authority_exec" {
     Version = "2012-10-17"
     Statement = concat(
       local.authority_runtime_common_exec_statements,
+      each.value.operation == "mutate_proof_agent" ? [] : local.authority_runtime_dynamodb_decrypt_statements,
       [
         {
           Sid    = "OwnLogStream"

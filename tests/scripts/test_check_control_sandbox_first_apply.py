@@ -1656,6 +1656,19 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
             ],
         },
         {
+            "Sid": "AuthorityDynamoDBDecrypt",
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt"],
+            "Resource": [RUNTIME_AUTHORITY_DATA_KEY_ARN],
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": (
+                        f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                    )
+                }
+            },
+        },
+        {
             "Sid": "AuthorityReads",
             "Effect": "Allow",
             "Action": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS),
@@ -1898,6 +1911,19 @@ def proof_recovery_runtime_exec_policy() -> str:
                 f"arn:aws:logs:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
                 f"log-group:/aws/lambda/{fn}:*"
             ],
+        },
+        {
+            "Sid": "AuthorityDynamoDBDecrypt",
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt"],
+            "Resource": [RUNTIME_AUTHORITY_DATA_KEY_ARN],
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": (
+                        f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                    )
+                }
+            },
         },
         {
             "Sid": "ProofRecoveryVerifyTableEncryption",
@@ -8534,6 +8560,21 @@ class PlanContractTests(unittest.TestCase):
         reads["Action"] = [
             action for action in reads["Action"] if action != "dynamodb:DescribeTable"
         ]
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_exec_dynamodb_decrypt_without_via_service(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "issue_assignment")
+        policy = json.loads(change["after"]["policy"])
+        decrypt = next(
+            s
+            for s in policy["Statement"]
+            if s["Sid"] == "AuthorityDynamoDBDecrypt"
+        )
+        decrypt.pop("Condition")
         change["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
 

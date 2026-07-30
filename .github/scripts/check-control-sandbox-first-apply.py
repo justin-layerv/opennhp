@@ -5473,6 +5473,27 @@ def _authority_string_set(value: Any, address: str, field: str) -> set[str]:
     return result
 
 
+def _check_authority_dynamodb_decrypt(
+    statement: dict[str, Any], fn: str, sid: str = "AuthorityDynamoDBDecrypt"
+) -> None:
+    """Pin the CMK grant to DynamoDB-mediated use of the Authority data key."""
+    resources = _authority_string_set(statement.get("Resource"), fn, f"{sid} Resource")
+    if (
+        statement.get("Effect") != "Allow"
+        or _authority_string_set(statement.get("Action"), fn, f"{sid} Action")
+        != {"kms:Decrypt"}
+        or len(resources) != 1
+        or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(next(iter(resources))) is None
+        or statement.get("Condition")
+        != {
+            "StringEquals": {
+                "kms:ViaService": f"dynamodb.{AWS_REGION}.amazonaws.com"
+            }
+        }
+    ):
+        raise ContractError(f"{fn} DynamoDB decrypt grant drifted")
+
+
 def _check_authority_dynamodb_endpoint_policy(
     after: dict[str, Any],
     address: str,
@@ -6019,7 +6040,13 @@ def _check_authority_exec_role_policy(
             raise ContractError(f"{fn} execution statement Sid missing or duplicated")
         by_sid[sid] = stmt
 
-    expected_sids = {"LambdaVpcEni", "OwnLogStream", "AuthorityReads", spec["write_sid"]}
+    expected_sids = {
+        "LambdaVpcEni",
+        "AuthorityDynamoDBDecrypt",
+        "OwnLogStream",
+        "AuthorityReads",
+        spec["write_sid"],
+    }
     if spec["signs"]:
         expected_sids.add("Qat1Sign")
     if proof_policy_consumer:
@@ -6073,6 +6100,7 @@ def _check_authority_exec_role_policy(
         != expected_read_resources
     ):
         raise ContractError(f"{fn} read resources must be exactly its SSE-verified tables")
+    _check_authority_dynamodb_decrypt(by_sid["AuthorityDynamoDBDecrypt"], fn)
 
     # Writes: connector_authority only, with the op's exact verbs.
     write = by_sid[spec["write_sid"]]
@@ -6333,6 +6361,7 @@ def _check_authority_proof_recovery_exec_role_policy(
 
     expected_sids = {
         "LambdaVpcEni",
+        "AuthorityDynamoDBDecrypt",
         "OwnLogStream",
         "ProofRecoveryVerifyTableEncryption",
         "ProofRecoveryCredentialReadWrite",
@@ -6350,6 +6379,7 @@ def _check_authority_proof_recovery_exec_role_policy(
         raise ContractError(f"{fn} ENI statement drifted")
     if "Condition" in eni:
         raise ContractError(f"{fn} ENI statement may not carry a condition")
+    _check_authority_dynamodb_decrypt(by_sid["AuthorityDynamoDBDecrypt"], fn)
 
     log_stmt = by_sid["OwnLogStream"]
     expected_log = (
@@ -6456,12 +6486,18 @@ def _check_authority_cell_exec_role_policy(
         sid = stmt.get("Sid")
         if not isinstance(sid, str) or sid in by_sid:
             raise ContractError(f"{fn} execution statement Sid missing or duplicated")
-        if "Condition" in stmt and sid != "OTPSecretDecrypt":
-            raise ContractError(f"{fn} only OTPSecretDecrypt may carry a Condition")
+        if "Condition" in stmt and sid not in {
+            "AuthorityDynamoDBDecrypt",
+            "OTPSecretDecrypt",
+        }:
+            raise ContractError(
+                f"{fn} only DynamoDB/OTP decrypt statements may carry a Condition"
+            )
         by_sid[sid] = stmt
 
     expected_sids = {
         "LambdaVpcEni",
+        "AuthorityDynamoDBDecrypt",
         "OwnLogStream",
         "AuthorityReads",
         *spec["writes"],
@@ -6493,6 +6529,7 @@ def _check_authority_cell_exec_role_policy(
         expected_log
     }:
         raise ContractError(f"{fn} own-log statement drifted")
+    _check_authority_dynamodb_decrypt(by_sid["AuthorityDynamoDBDecrypt"], fn)
 
     reads = by_sid["AuthorityReads"]
     expected_read_resources = set().union(
