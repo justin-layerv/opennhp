@@ -165,6 +165,54 @@ class AuthorityProofRolloutTransitionTests(unittest.TestCase):
         self.assertRegex(lifecycle, r"ignore_changes\s*=\s*\[desired_count\]")
         self.assertNotIn("task_definition", lifecycle)
 
+    def test_initial_prepare_reconciles_only_to_planned_hub_revision(self):
+        service_before = {
+            "name": "layerv-nhp-sandbox-control-hub",
+            "desired_count": 2,
+            "task_definition": "arn:aws:ecs:us-east-2:767397897469:task-definition/hub:6",
+        }
+        planned_arn = (
+            "arn:aws:ecs:us-east-2:767397897469:task-definition/hub:7"
+        )
+        by_address = {
+            CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS: {
+                "change": {"after": {"arn": planned_arn}}
+            },
+            CHECKER.HUB_WORKER_SERVICE_ADDRESS: {
+                "change": {
+                    "actions": ["update"],
+                    "before": service_before,
+                    "after": {
+                        **service_before,
+                        "task_definition": planned_arn,
+                    },
+                    "after_unknown": {},
+                }
+            },
+        }
+
+        CHECKER._check_hub_service_task_revision_update(
+            by_address, require_planned_target=True
+        )
+
+        wrong_target = copy.deepcopy(by_address)
+        wrong_target[CHECKER.HUB_WORKER_SERVICE_ADDRESS]["change"]["after"][
+            "task_definition"
+        ] = f"{planned_arn.rsplit(':', 1)[0]}:8"
+        with self.assertRaisesRegex(CHECKER.ContractError, "planned task revision"):
+            CHECKER._check_hub_service_task_revision_update(
+                wrong_target, require_planned_target=True
+            )
+
+        widened = copy.deepcopy(by_address)
+        widened[CHECKER.HUB_WORKER_SERVICE_ADDRESS]["change"]["after"][
+            "desired_count"
+        ] = 3
+        with self.assertRaisesRegex(CHECKER.ContractError, "only the Hub task revision"):
+            CHECKER._check_hub_service_task_revision_update(
+                widened, require_planned_target=True
+            )
+
 
 def applied_provisioned_cell_item(cell_id: str) -> str:
     """Render a catalog row the way a refreshed read renders it.

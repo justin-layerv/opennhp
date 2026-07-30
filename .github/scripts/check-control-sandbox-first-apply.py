@@ -7601,6 +7601,7 @@ def _check_authority_image_new_noops(
 
 
 HUB_WORKER_TASK_DEFINITION_ADDRESS = "module.control.aws_ecs_task_definition.hub[0]"
+HUB_WORKER_SERVICE_ADDRESS = "module.control.aws_ecs_service.hub[0]"
 # Attributes ECS/Terraform recompute for every new task-definition revision.
 # Everything NOT listed here must be byte-identical across the replacement.
 HUB_WORKER_TASK_DEFINITION_COMPUTED = frozenset(
@@ -7618,6 +7619,52 @@ def _claim_hub_worker_image_update(
     if sorted(actual_non_noop.get(address) or ()) != ["create", "delete"]:
         return None
     return frozenset({address})
+
+
+def _check_hub_service_task_revision_update(
+    by_address: dict[str, Any], *, require_planned_target: bool = False
+) -> None:
+    """Admit only an ECS service update to its planned Hub task revision."""
+    service_change = by_address[HUB_WORKER_SERVICE_ADDRESS]["change"]
+    service_before = service_change.get("before")
+    service_after = service_change.get("after")
+    service_after_unknown = service_change.get("after_unknown")
+    if (
+        service_change.get("actions") != ["update"]
+        or not isinstance(service_before, dict)
+        or not isinstance(service_after, dict)
+        or (
+            service_before.get("task_definition")
+            == service_after.get("task_definition")
+            and not (
+                isinstance(service_after_unknown, dict)
+                and service_after_unknown.get("task_definition") is True
+            )
+        )
+        or {
+            key: value
+            for key, value in service_before.items()
+            if key != "task_definition"
+        }
+        != {
+            key: value
+            for key, value in service_after.items()
+            if key != "task_definition"
+        }
+    ):
+        raise ContractError("proof rollout may update only the Hub task revision")
+
+    if require_planned_target:
+        task_after = by_address[HUB_WORKER_TASK_DEFINITION_ADDRESS]["change"].get(
+            "after"
+        )
+        if (
+            not isinstance(task_after, dict)
+            or service_after.get("task_definition") != task_after.get("arn")
+        ):
+            raise ContractError(
+                "proof rollout Hub service must select the planned task revision"
+            )
 
 
 def _claim_authority_hub_exec_policy_update(
@@ -8083,34 +8130,7 @@ def _check_authority_proof_selector_update(
         if before[key] != after[key]:
             raise ContractError("proof selector changed unrelated Hub task attributes")
 
-    service_change = by_address["module.control.aws_ecs_service.hub[0]"]["change"]
-    service_before = service_change.get("before")
-    service_after = service_change.get("after")
-    service_after_unknown = service_change.get("after_unknown")
-    if (
-        service_change.get("actions") != ["update"]
-        or not isinstance(service_before, dict)
-        or not isinstance(service_after, dict)
-        or (
-            service_before.get("task_definition")
-            == service_after.get("task_definition")
-            and not (
-                isinstance(service_after_unknown, dict)
-                and service_after_unknown.get("task_definition") is True
-            )
-        )
-        or {
-            key: value
-            for key, value in service_before.items()
-            if key != "task_definition"
-        }
-        != {
-            key: value
-            for key, value in service_after.items()
-            if key != "task_definition"
-        }
-    ):
-        raise ContractError("proof selector may update only the Hub task revision")
+    _check_hub_service_task_revision_update(by_address)
 
 
 def _normalize_hub_worker_container(container: dict[str, Any]) -> dict[str, Any]:
@@ -10698,11 +10718,14 @@ def check_plan(
     authority_proof_rollout_prepare_transition = (
         proof_rollout_mode
         and authority_proof_rollout_transition_kind == "prepare"
-        and changed
-        == (
-            rollout_initial_changes
+        and frozenset(changed)
+        in (
+            {
+                frozenset(rollout_initial_changes),
+                frozenset({*rollout_initial_changes, HUB_WORKER_SERVICE_ADDRESS}),
+            }
             if rollout_before_absent
-            else rollout_reprepare_changes
+            else {frozenset(rollout_reprepare_changes)}
         )
         and all(
             actual_non_noop.get(address)
@@ -11356,6 +11379,10 @@ def check_plan(
             by_address,
             "proof rollout standby pools must be new",
         )
+        if HUB_WORKER_SERVICE_ADDRESS in changed:
+            _check_hub_service_task_revision_update(
+                by_address, require_planned_target=True
+            )
     elif authority_proof_rollout_selector_transition:
         plan_mode = "authority-proof-rollout-selector"
         before_colors = _authority_proof_rollout_colors(
