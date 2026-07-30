@@ -22,6 +22,9 @@ locals {
   runner_name = "${var.name_prefix}-udp-proof-runner"
   runner_tags = merge(local.tags, { Name = local.runner_name })
 
+  aws_cli_archive_url    = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.36.11.zip"
+  aws_cli_archive_sha256 = "50fbb7a2f44a78eab4a210088040e8f0bc4b9937cac8043c2354269d58614df6"
+
   ec2_arn_prefix                       = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:"
   jit_secret_prefix                    = "${var.name_prefix}/udp-proof/jit/"
   jit_secret_arn_pattern               = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.jit_secret_prefix}*"
@@ -204,11 +207,13 @@ resource "aws_launch_template" "runner" {
   update_default_version               = true
   instance_initiated_shutdown_behavior = "terminate"
   user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
-    aws_region            = data.aws_region.current.region
-    jit_secret_prefix     = local.jit_secret_prefix
-    max_runtime_minutes   = var.max_runtime_minutes
-    runner_archive_sha256 = var.runner_archive_sha256
-    runner_archive_url    = var.runner_archive_url
+    aws_cli_archive_sha256 = local.aws_cli_archive_sha256
+    aws_cli_archive_url    = local.aws_cli_archive_url
+    aws_region             = data.aws_region.current.region
+    jit_secret_prefix      = local.jit_secret_prefix
+    max_runtime_minutes    = var.max_runtime_minutes
+    runner_archive_sha256  = var.runner_archive_sha256
+    runner_archive_url     = var.runner_archive_url
   }))
 
   iam_instance_profile {

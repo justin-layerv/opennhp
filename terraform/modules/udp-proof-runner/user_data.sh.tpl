@@ -7,7 +7,9 @@ umask 077
 
 # Never enable xtrace in this bootstrap. The one-time JIT configuration is read
 # into a root-only file and handed directly to the runner without being logged.
-exec > >(logger --tag udp-proof-bootstrap) 2>&1
+# Keep a console copy so a failed ephemeral boot remains diagnosable after its
+# delete-on-termination root volume disappears.
+exec > >(tee /dev/console | logger --tag udp-proof-bootstrap) 2>&1
 
 install -d -m 0700 /run/udp-proof
 install -d -m 0700 /var/lib/udp-proof
@@ -77,7 +79,6 @@ find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
   -exec sed -i 's|http://|https://|g' {} +
 retry_command apt-get -o Acquire::Retries=4 update -qq
 retry_command apt-get -o Acquire::Retries=4 install -y --no-install-recommends \
-  awscli \
   ca-certificates \
   curl \
   docker.io \
@@ -87,8 +88,24 @@ retry_command apt-get -o Acquire::Retries=4 install -y --no-install-recommends \
   jq \
   libcap2-bin \
   tar \
-  tcpdump
+  tcpdump \
+  unzip
 rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 no longer publishes an awscli package. Install the exact
+# checksum-pinned AWS CLI v2 archive instead of depending on the moving distro
+# package surface.
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --retry 4 --retry-all-errors --connect-timeout 10 --max-time 300 \
+  --output /run/udp-proof/awscliv2.zip \
+  '${aws_cli_archive_url}'
+echo '${aws_cli_archive_sha256}  /run/udp-proof/awscliv2.zip' | sha256sum --check --strict
+unzip -q /run/udp-proof/awscliv2.zip -d /run/udp-proof/awscli-installer
+/run/udp-proof/awscli-installer/aws/install \
+  --bin-dir /usr/local/bin \
+  --install-dir /opt/aws-cli
+rm -rf /run/udp-proof/awscliv2.zip /run/udp-proof/awscli-installer
+aws --version
 
 systemctl enable --now docker
 docker info >/dev/null

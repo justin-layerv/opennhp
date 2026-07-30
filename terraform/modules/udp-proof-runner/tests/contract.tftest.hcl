@@ -185,7 +185,13 @@ run "secure_ephemeral_runner_contract" {
       strcontains(base64decode(aws_launch_template.runner.user_data), "docker.io") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "iproute2") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "tcpdump") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "tee /dev/console | logger --tag udp-proof-bootstrap") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "retry_command apt-get -o Acquire::Retries=4 update") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "awscli-exe-linux-x86_64-2.36.11.zip") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "50fbb7a2f44a78eab4a210088040e8f0bc4b9937cac8043c2354269d58614df6") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "awscliv2.zip") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "sha256sum --check --strict") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "/aws/install") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "retry_command /opt/actions-runner/bin/installdependencies.sh") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "imds_token=\"$(retry_command curl") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "X-aws-ec2-metadata-token-ttl-seconds: 300") &&
