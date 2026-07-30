@@ -2992,3 +2992,53 @@ class DeployedRevisionContainmentTest(unittest.TestCase):
             )
         self.assertIn("repos/layervai/nhp/compare/", seen[0])
         self.assertIn("repos/layervai/qurl-service/compare/", seen[1])
+
+    def test_family_validator_accepts_mixed_revisions_against_trusted_heads(
+        self,
+    ) -> None:
+        github_evidence = {
+            "default_branches": {
+                "nhp": {"sha": self.TIP},
+                "qurl_service": {"sha": "5" * 40},
+            }
+        }
+        revisions = {
+            "nhp_cell0": "a" * 40,
+            "nhp_cell1": "b" * 40,
+            "nhp_hub": "c" * 40,
+            "qurl_service_authority": "d" * 40,
+            "qurl_service_cell0": "e" * 40,
+            "qurl_service_cell1": "f" * 40,
+        }
+        workloads = {
+            key: {"source_revision": revision}
+            for key, revision in revisions.items()
+        }
+
+        with mock.patch.object(
+            collector, "_require_revision_on_default_branch"
+        ) as require:
+            collector._validate_deployed_revision_families(
+                github_evidence,
+                workloads,
+            )
+
+        self.assertEqual(require.call_count, 6)
+        self.assertEqual(
+            require.call_args_list[0],
+            mock.call(
+                revisions["nhp_cell0"],
+                self.TIP,
+                "nhp_cell0",
+                repository_key="nhp",
+            ),
+        )
+        self.assertEqual(
+            require.call_args_list[-1],
+            mock.call(
+                revisions["qurl_service_cell1"],
+                "5" * 40,
+                "qurl_service_cell1",
+                repository_key="qurl_service",
+            ),
+        )

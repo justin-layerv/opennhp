@@ -4058,6 +4058,36 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+def _validate_deployed_revision_families(
+    github_evidence: dict[str, Any],
+    workloads: dict[str, Any],
+) -> None:
+    revision_families = {
+        "nhp": ("nhp_cell0", "nhp_cell1", "nhp_hub"),
+        "qurl_service": (
+            "qurl_service_authority",
+            "qurl_service_cell0",
+            "qurl_service_cell1",
+        ),
+    }
+    for repository_key, workload_keys in revision_families.items():
+        head = contract._sha(
+            github_evidence["default_branches"][repository_key]["sha"],
+            f"{repository_key} default branch head",
+        )
+        for workload_key in workload_keys:
+            revision = contract._sha(
+                workloads[workload_key]["source_revision"],
+                f"{workload_key} deployed source revision",
+            )
+            _require_revision_on_default_branch(
+                revision,
+                head,
+                workload_key,
+                repository_key=repository_key,
+            )
+
+
 def collect_aws_and_build_snapshot(
     *,
     github_evidence: dict[str, Any],
@@ -4150,51 +4180,27 @@ def collect_aws_and_build_snapshot(
     #
     # Containment is the property that actually matters and is stable: a fork
     # commit, an unmerged PR commit, or a rewritten history still fails closed.
-    # The manifest RECORDS every component's revision either way, so what was
+    # The provenance RECORDS every component's revision either way, so what was
     # deployed remains fully attributable -- the record is what makes it
     # provenance, not the coincidence that the numbers matched.
-    revision_families = {
-        "nhp": ("nhp_cell0", "nhp_cell1", "nhp_hub"),
-        "qurl_service": (
-            "qurl_service_authority",
-            "qurl_service_cell0",
-            "qurl_service_cell1",
-        ),
-    }
-    for repository_key, workload_keys in revision_families.items():
-        head = contract._sha(
-            github_evidence["default_branches"][repository_key]["sha"],
-            f"{repository_key} default branch head",
-        )
-        for workload_key in workload_keys:
-            revision = contract._sha(
-                workloads[workload_key]["source_revision"],
-                f"{workload_key} deployed source revision",
-            )
-            _require_revision_on_default_branch(
-                revision,
-                head,
-                workload_key,
-                repository_key=repository_key,
-            )
+    _validate_deployed_revision_families(github_evidence, workloads)
     repository_shas = {
         "frp": canary["frp_sha"],
-        "nhp": next(iter(nhp_revisions)),
         "qurl_connector": github_evidence["candidates"]["qurl_connector"]["head_sha"],
         "qurl_go": github_evidence["candidates"]["qurl_go"]["head_sha"],
         "qurl_reverse_tunnel_server": workloads["qurl_reverse_tunnel_server"][
             "source_revision"
         ],
-        "qurl_service": next(iter(qurl_service_revisions)),
         **{
             key: github_evidence["default_branches"][key]["sha"]
             for key in contract.DEFAULT_BRANCH_REPOSITORIES
         },
     }
-    for key in ("nhp", "qurl_reverse_tunnel_server", "qurl_service"):
-        _verify_commit(
-            contract.REPOSITORIES[key], repository_shas[key], f"deployed {key}"
-        )
+    _verify_commit(
+        contract.REPOSITORIES["qurl_reverse_tunnel_server"],
+        repository_shas["qurl_reverse_tunnel_server"],
+        "deployed qurl_reverse_tunnel_server",
+    )
     _verify_frp_tag(canary["frp_version"], canary["frp_sha"])
     for key in ("qurl_connector", "qurl_go"):
         candidate = github_evidence["candidates"][key]
@@ -4237,13 +4243,12 @@ def collect_aws_and_build_snapshot(
         "ref": f"refs/tags/{canary['frp_version']}",
         "sha": canary["frp_sha"],
     }
-    for key in ("nhp", "qurl_reverse_tunnel_server", "qurl_service"):
-        repository_evidence[key] = {
-            "repository": contract.REPOSITORIES[key],
-            "source": "deployed_runtime",
-            "ref": "deployed-runtime",
-            "sha": repository_shas[key],
-        }
+    repository_evidence["qurl_reverse_tunnel_server"] = {
+        "repository": contract.REPOSITORIES["qurl_reverse_tunnel_server"],
+        "source": "deployed_runtime",
+        "ref": "deployed-runtime",
+        "sha": repository_shas["qurl_reverse_tunnel_server"],
+    }
 
     manifest_cells = [
         {

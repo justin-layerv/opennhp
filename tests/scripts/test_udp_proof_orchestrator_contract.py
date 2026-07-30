@@ -419,6 +419,54 @@ class ProducerTest(unittest.TestCase):
             validation_time=VALIDATION_TIME,
         )
 
+    def test_authority_deployment_may_precede_qurl_service_main(self) -> None:
+        (
+            document,
+            manifest,
+            runtime,
+            provenance,
+            manifest_bytes,
+            runtime_bytes,
+            _,
+        ) = build_document()
+        authority_revision = "9" * 40
+        authority = provenance["evidence"]["workloads"]["qurl_service_authority"]
+        authority["source_revision"] = authority_revision
+        authority["source_evidence"]["revision_label"] = authority_revision
+        topology_row = document["rows"][
+            "orchestrator.real_hub_authority_and_two_cells"
+        ]
+        topology_row["authority"]["source_sha"] = authority_revision
+        topology_row["workload_observations_sha256"] = (
+            orchestrator._canonical_sha256(
+                provenance["evidence"]["workloads"],
+                "workload observations",
+            )
+        )
+        provenance_bytes = deployment.canonical_bytes(
+            provenance,
+            maximum=deployment.MAX_PROVENANCE_BYTES,
+            name="deployment-provenance.json",
+        )
+        document["bindings"]["deployment_provenance_sha256"] = hashlib.sha256(
+            provenance_bytes
+        ).hexdigest()
+
+        orchestrator.validate_orchestrator_evidence(
+            document,
+            manifest=manifest,
+            runtime=runtime,
+            provenance=provenance,
+            manifest_bytes=manifest_bytes,
+            runtime_bytes=runtime_bytes,
+            provenance_bytes=provenance_bytes,
+            proof_phase="pre_removal",
+            producer_run_id=RUN_ID,
+            producer_run_attempt=RUN_ATTEMPT,
+            producer_head_sha=HEAD_SHA,
+            validation_time=VALIDATION_TIME,
+        )
+
     def test_post_removal_rejects_a_still_present_legacy_surface(self) -> None:
         # The working tree still ships the fenced legacy relay admission lists,
         # so a post_removal document built from it must fail closed.

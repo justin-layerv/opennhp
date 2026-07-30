@@ -439,8 +439,7 @@ def _validate_topology_surface(
     ]
     if (
         _sha(authority["source_sha"], "orchestrator topology authority.source_sha")
-        != manifest["repositories"]["qurl_service"]
-        or authority["source_sha"] != authority_observation["source_revision"]
+        != authority_observation["source_revision"]
         or authority["image_digest"] != manifest["images"]["qurl_service_authority"]
         or authority["image_digest"] != authority_observation["image_digest"]
         or _bool(

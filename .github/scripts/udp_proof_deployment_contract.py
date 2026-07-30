@@ -128,12 +128,15 @@ REPOSITORIES = {
     "website": "layervai/website",
 }
 DEFAULT_BRANCH_REPOSITORIES = {
+    "nhp",
     "qurl_integrations",
     "qurl_mcp",
     "qurl_python",
+    "qurl_service",
     "qurl_typescript",
     "website",
 }
+MULTI_REVISION_REPOSITORIES = {"nhp", "qurl_service"}
 IMAGE_KEYS = {
     "nhp_cell0",
     "nhp_cell1",
@@ -1888,10 +1891,17 @@ def validate_provenance(
     workloads = _exact(evidence["workloads"], IMAGE_KEYS, "evidence workloads")
     for workload_key in sorted(IMAGE_KEYS):
         image_digest = manifest["images"][workload_key]
-        source_revision = manifest["repositories"][
-            WORKLOAD_REPOSITORY_KEYS[workload_key]
-        ]
         workload = workloads[workload_key]
+        repository_key = WORKLOAD_REPOSITORY_KEYS[workload_key]
+        if repository_key in MULTI_REVISION_REPOSITORIES:
+            if not isinstance(workload, dict):
+                raise ContractError(f"workload {workload_key} must be an object")
+            source_revision = _sha(
+                workload.get("source_revision"),
+                f"workloads.{workload_key}.source_revision",
+            )
+        else:
+            source_revision = manifest["repositories"][repository_key]
         expected_kind = WORKLOAD_KINDS[workload_key]
         if not isinstance(workload, dict) or workload.get("kind") != expected_kind:
             raise ContractError(

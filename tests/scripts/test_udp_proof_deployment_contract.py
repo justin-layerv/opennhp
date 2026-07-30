@@ -658,6 +658,24 @@ class ContractTest(unittest.TestCase):
                 ).encode("ascii"),
             )
 
+    def test_accepts_distinct_deployed_revisions_contained_in_main(self) -> None:
+        snapshot = valid_snapshot()
+        workloads = snapshot["provenance"]["evidence"]["workloads"]
+        nhp_hub_revision = "8" * 40
+        workloads["nhp_hub"]["source_revision"] = nhp_hub_revision
+        workloads["nhp_hub"]["source_evidence"][
+            "revision_label"
+        ] = nhp_hub_revision
+        authority_revision = "9" * 40
+        workloads["qurl_service_authority"][
+            "source_revision"
+        ] = authority_revision
+        workloads["qurl_service_authority"]["source_evidence"][
+            "revision_label"
+        ] = authority_revision
+
+        self.validate(snapshot)
+
     def test_rejects_unknown_influence_bearing_key(self) -> None:
         snapshot = valid_snapshot()
         snapshot["provenance"]["evidence"]["surprise"] = True
