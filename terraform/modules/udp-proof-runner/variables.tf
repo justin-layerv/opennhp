@@ -210,10 +210,11 @@ variable "proof_mailbox_domain" {
 
 variable "provisioned_cell_catalog_kms_key_arn" {
   description = <<-EOT
-    Exact CMK ARN encrypting the provisioned-cell catalog table
-    (`<name_prefix>-control-connector-authority`) the manifest producer reads.
+    Exact Control data CMK ARN encrypting the provisioned-cell catalog table
+    (`<name_prefix>-control-connector-authority`) the manifest producer reads
+    and the two proof-account tables the controller converges.
 
-    The table is SSE-KMS with a customer-managed key, so DynamoDB calls
+    These tables are SSE-KMS with a customer-managed key, so DynamoDB calls
     `kms:Decrypt` under the CALLER's identity: `dynamodb:GetItem` alone returns
     a KMS AccessDeniedException, not a DynamoDB one. Null keeps the decrypt
     absent (and the catalog read failing) rather than inventing a wildcard key.

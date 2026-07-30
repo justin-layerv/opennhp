@@ -273,7 +273,7 @@ resource "aws_iam_role_policy" "controller" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "CreateOneTimeJITConfiguration"
         Effect   = "Allow"
@@ -391,6 +391,20 @@ resource "aws_iam_role_policy" "controller" {
           }
         }
       },
+      ], var.provisioned_cell_catalog_kms_key_arn == null ? [] : [{
+        # The Control proof-account rows share the same customer-managed CMK
+        # as the provisioned-cell catalog. DynamoDB performs decrypt under the
+        # controller identity, so table permissions alone are insufficient.
+        Sid      = "DecryptOnlyProofAccountTables"
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = var.provisioned_cell_catalog_kms_key_arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+          }
+        }
+      }], [
       {
         Sid      = "DeleteRunBoundProofCredential"
         Effect   = "Allow"
@@ -604,7 +618,7 @@ resource "aws_iam_role_policy" "controller" {
           }
         }
       },
-    ]
+    ])
   })
 }
 

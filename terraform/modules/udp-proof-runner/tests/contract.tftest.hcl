@@ -408,6 +408,7 @@ run "secure_ephemeral_runner_contract" {
         "ReadBoundProofAccountCredentialDigest",
         "ConvergeExactProofCustomer",
         "ConvergeAndRemoveExactProofAccountKey",
+        "DecryptOnlyProofAccountTables",
         "DeleteRunBoundProofCredential",
         "CreateRunBoundProofCredential",
         "TagRunBoundProofCredential",
@@ -455,6 +456,9 @@ run "secure_ephemeral_runner_contract" {
       toset(({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Action) == toset(["dynamodb:GetItem", "dynamodb:PutItem"]) &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeExactProofCustomer"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [local.proof_account_owner_id] &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["ConvergeAndRemoveExactProofAccountKey"].Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"] == [var.proof_account_credential_sha256] &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Action == "kms:Decrypt" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Resource == var.provisioned_cell_catalog_kms_key_arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DecryptOnlyProofAccountTables"].Condition.StringEquals["kms:ViaService"] == "dynamodb.us-east-2.amazonaws.com" &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["CreateRunBoundProofCredential"].Condition.StringEquals["aws:RequestTag/Purpose"] == local.proof_account_jit_purpose &&
       ({ for statement in jsondecode(aws_iam_role_policy.controller.policy).Statement : statement.Sid => statement })["DeleteRunBoundProofCredential"].Resource == local.proof_account_jit_arn_pattern &&

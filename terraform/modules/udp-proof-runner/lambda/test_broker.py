@@ -77,6 +77,7 @@ class FakeEC2:
         self.describe_calls = []
         self.associate_calls = []
         self.terminated = []
+        self.wait_calls = []
 
     def get_paginator(self, name):
         assert name == "describe_instances"
@@ -94,6 +95,16 @@ class FakeEC2:
     def run_instances(self, **kwargs):
         self.run_calls.append(kwargs)
         return {"Instances": [{"InstanceId": "i-0123456789abcdef0"}]}
+
+    def get_waiter(self, name):
+        assert name == "instance_running"
+        client = self
+
+        class InstanceRunningWaiter:
+            def wait(self, **kwargs):
+                client.wait_calls.append(kwargs)
+
+        return InstanceRunningWaiter()
 
     def describe_addresses(self, AllocationIds):
         self.describe_address_ids = AllocationIds
@@ -388,6 +399,15 @@ class BrokerTest(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(
+            ec2.wait_calls,
+            [
+                {
+                    "InstanceIds": ["i-0123456789abcdef0"],
+                    "WaiterConfig": {"Delay": 2, "MaxAttempts": 10},
+                }
+            ],
+        )
 
         malformed = secret()
         malformed["Tags"] = tags()[:-1]
@@ -428,6 +448,27 @@ class BrokerTest(unittest.TestCase):
             new_broker(ec2, secrets).start(RUN_ID, RUN_ATTEMPT)
         self.assertEqual(len(ec2.run_calls), 1)
         self.assertEqual(ec2.terminated, [["i-0123456789abcdef0"]])
+
+    def test_start_leaves_pending_instance_for_bounded_same_run_retry(self):
+        name = PREFIX + RUN_ID + "/" + RUN_ATTEMPT
+
+        class SlowEC2(FakeEC2):
+            def get_waiter(self, name):
+                assert name == "instance_running"
+                client = self
+
+                class InstanceRunningWaiter:
+                    def wait(self, **kwargs):
+                        client.wait_calls.append(kwargs)
+                        raise RuntimeError("instance still pending")
+
+                return InstanceRunningWaiter()
+
+        ec2 = SlowEC2()
+        with self.assertRaisesRegex(RuntimeError, "instance still pending"):
+            new_broker(ec2, FakeSecrets({name: secret()})).start(RUN_ID, RUN_ATTEMPT)
+        self.assertEqual(ec2.terminated, [])
+        self.assertEqual(ec2.associate_calls, [])
 
     def test_start_rejects_ambiguous_launch_results(self):
         name = PREFIX + RUN_ID + "/" + RUN_ATTEMPT
@@ -483,6 +524,15 @@ class BrokerTest(unittest.TestCase):
                     "AllocationId": "eipalloc-0123456789abcdef0",
                     "InstanceId": existing["InstanceId"],
                     "AllowReassociation": False,
+                }
+            ],
+        )
+        self.assertEqual(
+            unattached_source.wait_calls,
+            [
+                {
+                    "InstanceIds": [existing["InstanceId"]],
+                    "WaiterConfig": {"Delay": 2, "MaxAttempts": 10},
                 }
             ],
         )

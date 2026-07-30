@@ -176,6 +176,16 @@ class Broker:
             AllowReassociation=False,
         )
 
+    def _wait_until_running(self, instance_id: str) -> None:
+        # EC2 can return RunInstances while the instance is still too early in
+        # pending for AssociateAddress. Keep each wait inside the Lambda's
+        # 30-second budget; the controller's bounded retries resume the same
+        # run-owned instance if it needs longer.
+        self.ec2.get_waiter("instance_running").wait(
+            InstanceIds=[instance_id],
+            WaiterConfig={"Delay": 2, "MaxAttempts": 10},
+        )
+
     def _validate_jit_secret(self, run_id: str, run_attempt: str) -> None:
         secret_name = self._secret_name(run_id, run_attempt)
         secret = self.secrets.describe_secret(SecretId=secret_name)
@@ -207,6 +217,13 @@ class Broker:
                 if not self._is_reusable_instance(instance):
                     self.ec2.terminate_instances(InstanceIds=[instance["InstanceId"]])
                     raise RuntimeError("same-run instance failed its reusable-runner contract")
+                try:
+                    source_instance_id = self._source_instance_id()
+                except Exception:
+                    self.ec2.terminate_instances(InstanceIds=[instance["InstanceId"]])
+                    raise
+                if source_instance_id != instance["InstanceId"]:
+                    self._wait_until_running(instance["InstanceId"])
                 try:
                     if self._source_instance_id() != instance["InstanceId"]:
                         self._attach_source_address(instance["InstanceId"])
@@ -252,6 +269,7 @@ class Broker:
                 self.ec2.terminate_instances(InstanceIds=returned_ids)
             raise RuntimeError("EC2 did not return exactly one runner instance")
         instance_id = instances[0]["InstanceId"]
+        self._wait_until_running(instance_id)
         try:
             self._attach_source_address(instance_id)
         except Exception:
