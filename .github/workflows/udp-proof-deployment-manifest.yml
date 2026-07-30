@@ -302,6 +302,7 @@ jobs:
 
       - name: Observe exact HTTP and relay retirement targets
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           PROOF_PHASE: ${{ inputs.proof_phase }}
         run: |
           set -euo pipefail

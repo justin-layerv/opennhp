@@ -125,6 +125,22 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         self.assertNotIn("aws ", step["run"])
         self.assertIn('[[ "${count}" = "4" && -z "${nonfiles}" ]]', self.raw)
 
+    def test_retirement_target_collector_receives_the_read_only_app_token(
+        self,
+    ) -> None:
+        steps = self.workflow["jobs"]["produce"]["steps"]
+        step = next(
+            step
+            for step in steps
+            if step.get("name") == "Observe exact HTTP and relay retirement targets"
+        )
+        self.assertEqual(set(step["env"]), {"GH_TOKEN", "PROOF_PHASE"})
+        self.assertEqual(
+            step["env"]["GH_TOKEN"],
+            "${{ steps.app.outputs.token }}",
+        )
+        self.assertIn("collect_udp_proof_retirement_targets.py", step["run"])
+
     def test_artifact_is_one_exact_three_file_handoff(self) -> None:
         steps = self.workflow["jobs"]["produce"]["steps"]
         uploads = [
