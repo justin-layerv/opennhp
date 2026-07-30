@@ -299,7 +299,7 @@ jobs:
       # Control state has BOTH the Connector Authority runtime contract bound
       # (Step 3) AND the runtime-slice functions enabled (Step 4). Regenerate the
       # same verified ephemeral tfvars that control-sandbox-update.yml plans with,
-      # including the runtime, Hub, proof mutation, and current blue-selected /
+      # including the runtime, Hub, proof mutation, and current green-selected /
       # green-prepared proof rollout, so this PR-time convergence plan reflects
       # the live-enabled slices instead of planning to destroy them. (Prod stays
       # dark: this workflow is sandbox-only, and the prod var validation forbids
@@ -322,7 +322,7 @@ jobs:
             --hub-worker-enabled \
             --proof-mutation-controls-enabled \
             --proof-policy-consumers-staged \
-            --proof-policy-selected-color blue \
+            --proof-policy-selected-color green \
             --proof-policy-prepared-color green
 
       - name: Terraform Control Init

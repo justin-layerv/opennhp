@@ -11552,10 +11552,11 @@ class WorkflowContractTests(unittest.TestCase):
         for flag in (
             "--proof-mutation-controls-enabled",
             "--proof-policy-consumers-staged",
-            "--proof-policy-selected-color blue",
+            "--proof-policy-selected-color green",
             "--proof-policy-prepared-color green",
         ):
             self.assertIn(flag, plan_workflow)
+        self.assertNotIn("--proof-policy-selected-color blue", plan_workflow)
         self.assertNotIn("--expected-action", plan_workflow)
         self.assertIn(
             "Fail closed on any unreviewed Control mutation",
