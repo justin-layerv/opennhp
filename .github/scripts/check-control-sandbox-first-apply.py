@@ -841,6 +841,10 @@ AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES = frozenset(
     for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
     for color in ("blue", "green")
 )
+AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES = frozenset(
+    f'module.control.data.aws_lambda_alias.authority_proof_policy_live["{AUTHORITY_PROOF_FUNCTION_NAME}:{color}"]'
+    for color in ("blue", "green")
+)
 AUTHORITY_PROOF_CONSUMER_BASE_UPDATE_ADDRESSES = frozenset(
     {
         "module.control.terraform_data.foundation_contract",
@@ -956,6 +960,23 @@ AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES = frozenset(
 )
 AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND = (
     "authority-proof-concurrency-recovery"
+)
+AUTHORITY_PROOF_PREPARE_RECOVERY_CONCURRENCY_ADDRESSES = frozenset(
+    "module.control.aws_lambda_provisioned_concurrency_config."
+    f'authority_proof_standby["{function_name}"]'
+    for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
+)
+AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS = (
+    "module.control.aws_iam_role.hub_task[0]"
+)
+AUTHORITY_PROOF_PREPARE_RECOVERY_DRIFT_ADDRESSES = frozenset(
+    {
+        AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+        *AUTHORITY_PROOF_PREPARE_RECOVERY_CONCURRENCY_ADDRESSES,
+    }
+)
+AUTHORITY_PROOF_PREPARE_RECOVERY_NORMALIZATION_KIND = (
+    "authority-proof-rollout-prepare-recovery"
 )
 # The historical live Hub predecessor sat at ONE of the two reviewed endpoints
 # of its original Authority image transition, and at no other basis:
@@ -3643,6 +3664,317 @@ def _authority_proof_rollout_transition(
     ):
         return "selector"
     return None
+
+
+def _is_exact_authority_proof_rollout_prepare_recovery(
+    actual_non_noop: dict[str, list[str]],
+    foundation_after: dict[str, Any],
+) -> bool:
+    """Admit only the observed, bounded retry after a partial prepare apply.
+
+    The foundation already records blue selected / green prepared. The three
+    failed consumer pools are tainted replacements, while ca-pm never entered
+    state and remains a create. Every function and green alias must move
+    together; any other address or action shape fails closed.
+    """
+    if _authority_proof_rollout_colors(foundation_after) != ("blue", "green"):
+        return False
+    expected: dict[str, list[str]] = {}
+    for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+        expected[
+            f'module.control.aws_lambda_function.authority["{function_name}"]'
+        ] = ["update"]
+        expected[
+            f'module.control.aws_lambda_alias.authority["{function_name}:green"]'
+        ] = ["update"]
+        expected[
+            "module.control.aws_lambda_provisioned_concurrency_config."
+            f'authority_proof_standby["{function_name}"]'
+        ] = (
+            ["create"]
+            if function_name == AUTHORITY_PROOF_FUNCTION_NAME
+            else ["delete", "create"]
+        )
+    return actual_non_noop == expected
+
+
+def _check_authority_proof_rollout_prepare_recovery(
+    by_address: dict[str, dict[str, Any]],
+    *,
+    refresh_disabled: bool,
+) -> None:
+    """Prove every field of the observed partial-prepare recovery.
+
+    Address/action matching alone is insufficient for an update: an alias could
+    add weighted routing, or a function could change its role/runtime envelope,
+    while retaining the same action class. Bind the three consumer functions
+    to exactly the two missing proof-policy variables, ca-pm to exactly its
+    prepared-color description marker, all four green aliases to version-only
+    movement, and all four standby pools to the observed taint recovery.
+    """
+    computed_fields = frozenset(
+        {"qualified_arn", "qualified_invoke_arn", "version"}
+    )
+    previous_versions = {
+        function_name: ("2" if function_name == AUTHORITY_PROOF_FUNCTION_NAME else "8")
+        for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
+    }
+
+    for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+        function_address = (
+            f'module.control.aws_lambda_function.authority["{function_name}"]'
+        )
+        item = by_address[function_address]
+        change = item.get("change")
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        before_sensitive = (
+            change.get("before_sensitive") if isinstance(change, dict) else None
+        )
+        expected_unknown = copy.deepcopy(before_sensitive)
+        if isinstance(expected_unknown, dict):
+            expected_unknown.update({field: True for field in computed_fields})
+        changed_fields = (
+            {
+                field
+                for field in set(before) | set(after)
+                if field not in before
+                or field not in after
+                or not _json_equal(before[field], after[field])
+            }
+            if isinstance(before, dict) and isinstance(after, dict)
+            else set()
+        )
+        expected_changed_fields = set(computed_fields)
+        expected_changed_fields.add(
+            "description"
+            if function_name == AUTHORITY_PROOF_FUNCTION_NAME
+            else "environment"
+        )
+        expected_identity = _authority_function_identity(function_name)
+        if (
+            item.get("mode") != "managed"
+            or item.get("type") != "aws_lambda_function"
+            or item.get("module_address") != "module.control"
+            or item.get("name") != "authority"
+            or item.get("index") != function_name
+            or item.get("deposed") is not None
+            or item.get("action_reason") is not None
+            or not isinstance(change, dict)
+            or set(change)
+            != {*_CHANGE_KEYS, "before_identity", "after_identity"}
+            or change.get("actions") != ["update"]
+            or not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or change.get("before_identity") != expected_identity
+            or change.get("after_identity") != expected_identity
+            or before.get("function_name") != function_name
+            or after.get("function_name") != function_name
+            or before.get("version") != previous_versions[function_name]
+            or any(field in after for field in computed_fields)
+            or changed_fields != expected_changed_fields
+            or change.get("after_unknown") != expected_unknown
+            or change.get("after_sensitive") != before_sensitive
+            or _has_unknown_value(before_sensitive)
+            or after.get("architectures") != ["x86_64"]
+            or after.get("memory_size") != 512
+            or after.get("timeout") != 10
+            or after.get("package_type") != "Image"
+            or after.get("publish") is not True
+            or after.get("region") != AWS_REGION
+            or after.get("role")
+            != f"arn:aws:iam::{ACCOUNT_ID}:role/{function_name}-exec"
+        ):
+            raise ContractError(
+                f"{function_address} is not the exact proof-prepare recovery update"
+            )
+
+        if function_name == AUTHORITY_PROOF_FUNCTION_NAME:
+            if (
+                before.get("description")
+                != "Connector Authority mutate_proof_agent (sandbox)"
+                or after.get("description")
+                != (
+                    "Connector Authority mutate_proof_agent "
+                    "(sandbox; proof-policy-prepared=green)"
+                )
+                or not _json_equal(before.get("environment"), after.get("environment"))
+            ):
+                raise ContractError(
+                    "ca-pm recovery may change only its prepared-color description"
+                )
+        else:
+            before_environment = before.get("environment")
+            after_environment = after.get("environment")
+            before_variables = (
+                before_environment[0].get("variables")
+                if isinstance(before_environment, list)
+                and len(before_environment) == 1
+                and isinstance(before_environment[0], dict)
+                else None
+            )
+            after_variables = (
+                after_environment[0].get("variables")
+                if isinstance(after_environment, list)
+                and len(after_environment) == 1
+                and isinstance(after_environment[0], dict)
+                else None
+            )
+            stripped_after = copy.deepcopy(after_variables)
+            if isinstance(stripped_after, dict):
+                directive_ttl = stripped_after.pop(
+                    "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL", None
+                )
+                minimum_lease = stripped_after.pop(
+                    "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS", None
+                )
+            else:
+                directive_ttl = None
+                minimum_lease = None
+            if (
+                not isinstance(before_variables, dict)
+                or stripped_after != before_variables
+                or directive_ttl != "5400"
+                or minimum_lease != "30"
+                or before.get("description") != after.get("description")
+            ):
+                raise ContractError(
+                    f"{function_name} recovery may add only the exact proof-policy "
+                    "TTL and minimum-lease variables"
+                )
+
+        alias_address = (
+            "module.control.aws_lambda_alias.authority"
+            f'["{function_name}:green"]'
+        )
+        alias_item = by_address[alias_address]
+        alias_change = alias_item.get("change")
+        alias_before = (
+            alias_change.get("before") if isinstance(alias_change, dict) else None
+        )
+        alias_after = (
+            alias_change.get("after") if isinstance(alias_change, dict) else None
+        )
+        alias_sensitive = (
+            alias_change.get("before_sensitive")
+            if isinstance(alias_change, dict)
+            else None
+        )
+        alias_expected_unknown = copy.deepcopy(alias_sensitive)
+        if isinstance(alias_expected_unknown, dict):
+            alias_expected_unknown["function_version"] = True
+        alias_changed_fields = (
+            {
+                field
+                for field in set(alias_before) | set(alias_after)
+                if field not in alias_before
+                or field not in alias_after
+                or not _json_equal(alias_before[field], alias_after[field])
+            }
+            if isinstance(alias_before, dict) and isinstance(alias_after, dict)
+            else set()
+        )
+        if (
+            alias_item.get("mode") != "managed"
+            or alias_item.get("type") != "aws_lambda_alias"
+            or alias_item.get("module_address") != "module.control"
+            or alias_item.get("name") != "authority"
+            or alias_item.get("index") != f"{function_name}:green"
+            or alias_item.get("deposed") is not None
+            or alias_item.get("action_reason") is not None
+            or not isinstance(alias_change, dict)
+            or set(alias_change) != _CHANGE_KEYS
+            or alias_change.get("actions") != ["update"]
+            or not isinstance(alias_before, dict)
+            or not isinstance(alias_after, dict)
+            or alias_before.get("function_name") != function_name
+            or alias_after.get("function_name") != function_name
+            or alias_before.get("name") != "green"
+            or alias_after.get("name") != "green"
+            or alias_before.get("description")
+            != "Closed green deployment qualifier"
+            or alias_after.get("description")
+            != "Closed green deployment qualifier"
+            or alias_before.get("routing_config") != []
+            or alias_after.get("routing_config") != []
+            or alias_before.get("function_version")
+            != previous_versions[function_name]
+            or "function_version" in alias_after
+            or alias_changed_fields != {"function_version"}
+            or alias_change.get("after_unknown") != alias_expected_unknown
+            or alias_change.get("after_sensitive") != alias_sensitive
+            or _has_unknown_value(alias_sensitive)
+        ):
+            raise ContractError(
+                f"{alias_address} may change only its green function version"
+            )
+
+        pool_address = (
+            "module.control.aws_lambda_provisioned_concurrency_config."
+            f'authority_proof_standby["{function_name}"]'
+        )
+        pool_item = by_address[pool_address]
+        pool_change = pool_item.get("change")
+        pool_before = (
+            pool_change.get("before") if isinstance(pool_change, dict) else None
+        )
+        pool_after = (
+            pool_change.get("after") if isinstance(pool_change, dict) else None
+        )
+        expected_pool_after = {
+            "function_name": function_name,
+            "provisioned_concurrent_executions": (
+                1 if function_name == AUTHORITY_PROOF_FUNCTION_NAME else 2
+            ),
+            "qualifier": "green",
+            "region": AWS_REGION,
+            "skip_destroy": False,
+            "timeouts": None,
+        }
+        if not isinstance(pool_change, dict):
+            pool_exact = False
+        elif function_name == AUTHORITY_PROOF_FUNCTION_NAME:
+            pool_exact = (
+                pool_item.get("action_reason") is None
+                and pool_change.get("actions") == ["create"]
+                and pool_before is None
+                and pool_after == expected_pool_after
+                and pool_change.get("after_unknown") == {"id": True}
+                and pool_change.get("before_sensitive") is False
+                and pool_change.get("after_sensitive") == {}
+            )
+        else:
+            pool_exact = (
+                pool_item.get("action_reason") == "replace_because_tainted"
+                and pool_change.get("actions") == ["delete", "create"]
+                and pool_before
+                == {
+                    **expected_pool_after,
+                    "id": f"{function_name},green",
+                    "provisioned_concurrent_executions": (
+                        2 if refresh_disabled else 0
+                    ),
+                }
+                and pool_after == expected_pool_after
+                and pool_change.get("after_unknown") == {"id": True}
+                and pool_change.get("before_sensitive") == {}
+                and pool_change.get("after_sensitive") == {}
+            )
+        if (
+            pool_item.get("mode") != "managed"
+            or pool_item.get("type")
+            != "aws_lambda_provisioned_concurrency_config"
+            or pool_item.get("module_address") != "module.control"
+            or pool_item.get("name") != "authority_proof_standby"
+            or pool_item.get("index") != function_name
+            or pool_item.get("deposed") is not None
+            or not isinstance(pool_change, dict)
+            or set(pool_change) != _CHANGE_KEYS
+            or not pool_exact
+        ):
+            raise ContractError(
+                f"{pool_address} is not the exact green standby recovery"
+            )
 
 
 def _hub_authority_alias_arns(rollout: bool) -> set[str]:
@@ -6466,6 +6798,14 @@ def _check_authority_runtime_resources(
             raise ContractError(f"{fn} must be Image-packaged")
         if function_after.get("image_uri") != image_uri:
             raise ContractError(f"{fn} image_uri must be the contract-pinned repository@digest")
+        expected_description = (
+            "Connector Authority mutate_proof_agent "
+            f"(sandbox; proof-policy-prepared={rollout_colors[1]})"
+            if proof_rollout and fn == AUTHORITY_PROOF_FUNCTION_NAME
+            else f"Connector Authority {_operation} (sandbox)"
+        )
+        if function_after.get("description") != expected_description:
+            raise ContractError(f"{fn} immutable rollout description drifted")
         proof_rollout_function = fn in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
         expected_reserved = spec.get(
             "rollout_reserved_concurrency"
@@ -6591,7 +6931,7 @@ def _check_authority_runtime_resources(
                         "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
                         "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
                     }
-                    if fn == AUTHORITY_PROOF_FUNCTION_NAME
+                    if fn != AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME
                     else {}
                 ),
             }
@@ -8579,6 +8919,214 @@ def _check_authority_proof_concurrency_recovery_drift(
             )
 
 
+def _expected_hub_task_inline_policy(*, rollout: bool) -> dict[str, Any]:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "lambda:InvokeFunction",
+                "Effect": "Allow",
+                "Resource": sorted(_hub_authority_alias_arns(rollout)),
+                "Sid": "AuthorityInvoke",
+            },
+            {
+                "Action": "cloudwatch:PutMetricData",
+                "Condition": {
+                    "StringEquals": {"cloudwatch:namespace": "LayerV/NHP"}
+                },
+                "Effect": "Allow",
+                "Resource": "*",
+                "Sid": "PublishHubMetrics",
+            },
+        ],
+    }
+
+
+def _check_authority_proof_prepare_recovery_drift(
+    drift: list[dict[str, Any]],
+    by_address: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Prove the exact four-entry drift left by the failed green prepare.
+
+    Three tainted IA/RA/ICR standby pools changed from configured two to live
+    zero. The Hub role's provider projection caught up with the separately
+    managed inline policy that the partial apply already expanded from blue to
+    both colors. Nothing here changes configuration; the recovery plan remains
+    the separately validated 12-address function/alias/pool repair.
+    """
+    by_drift = {
+        item.get("address"): item
+        for item in drift
+        if isinstance(item.get("address"), str)
+    }
+    if (
+        len(by_drift) != len(drift)
+        or set(by_drift) != set(AUTHORITY_PROOF_PREPARE_RECOVERY_DRIFT_ADDRESSES)
+    ):
+        raise _unexpected_drift_error(drift)
+
+    concurrency_value_keys = {
+        "function_name",
+        "id",
+        "provisioned_concurrent_executions",
+        "qualifier",
+        "region",
+        "skip_destroy",
+        "timeouts",
+    }
+    for address in AUTHORITY_PROOF_PREPARE_RECOVERY_CONCURRENCY_ADDRESSES:
+        item = by_drift[address]
+        function_name = address.rsplit('["', 1)[1][:-2]
+        change = item.get("change")
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if (
+            item.get("mode") != "managed"
+            or item.get("module_address") != "module.control"
+            or item.get("name") != "authority_proof_standby"
+            or item.get("provider_name")
+            != "registry.terraform.io/hashicorp/aws"
+            or item.get("type")
+            != "aws_lambda_provisioned_concurrency_config"
+            or item.get("index") != function_name
+            or item.get("deposed") is not None
+            or not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["update"]
+            or not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or set(before) != concurrency_value_keys
+            or set(after) != concurrency_value_keys
+            or before.get("function_name") != function_name
+            or after.get("function_name") != function_name
+            or before.get("id") != f"{function_name},green"
+            or after.get("id") != f"{function_name},green"
+            or before.get("provisioned_concurrent_executions") != 2
+            or after.get("provisioned_concurrent_executions") != 0
+            or before.get("qualifier") != "green"
+            or after.get("qualifier") != "green"
+            or before.get("region") != AWS_REGION
+            or after.get("region") != AWS_REGION
+            or before.get("skip_destroy") is not False
+            or after.get("skip_destroy") is not False
+            or before.get("timeouts") is not None
+            or after.get("timeouts") is not None
+            or change.get("after_unknown") != {}
+            or change.get("before_sensitive") != {}
+            or change.get("after_sensitive") != {}
+        ):
+            raise ContractError(
+                f"{address} is not the exact failed green concurrency drift"
+            )
+        if by_address is not None:
+            planned = by_address.get(address, {}).get("change", {})
+            if planned.get("actions") != ["delete", "create"]:
+                raise ContractError(
+                    f"{address} drift requires its exact tainted replacement"
+                )
+
+    role_address = AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+    role_item = by_drift[role_address]
+    role_change = role_item.get("change")
+    role_before = (
+        role_change.get("before") if isinstance(role_change, dict) else None
+    )
+    role_after = (
+        role_change.get("after") if isinstance(role_change, dict) else None
+    )
+    role_value_keys = {
+        "arn",
+        "assume_role_policy",
+        "create_date",
+        "description",
+        "force_detach_policies",
+        "id",
+        "inline_policy",
+        "managed_policy_arns",
+        "max_session_duration",
+        "name",
+        "name_prefix",
+        "path",
+        "permissions_boundary",
+        "tags",
+        "tags_all",
+        "unique_id",
+    }
+    expected_sensitive = {
+        "inline_policy": [{}],
+        "managed_policy_arns": [],
+        "tags": {},
+        "tags_all": {},
+    }
+    if (
+        role_item.get("mode") != "managed"
+        or role_item.get("module_address") != "module.control"
+        or role_item.get("name") != "hub_task"
+        or role_item.get("provider_name")
+        != "registry.terraform.io/hashicorp/aws"
+        or role_item.get("type") != "aws_iam_role"
+        or role_item.get("index") != 0
+        or role_item.get("deposed") is not None
+        or not isinstance(role_change, dict)
+        or set(role_change) != _CHANGE_KEYS
+        or role_change.get("actions") != ["update"]
+        or not isinstance(role_before, dict)
+        or not isinstance(role_after, dict)
+        or set(role_before) != role_value_keys
+        or set(role_after) != role_value_keys
+        or role_change.get("after_unknown") != {}
+        or role_change.get("before_sensitive") != expected_sensitive
+        or role_change.get("after_sensitive") != expected_sensitive
+        or {
+            key: value
+            for key, value in role_before.items()
+            if key != "inline_policy"
+        }
+        != {
+            key: value
+            for key, value in role_after.items()
+            if key != "inline_policy"
+        }
+        or not isinstance(role_before.get("inline_policy"), list)
+        or len(role_before["inline_policy"]) != 1
+        or not isinstance(role_after.get("inline_policy"), list)
+        or len(role_after["inline_policy"]) != 1
+        or role_before["inline_policy"][0].get("name") != "hub-task"
+        or role_after["inline_policy"][0].get("name") != "hub-task"
+        or _decode_exact_json(
+            role_before["inline_policy"][0].get("policy"),
+            "policy",
+            role_address,
+        )
+        != _expected_hub_task_inline_policy(rollout=False)
+        or _decode_exact_json(
+            role_after["inline_policy"][0].get("policy"),
+            "policy",
+            role_address,
+        )
+        != _expected_hub_task_inline_policy(rollout=True)
+    ):
+        raise ContractError(
+            "Hub task role drift is not the exact blue-to-both-colors "
+            "inline-policy projection"
+        )
+    if by_address is not None:
+        planned_role = by_address.get(role_address, {}).get("change", {})
+        policy_address = "module.control.aws_iam_role_policy.hub_task[0]"
+        planned_policy = by_address.get(policy_address, {}).get("change", {})
+        if (
+            planned_role.get("actions") != ["no-op"]
+            or planned_role.get("before") != role_after
+            or planned_role.get("after") != role_after
+            or planned_policy.get("actions") != ["no-op"]
+            or planned_policy.get("after", {}).get("policy")
+            != role_after["inline_policy"][0]["policy"]
+        ):
+            raise ContractError(
+                "Hub task role projection must match the exact no-op managed policy"
+            )
+
+
 def _require_normalization_plan_mode(
     normalization_drift_kind: str, plan_mode: str, plan: dict[str, Any]
 ) -> None:
@@ -8649,6 +9197,13 @@ def _check_state_normalization_drift(
     # reviewed-kind matcher below sees exactly that. Rejection diagnostics
     # therefore name only the entries that actually carry a signal.
     addresses = tuple(item.get("address") for item in drift)
+    if (
+        all(isinstance(address, str) for address in addresses)
+        and set(addresses)
+        == set(AUTHORITY_PROOF_PREPARE_RECOVERY_DRIFT_ADDRESSES)
+    ):
+        _check_authority_proof_prepare_recovery_drift(drift, by_address)
+        return AUTHORITY_PROOF_PREPARE_RECOVERY_NORMALIZATION_KIND
     if (
         all(isinstance(address, str) for address in addresses)
         and set(addresses)
@@ -10508,9 +11063,6 @@ def check_plan(
     base_inventory = set(EXPECTED_RESOURCES) - catalog_extra
     runtime_extra = set(AUTHORITY_RUNTIME_RESOURCES)
     proof_extra = set(AUTHORITY_PROOF_RESOURCES)
-    proof_consumer_data_extra = set(
-        AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES
-    )
     proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     hub_worker_extra = set(HUB_WORKER_RESOURCES)
@@ -10710,7 +11262,7 @@ def check_plan(
     )
     rollout_prepare_alias_changes = {
         f'module.control.aws_lambda_alias.authority["{function_name}:{rollout_prepared_color}"]'
-        for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
+        for function_name in AUTHORITY_PROOF_ROLLOUT_FUNCTIONS
     }
     rollout_initial_changes = {
         authority_contract_address,
@@ -10754,6 +11306,13 @@ def check_plan(
                 else ["update"]
             )
             for address in changed
+        )
+    )
+    authority_proof_rollout_prepare_recovery = (
+        proof_rollout_mode
+        and _is_exact_authority_proof_rollout_prepare_recovery(
+            actual_non_noop,
+            foundation_change.get("after", {}),
         )
     )
     authority_proof_rollout_selector_transition = (
@@ -11391,13 +11950,22 @@ def check_plan(
     elif authority_proof_consumer_disable_transition:
         plan_mode = "authority-proof-consumers-disable"
         _check_authority_proof_consumer_transition(by_address, enabling=False)
-    elif authority_proof_rollout_prepare_transition:
+    elif (
+        authority_proof_rollout_prepare_transition
+        or authority_proof_rollout_prepare_recovery
+    ):
         plan_mode = "authority-proof-rollout-prepare"
-        _require_create_shapes(
-            set(AUTHORITY_PROOF_ROLLOUT_RESOURCES) & changed,
-            by_address,
-            "proof rollout standby pools must be new",
-        )
+        if authority_proof_rollout_prepare_transition:
+            _require_create_shapes(
+                set(AUTHORITY_PROOF_ROLLOUT_RESOURCES) & changed,
+                by_address,
+                "proof rollout standby pools must be new",
+            )
+        else:
+            _check_authority_proof_rollout_prepare_recovery(
+                by_address,
+                refresh_disabled=refresh_disabled,
+            )
         if HUB_WORKER_SERVICE_ADDRESS in changed:
             _check_hub_service_task_revision_update(
                 by_address, require_planned_target=True
@@ -11704,6 +12272,15 @@ def check_plan(
             "proof concurrency recovery drift may accompany only the exact "
             "Authority image recovery transition"
         )
+    if (
+        normalization_drift_kind
+        == AUTHORITY_PROOF_PREPARE_RECOVERY_NORMALIZATION_KIND
+        and plan_mode != "authority-proof-rollout-prepare"
+    ):
+        raise ContractError(
+            "proof prepare recovery drift may accompany only the exact "
+            "Authority proof rollout recovery transition"
+        )
 
     expected_applyable = plan_mode != "no-op" or (
         normalization_drift_count > 0 and "resource_changes" not in plan
@@ -11749,6 +12326,9 @@ def check_state_list(path: Path) -> dict[str, int]:
     proof_consumer_data_extra = set(
         AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES
     )
+    proof_rollout_data_extra = set(
+        AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES
+    )
     proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
@@ -11761,6 +12341,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     runtime_present = bool(addresses & runtime_extra)
     proof_present = bool(addresses & proof_extra)
     proof_alias_reads_present = bool(addresses & proof_consumer_data_extra)
+    proof_rollout_alias_reads_present = bool(addresses & proof_rollout_data_extra)
     proof_rollout_present = bool(addresses & proof_rollout_extra)
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
@@ -11773,6 +12354,10 @@ def check_state_list(path: Path) -> dict[str, int]:
         raise ContractError(
             "proof-policy consumer staging requires the complete runtime and "
             "attended-proof slices in state"
+        )
+    if proof_rollout_alias_reads_present and not proof_rollout_present:
+        raise ContractError(
+            "proof-policy mutation alias reads require the complete rollout state"
         )
     if proof_rollout_present and not (
         runtime_present and proof_present and hub_worker_present
@@ -11793,6 +12378,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         | (proof_extra if proof_present else set())
         | (proof_rollout_extra if proof_rollout_present else set())
         | (proof_consumer_data_extra if proof_present else set())
+        | (proof_rollout_data_extra if proof_rollout_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -11808,6 +12394,11 @@ def check_state_list(path: Path) -> dict[str, int]:
             + (
                 len(AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES)
                 if proof_present
+                else 0
+            )
+            + (
+                len(AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES)
+                if proof_rollout_present
                 else 0
             )
             + (len(HUB_WORKER_DATA_RESOURCES) if hub_worker_present else 0)
@@ -12047,6 +12638,57 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
             "normalization_drift_count": len(drift),
             "normalization_drift_kind": (
                 AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
+            ),
+            "normalization_drift_sha256": _normalization_drift_sha256(drift),
+        }
+    prepare_recovery_addresses = [item.get("address") for item in substantive]
+    if (
+        all(isinstance(address, str) for address in prepare_recovery_addresses)
+        and set(prepare_recovery_addresses)
+        == set(AUTHORITY_PROOF_PREPARE_RECOVERY_DRIFT_ADDRESSES)
+    ):
+        _check_authority_proof_prepare_recovery_drift(substantive)
+        if (
+            not isinstance(prior_state, dict)
+            or prior_state.get("format_version") != "1.0"
+            or prior_state.get("terraform_version") != TF_VERSION
+        ):
+            raise ContractError(
+                f"normalization observation requires exact Terraform "
+                f"{TF_VERSION} state JSON"
+            )
+        state_values = prior_state.get("values")
+        root = (
+            state_values.get("root_module")
+            if isinstance(state_values, dict)
+            else None
+        )
+        for item in substantive:
+            address = item["address"]
+            matches = [
+                resource
+                for resource in _iter_resources(root)
+                if resource.get("mode") == "managed"
+                and resource.get("address") == address
+            ]
+            expected_type = (
+                "aws_iam_role"
+                if address == AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+                else "aws_lambda_provisioned_concurrency_config"
+            )
+            if (
+                len(matches) != 1
+                or matches[0].get("type") != expected_type
+                or matches[0].get("values") != item["change"]["before"]
+            ):
+                raise ContractError(
+                    "proof prepare recovery drift does not match captured "
+                    f"state for {address}"
+                )
+        return {
+            "normalization_drift_count": len(drift),
+            "normalization_drift_kind": (
+                AUTHORITY_PROOF_PREPARE_RECOVERY_NORMALIZATION_KIND
             ),
             "normalization_drift_sha256": _normalization_drift_sha256(drift),
         }

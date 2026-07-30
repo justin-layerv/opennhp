@@ -282,6 +282,170 @@ printf '%s\n' "$proof_pc_plan" \
   >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
+# The one exact failed proof-policy prepare recovery may replace the three
+# inactive green IA/RA/ICR allocations. Its complete 12-change envelope keeps
+# this from becoming a general provisioned-concurrency replacement exception.
+proof_prepare_recovery_plan="$(
+  jq -n '
+    def change($address; $type; $actions; $before; $after; $after_unknown):
+      {
+        address: $address,
+        type: $type,
+        mode: "managed",
+        change: {
+          actions: $actions,
+          before: $before,
+          after: $after,
+          after_unknown: $after_unknown
+        }
+      };
+    def pc_replace($name):
+      change(
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-\($name)\"]";
+        "aws_lambda_provisioned_concurrency_config";
+        ["delete", "create"];
+        {
+          function_name: "layerv-nhp-sandbox-ca-\($name)",
+          id: "layerv-nhp-sandbox-ca-\($name),green",
+          provisioned_concurrent_executions: 0,
+          qualifier: "green",
+          region: "us-east-2",
+          skip_destroy: false,
+          timeouts: null
+        };
+        {
+          function_name: "layerv-nhp-sandbox-ca-\($name)",
+          provisioned_concurrent_executions: 2,
+          qualifier: "green",
+          region: "us-east-2",
+          skip_destroy: false,
+          timeouts: null
+        };
+        {id: true}
+      ) + {action_reason: "replace_because_tainted"};
+    def pm_create:
+      change(
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-pm\"]";
+        "aws_lambda_provisioned_concurrency_config";
+        ["create"];
+        null;
+        {
+          function_name: "layerv-nhp-sandbox-ca-pm",
+          provisioned_concurrent_executions: 1,
+          qualifier: "green",
+          region: "us-east-2",
+          skip_destroy: false,
+          timeouts: null
+        };
+        {id: true}
+      );
+
+    {
+      resource_changes: (
+        (
+          ["ia", "icr", "pm", "ra"]
+          | map(
+              change(
+                "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-\(.):green\"]";
+                "aws_lambda_alias";
+                ["update"];
+                {};
+                {};
+                {}
+              )
+            )
+        )
+        + (
+          ["ia", "icr", "pm", "ra"]
+          | map(
+              change(
+                "module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-\(.)\"]";
+                "aws_lambda_function";
+                ["update"];
+                {};
+                {};
+                {}
+              )
+            )
+        )
+        + (["ia", "icr", "ra"] | map(pc_replace(.)))
+        + [pm_create]
+      ),
+      resource_drift: []
+    }
+  '
+)"
+printf '%s\n' "$proof_prepare_recovery_plan" >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# The PR configuration gate plans with -refresh=false, so its exact tainted
+# replacements read the configured state value 2 rather than the live failed
+# value 0. Both complete envelopes are reviewed; a mixed basis is not.
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby")) | select(.change.actions == ["delete", "create"]) | .change.before.provisioned_concurrent_executions) = 2' \
+  >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .change.before.provisioned_concurrent_executions) = 2' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '.resource_changes |= reverse' \
+  >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '.resource_changes += [{"address":"module.control.aws_iam_role.unchanged","type":"aws_iam_role","mode":"managed","change":{"actions":["no-op"],"before":{},"after":{},"after_unknown":{}}}]' \
+  >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '.resource_changes += [{"address":"module.control.aws_iam_role.smuggled","type":"aws_iam_role","mode":"managed","change":{"actions":["update"],"before":{},"after":{},"after_unknown":{}}}]' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq 'del(.resource_changes[] | select(.address == "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-pm:green\"]"))' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .change.after.provisioned_concurrent_executions) = 3' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .change.before.id) = "wrong,green"' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .change.before.extra) = true' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .action_reason) = null' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '(.resource_changes[] | select(.address | contains("authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]")) | .mode) = "data"' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '.resource_drift = [{"address":"aws_vpc.smuggled","type":"aws_vpc","mode":"managed","change":{"actions":["delete"],"before":{},"after":null}}]' \
+  >"$plan_json"
+expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' "$proof_prepare_recovery_plan" \
+  | jq '.resource_drift = {}' \
+  >"$plan_json"
+expect_failure 'resource_drift must be an array when present' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
 # A PURE delete of an authority function (not a replace) is still destructive.
 printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["delete"],"after":null}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"

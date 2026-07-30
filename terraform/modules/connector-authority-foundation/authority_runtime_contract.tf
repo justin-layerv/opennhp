@@ -673,7 +673,7 @@ locals {
     !local.authority_proof_policy_rollout_active ||
     var.authority_proof_policy_selected_color != var.authority_proof_policy_prepared_color ||
     alltrue([
-      for function_name in keys(local.authority_proof_policy_consumer_functions) :
+      for function_name in keys(local.authority_proof_policy_rollout_functions) :
       data.aws_lambda_alias.authority_proof_policy_live[
         "${function_name}:${var.authority_proof_policy_selected_color}"
       ].function_version == aws_lambda_function.authority[function_name].version

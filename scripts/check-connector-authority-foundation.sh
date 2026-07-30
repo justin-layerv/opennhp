@@ -112,6 +112,14 @@ if [[ -n "$plan_json" ]]; then
     echo "ERROR: Connector Authority plan JSON must contain a resource_changes array or non-empty resource_drift array" >&2
     exit 1
   fi
+  if ! jq -e '
+    (has("resource_drift") | not)
+    or .resource_drift == null
+    or (.resource_drift | type) == "array"
+  ' "$plan_json" >/dev/null; then
+    echo "ERROR: Connector Authority plan JSON resource_drift must be an array when present" >&2
+    exit 1
+  fi
 
   # Four exact replacement classes are intentional:
   #
@@ -173,9 +181,155 @@ if [[ -n "$plan_json" ]]; then
     hub_worker_image_update_allowed=true
   fi
 
+  # A failed proof-policy prepare leaves only the inactive green IA/RA/ICR
+  # concurrency allocations tainted. Admit their replacements only when the
+  # entire plan is the exact reviewed recovery: four function updates, four
+  # green-alias updates, those three 0 -> 2 replacements, and the missing PM
+  # green allocation. The Python convergence checker independently proves the
+  # full runtime and prior-state contract; this fence prevents any destructive
+  # action from borrowing that recovery lane before it gets there.
+  authority_proof_prepare_recovery_allowed=false
+  if jq -e '
+    def meaningful:
+      .change.actions != ["no-op"]
+      and .change.actions != ["read"];
+    def change_key:
+      "\(.address)|\(.type)|\(.mode // "null")|\(.deposed // "null")|\(.change.actions | join(","))";
+    def exact_replacement($function_name; $before_count):
+      .type == "aws_lambda_provisioned_concurrency_config"
+      and .mode == "managed"
+      and (.deposed // null) == null
+      and .action_reason == "replace_because_tainted"
+      and .change.actions == ["delete", "create"]
+      and .change.before == {
+        function_name: $function_name,
+        id: ($function_name + ",green"),
+        provisioned_concurrent_executions: $before_count,
+        qualifier: "green",
+        region: "us-east-2",
+        skip_destroy: false,
+        timeouts: null
+      }
+      and .change.after == {
+        function_name: $function_name,
+        provisioned_concurrent_executions: 2,
+        qualifier: "green",
+        region: "us-east-2",
+        skip_destroy: false,
+        timeouts: null
+      }
+      and .change.after_unknown == {id: true};
+    def exact_pm_create:
+      .type == "aws_lambda_provisioned_concurrency_config"
+      and .mode == "managed"
+      and (.deposed // null) == null
+      and (.action_reason // null) == null
+      and .change.actions == ["create"]
+      and .change.before == null
+      and .change.after == {
+        function_name: "layerv-nhp-sandbox-ca-pm",
+        provisioned_concurrent_executions: 1,
+        qualifier: "green",
+        region: "us-east-2",
+        skip_destroy: false,
+        timeouts: null
+      }
+      and .change.after_unknown == {id: true};
+
+    (
+      [
+        .resource_changes[]?
+        | select(meaningful)
+        | change_key
+      ] | sort
+    ) == ([
+      "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-ia:green\"]|aws_lambda_alias|managed|null|update",
+      "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-icr:green\"]|aws_lambda_alias|managed|null|update",
+      "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-pm:green\"]|aws_lambda_alias|managed|null|update",
+      "module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-ra:green\"]|aws_lambda_alias|managed|null|update",
+      "module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]|aws_lambda_function|managed|null|update",
+      "module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-icr\"]|aws_lambda_function|managed|null|update",
+      "module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-pm\"]|aws_lambda_function|managed|null|update",
+      "module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ra\"]|aws_lambda_function|managed|null|update",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]|aws_lambda_provisioned_concurrency_config|managed|null|delete,create",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-icr\"]|aws_lambda_provisioned_concurrency_config|managed|null|delete,create",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-pm\"]|aws_lambda_provisioned_concurrency_config|managed|null|create",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]|aws_lambda_provisioned_concurrency_config|managed|null|delete,create"
+    ] | sort)
+    and (
+      [
+        .resource_drift[]?
+        | select(.change.actions | index("delete"))
+      ] | length
+    ) == 0
+    and (
+      [
+        .resource_changes[]?
+        | select(
+            (
+              .address
+                == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]"
+              and exact_replacement(
+                "layerv-nhp-sandbox-ca-ia";
+                .change.before.provisioned_concurrent_executions
+              )
+            )
+            or (
+              .address
+                == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-icr\"]"
+              and exact_replacement(
+                "layerv-nhp-sandbox-ca-icr";
+                .change.before.provisioned_concurrent_executions
+              )
+            )
+            or (
+              .address
+                == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]"
+              and exact_replacement(
+                "layerv-nhp-sandbox-ca-ra";
+                .change.before.provisioned_concurrent_executions
+              )
+            )
+          )
+      ] | length
+    ) == 3
+    and (
+      (
+        [
+          .resource_changes[]?
+          | select(
+              .address
+                | startswith(
+                    "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby["
+                  )
+            )
+          | select(.change.actions == ["delete", "create"])
+          | .change.before.provisioned_concurrent_executions
+        ] | unique
+      ) as $before_counts
+      | (
+        ($before_counts == [0] or $before_counts == [2])
+        and (
+          [
+            .resource_changes[]?
+            | select(
+                .address
+                  == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-pm\"]"
+              )
+            | select(exact_pm_create)
+          ] | length
+        ) == 1
+      )
+    )
+  ' "$plan_json" >/dev/null; then
+    authority_proof_prepare_recovery_allowed=true
+  fi
+
   destructive_resources="$(jq -r \
     --argjson hub_worker_image_update_allowed \
-      "$hub_worker_image_update_allowed" '
+      "$hub_worker_image_update_allowed" \
+    --argjson authority_proof_prepare_recovery_allowed \
+      "$authority_proof_prepare_recovery_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -232,6 +386,20 @@ if [[ -n "$plan_json" ]]; then
               == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pm\"]"
             or .address
               == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pcr\"]"
+          )
+          and .type == "aws_lambda_provisioned_concurrency_config"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete", "create"]
+        ) or (
+          $authority_proof_prepare_recovery_allowed
+          and (
+            .address
+              == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]"
+            or .address
+              == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-icr\"]"
+            or .address
+              == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]"
           )
           and .type == "aws_lambda_provisioned_concurrency_config"
           and .mode == "managed"

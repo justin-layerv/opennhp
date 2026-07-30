@@ -81,6 +81,12 @@ override_resource {
 }
 
 override_resource {
+  target          = aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"]
+  override_during = plan
+  values          = { version = "7" }
+}
+
+override_resource {
   target          = aws_kms_key.qat1_signing
   override_during = plan
   values = {
@@ -908,8 +914,10 @@ run "selected_consumers_read_but_cannot_write_proof_policy" {
         for key, value in aws_lambda_function.authority[function_name].environment[0].variables :
         key => value if startswith(key, "CONNECTOR_AUTHORITY_PROOF_")
         } == {
-        CONNECTOR_AUTHORITY_PROOF_OWNER_ID        = "layerv-nhp-sandbox-udp-proof"
-        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX = "qurl-go-sandbox-"
+        CONNECTOR_AUTHORITY_PROOF_OWNER_ID          = "layerv-nhp-sandbox-udp-proof"
+        CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX   = "qurl-go-sandbox-"
+        CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = "5400"
+        CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = "30"
       }
     ])
     error_message = "The selected IA/RA/ICR versions must receive exactly the proof-policy contract."
@@ -1011,12 +1019,21 @@ run "proof_rollout_prepares_green_without_moving_blue_selector" {
         "layerv-nhp-sandbox-ca-ia",
         "layerv-nhp-sandbox-ca-ra",
         "layerv-nhp-sandbox-ca-icr",
+        "layerv-nhp-sandbox-ca-pm",
         ] : (
         aws_lambda_alias.authority["${function_name}:blue"].function_version == "6" &&
         aws_lambda_alias.authority["${function_name}:green"].function_version == "7"
       )
     ])
-    error_message = "Preparation may retarget only the inactive green consumer aliases."
+    error_message = "Preparation may retarget only the inactive green rollout aliases."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"].description ==
+      "Connector Authority mutate_proof_agent (sandbox; proof-policy-prepared=green)"
+    )
+    error_message = "Preparation must publish a distinct ca-pm version for the prepared color."
   }
 
   assert {
@@ -1060,4 +1077,41 @@ run "proof_rollout_promotes_green_without_moving_recovery_selector" {
     )
     error_message = "Promotion may move only the provisioned proof-mutation selector; recovery remains on the contract-selected provisioned alias."
   }
+}
+
+run "proof_selector_rejects_a_stale_pm_alias_after_consumers_are_ready" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_proof_policy_consumers_staged = true
+    authority_proof_policy_selected_color   = "green"
+    authority_proof_policy_prepared_color   = "green"
+    hub_edge_enabled                        = true
+    hub_worker_enabled                      = true
+    hub_public_udp_ingress_cidrs            = ["198.51.100.42/32"]
+  }
+
+  override_data {
+    target          = data.aws_lambda_alias.authority_proof_policy_live["layerv-nhp-sandbox-ca-ia:green"]
+    override_during = plan
+    values          = { function_version = "7" }
+  }
+
+  override_data {
+    target          = data.aws_lambda_alias.authority_proof_policy_live["layerv-nhp-sandbox-ca-ra:green"]
+    override_during = plan
+    values          = { function_version = "7" }
+  }
+
+  override_data {
+    target          = data.aws_lambda_alias.authority_proof_policy_live["layerv-nhp-sandbox-ca-icr:green"]
+    override_during = plan
+    values          = { function_version = "7" }
+  }
+
+  # ca-pm intentionally remains on the provider default version 6 while its
+  # staged function is version 7. The selector fence must include PM, not only
+  # the three Hub consumers.
+  expect_failures = [terraform_data.foundation_contract]
 }

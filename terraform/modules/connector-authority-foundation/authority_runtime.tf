@@ -77,6 +77,18 @@ locals {
   authority_proof_policy_rollout_function_names = toset(
     keys(local.authority_proof_policy_rollout_functions)
   )
+  # Consumer aliases are pinned as soon as their proof-aware versions are
+  # staged. During a rollout, pin ca-pm as well: its selected alias must remain
+  # on the live version while the prepared alias receives a distinct published
+  # version and its own provisioned pool.
+  authority_proof_policy_pinned_functions = merge(
+    local.authority_proof_policy_consumer_functions,
+    local.authority_proof_policy_rollout_active ? {
+      for function_name, fn in local.authority_runtime_functions :
+      function_name => fn
+      if fn.operation == "mutate_proof_agent"
+    } : {},
+  )
   authority_proof_policy_rollout_alias_arns = local.authority_proof_policy_rollout_active ? {
     for function_name, fn in local.authority_proof_policy_rollout_functions :
     function_name => {
@@ -159,6 +171,13 @@ locals {
     keys(local.authority_contract_proof_operation_suffixes),
     var.authority_proof_policy_consumers_staged ? local.authority_proof_policy_consumer_operations : [],
   ))
+  # The shared qurl-service proof-policy reader constructor validates the
+  # directive TTL and minimum lease even for IA/RA/ICR, while ca-pcr has a
+  # separate owner/prefix-only recovery identity contract.
+  authority_proof_policy_operations = [
+    for operation in local.authority_proof_operations : operation
+    if operation != "prepare_proof_credential_recovery"
+  ]
 
   # The uniquely tagged ephemeral agent namespace the control may address. It
   # matches the attended proof harness's generated identity
@@ -770,7 +789,7 @@ locals {
         CONNECTOR_AUTHORITY_PROOF_OWNER_ID        = var.authority_proof_mutation_owner_id
         CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX = local.authority_proof_agent_id_prefix
       } : {},
-      fn.operation == "mutate_proof_agent" ? {
+      contains(local.authority_proof_policy_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL     = tostring(local.authority_proof_directive_ttl_seconds)
         CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS = tostring(local.authority_proof_minimum_lease_seconds)
       } : {},
@@ -973,10 +992,20 @@ resource "aws_lambda_function" "authority" {
   for_each = local.authority_runtime_functions
 
   function_name = each.key
-  description   = "Connector Authority ${each.value.operation} (${var.environment})"
-  role          = aws_iam_role.authority_exec[each.key].arn
-  package_type  = "Image"
-  image_uri     = local.authority_runtime_image_uri
+  # ca-pm has no runtime-config delta when IA/RA/ICR become proof-aware. Bind
+  # its immutable description to the prepared color so publish=true creates a
+  # distinct version for the inactive alias and AWS can provision both colors
+  # concurrently. Selector-only changes keep the prepared color unchanged and
+  # therefore do not publish another version.
+  description = (
+    local.authority_proof_policy_rollout_active &&
+    each.value.operation == "mutate_proof_agent"
+    ? "Connector Authority ${each.value.operation} (${var.environment}; proof-policy-prepared=${var.authority_proof_policy_prepared_color})"
+    : "Connector Authority ${each.value.operation} (${var.environment})"
+  )
+  role         = aws_iam_role.authority_exec[each.key].arn
+  package_type = "Image"
+  image_uri    = local.authority_runtime_image_uri
 
   # FLAG (POST-STEP-3 VERIFY): must match the published qurl-connector-authority
   # image architecture (docker/Dockerfile.connector-authority-lambda in
@@ -1036,7 +1065,7 @@ data "aws_lambda_alias" "authority_proof_policy_live" {
   for_each = var.authority_proof_mutation_controls_enabled ? {
     for key, alias in local.authority_runtime_aliases :
     key => alias
-    if contains(keys(local.authority_proof_policy_consumer_functions), alias.function_name)
+    if contains(keys(local.authority_proof_policy_pinned_functions), alias.function_name)
   } : {}
 
   function_name = each.value.function_name
@@ -1051,7 +1080,7 @@ resource "aws_lambda_alias" "authority" {
   function_name = aws_lambda_function.authority[each.value.function_name].function_name
   function_version = (
     var.authority_proof_mutation_controls_enabled &&
-    contains(keys(local.authority_proof_policy_consumer_functions), each.value.function_name)
+    contains(keys(local.authority_proof_policy_pinned_functions), each.value.function_name)
     ? (
       local.authority_proof_policy_rollout_active &&
       each.value.color == var.authority_proof_policy_prepared_color

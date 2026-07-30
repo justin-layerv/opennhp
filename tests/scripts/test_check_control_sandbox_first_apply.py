@@ -226,6 +226,313 @@ class AuthorityProofRolloutTransitionTests(unittest.TestCase):
             CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES,
         )
 
+    def test_partial_prepare_recovery_is_exact_and_includes_pm(self):
+        actions = {}
+        for function_name in CHECKER.AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+            actions[
+                f'module.control.aws_lambda_function.authority["{function_name}"]'
+            ] = ["update"]
+            actions[
+                f'module.control.aws_lambda_alias.authority["{function_name}:green"]'
+            ] = ["update"]
+            actions[
+                "module.control.aws_lambda_provisioned_concurrency_config."
+                f'authority_proof_standby["{function_name}"]'
+            ] = (
+                ["create"]
+                if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+                else ["delete", "create"]
+            )
+
+        self.assertEqual(len(actions), 12)
+        self.assertTrue(
+            CHECKER._is_exact_authority_proof_rollout_prepare_recovery(
+                actions,
+                self.foundation("blue", "green"),
+            )
+        )
+        self.assertIn(
+            (
+                "module.control.aws_lambda_alias.authority"
+                f'["{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"]'
+            ),
+            actions,
+        )
+
+        for label, mutate in {
+            "missing": lambda candidate: candidate.pop(next(iter(candidate))),
+            "extra": lambda candidate: candidate.update(
+                {'module.control.aws_lambda_function.authority["foreign"]': ["update"]}
+            ),
+            "wrong action": lambda candidate: candidate.update(
+                {
+                    "module.control.aws_lambda_provisioned_concurrency_config."
+                    f'authority_proof_standby["{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}"]': [
+                        "delete",
+                        "create",
+                    ]
+                }
+            ),
+        }.items():
+            with self.subTest(label=label):
+                malformed = copy.deepcopy(actions)
+                mutate(malformed)
+                self.assertFalse(
+                    CHECKER._is_exact_authority_proof_rollout_prepare_recovery(
+                        malformed,
+                        self.foundation("blue", "green"),
+                    )
+                )
+
+        self.assertFalse(
+            CHECKER._is_exact_authority_proof_rollout_prepare_recovery(
+                actions,
+                self.foundation("green", "green"),
+            )
+        )
+
+    @staticmethod
+    def partial_prepare_recovery_resources():
+        resources = {}
+        descriptions = {
+            function_name: (
+                f"Connector Authority {operation} (sandbox)"
+            )
+            for function_name, operation in (
+                CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF.items()
+            )
+        }
+        base_proof_variables = {
+            "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": CHECKER.AUTHORITY_PROOF_OWNER_ID,
+            "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
+        }
+        added_proof_variables = {
+            "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
+            "CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS": "30",
+        }
+        for function_name in CHECKER.AUTHORITY_PROOF_ROLLOUT_FUNCTIONS:
+            previous_version = (
+                "2"
+                if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+                else "8"
+            )
+            before_variables = dict(base_proof_variables)
+            if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME:
+                before_variables.update(added_proof_variables)
+            before = {
+                "function_name": function_name,
+                "description": descriptions[function_name],
+                "environment": [{"variables": before_variables}],
+                "architectures": ["x86_64"],
+                "memory_size": 512,
+                "timeout": 10,
+                "package_type": "Image",
+                "publish": True,
+                "region": CHECKER.AWS_REGION,
+                "role": (
+                    f"arn:aws:iam::{CHECKER.ACCOUNT_ID}:role/{function_name}-exec"
+                ),
+                "qualified_arn": f"qualified:{function_name}:{previous_version}",
+                "qualified_invoke_arn": (
+                    f"qualified-invoke:{function_name}:{previous_version}"
+                ),
+                "version": previous_version,
+            }
+            after = copy.deepcopy(before)
+            for field in ("qualified_arn", "qualified_invoke_arn", "version"):
+                after.pop(field)
+            if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME:
+                after["description"] = (
+                    "Connector Authority mutate_proof_agent "
+                    "(sandbox; proof-policy-prepared=green)"
+                )
+            else:
+                after["environment"][0]["variables"].update(added_proof_variables)
+            function_address = (
+                f'module.control.aws_lambda_function.authority["{function_name}"]'
+            )
+            resources[function_address] = {
+                "address": function_address,
+                "mode": "managed",
+                "module_address": "module.control",
+                "name": "authority",
+                "type": "aws_lambda_function",
+                "index": function_name,
+                "change": {
+                    "actions": ["update"],
+                    "before": before,
+                    "after": after,
+                    "after_unknown": {
+                        "qualified_arn": True,
+                        "qualified_invoke_arn": True,
+                        "version": True,
+                    },
+                    "before_sensitive": {},
+                    "after_sensitive": {},
+                    "before_identity": CHECKER._authority_function_identity(
+                        function_name
+                    ),
+                    "after_identity": CHECKER._authority_function_identity(
+                        function_name
+                    ),
+                },
+            }
+
+            alias_address = (
+                "module.control.aws_lambda_alias.authority"
+                f'["{function_name}:green"]'
+            )
+            alias_before = {
+                "function_name": function_name,
+                "function_version": previous_version,
+                "name": "green",
+                "description": "Closed green deployment qualifier",
+                "routing_config": [],
+            }
+            alias_after = copy.deepcopy(alias_before)
+            alias_after.pop("function_version")
+            resources[alias_address] = {
+                "address": alias_address,
+                "mode": "managed",
+                "module_address": "module.control",
+                "name": "authority",
+                "type": "aws_lambda_alias",
+                "index": f"{function_name}:green",
+                "change": {
+                    "actions": ["update"],
+                    "before": alias_before,
+                    "after": alias_after,
+                    "after_unknown": {"function_version": True},
+                    "before_sensitive": {},
+                    "after_sensitive": {},
+                },
+            }
+
+            pool_address = (
+                "module.control.aws_lambda_provisioned_concurrency_config."
+                f'authority_proof_standby["{function_name}"]'
+            )
+            pool_after = {
+                "function_name": function_name,
+                "provisioned_concurrent_executions": (
+                    1
+                    if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+                    else 2
+                ),
+                "qualifier": "green",
+                "region": CHECKER.AWS_REGION,
+                "skip_destroy": False,
+                "timeouts": None,
+            }
+            is_pm = function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME
+            resources[pool_address] = {
+                "address": pool_address,
+                "mode": "managed",
+                "module_address": "module.control",
+                "name": "authority_proof_standby",
+                "type": "aws_lambda_provisioned_concurrency_config",
+                "index": function_name,
+                **({} if is_pm else {"action_reason": "replace_because_tainted"}),
+                "change": {
+                    "actions": ["create"] if is_pm else ["delete", "create"],
+                    "before": (
+                        None
+                        if is_pm
+                        else {
+                            **pool_after,
+                            "id": f"{function_name},green",
+                            "provisioned_concurrent_executions": 0,
+                        }
+                    ),
+                    "after": pool_after,
+                    "after_unknown": {"id": True},
+                    "before_sensitive": False if is_pm else {},
+                    "after_sensitive": {},
+                },
+            }
+        return resources
+
+    def test_partial_prepare_recovery_rejects_field_level_bypasses(self):
+        exact = self.partial_prepare_recovery_resources()
+        CHECKER._check_authority_proof_rollout_prepare_recovery(
+            exact,
+            refresh_disabled=False,
+        )
+        refresh_disabled = copy.deepcopy(exact)
+        for function_name in CHECKER.AUTHORITY_PROOF_CONSUMER_FUNCTIONS:
+            address = (
+                "module.control.aws_lambda_provisioned_concurrency_config."
+                f'authority_proof_standby["{function_name}"]'
+            )
+            refresh_disabled[address]["change"]["before"][
+                "provisioned_concurrent_executions"
+            ] = 2
+        CHECKER._check_authority_proof_rollout_prepare_recovery(
+            refresh_disabled,
+            refresh_disabled=True,
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_proof_rollout_prepare_recovery(
+                refresh_disabled,
+                refresh_disabled=False,
+            )
+
+        ia_function = (
+            'module.control.aws_lambda_function.authority["'
+            'layerv-nhp-sandbox-ca-ia"]'
+        )
+        ia_alias = (
+            'module.control.aws_lambda_alias.authority["'
+            'layerv-nhp-sandbox-ca-ia:green"]'
+        )
+        ia_pool = (
+            "module.control.aws_lambda_provisioned_concurrency_config."
+            'authority_proof_standby["layerv-nhp-sandbox-ca-ia"]'
+        )
+        mutations = {
+            "weighted alias routing": (
+                ia_alias,
+                ("change", "after", "routing_config"),
+                [{"additional_version_weights": {"6": 0.5}}],
+            ),
+            "foreign function role": (
+                ia_function,
+                ("change", "after", "role"),
+                f"arn:aws:iam::{CHECKER.ACCOUNT_ID}:role/foreign",
+            ),
+            "widened timeout": (
+                ia_function,
+                ("change", "after", "timeout"),
+                900,
+            ),
+            "changed architecture": (
+                ia_function,
+                ("change", "after", "architectures"),
+                ["arm64"],
+            ),
+            "fabricated pool before-state": (
+                ia_pool,
+                (
+                    "change",
+                    "before",
+                    "provisioned_concurrent_executions",
+                ),
+                99,
+            ),
+        }
+        for label, (address, path, value) in mutations.items():
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(exact)
+                target = candidate[address]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_authority_proof_rollout_prepare_recovery(
+                        candidate,
+                        refresh_disabled=False,
+                    )
+
 
 def applied_provisioned_cell_item(cell_id: str) -> str:
     """Render a catalog row the way a refreshed read renders it.
@@ -1798,6 +2105,10 @@ def _runtime_resource_changes() -> list[dict]:
                 "change": _runtime_create(
                     {
                         "function_name": fn,
+                        "description": (
+                            "Connector Authority "
+                            f"{CHECKER.AUTHORITY_RUNTIME_FUNCTIONS[fn]} (sandbox)"
+                        ),
                         "package_type": "Image",
                         "image_uri": image_uri,
                         "reserved_concurrent_executions": spec[
@@ -1994,7 +2305,7 @@ def _proof_environment(function_name: str = CHECKER.AUTHORITY_PROOF_FUNCTION_NAM
         "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": CHECKER.AUTHORITY_PROOF_OWNER_ID,
         "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
     }
-    if function_name == CHECKER.AUTHORITY_PROOF_FUNCTION_NAME:
+    if function_name != CHECKER.AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME:
         environment.update(
             {
                 "CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL": "5400",
@@ -2070,6 +2381,11 @@ def _proof_resource_changes(payload: dict) -> list[dict]:
                     "change": _runtime_create(
                         {
                             "function_name": fn,
+                            "description": (
+                                "Connector Authority "
+                                f"{CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF[fn]} "
+                                "(sandbox)"
+                            ),
                             "package_type": "Image",
                             "image_uri": payload["authority_image_uri"],
                             "reserved_concurrent_executions": spec[
@@ -11233,6 +11549,13 @@ class WorkflowContractTests(unittest.TestCase):
             "control.tfplan.json --refresh-disabled",
             plan_workflow,
         )
+        for flag in (
+            "--proof-mutation-controls-enabled",
+            "--proof-policy-consumers-staged",
+            "--proof-policy-selected-color blue",
+            "--proof-policy-prepared-color green",
+        ):
+            self.assertIn(flag, plan_workflow)
         self.assertNotIn("--expected-action", plan_workflow)
         self.assertIn(
             "Fail closed on any unreviewed Control mutation",

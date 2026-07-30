@@ -211,7 +211,7 @@ resource "terraform_data" "foundation_contract" {
 
     precondition {
       condition     = local.authority_proof_policy_selected_alias_ready
-      error_message = "A selector apply may not retarget its selected alias; when selected equals prepared, every selected IA/RA/ICR alias must already point at the staged published version."
+      error_message = "A selector apply may not retarget its selected alias; when selected equals prepared, every selected IA/RA/ICR + ca-pm alias must already point at the staged published version."
     }
 
     precondition {
