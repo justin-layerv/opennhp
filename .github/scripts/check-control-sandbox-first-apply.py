@@ -10533,6 +10533,8 @@ def check_plan(
         expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if proof_inventory_mode:
         expected_resources.update(AUTHORITY_PROOF_RESOURCES)
+    if proof_rollout_mode:
+        expected_resources.update(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     if hub_edge_mode:
         expected_resources.update(HUB_EDGE_RESOURCES)
     if hub_worker_mode:

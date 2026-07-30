@@ -35,6 +35,9 @@ HUB_ARTIFACT_TF_PATH = (
 PUBLISHER_TF_PATH = (
     ROOT / "terraform/modules/connector-authority-foundation/publisher.tf"
 )
+HUB_WORKER_TF_PATH = (
+    ROOT / "terraform/modules/connector-authority-foundation/hub_worker.tf"
+)
 CONTROL_README_PATH = ROOT / "terraform/control/README.md"
 HUB_ROLLOUT_LEDGER_PATH = (
     ROOT
@@ -142,6 +145,25 @@ class AuthorityProofRolloutTransitionTests(unittest.TestCase):
                 CHECKER.AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME: "blue",
             },
         )
+
+    def test_plan_tracks_rollout_resources_and_service_revision(self):
+        checker_source = CHECKER_PATH.read_text()
+        self.assertRegex(
+            checker_source,
+            re.compile(
+                r"if proof_rollout_mode:\s+"
+                r"expected_resources\.update"
+                r"\(AUTHORITY_PROOF_ROLLOUT_RESOURCES\)"
+            ),
+        )
+
+        hub_worker_source = HUB_WORKER_TF_PATH.read_text()
+        service = hub_worker_source.split(
+            'resource "aws_ecs_service" "hub" {', 1
+        )[1]
+        lifecycle = service.split("lifecycle {", 1)[1].split("}", 1)[0]
+        self.assertRegex(lifecycle, r"ignore_changes\s*=\s*\[desired_count\]")
+        self.assertNotIn("task_definition", lifecycle)
 
 
 def applied_provisioned_cell_item(cell_id: str) -> str:

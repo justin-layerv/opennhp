@@ -506,13 +506,14 @@ resource "aws_ecs_task_definition" "hub" {
   }
 }
 
-# Fargate service fronting the 5a NLB target group. desired_count and
-# task_definition are co-owned with the deploy pipeline (rolling updates), so
-# both are ignored after create. The circuit breaker rolls back a failed
-# deployment automatically. It waits on the retry-safe keygen transaction (the
-# secret must hold real key material and its exact public identity must be
-# published before a task starts) and on the 5a listener (the target group must
-# be wired to a listener before registration).
+# Fargate service fronting the 5a NLB target group. desired_count remains
+# deploy-pipeline-owned, while Terraform owns task_definition so an attended
+# proof-policy selector change actually rolls the live Hub tasks to the selected
+# revision. The circuit breaker rolls back a failed deployment automatically.
+# It waits on the retry-safe keygen transaction (the secret must hold real key
+# material and its exact public identity must be published before a task starts)
+# and on the 5a listener (the target group must be wired to a listener before
+# registration).
 resource "aws_ecs_service" "hub" {
   count = local.hub_worker_count
 
@@ -549,7 +550,7 @@ resource "aws_ecs_service" "hub" {
   }
 
   lifecycle {
-    ignore_changes = [desired_count, task_definition]
+    ignore_changes = [desired_count]
   }
 
   depends_on = [
