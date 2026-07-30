@@ -370,7 +370,12 @@ def context_lookups_relay_ssm_policy() -> str:
                     "Action": "ssm:SendCommand",
                     "Resource": f"arn:aws:ec2:us-east-2:{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:instance/*",
                     "Condition": {
-                        "StringEquals": {"ssm:resourceTag/Environment": "sandbox"}
+                        "StringEquals": {
+                            "ssm:resourceTag/Environment": [
+                                "sandbox",
+                                "sandbox-cell1",
+                            ]
+                        }
                     },
                 },
                 {
@@ -6864,14 +6869,22 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         iam["change"]["after"]["policy"] = json.dumps(policy)
         self.assert_violation(plan, "commercial AWS-owned AWS-RunShellScript")
 
-    def test_ssm_instance_grant_requires_exact_sandbox_tag(self) -> None:
+    def test_ssm_instance_grant_accepts_only_sandbox_cells(self) -> None:
         plan = clean_plan()
         iam = resource(plan, ".aws_iam_role_policy.context_lookups_relay_ssm[0]")
         policy = json.loads(iam["change"]["after"]["policy"])
         statement = statement_by_sid(policy, "SSMHealthCheckSandboxInstances")
-        statement["Condition"]["StringEquals"]["ssm:resourceTag/Environment"] = "prod"
+        environments = statement["Condition"]["StringEquals"][
+            "ssm:resourceTag/Environment"
+        ]
+        self.assertEqual(["sandbox", "sandbox-cell1"], environments)
+        self.assertEqual([], checker.validate_plan(plan))
+
+        environments.append("prod")
         iam["change"]["after"]["policy"] = json.dumps(policy)
-        self.assert_violation(plan, "require Environment=sandbox")
+        self.assert_violation(
+            plan, "require exactly Environment=sandbox or sandbox-cell1"
+        )
 
     def test_ssm_instance_grant_cannot_cross_accounts(self) -> None:
         plan = clean_plan()

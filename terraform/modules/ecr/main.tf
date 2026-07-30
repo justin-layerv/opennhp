@@ -1323,15 +1323,20 @@ resource "aws_iam_role_policy" "context_lookups_relay_ssm" {
       },
       {
         # Environment is the strongest tag shared by every existing sandbox
-        # Run Command target (server, AC, relay, and smoke-test hosts). A
-        # relay-only Component/Service condition would break those probes.
+        # Run Command target (server, AC, relay, and smoke-test hosts). The
+        # shared deploy role also drives the provisioned cell1 server fleet,
+        # whose environment tag is "sandbox-cell1". A relay-only
+        # Component/Service condition would break those probes.
         Sid      = "SSMHealthCheckSandboxInstances"
         Effect   = "Allow"
         Action   = "ssm:SendCommand"
         Resource = "arn:aws:ec2:${local.region}:${local.account_id}:instance/*"
         Condition = {
           StringEquals = {
-            "ssm:resourceTag/Environment" = var.environment
+            "ssm:resourceTag/Environment" = [
+              "sandbox",
+              "sandbox-cell1",
+            ]
           }
         }
       },

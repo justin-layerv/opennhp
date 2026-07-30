@@ -2092,9 +2092,13 @@ def check_context_lookups_ssm_policy(
             "Effect": "Allow",
             "Action": "ssm:SendCommand",
             "Resource": f"arn:aws:ec2:{EXPECTED_SANDBOX_REGION}:{EXPECTED_SANDBOX_ACCOUNT_ID}:instance/*",
-            "Condition": {"StringEquals": {"ssm:resourceTag/Environment": "sandbox"}},
+            "Condition": {
+                "StringEquals": {
+                    "ssm:resourceTag/Environment": ["sandbox", "sandbox-cell1"]
+                }
+            },
         },
-        "SSM SendCommand instance access must be same-account and require Environment=sandbox",
+        "SSM SendCommand instance access must be same-account and require exactly Environment=sandbox or sandbox-cell1",
     )
     v.require(
         by_sid.get("SSMHealthCheckInvocation")
@@ -3316,11 +3320,10 @@ def validate_plan(
     )
     v.require(
         {
-            "var.environment",
             "local.region",
             "local.account_id",
         }.issubset(expression_refs(relay_ssm_config, "policy")),
-        "relay-only SSM policy must retain environment tag, region, and account references",
+        "relay-only SSM policy must retain region and account references",
     )
     networking_call = (
         (parent_module.get("module_calls") or {}).get("networking")
