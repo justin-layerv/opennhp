@@ -1569,11 +1569,12 @@ jobs:
       # reconnect to the new servers. Verify every newly-active server
       # instance has AC peers connected before downstream consumers
       # (smoke tests, build-and-push validation) start.
-      # Condition: deploy_server — the AC restart runs whenever servers
-      # are deployed (it handles both server-only and server+AC deploys),
-      # so the knock-ready check must also run in both cases.
+      # Require this after every server switch in a topology with an AC fleet,
+      # including a server-only deploy such as cell0. AC-less transport-canary
+      # cells cannot satisfy an AC-peer gate; using the prepared topology output
+      # makes a future provisioned cell inherit the gate when it adds ACs.
       - name: "[Server] Verify Post-Switch Knock Readiness"
-        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
+        if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.ac_active_asg != '' && inputs.dry_run != true
         env:
           NEW_ACTIVE_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
           # Regression-detection budget — traffic is already live here.
