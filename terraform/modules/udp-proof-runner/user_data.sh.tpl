@@ -107,6 +107,19 @@ unzip -q /run/udp-proof/awscliv2.zip -d /run/udp-proof/awscli-installer
 rm -rf /run/udp-proof/awscliv2.zip /run/udp-proof/awscli-installer
 aws --version
 
+# GitHub CLI. The proof workflows shell out to `gh` to authenticate the
+# controller run and download the deployment-producer artifact; Ubuntu 24.04
+# ships no gh package, so pin the exact release archive by checksum.
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --retry 4 --retry-all-errors --connect-timeout 10 --max-time 300 \
+  --output /run/udp-proof/gh.tar.gz \
+  '${gh_cli_archive_url}'
+echo '${gh_cli_archive_sha256}  /run/udp-proof/gh.tar.gz' | sha256sum --check --strict
+tar -xzf /run/udp-proof/gh.tar.gz -C /run/udp-proof
+install -m 0755 /run/udp-proof/${gh_cli_archive_root}/bin/gh /usr/local/bin/gh
+rm -rf /run/udp-proof/gh.tar.gz /run/udp-proof/${gh_cli_archive_root}
+gh --version
+
 systemctl enable --now docker
 docker info >/dev/null
 tc -Version >/dev/null

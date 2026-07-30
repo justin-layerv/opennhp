@@ -25,6 +25,14 @@ locals {
   aws_cli_archive_url    = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.36.11.zip"
   aws_cli_archive_sha256 = "50fbb7a2f44a78eab4a210088040e8f0bc4b9937cac8043c2354269d58614df6"
 
+  # The proof workflows call `gh` to authenticate the controller run and read the
+  # deployment-producer artifact, and Ubuntu 24.04 does not ship it. Pin the
+  # exact release archive by checksum for the same reason the AWS CLI is pinned
+  # above: the runner must not depend on a moving distro or upstream surface.
+  gh_cli_archive_url    = "https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_linux_amd64.tar.gz"
+  gh_cli_archive_sha256 = "a5cf6cdb40fc67751adf561126b3314044779cea81ba4f254fbe8e9a69f1676f"
+  gh_cli_archive_root   = "gh_2.83.0_linux_amd64"
+
   ec2_arn_prefix                       = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:"
   jit_secret_prefix                    = "${var.name_prefix}/udp-proof/jit/"
   jit_secret_arn_pattern               = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${local.jit_secret_prefix}*"
@@ -208,6 +216,9 @@ resource "aws_launch_template" "runner" {
   instance_initiated_shutdown_behavior = "terminate"
   user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
     aws_cli_archive_sha256 = local.aws_cli_archive_sha256
+    gh_cli_archive_url     = local.gh_cli_archive_url
+    gh_cli_archive_sha256  = local.gh_cli_archive_sha256
+    gh_cli_archive_root    = local.gh_cli_archive_root
     aws_cli_archive_url    = local.aws_cli_archive_url
     aws_region             = data.aws_region.current.region
     jit_secret_prefix      = local.jit_secret_prefix
