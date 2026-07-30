@@ -6608,6 +6608,86 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assert_rejected(output)
 
+    def test_proof_policy_consumer_pins_read_and_deny_set_operators(
+        self,
+    ) -> None:
+        operation = "issue_assignment"
+        fn = next(
+            function_name
+            for function_name, function_operation in (
+                CHECKER.AUTHORITY_RUNTIME_FUNCTIONS.items()
+            )
+            if function_operation == operation
+        )
+        table_resources = sorted(
+            CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+        )
+        policy = json.loads(runtime_exec_policy(fn, operation))
+        policy["Statement"].extend(
+            [
+                {
+                    "Sid": "ProofPolicyRead",
+                    "Effect": "Allow",
+                    "Action": ["dynamodb:GetItem"],
+                    "Resource": table_resources,
+                    "Condition": {
+                        "ForAllValues:StringEquals": {
+                            "dynamodb:LeadingKeys": ["PROOF"],
+                        },
+                        "Null": {"dynamodb:LeadingKeys": "false"},
+                    },
+                },
+                {
+                    "Sid": "DenyProofPolicyWrite",
+                    "Effect": "Deny",
+                    "Action": [
+                        "dynamodb:DeleteItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                    ],
+                    "Resource": table_resources,
+                    "Condition": {
+                        "ForAnyValue:StringEquals": {
+                            "dynamodb:LeadingKeys": ["PROOF"],
+                        },
+                        "Null": {"dynamodb:LeadingKeys": "false"},
+                    },
+                },
+            ]
+        )
+        after = {"policy": json.dumps(policy)}
+        CHECKER._check_authority_exec_role_policy(
+            after,
+            fn,
+            operation,
+            proof_policy_consumer=True,
+        )
+
+        for sid, current_operator, wrong_operator in (
+            ("ProofPolicyRead", "ForAllValues:StringEquals", "ForAnyValue:StringEquals"),
+            ("DenyProofPolicyWrite", "ForAnyValue:StringEquals", "ForAllValues:StringEquals"),
+        ):
+            with self.subTest(sid=sid):
+                malformed = copy.deepcopy(policy)
+                statement = next(
+                    candidate
+                    for candidate in malformed["Statement"]
+                    if candidate["Sid"] == sid
+                )
+                statement["Condition"][wrong_operator] = statement[
+                    "Condition"
+                ].pop(current_operator)
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError,
+                    "proof policy must be exact",
+                ):
+                    CHECKER._check_authority_exec_role_policy(
+                        {"policy": json.dumps(malformed)},
+                        fn,
+                        operation,
+                        proof_policy_consumer=True,
+                    )
+
     def test_exact_legacy_hub_runtime_expansion_passes(self) -> None:
         candidate = authority_runtime_legacy_expansion_fixture()
         summary = CHECKER.check_plan(candidate)

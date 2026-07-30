@@ -5760,8 +5760,17 @@ def _check_authority_exec_role_policy(
         proof_read = by_sid["ProofPolicyRead"]
         proof_deny = by_sid["DenyProofPolicyWrite"]
         table_resources = set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"])
-        expected_condition = {
+        expected_read_condition = {
             "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": ["PROOF"],
+            },
+            "Null": {"dynamodb:LeadingKeys": "false"},
+        }
+        # A read allow must require every requested key to be the proof
+        # partition. The explicit write deny is deliberately stronger: deny
+        # the request when any requested key is the proof partition.
+        expected_deny_condition = {
+            "ForAnyValue:StringEquals": {
                 "dynamodb:LeadingKeys": ["PROOF"],
             },
             "Null": {"dynamodb:LeadingKeys": "false"},
@@ -5772,7 +5781,7 @@ def _check_authority_exec_role_policy(
             != {"dynamodb:GetItem"}
             or _authority_string_set(proof_read.get("Resource"), fn, "proof read")
             != table_resources
-            or proof_read.get("Condition") != expected_condition
+            or proof_read.get("Condition") != expected_read_condition
             or proof_deny.get("Effect") != "Deny"
             or _authority_string_set(proof_deny.get("Action"), fn, "proof deny")
             != {
@@ -5782,7 +5791,7 @@ def _check_authority_exec_role_policy(
             }
             or _authority_string_set(proof_deny.get("Resource"), fn, "proof deny")
             != table_resources
-            or proof_deny.get("Condition") != expected_condition
+            or proof_deny.get("Condition") != expected_deny_condition
         ):
             raise ContractError(
                 f"{fn} proof policy must be exact GetItem plus an explicit write deny"
