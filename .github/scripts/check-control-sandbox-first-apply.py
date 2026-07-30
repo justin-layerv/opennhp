@@ -2752,9 +2752,13 @@ def _partition_first_projection_drift(
         address = item.get("address") if isinstance(item, dict) else None
         # Guard the isinstance BEFORE the set membership: a malformed address can
         # be an unhashable value (a dict), which would raise TypeError here
-        # instead of reaching the bounded, value-free rejection diagnostic.
-        strict = isinstance(address, str) and address in _STRICT_DRIFT_ADDRESSES
-        if not strict and _drift_is_first_projection_only(item):
+        # instead of reaching the bounded, value-free rejection diagnostic. A
+        # non-str or strict address always routes to ``substantive``.
+        if (
+            isinstance(address, str)
+            and address not in _STRICT_DRIFT_ADDRESSES
+            and _drift_is_first_projection_only(item)
+        ):
             benign.append(item)
         else:
             substantive.append(item)
@@ -11946,14 +11950,19 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         # narrow mode, because the enablement's unapplied output change means the
         # full refresh-only ``check_plan`` contract cannot describe the observation.
         return _check_authority_enablement_normalization_drift(drift, prior_state)
-    proof_recovery_addresses = [item.get("address") for item in drift]
+    # The reviewed image-recovery observation currently carries 22 benign
+    # first-projection alarm entries alongside the substantive PM/PCR pool
+    # failures. Classify and validate only the substantive remainder, just as
+    # the saved-plan lane above does, while binding the returned count/hash to
+    # the full observation that the workflow compares across plan and apply.
+    proof_recovery_addresses = [item.get("address") for item in substantive]
     if (
         all(isinstance(address, str) for address in proof_recovery_addresses)
         and set(proof_recovery_addresses)
         and set(proof_recovery_addresses)
         <= set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
     ):
-        _check_authority_proof_concurrency_recovery_drift(drift)
+        _check_authority_proof_concurrency_recovery_drift(substantive)
         if (
             not isinstance(prior_state, dict)
             or prior_state.get("format_version") != "1.0"
@@ -11969,7 +11978,7 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
             if isinstance(state_values, dict)
             else None
         )
-        for item in drift:
+        for item in substantive:
             address = item["address"]
             matches = [
                 resource

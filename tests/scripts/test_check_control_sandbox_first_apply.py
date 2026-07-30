@@ -7203,6 +7203,81 @@ class PlanContractTests(unittest.TestCase):
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_normalization_drift(moved, moved_state)
 
+    def test_proof_concurrency_recovery_live_reproof_keeps_full_mixed_drift(
+        self,
+    ) -> None:
+        recovery_addresses = set(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES
+        )
+        recovery = authority_proof_concurrency_recovery_drift(
+            recovery_addresses
+        )
+        # Captured sandbox shape: 22 alarm first projections plus the two
+        # substantive PM/PCR state-1 -> live-0 observations.
+        projections = [
+            _slice_refresh_drift(
+                f'module.control.aws_cloudwatch_metric_alarm.captured["{index}"]',
+                "aws_cloudwatch_metric_alarm",
+            )
+            for index in range(22)
+        ]
+        full_drift = [*projections, *recovery]
+
+        saved = authority_image_update_fixture(
+            recovery_replaces=recovery_addresses,
+        )
+        saved["resource_drift"] = copy.deepcopy(full_drift)
+        saved_summary = CHECKER.check_plan(saved)
+
+        live, prior_state = (
+            authority_proof_concurrency_recovery_normalization_fixture()
+        )
+        live["resource_drift"] = copy.deepcopy(full_drift)
+        observation = CHECKER.check_normalization_drift(live, prior_state)
+        self.assertEqual(observation["normalization_drift_count"], 24)
+        self.assertEqual(
+            observation["normalization_drift_kind"],
+            CHECKER.AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND,
+        )
+        self.assertEqual(observation, {
+            field: saved_summary[field]
+            for field in (
+                "normalization_drift_count",
+                "normalization_drift_kind",
+                "normalization_drift_sha256",
+            )
+        })
+
+        live["resource_drift"].reverse()
+        self.assertEqual(
+            CHECKER.check_normalization_drift(live, prior_state),
+            observation,
+        )
+
+    def test_proof_concurrency_recovery_mixed_reproof_rejects_signal(
+        self,
+    ) -> None:
+        substantive = _substantive_refresh_drift(
+            "module.control.aws_kms_key.authority_data",
+            "aws_kms_key",
+        )
+        malformed = _slice_refresh_drift(
+            "module.control.aws_cloudwatch_metric_alarm.malformed",
+            "aws_cloudwatch_metric_alarm",
+        )
+        malformed["address"] = {"malformed": True}
+        for label, extra in (
+            ("substantive", substantive),
+            ("malformed", malformed),
+        ):
+            with self.subTest(label=label):
+                candidate, prior_state = (
+                    authority_proof_concurrency_recovery_normalization_fixture()
+                )
+                candidate["resource_drift"].insert(0, extra)
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_normalization_drift(candidate, prior_state)
+
     def test_authority_image_update_rejects_unpinned_source_and_alias_drift(
         self,
     ) -> None:
