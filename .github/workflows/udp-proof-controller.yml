@@ -85,6 +85,8 @@ jobs:
     outputs:
       connector_workflow_identity: ${{ steps.files.outputs.connector_workflow_identity }}
       qurl_go_workflow_identity: ${{ steps.files.outputs.qurl_go_workflow_identity }}
+      connector_workflow_group_identity: ${{ steps.files.outputs.connector_workflow_group_identity }}
+      qurl_go_workflow_group_identity: ${{ steps.files.outputs.qurl_go_workflow_group_identity }}
       client_repository: ${{ steps.files.outputs.client_repository }}
       client_workflow: ${{ steps.files.outputs.client_workflow }}
       client_ref: ${{ steps.files.outputs.client_ref }}
@@ -244,6 +246,8 @@ jobs:
           RUNNER_GROUP_ID: ${{ vars.UDP_PROOF_RUNNER_GROUP_ID }}
           CONNECTOR_WORKFLOW: ${{ needs.gate.outputs.connector_workflow_identity }}
           QURL_GO_WORKFLOW: ${{ needs.gate.outputs.qurl_go_workflow_identity }}
+          CONNECTOR_GROUP_WORKFLOW: ${{ needs.gate.outputs.connector_workflow_group_identity }}
+          QURL_GO_GROUP_WORKFLOW: ${{ needs.gate.outputs.qurl_go_workflow_group_identity }}
         run: |
           set -euo pipefail
 
@@ -277,12 +281,24 @@ jobs:
             echo "::error::runner-group visibility/public/restricted control drift"
             exit 1
           }
+          # Assert the identities GitHub actually MATCHES, which are branch
+          # refs. A client proof run is dispatched by branch, so its recorded
+          # workflow ref is refs/heads/<branch> and never the commit SHA -- a
+          # SHA-pinned group matches nothing and the job queues forever beside
+          # an idle, correctly-labelled runner.
+          #
+          # The frozen-head guarantee is NOT weakened: the "Require the frozen
+          # client candidate heads" step above independently binds the producer
+          # artifact's SHA-form workflow identity to PINNED_CONNECTOR_SHA and
+          # PINNED_QURL_GO_SHA. This assertion only scopes WHICH workflow may
+          # claim these runners, and it is still exact -- both entries, nothing
+          # else.
           jq -e \
-            --arg connector "$CONNECTOR_WORKFLOW" \
-            --arg qurl_go "$QURL_GO_WORKFLOW" \
+            --arg connector "$CONNECTOR_GROUP_WORKFLOW" \
+            --arg qurl_go "$QURL_GO_GROUP_WORKFLOW" \
             '(.selected_workflows | sort) == ([$connector, $qurl_go] | sort)' \
             <<<"$group" >/dev/null || {
-            echo "::error::runner-group workflows do not pin both manifest candidate SHAs"
+            echo "::error::runner-group workflows do not pin both candidate head branches"
             exit 1
           }
 

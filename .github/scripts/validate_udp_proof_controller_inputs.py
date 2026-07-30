@@ -37,6 +37,30 @@ def _workflow_identity(target: dict[str, str], repositories: dict[str, str]) -> 
     )
 
 
+def _workflow_group_identity(
+    target: dict[str, str], candidates: dict[str, dict[str, str]]
+) -> str:
+    """The identity GitHub actually matches a runner group against.
+
+    A client proof run is dispatched by BRANCH (`client_ref` below is the
+    candidate's head_ref, and the dispatch sets head_branch from it), so the
+    workflow ref GitHub records for that run is `refs/heads/<branch>` -- never
+    the commit SHA. A runner group whose selected_workflows pin the SHA
+    therefore matches nothing, and the job stays queued forever with an idle,
+    correctly-labelled runner sitting next to it.
+
+    The frozen-head guarantee does NOT live here. It is enforced separately
+    against the producer artifact by the "Require the frozen client candidate
+    heads" step, which compares _workflow_identity (SHA-form) to the pinned
+    SHAs. This identity only scopes WHICH workflow may claim the runners.
+    """
+    return (
+        f"{target['repository']}/.github/workflows/"
+        f"{target['workflow']}@refs/heads/"
+        f"{candidates[target['repository_key']]['head_ref']}"
+    )
+
+
 def select_dispatch(
     *,
     client: str,
@@ -69,6 +93,12 @@ def select_dispatch(
             connector_target, repositories
         ),
         "qurl_go_workflow_identity": _workflow_identity(qurl_go_target, repositories),
+        "connector_workflow_group_identity": _workflow_group_identity(
+            connector_target, candidates
+        ),
+        "qurl_go_workflow_group_identity": _workflow_group_identity(
+            qurl_go_target, candidates
+        ),
         "client_repository": target["repository"],
         "client_workflow": target["workflow"],
         "client_ref": client_ref,

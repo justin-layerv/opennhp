@@ -556,3 +556,43 @@ class ShellHelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunnerGroupWorkflowIdentityTest(unittest.TestCase):
+    """The runner group must pin what GitHub actually matches: branch refs.
+
+    A client proof run is dispatched by BRANCH, so its recorded workflow ref is
+    refs/heads/<branch>, never the commit SHA. A SHA-pinned group matches
+    nothing and the job queues forever beside an idle, correctly-labelled
+    runner -- observed directly before this fix.
+    """
+
+    def test_group_identity_uses_the_candidate_head_branch(self) -> None:
+        target = {
+            "repository": "layervai/qurl-connector",
+            "workflow": "sandbox-smoke.yml",
+            "repository_key": "qurl_connector",
+        }
+        candidates = {"qurl_connector": {"head_ref": "justin/fix/routing"}}
+        self.assertEqual(
+            validator._workflow_group_identity(target, candidates),
+            "layervai/qurl-connector/.github/workflows/"
+            "sandbox-smoke.yml@refs/heads/justin/fix/routing",
+        )
+
+    def test_group_identity_differs_from_the_frozen_sha_identity(self) -> None:
+        """The SHA form is still used -- for the frozen-head check, not here."""
+        target = {
+            "repository": "layervai/qurl-go",
+            "workflow": "native-udp-sandbox.yml",
+            "repository_key": "qurl_go",
+        }
+        repositories = {"qurl_go": "0" * 40}
+        candidates = {"qurl_go": {"head_ref": "justin/feat/recovery"}}
+        self.assertNotEqual(
+            validator._workflow_group_identity(target, candidates),
+            validator._workflow_identity(target, repositories),
+        )
+        self.assertTrue(
+            validator._workflow_identity(target, repositories).endswith("0" * 40)
+        )
