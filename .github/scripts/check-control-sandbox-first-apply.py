@@ -1833,6 +1833,25 @@ _AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES = frozenset(
     }
 )
 _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND = "authority-enablement-normalization"
+_AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES = frozenset(
+    {
+        "no-op",
+        "authority-runtime-slice",
+        "authority-runtime-slice-retry",
+        "authority-runtime-legacy-expansion",
+        "authority-runtime-legacy-expansion-hub-identity",
+        "authority-runtime-legacy-expansion-provisioned-cell-catalog",
+        (
+            "authority-runtime-legacy-expansion-hub-identity-"
+            "provisioned-cell-catalog"
+        ),
+        # Proof rollout plans update and validate resources in the same runtime
+        # slice. Provider refresh re-projections confined to that slice are no
+        # less exact merely because prepare or selector owns the config change.
+        "authority-proof-rollout-prepare",
+        "authority-proof-rollout-selector",
+    }
+)
 
 
 def _is_exact_passwordless_authentication_mode(
@@ -11671,20 +11690,10 @@ def check_plan(
         # after-state has already passed every security validator above. Bind
         # the drift to these exact plan modes and reject any unrelated resource
         # transition.
-        if plan_mode not in (
-            "authority-runtime-slice",
-            "authority-runtime-slice-retry",
-            "authority-runtime-legacy-expansion",
-            "authority-runtime-legacy-expansion-hub-identity",
-            "authority-runtime-legacy-expansion-provisioned-cell-catalog",
-            (
-                "authority-runtime-legacy-expansion-hub-identity-"
-                "provisioned-cell-catalog"
-            ),
-        ) and plan_mode != "no-op":
+        if plan_mode not in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
             raise ContractError(
                 "authority runtime-slice state normalization is admitted only for "
-                "the runtime-slice completion transition or a steady no-op re-read"
+                "a runtime-slice transition, proof rollout, or steady no-op re-read"
             )
     if (
         normalization_drift_kind

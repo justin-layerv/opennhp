@@ -213,6 +213,19 @@ class AuthorityProofRolloutTransitionTests(unittest.TestCase):
                 widened, require_planned_target=True
             )
 
+    def test_runtime_normalization_is_scoped_to_proof_rollout_modes(self):
+        self.assertTrue(
+            {
+                "authority-proof-rollout-prepare",
+                "authority-proof-rollout-selector",
+            }
+            <= CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES
+        )
+        self.assertNotIn(
+            "authority-proof-enable",
+            CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES,
+        )
+
 
 def applied_provisioned_cell_item(cell_id: str) -> str:
     """Render a catalog row the way a refreshed read renders it.
