@@ -88,6 +88,7 @@ retry_command apt-get -o Acquire::Retries=4 install -y --no-install-recommends \
   jq \
   libcap2-bin \
   make \
+  sudo \
   tar \
   tcpdump \
   unzip
@@ -151,6 +152,26 @@ retry_command /opt/actions-runner/bin/installdependencies.sh
 # --cap-add=NET_ADMIN; the host qdisc is never modified by bootstrap.
 setcap cap_net_admin,cap_net_raw=eip "$(command -v tcpdump)"
 getcap "$(command -v tcpdump)" | grep -Eq 'cap_net_admin,cap_net_raw=eip|cap_net_raw,cap_net_admin=eip'
+
+# The strict proof shells out to sudo for exactly two operations, and both
+# failed closed with "sudo: a password is required":
+#   * `sudo -n chown [-R] 65532:65532 <dir>` to hand the secure state directory
+#     to the container's non-root UID/GID (docker_test.go);
+#   * `sudo -n <abs tcpdump> ...` to run the lifecycle packet capture, which the
+#     test uses whenever it is not already root (connector_udp_test.go).
+# setcap alone does not satisfy them because the test invokes sudo by name.
+#
+# Grant those two binaries and nothing else, so this stays what the comment
+# above intends -- no GENERAL sudo grant on the disposable runner. Verified in
+# an ubuntu:24.04 container: visudo parses it, both exact call forms succeed,
+# and `sudo -n /bin/cat` / `sudo -n /bin/bash` are still refused.
+runner_tcpdump="$(command -v tcpdump)"
+runner_chown="$(command -v chown)"
+cat >/etc/sudoers.d/udp-proof-runner <<SUDOERS
+runner ALL=(root) NOPASSWD: $runner_tcpdump, $runner_chown
+SUDOERS
+chmod 0440 /etc/sudoers.d/udp-proof-runner
+visudo -c -f /etc/sudoers.d/udp-proof-runner
 
 imds_token="$(retry_command curl --fail --silent --show-error --request PUT \
   --header 'X-aws-ec2-metadata-token-ttl-seconds: 300' \

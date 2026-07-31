@@ -188,6 +188,13 @@ run "secure_ephemeral_runner_contract" {
       # failed with exit 127 (make: command not found) once the earlier missing
       # tools were fixed.
       strcontains(base64decode(aws_launch_template.runner.user_data), "make") &&
+      # The strict proof calls `sudo -n chown` and `sudo -n <tcpdump>`; both
+      # failed closed with "sudo: a password is required". Grant exactly those
+      # two binaries -- never a general sudo grant on the disposable runner.
+      strcontains(base64decode(aws_launch_template.runner.user_data), "sudo") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "runner ALL=(root) NOPASSWD:") &&
+      strcontains(base64decode(aws_launch_template.runner.user_data), "visudo -c -f /etc/sudoers.d/udp-proof-runner") &&
+      !strcontains(base64decode(aws_launch_template.runner.user_data), "NOPASSWD: ALL") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "tcpdump") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "tee /dev/console | logger --tag udp-proof-bootstrap") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "retry_command apt-get -o Acquire::Retries=4 update") &&
