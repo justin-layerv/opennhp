@@ -176,6 +176,14 @@ run "default_is_cell_identity_with_no_control_grant" {
     ])
     error_message = "cell identity mode pointed the mint idempotency table at Control"
   }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      statement.Sid != "KMSDecryptControlDynamoDB"
+    ])
+    error_message = "cell identity mode granted decrypt on the Control KMS key"
+  }
 }
 
 run "control_identity_grants_and_selects_the_control_namespace" {
@@ -186,6 +194,7 @@ run "control_identity_grants_and_selects_the_control_namespace" {
   variables {
     control_identity_environment_id = "sandbox"
     control_identity_home_region    = "us-east-2"
+    control_identity_kms_key_arn    = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"
     # All four tables the root passes. The mint idempotency table is included
     # deliberately: naming it in the env var without granting IAM boots cleanly
     # and then fails with AccessDenied on the first mint.
@@ -237,6 +246,19 @@ run "control_identity_grants_and_selects_the_control_namespace" {
       ]) if statement.Sid == "ControlIdentityAccess"
     ])
     error_message = "Control identity grant does not cover the mint idempotency table the env var names"
+  }
+
+  # Reading an SSE-KMS table needs decrypt on that table's key. Granting the
+  # DynamoDB actions without it boots cleanly and then fails every API-key
+  # lookup with AccessDeniedException -- a live 500, not a refusal to start.
+  assert {
+    condition = anytrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      contains(statement.Action, "kms:Decrypt")
+      && contains(statement.Resource, "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee")
+      if statement.Sid == "KMSDecryptControlDynamoDB"
+    ])
+    error_message = "Control identity mode does not grant decrypt on the Control tables' KMS key"
   }
 
   # Every identity read is a key or index lookup, which is what keeps validation
@@ -291,6 +313,22 @@ run "control_identity_grant_without_mode_is_rejected" {
   command = plan
 
   variables {
+    control_identity_table_arns = [
+      "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
+    ]
+  }
+
+  expect_failures = [aws_ecs_task_definition.qurl]
+}
+
+# The failure this run guards against is the one that reached production: the
+# service boots, then every API-key lookup 500s on AccessDeniedException.
+run "control_identity_without_the_kms_key_is_rejected" {
+  command = plan
+
+  variables {
+    control_identity_environment_id = "sandbox"
+    control_identity_home_region    = "us-east-2"
     control_identity_table_arns = [
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
     ]

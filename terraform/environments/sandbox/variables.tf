@@ -2551,3 +2551,9 @@ variable "control_identity_home_region" {
   type        = string
   default     = ""
 }
+
+variable "control_identity_kms_key_arn" {
+  description = "KMS key encrypting the Control identity tables. Required when control_identity_environment_id is set."
+  type        = string
+  default     = ""
+}

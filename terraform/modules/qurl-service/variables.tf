@@ -570,6 +570,17 @@ variable "control_identity_home_region" {
   }
 }
 
+variable "control_identity_kms_key_arn" {
+  description = <<-EOT
+    KMS key encrypting the Control identity tables. Required when
+    control_identity_environment_id is set: DynamoDB reads of an SSE-KMS table
+    fail with AccessDeniedException unless the caller can decrypt with the
+    table's key, and the Control tables use a different key than the cell ones.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "control_identity_table_arns" {
   description = <<-EOT
     ARNs of the Control identity tables this service may read and write

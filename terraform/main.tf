@@ -2761,6 +2761,7 @@ module "qurl_service" {
   control_identity_environment_id = var.control_identity_environment_id
   control_identity_home_region    = var.control_identity_home_region
   control_identity_table_arns     = local.control_identity_table_arns
+  control_identity_kms_key_arn    = var.control_identity_kms_key_arn
 
   environment = var.environment
   name_prefix = local.name_prefix

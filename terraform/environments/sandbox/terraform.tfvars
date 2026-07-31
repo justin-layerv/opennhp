@@ -970,3 +970,7 @@ tags = {
 # namespace.
 control_identity_environment_id = "sandbox"
 control_identity_home_region    = "us-east-2"
+# The Control tables are encrypted with the Connector Authority key, which is
+# NOT this cell's DynamoDB key. Without decrypt on it the service boots fine and
+# then every API-key lookup returns AccessDeniedException as a 500.
+control_identity_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"

@@ -852,6 +852,17 @@ resource "aws_iam_role_policy" "task_dynamodb" {
       # reads only this namespace. Kept as its own statement so the cell grant
       # above is unchanged and this grant can be read at a glance. Empty in cell
       # compatibility mode, which emits no statement at all.
+      # Reading an SSE-KMS DynamoDB table needs decrypt on THAT table's key. The
+      # Control tables use a different key than this cell's, so the DynamoDB
+      # grant above is necessary but not sufficient -- without this the service
+      # starts cleanly and then every API-key lookup fails with
+      # AccessDeniedException, which is a live 500 rather than a refusal to boot.
+      var.control_identity_kms_key_arn != "" ? [{
+        Sid      = "KMSDecryptControlDynamoDB"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.control_identity_kms_key_arn]
+      }] : [],
       length(var.control_identity_table_arns) > 0 ? [{
         Sid    = "ControlIdentityAccess"
         Effect = "Allow"
@@ -1811,6 +1822,10 @@ resource "aws_ecs_task_definition" "qurl" {
         var.control_identity_home_region != "" && length(var.control_identity_table_arns) > 0
       )
       error_message = "control identity mode requires control_identity_home_region and control_identity_table_arns alongside control_identity_environment_id."
+    }
+    precondition {
+      condition     = var.control_identity_environment_id == "" || var.control_identity_kms_key_arn != ""
+      error_message = "control identity mode requires control_identity_kms_key_arn; DynamoDB reads of the SSE-KMS Control tables fail with AccessDenied without it."
     }
     precondition {
       condition     = var.control_identity_environment_id != "" || length(var.control_identity_table_arns) == 0
