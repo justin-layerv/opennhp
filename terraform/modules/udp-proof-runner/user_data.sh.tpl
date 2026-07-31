@@ -87,6 +87,7 @@ retry_command apt-get -o Acquire::Retries=4 install -y --no-install-recommends \
   iptables \
   jq \
   libcap2-bin \
+  make \
   tar \
   tcpdump \
   unzip

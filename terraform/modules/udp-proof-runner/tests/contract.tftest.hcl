@@ -184,6 +184,10 @@ run "secure_ephemeral_runner_contract" {
       strcontains(base64decode(aws_launch_template.runner.user_data), "s|http://|https://|g") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "docker.io") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "iproute2") &&
+      # The connector proof runs `make frpc` to build its client binary, which
+      # failed with exit 127 (make: command not found) once the earlier missing
+      # tools were fixed.
+      strcontains(base64decode(aws_launch_template.runner.user_data), "make") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "tcpdump") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "tee /dev/console | logger --tag udp-proof-bootstrap") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "retry_command apt-get -o Acquire::Retries=4 update") &&
