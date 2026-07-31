@@ -98,6 +98,8 @@ module "nhp" {
 
   # QURL Service
   deploy_qurl_service                         = var.deploy_qurl_service
+  control_identity_environment_id             = var.control_identity_environment_id
+  control_identity_home_region                = var.control_identity_home_region
   deploy_qurl_bootstrap_chain                 = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap                 = var.enable_qurl_agent_bootstrap
   qurl_scanner_lambda_enabled                 = var.qurl_scanner_lambda_enabled

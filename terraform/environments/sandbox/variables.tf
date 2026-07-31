@@ -2537,3 +2537,17 @@ variable "auth0_slack_oauth_client_id" {
   type        = string
   default     = null
 }
+
+# Control identity plane for qurl-service. See terraform/variables.tf for why
+# identity is global rather than cell-scoped. Empty keeps cell identity tables.
+variable "control_identity_environment_id" {
+  description = "Control namespace environment id for qurl-service identity. Empty keeps cell identity tables."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_home_region" {
+  description = "Home region of the Control identity tables. Required when control_identity_environment_id is set."
+  type        = string
+  default     = ""
+}

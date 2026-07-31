@@ -956,3 +956,17 @@ tags = {
   CostCenter   = "infrastructure"
   Owner        = "platform-team"
 }
+
+# Identity plane: read accounts and credentials from Control, not this cell.
+#
+# The Connector Authority is global -- it validates enrollment credentials for
+# every cell -- so it reads only the Control namespace. While this cell kept its
+# own accounts and API keys, a perfectly valid customer key was invisible to the
+# Authority and every native enrollment answered credential_invalid.
+#
+# The identity rows (1141 API keys, 15 customers, 993 agent keys) were copied to
+# Control and each one verified field-by-field BEFORE this was set. Order
+# matters: setting it first would point every existing customer at an empty
+# namespace.
+control_identity_environment_id = "sandbox"
+control_identity_home_region    = "us-east-2"
