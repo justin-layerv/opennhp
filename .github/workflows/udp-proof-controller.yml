@@ -72,7 +72,7 @@ env:
   # and `repositories.qurl_go` from those live PR heads and the gate below
   # rejects any producer artifact that binds a different head. If either head
   # moves, re-run the producer and update both pins plus runner-group 5.
-  PINNED_CONNECTOR_SHA: 1bbd163c5184ef1fa1a84ee97d3fd888e5e8c6d7
+  PINNED_CONNECTOR_SHA: c54ad97bfa061442fd7f91a25308c0e1cc8b105e
   PINNED_QURL_GO_SHA: 064f9b6f024cf18ce70ce1243a8e698c08019806
 
 jobs:
