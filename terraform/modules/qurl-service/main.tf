@@ -332,6 +332,12 @@ locals {
   )
 
   # Container environment variables
+  # One derivation of the Control namespace prefix, reused by every value that
+  # must agree with it. Two hand-written copies of "layerv-nhp-<id>-control" can
+  # drift, which is the same "plumbed separately, then disagree" failure that
+  # took the mint idempotency table out of sync with identity in the first place.
+  control_identity_table_prefix = var.control_identity_environment_id != "" ? "layerv-nhp-${var.control_identity_environment_id}-control" : ""
+
   container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
     { name = "AWS_REGION", value = data.aws_region.current.id },
@@ -351,10 +357,7 @@ locals {
     { name = "DYNAMODB_CONTROL_HOME_REGION", value = var.control_identity_home_region },
     # Must equal controlnamespace.DynamoDBTablePrefix(environment_id); the
     # service revalidates it at startup and refuses to boot on a mismatch.
-    {
-      name  = "DYNAMODB_CONTROL_TABLE_PREFIX"
-      value = var.control_identity_environment_id != "" ? "layerv-nhp-${var.control_identity_environment_id}-control" : ""
-    },
+    { name = "DYNAMODB_CONTROL_TABLE_PREFIX", value = local.control_identity_table_prefix },
     # Hardcoded "true" — every cell running this module must have the
     # periodic DynamoDB schema reconciler on; no per-env opt-out.
     # Defense-in-depth layer against GSI drift (incident class #877).
@@ -454,8 +457,27 @@ locals {
     var.idempotency_table_name != "" ? [
       { name = "IDEMPOTENCY_TABLE_NAME", value = var.idempotency_table_name },
     ] : [],
-    # API key idempotency table (dedicated for POST /v1/api-keys mint)
-    var.apikey_idempotency_table_name != "" ? [
+    # API key idempotency table (dedicated for POST /v1/api-keys mint).
+    #
+    # In Control identity mode this MUST name the Control table. qurl-service
+    # asserts the two agree at startup and exits fatally on a mismatch --
+    # correctly, because a mint deduplicating against a different namespace than
+    # it writes to would silently issue duplicate keys. Passing the cell table
+    # here while identity is Control is exactly that mismatch, so the name is
+    # derived from the same prefix as the identity tables rather than plumbed
+    # separately, which is what let them disagree in the first place.
+    #
+    # IAM for this table is NOT granted here: it comes from
+    # control_identity_table_arns, so the caller must include the Control
+    # idempotency ARN there. Naming it without granting it boots cleanly and
+    # then fails with AccessDenied on the first mint -- quieter, and worse, than
+    # the fatal boot check. The contract test asserts the grant covers it.
+    var.control_identity_environment_id != "" ? [
+      {
+        name  = "APIKEY_IDEMPOTENCY_TABLE_NAME"
+        value = "${local.control_identity_table_prefix}-qurl-apikey-idempotency"
+      },
+      ] : var.apikey_idempotency_table_name != "" ? [
       { name = "APIKEY_IDEMPOTENCY_TABLE_NAME", value = var.apikey_idempotency_table_name },
     ] : [],
     # Webhooks configuration

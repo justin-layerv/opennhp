@@ -165,6 +165,17 @@ run "default_is_cell_identity_with_no_control_grant" {
     ])
     error_message = "cell identity mode leaked a Control namespace value"
   }
+
+  # The converse: cell mode must keep passing the caller-supplied cell table, so
+  # fixing the Control case did not quietly repoint existing deployments.
+  assert {
+    condition = alltrue([
+      for env in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment :
+      !strcontains(env.value, "-control-qurl-apikey-idempotency")
+      if env.name == "APIKEY_IDEMPOTENCY_TABLE_NAME"
+    ])
+    error_message = "cell identity mode pointed the mint idempotency table at Control"
+  }
 }
 
 run "control_identity_grants_and_selects_the_control_namespace" {
@@ -175,10 +186,14 @@ run "control_identity_grants_and_selects_the_control_namespace" {
   variables {
     control_identity_environment_id = "sandbox"
     control_identity_home_region    = "us-east-2"
+    # All four tables the root passes. The mint idempotency table is included
+    # deliberately: naming it in the env var without granting IAM boots cleanly
+    # and then fails with AccessDenied on the first mint.
     control_identity_table_arns = [
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-customers",
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys",
+      "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-apikey-idempotency",
     ]
   }
 
@@ -209,6 +224,21 @@ run "control_identity_grants_and_selects_the_control_namespace" {
     error_message = "control identity mode did not emit exactly one Control identity IAM statement"
   }
 
+  # The env var naming the Control idempotency table is only half the contract:
+  # the task role must also be able to write it. Without this, the service boots
+  # clean and the first mint fails with AccessDenied -- quieter than the fatal
+  # boot check, and a worse rollback.
+  assert {
+    condition = anytrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      anytrue([
+        for resource in statement.Resource :
+        endswith(resource, "-control-qurl-apikey-idempotency")
+      ]) if statement.Sid == "ControlIdentityAccess"
+    ])
+    error_message = "Control identity grant does not cover the mint idempotency table the env var names"
+  }
+
   # Every identity read is a key or index lookup, which is what keeps validation
   # O(1) as cells are added. A Scan grant would hide an accidental table walk on
   # the enrollment hot path.
@@ -220,12 +250,26 @@ run "control_identity_grants_and_selects_the_control_namespace" {
     error_message = "Control identity grant includes Scan; no identity path scans"
   }
 
+  # The mint idempotency table must follow the identity namespace. qurl-service
+  # asserts these agree and exits fatally otherwise -- a live rollout was rolled
+  # back by exactly this mismatch, because the cell table name was still being
+  # passed while identity had moved to Control. Deduplicating a mint against a
+  # different namespace than it writes to would silently issue duplicate keys.
+  assert {
+    condition = anytrue([
+      for env in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment :
+      env.name == "APIKEY_IDEMPOTENCY_TABLE_NAME"
+      && env.value == "layerv-nhp-sandbox-control-qurl-apikey-idempotency"
+    ])
+    error_message = "mint idempotency table does not follow the Control identity namespace"
+  }
+
   # Index ARNs are derived rather than listed, so a caller cannot pass a table
   # without its indexes and leave owner-index/key-id-index unreadable at runtime.
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
-      length(statement.Resource) == 6 if statement.Sid == "ControlIdentityAccess"
+      length(statement.Resource) == 8 if statement.Sid == "ControlIdentityAccess"
     ])
     error_message = "Control identity grant does not cover each table plus its indexes"
   }
