@@ -261,6 +261,19 @@ run "control_identity_grants_and_selects_the_control_namespace" {
     error_message = "Control identity mode does not grant decrypt on the Control tables' KMS key"
   }
 
+  # ConditionCheckItem is authorized separately from TransactWriteItems. Minting
+  # an API key condition-checks the owning customer row inside the transaction,
+  # so without this action every POST /v1/api-keys returns 500 and no customer or
+  # agent can enroll -- while every write action above looks correctly granted.
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      contains(statement.Action, "dynamodb:ConditionCheckItem")
+      if statement.Sid == "ControlIdentityAccess"
+    ])
+    error_message = "Control identity grant omits dynamodb:ConditionCheckItem; transactional API-key mint will 500"
+  }
+
   # Every identity read is a key or index lookup, which is what keeps validation
   # O(1) as cells are added. A Scan grant would hide an accidental table walk on
   # the enrollment hot path.

@@ -875,6 +875,15 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           "dynamodb:BatchGetItem",
           "dynamodb:TransactGetItems",
           "dynamodb:TransactWriteItems",
+          # ConditionCheckItem is a SEPARATE action from TransactWriteItems, and
+          # holding the latter does not imply it. A transaction that carries a
+          # ConditionCheck leg is authorized per-leg, so minting an API key --
+          # which condition-checks the owning customer row before writing the
+          # credential -- fails with AccessDeniedException on
+          # `dynamodb:ConditionCheckItem` even though every write action is
+          # granted. That surfaces as HTTP 500 on POST /v1/api-keys, i.e. no new
+          # customer or agent can be enrolled at all.
+          "dynamodb:ConditionCheckItem",
           # The schema reconciler describes every table in its registry, which
           # includes the identity tables once they are the live namespace.
           "dynamodb:DescribeTable",
