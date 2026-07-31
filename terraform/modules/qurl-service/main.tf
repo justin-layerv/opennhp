@@ -339,6 +339,22 @@ locals {
     { name = "SERVER_PORT", value = tostring(var.container_port) },
     { name = "API_BASE_URL", value = local.computed_api_base_url },
     { name = "DYNAMODB_TABLE_PREFIX", value = var.dynamodb_table_prefix },
+    # Identity store selection. qurl-service makes the cell-versus-Control
+    # choice once at startup (initRuntimeIdentityRepositories) so no single
+    # identity path can fall back to a cell table. Empty environment id keeps
+    # the historical cell namespace.
+    {
+      name  = "DYNAMODB_IDENTITY_STORE_MODE"
+      value = var.control_identity_environment_id != "" ? "control" : "cell"
+    },
+    { name = "DYNAMODB_CONTROL_ENVIRONMENT_ID", value = var.control_identity_environment_id },
+    { name = "DYNAMODB_CONTROL_HOME_REGION", value = var.control_identity_home_region },
+    # Must equal controlnamespace.DynamoDBTablePrefix(environment_id); the
+    # service revalidates it at startup and refuses to boot on a mismatch.
+    {
+      name  = "DYNAMODB_CONTROL_TABLE_PREFIX"
+      value = var.control_identity_environment_id != "" ? "layerv-nhp-${var.control_identity_environment_id}-control" : ""
+    },
     # Hardcoded "true" — every cell running this module must have the
     # periodic DynamoDB schema reconciler on; no per-env opt-out.
     # Defense-in-depth layer against GSI drift (incident class #877).
@@ -809,6 +825,35 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           )
         },
       ],
+      # Control identity plane. Identity is global, not cell-scoped: the
+      # Connector Authority validates enrollment credentials for every cell and
+      # reads only this namespace. Kept as its own statement so the cell grant
+      # above is unchanged and this grant can be read at a glance. Empty in cell
+      # compatibility mode, which emits no statement at all.
+      length(var.control_identity_table_arns) > 0 ? [{
+        Sid    = "ControlIdentityAccess"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:BatchGetItem",
+          "dynamodb:TransactGetItems",
+          "dynamodb:TransactWriteItems",
+          # The schema reconciler describes every table in its registry, which
+          # includes the identity tables once they are the live namespace.
+          "dynamodb:DescribeTable",
+        ]
+        # Scan is deliberately absent: no identity read path scans. Every lookup
+        # is a key or index query, which is also why this stays O(1) as cells
+        # are added.
+        Resource = concat(
+          var.control_identity_table_arns,
+          [for arn in var.control_identity_table_arns : "${arn}/index/*"],
+        )
+      }] : [],
       var.nhp_resources_table_arn != "" ? [{
         Sid    = "NHPResourceCatalogWrite"
         Effect = "Allow"
@@ -1735,6 +1780,20 @@ resource "aws_ecs_task_definition" "qurl" {
   # See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
   # Note: When grafana_cloud_enabled=true, CPU is set to max(container_cpu, 512) and memory is increased by 256MB
   lifecycle {
+    # A half-configured identity cutover is worse than either end state: the
+    # service either refuses to boot (it revalidates the Control prefix at
+    # startup) or runs against Control without the IAM grant. Require the three
+    # settings to move together, in both directions.
+    precondition {
+      condition = var.control_identity_environment_id == "" || (
+        var.control_identity_home_region != "" && length(var.control_identity_table_arns) > 0
+      )
+      error_message = "control identity mode requires control_identity_home_region and control_identity_table_arns alongside control_identity_environment_id."
+    }
+    precondition {
+      condition     = var.control_identity_environment_id != "" || length(var.control_identity_table_arns) == 0
+      error_message = "control_identity_table_arns is granted without control_identity_environment_id; the service would still read cell identity tables while holding Control write access."
+    }
     precondition {
       condition     = (var.image_uri == null) == (var.source_revision == null)
       error_message = "image_uri and source_revision must be set together or both left null. An immutable image without its exact source revision (or vice versa) is not deployable provenance."

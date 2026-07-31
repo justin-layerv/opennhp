@@ -539,6 +539,47 @@ variable "idempotency_table_name" {
   default     = ""
 }
 
+# Control identity plane.
+#
+# Identity is not cell-scoped. A customer exists before any cell assignment, may
+# hold resources in more than one cell, and must survive the loss of any single
+# cell; the Connector Authority is global and validates enrollment credentials
+# for every cell, so it reads the Control namespace only and never a cell. These
+# variables let this module run its qurl-service against that Control identity
+# namespace instead of its own cell tables.
+#
+# Empty is cell compatibility mode, which is the historical behavior and stays
+# the default. Populating them is a deliberate cutover and REQUIRES the identity
+# rows to already exist in Control -- switching first would point every existing
+# customer at an empty namespace.
+
+variable "control_identity_environment_id" {
+  description = "Control namespace environment id (e.g. \"sandbox\"). Empty keeps cell identity mode."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_home_region" {
+  description = "Home region of the Control identity tables. Required when control_identity_environment_id is set."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.control_identity_home_region == "" || can(regex("^[a-z]{2}(-gov)?-[a-z]+-[0-9]$", var.control_identity_home_region))
+    error_message = "control_identity_home_region must be a canonical AWS region id."
+  }
+}
+
+variable "control_identity_table_arns" {
+  description = <<-EOT
+    ARNs of the Control identity tables this service may read and write
+    (customers, api-keys, agent-keys, apikey-idempotency). Required when
+    control_identity_environment_id is set. Index ARNs are derived, not listed.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "apikey_idempotency_table_arn" {
   description = "DynamoDB table ARN for API key mint idempotency storage"
   type        = string

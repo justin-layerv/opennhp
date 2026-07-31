@@ -886,6 +886,21 @@ AUTHORITY_ALARM_UPDATE_ADDRESSES = frozenset(
     for _fn in AUTHORITY_RUNTIME_FUNCTIONS
 )
 
+# Exec-policy addresses for EVERY authority function the contract knows about,
+# hub and per-cell and proof alike.
+#
+# The legacy set below is built from the hub functions only, which was the whole
+# runtime when it was written. The runtime has since grown per-cell and proof
+# functions, so a plan that touches all of their exec policies presents
+# addresses the legacy set cannot name -- the shape is identical, the membership
+# test is simply out of date. Deriving from the function map keeps the claim
+# bounded (an address for an unknown function is still never claimable) while
+# tracking the runtime instead of a moment in its history.
+AUTHORITY_EXEC_POLICY_ADDRESSES = frozenset(
+    f'module.control.aws_iam_role_policy.authority_exec["{_fn}"]'
+    for _fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+)
+
 AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES = {
     AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
 }
@@ -8100,15 +8115,17 @@ def _claim_authority_hub_exec_policy_update(
     closed. So this lane stands down whenever staging claims them, and covers
     only the case where the exec policies move on their own.
 
-    Scoped to the reviewed legacy Hub resource set, so an exec policy belonging
-    to any other function is never claimed.
+    Scoped to exec policies of KNOWN authority functions, so a policy belonging
+    to anything else is never claimed. It deliberately covers the per-cell and
+    proof functions too: their exec policies move together with the hub ones,
+    and pinning only the hub subset made every later plan unadmittable while the
+    shape was identical.
     """
     staged = _claim_authority_proof_consumer_staging(changed, actual_non_noop, by_address)
     claimed = {
         address
         for address in changed
-        if address in AUTHORITY_RUNTIME_LEGACY_HUB_RESOURCE_ADDRESSES
-        and address.startswith("module.control.aws_iam_role_policy.authority_exec[")
+        if address in AUTHORITY_EXEC_POLICY_ADDRESSES
         and (actual_non_noop.get(address) or ()) == ["update"]
     }
     if staged and (claimed & set(staged)):

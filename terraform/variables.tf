@@ -3281,3 +3281,28 @@ variable "qurl_v2_relay_allowlist" {
     error_message = "qurl_v2_relay_allowlist must be empty or a comma-separated list of host[:port] entries (no spaces or scheme)."
   }
 }
+
+# Control identity plane.
+#
+# Identity is global, not cell-scoped: a customer exists before any cell
+# assignment, may hold resources in several cells, and must outlive the loss of
+# any one of them. The Connector Authority validates enrollment credentials for
+# every cell and reads only the Control namespace, so a cell that keeps its own
+# accounts and API keys is invisible to it -- an agent enrolling with a
+# perfectly valid key gets credential_invalid.
+#
+# Empty keeps this cell on its own identity tables, which is the historical
+# behavior. Setting it is a deliberate cutover and REQUIRES the identity rows to
+# already exist in Control; flipping first would point every existing customer
+# at an empty namespace.
+variable "control_identity_environment_id" {
+  description = "Control namespace environment id for qurl-service identity (e.g. \"sandbox\"). Empty keeps cell identity tables."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_home_region" {
+  description = "Home region of the Control identity tables. Required when control_identity_environment_id is set."
+  type        = string
+  default     = ""
+}

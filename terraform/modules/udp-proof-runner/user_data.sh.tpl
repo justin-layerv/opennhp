@@ -118,8 +118,8 @@ curl --fail --location --proto '=https' --tlsv1.2 \
   '${gh_cli_archive_url}'
 echo '${gh_cli_archive_sha256}  /run/udp-proof/gh.tar.gz' | sha256sum --check --strict
 tar -xzf /run/udp-proof/gh.tar.gz -C /run/udp-proof
-install -m 0755 /run/udp-proof/${gh_cli_archive_root}/bin/gh /usr/local/bin/gh
-rm -rf /run/udp-proof/gh.tar.gz /run/udp-proof/${gh_cli_archive_root}
+install -m 0755 '/run/udp-proof/${gh_cli_archive_root}/bin/gh' /usr/local/bin/gh
+rm -rf /run/udp-proof/gh.tar.gz '/run/udp-proof/${gh_cli_archive_root}'
 gh --version
 
 systemctl enable --now docker

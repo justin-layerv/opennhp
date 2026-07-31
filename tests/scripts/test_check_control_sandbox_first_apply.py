@@ -13124,6 +13124,34 @@ class ExecPolicyLanePrecedenceTest(unittest.TestCase):
                 )
             )
 
+    def test_claims_every_known_authority_function_not_just_the_hub_three(self) -> None:
+        """The runtime grew; the claim must track it.
+
+        The hub trio was the whole runtime when this lane was written. Per-cell
+        and proof functions were added later and their exec policies move in the
+        same plan, so scoping the claim to the hub subset left a real plan
+        unadmittable while its shape was identical -- the failure a live PR hit
+        with all thirteen policies present.
+        """
+        every = frozenset(
+            f'module.control.aws_iam_role_policy.authority_exec["{fn}"]'
+            for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+        )
+        # Guard the premise: this is only meaningful while the runtime really is
+        # wider than the hub trio.
+        self.assertGreater(len(every), len(self.POLICIES))
+        self.assertEqual(self.claim(every, staged=None), every)
+
+    def test_still_refuses_an_exec_policy_for_an_unknown_function(self) -> None:
+        """Widening tracks the function map; it does not open the lane up."""
+        unknown = 'module.control.aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-nope"]'
+        self.assertIsNone(self.claim({unknown}, staged=None))
+        # A known policy alongside an unknown one claims only the known address,
+        # so the unknown one falls through to the terminal rejection rather than
+        # riding along.
+        known = next(iter(self.POLICIES))
+        self.assertEqual(self.claim({known, unknown}, staged=None), frozenset({known}))
+
 
 class StandaloneExecPolicyLaneTest(unittest.TestCase):
     """The exec policies moving alone must be admissible too.

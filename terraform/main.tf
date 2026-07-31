@@ -2728,9 +2728,39 @@ data "aws_secretsmanager_secret" "billing_stripe" {
   name  = var.billing_stripe_secret_name
 }
 
+locals {
+  # The Control stack lives in its own root and state, so its table ARNs are
+  # derived here rather than read across a state boundary -- the names are
+  # canonical and the authority module asserts the same prefix form
+  # ("layerv-nhp-<environment>-control"), so a drift there fails that module's
+  # own precondition rather than silently mis-pointing this one.
+  control_identity_table_prefix = var.control_identity_environment_id != "" ? "layerv-nhp-${var.control_identity_environment_id}-control" : ""
+
+  control_identity_table_arns = var.control_identity_environment_id == "" ? [] : [
+    for name in [
+      "qurl-api-keys",
+      "qurl-customers",
+      "qurl-agent-keys",
+      "qurl-apikey-idempotency",
+      ] : format(
+      "arn:aws:dynamodb:%s:%s:table/%s-%s",
+      var.control_identity_home_region,
+      var.aws_account_id,
+      local.control_identity_table_prefix,
+      name,
+    )
+  ]
+}
+
 module "qurl_service" {
   count  = var.deploy_qurl_service ? 1 : 0
   source = "./modules/qurl-service"
+
+  # Identity store selection. Empty environment id keeps this cell's own
+  # identity tables; see variables.tf for why identity is not cell-scoped.
+  control_identity_environment_id = var.control_identity_environment_id
+  control_identity_home_region    = var.control_identity_home_region
+  control_identity_table_arns     = local.control_identity_table_arns
 
   environment = var.environment
   name_prefix = local.name_prefix

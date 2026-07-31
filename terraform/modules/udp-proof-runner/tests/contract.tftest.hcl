@@ -208,7 +208,10 @@ run "secure_ephemeral_runner_contract" {
       # inputs" with exit 127, so pin it by checksum like the AWS CLI above.
       strcontains(base64decode(aws_launch_template.runner.user_data), "cli/cli/releases/download/v2.83.0") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "a5cf6cdb40fc67751adf561126b3314044779cea81ba4f254fbe8e9a69f1676f") &&
-      strcontains(base64decode(aws_launch_template.runner.user_data), "install -m 0755 /run/udp-proof/gh_2.83.0_linux_amd64/bin/gh /usr/local/bin/gh") &&
+      # Single-quoted like every other interpolation in the template: the value
+      # is substituted by Terraform, so quoting keeps shellcheck from reading it
+      # as an unassigned shell variable while the rendered path is unchanged.
+      strcontains(base64decode(aws_launch_template.runner.user_data), "install -m 0755 '/run/udp-proof/gh_2.83.0_linux_amd64/bin/gh' /usr/local/bin/gh") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "retry_command /opt/actions-runner/bin/installdependencies.sh") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "imds_token=\"$(retry_command curl") &&
       strcontains(base64decode(aws_launch_template.runner.user_data), "X-aws-ec2-metadata-token-ttl-seconds: 300") &&
