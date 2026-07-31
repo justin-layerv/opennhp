@@ -69,8 +69,19 @@ echo ""
 # 2. Check NHP Server
 echo "2. NHP Server"
 echo "-------------"
+# The public assigned-cell server NLB is named "<prefix>-edge" when the public
+# UDP source fence is enabled and "<prefix>-nlb" when it is not -- see
+# local.server_nlb_name in terraform/modules/compute/main.tf. This check only
+# knew the unfenced "-nlb" spelling, so it reported the NLB missing on every
+# fenced deploy even though the load balancer was present and healthy.
+#
+# Match either spelling, and require internet-facing so the internal NLB
+# ("<prefix>-srv-int") can never quietly satisfy a check about the PUBLIC path.
+# The substring anchors are exact enough that sibling balancers do not collide:
+# "<prefix>-ac-nlb", "<prefix>-hub-edge", and "<prefix>-cell1-edge" contain
+# neither "nhp-${ENV}-nlb" nor "nhp-${ENV}-edge".
 NHP_NLB=$(run_aws elbv2 describe-load-balancers \
-    --query "LoadBalancers[?contains(LoadBalancerName, 'nhp-${ENV}-nlb')].DNSName | [0]" \
+    --query "LoadBalancers[?Scheme=='internet-facing' && (contains(LoadBalancerName, 'nhp-${ENV}-edge') || contains(LoadBalancerName, 'nhp-${ENV}-nlb'))].DNSName | [0]" \
     --output text 2>/dev/null || true)
 
 if [ -n "$NHP_NLB" ] && [ "$NHP_NLB" != "None" ]; then
