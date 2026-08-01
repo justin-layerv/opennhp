@@ -215,21 +215,6 @@ const (
 	// (there is no authenticated agent to encrypt one for); auth REJECTS after
 	// the inner decrypt are delivered as acks and counted by MetricAuthFailure.
 	MetricRelayForwardReject = "RelayForwardReject"
-	// MetricRelayOTP counts relayed NHP_OTP inner packets that passed the
-	// Connector lifecycle ingress-rejection gate and were handed to dispatchOTP.
-	// Exact Connector registration intent is instead silently dropped and counted
-	// by MetricConnectorRegistrationIngressRejected while that composition is
-	// configured. For the remaining generic/legacy relay path, OTP is
-	// fire-and-forget and this counter is incremented before dispatchOTP, so it
-	// includes every downstream outcome, including a rate-limited drop. A shed
-	// relayed OTP therefore ticks both this and MetricOTPRejectRateLimited.
-	MetricRelayOTP = "RelayOTP"
-	// MetricRelayRegister counts relayed NHP_REG inner packets that passed the
-	// Connector lifecycle ingress-rejection gate and reached the generic register
-	// dispatch (buildRegisterAck). Exact Connector registration intent is counted
-	// by MetricConnectorRegistrationIngressRejected instead. Generic REG always
-	// produces a RAK reply wrapped in an authenticated RelayReturnMsg.
-	MetricRelayRegister = "RelayRegister"
 	// MetricOTPRejectRateLimited counts native-UDP OTP requests (including
 	// Connector registration) and generic requests on non-direct ingress dropped
 	// by the pre-plugin OTP rate limiter (agent_otp_ratelimit.go) before the
@@ -237,9 +222,8 @@ const (
 	// rejected before the limiter and counted by
 	// MetricConnectorRegistrationIngressRejected. A non-zero rate means a
 	// per-key or aggregate OTP flood is being shed at the server.
-	// NOTE: deliberately NOT prefixed "Relay" (unlike MetricRelayOTP/
-	// MetricRelayRegister, which are relay-path only) because it ticks for a
-	// direct-UDP OTP as well as an admitted relayed one.
+	// This is deliberately not relay-prefixed because it is a native/direct-UDP
+	// metric; browser relay lifecycle requests are rejected at admission.
 	MetricOTPRejectRateLimited      = "OTPRejectRateLimited"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
 	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's

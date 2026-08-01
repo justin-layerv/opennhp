@@ -74,17 +74,6 @@ func (h *Handler) HandleDirect(ctx context.Context, raw, authenticatedPeer []byt
 	return h.handleDecodedCompletion(ctx, request, rejection, err), true
 }
 
-// RejectRelayedCompletion recognizes the same exact intent without decoding
-// recovery secrets into Go strings. Relay has no Authority capability, so every
-// routed form returns the fixed invalid-request LRT and no attacker-controlled
-// value can influence the response.
-func RejectRelayedCompletion(raw []byte) ([]byte, bool) {
-	if !routeCompletionIntent(raw) {
-		return nil, false
-	}
-	return completionInvalidRequestBody(), true
-}
-
 func (h *Handler) handleDecodedCompletion(
 	ctx context.Context,
 	request CompletionRequest,

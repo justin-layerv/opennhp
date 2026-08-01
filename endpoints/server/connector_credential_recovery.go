@@ -40,7 +40,6 @@ const (
 	MetricConnectorCredentialRecoveryResponseRejected  = "ConnectorCredentialRecoveryResponseRejected"
 	MetricConnectorCredentialRecoveryAuthorityRejected = "ConnectorCredentialRecoveryAuthorityRejected"
 	MetricConnectorCredentialRecoveryInternalFailure   = "ConnectorCredentialRecoveryInternalFailure"
-	MetricConnectorCredentialRecoveryRelayRejected     = "ConnectorCredentialRecoveryRelayRejected"
 )
 
 type credentialRecoveryDirectHandler interface {
@@ -164,25 +163,6 @@ func (s *UdpServer) recordCredentialRecoveryOutcome(classification connectorcell
 		metric = MetricConnectorCredentialRecoveryAuthorityRejected
 	}
 	s.metrics.IncrCounter(metric)
-}
-
-func (s *UdpServer) rejectRelayedCredentialRecovery(raw []byte) ([]byte, bool) {
-	// The relay guard is part of the same opt-in composition as direct recovery.
-	// With no configured handler the entire feature stays dark and generic LST
-	// behavior remains byte-for-byte unchanged.
-	if s.credentialRecoveryHandler == nil {
-		return nil, false
-	}
-	body, handled := connectorcell.RejectRelayedCompletion(raw)
-	if !handled {
-		return nil, false
-	}
-	clear(raw)
-	if s.observeRelayedCredentialRecoveryBodyCleared != nil {
-		s.observeRelayedCredentialRecoveryBodyCleared(raw)
-	}
-	s.metrics.IncrCounter(MetricConnectorCredentialRecoveryRelayRejected)
-	return body, true
 }
 
 func (s *UdpServer) forwardCredentialRecoveryToTransaction(

@@ -173,11 +173,6 @@ func TestNHPRVAHeaderType_ServerReachability(t *testing.T) {
 // unauthenticated HTTP client can bounce at a server, so the matrix is pinned
 // exhaustively: every type NOT explicitly allowed must be rejected.
 //
-// NHP_OTP and NHP_RAK are the agent self-registration additions (N1): the
-// relay must precheck-accept client-POSTed NHP_OTP requests (fire-and-forget
-// per the CSA NHP spec — no reply ever returns) and the NHP_RAK acks a server
-// sends back for a relayed NHP_REG.
-//
 // The loop bound is the nhpHeaderTypeStrings table, so a future header type
 // appended to the const block (and its string entry) lands in this matrix
 // automatically with want=false — the fail-closed default a new type should
@@ -189,15 +184,10 @@ func TestNHPRelayRecvHeaderType_AllowlistMatrix(t *testing.T) {
 	// before consulting CheckRecvHeaderType ("NHP_KPL is handled elsewhere"),
 	// so the gate itself reports false for it.
 	allowed := map[int]bool{
-		NHP_REG: true, // agent→server register request (client-POSTed)
 		NHP_KNK: true, // agent→server knock (client-POSTed)
 		NHP_ACK: true, // server→agent knock ack (reply path)
-		NHP_LST: true, // agent→server list request (client-POSTed)
-		NHP_LRT: true, // server→agent list result (reply path)
 		NHP_COK: true, // server→agent cookie (reply path)
 		NHP_RKN: true, // agent→server reknock (client-POSTed)
-		NHP_OTP: true, // agent→server OTP request (client-POSTed, no reply)
-		NHP_RAK: true, // server→agent register ack (reply path)
 		NHP_EXT: true, // agent→server disconnect (client-POSTed)
 	}
 
@@ -215,16 +205,6 @@ func TestNHPRelayRecvHeaderType_AllowlistMatrix(t *testing.T) {
 		t.Error("NHP_RELAY CheckRecvHeaderType unexpectedly admits native-only DHP_KNK")
 	}
 
-	// The sender identities of the two newly relay-permitted types are
-	// unchanged by the allowlist edit; pin them here so the registration wire
-	// contract (agent sends NHP_OTP, server sends NHP_RAK) is asserted next to
-	// the gate that now lets them transit the relay.
-	if got := HeaderTypeToDeviceType(NHP_OTP); got != NHP_AGENT {
-		t.Errorf("HeaderTypeToDeviceType(NHP_OTP) = %d, want NHP_AGENT (%d)", got, NHP_AGENT)
-	}
-	if got := HeaderTypeToDeviceType(NHP_RAK); got != NHP_SERVER {
-		t.Errorf("HeaderTypeToDeviceType(NHP_RAK) = %d, want NHP_SERVER (%d)", got, NHP_SERVER)
-	}
 }
 
 func TestIsForwardableKnockType(t *testing.T) {

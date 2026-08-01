@@ -10,7 +10,7 @@
 //     the relay inspects only bounded cleartext header metadata for admission.
 //   - The OUTER NHP_RLY is encrypted relay<->server (Noise IK); the relay must
 //     be a registered NHP_RELAY peer on the server (relay.toml). The server
-//     wraps its opaque inner ACK/COK/RAK in an authenticated RelayReturnMsg;
+//     wraps its opaque inner ACK/COK in an authenticated RelayReturnMsg;
 //     the relay validates the server key and dispatches by a random RequestID.
 //   - SourceAddr — the client IP the server opens the AC pinhole for — is the
 //     ONLY trusted source of that IP. HTTPS defaults to the TCP peer;
@@ -60,10 +60,6 @@ import (
 // (recordShed below), so the relay's first metric is consistent with the rest
 // of the fleet rather than a parallel convention.
 const MetricRelayShed = "RelayShed"
-
-// MetricRelayOTPForward counts successfully forwarded fire-and-forget HTTPS
-// OTP requests.
-const MetricRelayOTPForward = "RelayOTPForward"
 
 // MetricRelayReturnServerMismatch counts authenticated returns whose random
 // request ID is active but bound to a different configured server. Delivery is
@@ -669,23 +665,6 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if innerType == core.NHP_OTP {
-		// OTP is fire-and-forget, so this ID is intentionally unreserved: there
-		// is no response waiter or return that could collide with an active ID.
-		requestID, err := common.NewRelayRequestID()
-		if err != nil {
-			http.Error(w, "relay unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if err := rs.forward(srv, sourceAddr, inner, requestID); err != nil {
-			log.Error("relay: OTP forward to %s failed: %v", srv.name, err)
-			http.Error(w, "forward failed", http.StatusBadGateway)
-			return
-		}
-		rs.metrics.IncrCounter(MetricRelayOTPForward)
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
 	// Reserve and populate the exact waiter atomically so request-ID collision
 	// detection and return dispatch share one lifecycle map and one lock.
 	respCh := make(chan []byte, 1)
@@ -950,7 +929,7 @@ func (rs *RelayServer) decodeRelayReturn(raw []byte, from *net.UDPAddr) (string,
 // NHP_RELAY receive gate in lockstep; the union invariant is tested below.
 func relayReturnTypeAllowed(headerType int) bool {
 	switch headerType {
-	case core.NHP_ACK, core.NHP_COK, core.NHP_RAK, core.NHP_LRT:
+	case core.NHP_ACK, core.NHP_COK:
 		return true
 	default:
 		return false
@@ -959,7 +938,7 @@ func relayReturnTypeAllowed(headerType int) bool {
 
 func httpsAgentTypeAllowed(headerType int) bool {
 	switch headerType {
-	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.NHP_OTP, core.NHP_REG, core.NHP_LST:
+	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT:
 		return true
 	default:
 		return false
@@ -1003,6 +982,16 @@ func (rs *RelayServer) innerType(raw []byte) (int, error) {
 	defer rs.device.ReleasePoolPacket(pkt)
 	copy(pkt.Buf[:len(raw)], raw)
 	pkt.Content = pkt.Buf[:len(raw)]
+	// Lifecycle types are deliberately absent from the NHP_RELAY device
+	// receive allowlist. Parse only their canonical cleartext header/size here
+	// so the HTTPS boundary can reject them explicitly (and emit the
+	// provenance-bound retirement proof) before waiter reservation or
+	// forwarding. No lifecycle packet reaches the relay device or crypto path.
+	headerType, payloadSize := pkt.HeaderTypeAndSize()
+	if proofLifecycleMessageType(headerType) != "" &&
+		len(pkt.Content) == pkt.Header().Size()+payloadSize {
+		return headerType, nil
+	}
 	headerType, _, err := rs.device.RecvPrecheck(pkt)
 	if err != nil {
 		return 0, err
@@ -1167,7 +1156,7 @@ func (rs *RelayServer) deriveSourceAddr(r *http.Request) *net.UDPAddr {
 const maxInnerPacketSize = core.PacketBufferSize
 
 // maxAckPacketSize is the receive bound for the authenticated server return
-// envelope carrying an opaque ACK/COK/RAK/LRT. The inner packet remains capped
+// envelope carrying an opaque ACK/COK. The inner packet remains capped
 // at one standard pool buffer; only the authenticated outer envelope gets the
 // dedicated larger bound.
 const maxAckPacketSize = core.RelayPacketBufferSize

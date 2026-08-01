@@ -1,9 +1,6 @@
 package agent
 
 import (
-	"fmt"
-	"sync"
-
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -16,60 +13,17 @@ func Version() string {
 	return PluginID + " v" + version
 }
 
-// Package-level registration state, initialized exactly once by Init. Mirrors
-// the qURL plugin's main.go pattern (a package-level resolver + sync.Once): the
-// host server may call Init more than once (New() is invoked lazily per aspId
-// load), so the sync.Once makes construction idempotent and thread-safe. Only
-// reg + initErr are package-level (the loaded Config is Init-local, matching the
-// qURL plugin where cfg does not escape Init):
-//
-//   - reg is the qurl-service HTTP client, constructed ONLY when enabled; it
-//     stays nil when the feature is disabled/misconfigured, so RequestOTP/
-//     RegisterAgent short-circuit to the disabled verdict without any network.
-//   - initErr latches a config error so every RequestOTP/RegisterAgent on a
-//     misconfigured (enabled-but-incomplete) server fails closed consistently
-//     rather than nil-derefing the registrar.
-var (
-	initOnce sync.Once
-	reg      *registrar
-	initErr  error
-)
-
-// Init loads the agent-registration config and, when the feature is enabled,
-// constructs the qurl-service registrar exactly once. Fail-fast: an
-// enabled-but-incomplete configuration (missing QURL_API_URL /
-// QURL_SERVICE_TOKEN, or a non-http(s) URL) latches initErr here so it surfaces
-// at server boot rather than at the first agent OTP.
-//
-// When the feature is DISABLED (the default), LoadConfig returns a non-error
-// disabled config and no registrar is built — the plugin loads inert. This is
-// what keeps this PR shipping dark until ops flips AGENT_OTP_REGISTRATION_ENABLED.
+// Init retains the static-plugin lifecycle hook. Native Connector
+// registration is handled by the assigned-cell composition before plugin
+// dispatch; this plugin owns only registered-agent knock admission.
 func Init(in *plugins.PluginParamsIn) error {
 	_ = in // unused but required by the plugin interface
-
-	initOnce.Do(func() {
-		cfg, err := LoadConfig()
-		if err != nil {
-			initErr = fmt.Errorf("[AGENT] failed to initialize: %w", err)
-			return
-		}
-		if !cfg.Enabled {
-			log.Info("[AGENT] Plugin initialized: %s (NHP-native registration DISABLED — set AGENT_OTP_REGISTRATION_ENABLED to enable)", Version())
-			return
-		}
-		reg = newRegistrar(cfg)
-		log.Info("[AGENT] Plugin initialized: %s (NHP-native registration ENABLED)", Version())
-	})
-
-	return initErr
+	log.Info("[AGENT] Plugin initialized: %s (registered-agent knock admission)", Version())
+	return nil
 }
 
-// Close releases the registrar's pooled connections. Defensive nil checks: Close
-// may run even if Init failed or the feature is disabled (reg is nil then).
+// Close implements the static-plugin lifecycle. The plugin owns no resources.
 func Close() error {
-	if reg != nil {
-		reg.Close()
-	}
 	return nil
 }
 

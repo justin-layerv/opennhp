@@ -384,29 +384,10 @@ func isConnectorRegistrationIntent(body []byte, operation connectorRegistrationO
 	}
 }
 
-// rejectConnectorRegistrationOutsideDirectUDP keeps enrollment on the assigned
-// cell's authenticated native UDP ingress. While the composition is active,
-// exact Connector OTP, REG, and completion intents from relay, WebRTC, unknown,
-// or future transports are claimed and silently dropped before either Authority
-// or the legacy permissive plugin path. Other ASPs are left untouched until the
-// separately staged relay retirement removes that old generic lifecycle surface.
-func (s *UdpServer) rejectConnectorRegistrationOutsideDirectUDP(
-	ppd *core.PacketParserData,
-	operation connectorRegistrationOperation,
-) bool {
-	if s.connectorRegistrationHandler == nil || ppd == nil {
-		return false
-	}
-	if !isConnectorRegistrationIntent(ppd.BodyMessage, operation) {
-		return false
-	}
-	return s.rejectClaimedConnectorRegistrationOutsideDirectUDP(ppd)
-}
-
 // rejectClaimedConnectorRegistrationOutsideDirectUDP is the transport-only
-// counterpart for callers that have already matched an exact registration
-// intent. Relay callers use rejectConnectorRegistrationOutsideDirectUDP so
-// unclaimed legacy traffic still reaches the existing plugin path.
+// counterpart for a caller that has already matched an exact registration
+// intent. Browser relay lifecycle traffic is rejected unconditionally by the
+// relay boundary and never reaches this handler.
 func (s *UdpServer) rejectClaimedConnectorRegistrationOutsideDirectUDP(
 	ppd *core.PacketParserData,
 ) bool {

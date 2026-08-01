@@ -182,8 +182,11 @@ func TestAllowUnregisteredAgentLSTIsIgnoredByNonServerReceiver(t *testing.T) {
 	relayPPD, err := relay.parse(t, relay.packet, time.Now().UnixNano())
 	if relayPPD != nil {
 		defer relayPPD.Destroy()
+		t.Fatal("NHP_RELAY admitted retired lifecycle NHP_LST")
 	}
-	assertNHPError(t, err, ErrPeerNotFound)
+	if err == nil {
+		t.Fatal("NHP_RELAY accepted NHP_LST when only the server may receive it")
+	}
 
 	fixture := newConnectorHubAdmissionFixture(t, NHP_AC, NHP_LST, DeviceOptions{AllowUnregisteredAgentLST: true})
 	pkt := &Packet{Content: bytes.Clone(fixture.packet), HeaderType: NHP_LST}

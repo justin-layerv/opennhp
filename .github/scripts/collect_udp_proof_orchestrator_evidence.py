@@ -91,7 +91,10 @@ REVIEWED_INTERFACES: tuple[dict[str, Any], ...] = (
         "path": "endpoints/relay/relay.go",
         "role": "legacy_registrar",
         "lifecycle_message_types": ["NHP_LST", "NHP_OTP", "NHP_REG"],
-        "anchor": "func httpsAgentTypeAllowed(headerType int) bool {",
+        "anchor": (
+            "case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, "
+            "core.NHP_OTP, core.NHP_REG, core.NHP_LST:"
+        ),
         "unused_guard": {
             "path": "endpoints/server/relay.go",
             "anchor": "rejectConnectorRegistrationOutsideDirectUDP",
@@ -102,7 +105,7 @@ REVIEWED_INTERFACES: tuple[dict[str, Any], ...] = (
         "path": "endpoints/relay/relay.go",
         "role": "legacy_registrar",
         "lifecycle_message_types": ["NHP_LRT", "NHP_RAK"],
-        "anchor": "func relayReturnTypeAllowed(headerType int) bool {",
+        "anchor": "case core.NHP_ACK, core.NHP_COK, core.NHP_RAK, core.NHP_LRT:",
         "unused_guard": {
             "path": "endpoints/server/relay.go",
             "anchor": "rejectConnectorRegistrationOutsideDirectUDP",
@@ -147,7 +150,16 @@ class OrchestratorEvidenceError(orchestrator.OrchestratorContractError):
     """A live orchestrator observation is unavailable or not authoritative."""
 
 
-def _run_bounded(command: list[str], name: str) -> bytes:
+class SourceBlobAbsent(OrchestratorEvidenceError):
+    """The contents API authoritatively reported a reviewed blob absent."""
+
+
+def _run_bounded(
+    command: list[str],
+    name: str,
+    *,
+    allow_not_found: bool = False,
+) -> bytes | None:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             command,
@@ -158,14 +170,31 @@ def _run_bounded(command: list[str], name: str) -> bytes:
     except (OSError, subprocess.SubprocessError) as exc:
         raise OrchestratorEvidenceError(f"could not run {name}") from exc
     if completed.returncode != 0:
+        if allow_not_found:
+            try:
+                error = json.loads(completed.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                error = None
+            if (
+                isinstance(error, dict)
+                and error.get("message") == "Not Found"
+                and str(error.get("status")) == "404"
+            ):
+                return None
         raise OrchestratorEvidenceError(f"{name} failed")
     if not completed.stdout or len(completed.stdout) > API_RESPONSE_MAX_BYTES:
         raise OrchestratorEvidenceError(f"{name} returned an out-of-bounds response")
     return completed.stdout
 
 
-def _gh_json(path: str, name: str) -> Any:
-    raw = _run_bounded(["gh", "api", "--method", "GET", path], name)
+def _gh_json(path: str, name: str, *, allow_not_found: bool = False) -> Any:
+    raw = _run_bounded(
+        ["gh", "api", "--method", "GET", path],
+        name,
+        allow_not_found=allow_not_found,
+    )
+    if raw is None:
+        return None
     try:
         return json.loads(
             raw.decode("utf-8"),
@@ -470,7 +499,13 @@ def read_blob(repository: str, path: str, ref: str) -> bytes:
 
     deployment._sha(ref, f"{repository} ref")
     name = f"{repository} contents {path}@{ref}"
-    value = _gh_json(f"repos/{repository}/contents/{path}?ref={ref}", name)
+    value = _gh_json(
+        f"repos/{repository}/contents/{path}?ref={ref}",
+        name,
+        allow_not_found=True,
+    )
+    if value is None:
+        raise SourceBlobAbsent(f"{name} is absent")
     if not isinstance(value, dict):
         raise OrchestratorEvidenceError(f"{name} is not a single file object")
     if value.get("type") != "file" or value.get("path") != path:
@@ -533,7 +568,7 @@ def parse_message_type_wire_values(blob: bytes) -> dict[str, int]:
 
 
 def observe_interfaces(
-    blobs: dict[str, bytes],
+    blobs: dict[str, bytes | None],
 ) -> list[dict[str, Any]]:
     """Turn the reviewed inventory into observed rows at the deployed revision."""
 
@@ -541,7 +576,7 @@ def observe_interfaces(
     for reviewed in REVIEWED_INTERFACES:
         path = reviewed["path"]
         blob = blobs[path]
-        present = reviewed["anchor"].encode("utf-8") in blob
+        present = blob is not None and reviewed["anchor"].encode("utf-8") in blob
         guard = reviewed["unused_guard"]
         state = "present" if present else "absent"
         if reviewed["role"] == "native_runtime":
@@ -553,12 +588,18 @@ def observe_interfaces(
             # A still-deployed legacy entry point counts as unused only while
             # its reviewed fail-closed fence is also present at this revision.
             guard_blob = blobs[guard["path"]]
+            if guard_blob is None:
+                raise OrchestratorEvidenceError(
+                    f"required legacy guard source {guard['path']} is absent"
+                )
             dispatches = guard["anchor"].encode("utf-8") not in guard_blob
         observed.append(
             {
                 "symbol": reviewed["symbol"],
                 "path": path,
-                "path_sha256": hashlib.sha256(blob).hexdigest(),
+                "path_sha256": (
+                    hashlib.sha256(blob).hexdigest() if blob is not None else None
+                ),
                 "role": reviewed["role"],
                 "state": state,
                 "lifecycle_message_types": list(reviewed["lifecycle_message_types"]),
@@ -693,9 +734,24 @@ def build(
         for reviewed in REVIEWED_INTERFACES
         if reviewed["unused_guard"] is not None
     )
-    blobs = {
-        path: read_blob_fn(NHP_REPOSITORY, path, nhp_sha) for path in sorted(paths)
+    removable_legacy_paths = {
+        path
+        for path in paths
+        if any(reviewed["path"] == path for reviewed in REVIEWED_INTERFACES)
+        and all(
+            reviewed["role"] == "legacy_registrar"
+            for reviewed in REVIEWED_INTERFACES
+            if reviewed["path"] == path
+        )
     }
+    blobs: dict[str, bytes | None] = {}
+    for path in sorted(paths):
+        try:
+            blobs[path] = read_blob_fn(NHP_REPOSITORY, path, nhp_sha)
+        except SourceBlobAbsent:
+            if path not in removable_legacy_paths:
+                raise
+            blobs[path] = None
     packet_blob = read_blob_fn(
         NHP_REPOSITORY, orchestrator.MESSAGE_TYPE_SOURCE_PATH, nhp_sha
     )

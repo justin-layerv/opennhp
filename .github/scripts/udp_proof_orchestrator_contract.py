@@ -769,13 +769,20 @@ def _validate_interface(
     )
     _string(item["symbol"], f"{name}.symbol")
     _repository_path(item["path"], f"{name}.path")
-    _sha256(item["path_sha256"], f"{name}.path_sha256")
     role = item["role"]
     if role not in SURFACE_ROLES:
         raise OrchestratorContractError(f"{name}.role is not an allowed role")
     state = item["state"]
     if state not in SURFACE_STATES:
         raise OrchestratorContractError(f"{name}.state is not an allowed state")
+    path_sha256 = item["path_sha256"]
+    if path_sha256 is None:
+        if role != "legacy_registrar" or state != "absent":
+            raise OrchestratorContractError(
+                f"{name}.path_sha256 may be null only for an absent legacy source"
+            )
+    else:
+        _sha256(path_sha256, f"{name}.path_sha256")
     types = item["lifecycle_message_types"]
     if (
         not isinstance(types, list)

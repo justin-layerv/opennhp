@@ -960,22 +960,19 @@ func TestConnectorRegistrationRelayedLifecycleRejectedBeforeAuthorityOrPlugins(t
 			server.device = serverDev
 			server.listenConn = serverListen
 			server.relayPeerMap = make(map[string]*core.UdpPeer)
-			wiped := false
-			server.observeConnectorRegistrationRejectedBodyCleared = func(body []byte) { wiped = allZero(body) }
-
 			inner := encryptRawInnerForRelay(
 				t, agentDev, decodeBase64PubKey(serverDev.PublicKeyBase64()), test.headerType, 611, test.body,
 			)
 			outer, _, _ := buildRealRelayForwardOuterPpd(t, server, relayListen.LocalAddr().(*net.UDPAddr), inner, nil)
 			server.HandleRelayForward(outer)
 
-			if authority.callCount(test.operation) != 0 || plugin.otpCalls+plugin.regCalls+plugin.listCalls != 0 || !wiped {
-				t.Fatalf("authority=%d plugins=%d wiped=%v", authority.callCount(test.operation),
-					plugin.otpCalls+plugin.regCalls+plugin.listCalls, wiped)
+			if authority.callCount(test.operation) != 0 || plugin.otpCalls+plugin.regCalls+plugin.listCalls != 0 {
+				t.Fatalf("authority=%d plugins=%d", authority.callCount(test.operation),
+					plugin.otpCalls+plugin.regCalls+plugin.listCalls)
 			}
 			counters, _ := server.metrics.CountersForTest(t)
-			if counters[MetricConnectorRegistrationIngressRejected] != 1 ||
-				counters[MetricRelayOTP] != 0 || counters[MetricRelayRegister] != 0 {
+			if counters[MetricRelayForwardReject] != 1 ||
+				counters[MetricConnectorRegistrationIngressRejected] != 0 {
 				t.Fatalf("relay rejection counters=%v", counters)
 			}
 			if err := relayListen.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
@@ -1079,7 +1076,7 @@ func TestConnectorRegistrationNonDirectIngressFailsClosed(t *testing.T) {
 	}
 }
 
-func TestConnectorRegistrationConfiguredRelayLeavesOtherASPOnPluginPath(t *testing.T) {
+func TestConnectorRegistrationConfiguredRelayRejectsOtherASPLifecycle(t *testing.T) {
 	_, vectors, _, _, _, _ := connectorRegistrationFixture(t)
 	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x92, &core.DeviceOptions{DisableAgentPeerValidation: true})
 	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x91, nil)
@@ -1095,7 +1092,11 @@ func TestConnectorRegistrationConfiguredRelayLeavesOtherASPOnPluginPath(t *testi
 	inner := encryptRawInnerForRelay(t, agentDev, decodeBase64PubKey(serverDev.PublicKeyBase64()), core.NHP_OTP, 621, body)
 	outer, _, _ := buildRealRelayForwardOuterPpd(t, server, relayListen.LocalAddr().(*net.UDPAddr), inner, nil)
 	server.HandleRelayForward(outer)
-	if plugin.otpCalls != 1 || !bytes.Equal(plugin.otpGot.RawBody, body) {
-		t.Fatalf("generic plugin calls=%d body=%q", plugin.otpCalls, plugin.otpGot.RawBody)
+	if plugin.otpCalls != 0 {
+		t.Fatalf("generic plugin calls=%d, want 0", plugin.otpCalls)
+	}
+	counters, _ := server.metrics.CountersForTest(t)
+	if counters[MetricRelayForwardReject] != 1 {
+		t.Fatalf("relay rejection counters=%v", counters)
 	}
 }

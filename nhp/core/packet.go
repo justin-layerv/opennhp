@@ -320,7 +320,7 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 		// DHP_KNK is intentionally absent. DHP is supported only on the native
 		// UDP/62206 path; allowing it here would also widen the unauthenticated
 		// HTTPS relay allowlist used by innerType.
-		case NHP_REG, NHP_KNK, NHP_ACK, NHP_LST, NHP_LRT, NHP_COK, NHP_RKN, NHP_OTP, NHP_RAK, NHP_EXT:
+		case NHP_KNK, NHP_ACK, NHP_COK, NHP_RKN, NHP_EXT:
 			return true
 		}
 

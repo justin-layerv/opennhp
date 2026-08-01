@@ -334,44 +334,6 @@ func TestHandleListRequestLateMalformedRecoveryIsDeadlineWithNoReply(t *testing.
 	}
 }
 
-func TestRelayCredentialRecoveryRejectsWithoutAuthorityAndWipesOnlyHandledBodies(t *testing.T) {
-	t.Parallel()
-	_, _, valid, _ := recoveryFixture(t)
-	authority := &capturingRecoveryAuthority{}
-	server := recoveryServer(t, authority)
-	want, err := connectorcell.EncodeCompletionError(connectorcell.CompletionErrorInvalidRequest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, request := range [][]byte{
-		bytes.Clone(valid),
-		[]byte(strings.Replace(string(valid), `"query":"agent_credential_recovery"`, `"query":"ordinary","query":"agent_credential_recovery"`, 1)),
-	} {
-		body, handled := server.rejectRelayedCredentialRecovery(request)
-		if !handled || !bytes.Equal(body, want) || authority.callCount() != 0 || !allZero(request) {
-			t.Fatalf("body=%q handled=%v calls=%d wiped=%v", body, handled, authority.callCount(), allZero(request))
-		}
-	}
-	ordinary := []byte(strings.Replace(string(valid), `"query":"agent_credential_recovery"`, `"query":"ordinary"`, 1))
-	wantOrdinary := bytes.Clone(ordinary)
-	if body, handled := server.rejectRelayedCredentialRecovery(ordinary); handled || body != nil || !bytes.Equal(ordinary, wantOrdinary) {
-		t.Fatalf("ordinary body=%q handled=%v request=%q", body, handled, ordinary)
-	}
-}
-
-func TestRelayCredentialRecoveryIsDarkAndUntouchedWithoutConfiguration(t *testing.T) {
-	t.Parallel()
-	_, _, request, _ := recoveryFixture(t)
-	want := bytes.Clone(request)
-	server := &UdpServer{metrics: metrics.NewPublisherForTest(t)}
-	if body, handled := server.rejectRelayedCredentialRecovery(request); handled || body != nil {
-		t.Fatalf("dark relay recovery body=%q handled=%v", body, handled)
-	}
-	if !bytes.Equal(request, want) {
-		t.Fatal("dark relay path modified generic LST bytes")
-	}
-}
-
 func TestHandleListRequestRecoveryBypassesGenericPluginAndPreservesQueuedLRT(t *testing.T) {
 	t.Parallel()
 	vectors, peer, request, privateResponse := recoveryFixture(t)

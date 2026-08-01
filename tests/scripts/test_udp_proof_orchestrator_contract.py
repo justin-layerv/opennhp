@@ -48,7 +48,29 @@ def local_blob_reader(surface_bytes: bytes | None = None):
                 raise collector.OrchestratorEvidenceError(f"unexpected path {path}")
             return surface
         if repository == collector.NHP_REPOSITORY:
-            return (ROOT / path).read_bytes()
+            try:
+                blob = (ROOT / path).read_bytes()
+            except FileNotFoundError:
+                blob = b""
+            # Producer fixtures model the deployed pre-removal revision even
+            # after this branch removes the reviewed legacy declarations.
+            anchors = [
+                reviewed["anchor"]
+                for reviewed in collector.REVIEWED_INTERFACES
+                if reviewed["role"] == "legacy_registrar"
+                and reviewed["path"] == path
+            ]
+            guards = [
+                reviewed["unused_guard"]["anchor"]
+                for reviewed in collector.REVIEWED_INTERFACES
+                if reviewed["unused_guard"] is not None
+                and reviewed["unused_guard"]["path"] == path
+            ]
+            if anchors or guards:
+                blob += ("\n".join([*anchors, *guards]) + "\n").encode()
+            if not blob:
+                raise collector.SourceBlobAbsent(f"{path} is absent")
+            return blob
         expected = {
             (
                 orchestrator.GENERATED_ARTIFACT_REPOSITORIES[repository_key],
@@ -218,10 +240,18 @@ class ReviewedContractLockstepTest(unittest.TestCase):
         ) in orchestrator.RETIRED_MESSAGE_TYPE_WIRE_VALUES.items():
             self.assertEqual(wire_values[message_type], expected, message_type)
 
-    def test_every_reviewed_anchor_still_exists_in_the_working_tree(self) -> None:
+    def test_working_tree_has_removed_legacy_anchors_but_kept_native_anchors(
+        self,
+    ) -> None:
         for reviewed in collector.REVIEWED_INTERFACES:
             with self.subTest(symbol=reviewed["symbol"]):
-                blob = (ROOT / reviewed["path"]).read_bytes()
+                try:
+                    blob = (ROOT / reviewed["path"]).read_bytes()
+                except FileNotFoundError:
+                    blob = b""
+                if reviewed["role"] == "legacy_registrar":
+                    self.assertNotIn(reviewed["anchor"].encode("utf-8"), blob)
+                    continue
                 self.assertIn(reviewed["anchor"].encode("utf-8"), blob)
                 guard = reviewed["unused_guard"]
                 if guard is None:
@@ -287,22 +317,33 @@ class MessageTypeParserTest(unittest.TestCase):
 
 
 class InterfaceObservationTest(unittest.TestCase):
-    def blobs(self) -> dict[str, bytes]:
+    def blobs(self) -> dict[str, bytes | None]:
         paths = {reviewed["path"] for reviewed in collector.REVIEWED_INTERFACES}
         paths.update(
             reviewed["unused_guard"]["path"]
             for reviewed in collector.REVIEWED_INTERFACES
             if reviewed["unused_guard"] is not None
         )
-        return {path: (ROOT / path).read_bytes() for path in sorted(paths)}
+        blobs: dict[str, bytes | None] = {}
+        for path in sorted(paths):
+            try:
+                blobs[path] = (ROOT / path).read_bytes()
+            except FileNotFoundError:
+                blobs[path] = None
+        return blobs
 
-    def test_fenced_legacy_entry_points_are_deployed_but_unused(self) -> None:
+    def test_retired_legacy_entry_points_are_absent_and_native_runtime_remains(
+        self,
+    ) -> None:
         observed = collector.observe_interfaces(self.blobs())
         by_symbol = {item["symbol"]: item for item in observed}
         for reviewed in collector.REVIEWED_INTERFACES:
             item = by_symbol[reviewed["symbol"]]
             with self.subTest(symbol=reviewed["symbol"]):
-                self.assertEqual(item["state"], "present")
+                self.assertEqual(
+                    item["state"],
+                    "present" if reviewed["role"] == "native_runtime" else "absent",
+                )
                 self.assertEqual(
                     item["dispatches_lifecycle_work"],
                     reviewed["role"] == "native_runtime",
@@ -310,6 +351,9 @@ class InterfaceObservationTest(unittest.TestCase):
 
     def test_removing_the_fence_marks_the_legacy_surface_live(self) -> None:
         blobs = self.blobs()
+        blobs["endpoints/relay/relay.go"] = (
+            collector.REVIEWED_INTERFACES[2]["anchor"].encode()
+        )
         blobs["endpoints/server/relay.go"] = b"package server\n"
         observed = collector.observe_interfaces(blobs)
         relay = next(

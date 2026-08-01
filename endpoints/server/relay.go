@@ -31,7 +31,7 @@ var (
 //
 // HandleRelayForward decrypts the inner packet with the server key (the relay
 // cannot read it — inner crypto is end-to-end agent<->server), dispatches it by
-// authenticated inner type, and encrypts ACK/COK/RAK/LRT replies for the agent
+// authenticated inner type, and encrypts ACK/COK replies for the agent
 // from that inner cipher state. It then places those still-opaque bytes in an
 // authenticated server->relay RelayReturnMsg carrying the random RequestID.
 //
@@ -130,9 +130,8 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	}
 
 	// Every relayed type needs a syntactically valid source for its synthetic
-	// connection. Only knock types are required to be publicly routable because
-	// only those types can open an AC pinhole; OTP/REG/LST also need to work from
-	// private and loopback addresses in development and same-host smoke tests.
+	// connection. Forwardable knock types are additionally required to be
+	// publicly routable because they can open an AC pinhole.
 	sourceAddr, err := validateRelaySourceAddrSyntactic(rlyMsg.SourceAddr)
 	if err != nil {
 		s.metrics.IncrCounter(MetricRelayForwardReject)
@@ -194,11 +193,9 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		return
 	}
 
-	// Browser relay carries application KNK/RKN/EXT, not Connector lifecycle.
-	// During the staged cutover, an active Connector registration composition
-	// claims its exact OTP/REG/completion intents here and drops them before
-	// Authority or legacy plugin dispatch. Other ASPs retain their existing relay
-	// behavior until the separate relay-retirement change removes that surface.
+	// Browser relay carries application KNK/RKN/EXT only. Native lifecycle
+	// messages use direct UDP; every other authenticated relay type falls
+	// through to the fixed drop below before plugin or Authority dispatch.
 	switch {
 	case core.IsForwardableKnockType(innerPpd.HeaderType):
 		if !isRoutablePublicIP(sourceAddr.IP) {
@@ -215,80 +212,11 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		// ServerDHPKnockAckMsg body; there is no separate DHP ack header constant.
 		// DHP only appraises device evidence and does not open an AC pinhole, so
 		// keep the syntactic source check without imposing the public-IP knock gate.
-	case innerPpd.HeaderType == core.NHP_OTP:
-		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationOTP) {
-			return
-		}
-		// Fire-and-forget: the relay has no pending waiter for OTP.
-		s.metrics.IncrCounter(MetricRelayOTP)
-		if otpErr := s.dispatchOTP(innerPpd); otpErr != nil {
-			keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
-			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] relayed OTP dispatch error (swallowed, fire-and-forget): %v",
-				relayAddr, sourceAddr, keyPrefix, otpErr)
-		}
-		return
-	case innerPpd.HeaderType == core.NHP_REG:
-		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationActivation) {
-			return
-		}
-		s.metrics.IncrCounter(MetricRelayRegister)
-		keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
-		rakBytes, buildErr := s.buildRegisterAck(innerPpd)
-		if buildErr != nil {
-			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] failed to build relayed RAK: %v",
-				relayAddr, sourceAddr, keyPrefix, buildErr)
-			return
-		}
-		innerReply, encryptErr := s.buildRelayInnerReply(innerPpd, core.NHP_RAK, rakBytes)
-		if encryptErr != nil {
-			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] failed to encrypt relayed RAK: %v",
-				relayAddr, sourceAddr, keyPrefix, encryptErr)
-			return
-		}
-		if returnErr := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, innerReply); returnErr != nil {
-			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] failed to return relayed RAK: %v",
-				relayAddr, sourceAddr, keyPrefix, returnErr)
-		}
-		return
-	case innerPpd.HeaderType == core.NHP_LST:
-		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationCompletion) {
-			return
-		}
-		// Native credential recovery is assigned-cell direct UDP only. Recognize
-		// exact intent (including malformed duplicate/unknown/trailing forms),
-		// wipe its decrypted body, and return one fixed 52414 without entering
-		// buildListResult or holding any Authority capability on the relay path.
-		if rejectedLRT, handled := s.rejectRelayedCredentialRecovery(innerPpd.BodyMessage); handled {
-			innerReply, encryptErr := s.buildRelayInnerReply(innerPpd, core.NHP_LRT, rejectedLRT)
-			if encryptErr != nil {
-				log.Error("server-relay(@%s src=%s)[HandleRelayForward] failed to encrypt credential-recovery rejection: %v", relayAddr, sourceAddr, encryptErr)
-				return
-			}
-			if returnErr := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, innerReply); returnErr != nil {
-				log.Error("server-relay(@%s src=%s)[HandleRelayForward] failed to return credential-recovery rejection: %v", relayAddr, sourceAddr, returnErr)
-			}
-			return
-		}
-		lrtBytes, userID, listErr := s.buildListResult(innerPpd)
-		// Logical/plugin failures are encoded in a populated LRT and must reach
-		// the agent. Nil alone means the LRT verdict could not be marshaled.
-		if lrtBytes == nil {
-			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to build relayed LRT: %v",
-				relayAddr, sourceAddr, userID, listErr)
-			return
-		}
-		innerReply, encryptErr := s.buildRelayInnerReply(innerPpd, core.NHP_LRT, lrtBytes)
-		if encryptErr != nil {
-			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to encrypt relayed LRT: %v",
-				relayAddr, sourceAddr, userID, encryptErr)
-			return
-		}
-		if returnErr := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, innerReply); returnErr != nil {
-			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to return relayed LRT: %v",
-				relayAddr, sourceAddr, userID, returnErr)
-		}
-		return
 	default:
+		clear(innerPpd.BodyMessage)
+		if s.observeRelayRejectedBodyCleared != nil {
+			s.observeRelayRejectedBodyCleared(innerPpd.BodyMessage)
+		}
 		s.metrics.IncrCounter(MetricRelayForwardReject)
 		log.Error("server-relay(@%s src=%s)[HandleRelayForward] inner packet header=%s is not a relayable type; dropping",
 			relayAddr, sourceAddr, core.HeaderTypeToString(innerPpd.HeaderType))

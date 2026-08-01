@@ -128,6 +128,21 @@ func newKnockReq(resourceId string) *common.NhpAuthRequest {
 	}
 }
 
+func TestRegistrationInterfaceMethodsFailClosed(t *testing.T) {
+	p := &Plugin{}
+
+	if err := p.RequestOTP(&common.NhpOTPRequest{}, nil); !errors.Is(err, plugins.ErrPluginNotRegistered) {
+		t.Fatalf("RequestOTP error = %v, want ErrPluginNotRegistered", err)
+	}
+	ack, err := p.RegisterAgent(&common.NhpRegisterRequest{}, nil)
+	if !errors.Is(err, plugins.ErrPluginNotRegistered) {
+		t.Fatalf("RegisterAgent error = %v, want ErrPluginNotRegistered", err)
+	}
+	if ack != nil {
+		t.Fatalf("RegisterAgent ack = %#v, want nil", ack)
+	}
+}
+
 func TestAuthWithNHP_QURLTunnelServerPlacementIsServerOwned(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(newAspWithTunnelServerAZRows(), capture, nil)

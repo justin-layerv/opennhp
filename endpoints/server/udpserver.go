@@ -296,15 +296,14 @@ type UdpServer struct {
 	// observeConnectorRegistrationRejectedBodyCleared is a TEST-ONLY SEAM proving
 	// registration secrets rejected on non-direct ingress are cleared before return.
 	observeConnectorRegistrationRejectedBodyCleared func([]byte)
+	// observeRelayRejectedBodyCleared is a TEST-ONLY SEAM proving generic
+	// authenticated-relay rejection clears decrypted bodies. Production leaves nil.
+	observeRelayRejectedBodyCleared func([]byte)
 	// credentialRecoveryHandler is the direct-UDP-only assigned-cell recovery
 	// capability. Nil is the dark, absent-configuration state. It is constructed
 	// once during Start before the listener binds and is never exposed to relay or
 	// generic plugin dispatch.
 	credentialRecoveryHandler credentialRecoveryDirectHandler
-	// observeRelayedCredentialRecoveryBodyCleared is a TEST-ONLY SEAM used to
-	// prove that the production HandleRelayForward path clears its decrypted
-	// recovery request before returning. Production leaves it nil.
-	observeRelayedCredentialRecoveryBodyCleared func([]byte)
 
 	// signals
 	signals struct {
