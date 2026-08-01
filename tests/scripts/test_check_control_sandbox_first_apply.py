@@ -13069,6 +13069,7 @@ class ComposedTransitionTest(unittest.TestCase):
         self.assertEqual(
             names,
             {
+                "provisioned-cell-status-update",
                 "hub-worker-image-update",
                 "authority-proof-enable",
                 "authority-proof-consumer-staging",
@@ -13368,3 +13369,81 @@ class DualDigestPlanModeGateTest(unittest.TestCase):
     def test_a_no_op_with_resource_changes_still_requires_refresh_only(self) -> None:
         with self.assertRaisesRegex(CHECKER.ContractError, "refresh-only"):
             self.gate("no-op", {"resource_changes": []})
+
+
+class ProvisionedCellStatusUpdateTest(unittest.TestCase):
+    """The reviewed cell-lifecycle transition, and what it must NOT admit.
+
+    Draining a cell stops the Authority placing new agents on it. That is a
+    legitimate reviewed change, but the same plan shape must never be able to
+    carry an endpoint, server-key, or weight edit: those decide where an agent
+    is sent and which server identity it trusts.
+    """
+
+    def _plan(self, cell, overrides=None):
+        # `overrides` is a dict rather than **kwargs: one of the fields under
+        # test is literally named cell_id, which collides with the parameter.
+        expected = dict(CHECKER.PROVISIONED_CELL_DYNAMODB_ITEMS[cell])
+        expected.update(overrides or {})
+        address = CHECKER.PROVISIONED_CELL_ADDRESSES[cell]
+        return {address: {"change": {"after": {"item": json.dumps(expected)}}}}
+
+    def test_status_only_update_is_admitted(self):
+        cell_id = "cell1"
+        address = CHECKER.PROVISIONED_CELL_ADDRESSES[cell_id]
+        by_address = self._plan(cell_id)
+        self.assertTrue(
+            CHECKER._claim_provisioned_cell_status_update(
+                {address}, {address: ["update"]}, by_address
+            ),
+            "a status/updated_at-only catalog update must be admitted",
+        )
+
+    def test_endpoint_or_key_edit_is_rejected(self):
+        cell_id = "cell1"
+        address = CHECKER.PROVISIONED_CELL_ADDRESSES[cell_id]
+        # DynamoDB-typed values, matching the real catalog item shape; a raw
+        # value would be rejected for the wrong reason and prove nothing.
+        for field, value in (
+            ("nhp_host", {"S": "attacker.example"}),
+            ("server_public_key_b64", {"S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}),
+            ("nhp_port", {"N": "1"}),
+            ("selection_weight", {"N": "9"}),
+            ("cell_id", {"S": "cell0"}),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    CHECKER._claim_provisioned_cell_status_update(
+                        {address}, {address: ["update"]}, self._plan(cell_id, {field: value})
+                    ),
+                    f"a {field} edit must not ride the status-update lane",
+                )
+
+    def test_replace_is_rejected(self):
+        """Only in-place updates. A replace would re-create the row."""
+        cell_id = "cell1"
+        address = CHECKER.PROVISIONED_CELL_ADDRESSES[cell_id]
+        self.assertFalse(
+            CHECKER._claim_provisioned_cell_status_update(
+                {address}, {address: ["delete", "create"]}, self._plan(cell_id)
+            )
+        )
+
+    def test_claims_only_catalog_addresses(self):
+        """The lane never claims an address outside the cell catalog.
+
+        It is composable, so it takes only what it owns; a plan carrying an
+        address that NO lane claims is rejected by composition, whose union
+        must equal `changed` exactly. Claiming the stray here instead would be
+        precisely the "widen a plan by absorbing a stray change" failure the
+        composition contract exists to prevent.
+        """
+        address = CHECKER.PROVISIONED_CELL_ADDRESSES["cell1"]
+        foreign = "module.control.aws_iam_role.something_else"
+        by_address = self._plan("cell1")
+        by_address[foreign] = {"change": {"after": {}}}
+        claimed = CHECKER._claim_provisioned_cell_status_update(
+            {address, foreign}, {address: ["update"], foreign: ["update"]}, by_address
+        )
+        self.assertEqual(claimed, frozenset({address}))
+        self.assertNotIn(foreign, claimed or frozenset())

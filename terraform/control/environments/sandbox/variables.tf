@@ -49,7 +49,7 @@ variable "ses_configuration_set_name" {
 }
 
 variable "provisioned_cells" {
-  description = "Exact reviewed sandbox native-UDP cell catalog. cell0 and cell1 are both assignable. cell1 was activated in an attended review on its DEPLOYMENT readiness (see the provisioned-cell catalog ledger); its PROTOCOL readiness is established by the two-cell proof this activation unblocks. Endpoint identities are pinned from live cell producer output/readback; no Control caller derives them. updated_at is the deterministic catalog mutation revision and must change in the same review as every row mutation."
+  description = "Exact reviewed sandbox native-UDP cell catalog. cell0 is assignable; cell1 is a sandbox-only topology dummy and is draining, so it serves any existing assignment while the Authority places no new agent on it. cell1 was previously active on its DEPLOYMENT readiness, but it is deliberately dark for qURL v2 issuance/admission and native agent registration (see terraform/environments/sandbox-cell1/main.tf), so an agent placed there could not enroll -- it failed errCode 52107, the fail-closed catch-all that never names the cause. Production runs a single cell, so single-cell placement is also the production shape. Endpoint identities are pinned from live cell producer output/readback; no Control caller derives them. updated_at is the deterministic catalog mutation revision and must change in the same review as every row mutation."
   type = map(object({
     cell_id               = string
     status                = string
@@ -73,13 +73,13 @@ variable "provisioned_cells" {
     }
     cell1 = {
       cell_id               = "cell1"
-      status                = "active"
+      status                = "draining"
       endpoint_revision     = 1
       nhp_host              = "cell1.nhp.layerv.xyz"
       nhp_port              = 62206
       server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
       selection_weight      = "1"
-      updated_at            = "2026-07-27T00:00:00Z"
+      updated_at            = "2026-08-01T00:00:00Z"
     }
   }
 
@@ -97,16 +97,16 @@ variable "provisioned_cells" {
       }
       cell1 = {
         cell_id               = "cell1"
-        status                = "active"
+        status                = "draining"
         endpoint_revision     = 1
         nhp_host              = "cell1.nhp.layerv.xyz"
         nhp_port              = 62206
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
-        updated_at            = "2026-07-27T00:00:00Z"
+        updated_at            = "2026-08-01T00:00:00Z"
       }
     })
-    error_message = "The sandbox catalog must contain exactly active cell0 and active cell1 with the reviewed producer values; update this validation in the same review as any attended lifecycle or endpoint revision."
+    error_message = "The sandbox catalog must contain exactly active cell0 and draining cell1 with the reviewed producer values; update this validation in the same review as any attended lifecycle or endpoint revision."
   }
 }
 

@@ -374,13 +374,13 @@ PROVISIONED_CELL_CATALOG = {
     },
     "cell1": {
         "cell_id": "cell1",
-        "status": "active",
+        "status": "draining",
         "endpoint_revision": 1,
         "nhp_host": "cell1.nhp.layerv.xyz",
         "nhp_port": 62206,
         "server_public_key_b64": "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=",
         "selection_weight": "1",
-        "updated_at": "2026-07-27T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
     },
 }
 PROVISIONED_CELL_DYNAMODB_ITEMS = {
@@ -8103,6 +8103,44 @@ def _check_hub_service_task_revision_update(
             )
 
 
+def _claim_provisioned_cell_status_update(changed, actual_non_noop, by_address):
+    """Admit ONLY an in-place status change on provisioned-cell catalog rows.
+
+    Draining a cell is a reviewed lifecycle decision, not a shape change: the
+    Authority stops placing new agents on it while existing assignments keep
+    being served. It must not be able to smuggle an endpoint, key, or weight
+    edit through the same plan, because those decide where an agent is sent and
+    which server identity it trusts.
+    """
+    claimed = {
+        address
+        for address in changed
+        if address in set(PROVISIONED_CELL_ADDRESSES.values())
+        and (actual_non_noop.get(address) or ()) == ["update"]
+    }
+    if not claimed:
+        return None
+    for address in claimed:
+        cell_id = PROVISIONED_CELL_ID_BY_ADDRESS[address]
+        after = by_address[address].get("change", {}).get("after", {})
+        try:
+            item = json.loads(after.get("item") or "{}")
+        except (TypeError, ValueError):
+            return None
+        expected = PROVISIONED_CELL_DYNAMODB_ITEMS[cell_id]
+        # Everything except status and its paired revision stamp must be
+        # byte-identical to the reviewed catalog.
+        for field, value in expected.items():
+            if field in ("status", "updated_at"):
+                continue
+            if item.get(field) != value:
+                return None
+        if item.get("status") != expected["status"]:
+            return None
+        if item.get("updated_at") != expected["updated_at"]:
+            return None
+    return frozenset(claimed)
+
 def _claim_authority_hub_exec_policy_update(
     changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
 ) -> frozenset[str] | None:
@@ -8332,7 +8370,30 @@ def _validate_authority_proof_consumer_staging(
 
 # Transitions that may appear TOGETHER in one plan. Each entry claims a disjoint
 # slice of the changed set and validates that slice on its own.
+def _validate_provisioned_cell_status_update(claimed, by_address, plan):
+    """Pin the SHAPE. The claim already proved the exact reviewed after-state.
+
+    Composition only needs to know nothing but an in-place update reached here;
+    a create or replace would re-materialize a catalog row rather than
+    transition it.
+    """
+    del plan
+    for address in sorted(claimed):
+        change = by_address.get(address, {}).get("change")
+        if not isinstance(change, dict):
+            raise ContractError(f"composed provisioned-cell {address} change is malformed")
+        if list(change.get("actions") or ()) != ["update"]:
+            raise ContractError(f"composed provisioned-cell {address} is not an update")
+        if not isinstance(change.get("before"), dict) or not isinstance(change.get("after"), dict):
+            raise ContractError(f"composed provisioned-cell {address} has no before/after")
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "provisioned-cell-status-update",
+        _claim_provisioned_cell_status_update,
+        _validate_provisioned_cell_status_update,
+    ),
     (
         "hub-worker-image-update",
         _claim_hub_worker_image_update,
@@ -12244,6 +12305,15 @@ def check_plan(
             by_address,
             "Authority alarm resources must be new",
         )
+    elif (
+        _cells_only := _claim_provisioned_cell_status_update(
+            changed, actual_non_noop, by_address
+        )
+    ) is not None and set(_cells_only) == changed:
+        # Reviewed cell lifecycle transition (e.g. active -> draining). The
+        # claim above already proved every other catalog field matches the
+        # reviewed values byte-for-byte.
+        plan_mode = "provisioned-cell-status-update"
     elif changed == {HUB_WORKER_TASK_DEFINITION_ADDRESS}:
         # Deploying a reviewed Hub image. Immutable task definitions make this a
         # replacement by construction; _check_hub_worker_image_update proves the
