@@ -228,6 +228,7 @@ deploy_qurl_service = true
 # tfvars deliberately omits both until sandbox burn-in lands.
 deploy_qurl_bootstrap_chain = true
 enable_qurl_agent_bootstrap = true
+retire_http_agent_lifecycle = true
 
 # qurl-scanner Lambda — sandbox second-apply of the two-apply rollout
 # documented in the prod-rollout ledger entry for #2326. First apply
@@ -887,7 +888,7 @@ deploy_e2e_echo_server = true
 # the paired data-plane (qurl-service /v1/agent/bootstrap) PR — every 503
 # probe would route. Wire alerts-infra in a separate follow-up after the
 # data plane is healthy.
-deploy_bootstrap_alb                = true
+deploy_bootstrap_alb                = false
 bootstrap_alb_dns_name              = "bootstrap.layerv.xyz"
 bootstrap_alb_route53_zone_id       = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 bootstrap_alb_provision_certificate = true

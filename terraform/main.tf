@@ -185,7 +185,7 @@ resource "terraform_data" "qurl_tunnel_active_registration_preconditions" {
 # same operator-confusion trap as the qurl_site_authz preconditions
 # above. Fail at plan time.
 resource "terraform_data" "qurl_bootstrap_chain_preconditions" {
-  count = var.deploy_qurl_bootstrap_chain ? 1 : 0
+  count = var.deploy_qurl_bootstrap_chain && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     precondition {
@@ -206,7 +206,7 @@ resource "terraform_data" "qurl_bootstrap_chain_preconditions" {
 # the activation bool — the all-defaults-false posture doesn't
 # trip it.
 resource "terraform_data" "qurl_bootstrap_activation_preconditions" {
-  count = var.enable_qurl_agent_bootstrap ? 1 : 0
+  count = var.enable_qurl_agent_bootstrap && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     precondition {
@@ -223,7 +223,7 @@ resource "terraform_data" "qurl_bootstrap_activation_preconditions" {
 # PATH B (OTP) is the flag that creates the SES infra + pepper secret, so getting
 # its preconditions right before apply is what keeps a dark env dark.
 resource "terraform_data" "agent_registration_preconditions" {
-  count = var.agent_registration_enabled ? 1 : 0
+  count = var.agent_registration_enabled && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     # REGISTRATION ⇒ bootstrap chain enabled. qurl-service refuses to boot with
@@ -245,7 +245,7 @@ resource "terraform_data" "agent_registration_preconditions" {
 }
 
 resource "terraform_data" "agent_otp_preconditions" {
-  count = var.agent_otp_enabled ? 1 : 0
+  count = var.agent_otp_enabled && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     # OTP ⇒ REGISTRATION. The email-OTP flow layers on the register path.
@@ -272,7 +272,7 @@ resource "terraform_data" "agent_otp_preconditions" {
 # Inverse: the NHP-server plugin side flipped without the qurl-service side. The
 # plugin would accept OTP-registered agents that qurl-service never mints.
 resource "terraform_data" "agent_otp_registration_plugin_preconditions" {
-  count = var.agent_otp_registration_enabled ? 1 : 0
+  count = var.agent_otp_registration_enabled && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     precondition {
@@ -2930,6 +2930,7 @@ module "qurl_service" {
   # manually rather than waiting for the next merge.
   deploy_qurl_bootstrap_chain = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap = var.enable_qurl_agent_bootstrap
+  retire_http_agent_lifecycle = var.retire_http_agent_lifecycle
   nhp_server_public_key_b64   = module.compute.server_public_key_b64
   nhp_server_host             = module.compute.nlb_dns_name
   qurl_browser_relay_base_url = (
@@ -2951,7 +2952,7 @@ module "qurl_service" {
   agent_otp_enabled           = var.agent_otp_enabled
   agent_otp_email_from        = var.agent_otp_email_from
   agent_otp_relay_base_url    = var.agent_registration_relay_base_url
-  agent_otp_pepper_secret_arn = var.agent_otp_enabled ? aws_secretsmanager_secret.agent_otp_pepper[0].arn : ""
+  agent_otp_pepper_secret_arn = local.agent_otp_legacy_secret_enabled ? aws_secretsmanager_secret.agent_otp_pepper[0].arn : ""
   # Config-set name the task role's ses:SendEmail grant must also authorize (SESv2
   # SendEmail with a configuration_set_name authorizes against the config-set
   # resource too, not just the identity). Single source of truth: agent_otp_ses.tf.

@@ -64,7 +64,7 @@ locals {
   # surface, not two. The semantic association with bootstrap-alb is
   # preserved through the alarm-name prefix (see below), not through
   # SNS routing.
-  bootstrap_outcomes_enabled = var.deploy_qurl_service
+  bootstrap_outcomes_enabled = var.deploy_qurl_service && !var.retire_http_agent_lifecycle
 
   # Name prefix mirrors the bootstrap-ALB module's own alarm names
   # (`bootstrap-alb-${var.environment}-*`, where `bootstrap-alb` comes
@@ -253,12 +253,12 @@ locals {
   # OTP-path alarms need the flow that emits `agent_otp_completed` (PATH B) to be
   # on. agent_otp_enabled ⇒ agent_registration_enabled ⇒ deploy_qurl_service is
   # enforced by the main.tf preconditions, so this single flag is sufficient.
-  agent_otp_alarms_enabled = var.agent_otp_enabled
+  agent_otp_alarms_enabled = var.agent_otp_enabled && !var.retire_http_agent_lifecycle
 
   # Register-path alarms need the flow that emits `agent_register_completed`
   # (PATH A). agent_registration_enabled ⇒ deploy_qurl_service (via the bootstrap
   # chain, enforced in main.tf).
-  agent_register_alarms_enabled = var.agent_registration_enabled
+  agent_register_alarms_enabled = var.agent_registration_enabled && !var.retire_http_agent_lifecycle
 
   # OTP-shed alarm gate. The OTPRejectRateLimited metric is emitted from the
   # SHARED OTP dispatch core in endpoints/server (dispatchReceivedMessage routes
@@ -630,10 +630,11 @@ resource "aws_cloudwatch_metric_alarm" "agent_relay_otp_reject_rate_limited" {
 # the minimal way to page on "any async deliverability failure" without standing
 # up three near-identical alarms. threshold defaults to 0 → the FIRST bounce/
 # complaint/reject pages (1-of-1), mirroring send_failed's first-event posture;
-# a healthy verified sender emits none. Gated on agent_otp_alarms_enabled — the
-# SES config set only exists when agent_otp_enabled, so the metrics only exist then.
+# a healthy verified sender emits none. Keep this on the shared SES gate so
+# native UDP Authority OTP retains delivery observability after qurl-service's
+# HTTP lifecycle alarms are retired.
 resource "aws_cloudwatch_metric_alarm" "agent_otp_bounce" {
-  count = local.agent_otp_alarms_enabled ? 1 : 0
+  count = local.agent_otp_ses_enabled ? 1 : 0
 
   alarm_name          = "${local.agent_reg_outcomes_name_prefix}-otp-bounce"
   alarm_description   = "SES reported >${var.agent_otp_bounce_threshold_per_minute} async OTP delivery failures/min (Bounce + Complaint + Reject) on the ${local.name_prefix}-agent-otp configuration set — messages SES ACCEPTED at send time but could not deliver (hard bounce / spam complaint / filter reject), so the user silently never receives the code (LAUNCH-BLOCKING, complements agent-otp-send-failed-spike which only catches synchronous send errors). Check: (1) recipient-domain reputation / a bad address list, (2) SES account reputation + sending pause, (3) content tripping SES's reject filter. A sustained bounce/complaint rate also risks SES throttling the whole sender."

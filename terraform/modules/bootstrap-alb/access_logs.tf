@@ -86,14 +86,20 @@ locals {
 resource "aws_s3_bucket" "alb_access_logs" {
   bucket = local.alb_access_logs_bucket_name
 
-  # The retired HTTP bootstrap surface is being removed from sandbox. Keep this
-  # change in an applied preparation revision before setting
-  # deploy_bootstrap_alb=false: the provider must persist force_destroy in state
-  # before the module instance (and its non-empty versioned bucket) disappears
-  # from configuration.
-  force_destroy = true
+  # `force_destroy = false` in every surviving environment. Sandbox's retirement
+  # first applies a separate preparation revision with this set to true, then
+  # removes the module while restoring this fence for the still-live production
+  # instance.
+  force_destroy = false
 
   tags = merge(local.tags, { Name = local.alb_access_logs_bucket_name })
+
+  # Production bootstrap forensics are irrecoverable. Sandbox removes this
+  # lifecycle rule in the separately applied preparation revision; this deletion
+  # revision restores it for every surviving module instance.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "alb_access_logs" {

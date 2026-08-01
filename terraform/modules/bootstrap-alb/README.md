@@ -588,20 +588,20 @@ the operator needs to handle manually:
 
 ### 1. Access-log bucket teardown is a two-apply operation
 
-The retired bootstrap surface has deliberately armed the access-log bucket for
-removal with `force_destroy = true` and no `prevent_destroy` lifecycle rule.
-Terraform must apply that preparation while the module still exists before a
-later apply sets `deploy_bootstrap_alb=false`. This records the destroy behavior
-in state before the resource disappears from configuration.
+The access-log bucket normally carries `force_destroy = false` and
+`prevent_destroy = true`. A sandbox teardown therefore requires two applied
+revisions:
 
-Do not combine the preparation and removal into one unapplied revision, and do
-not use a targeted destroy. Apply reviewed `main` once with the module present,
-then merge the separate sandbox retirement revision and apply its normal saved
-plan. This preparation revision is sandbox-only: do not run a production
-Terraform apply while its temporary source-level fences are relaxed. The
-separate retirement revision restores `force_destroy=false` and
-`prevent_destroy=true` for the still-live production module in the same commit
-that removes the prepared sandbox instance.
+1. Apply a preparation revision while the module still exists that sets
+   `force_destroy = true` and removes `prevent_destroy`.
+2. Apply the separate retirement revision that sets
+   `deploy_bootstrap_alb=false` for sandbox and restores both fences in module
+   source for every surviving environment.
+
+The first apply records the sandbox bucket's destroy behavior in state before
+the resource disappears from configuration. The second deletes sandbox through
+the normal saved plan while leaving production protected. Do not combine the
+two revisions into one unapplied change and do not use a targeted destroy.
 
 ### 2. Orphaned ACM cert (`provision_certificate = false` paths)
 

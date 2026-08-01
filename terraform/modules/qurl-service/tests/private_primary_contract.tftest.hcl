@@ -505,6 +505,7 @@ run "retired_http_agent_runtime_is_detached" {
   variables {
     deploy_qurl_bootstrap_chain = true
     enable_qurl_agent_bootstrap = true
+    retire_http_agent_lifecycle = true
     nhp_server_public_key_b64   = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     nhp_server_host             = "cell0.nhp.layerv.xyz"
     qurl_browser_relay_base_url = "https://relay.layerv.xyz"
@@ -569,5 +570,13 @@ run "retired_http_agent_runtime_is_detached" {
       )
     )
     error_message = "HTTP lifecycle retirement must retain the browser relay URL and its pinned NHP server identity."
+  }
+
+  assert {
+    condition = (
+      length(terraform_data.qurl_bootstrap_chain_inputs) == 0
+      && length(aws_iam_role_policy.task_agent_otp_ses) == 0
+    )
+    error_message = "The HTTP lifecycle retirement must delete the qurl-service bootstrap sentinel and legacy SES send grant."
   }
 }

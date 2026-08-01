@@ -103,6 +103,7 @@ module "nhp" {
   control_identity_kms_key_arn                = var.control_identity_kms_key_arn
   deploy_qurl_bootstrap_chain                 = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap                 = var.enable_qurl_agent_bootstrap
+  retire_http_agent_lifecycle                 = var.retire_http_agent_lifecycle
   qurl_scanner_lambda_enabled                 = var.qurl_scanner_lambda_enabled
   qurl_scanner_sqs_emit_enabled               = var.qurl_scanner_sqs_emit_enabled
   qurl_scanner_tombstone_write_enabled        = var.qurl_scanner_tombstone_write_enabled

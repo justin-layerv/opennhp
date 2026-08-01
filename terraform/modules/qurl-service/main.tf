@@ -116,7 +116,7 @@ resource "terraform_data" "nhp_resource_catalog_inputs" {
 # Sandbox + prod both have the secret populated already, so the
 # plan-time signal works there today.
 resource "terraform_data" "qurl_bootstrap_chain_inputs" {
-  count = var.deploy_qurl_bootstrap_chain ? 1 : 0
+  count = var.deploy_qurl_bootstrap_chain && !var.retire_http_agent_lifecycle ? 1 : 0
 
   lifecycle {
     precondition {
@@ -1190,7 +1190,7 @@ resource "aws_iam_role_policy" "task_stripe_secret" {
 # configured sender so the role can only send AS that address (the condition applies
 # correctly to both resources).
 resource "aws_iam_role_policy" "task_agent_otp_ses" {
-  count = var.agent_otp_enabled ? 1 : 0
+  count = var.agent_otp_enabled && !var.retire_http_agent_lifecycle ? 1 : 0
   name  = "agent-otp-ses-send"
   role  = aws_iam_role.task.id
 

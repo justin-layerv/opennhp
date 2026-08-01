@@ -562,6 +562,12 @@ variable "enable_qurl_agent_bootstrap" {
   default     = false
 }
 
+variable "retire_http_agent_lifecycle" {
+  description = "Delete the obsolete HTTP agent lifecycle Terraform resources after the preparation revision has been applied."
+  type        = bool
+  default     = false
+}
+
 # ── Agent registration + email OTP (T1) — pass-through to module "nhp" ──
 # See the root terraform/variables.tf for full rationale. PATH A (registration),
 # PATH B (OTP, split across qurl-service + nhp-server), email_from, relay URL, and

@@ -1074,6 +1074,12 @@ variable "enable_qurl_agent_bootstrap" {
   default     = false
 }
 
+variable "retire_http_agent_lifecycle" {
+  description = "Delete the qurl-service-owned Terraform sentinels and IAM grant for the retired HTTP agent lifecycle after runtime consumers have been detached."
+  type        = bool
+  default     = false
+}
+
 variable "nhp_server_public_key_b64" {
   description = "NHP server-identity public key (base64; raw 32-byte X25519 key). Threaded from `module.compute.server_public_key_b64` at the root — the key the running NHP server actually signs NHP packets with. NOT `module.nhp_keypair.registration_public_key` (which is the shared AC↔server registration key — a different role; wiring that here silently breaks every agent knock with a server-HMAC-validation failure). Consumed only when deploy_qurl_bootstrap_chain = true; pass empty string when the gate is off."
   type        = string

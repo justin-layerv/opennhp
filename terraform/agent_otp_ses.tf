@@ -36,6 +36,9 @@
 
 locals {
   agent_otp_ses_enabled = var.agent_otp_enabled
+  # Keep the shared SES sender/configuration set for native UDP Authority OTP,
+  # but remove the qurl-service-only pepper in the coordinated HTTP retirement.
+  agent_otp_legacy_secret_enabled = local.agent_otp_ses_enabled && !var.retire_http_agent_lifecycle
 
   # Sender domain derived from the From address (noreply@<domain> → <domain>).
   # split() on "@" and take element 1. Empty-safe: when OTP is dark
@@ -100,10 +103,10 @@ resource "terraform_data" "agent_otp_ses_preconditions" {
 # Mirrors the `nhp_internal_auth` pattern exactly (main.tf): the secret RESOURCE
 # is created by Terraform, but the VALUE is seeded out-of-band via a local-exec
 # (get-random-password) so it never lands in Terraform state, and a check block
-# confirms the version is populated + meets the 32-char floor. Gated on
-# agent_otp_enabled so a dark env creates no secret.
+# confirms the version is populated + meets the 32-char floor. The legacy-secret
+# gate lets the shared SES sender survive the HTTP qurl-service retirement.
 resource "aws_secretsmanager_secret" "agent_otp_pepper" {
-  count = local.agent_otp_ses_enabled ? 1 : 0
+  count = local.agent_otp_legacy_secret_enabled ? 1 : 0
 
   name                    = "${local.name_prefix}-agent-otp-pepper"
   description             = "OTP hash pepper for qurl-service agent-registration email OTP (QURL_AGENT_OTP_PEPPER) — server-side secret, 32+ chars"
@@ -144,7 +147,7 @@ resource "aws_secretsmanager_secret" "agent_otp_pepper" {
 # <32-char QURL_AGENT_OTP_PEPPER fail-closed at startup. A redundant terraform-level
 # re-read isn't worth putting the secret in state, so it is intentionally omitted.
 resource "terraform_data" "agent_otp_pepper_seed" {
-  count = local.agent_otp_ses_enabled ? 1 : 0
+  count = local.agent_otp_legacy_secret_enabled ? 1 : 0
 
   triggers_replace = [aws_secretsmanager_secret.agent_otp_pepper[0].arn]
 

@@ -1017,6 +1017,12 @@ variable "enable_qurl_agent_bootstrap" {
   default     = false
 }
 
+variable "retire_http_agent_lifecycle" {
+  description = "Delete the obsolete HTTP agent bootstrap, registration, and qurl-service OTP Terraform resources after their runtime consumers have been detached in a separately applied preparation revision. Default false. Set only in the environment undergoing the coordinated UDP-only retirement."
+  type        = bool
+  default     = false
+}
+
 # ==================== Agent registration + email OTP (T1) ====================
 #
 # Two independent activation flags layered on top of the Wave-5 bootstrap chain,
