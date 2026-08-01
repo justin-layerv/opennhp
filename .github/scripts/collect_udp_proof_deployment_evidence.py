@@ -457,6 +457,29 @@ def _verify_commit(repository: str, sha: str, name: str) -> None:
         raise EvidenceError(f"{name} exact head is not GitHub signature-verified")
 
 
+def _canary_commit_is_in_main(repository: str, sha: str) -> bool:
+    """Is this canary's commit part of main?
+
+    Requiring the canary's head_sha to EQUAL the resolved main head is wrong: a
+    squash merge rewrites the commit, so a canary built from a pull request head
+    can never equal main even though main contains exactly that code. Requiring
+    only that the canary exist is too weak -- it would admit an image built from
+    a branch that was abandoned.
+
+    Reachability is the honest question: is the code in this image part of main?
+    GitHub answers it directly. "identical" means the canary is main; "behind"
+    means main has advanced past it, which is expected while the proof runs.
+    "ahead" or "diverged" means the image contains code main does not have, and
+    the proof must refuse it.
+    """
+    comparison = _gh(
+        f"repos/{repository}/compare/main...{sha}",
+        f"{repository} canary reachability",
+    )
+    status = comparison.get("status") if isinstance(comparison, dict) else None
+    return status in ("identical", "behind")
+
+
 def _resolve_client_main(repository: str, name: str) -> dict[str, Any]:
     """Resolve a client repository's CURRENT main commit.
 
@@ -776,8 +799,7 @@ def _validate_canary_provenance(
         # match is the COMMIT: the canary has to have been built from the
         # connector commit this run is proving.
         or not isinstance(root.get("pr_number"), int)
-        or root["head_sha"] != candidate["head_sha"]
-        or root["head_sha"] != candidate["head_sha"]
+        or not _canary_commit_is_in_main("layervai/qurl-connector", root["head_sha"])
         or root["signed_head_verified"] is not True
     ):
         raise EvidenceError("canary provenance candidate identity drift")
@@ -972,7 +994,7 @@ def validate_canary_files(
         published["schema"] != "layerv.qurl-connector.published-canary.v1"
         or published["repository"] != "layervai/qurl-connector"
         or not isinstance(published.get("pr_number"), int)
-        or published["head_sha"] != candidate["head_sha"]
+        or not _canary_commit_is_in_main("layervai/qurl-connector", published["head_sha"])
         or published["head_ref"] != candidate["head_ref"]
         or published["head_sha"] != candidate["head_sha"]
         or not isinstance(image_ref, str)
