@@ -87,11 +87,23 @@ def build_receipt(
         if "delete" not in actions:
             continue
         logical = _logical_retirement_address(address)
+        # Ordinary Terraform replacements carry a delete action paired with a
+        # create, and are not retirements. Skip them here rather than relying
+        # on the early return below, which only excludes them while NO
+        # retirement resource is in the plan — that is, everywhere except the
+        # one apply this receipt exists to govern. An ECS task definition is
+        # immutable and replaces on every image change, so the retirement apply
+        # was guaranteed to carry one and be rejected for it.
+        #
+        # Replacement of a GOVERNED retirement address is a different thing and
+        # stays in scope: the loop below still rejects it as not-a-pure-deletion.
+        if logical is None and "create" in actions:
+            continue
         deletions.append((address, actions, logical))
 
     # This producer runs on every sandbox apply, but only governs the exact
-    # one-time UDP retirement. Ordinary Terraform replacements may include a
-    # delete action and are outside this receipt's scope.
+    # one-time UDP retirement. A plan with no retirement resource in it is out
+    # of scope entirely.
     if not any(logical is not None for _, _, logical in deletions):
         return None
 

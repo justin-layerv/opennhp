@@ -120,30 +120,59 @@ class SavedPlanReceiptTest(unittest.TestCase):
                     )
                 )
 
-    def test_retirement_with_every_unapproved_delete_action_fails_closed(
-        self,
-    ) -> None:
-        for actions in (["delete"], ["delete", "create"], ["create", "delete"]):
+    def test_retirement_with_unapproved_pure_delete_fails_closed(self) -> None:
+        """An unexplained DESTROY riding along with the retirement is refused."""
+        with self.assertRaisesRegex(
+            producer.TerraformApplyReceiptError,
+            "unapproved deletion actions",
+        ):
+            producer.build_receipt(
+                {
+                    "resource_changes": exact_retirement_changes()
+                    + [change("module.nhp.aws_s3_bucket.unrelated", ["delete"])]
+                },
+                saved_plan_sha256=PLAN_SHA256,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                head_sha=HEAD_SHA,
+            )
+
+    def test_retirement_tolerates_ordinary_replacements(self) -> None:
+        """A replacement is not a retirement, even during the retirement apply.
+
+        This is not hypothetical. The real retirement apply carried
+        `aws_ecs_task_definition.qurl must be replaced` — task definitions are
+        immutable and replace on every image change — and the receipt rejected
+        the whole apply for it. The producer's scope note always said ordinary
+        replacements were out of scope; the early return implementing that only
+        fired when NO retirement resource was present, i.e. everywhere except
+        the one apply this receipt governs.
+        """
+        for actions in (["delete", "create"], ["create", "delete"]):
             with self.subTest(actions=actions):
-                with self.assertRaisesRegex(
-                    producer.TerraformApplyReceiptError,
-                    "unapproved deletion actions",
-                ):
-                    producer.build_receipt(
-                        {
-                            "resource_changes": exact_retirement_changes()
-                            + [
-                                change(
-                                    "module.nhp.aws_s3_bucket.unrelated",
-                                    actions,
-                                )
-                            ]
-                        },
-                        saved_plan_sha256=PLAN_SHA256,
-                        run_id=RUN_ID,
-                        run_attempt=RUN_ATTEMPT,
-                        head_sha=HEAD_SHA,
-                    )
+                receipt = producer.build_receipt(
+                    {
+                        "resource_changes": exact_retirement_changes()
+                        + [
+                            change(
+                                "module.nhp.module.qurl_service[0]."
+                                "aws_ecs_task_definition.qurl",
+                                actions,
+                            )
+                        ]
+                    },
+                    saved_plan_sha256=PLAN_SHA256,
+                    run_id=RUN_ID,
+                    run_attempt=RUN_ATTEMPT,
+                    head_sha=HEAD_SHA,
+                )
+                self.assertIsNotNone(receipt)
+                # The replacement is tolerated, never recorded as approved.
+                self.assertNotIn(
+                    "module.nhp.module.qurl_service[0]."
+                    "aws_ecs_task_definition.qurl",
+                    receipt["approved_deletions"],
+                )
 
     def test_approved_target_replacement_fails_closed(self) -> None:
         changes = exact_retirement_changes()
