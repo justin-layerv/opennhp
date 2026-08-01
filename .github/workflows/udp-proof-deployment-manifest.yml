@@ -139,6 +139,17 @@ jobs:
 
       - name: Validate every canary evidence file
         id: canary
+        env:
+          # The published-canary check asks GitHub whether the canary's commit
+          # is reachable from main -- equality is wrong, because a squash merge
+          # rewrites the commit. That question needs a token, and this step had
+          # none, so the producer died on "set the GH_TOKEN environment
+          # variable".
+          #
+          # It must be the App token, like every other collector step: the
+          # question is about layervai/qurl-connector, and the default
+          # github.token is scoped to this repository only.
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           python3 .github/scripts/collect_udp_proof_deployment_evidence.py \

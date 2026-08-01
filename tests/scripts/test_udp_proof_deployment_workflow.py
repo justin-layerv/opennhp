@@ -220,5 +220,43 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ steps.app.outputs.token }}", self.raw)
 
 
+    def test_every_collector_step_can_reach_github(self) -> None:
+        """A collector step that talks to GitHub must carry a token.
+
+        The published-canary check asks GitHub whether the canary's commit is
+        reachable from main -- equality is wrong there, because a squash merge
+        rewrites the commit. That question needs a token, and the step that runs
+        it had none, so the producer died on "set the GH_TOKEN environment
+        variable" AFTER the expensive live AWS observation had already run.
+
+        Every invocation is checked rather than the one that broke: which
+        subcommand needs the network is an implementation detail of the
+        collector, and it has changed at least once already.
+        """
+        invocations = []
+        for job in self.workflow["jobs"].values():
+            for step in job.get("steps", []):
+                run = step.get("run") or ""
+                if "collect_udp_proof_deployment_evidence.py" not in run:
+                    continue
+                invocations.append(step.get("name") or "<unnamed>")
+                token = (step.get("env") or {}).get("GH_TOKEN")
+                with self.subTest(step=step.get("name")):
+                    # The App token, not github.token: every collector step
+                    # reads layervai/qurl-connector, and the default token is
+                    # scoped to this repository alone.
+                    self.assertEqual(
+                        token,
+                        "${{ steps.app.outputs.token }}",
+                        f"step {step.get('name')!r} runs the evidence collector "
+                        "without the cross-repository App token; any GitHub read "
+                        "it makes fails at run time, not here",
+                    )
+        self.assertGreaterEqual(
+            len(invocations),
+            3,
+            f"expected the producer to invoke the collector; found {invocations}",
+        )
+
 if __name__ == "__main__":
     unittest.main()
