@@ -26,10 +26,12 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(
             set(inputs),
+            # No client selector inputs by design: main is the bible. The
+            # producer resolves each client's main at run time, so there is
+            # nothing for a dispatcher to choose -- and therefore nothing to
+            # keep in sync with the client repositories.
             {
                 "proof_phase",
-                "qurl_connector_pr_number",
-                "qurl_go_pr_number",
                 "connector_canary_run_id",
                 "terraform_apply_run_id",
             },

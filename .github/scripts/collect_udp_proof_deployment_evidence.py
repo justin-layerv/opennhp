@@ -457,6 +457,32 @@ def _verify_commit(repository: str, sha: str, name: str) -> None:
         raise EvidenceError(f"{name} exact head is not GitHub signature-verified")
 
 
+def _resolve_client_main(repository: str, name: str) -> dict[str, Any]:
+    """Resolve a client repository's CURRENT main commit.
+
+    Main is the bible. This proof used to bind an open pull request's head --
+    a mutable branch pointer -- which forced the client branches to freeze:
+    absorbing main moved the head and broke the binding, so the branches drifted
+    further the longer the proof took to pass. With many developers merging
+    concurrently that loop tightens instead of converging, and the pinned SHAs
+    had to be restated in three files across two repositories to stay agreed.
+
+    Resolving main removes the pin entirely. The producer already holds itself to
+    exactly this rule (it refuses to run unless it IS the current nhp main
+    commit); this applies the same rule to the clients it proves.
+    """
+    ref = _gh(f"repos/{repository}/git/ref/heads/main", f"{name} main ref")
+    sha = ((ref or {}).get("object") or {}).get("sha") if isinstance(ref, dict) else None
+    if not isinstance(sha, str) or not contract.SHA_RE.fullmatch(sha):
+        raise EvidenceError(f"{name} main ref did not resolve to a commit sha")
+    _verify_commit(repository, sha, name)
+    return {
+        "repository": repository,
+        "head_ref": "main",
+        "head_sha": sha,
+    }
+
+
 def _resolve_candidate(repository: str, number: int, name: str) -> dict[str, Any]:
     pull = _gh(f"repos/{repository}/pulls/{number}", f"{name} pull request")
     if not isinstance(pull, dict):
@@ -551,15 +577,13 @@ def collect_github_metadata(
     _verify_commit("layervai/nhp", producer_sha, "producer workflow")
 
     candidates = {
-        "qurl_connector": _resolve_candidate(
+        "qurl_connector": _resolve_client_main(
             "layervai/qurl-connector",
-            connector_pr_number,
-            "qurl-connector candidate",
+            "qurl-connector main",
         ),
-        "qurl_go": _resolve_candidate(
+        "qurl_go": _resolve_client_main(
             "layervai/qurl-go",
-            qurl_go_pr_number,
-            "qurl-go candidate",
+            "qurl-go main",
         ),
     }
     default_branches = {

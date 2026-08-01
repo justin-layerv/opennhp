@@ -179,11 +179,12 @@ class WorkflowContractTest(unittest.TestCase):
             "actions/runs/${PRODUCER_RUN_ID}/artifacts?per_page=100",
             "could not authenticate the producer run after bounded retries",
             "could not authenticate the producer artifact after bounded retries",
-            "PINNED_CONNECTOR_SHA: d35ddc533dd2c48ed40268c13912ee5113249d96",
-            "PINNED_QURL_GO_SHA: 48e266dc0be46fa2bbad015bdbd46ff5c8d64af9",
             "EXPECTED_AGENT_ID: qurl-go-sandbox-${{ github.run_id }}-${{ github.run_attempt }}",
-            "producer artifact does not bind the frozen Connector head",
-            "producer artifact does not bind the frozen qurl-go head",
+            # Main is the bible: the controller no longer binds frozen candidate
+            # heads. It re-reads each client's main and requires the producer
+            # artifact to agree, so these pin the replacement guarantee.
+            "producer artifact does not bind layervai/${repo}",
+            "but main is now",
             "invoke_udp_proof_broker.sh",
             "wait_for_action_run.sh",
             "permission-actions: write",

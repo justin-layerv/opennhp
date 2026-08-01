@@ -13,14 +13,6 @@ on:
         options:
           - pre_removal
           - post_removal
-      qurl_connector_pr_number:
-        description: Current open same-repository qurl-connector PR number
-        required: true
-        type: string
-      qurl_go_pr_number:
-        description: Current open same-repository qurl-go PR number
-        required: true
-        type: string
       connector_canary_run_id:
         description: Successful trusted-main Connector canary workflow run ID
         required: true
@@ -124,16 +116,12 @@ jobs:
         id: metadata
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          CONNECTOR_PR_NUMBER: ${{ inputs.qurl_connector_pr_number }}
-          QURL_GO_PR_NUMBER: ${{ inputs.qurl_go_pr_number }}
           CANARY_RUN_ID: ${{ inputs.connector_canary_run_id }}
         run: |
           set -euo pipefail
           mkdir -m 700 evidence canary
           python3 .github/scripts/collect_udp_proof_deployment_evidence.py \
             github-metadata \
-            --connector-pr-number "${CONNECTOR_PR_NUMBER}" \
-            --qurl-go-pr-number "${QURL_GO_PR_NUMBER}" \
             --canary-run-id "${CANARY_RUN_ID}" \
             --output evidence/github-metadata.json \
             --github-output "${GITHUB_OUTPUT}"

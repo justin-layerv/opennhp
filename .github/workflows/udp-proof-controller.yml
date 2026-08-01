@@ -72,8 +72,6 @@ env:
   # and `repositories.qurl_go` from those live PR heads and the gate below
   # rejects any producer artifact that binds a different head. If either head
   # moves, re-run the producer and update both pins plus runner-group 5.
-  PINNED_CONNECTOR_SHA: d35ddc533dd2c48ed40268c13912ee5113249d96
-  PINNED_QURL_GO_SHA: 48e266dc0be46fa2bbad015bdbd46ff5c8d64af9
 
 jobs:
   gate:
@@ -191,22 +189,40 @@ jobs:
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Require the frozen client candidate heads
+      - name: Require the producer to bind current client main
         env:
-          CONNECTOR_WORKFLOW: ${{ steps.files.outputs.connector_workflow_identity }}
-          QURL_GO_WORKFLOW: ${{ steps.files.outputs.qurl_go_workflow_identity }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$CONNECTOR_WORKFLOW" = \
-            "layervai/qurl-connector/.github/workflows/sandbox-smoke.yml@${PINNED_CONNECTOR_SHA}" || {
-            echo "::error::producer artifact does not bind the frozen Connector head"
-            exit 1
-          }
-          test "$QURL_GO_WORKFLOW" = \
-            "layervai/qurl-go/.github/workflows/native-udp-sandbox.yml@${PINNED_QURL_GO_SHA}" || {
-            echo "::error::producer artifact does not bind the frozen qurl-go head"
-            exit 1
-          }
+          # Main is the bible. This step used to require the producer artifact to
+          # bind two frozen candidate SHAs, restated here and in each client
+          # repository. Any change to a client branch -- even absorbing main --
+          # moved a head and broke the binding, so the client branches could
+          # never converge. With many developers merging concurrently that never
+          # settles.
+          #
+          # Now the producer resolves each client's main at run time and this
+          # step re-reads main independently, so the two must agree on a commit
+          # neither of them chose. A client merge landing between the two reads
+          # is a genuine mismatch: the proof would otherwise attest a tree that
+          # is no longer main.
+          for repo in qurl-connector qurl-go; do
+            case "${repo}" in
+              qurl-connector) key=qurl_connector ;;
+              qurl-go)        key=qurl_go ;;
+            esac
+            bound="$(jq -r --arg k "$key" '.candidates[$k].head_sha' evidence/deployment.json)"
+            live="$(gh api "repos/layervai/${repo}/git/ref/heads/main" --jq '.object.sha')"
+            if [[ -z "${bound}" || "${bound}" == "null" ]]; then
+              echo "::error::producer artifact does not bind layervai/${repo}"
+              exit 1
+            fi
+            if [[ "${bound}" != "${live}" ]]; then
+              echo "::error::producer bound layervai/${repo} ${bound} but main is now ${live}; re-run the producer"
+              exit 1
+            fi
+            echo "layervai/${repo} main = ${live}"
+          done
 
   proof:
     needs: gate
@@ -287,12 +303,11 @@ jobs:
           # SHA-pinned group matches nothing and the job queues forever beside
           # an idle, correctly-labelled runner.
           #
-          # The frozen-head guarantee is NOT weakened: the "Require the frozen
-          # client candidate heads" step above independently binds the producer
-          # artifact's SHA-form workflow identity to PINNED_CONNECTOR_SHA and
-          # PINNED_QURL_GO_SHA. This assertion only scopes WHICH workflow may
-          # claim these runners, and it is still exact -- both entries, nothing
-          # else.
+          # The binding is NOT weakened: the "Require the producer to bind
+          # current client main" step above independently re-reads each client's
+          # main and requires the producer artifact to agree. This assertion only
+          # scopes WHICH workflow may claim these runners, and it is still exact
+          # -- both entries, nothing else.
           jq -e \
             --arg connector "$CONNECTOR_GROUP_WORKFLOW" \
             --arg qurl_go "$QURL_GO_GROUP_WORKFLOW" \
