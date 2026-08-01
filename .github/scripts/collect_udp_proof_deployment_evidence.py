@@ -506,38 +506,23 @@ def _resolve_client_main(repository: str, name: str) -> dict[str, Any]:
     }
 
 
-def _resolve_candidate(repository: str, number: int, name: str) -> dict[str, Any]:
-    pull = _gh(f"repos/{repository}/pulls/{number}", f"{name} pull request")
-    if not isinstance(pull, dict):
-        raise EvidenceError(f"{name} pull request response must be an object")
-    head = pull.get("head")
-    base = pull.get("base")
-    if not isinstance(head, dict) or not isinstance(base, dict):
-        raise EvidenceError(f"{name} pull request head/base are missing")
-    head_repo = head.get("repo")
-    base_repo = base.get("repo")
-    sha = head.get("sha")
-    head_ref = head.get("ref")
-    if (
-        pull.get("number") != number
-        or pull.get("state") != "open"
-        or not isinstance(head_repo, dict)
-        or head_repo.get("full_name") != repository
-        or not isinstance(base_repo, dict)
-        or base_repo.get("full_name") != repository
-        or base.get("ref") != "main"
-        or not isinstance(sha, str)
-        or not contract.SHA_RE.fullmatch(sha)
-    ):
-        raise EvidenceError(f"{name} must be an open same-repository PR onto main")
-    head_ref = contract.validate_branch(head_ref, f"{name} head ref")
-    _verify_commit(repository, sha, name)
-    return {
-        "repository": repository,
-        "pull_request_number": number,
-        "head_ref": head_ref,
-        "head_sha": sha,
-    }
+def _is_optional_pull_request_number(value: Any) -> bool:
+    """A canary's pr_number: a real PR number, or null for a build from main.
+
+    A canary built from main has no pull request, so this field is null. Both
+    canary checks required an int, which rejected exactly the build the proof
+    exists to consume -- it could only ever accept an image built from a branch,
+    the inversion de-pinning removed.
+
+    Null is permitted, and permitting it weakens nothing: this field never
+    decided what gets proved. The connector COMMIT is bound separately, and
+    reachability from main is asserted on every path. A value that IS present
+    must still be a genuine positive pull request number.
+    """
+    if value is None:
+        return True
+    # bool is an int subclass; True must not read as pull request #1.
+    return type(value) is int and value > 0
 
 
 def _resolve_default_branch(repository_key: str) -> dict[str, Any]:
@@ -671,13 +656,19 @@ def collect_github_metadata(
         raise EvidenceError("Connector canary attempt timestamps are invalid")
 
     artifacts = _github_run_artifacts(canary_run_id)
-    # The canary names its evidence artifact connector-canary-pr-<n>-<sha>.
+    # The canary names its evidence artifact connector-canary-<label>-<sha>,
+    # where the label is "main" or "pr-<n>".
+    #
     # The producer used to reconstruct that string from a --connector-pr-number
     # input, so every canary re-run against a different PR silently broke the
     # lookup. Match the canary run's OWN artifact instead: exactly one artifact
-    # may carry this prefix, which is a stronger check than string equality with
+    # may carry this shape, which is a stronger check than string equality with
     # a number the caller supplied.
-    canary_evidence_re = re.compile(r"^connector-canary-pr-[1-9][0-9]{0,5}-[0-9a-f]{40}$")
+    #
+    # "main" must be accepted or the proof can only ever consume a canary built
+    # from a branch -- the exact inversion this de-pinning removed. The pull
+    # request form stays valid for pre-merge canaries.
+    canary_evidence_re = contract.CANARY_EVIDENCE_ARTIFACT_RE
     matches = [
         artifact
         for artifact in artifacts
@@ -796,9 +787,8 @@ def _validate_canary_provenance(
         # The canary's pr_number describes the canary build, not the tree under
         # proof. It used to be compared to the candidate's own pull request
         # number, which no longer exists now that the proof binds main. What must
-        # match is the COMMIT: the canary has to have been built from the
-        # connector commit this run is proving.
-        or not isinstance(root.get("pr_number"), int)
+        # match is the COMMIT -- asserted on the line below.
+        or not _is_optional_pull_request_number(root.get("pr_number"))
         or not _canary_commit_is_in_main("layervai/qurl-connector", root["head_sha"])
         or root["signed_head_verified"] is not True
     ):
@@ -993,7 +983,7 @@ def validate_canary_files(
     if (
         published["schema"] != "layerv.qurl-connector.published-canary.v1"
         or published["repository"] != "layervai/qurl-connector"
-        or not isinstance(published.get("pr_number"), int)
+        or not _is_optional_pull_request_number(published.get("pr_number"))
         or not _canary_commit_is_in_main("layervai/qurl-connector", published["head_sha"])
         or published["head_ref"] != candidate["head_ref"]
         or published["head_sha"] != candidate["head_sha"]
@@ -4081,9 +4071,8 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
     if (
         canary["repository"] != "layervai/qurl-connector"
         or canary["workflow_path"] != CANARY_WORKFLOW_PATH
-        or not re.fullmatch(
-            r"connector-canary-pr-[1-9][0-9]{0,5}-[0-9a-f]{40}",
-            str(canary.get("artifact_name") or ""),
+        or not contract.CANARY_EVIDENCE_ARTIFACT_RE.fullmatch(
+            str(canary.get("artifact_name") or "")
         )
         or not str(canary.get("artifact_name") or "").endswith(
             f"{candidates['qurl_connector']['head_sha']}"

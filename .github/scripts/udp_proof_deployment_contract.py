@@ -72,6 +72,13 @@ HOST_RE = re.compile(
 )
 PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+# connector-canary-<label>-<sha>, the label being "main" or "pr-<n>". Defined once
+# and shared with the collector: the lookup and the manifest re-validation are two
+# halves of one contract, and they drifted apart the last time each held its own
+# copy of the shape.
+CANARY_EVIDENCE_ARTIFACT_RE = re.compile(
+    r"^connector-canary-(?:main|pr-[1-9][0-9]{0,5})-[0-9a-f]{40}$"
+)
 CONNECTOR_PROOF_KMS_KEY_ARN_RE = re.compile(
     r"^arn:aws:kms:us-east-2:767397897469:key/"
     r"(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$"
@@ -1692,11 +1699,15 @@ def _validate_canary(
         canary["repository"] != "layervai/qurl-connector"
         or canary["workflow_path"] != ".github/workflows/connector-canary-publish.yml"
         or not SHA_RE.fullmatch(str(canary["head_sha"]))
-        or canary["artifact_name"]
-        != (
-            "connector-canary-pr-"
-            f"{candidates['qurl_connector']['pull_request_number']}-"
-            f"{candidates['qurl_connector']['head_sha']}"
+        # connector-canary-<label>-<sha>. The label is the canary build's own
+        # ("main", or "pr-<n>" for a pre-merge canary) and is NOT reconstructible
+        # from anything in this manifest -- it used to be rebuilt from a candidate
+        # pull request number that no longer exists. What this contract can and
+        # must bind is the SHA: the evidence has to be for the connector commit
+        # this manifest is about.
+        or not CANARY_EVIDENCE_ARTIFACT_RE.fullmatch(str(canary["artifact_name"]))
+        or not str(canary["artifact_name"]).endswith(
+            f"-{candidates['qurl_connector']['head_sha']}"
         )
         or not isinstance(canary["artifact_digest"], str)
         or not DIGEST_RE.fullmatch(canary["artifact_digest"])
@@ -1761,13 +1772,18 @@ def validate_provenance(
     ):
         candidate = _exact(
             candidates[key],
-            {"repository", "pull_request_number", "head_ref", "head_sha"},
+            {"repository", "head_ref", "head_sha"},
             f"deployment provenance candidates.{key}",
         )
         if candidate["repository"] != repository:
             raise ContractError(f"candidate repository drift for {key}")
-        _positive_int(candidate["pull_request_number"], f"{key} PR number")
+        # No pull request number: the proof binds main, so there is nothing to
+        # select and head_ref is always main. Requiring one here contradicted the
+        # producer, which stopped emitting it -- one side of a two-sided contract
+        # was left behind, so every producer run failed validation.
         validate_branch(candidate["head_ref"], f"{key} head_ref")
+        if candidate["head_ref"] != "main":
+            raise ContractError(f"candidate {key} head_ref is not main")
         if candidate["head_sha"] != manifest["repositories"][key]:
             raise ContractError(f"candidate head SHA drift for {key}")
 

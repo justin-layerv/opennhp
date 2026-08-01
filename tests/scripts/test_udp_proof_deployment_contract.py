@@ -306,17 +306,18 @@ def valid_snapshot() -> dict[str, object]:
             },
         ],
     }
+    # Candidates are main, always. The fixture used to name two feature branches
+    # and their pull request numbers, which is the state the proof was rebuilt to
+    # make unrepresentable.
     candidates = {
         "qurl_connector": {
             "repository": "layervai/qurl-connector",
-            "pull_request_number": 452,
-            "head_ref": "justin/fix/connector-routing-identity",
+            "head_ref": "main",
             "head_sha": CONNECTOR_SHA,
         },
         "qurl_go": {
             "repository": "layervai/qurl-go",
-            "pull_request_number": 93,
-            "head_ref": "justin/feat/native-udp",
+            "head_ref": "main",
             "head_sha": QURL_GO_SHA,
         },
     }
@@ -386,7 +387,7 @@ def valid_snapshot() -> dict[str, object]:
         "run_attempt": 1,
         "head_sha": "f" * 40,
         "artifact_id": 67890,
-        "artifact_name": f"connector-canary-pr-452-{CONNECTOR_SHA}",
+        "artifact_name": f"connector-canary-main-{CONNECTOR_SHA}",
         "artifact_digest": digest("a"),
         "image_ref": (
             f"ghcr.io/layervai/qurl-connector-canary@{IMAGE_DIGESTS['qurl_connector']}"
