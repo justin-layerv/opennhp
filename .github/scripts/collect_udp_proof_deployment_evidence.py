@@ -770,7 +770,13 @@ def _validate_canary_provenance(
     if (
         root["schema"] != "layerv.qurl-connector.canary-provenance.v1"
         or root["repository"] != "layervai/qurl-connector"
-        or root["pr_number"] != candidate["pull_request_number"]
+        # The canary's pr_number describes the canary build, not the tree under
+        # proof. It used to be compared to the candidate's own pull request
+        # number, which no longer exists now that the proof binds main. What must
+        # match is the COMMIT: the canary has to have been built from the
+        # connector commit this run is proving.
+        or not isinstance(root.get("pr_number"), int)
+        or root["head_sha"] != candidate["head_sha"]
         or root["head_sha"] != candidate["head_sha"]
         or root["signed_head_verified"] is not True
     ):
@@ -965,7 +971,8 @@ def validate_canary_files(
     if (
         published["schema"] != "layerv.qurl-connector.published-canary.v1"
         or published["repository"] != "layervai/qurl-connector"
-        or published["pr_number"] != candidate["pull_request_number"]
+        or not isinstance(published.get("pr_number"), int)
+        or published["head_sha"] != candidate["head_sha"]
         or published["head_ref"] != candidate["head_ref"]
         or published["head_sha"] != candidate["head_sha"]
         or not isinstance(image_ref, str)
@@ -3993,18 +4000,18 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
     for key in ("qurl_connector", "qurl_go"):
         candidate = _exact(
             candidates[key],
-            {"repository", "pull_request_number", "head_ref", "head_sha"},
+            {"repository", "head_ref", "head_sha"},
             f"GitHub evidence candidates.{key}",
         )
         if candidate["repository"] != contract.REPOSITORIES[key]:
             raise EvidenceError(f"GitHub evidence candidate repository drift for {key}")
-        contract._positive_int(
-            candidate["pull_request_number"],
-            f"GitHub evidence candidates.{key}.pull_request_number",
-        )
-        contract.validate_branch(
-            candidate["head_ref"], f"GitHub evidence candidates.{key}.head_ref"
-        )
+        # A resolved candidate carries no pull request number: the proof binds
+        # main, so head_ref is always "main" and there is nothing to select.
+        if candidate["head_ref"] != "main":
+            raise EvidenceError(
+                f"GitHub evidence candidate {key} head_ref is "
+                f"{candidate['head_ref']!r}; the proof binds main"
+            )
         contract._sha(
             candidate["head_sha"], f"GitHub evidence candidates.{key}.head_sha"
         )
@@ -4052,10 +4059,11 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
     if (
         canary["repository"] != "layervai/qurl-connector"
         or canary["workflow_path"] != CANARY_WORKFLOW_PATH
-        or canary["artifact_name"]
-        != (
-            "connector-canary-pr-"
-            f"{candidates['qurl_connector']['pull_request_number']}-"
+        or not re.fullmatch(
+            r"connector-canary-pr-[1-9][0-9]{0,5}-[0-9a-f]{40}",
+            str(canary.get("artifact_name") or ""),
+        )
+        or not str(canary.get("artifact_name") or "").endswith(
             f"{candidates['qurl_connector']['head_sha']}"
         )
         or canary["image_ref"]
@@ -4229,9 +4237,8 @@ def collect_aws_and_build_snapshot(
     _verify_frp_tag(canary["frp_version"], canary["frp_sha"])
     for key in ("qurl_connector", "qurl_go"):
         candidate = github_evidence["candidates"][key]
-        refreshed = _resolve_candidate(
+        refreshed = _resolve_client_main(
             candidate["repository"],
-            candidate["pull_request_number"],
             f"refreshed {key} candidate",
         )
         if refreshed != candidate:
