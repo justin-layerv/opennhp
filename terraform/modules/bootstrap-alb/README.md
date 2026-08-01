@@ -603,6 +603,21 @@ the resource disappears from configuration. The second deletes sandbox through
 the normal saved plan while leaving production protected. Do not combine the
 two revisions into one unapplied change and do not use a targeted destroy.
 
+**`prevent_destroy` cannot be restored in the retirement revision itself.** It
+is evaluated from configuration, not state, and Terraform requires a literal
+there, so it cannot be scoped to the surviving environment. Restoring it in the
+same revision that removes the retiring module instance makes that revision
+block its own destroy —
+[#3607](https://github.com/layervai/nhp/pull/3607) did exactly this and took
+the whole sandbox root out of `terraform plan`, failing every unrelated
+Terraform PR until it was reverted. The retirement is therefore three applied
+revisions, not two: prepare, destroy with the guard absent, then restore the
+guard for the surviving environments.
+
+`force_destroy` has no such constraint — it is an ordinary argument, so it can
+be scoped with an expression like `var.environment != "prod"` if a future
+retirement wants to keep the surviving environment's fence on throughout.
+
 ### 2. Orphaned ACM cert (`provision_certificate = false` paths)
 
 When `provision_certificate = false` (prod's posture once it flips
