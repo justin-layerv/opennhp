@@ -201,3 +201,24 @@ variable "tags" {
     Owner        = "platform-team"
   }
 }
+
+variable "qurl_v2_issuer_key_alias" {
+  description = <<-EOT
+    Alias of the account-global qURL v2 issuer KMS key, owned by the cell0 root.
+    cell1 reads it so both cells verify links against the SAME issuer identity.
+    Never point this at a cell-local key: a second issuer would mean a link
+    minted by one cell fails to verify at the other.
+  EOT
+  type        = string
+  default     = "alias/layerv-nhp-sandbox-qurl-v2-issuer"
+}
+
+variable "qurl_v2_issuer_kid" {
+  description = <<-EOT
+    Key id under which the issuer public key is published in this cell's trust
+    store. Must match the cell0 root's qurl_v2_issuer_kid; a mismatch means a
+    link names an issuer this cell cannot look up.
+  EOT
+  type        = string
+  default     = "qurl-issuer-sandbox-2026-07"
+}

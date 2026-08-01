@@ -77,6 +77,19 @@ data "aws_region" "current" {}
 # Shared, account-global ECR repository for the NHP server image. Created and
 # owned by the cell0 sandbox root (is_primary_account = true). cell1 REFERENCES
 # it rather than creating a duplicate (repo names are not environment-scoped).
+# ---------------------------------------------------------------------------
+# qURL v2 issuer public key — READ ONLY.
+#
+# The issuer key is account-global and owned by the cell0 root, exactly like the
+# ECR repositories and the registration key pool above. cell1 reads it by alias
+# so both cells verify links against the SAME issuer identity; creating a second
+# key here would mean two identities signing for one deployment, and a link
+# minted by cell0 would not verify at cell1.
+# ---------------------------------------------------------------------------
+data "aws_kms_public_key" "qurl_v2_issuer" {
+  key_id = var.qurl_v2_issuer_key_alias
+}
+
 data "aws_ecr_repository" "server" {
   name = "layerv/nhp-server"
 }
@@ -362,6 +375,25 @@ module "compute" {
     idle_conn_timeout       = 30
   } : null
   qurl_service_token_secret_arn = local.qurl_service_deployable ? aws_secretsmanager_secret.qurl_service["internal-token"].arn : null
+
+  # Native agent registration (NHP_OTP -> NHP_REG -> NHP_RAK) and independent
+  # qURL v2 admission on the NHP-server side.
+  #
+  # cell0 has carried both since #3172; this root never passed them, so the
+  # compute module took its `false` defaults and cell1's servers booted with
+  # "NHP-native registration DISABLED" and no v2 trust store. The Connector
+  # Authority assigns agents across cells, so any agent placed here failed
+  # enrollment with errCode 52107 -- the fail-closed catch-all that never names
+  # the cause -- and could not have been admitted afterwards either.
+  #
+  # Both are bound to qurl_service_deployable: they render only inside the
+  # user_data template's `qurl_enabled` block, so enabling them while the QURL
+  # plugin is dark would silently drop them and recreate the same failure.
+  agent_otp_registration_enabled = local.qurl_service_deployable
+  qurl_v2_admission_enabled      = local.qurl_service_deployable
+  qurl_v2_issuer_trust_store = local.qurl_service_deployable ? jsonencode({
+    (var.qurl_v2_issuer_kid) = data.aws_kms_public_key.qurl_v2_issuer.public_key
+  }) : "{}"
 
   # HTTP timeouts (required; single source of truth in this root).
   http_timeouts_ms = local.http_timeouts_ms
