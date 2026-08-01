@@ -545,8 +545,6 @@ def _resolve_default_branch(repository_key: str) -> dict[str, Any]:
 
 def collect_github_metadata(
     *,
-    connector_pr_number: int,
-    qurl_go_pr_number: int,
     canary_run_id: int,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     expected_context = {
@@ -650,15 +648,18 @@ def collect_github_metadata(
         raise EvidenceError("Connector canary attempt timestamps are invalid")
 
     artifacts = _github_run_artifacts(canary_run_id)
-    expected_name = (
-        "connector-canary-pr-"
-        f"{connector_pr_number}-{candidates['qurl_connector']['head_sha']}"
-    )
+    # The canary names its evidence artifact connector-canary-pr-<n>-<sha>.
+    # The producer used to reconstruct that string from a --connector-pr-number
+    # input, so every canary re-run against a different PR silently broke the
+    # lookup. Match the canary run's OWN artifact instead: exactly one artifact
+    # may carry this prefix, which is a stronger check than string equality with
+    # a number the caller supplied.
+    canary_evidence_re = re.compile(r"^connector-canary-pr-[1-9][0-9]{0,5}-[0-9a-f]{40}$")
     matches = [
         artifact
         for artifact in artifacts
         if isinstance(artifact, dict)
-        and artifact.get("name") == expected_name
+        and canary_evidence_re.fullmatch(str(artifact.get("name") or ""))
         and isinstance(artifact.get("created_at"), str)
         and (
             attempt_started_at - contract.MAX_CLOCK_SKEW
@@ -709,7 +710,7 @@ def collect_github_metadata(
             "run_attempt": run_attempt,
             "head_sha": canary_head_sha,
             "artifact_id": artifact_id,
-            "artifact_name": expected_name,
+            "artifact_name": artifact.get("name"),
             "artifact_digest": artifact_digest,
             "artifact_size": artifact_size,
         },
@@ -4412,8 +4413,6 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     metadata = subparsers.add_parser("github-metadata")
-    metadata.add_argument("--connector-pr-number", required=True)
-    metadata.add_argument("--qurl-go-pr-number", required=True)
     metadata.add_argument("--canary-run-id", required=True)
     metadata.add_argument("--output", type=Path, required=True)
     metadata.add_argument("--github-output", type=Path, required=True)
@@ -4437,12 +4436,6 @@ def main() -> int:
     try:
         if args.command == "github-metadata":
             value, outputs = collect_github_metadata(
-                connector_pr_number=_positive_input(
-                    args.connector_pr_number, "qurl-connector PR number"
-                ),
-                qurl_go_pr_number=_positive_input(
-                    args.qurl_go_pr_number, "qurl-go PR number"
-                ),
                 canary_run_id=_positive_input(
                     args.canary_run_id, "Connector canary run id"
                 ),
