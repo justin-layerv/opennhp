@@ -3245,13 +3245,76 @@ jobs:
   # group, so a parallel dispatch would just block on the lock. Sequencing
   # keeps the wait short and failure attribution clean.
   #
-  # cell1's terraform root is applied out-of-band (this workflow validates but
-  # never applies terraform/environments/sandbox-cell1). That is fine for
-  # convergence: the image tag reaches instances through SSM
-  # (/sandbox-cell1/nhp/server/{,green-}image-tag, read at boot by
-  # terraform/modules/compute/user_data.sh.tpl via the DeployColor tag) plus an
-  # instance refresh — no apply required. Launch-template/user_data changes
-  # still need that out-of-band apply.
+  # Apply cell1's terraform root from main.
+  #
+  # This used to be an out-of-band, human-remembered step, and the comment here
+  # said so. It was not fine: a user_data change merged to main and then sat
+  # unapplied for five days, so cell1's NHP servers kept booting with native
+  # agent registration and qURL v2 admission compiled out. Every agent the
+  # Connector Authority assigned to cell1 failed enrollment with errCode 52107,
+  # and nothing surfaced the gap because CI reported green -- it validates this
+  # root but never applied it.
+  #
+  # Main is the bible: a cell whose infrastructure only converges when someone
+  # remembers is a cell whose running state is not described by main.
+  deploy-sandbox-cell1-infra:
+    name: Deploy Sandbox cell1 - Infrastructure
+    needs: [deploy-sandbox-infra]
+    if: |
+      always() &&
+      needs.deploy-sandbox-infra.result == 'success'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 45
+    concurrency:
+      group: deploy-sandbox-cell1-infra
+      cancel-in-progress: false  # Never cancel an in-flight terraform apply.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform apply (sandbox-cell1)
+        working-directory: terraform/environments/sandbox-cell1
+        run: |
+          set -euo pipefail
+          terraform init -no-color
+          # Plan to a file and apply exactly that, so what is reviewed in the log
+          # is what runs. A no-op plan applies cleanly and costs seconds.
+          terraform plan -no-color -out=tfplan
+          test -s tfplan
+          terraform apply -no-color -auto-approve tfplan
+
+      - name: Prove the bootstrap script carries the agent-serving config
+        run: |
+          set -euo pipefail
+          # The launch template holds only a shim; the real server config is the
+          # S3 object instances fetch at boot. Reading the template instead of
+          # this object is what made the original gap so hard to see.
+          script="$(aws s3 cp "s3://layerv-nhp-sandbox-cell1-plugins/scripts/server-init.sh" -)"
+          missing=0
+          for key in AGENT_OTP_REGISTRATION_ENABLED QURL_V2_ADMISSION_ENABLED; do
+            if ! printf '%s' "${script}" | grep -q "^${key}="; then
+              echo "::error::cell1 server-init.sh is missing ${key}; agents assigned to cell1 cannot enroll"
+              missing=1
+            fi
+          done
+          test "${missing}" -eq 0
+          echo "cell1 bootstrap carries the agent-serving configuration"
+
   deploy-sandbox-cell1-blue-green:
     name: Deploy Sandbox cell1 - Blue/Green
     # Only deploy-sandbox-blue-green is listed: it already needs setup, build
