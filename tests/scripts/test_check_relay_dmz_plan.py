@@ -2368,6 +2368,29 @@ def source_fenced_plan() -> dict[str, Any]:
             ),
             config_resource(
                 "aws_vpc_security_group_ingress_rule",
+                "server_nhp_udp_vpc",
+                {
+                    "count": {
+                        "references": ["var.public_nhp_udp_ingress_cidrs"]
+                    },
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                    "ip_protocol": {"constant_value": "udp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "cidr_ipv4": {"references": ["var.vpc_cidr"]},
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                },
+            ),
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
                 "server_nlb_health",
                 {
                     "from_port": {
@@ -2509,6 +2532,20 @@ def source_fenced_plan() -> dict[str, Any]:
             "from_port": checker.EXPECTED_NHP_SERVER_PORT,
             "to_port": checker.EXPECTED_NHP_SERVER_PORT,
             "cidr_ipv4": None,
+        },
+    )
+    add(
+        "module.nhp.module.compute."
+        "aws_vpc_security_group_ingress_rule.server_nhp_udp_vpc[0]",
+        "aws_vpc_security_group_ingress_rule",
+        "server_nhp_udp_vpc",
+        {
+            "security_group_id": "sg-server",
+            "referenced_security_group_id": None,
+            "ip_protocol": "udp",
+            "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "cidr_ipv4": "10.100.0.0/16",
         },
     )
     add(
@@ -3074,100 +3111,60 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             ),
         )
 
-    def _with_in_vpc_ac_rule(
-        self, plan: dict[str, Any], *, cidr_ref: str = "var.vpc_cidr"
-    ) -> dict[str, Any]:
-        """Add the in-VPC AC keepalive rule to a source-fenced plan."""
+    def test_in_vpc_ac_rule_is_required_by_the_fenced_topology(self) -> None:
+        """Dropping the rule reds the contract, so the AC path cannot silently go.
+
+        The public UDP fence removed this path once already, by zeroing
+        server_nhp_udp's count -- whose 0.0.0.0/0 source was also the only rule
+        admitting in-VPC AC traffic. Requiring the replacement here is what stops
+        a future fence change from taking it out again unnoticed.
+        """
+        plan = source_fenced_plan()
         compute_config = plan["configuration"]["root_module"]["module_calls"]["nhp"][
             "module"
         ]["module_calls"]["compute"]["module"]
-        compute_config["resources"].append(
-            config_resource(
-                "aws_vpc_security_group_ingress_rule",
-                "server_nhp_udp_vpc",
-                {
-                    "count": {
-                        "references": ["var.public_nhp_udp_ingress_cidrs"]
-                    },
-                    "from_port": {
-                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
-                    },
-                    "ip_protocol": {"constant_value": "udp"},
-                    "security_group_id": {
-                        "references": [
-                            "aws_security_group.server.id",
-                            "aws_security_group.server",
-                        ]
-                    },
-                    "cidr_ipv4": {"references": [cidr_ref]},
-                    "to_port": {
-                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
-                    },
-                },
-            )
-        )
-        plan["resource_changes"].append(
-            {
-                "address": "module.nhp.module.compute."
-                "aws_vpc_security_group_ingress_rule.server_nhp_udp_vpc[0]",
-                "module_address": "module.nhp.module.compute",
-                "mode": "managed",
-                "type": "aws_vpc_security_group_ingress_rule",
-                "name": "server_nhp_udp_vpc",
-                "index": 0,
-                "change": {
-                    "actions": ["create"],
-                    "before": None,
-                    "after": {
-                        "security_group_id": "sg-server",
-                        "referenced_security_group_id": None,
-                        "ip_protocol": "udp",
-                        "from_port": checker.EXPECTED_NHP_SERVER_PORT,
-                        "to_port": checker.EXPECTED_NHP_SERVER_PORT,
-                        "cidr_ipv4": "10.100.0.0/16",
-                    },
-                    "after_unknown": {},
-                },
-            }
-        )
-        return plan
-
-    def test_fenced_topology_admits_the_in_vpc_ac_rule_before_it_exists(
-        self,
-    ) -> None:
-        """The contract must admit the rule BEFORE the HCL can introduce it.
-
-        terraform-plan-pr.yml restores this checker from the merge-base, so the
-        compute PR that adds server_nhp_udp_vpc is graded by whatever is already
-        on main. If main's contract did not accept the rule, that PR could never
-        go green — the exact deadlock this transitional window exists to break.
-        Main's own shape (no rule yet) is covered by every other fenced test.
-        """
-        self.assertEqual(
-            [],
-            checker.validate_plan(
-                self._with_in_vpc_ac_rule(source_fenced_plan()),
-                require_udp_source_fenced_topology=True,
-            ),
-        )
-
-    def test_in_vpc_ac_rule_is_graded_exactly_once_present(self) -> None:
-        """Optional presence never means unreviewed shape.
-
-        The source must be the cell's own VPC CIDR; routing it through the
-        operator-supplied relay list would let an arbitrary CIDR reach the
-        servers on UDP 62206 under this rule's name.
-        """
+        compute_config["resources"] = [
+            r
+            for r in compute_config["resources"]
+            if r.get("name") != "server_nhp_udp_vpc"
+        ]
+        plan["resource_changes"] = [
+            c
+            for c in plan["resource_changes"]
+            if c.get("name") != "server_nhp_udp_vpc"
+        ]
         self.assertNotEqual(
             [],
             checker.validate_plan(
-                self._with_in_vpc_ac_rule(
-                    source_fenced_plan(),
-                    cidr_ref="var.additional_nhp_udp_ingress_cidrs",
-                ),
-                require_udp_source_fenced_topology=True,
+                plan, require_udp_source_fenced_topology=True
             ),
         )
+
+    def test_in_vpc_ac_rule_source_must_be_the_cell_vpc_cidr(self) -> None:
+        """Routing it through the operator-supplied relay list is refused.
+
+        var.additional_nhp_udp_ingress_cidrs is an arbitrary caller-supplied
+        list; binding this rule to it would let any CIDR reach the servers on
+        UDP 62206 under the in-VPC AC rule's name.
+        """
+        plan = source_fenced_plan()
+        compute_config = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]["module_calls"]["compute"]["module"]
+        for resource in compute_config["resources"]:
+            if resource.get("name") == "server_nhp_udp_vpc":
+                resource["expressions"]["cidr_ipv4"] = {
+                    "references": ["var.additional_nhp_udp_ingress_cidrs"]
+                }
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertIn(
+            "canonical server SG in-VPC AC rule must bind only the cell VPC"
+            " CIDR on UDP 62206",
+            errors,
+        )
+
 
     def test_source_fenced_topology_requires_explicit_unknown_sg_references(
         self,

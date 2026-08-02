@@ -830,6 +830,39 @@ resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp_nlb" {
   }
 }
 
+# In-VPC AC keepalive/refresh ingress. ACs send NHP_KPL and registration
+# refreshes STRAIGHT to their assigned servers' private IPs, not through the
+# public NLB -- see endpoints/ac/registration.go::refreshAssignedServerRegistrations
+# and the keepalive note on DefaultNLBReregistrationInterval.
+#
+# Before the fence that path rode on server_nhp_udp, whose 0.0.0.0/0 source
+# incidentally covered in-VPC callers (that rule's own comment calls out that it
+# "still serves in-VPC AC traffic"). Fencing the public edge sets that rule's
+# count to 0, which silently took the AC path down with it: every assigned-server
+# keepalive times out, the all-unconnected detector re-registers through the NLB
+# every ~30s, and because lastNLBRegistrationNano keeps resetting, the periodic
+# NLB re-registration never reaches its interval and never fires. The fleet looks
+# alive -- registration through the edge succeeds -- while no AC can actually
+# reach the servers it was assigned.
+#
+# Scoped to the VPC CIDR, matching how server_http_traefik and server_http_plugins
+# already admit AC traffic, and strictly tighter than the 0.0.0.0/0 rule it
+# replaces here.
+resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp_vpc" {
+  count = local.public_udp_fence_count
+
+  security_group_id = aws_security_group.server.id
+  description       = "NHP Protocol from in-VPC ACs to their assigned servers"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = var.vpc_cidr
+
+  tags = {
+    Name = "${var.name_prefix}-server-nhp-udp-vpc"
+  }
+}
+
 # The public NLB health check is likewise accepted only through the NLB
 # security-group identity. The existing VPC-scoped plugin rule remains for
 # legitimate in-VPC callers and does not broaden public ingress.

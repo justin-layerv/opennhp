@@ -98,7 +98,14 @@ func TestACLogs_NLBReregistrationFiresWithinDeployGate(t *testing.T) {
 			"This metric is fleet-breadth-keyed so a partial-fleet regression (loop "+
 			"dies on N-1 of N ACs) is still caught. See "+
 			"endpoints/ac/registration.go::checkPeriodicNLBReregistration and the "+
-			"PR #1726 comment block on DefaultNLBReregistrationInterval.",
+			"PR #1726 comment block on DefaultNLBReregistrationInterval. "+
+			"FIRST CHECK ASSIGNED-SERVER REACHABILITY, not the loop itself: when ACs "+
+			"cannot reach their assigned servers' private IPs on UDP 62206, "+
+			"checkAllUnconnected re-registers through the NLB every ~30s, that keeps "+
+			"resetting lastNLBRegistrationNano, and the periodic loop never reaches its "+
+			"interval — so a pure connectivity break presents here as a silent loop. "+
+			"Grep the AC log group for 'Failed to connect to assigned server'; if it is "+
+			"there, the fault is the server security group's UDP 62206 ingress, not cadence.",
 			distinctACs, logGroup, lookbackMinutes, minNLBReregistrationDistinctACs)
 	}
 
