@@ -172,7 +172,10 @@ func TestDecodeAuthorityResponseRejectsNestedDriftAndCrossAgentResult(t *testing
 		{
 			name:    "unknown endpoint field",
 			request: authorityFixtureRequest(vectors, ModeRefresh),
-			body:    strings.Replace(refresh, `"port":62206`, `"port":62206,"url":"https://forbidden.example"`, 1),
+			// The needle must track the conformance vectors' endpoint port, which
+			// moved to 443 in v0.11.0. A stale needle matches nothing and silently
+			// turns this rejection case into a no-op on a valid body.
+			body: strings.Replace(refresh, `"port":443`, `"port":443,"url":"https://forbidden.example"`, 1),
 		},
 		{
 			name:    "cross agent result",
