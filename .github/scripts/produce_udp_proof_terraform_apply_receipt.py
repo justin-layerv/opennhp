@@ -154,23 +154,18 @@ def build_receipt(
     # one-time UDP retirement. A plan with no retirement resource in it is out
     # of scope entirely.
     #
-    # bootstrap_alb alone does NOT put a plan in scope. It is a whole module,
-    # and ordinary work legitimately deletes resources inside it: #3657 ("let CI
-    # empty the sandbox bootstrap-ALB buckets") deleted one, which scoped the
-    # plan in, found the other 24 retirement artifacts absent because they are
-    # still live, and turned Build and Deploy NHP red on main for a change that
-    # had nothing to do with the retirement.
+    # bootstrap_alb is deliberately NOT excluded here. #3659 excluded it, on the
+    # theory that a lone deletion inside that module is ordinary work rather than
+    # the retirement. That is wrong: the retirement's FINAL apply is exactly a
+    # bootstrap_alb-only plan -- the real one destroyed 41 of 43 resources and
+    # left the versioned access-log bucket -- so excluding it means the last
+    # apply of the retirement emits no governed receipt at all.
     #
-    # The other 24 addresses are HTTP-agent retirement artifacts -- the OTP
-    # pepper, its preconditions, the agent register/bootstrap metric filters and
-    # alarms. Nothing but the retirement deletes them, so they, and not the
-    # shared module, are what identifies the retirement apply. Once one of them
-    # appears the full all-or-nothing set is still required, so a genuinely
-    # partial retirement is still refused.
-    if not any(
-        logical is not None and logical != BOOTSTRAP_ALB
-        for _, _, logical in deletions
-    ):
+    # The #3657 red that motivated #3659 is already fixed correctly below, by
+    # prior state: an address may be missing from the plan only when it is also
+    # gone from state. That answers "is this the retirement resuming, or an
+    # unrelated change?" with evidence instead of a heuristic.
+    if not any(logical is not None for _, _, logical in deletions):
         return None
 
     approved: set[str] = set()

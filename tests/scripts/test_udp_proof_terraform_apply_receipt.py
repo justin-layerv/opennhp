@@ -120,57 +120,13 @@ class SavedPlanReceiptTest(unittest.TestCase):
                 head_sha=HEAD_SHA,
             )
 
-    def test_bootstrap_alb_deletion_alone_is_not_the_retirement(self) -> None:
-        """Ordinary work deletes resources inside the ALB module.
-
-        #3657 ("let CI empty the sandbox bootstrap-ALB buckets") deleted one.
-        That scoped the plan into the retirement receipt, which then found the
-        other 24 retirement artifacts absent -- because they are still live --
-        and turned Build and Deploy NHP red on main for a change with nothing to
-        do with the retirement.
-
-        bootstrap_alb is a whole MODULE. It cannot be what identifies the
-        one-time retirement apply.
-        """
-        for address in (
-            f"{producer.BOOTSTRAP_ALB}.aws_s3_bucket_policy.logs",
-            f"{producer.BOOTSTRAP_ALB}.aws_lb.this[0]",
-            f"{producer.BOOTSTRAP_ALB}.module.inner.aws_s3_object.x",
-        ):
-            with self.subTest(address=address):
-                self.assertIsNone(
-                    producer.build_receipt(
-                        {"resource_changes": [change(address, ["delete"])]},
-                        saved_plan_sha256=PLAN_SHA256,
-                        run_id=RUN_ID,
-                        run_attempt=RUN_ATTEMPT,
-                        head_sha=HEAD_SHA,
-                    )
-                )
-
-    def test_a_retirement_artifact_still_scopes_the_plan_in(self) -> None:
-        """Narrowing the scope must not become a way to skip the gate.
-
-        One genuine retirement artifact is enough to demand the whole
-        all-or-nothing set, with or without the ALB module alongside it.
-        """
-        marker = "module.nhp.aws_secretsmanager_secret.agent_otp_pepper"
-        self.assertIn(marker, orchestrator.TERRAFORM_RETIREMENT_RESOURCES)
-        for extra in ([], [change(f"{producer.BOOTSTRAP_ALB}.aws_lb.this[0]", ["delete"])]):
-            with self.subTest(with_alb=bool(extra)):
-                with self.assertRaisesRegex(
-                    producer.TerraformApplyReceiptError, "deletion set drift"
-                ):
-                    producer.build_receipt(
-                        {"resource_changes": [change(marker, ["delete"])] + extra},
-                        saved_plan_sha256=PLAN_SHA256,
-                        run_id=RUN_ID,
-                        run_attempt=RUN_ATTEMPT,
-                        head_sha=HEAD_SHA,
-                    )
-
     def test_the_complete_retirement_still_emits_its_receipt(self) -> None:
-        """The narrowing must not disarm the real retirement apply."""
+        """The whole set in one plan is still the ordinary retirement apply.
+
+        Kept from #3659 after its scope narrowing was reverted: the narrowing was
+        wrong, but a direct assertion that a complete plan still emits a receipt
+        naming the full canonical set is worth having on its own.
+        """
         receipt = exact_receipt()
         self.assertIn(producer.BOOTSTRAP_ALB, receipt["approved_deletions"])
         self.assertEqual(
