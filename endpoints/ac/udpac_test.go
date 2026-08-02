@@ -168,7 +168,7 @@ func TestNewConnection_UnconnectedSocket(t *testing.T) {
 	// Create connection to an arbitrary address
 	remoteAddr := &net.UDPAddr{
 		IP:   net.ParseIP("192.168.1.100"),
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 	}
 
 	conn := ac.newConnection(remoteAddr)
@@ -217,7 +217,7 @@ func TestNewConnection_IPv6Socket(t *testing.T) {
 	// Create connection to an IPv6 address
 	remoteAddr := &net.UDPAddr{
 		IP:   net.ParseIP("::1"),
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 	}
 
 	conn := ac.newConnection(remoteAddr)
@@ -393,9 +393,9 @@ func TestMultipleConnections_DifferentPorts(t *testing.T) {
 
 	// Create multiple connections to different remotes
 	remotes := []*net.UDPAddr{
-		{IP: net.ParseIP("10.0.1.1"), Port: DefaultServerPort},
-		{IP: net.ParseIP("10.0.1.2"), Port: DefaultServerPort},
-		{IP: net.ParseIP("10.0.1.3"), Port: DefaultServerPort},
+		{IP: net.ParseIP("10.0.1.1"), Port: testServerListenPort},
+		{IP: net.ParseIP("10.0.1.2"), Port: testServerListenPort},
+		{IP: net.ParseIP("10.0.1.3"), Port: testServerListenPort},
 	}
 
 	var conns []*UdpConn
@@ -603,7 +603,7 @@ func TestConnection_RemoteAddrPreserved(t *testing.T) {
 	}{
 		{
 			name: "IPv4 address",
-			addr: &net.UDPAddr{IP: net.ParseIP("192.168.1.100"), Port: DefaultServerPort},
+			addr: &net.UDPAddr{IP: net.ParseIP("192.168.1.100"), Port: testServerListenPort},
 		},
 		{
 			name: "localhost",
@@ -644,7 +644,7 @@ func TestConnection_QueuesInitialized(t *testing.T) {
 
 	remoteAddr := &net.UDPAddr{
 		IP:   net.ParseIP("10.0.1.1"),
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 	}
 
 	conn := ac.newConnection(remoteAddr)
@@ -881,7 +881,7 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:   "10.0.0.1",
-				Port: DefaultServerPort,
+				Port: testServerListenPort,
 			},
 		},
 	}
@@ -899,7 +899,7 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 	}
 
 	// Create connection with very short timeout (50ms)
-	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: DefaultServerPort}
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: testServerListenPort}
 	netConnLocalAddr, ok := netConn.LocalAddr().(*net.UDPAddr)
 	if !ok {
 		t.Fatalf("expected *net.UDPAddr, got %T", netConn.LocalAddr())
@@ -977,7 +977,7 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:   "192.168.1.100", // Different from test connection
-				Port: DefaultServerPort,
+				Port: testServerListenPort,
 			},
 		},
 	}

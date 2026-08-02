@@ -22,6 +22,14 @@ import (
 
 const acReadinessPath = "/nhp-ac/ready"
 
+// defaultHTTPListenPort is the loopback TCP port nhp-acd serves plugin HTTP on
+// when HttpListenPort is unset. It shares the NHP server's listen port number
+// for historical reasons only — it is a localhost TCP listener with no relation
+// to the UDP client edge, so it must not follow common.DefaultNHPClientPort
+// (binding TCP/443 would need CAP_NET_BIND_SERVICE and collide with any local
+// TLS listener).
+const defaultHTTPListenPort = common.DefaultNHPPort
+
 type HttpAC struct {
 	id         string
 	ua         *UdpAC
@@ -49,7 +57,7 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 
 	port := hc.HttpListenPort
 	if hc.HttpListenPort == 0 {
-		port = DefaultServerPort
+		port = defaultHTTPListenPort
 	}
 	// only listen to localhost for security reason.
 	hs.listenAddr = &net.TCPAddr{

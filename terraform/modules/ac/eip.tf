@@ -51,6 +51,8 @@ resource "aws_eip" "ac" {
 # NLB must therefore admit the complete managed AC EIP pool as well as the
 # external proof source. Index keys keep the for_each shape plan-known on a
 # first apply while the EIP addresses themselves are still provider-unknown.
+# The port is the client-edge listener port (UDP 443) the AC's ConnectorClient
+# dials — see endpoints/ac.DefaultServerPort — not the server's 62206 bind.
 resource "aws_vpc_security_group_ingress_rule" "server_nlb_registration" {
   for_each = var.server_nlb_source_fenced ? {
     for index, address in aws_eip.ac :
@@ -59,8 +61,8 @@ resource "aws_vpc_security_group_ingress_rule" "server_nlb_registration" {
 
   security_group_id = var.server_nlb_security_group_id
   description       = "NHP AC registration source ${each.value}"
-  from_port         = 62206
-  to_port           = 62206
+  from_port         = 443
+  to_port           = 443
   ip_protocol       = "udp"
   cidr_ipv4         = each.value
 

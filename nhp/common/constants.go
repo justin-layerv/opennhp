@@ -21,9 +21,21 @@ const (
 
 // Network defaults
 const (
-	// DefaultNHPPort is the default UDP port for NHP server knock packets.
-	// Used by AC, Agent, and Server when no port is explicitly configured.
+	// DefaultNHPPort is the UDP port an NHP server binds for knock packets.
+	// It is the private, in-VPC port: server↔server forwarding, the relay's
+	// NHP_RLY hop, and the public NLB's target group all address the server
+	// here. It is NOT the port a client dials — see DefaultNHPClientPort.
 	DefaultNHPPort = 62206
+
+	// DefaultNHPClientPort is the UDP port clients dial to reach a cell's
+	// public NHP edge (the assigned cell's server NLB, or the Connector Hub
+	// NLB). The load balancer listens here and forwards to DefaultNHPPort on
+	// its targets, so the two are deliberately different: restrictive egress
+	// filters routinely drop high-numbered outbound UDP but pass 443, which
+	// they must leave open for QUIC/HTTP-3. UDP 53 was rejected as the
+	// alternative because enterprise networks commonly hijack outbound DNS to
+	// their own resolver, which would swallow knock packets.
+	DefaultNHPClientPort = 443
 
 	// FarFutureExpiry is a Unix timestamp (2030-12-31 23:59:59 UTC) used as a sentinel
 	// value when a peer should effectively never expire.

@@ -74,7 +74,7 @@ func knockWithFreshRunID(
 	if err := common.ValidateAgentKnockRunID(runID); err != nil {
 		return "", fmt.Errorf("generator returned noncanonical RunID: %w", err)
 	}
-	return knock(cfg.ASP, cfg.Resource, runID, "", cfg.ServerHost, 62206), nil
+	return knock(cfg.ASP, cfg.Resource, runID, "", cfg.ServerHost, common.DefaultNHPClientPort), nil
 }
 
 func required(name string) string {
@@ -172,8 +172,8 @@ func run(cfg config) (result, error) {
 		return result{}, fmt.Errorf("initialize NHP SDK")
 	}
 	defer sdk.Close()
-	if !sdk.AddServer(cfg.ServerPublicKey, "", cfg.ServerHost, 62206, 0) {
-		return result{}, fmt.Errorf("add NHP server %s:62206", cfg.ServerHost)
+	if !sdk.AddServer(cfg.ServerPublicKey, "", cfg.ServerHost, common.DefaultNHPClientPort, 0) {
+		return result{}, fmt.Errorf("add NHP server %s:%d", cfg.ServerHost, common.DefaultNHPClientPort)
 	}
 	if !sdk.SetKnockUser(cfg.User, "udp-readiness", "", `{}`) {
 		return result{}, fmt.Errorf("set NHP probe user %q", cfg.User)

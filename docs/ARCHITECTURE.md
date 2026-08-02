@@ -37,7 +37,8 @@ LayerV spans multiple repositories:
 The NHP Server receives knock requests and coordinates with ACs to grant access.
 
 **Key Responsibilities:**
-- Receives direct SDK UDP knocks on port 62206 through the assigned cell's
+- Receives direct SDK UDP knocks on port 62206, forwarded from the assigned
+  cell's public NLB listener on UDP 443, through the assigned cell's
   public NLB and browser-relayed knocks through the private internal NLB
 - Receives HTTP knock requests on port 443 (via Traefik)
 - Loads and manages authentication plugins
@@ -84,6 +85,7 @@ GET /plugins/:aspid/:resid/valid - Legacy validation endpoint
 
 **Listens On:**
 - UDP 62206 via the assigned cell's public NLB - direct native SDK knocks
+  (clients dial the NLB on UDP 443; the NLB forwards to 62206)
 - UDP 62206 via the internal NLB - private NHP_RLY knocks from the HTTPS relay
 - TCP 8888 (HTTP) - Plugin endpoints (passcode login, auth validation)
   - Accessed via AC Traefik (`/plugins/*` routes) or Demo Gateway nginx
@@ -104,7 +106,10 @@ engine and AOP signing authority stay private. Browser agents use
 re-encrypts to relay HTTPS 8080. The relay owns no public UDP listener.
 
 Upcoming UDP SDKs connect directly to the public NHP server NLB for their
-assigned cell. That server NLB exposes exactly one public UDP listener, 62206.
+assigned cell. That server NLB exposes exactly one public UDP listener, 443,
+which forwards to the server's UDP 62206 target group. Clients never dial
+62206 directly: restrictive egress filters drop high-numbered outbound UDP
+but leave 443 open for QUIC.
 The sandbox cell0 proof edge admits the persistent proof-runner EIP `/32` plus
 the complete Terraform-managed AC EIP pool as exact `/32`s so AC registration
 and rolling refresh remain available through the same protected endpoint. The
@@ -679,7 +684,7 @@ go test -v -tags=integration ./tests/integration/... -run TestPlugins
 ### UDP Communication Flow
 
 ```
-Native UDP SDK ──UDP 62206──► assigned-cell public NHP NLB ──► NHP Server
+Native UDP SDK ──UDP 443──► assigned-cell public NHP NLB ──UDP 62206──► NHP Server
 
 Browser JS-Agent ──HTTPS 443──► relay ALB ──HTTPS 8080──► NHP Relay
                                                        │
@@ -1144,7 +1149,7 @@ deployment contract: production remains relay-dark with `deploy_relay=false`.
 | AC ASG | `layerv-nhp-sandbox-ac-asg` | `layerv-nhp-prod-ac-asg` |
 | Relay ASG | Singleton canonical target, DMZ-specific remote name | Absent |
 | etcd (ECS) | `etcd.nhp.sandbox.internal:2379` | `etcd.nhp.prod.internal:2379` |
-| NHP server ingress | Public assigned-cell NLB UDP 62206 for SDKs + internal NLB UDP 62206 for relay | Public assigned-cell NLB UDP 62206; relay path absent while relay-dark |
+| NHP server ingress | Public assigned-cell NLB UDP 443 (forwarded to server UDP 62206) for SDKs + internal NLB UDP 62206 for relay | Public assigned-cell NLB UDP 443; relay path absent while relay-dark |
 
 **Directory Structure (Terraform-managed):**
 ```
@@ -1170,7 +1175,7 @@ deployment contract: production remains relay-dark with `deploy_relay=false`.
 
 The sandbox target makes the DMZ relay fleet the public HTTPS browser-knock
 edge. Direct SDK knocks enter the public NHP server NLB of the assigned cell on
-its only UDP listener, 62206. UDP 62207 is relay-private traffic and is never
+its only UDP listener, 443. UDP 62207 is relay-private traffic and is never
 internet-facing. This does not mean the whole account is
 private: AC, qURL, bootstrap, CloudFront, and legacy surfaces are separate
 boundaries. Apply and rollback follow the
@@ -1179,7 +1184,7 @@ boundaries. Apply and rollback follow the
 ```
 Internet
    ├─ HTTPS 443 ─► relay public ALB ─► relay HTTPS 8080
-   └─ UDP 62206 ─► assigned-cell public server NLB ─► NHP server
+   └─ UDP 443 ─► assigned-cell public server NLB ─► NHP server (UDP 62206)
    ▼
 ┌──────────────────── Relay DMZ VPC (10.101.0.0/16) ────────────────┐
 │ Public load-balancer subnets: IGW default route only               │
@@ -1194,7 +1199,7 @@ Internet
                  + authenticated return     │
                                             ▼
 ┌──────────────────────── Main VPC (10.100.0.0/16) ──────────────────┐
-│ Public server NLB UDP 62206 + internal relay NLB UDP 62206         │
+│ Public server NLB UDP 443 + internal relay NLB UDP 62206           │
 │                         NHP server ASGs / policy engine / AOP       │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -1219,7 +1224,7 @@ shared Logs key and relay-dark production policy unchanged.
 | Relay node SG | UDP 62206 to exact main private-subnet CIDRs | NHP_RLY to the internal server path |
 | Relay node SG | UDP 62207 from server SG | Private authenticated RelayReturn receive socket |
 | Relay node SG | TCP 443 to endpoint SG and regional S3 prefix list | Bounded AWS control-plane/bootstrap egress |
-| Sandbox proof public server NLB SG | UDP 62206 from the exact proof-runner EIP `/32` and every Terraform-managed AC EIP `/32` | Source-fenced direct SDK proof plus AC registration ingress |
+| Sandbox proof public server NLB SG | UDP 443 from the exact proof-runner EIP `/32` and every Terraform-managed AC EIP `/32` | Source-fenced direct SDK proof plus AC registration ingress |
 | Sandbox proof server SG | UDP 62206 from the public server NLB SG | Direct SDK traffic forwarded by the assigned-cell NLB |
 | Server SG | UDP 62206 from the DMZ relay subnet CIDRs | Peered browser-relay forwarding through the internal NLB |
 
@@ -1657,7 +1662,7 @@ AC starts, generates keypair, registers in etcd (/nhp/ac-registry/{instance-id})
     ↓
 Server watches etcd, discovers AC, adds to trusted peers
     ↓
-AC dials out to Server (UDP 62206)
+AC dials out to Server (public NLB UDP 443)
     ↓
 Server recognizes AC's public key → NHP-AOL/NHP-AAK handshake succeeds
     ↓
@@ -1943,7 +1948,7 @@ ETCDCTL_API=3 etcdctl get /nhp/config --print-value-only
 ETCDCTL_API=3 etcdctl get /nhp/ac-registry/ --prefix --keys-only
 
 # Test UDP connectivity
-nc -u -v {nlb-dns} 62206
+nc -u -v {nlb-dns} 443
 
 # Test demo API
 curl -X POST https://home.secure.layerv.xyz/api/ps/createPortalSitesByURL \
@@ -1999,7 +2004,7 @@ nmap -Pn -p 80,443 abc123.qurl.site
 
 | Port | Protocol | Component | Purpose |
 |------|----------|-----------|---------|
-| 62206 | UDP | Assigned-cell public server NLB | Direct SDK knock ingress (the NLB's only UDP listener) |
+| 443 | UDP | Assigned-cell public server NLB | Direct SDK knock ingress (the NLB's only UDP listener; forwards to server UDP 62206) |
 | 62206 | UDP | Private NHP Server path | Browser-relayed knock packets through the internal NLB |
 | 62207 | UDP | NHP Relay (private only) | `NHP_RLY` send and authenticated return socket; never public |
 | 443 | TCP | Traefik | HTTPS (TLS termination) |

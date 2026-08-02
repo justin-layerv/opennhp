@@ -1,6 +1,6 @@
 # Plan-only tests for the Connector Hub public UDP edge slice (Step 5, slice
 # 5a). They prove the dark-first gate creates ZERO public-edge resources while
-# off, and that flipping it opens EXACTLY the caller-facing public UDP-62206
+# off, and that flipping it opens EXACTLY the caller-facing public UDP-443
 # edge -- three public subnets, one internet gateway, one public route table
 # carrying a single 0.0.0.0/0 default route, and one internet-facing network
 # NLB + UDP listener + IP target group -- without weakening the isolated
@@ -300,20 +300,20 @@ run "hub_edge_on_opens_only_the_public_udp_edge" {
       length(aws_vpc_security_group_ingress_rule.hub_nlb_udp) == 1 &&
       aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].cidr_ipv4 == "3.141.109.76/32" &&
       aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].ip_protocol == "udp" &&
-      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].from_port == 62206 &&
-      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].to_port == 62206 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].from_port == 443 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"].to_port == 443 &&
       length(aws_lb.hub) == 1 &&
       aws_lb.hub[0].internal == false &&
       aws_lb.hub[0].load_balancer_type == "network" &&
       length(aws_lb.hub[0].security_groups) == 1 &&
       aws_lb.hub[0].name == "layerv-nhp-sandbox-hub-edge" &&
       length(aws_lb_listener.hub) == 1 &&
-      aws_lb_listener.hub[0].port == 62206 &&
+      aws_lb_listener.hub[0].port == 443 &&
       aws_lb_listener.hub[0].protocol == "UDP" &&
       aws_lb_target_group.hub[0].target_type == "ip" &&
       aws_lb_target_group.hub[0].port == 62206
     )
-    error_message = "Enabling the Hub edge must open exactly the proof-/32-fenced public UDP-62206 edge with its NLB security group attached at creation."
+    error_message = "Enabling the Hub edge must open exactly the proof-/32-fenced public UDP-443 edge (translating to UDP-62206 targets) with its NLB security group attached at creation."
   }
 
   assert {

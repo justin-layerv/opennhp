@@ -19,7 +19,7 @@ import time
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, default=62206)
+    parser.add_argument("--port", type=int, default=443)
     parser.add_argument("--pps", type=int, default=2000)
     parser.add_argument("--duration-seconds", type=int, default=300)
     parser.add_argument("--source-sockets", type=int, default=64)

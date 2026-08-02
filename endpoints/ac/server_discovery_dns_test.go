@@ -131,7 +131,7 @@ func TestServerDiscovery_OldConnectionClosedOnAddressChange(t *testing.T) {
 	newAddr := "10.0.0.2:62206"
 
 	// Create old connection via the AC's newConnection (properly initializes all fields)
-	oldConn := createTestUdpConn(t, ac, "10.0.0.1", DefaultServerPort)
+	oldConn := createTestUdpConn(t, ac, "10.0.0.1", testServerListenPort)
 	ac.remoteConnectionMutex.Lock()
 	ac.remoteConnectionMap[oldAddr] = oldConn
 	ac.remoteConnectionMutex.Unlock()
@@ -240,7 +240,7 @@ func TestServerDiscovery_ConnectionMapUpdatedOnAddressChange(t *testing.T) {
 	newAddr := "10.0.0.2:62206"
 
 	// Create old connection
-	oldConn := createTestUdpConn(t, ac, "10.0.0.1", DefaultServerPort)
+	oldConn := createTestUdpConn(t, ac, "10.0.0.1", testServerListenPort)
 	ac.remoteConnectionMutex.Lock()
 	ac.remoteConnectionMap[oldAddr] = oldConn
 	ac.remoteConnectionMutex.Unlock()
@@ -254,7 +254,7 @@ func TestServerDiscovery_ConnectionMapUpdatedOnAddressChange(t *testing.T) {
 	ac.remoteConnectionMutex.Unlock()
 
 	// Add new connection (simulating what sendMsgCh would cause)
-	newConn := createTestUdpConn(t, ac, "10.0.0.2", DefaultServerPort)
+	newConn := createTestUdpConn(t, ac, "10.0.0.2", testServerListenPort)
 	ac.remoteConnectionMutex.Lock()
 	ac.remoteConnectionMap[newAddr] = newConn
 	ac.remoteConnectionMutex.Unlock()
@@ -284,7 +284,7 @@ func TestServerDiscovery_ConnectionMapUpdatedOnAddressChange(t *testing.T) {
 func TestUdpPeer_DNSResolutionFailureRetries(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname:       "server.nhp.test.internal",
-		Port:           DefaultServerPort,
+		Port:           testServerListenPort,
 		Type:           core.NHP_SERVER,
 		LookupHostFunc: failingLookupHost,
 	}
@@ -307,7 +307,7 @@ func TestUdpPeer_DNSCacheInvalidationAfterFailures(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname: "localhost",
 		Ip:       "127.0.0.1",
-		Port:     DefaultServerPort,
+		Port:     testServerListenPort,
 		Type:     core.NHP_SERVER,
 	}
 
@@ -360,7 +360,7 @@ func TestUdpPeer_StaticIPFallbackOnDNSFailure(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname:       "server.nhp.test.internal",
 		Ip:             "10.0.0.42",
-		Port:           DefaultServerPort,
+		Port:           testServerListenPort,
 		Type:           core.NHP_SERVER,
 		LookupHostFunc: failingLookupHost,
 	}
@@ -377,7 +377,7 @@ func TestUdpPeer_StaticIPFallbackOnDNSFailure(t *testing.T) {
 		t.Fatal("SendAddr should not return nil when static IP fallback is available")
 	}
 
-	assertUDPAddr(t, addr, "10.0.0.42", DefaultServerPort)
+	assertUDPAddr(t, addr, "10.0.0.42", testServerListenPort)
 }
 
 // TestUdpPeer_InvalidateDNSCacheNoHostname verifies that calling
@@ -385,7 +385,7 @@ func TestUdpPeer_StaticIPFallbackOnDNSFailure(t *testing.T) {
 func TestUdpPeer_InvalidateDNSCacheNoHostname(t *testing.T) {
 	peer := &core.UdpPeer{
 		Ip:   "10.0.0.1",
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 		Type: core.NHP_SERVER,
 	}
 
@@ -398,7 +398,7 @@ func TestUdpPeer_InvalidateDNSCacheNoHostname(t *testing.T) {
 		t.Fatal("SendAddr should return address for peer with static IP")
 	}
 
-	assertUDPAddr(t, addr, "10.0.0.1", DefaultServerPort)
+	assertUDPAddr(t, addr, "10.0.0.1", testServerListenPort)
 }
 
 // TestServerDiscovery_ConcurrentAddressChangeAndMapAccess verifies that
@@ -422,7 +422,7 @@ func TestServerDiscovery_ConcurrentAddressChangeAndMapAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < numIterations; j++ {
-				addr := fmt.Sprintf("10.0.%d.%d:%d", id, j%256, DefaultServerPort)
+				addr := fmt.Sprintf("10.0.%d.%d:%d", id, j%256, testServerListenPort)
 
 				// Simulate adding a connection (like sendMessageRoutine does)
 				ac.remoteConnectionMutex.Lock()
@@ -430,7 +430,7 @@ func TestServerDiscovery_ConcurrentAddressChangeAndMapAccess(t *testing.T) {
 					ConnData: &core.ConnectionData{
 						RemoteAddr: &net.UDPAddr{
 							IP:   net.ParseIP(fmt.Sprintf("10.0.%d.%d", id, j%256)),
-							Port: DefaultServerPort,
+							Port: testServerListenPort,
 						},
 					},
 				}
@@ -552,7 +552,7 @@ func TestServerDiscovery_MultipleAddressChangesResetCounters(t *testing.T) {
 func TestUdpPeer_SendAddrWithHostname(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname: "localhost",
-		Port:     DefaultServerPort,
+		Port:     testServerListenPort,
 		Type:     core.NHP_SERVER,
 	}
 
@@ -562,7 +562,7 @@ func TestUdpPeer_SendAddrWithHostname(t *testing.T) {
 	}
 
 	// localhost IP varies by platform; just check port
-	assertUDPAddr(t, addr, "", DefaultServerPort)
+	assertUDPAddr(t, addr, "", testServerListenPort)
 }
 
 // TestUdpPeer_SendAddrWithStaticIP verifies that SendAddr returns the
@@ -570,7 +570,7 @@ func TestUdpPeer_SendAddrWithHostname(t *testing.T) {
 func TestUdpPeer_SendAddrWithStaticIP(t *testing.T) {
 	peer := &core.UdpPeer{
 		Ip:   "192.168.1.100",
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 		Type: core.NHP_SERVER,
 	}
 
@@ -579,7 +579,7 @@ func TestUdpPeer_SendAddrWithStaticIP(t *testing.T) {
 		t.Fatal("SendAddr should succeed with static IP")
 	}
 
-	assertUDPAddr(t, addr, "192.168.1.100", DefaultServerPort)
+	assertUDPAddr(t, addr, "192.168.1.100", testServerListenPort)
 }
 
 // TestUdpPeer_SendAddrNilForInvalidIP verifies that SendAddr returns
@@ -587,7 +587,7 @@ func TestUdpPeer_SendAddrWithStaticIP(t *testing.T) {
 func TestUdpPeer_SendAddrNilForInvalidIP(t *testing.T) {
 	peer := &core.UdpPeer{
 		Ip:   "not-a-valid-ip",
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 		Type: core.NHP_SERVER,
 	}
 
@@ -603,7 +603,7 @@ func TestUdpPeer_SendAddrNilForInvalidIP(t *testing.T) {
 func TestUdpPeer_DNSCacheRespectsTTL(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname: "localhost",
-		Port:     DefaultServerPort,
+		Port:     testServerListenPort,
 		Type:     core.NHP_SERVER,
 	}
 
@@ -735,7 +735,7 @@ func TestUdpPeer_ResolveHostCachingBehavior(t *testing.T) {
 	peer := &core.UdpPeer{
 		Hostname: "localhost",
 		Ip:       "10.0.0.99",
-		Port:     DefaultServerPort,
+		Port:     testServerListenPort,
 		Type:     core.NHP_SERVER,
 	}
 
@@ -767,7 +767,7 @@ func TestUdpPeer_ResolveHostCachingBehavior(t *testing.T) {
 func TestUdpPeer_NoHostnameSkipsDNS(t *testing.T) {
 	peer := &core.UdpPeer{
 		Ip:   "10.0.0.42",
-		Port: DefaultServerPort,
+		Port: testServerListenPort,
 		Type: core.NHP_SERVER,
 	}
 
@@ -798,7 +798,7 @@ func TestServerDiscovery_AddressChangeCleanupOrder(t *testing.T) {
 
 	oldAddr := "10.0.0.1:62206"
 
-	conn := createTestUdpConn(t, ac, "10.0.0.1", DefaultServerPort)
+	conn := createTestUdpConn(t, ac, "10.0.0.1", testServerListenPort)
 	ac.remoteConnectionMutex.Lock()
 	ac.remoteConnectionMap[oldAddr] = conn
 	ac.remoteConnectionMutex.Unlock()

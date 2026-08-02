@@ -662,9 +662,9 @@ def require_alarm_registry(
 #
 #   sandbox-hub-dns: a DNS-only root that emits public A-alias records whose
 #   target NLBs live in roots that cannot emit their own Route 53 record —
-#   hub.nhp.layerv.xyz -> the Connector Hub UDP:62206 NLB (Step 5 slice 5c; the
+#   hub.nhp.layerv.xyz -> the Connector Hub UDP:443 NLB (Step 5 slice 5c; the
 #   Control tree forbids aws_route53_record) and cell0.nhp.layerv.xyz -> the
-#   cell0 server UDP:62206 NLB (Step 7; kept out of the giant main root). It
+#   cell0 server UDP:443 NLB (Step 7; kept out of the giant main root). It
 #   instantiates no compute/AC/relay/security and no `module "nhp"` — those
 #   servers + their alarms live in other roots this lint already checks, so there
 #   is no server observability surface to enforce parity on here. Removing the

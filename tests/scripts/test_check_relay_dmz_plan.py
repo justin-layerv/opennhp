@@ -2069,7 +2069,7 @@ def clean_plan() -> dict[str, Any]:
         "module.nhp.module.compute.aws_lb_listener.udp[0]",
         "aws_lb_listener",
         "udp",
-        {"protocol": "UDP", "port": checker.EXPECTED_NHP_SERVER_PORT},
+        {"protocol": "UDP", "port": checker.EXPECTED_NHP_CLIENT_EDGE_PORT},
     )
     add(
         "module.nhp.module.compute.aws_autoscaling_attachment.server[0]",
@@ -2209,14 +2209,14 @@ def source_fenced_plan() -> dict[str, Any]:
                         "cidr_ipv4": {"references": ["each.value"]},
                         "description": {"references": ["each.value"]},
                         "from_port": {
-                            "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                            "constant_value": checker.EXPECTED_NHP_CLIENT_EDGE_PORT
                         },
                         "ip_protocol": {"constant_value": "udp"},
                         "security_group_id": {
                             "references": ["var.server_nlb_security_group_id"]
                         },
                         "to_port": {
-                            "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                            "constant_value": checker.EXPECTED_NHP_CLIENT_EDGE_PORT
                         },
                     },
                 )
@@ -2474,8 +2474,8 @@ def source_fenced_plan() -> dict[str, Any]:
             {
                 "security_group_id": "sg-server-nlb",
                 "ip_protocol": "udp",
-                "from_port": checker.EXPECTED_NHP_SERVER_PORT,
-                "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+                "from_port": checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+                "to_port": checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
                 "cidr_ipv4": f"{public_ip}/32",
             },
         )
@@ -2492,8 +2492,8 @@ def source_fenced_plan() -> dict[str, Any]:
         {
             "security_group_id": "sg-server-nlb",
             "ip_protocol": "udp",
-            "from_port": checker.EXPECTED_NHP_SERVER_PORT,
-            "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+            "from_port": checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+            "to_port": checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
             "cidr_ipv4": checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
         },
     )
@@ -2885,6 +2885,139 @@ def run_checker_cli(
         plan_path = Path(temp_dir) / "tfplan.json"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
         return run_checker_cli_path(plan_path, *options)
+
+
+
+class ClientEdgePortMigrationBoundaryTests(unittest.TestCase):
+    """The 62206 -> 443 client-edge move is its own reviewed boundary shape.
+
+    The DMZ boundary is frozen for ordinary applies and the source-fence
+    replacement was the only previously reviewed mutation. Moving the public
+    client edge is a second, different mutation, so it is admitted on its own
+    exact terms rather than by loosening the fence contract.
+    """
+
+    COMPUTE = "module.nhp.module.compute"
+    AC = "module.nhp.module.ac[0]"
+
+    def _listener(self, before_port=62206, after_port=443, **after_over):
+        after = {
+            "port": after_port,
+            "protocol": "UDP",
+            "load_balancer_arn": "arn:lb",
+            "default_action": [{"target_group_arn": "arn:tg"}],
+        }
+        after.update(after_over)
+        return {
+            "address": f"{self.COMPUTE}.aws_lb_listener.udp[0]",
+            "mode": "managed",
+            "change": {
+                "actions": ["update"],
+                "before": {
+                    "port": before_port,
+                    "protocol": "UDP",
+                    "load_balancer_arn": "arn:lb",
+                    "default_action": [{"target_group_arn": "arn:tg"}],
+                },
+                "after": after,
+            },
+        }
+
+    def _rule(self, address, cidr, before_port=62206, after_port=443, **after_over):
+        after = {
+            "from_port": after_port,
+            "to_port": after_port,
+            "ip_protocol": "udp",
+            "cidr_ipv4": cidr,
+            "security_group_id": "sg-nlb",
+            "referenced_security_group_id": None,
+        }
+        after.update(after_over)
+        return {
+            "address": address,
+            "mode": "managed",
+            "change": {
+                "actions": ["update"],
+                "before": {
+                    "from_port": before_port,
+                    "to_port": before_port,
+                    "ip_protocol": "udp",
+                    "cidr_ipv4": cidr,
+                    "security_group_id": "sg-nlb",
+                    "referenced_security_group_id": None,
+                },
+                "after": after,
+            },
+        }
+
+    def _complete(self):
+        proof = checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR
+        changes = [
+            self._listener(),
+            self._rule(
+                f"{self.COMPUTE}.aws_vpc_security_group_ingress_rule."
+                f'server_nlb_udp["{proof}"]',
+                proof,
+            ),
+        ]
+        for index in range(checker.EXPECTED_SANDBOX_AC_EIP_COUNT):
+            changes.append(
+                self._rule(
+                    f"{self.AC}.aws_vpc_security_group_ingress_rule."
+                    f'server_nlb_registration["{index}"]',
+                    f"198.51.100.{index}/32",
+                )
+            )
+        return changes
+
+    def test_complete_move_is_admitted(self) -> None:
+        self.assertEqual(
+            checker.validate_dmz_boundary_noop({"resource_changes": self._complete()}),
+            [],
+        )
+
+    def test_partial_move_is_refused(self) -> None:
+        """Half a move black-holes the edge or leaves the old port admitted."""
+        for drop in (0, 1, 5):
+            with self.subTest(dropped=drop):
+                changes = self._complete()
+                dropped = changes.pop(drop)
+                errors = checker.validate_dmz_boundary_noop(
+                    {"resource_changes": changes}
+                )
+                self.assertTrue(errors)
+                self.assertTrue(
+                    any("refuses relay-DMZ boundary change" in e for e in errors),
+                    f"expected generic refusal after dropping {dropped['address']}",
+                )
+
+    def test_wrong_destination_port_is_refused(self) -> None:
+        changes = self._complete()
+        changes[0] = self._listener(after_port=8443)
+        errors = checker.validate_dmz_boundary_noop({"resource_changes": changes})
+        self.assertTrue(any("client-edge listener must move" in e for e in errors))
+
+    def test_widened_source_is_refused(self) -> None:
+        """The port may move; who is admitted may not."""
+        proof = checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR
+        changes = self._complete()
+        changes[1] = self._rule(
+            f"{self.COMPUTE}.aws_vpc_security_group_ingress_rule."
+            f'server_nlb_udp["{proof}"]',
+            proof,
+            cidr_ipv4="0.0.0.0/0",
+        )
+        errors = checker.validate_dmz_boundary_noop({"resource_changes": changes})
+        self.assertTrue(any("source and security group unchanged" in e for e in errors))
+
+    def test_retargeted_forward_is_refused(self) -> None:
+        changes = self._complete()
+        changes[0] = self._listener(
+            default_action=[{"target_group_arn": "arn:tg-other"}]
+        )
+        errors = checker.validate_dmz_boundary_noop({"resource_changes": changes})
+        self.assertTrue(any("client-edge listener must move" in e for e in errors))
+
 
 
 class RelayDmzPlanCheckerTests(unittest.TestCase):

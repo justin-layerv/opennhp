@@ -236,7 +236,8 @@ can still pass validation and fail later at DNS/runtime.
 token-validation path above (`local.nhp_server_internal_url`,
 `server.<namespace>:8888`) stays on Cloud Map. Upcoming UDP SDKs use
 `module.compute.nlb_dns_name`, the assigned cell's public server NLB, whose only
-UDP listener is 62206. Browser relay traffic uses
+UDP listener is 443, which forwards to the server's UDP 62206 target group.
+Browser relay traffic uses
 `module.compute.internal_nlb_dns_name` on private UDP 62206. The relay does not
 own a public UDP NLB or listener; do not add a relay-native cutover flag or
 repoint SDK DNS to the relay. The internal NLB runs `preserve_client_ip=true`,

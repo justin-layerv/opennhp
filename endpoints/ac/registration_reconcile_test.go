@@ -113,10 +113,10 @@ func TestACRegistration_HandleRedispatch_PrunesRetiredPeersBeforeConnect(t *test
 
 	priorServers := make([]*AssignedServer, 0, 3)
 	for _, ip := range []string{"10.100.10.10", "10.100.11.11", "10.100.12.12"} {
-		peer := &core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+		peer := &core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 		device.AddPeer(peer)
 		priorServers = append(priorServers, &AssignedServer{
-			Target: common.RedirectTarget{IP: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey},
+			Target: common.RedirectTarget{IP: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey},
 			Peer:   peer,
 		})
 	}
@@ -125,7 +125,7 @@ func TestACRegistration_HandleRedispatch_PrunesRetiredPeersBeforeConnect(t *test
 	// retired peers it leaves exactly one slot before refresh: without the
 	// pre-connect prune, one new server wins the race and the other two are
 	// refused at MaxPeerGroupSize.
-	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(registrationPeer)
 
 	reg.mu.Lock()
@@ -135,7 +135,7 @@ func TestACRegistration_HandleRedispatch_PrunesRetiredPeersBeforeConnect(t *test
 	targets := make([]common.RedirectTarget, 0, len(newPeerIPs))
 	for _, ip := range newPeerIPs {
 		targets = append(targets, common.RedirectTarget{
-			IP: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey,
+			IP: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey,
 		})
 	}
 
@@ -215,14 +215,14 @@ func TestACRegistration_HandleRedispatch_RotatingSharedKeyConvergesActualGroup(t
 
 	sharedKeyBytes := bytes.Repeat([]byte{0x43}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(registrationPeer)
 
 	blue := []string{"10.100.10.10", "10.100.11.11", "10.100.12.12"}
 	green := []string{"10.100.10.103", "10.100.11.144", "10.100.12.145"}
 	bluePeers := make([]*core.UdpPeer, 0, len(blue))
 	for _, ip := range blue {
-		peer := &core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+		peer := &core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 		reg.addAssignmentPeer(peer)
 		bluePeers = append(bluePeers, peer)
 	}
@@ -231,8 +231,8 @@ func TestACRegistration_HandleRedispatch_RotatingSharedKeyConvergesActualGroup(t
 	// the actual PeerGroup.
 	reg.mu.Lock()
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: blue[0], Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: bluePeers[0]},
-		{Target: common.RedirectTarget{IP: blue[1], Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: bluePeers[1]},
+		{Target: common.RedirectTarget{IP: blue[0], Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: bluePeers[0]},
+		{Target: common.RedirectTarget{IP: blue[1], Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: bluePeers[1]},
 	}
 	reg.mu.Unlock()
 
@@ -254,7 +254,7 @@ func TestACRegistration_HandleRedispatch_RotatingSharedKeyConvergesActualGroup(t
 	for epoch, ips := range epochs {
 		targets := make([]common.RedirectTarget, 0, len(ips))
 		for _, ip := range ips {
-			targets = append(targets, common.RedirectTarget{IP: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey})
+			targets = append(targets, common.RedirectTarget{IP: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey})
 		}
 
 		result := make(chan error, 1)
@@ -318,7 +318,7 @@ func TestACRegistration_AuthoritativeTransitionsSerialize(t *testing.T) {
 	targets := func(ips []string) []common.RedirectTarget {
 		out := make([]common.RedirectTarget, 0, len(ips))
 		for _, ip := range ips {
-			out = append(out, common.RedirectTarget{IP: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey})
+			out = append(out, common.RedirectTarget{IP: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey})
 		}
 		return out
 	}
@@ -424,7 +424,7 @@ func TestACRegistration_StopCancelsPrefenceAuthoritativeResponse(t *testing.T) {
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x4d}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	pending := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	pending := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	if err := reg.beginRegistrationAttempt(pending); err != nil {
 		t.Fatalf("beginRegistrationAttempt: %v", err)
 	}
@@ -482,7 +482,7 @@ func TestACRegistration_StopCancelsInFlightRedispatchConnect(t *testing.T) {
 		result <- reg.HandleRedispatch(&common.ACRedispatchMsg{
 			ErrCode: common.ErrSuccess.ErrorCode(),
 			Targets: []common.RedirectTarget{{
-				IP: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: sharedPubKey,
+				IP: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey,
 			}},
 		})
 	}()
@@ -537,13 +537,13 @@ func TestACRegistration_StopCancellationDoesNotDegradeEmbeddedAAKToSuccess(t *te
 	reg.ac.running.Store(true)
 	sharedKeyBytes := bytes.Repeat([]byte{0x58}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	registrationPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(registrationPeer)
 	aakBody := mustJSON(t, common.ServerACAckMsg{
 		ErrCode:    common.ErrSuccess.ErrorCode(),
 		Registered: true,
 		Peers: []common.RedirectTarget{{
-			IP: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: sharedPubKey,
+			IP: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey,
 		}},
 	})
 
@@ -614,7 +614,7 @@ func TestACRegistration_LateAuthoritativeResponseCannotRepopulateAfterStop(t *te
 				HeaderType: core.NHP_ARD,
 				BodyMessage: mustJSON(t, common.ACRedispatchMsg{
 					ErrCode: common.ErrSuccess.ErrorCode(),
-					Targets: []common.RedirectTarget{{IP: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}},
+					Targets: []common.RedirectTarget{{IP: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey}},
 				}),
 			},
 		},
@@ -623,7 +623,7 @@ func TestACRegistration_LateAuthoritativeResponseCannotRepopulateAfterStop(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reg, device := newACRegistrationWithDevice(t)
-			pending := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+			pending := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 			if err := reg.beginRegistrationAttempt(pending); err != nil {
 				t.Fatalf("beginRegistrationAttempt: %v", err)
 			}
@@ -654,7 +654,7 @@ func TestACRegistration_MalformedARDCleansPendingPeer(t *testing.T) {
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x4a}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	pending := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	pending := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	if err := reg.beginRegistrationAttempt(pending); err != nil {
 		t.Fatalf("beginRegistrationAttempt: %v", err)
 	}
@@ -689,7 +689,7 @@ func TestACRegistration_HandleRedispatch_PreservesPendingRegistrationPeer(t *tes
 
 	sharedKeyBytes := bytes.Repeat([]byte{0x46}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	pendingPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	pendingPeer := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	if err := reg.beginRegistrationAttempt(pendingPeer); err != nil {
 		t.Fatalf("beginRegistrationAttempt: %v", err)
 	}
@@ -697,7 +697,7 @@ func TestACRegistration_HandleRedispatch_PreservesPendingRegistrationPeer(t *tes
 	assigned := []string{"10.100.10.103", "10.100.11.144", "10.100.12.145"}
 	targets := make([]common.RedirectTarget, 0, len(assigned))
 	for _, ip := range assigned {
-		targets = append(targets, common.RedirectTarget{IP: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey})
+		targets = append(targets, common.RedirectTarget{IP: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey})
 	}
 
 	result := make(chan error, 1)
@@ -761,9 +761,9 @@ func TestACRegistration_BeginRegistrationAttemptDrainsFullSharedKeyGroup(t *test
 	sharedKeyBytes := bytes.Repeat([]byte{0x48}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 	for _, ip := range []string{"10.100.10.10", "10.100.11.11", "10.100.12.12", "10.100.20.20", "10.100.21.21"} {
-		reg.addAssignmentPeer(&core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
+		reg.addAssignmentPeer(&core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
 	}
-	pending := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	pending := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 
 	if err := reg.beginRegistrationAttempt(pending); err != nil {
 		t.Fatalf("beginRegistrationAttempt: %v", err)
@@ -782,13 +782,13 @@ func TestACRegistration_BeginRegistrationAttemptRejectsFullStaticGroup(t *testin
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 	staticPeers := make([]*core.UdpPeer, 0, core.MaxPeerGroupSize)
 	for _, ip := range []string{"10.100.10.10", "10.100.11.11", "10.100.12.12", "10.100.20.20", "10.100.21.21"} {
-		peer := &core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+		peer := &core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 		staticPeers = append(staticPeers, peer)
 		device.AddPeer(peer)
 	}
 	reg.ac.config.Servers = staticPeers
 	reg.ac.serverPeerMap = map[string]*core.UdpPeer{sharedPubKey: staticPeers[0]}
-	pending := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	pending := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 
 	err := reg.beginRegistrationAttempt(pending)
 	if err == nil || !strings.Contains(err.Error(), "at capacity") {
@@ -810,7 +810,7 @@ func TestACRegistration_DiscardRegistrationRestoresSameAddressStaticPeer(t *test
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x52}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	pendingPeer := &core.UdpPeer{Ip: staticPeer.Ip, Port: staticPeer.Port, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(staticPeer)
 	reg.ac.config.Servers = []*core.UdpPeer{staticPeer}
@@ -833,7 +833,7 @@ func TestACRegistration_FailedAssignmentRestoresSameAddressStaticPeer(t *testing
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x53}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(staticPeer)
 	reg.ac.config.Servers = []*core.UdpPeer{staticPeer}
 	reg.ac.serverPeerMap = map[string]*core.UdpPeer{sharedPubKey: staticPeer}
@@ -857,8 +857,8 @@ func TestACRegistration_BeginRegistrationAttemptRejectsSupersession(t *testing.T
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x47}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	first := &core.UdpPeer{Ip: "10.100.20.20", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	second := &core.UdpPeer{Ip: "10.100.21.21", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	first := &core.UdpPeer{Ip: "10.100.20.20", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	second := &core.UdpPeer{Ip: "10.100.21.21", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 
 	if err := reg.beginRegistrationAttempt(first); err != nil {
 		t.Fatalf("first beginRegistrationAttempt: %v", err)
@@ -887,9 +887,9 @@ func TestACRegistration_ReconcilePreservesStaticSameKeyReloadReplacement(t *test
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x4b}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	staticOld := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	forgottenOwned := &core.UdpPeer{Ip: "10.100.10.10", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	priorOwned := &core.UdpPeer{Ip: "10.100.11.11", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	staticOld := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	forgottenOwned := &core.UdpPeer{Ip: "10.100.10.10", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorOwned := &core.UdpPeer{Ip: "10.100.11.11", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(staticOld)
 	reg.addAssignmentPeer(forgottenOwned)
 	reg.addAssignmentPeer(priorOwned)
@@ -905,7 +905,7 @@ func TestACRegistration_ReconcilePreservesStaticSameKeyReloadReplacement(t *test
 		Peer:   priorOwned,
 	}}
 	newServers := []*AssignedServer{{
-		Target: common.RedirectTarget{IP: "10.100.12.12", Port: DefaultServerPort, PubKeyBase64: sharedPubKey},
+		Target: common.RedirectTarget{IP: "10.100.12.12", Port: testServerListenPort, PubKeyBase64: sharedPubKey},
 	}}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -952,10 +952,10 @@ func TestACRegistration_RefusedAssignmentPeerDoesNotLeakOwnership(t *testing.T) 
 	sharedKeyBytes := bytes.Repeat([]byte{0x4c}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 	for _, ip := range []string{"10.100.10.10", "10.100.11.11", "10.100.12.12", "10.100.20.20", "10.100.21.21"} {
-		device.AddPeer(&core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
+		device.AddPeer(&core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
 	}
 	server := &AssignedServer{Target: common.RedirectTarget{
-		IP: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey,
+		IP: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey,
 	}}
 
 	// The group is full, so admission fails before connectToServer can send to
@@ -982,17 +982,17 @@ func TestACRegistration_DirectAAK_ConvergesFullSharedKeyGroup(t *testing.T) {
 	sharedKeyBytes := bytes.Repeat([]byte{0x44}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 
-	oldPeer := &core.UdpPeer{Ip: "10.100.10.10", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	oldPeer := &core.UdpPeer{Ip: "10.100.10.10", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	reg.addAssignmentPeer(oldPeer)
 	for _, ip := range []string{"10.100.11.11", "10.100.12.12", "10.100.20.20", "10.100.21.21"} {
-		reg.addAssignmentPeer(&core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
+		reg.addAssignmentPeer(&core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER})
 	}
 	reg.registrationPeer = oldPeer
 	reg.assignedServers = []*AssignedServer{
 		{Target: common.RedirectTarget{IP: oldPeer.Ip, Port: oldPeer.Port, PubKeyBase64: sharedPubKey}, Peer: oldPeer, Connected: true},
 	}
 
-	newPeer := &core.UdpPeer{Ip: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	newPeer := &core.UdpPeer{Ip: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	// Mirrors register(): AddPeer runs before handleRegistrationResponse and is
 	// refused at the cap in this setup.
 	device.AddPeer(newPeer)
@@ -1029,7 +1029,7 @@ func TestACRegistration_DirectAAK_RejectsFullStaticGroup(t *testing.T) {
 			sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 			staticPeers := make([]*core.UdpPeer, 0, core.MaxPeerGroupSize)
 			for _, ip := range []string{"10.100.10.10", "10.100.11.11", "10.100.12.12", "10.100.20.20", "10.100.21.21"} {
-				peer := &core.UdpPeer{Ip: ip, Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+				peer := &core.UdpPeer{Ip: ip, Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 				staticPeers = append(staticPeers, peer)
 				device.AddPeer(peer)
 			}
@@ -1038,7 +1038,7 @@ func TestACRegistration_DirectAAK_RejectsFullStaticGroup(t *testing.T) {
 
 			registrationKeyBytes := bytes.Repeat([]byte{0x4d}, core.PublicKeySize)
 			registrationPeer := &core.UdpPeer{
-				Ip: "9.9.9.9", Port: DefaultServerPort,
+				Ip: "9.9.9.9", Port: testServerListenPort,
 				PubKeyBase64: base64.StdEncoding.EncodeToString(registrationKeyBytes), Type: core.NHP_SERVER,
 			}
 			device.AddPeer(registrationPeer)
@@ -1082,8 +1082,8 @@ func TestACRegistration_DirectAAK_CleansRetainedNilAddressPeer(t *testing.T) {
 	reg, device := newACRegistrationWithDevice(t)
 	sharedKeyBytes := bytes.Repeat([]byte{0x45}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
-	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	retainedPeer := &core.UdpPeer{Ip: "not-an-ip", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	retainedPeer := &core.UdpPeer{Ip: "not-an-ip", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(staticPeer)
 	device.AddPeer(retainedPeer)
 	reg.ac.config.Servers = []*core.UdpPeer{staticPeer}
@@ -1112,7 +1112,7 @@ func TestACRegistration_DirectAAK_CleansRetainedNilAddressPeer(t *testing.T) {
 	// A later same-key direct assignment has no priorServers entry for the
 	// retained peer. Reconciliation must find it through the ownership map,
 	// remove it, and preserve the statically configured same-key endpoint.
-	newPeer := &core.UdpPeer{Ip: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	newPeer := &core.UdpPeer{Ip: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(newPeer)
 	if err := reg.handleRegistrationResponse(&core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
@@ -1139,7 +1139,7 @@ func TestACRegistration_RedispatchCleansRetainedNilAddressPeerAcrossKeys(t *test
 
 	oldKeyBytes := bytes.Repeat([]byte{0x54}, core.PublicKeySize)
 	oldPubKey := base64.StdEncoding.EncodeToString(oldKeyBytes)
-	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: DefaultServerPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
+	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: testServerListenPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(oldPeer)
 	if err := reg.handleRegistrationResponse(&core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
@@ -1155,7 +1155,7 @@ func TestACRegistration_RedispatchCleansRetainedNilAddressPeerAcrossKeys(t *test
 		result <- reg.HandleRedispatch(&common.ACRedispatchMsg{
 			ErrCode: common.ErrSuccess.ErrorCode(),
 			Targets: []common.RedirectTarget{{
-				IP: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: newPubKey,
+				IP: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: newPubKey,
 			}},
 		})
 	}()
@@ -1200,7 +1200,7 @@ func TestACRegistration_FailedRedispatchClearsSupersededRegistrationPeer(t *test
 	reg, device := newACRegistrationWithDevice(t)
 	oldKeyBytes := bytes.Repeat([]byte{0x56}, core.PublicKeySize)
 	oldPubKey := base64.StdEncoding.EncodeToString(oldKeyBytes)
-	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: DefaultServerPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
+	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: testServerListenPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(oldPeer)
 	if err := reg.handleRegistrationResponse(&core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
@@ -1213,7 +1213,7 @@ func TestACRegistration_FailedRedispatchClearsSupersededRegistrationPeer(t *test
 	err := reg.HandleRedispatch(&common.ACRedispatchMsg{
 		ErrCode: common.ErrSuccess.ErrorCode(),
 		Targets: []common.RedirectTarget{{
-			IP: "10.100.10.103", Port: DefaultServerPort, PubKeyBase64: newPubKey,
+			IP: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: newPubKey,
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "failed to connect to any assigned servers") {
@@ -1249,8 +1249,8 @@ func TestACRegistration_EmbeddedPeersFailureRetainsUsableResponsePeer(t *testing
 			if tt.directServer {
 				registrationPubKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x47}, core.PublicKeySize))
 			}
-			staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-			registrationPeer := &core.UdpPeer{Ip: "10.100.40.40", Port: DefaultServerPort, PubKeyBase64: registrationPubKey, Type: core.NHP_SERVER}
+			staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+			registrationPeer := &core.UdpPeer{Ip: "10.100.40.40", Port: testServerListenPort, PubKeyBase64: registrationPubKey, Type: core.NHP_SERVER}
 			device.AddPeer(staticPeer)
 			device.AddPeer(registrationPeer)
 			reg.ac.config.Servers = []*core.UdpPeer{staticPeer}
@@ -1260,14 +1260,14 @@ func TestACRegistration_EmbeddedPeersFailureRetainsUsableResponsePeer(t *testing
 				ErrCode:    common.ErrSuccess.ErrorCode(),
 				Registered: true,
 				Peers: []common.RedirectTarget{{
-					IP: "10.100.50.50", Port: DefaultServerPort, PubKeyBase64: sharedPubKey,
+					IP: "10.100.50.50", Port: testServerListenPort, PubKeyBase64: sharedPubKey,
 				}},
 			}
 			expectedPeer := registrationPeer
 			if tt.directServer {
 				aak.ServerAddr = "8.8.8.8:62206"
 				aak.ServerPubKey = sharedPubKey
-				expectedPeer = &core.UdpPeer{Ip: "8.8.8.8", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+				expectedPeer = &core.UdpPeer{Ip: "8.8.8.8", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 			}
 
 			// running=false makes every embedded-peer connection fail after its
@@ -1317,10 +1317,10 @@ func TestACRegistration_EmbeddedPeersSuccessRetiresOnlyResponsePeer(t *testing.T
 	sharedKeyBytes := bytes.Repeat([]byte{0x48}, core.PublicKeySize)
 	sharedPubKey := base64.StdEncoding.EncodeToString(sharedKeyBytes)
 	registrationPubKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x49}, core.PublicKeySize))
-	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	registrationPeer := &core.UdpPeer{Ip: "10.100.40.40", Port: DefaultServerPort, PubKeyBase64: registrationPubKey, Type: core.NHP_SERVER}
-	oldDirectPeer := &core.UdpPeer{Ip: "8.8.8.9", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	target := common.RedirectTarget{IP: "8.8.4.4", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}
+	staticPeer := &core.UdpPeer{Ip: "10.100.30.30", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	registrationPeer := &core.UdpPeer{Ip: "10.100.40.40", Port: testServerListenPort, PubKeyBase64: registrationPubKey, Type: core.NHP_SERVER}
+	oldDirectPeer := &core.UdpPeer{Ip: "8.8.8.9", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	target := common.RedirectTarget{IP: "8.8.4.4", Port: testServerListenPort, PubKeyBase64: sharedPubKey}
 	device.AddPeer(staticPeer)
 	device.AddPeer(registrationPeer)
 	if !reg.addAssignmentPeer(oldDirectPeer) {
@@ -1397,16 +1397,16 @@ func TestACRegistration_ReconcileDevicePeers_PreservesSharedAddress(t *testing.T
 	const sharedPubKey = "c2hhcmVkLXNlcnZlci1wdWJrZXk="
 
 	// Prior assignment installed two members under the shared pubkey.
-	priorPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	priorPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer1)
 	device.AddPeer(priorPeer2)
 
 	// Re-registration installed fresh structs at the same addresses. AddPeer's
 	// same-address branch replaces the PeerGroup member, so the prior pointers
 	// are no longer in peerMap, but their addresses alias the new members.
-	newPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	newPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	newPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	newPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(newPeer1)
 	device.AddPeer(newPeer2)
 
@@ -1416,12 +1416,12 @@ func TestACRegistration_ReconcileDevicePeers_PreservesSharedAddress(t *testing.T
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer1},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer1},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: newPeer1, Connected: true},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: newPeer2, Connected: true},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: newPeer1, Connected: true},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: newPeer2, Connected: true},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1442,8 +1442,8 @@ func TestACRegistration_ReconcileDevicePeers_IPHostnameCombo(t *testing.T) {
 	reg, device := newACRegistrationWithDevice(t)
 	const sharedPubKey = "Y29tYm8tcHVia2V5LWluLXNoYXJlZA=="
 
-	priorPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Hostname: "a.nhp.test.internal", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	priorPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer1 := &core.UdpPeer{Ip: "10.0.0.1", Hostname: "a.nhp.test.internal", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer2 := &core.UdpPeer{Ip: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer1)
 	device.AddPeer(priorPeer2)
 
@@ -1453,11 +1453,11 @@ func TestACRegistration_ReconcileDevicePeers_IPHostnameCombo(t *testing.T) {
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Hostname: "a.nhp.test.internal", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer1},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Hostname: "a.nhp.test.internal", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer1},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2, Connected: true},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Hostname: "b.nhp.test.internal", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer2, Connected: true},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1498,8 +1498,8 @@ func TestACRegistration_ReconcileDevicePeers_IPHostnameCombo(t *testing.T) {
 func TestACRegistration_ReconcileDevicePeers_DirectAAKShape(t *testing.T) {
 	reg, device := newACRegistrationWithDevice(t)
 
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "cHJpb3ItYXNzaWduZWQtcHVia2V5", Type: core.NHP_SERVER}
-	newPeer := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: "bmV3LXJlZ2lzdHJhdGlvbi1wdWJrZXk=", Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "cHJpb3ItYXNzaWduZWQtcHVia2V5", Type: core.NHP_SERVER}
+	newPeer := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: "bmV3LXJlZ2lzdHJhdGlvbi1wdWJrZXk=", Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 	device.AddPeer(newPeer)
 
@@ -1538,8 +1538,8 @@ func TestACRegistration_ReconcileDevicePeers_DirectAAKShape_SharedPubKey(t *test
 	reg, device := newACRegistrationWithDevice(t)
 	const sharedPubKey = "ZGlyZWN0LWFhay1zaGFyZWQtcHVia2V5"
 
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	newPeer := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	newPeer := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 	device.AddPeer(newPeer)
 
@@ -1549,10 +1549,10 @@ func TestACRegistration_ReconcileDevicePeers_DirectAAKShape_SharedPubKey(t *test
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeer},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: newPeer, Connected: true},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: newPeer, Connected: true},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1588,8 +1588,8 @@ func TestACRegistration_ReconcileDevicePeers_PartialPeerGroupRetirement(t *testi
 	reg, device := newACRegistrationWithDevice(t)
 	const sharedPubKey = "c2hhcmVkLXNlcnZlci1wdWJrZXk="
 
-	priorPeerA := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
-	priorPeerB := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeerA := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeerB := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeerA)
 	device.AddPeer(priorPeerB)
 
@@ -1599,11 +1599,11 @@ func TestACRegistration_ReconcileDevicePeers_PartialPeerGroupRetirement(t *testi
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerA},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerB},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerA},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerB},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerB, Connected: true},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: sharedPubKey}, Peer: priorPeerB, Connected: true},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1641,7 +1641,7 @@ func TestACRegistration_ReconcileDevicePeers_RemovesRetiredAddress(t *testing.T)
 	reg, device := newACRegistrationWithDevice(t)
 	const distinctPubKey = "cmV0aXJlZC1wZWVyLXB1YmtleQ=="
 
-	retiredPeer := &core.UdpPeer{Ip: "10.0.0.99", Port: DefaultServerPort, PubKeyBase64: distinctPubKey, Type: core.NHP_SERVER}
+	retiredPeer := &core.UdpPeer{Ip: "10.0.0.99", Port: testServerListenPort, PubKeyBase64: distinctPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(retiredPeer)
 	pubKeyBytes := retiredPeer.PublicKey()
 	if device.LookupPeer(pubKeyBytes) == nil {
@@ -1649,10 +1649,10 @@ func TestACRegistration_ReconcileDevicePeers_RemovesRetiredAddress(t *testing.T)
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.99", Port: DefaultServerPort, PubKeyBase64: distinctPubKey}, Peer: retiredPeer},
+		{Target: common.RedirectTarget{IP: "10.0.0.99", Port: testServerListenPort, PubKeyBase64: distinctPubKey}, Peer: retiredPeer},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "ZGlmZmVyZW50LXBlZXItcHVia2V5"}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "ZGlmZmVyZW50LXBlZXItcHVia2V5"}},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1675,9 +1675,9 @@ func TestACRegistration_ReconcileDevicePeers_RemovesAllRetiredOnDisjoint(t *test
 	priorPubB := "cHJpb3ItYi1wdWJrZXk="
 	priorPubC := "cHJpb3ItYy1wdWJrZXk="
 
-	priorPeerA := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: priorPubA, Type: core.NHP_SERVER}
-	priorPeerB := &core.UdpPeer{Ip: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: priorPubB, Type: core.NHP_SERVER}
-	priorPeerC := &core.UdpPeer{Ip: "10.0.0.3", Port: DefaultServerPort, PubKeyBase64: priorPubC, Type: core.NHP_SERVER}
+	priorPeerA := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: priorPubA, Type: core.NHP_SERVER}
+	priorPeerB := &core.UdpPeer{Ip: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: priorPubB, Type: core.NHP_SERVER}
+	priorPeerC := &core.UdpPeer{Ip: "10.0.0.3", Port: testServerListenPort, PubKeyBase64: priorPubC, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeerA)
 	device.AddPeer(priorPeerB)
 	device.AddPeer(priorPeerC)
@@ -1689,13 +1689,13 @@ func TestACRegistration_ReconcileDevicePeers_RemovesAllRetiredOnDisjoint(t *test
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: priorPubA}, Peer: priorPeerA},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: priorPubB}, Peer: priorPeerB},
-		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: DefaultServerPort, PubKeyBase64: priorPubC}, Peer: priorPeerC},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: priorPubA}, Peer: priorPeerA},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: priorPubB}, Peer: priorPeerB},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: testServerListenPort, PubKeyBase64: priorPubC}, Peer: priorPeerC},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.1.0.1", Port: DefaultServerPort, PubKeyBase64: "bmV3LWEtcHVia2V5"}},
-		{Target: common.RedirectTarget{IP: "10.1.0.2", Port: DefaultServerPort, PubKeyBase64: "bmV3LWItcHVia2V5"}},
+		{Target: common.RedirectTarget{IP: "10.1.0.1", Port: testServerListenPort, PubKeyBase64: "bmV3LWEtcHVia2V5"}},
+		{Target: common.RedirectTarget{IP: "10.1.0.2", Port: testServerListenPort, PubKeyBase64: "bmV3LWItcHVia2V5"}},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1733,7 +1733,7 @@ func TestACRegistration_ReconcileDevicePeers_IPToHostnameTransition(t *testing.T
 	const pubKey = "dHJhbnNpdGlvbi1wdWJrZXk="
 
 	// Prior: IP-only target, peer with Ip set.
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.42", Port: DefaultServerPort, PubKeyBase64: pubKey, Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.42", Port: testServerListenPort, PubKeyBase64: pubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 	priorKey := priorPeer.PublicKey()
 	if device.LookupPeer(priorKey) == nil {
@@ -1742,14 +1742,14 @@ func TestACRegistration_ReconcileDevicePeers_IPToHostnameTransition(t *testing.T
 
 	// New: Hostname-only target for the same logical peer (different
 	// address). Config flip simulates the drain-redirect form.
-	newPeer := &core.UdpPeer{Hostname: "drain.nhp.internal", Port: DefaultServerPort, PubKeyBase64: pubKey, Type: core.NHP_SERVER}
+	newPeer := &core.UdpPeer{Hostname: "drain.nhp.internal", Port: testServerListenPort, PubKeyBase64: pubKey, Type: core.NHP_SERVER}
 	device.AddPeer(newPeer)
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.42", Port: DefaultServerPort, PubKeyBase64: pubKey}, Peer: priorPeer},
+		{Target: common.RedirectTarget{IP: "10.0.0.42", Port: testServerListenPort, PubKeyBase64: pubKey}, Peer: priorPeer},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{Hostname: "drain.nhp.internal", Port: DefaultServerPort, PubKeyBase64: pubKey}, Peer: newPeer},
+		{Target: common.RedirectTarget{Hostname: "drain.nhp.internal", Port: testServerListenPort, PubKeyBase64: pubKey}, Peer: newPeer},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1839,15 +1839,15 @@ func TestACRegistration_ReconcileDevicePeers_EmitsUnaddressedMetric(t *testing.T
 	reg, device := newACRegistrationWithDevice(t)
 	reg.metrics = metrics.NewPublisherForTest(t)
 
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "cHJpb3ItcHVia2V5", Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "cHJpb3ItcHVia2V5", Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "cHJpb3ItcHVia2V5"}, Peer: priorPeer},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "cHJpb3ItcHVia2V5"}, Peer: priorPeer},
 	}
 	// New target has no IP and no Hostname — the <unaddressed> sentinel branch.
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{PubKeyBase64: "bmV3LXB1YmtleQ==", Port: DefaultServerPort}},
+		{Target: common.RedirectTarget{PubKeyBase64: "bmV3LXB1YmtleQ==", Port: testServerListenPort}},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1875,13 +1875,13 @@ func TestACRegistration_ReconcileDevicePeers_InstanceRemovalPreservesReplaced(t 
 	reg, device := newACRegistrationWithDevice(t)
 	const sharedPubKey = "ZGVmZW5zZS1pbi1kZXB0aC1wdWJrZXk="
 
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 
 	// Sibling AddPeer at the same (pubkey, address) replaces peerMap[K]'s
 	// pointer in-place via udpPeersShareAddress's same-address-replace
 	// branch. After this, peerMap[K] points at replacementPeer, not priorPeer.
-	replacementPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
+	replacementPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(replacementPeer)
 
 	pubKeyBytes := replacementPeer.PublicKey()
@@ -1897,7 +1897,7 @@ func TestACRegistration_ReconcileDevicePeers_InstanceRemovalPreservesReplaced(t 
 		{Target: common.RedirectTarget{IP: priorPeer.Ip, Port: priorPeer.Port, PubKeyBase64: priorPeer.PubKeyBase64}, Peer: priorPeer},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.99", Port: DefaultServerPort, PubKeyBase64: "b3RoZXItcHVia2V5LWZvci1uZXc="}},
+		{Target: common.RedirectTarget{IP: "10.0.0.99", Port: testServerListenPort, PubKeyBase64: "b3RoZXItcHVia2V5LWZvci1uZXc="}},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -1919,7 +1919,7 @@ func TestACRegistration_HandleRedispatch_AllConnectsFail_EvictsPriorPeers(t *tes
 		t.Fatal("test AC must be stopped to exercise the all-connects-fail path")
 	}
 
-	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "cHJpb3ItYXNzaWduZWQtcGVlcg==", Type: core.NHP_SERVER}
+	priorPeer := &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "cHJpb3ItYXNzaWduZWQtcGVlcg==", Type: core.NHP_SERVER}
 	device.AddPeer(priorPeer)
 	priorKey := priorPeer.PublicKey()
 	if device.LookupPeer(priorKey) == nil {
@@ -1978,7 +1978,7 @@ func TestACRegistration_ReconcileDevicePeers_NilSafe(t *testing.T) {
 
 	priorServers := []*AssignedServer{
 		nil,
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k"}, Peer: nil},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k"}, Peer: nil},
 	}
 	newServers := []*AssignedServer{
 		nil,
@@ -2001,7 +2001,7 @@ func TestACRegistration_ReconcileDevicePeers_AllPeerNilPriors_NoOp(t *testing.T)
 
 	// Plant an unrelated peer in the device pool. If reconcile incorrectly
 	// touched it, the test would fail.
-	bystander := &core.UdpPeer{Ip: "10.0.0.99", Port: DefaultServerPort, PubKeyBase64: "Ynlz", Type: core.NHP_SERVER}
+	bystander := &core.UdpPeer{Ip: "10.0.0.99", Port: testServerListenPort, PubKeyBase64: "Ynlz", Type: core.NHP_SERVER}
 	device.AddPeer(bystander)
 	bystanderKey := bystander.PublicKey()
 	if device.LookupPeer(bystanderKey) == nil {
@@ -2009,12 +2009,12 @@ func TestACRegistration_ReconcileDevicePeers_AllPeerNilPriors_NoOp(t *testing.T)
 	}
 
 	priorServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k1"}, Peer: nil},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: "k2"}, Peer: nil},
-		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: DefaultServerPort, PubKeyBase64: "k3"}, Peer: nil},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k1"}, Peer: nil},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: "k2"}, Peer: nil},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: testServerListenPort, PubKeyBase64: "k3"}, Peer: nil},
 	}
 	newServers := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.1.0.1", Port: DefaultServerPort, PubKeyBase64: "newpk"}},
+		{Target: common.RedirectTarget{IP: "10.1.0.1", Port: testServerListenPort, PubKeyBase64: "newpk"}},
 	}
 
 	reg.reconcileDevicePeers(priorServers, newServers)
@@ -2038,10 +2038,10 @@ func TestACRegistration_ReconcileDevicePeers_MetricsAccumulateAcrossCalls(t *tes
 	// Each call has 1 sentinel hit (newServers contains a target with
 	// neither IP nor Hostname). After two calls, the total should be 2.
 	priors := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "p1"}, Peer: &core.UdpPeer{Ip: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "p1", Type: core.NHP_SERVER}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "p1"}, Peer: &core.UdpPeer{Ip: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "p1", Type: core.NHP_SERVER}},
 	}
 	sentinelNew := []*AssignedServer{
-		{Target: common.RedirectTarget{PubKeyBase64: "broken", Port: DefaultServerPort}}, // no IP, no Hostname
+		{Target: common.RedirectTarget{PubKeyBase64: "broken", Port: testServerListenPort}}, // no IP, no Hostname
 	}
 
 	reg.reconcileDevicePeers(priors, sentinelNew)
@@ -2104,7 +2104,7 @@ func TestACRegistration_ReconcileInFlightCounter_StoppedEarlyReturn(t *testing.T
 		t.Fatalf("precondition: counter should be 0, got %d", got)
 	}
 
-	err := reg.HandleRedispatch(&common.ACRedispatchMsg{Targets: []common.RedirectTarget{{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k"}}})
+	err := reg.HandleRedispatch(&common.ACRedispatchMsg{Targets: []common.RedirectTarget{{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k"}}})
 	if err == nil {
 		t.Error("HandleRedispatch on stopped manager should return ErrRegistrationStopped")
 	}

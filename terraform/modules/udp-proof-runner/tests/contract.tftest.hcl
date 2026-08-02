@@ -143,7 +143,7 @@ run "secure_ephemeral_runner_contract" {
       aws_vpc_security_group_egress_rule.dns_tcp.from_port == 53 &&
       aws_vpc_security_group_egress_rule.https.from_port == 443 &&
       aws_vpc_security_group_egress_rule.nhp_udp.cidr_ipv4 == "0.0.0.0/0" &&
-      aws_vpc_security_group_egress_rule.nhp_udp.from_port == 62206 &&
+      aws_vpc_security_group_egress_rule.nhp_udp.from_port == 443 &&
       aws_vpc_security_group_egress_rule.time_sync.cidr_ipv4 == "169.254.169.123/32" &&
       aws_vpc_security_group_egress_rule.time_sync.from_port == 123
     )

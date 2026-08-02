@@ -3530,7 +3530,7 @@ jobs:
           ./scripts/validate-deployment.sh sandbox
 
       # Integration tests knock the assigned-cell server over its required
-      # public NLB (NHP_SERVER_ENDPOINT) on UDP 62206. Today this proves required
+      # public NLB (NHP_SERVER_ENDPOINT) on UDP 443. Today this proves required
       # endpoint discovery, DNS resolution, and a UDP send attempt; valid SDK
       # protocol round trips under distributed load are enforced by the manual
       # Assigned-cell UDP flood readiness workflow before SDK rollout.
@@ -3555,7 +3555,7 @@ jobs:
       - name: Run Integration Tests
         timeout-minutes: 7
         env:
-          NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:62206"
+          NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:443"
           ETCD_ENDPOINTS: ${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}
           AWS_REGION: ${{ env.AWS_REGION }}
         run: |

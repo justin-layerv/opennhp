@@ -14,7 +14,7 @@ gates. Immediately after Terraform apply it runs
 --wait-seconds 300` to
 enumerate the live VPC, routes, SGs, endpoints and policies, DNS Firewall/query
 logging, browser ALB, absence of relay UDP/NLB resources, the assigned-cell
-public server NLB's sole UDP 62206 listener, WAF, canonical ASG handoff, exact
+public server NLB's sole UDP 443 listener, WAF, canonical ASG handoff, exact
 fleet convergence, and
 absence of the pre-DMZ fleet. After `deploy-relay.sh` refreshes that canonical
 ASG and waits for convergence, functional mode runs with `--wait-seconds 1200`
@@ -32,7 +32,7 @@ bound — persistence, not a single read, so a still-provisioning agent's transi
 `"Waiting for SSM notification"` never false-fails. The later
 `qurl-relay-bootstrap-smoke` step proves the public browser
 hostname/path. The rollout runbook separately requires a real external SDK NHP
-round trip through the assigned cell's server NLB UDP 62206 listener and
+round trip through the assigned cell's server NLB UDP 443 listener and
 listener/SG/Flow proof that UDP 62207 is not public. WAF evidence applies only
 to the relay HTTP path; WAF cannot inspect direct server UDP.
 Neither live-detector mode is the warning-only general deployment validator.
@@ -129,13 +129,13 @@ When the relay DMZ is in the planned graph,
 `.github/scripts/check-relay-dmz-plan.py` consumes the actual
 `terraform show -json` artifact. It checks resource cardinality and the
 no-public-IP/no-default-route contract, the HTTPS-only relay ALB and SG, the
-assigned-cell server NLB's sole public UDP 62206 listener and exact target-group
+assigned-cell server NLB's sole public UDP 443 listener and exact target-group
 wiring, no public UDP 62207 or second UDP-capable edge, endpoint policies, S3
 allowlists, fail-closed DNS/query logging, the dedicated DMZ logs CMK
 conditions, and the narrow guardduty-data policy exception. Negative fixtures
 must prove each assertion can fail. This is structural PR evidence only: endpoint
 connectivity, DNS blocking, GuardDuty installation, authenticated UDP return,
-target health, browser relay behavior, a valid external SDK UDP 62206 round trip,
+target health, browser relay behavior, a valid external SDK UDP 443 round trip,
 and listener/SG/Flow negative proof that UDP 62207 is not public remain
 post-apply/post-refresh gates. Deploy
 and converge the compatible server return-envelope build before refreshing the

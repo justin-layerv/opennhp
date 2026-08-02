@@ -39,7 +39,7 @@ func TestACRegistration_HandleRedispatch_RejectsAfterStop(t *testing.T) {
 
 	ardMsg := &common.ACRedispatchMsg{
 		Targets: []common.RedirectTarget{
-			{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: testPubKeyBase64},
+			{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: testPubKeyBase64},
 		},
 	}
 
@@ -64,7 +64,7 @@ func TestACRegistration_HandleRegistrationResponse_NHPARDPropagatesSentinel(t *t
 
 	ardMsg := common.ACRedispatchMsg{
 		Targets: []common.RedirectTarget{
-			{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: testPubKeyBase64},
+			{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: testPubKeyBase64},
 		},
 	}
 	body, err := json.Marshal(ardMsg)
@@ -76,7 +76,7 @@ func TestACRegistration_HandleRegistrationResponse_NHPARDPropagatesSentinel(t *t
 	// real DNS lookup and falls back to Ip.
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         DefaultServerPort,
+		Port:         testServerListenPort,
 		PubKeyBase64: testPubKeyBase64,
 		Type:         core.NHP_SERVER,
 	}
@@ -120,7 +120,7 @@ func TestACRegistration_HandleRegistrationResponse_NHPAAKPropagatesSentinel(t *t
 		ErrCode:    common.ErrSuccess.ErrorCode(),
 		Registered: true,
 		Peers: []common.RedirectTarget{
-			{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: testPubKeyBase64},
+			{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: testPubKeyBase64},
 		},
 	}
 	body, err := json.Marshal(aakMsg)
@@ -132,7 +132,7 @@ func TestACRegistration_HandleRegistrationResponse_NHPAAKPropagatesSentinel(t *t
 	// real DNS lookup and falls back to Ip.
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         DefaultServerPort,
+		Port:         testServerListenPort,
 		PubKeyBase64: testPubKeyBase64,
 		Type:         core.NHP_SERVER,
 	}

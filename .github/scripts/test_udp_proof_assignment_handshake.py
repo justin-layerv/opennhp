@@ -298,8 +298,8 @@ class AssignmentHandshakeTest(unittest.TestCase):
             "capture_sha256": "a" * 64,
             "capture_targets_sha256": "b" * 64,
             "captured_packet_count": 2,
-            "udp_62206_outbound": 1,
-            "udp_62206_inbound": 1,
+            "udp_443_outbound": 1,
+            "udp_443_inbound": 1,
             "http_trap_calls": 0,
             "observed_cell_ids": ["cell0", "cell1"],
             "nhp_udp_lifecycle_success": True,
@@ -443,8 +443,8 @@ class AssignmentHandshakeTest(unittest.TestCase):
             "http_trap_calls": 0,
             "nhp_udp_lifecycle_success": True,
             "observed_cell_ids": ["cell0", "cell1"],
-            "udp_62206_inbound": 1,
-            "udp_62206_outbound": 1,
+            "udp_443_inbound": 1,
+            "udp_443_outbound": 1,
             "version": 1,
         }
         checkpoint_raw = handshake._canonical(checkpoint)

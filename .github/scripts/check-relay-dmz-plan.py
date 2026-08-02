@@ -161,7 +161,13 @@ EXPECTED_SANDBOX_RELAY_SUBNET_CIDRS = {
 EXPECTED_IPV4_DEFAULT_CIDR = "0.0.0.0/0"
 EXPECTED_HTTPS_PORT = 443
 EXPECTED_RELAY_BACKEND_PORT = 8080
+# The server's own private UDP bind. Target groups, the internal NLB
+# listener, the relay hop, and every server-SG rule address the server here.
 EXPECTED_NHP_SERVER_PORT = 62206
+# The PUBLIC client-edge port: the assigned cell's public NLB listener and
+# the NLB security group's caller-facing ingress. The NLB translates between
+# the two, so they are deliberately different — see nhp/common/constants.go.
+EXPECTED_NHP_CLIENT_EDGE_PORT = 443
 EXPECTED_SERVER_HEALTH_PORT = 8888
 EXPECTED_RELAY_ACK_PORT = 62207
 EXPECTED_DEREGISTRATION_DELAY = 30
@@ -853,6 +859,15 @@ def validate_udp_source_fence_transition(
                 "UDP source-fence listener replacement is not the exact "
                 "Terraform 1.14.3/AWS provider 6.54.0 envelope",
             )
+        # Both sides stay on EXPECTED_NHP_SERVER_PORT even though the public
+        # listener now serves EXPECTED_NHP_CLIENT_EDGE_PORT. This block only
+        # fires when a plan carries the UDP source-fence REPLACEMENT step, and
+        # that migration is a completed, byte-pinned historical envelope
+        # (_load_udp_source_fence_provider_fixture) captured while the listener
+        # was on 62206 — the checker compares against it exactly. The port move
+        # is a later in-place ModifyListener, a different action shape that
+        # never enters this branch. Re-pointing this at the client edge would
+        # only desync it from the recorded envelope.
         checked_sides = (
             ((listener_after, "fenced after-state"),)
             if listener_actions == ("create",)
@@ -972,6 +987,96 @@ def validate_udp_source_fence_transition(
     return errors
 
 
+def _client_edge_port_migration_addresses() -> "frozenset[str]":
+    """The exact boundary set the client-edge port move is allowed to touch."""
+    compute = "module.nhp.module.compute"
+    ac = "module.nhp.module.ac[0]"
+    return frozenset(
+        {
+            f"{compute}.aws_lb_listener.udp[0]",
+            f"{compute}.aws_vpc_security_group_ingress_rule."
+            f'server_nlb_udp["{EXPECTED_SANDBOX_PROOF_SOURCE_CIDR}"]',
+        }
+        | {
+            f"{ac}.aws_vpc_security_group_ingress_rule."
+            f'server_nlb_registration["{index}"]'
+            for index in range(EXPECTED_SANDBOX_AC_EIP_COUNT)
+        }
+    )
+
+
+def validate_udp_client_edge_port_migration(
+    boundary_changes: list[dict[str, Any]],
+) -> "list[str] | None":
+    """Admit ONLY the complete 62206 -> 443 client-edge move, or nothing.
+
+    The DMZ boundary is frozen for ordinary applies, and the source-fence
+    replacement is the only mutation previously reviewed. Moving the public
+    client edge to 443 is a second, different boundary mutation, so it gets its
+    own explicitly reviewed shape rather than a relaxation of the first.
+
+    All-or-nothing on purpose. The listener is what callers dial and the two SG
+    rule families are what admit them; a plan that moved the listener without
+    the rules would black-hole the edge, and moving the rules without the
+    listener would leave the old port admitted. Returns None when this is not a
+    client-edge migration at all, so callers fall through to the normal refusal.
+    """
+    expected = _client_edge_port_migration_addresses()
+    mutations = {
+        str(raw.get("address", "")): raw
+        for raw in boundary_changes
+        if tuple((raw.get("change") or {}).get("actions") or ()) != ("no-op",)
+    }
+    if not mutations or set(mutations) != set(expected):
+        return None
+
+    errors: list[str] = []
+    for address, raw in sorted(mutations.items()):
+        change = raw.get("change") or {}
+        if tuple(change.get("actions") or ()) != ("update",):
+            errors.append(
+                f"client-edge port migration {address} must be an in-place update"
+            )
+            continue
+        before = change.get("before") or {}
+        after = change.get("after") or {}
+        if address.endswith("aws_lb_listener.udp[0]"):
+            if (
+                before.get("port") != EXPECTED_NHP_SERVER_PORT
+                or after.get("port") != EXPECTED_NHP_CLIENT_EDGE_PORT
+                or before.get("protocol") != "UDP"
+                or after.get("protocol") != "UDP"
+                or before.get("load_balancer_arn") != after.get("load_balancer_arn")
+                or before.get("default_action") != after.get("default_action")
+            ):
+                errors.append(
+                    "client-edge listener must move exactly UDP "
+                    f"{EXPECTED_NHP_SERVER_PORT} -> {EXPECTED_NHP_CLIENT_EDGE_PORT} "
+                    "on the same load balancer and forwarded target group"
+                )
+            continue
+        # Both SG rule families: only the port may move. Everything deciding WHO
+        # is admitted -- protocol, source CIDR, security group -- stays byte-identical.
+        if (
+            before.get("from_port") != EXPECTED_NHP_SERVER_PORT
+            or before.get("to_port") != EXPECTED_NHP_SERVER_PORT
+            or after.get("from_port") != EXPECTED_NHP_CLIENT_EDGE_PORT
+            or after.get("to_port") != EXPECTED_NHP_CLIENT_EDGE_PORT
+            or before.get("ip_protocol") != "udp"
+            or after.get("ip_protocol") != "udp"
+            or before.get("cidr_ipv4") != after.get("cidr_ipv4")
+            or before.get("security_group_id") != after.get("security_group_id")
+            or before.get("referenced_security_group_id")
+            != after.get("referenced_security_group_id")
+        ):
+            errors.append(
+                f"client-edge ingress {address} must move exactly UDP "
+                f"{EXPECTED_NHP_SERVER_PORT} -> {EXPECTED_NHP_CLIENT_EDGE_PORT} "
+                "with its source and security group unchanged"
+            )
+    return errors
+
+
 def validate_dmz_boundary_noop(
     plan: dict[str, Any],
     *,
@@ -987,6 +1092,17 @@ def validate_dmz_boundary_noop(
         if not is_dmz_boundary_address(address):
             continue
         boundary_changes.append(raw)
+
+    # The client-edge port migration is a second reviewed boundary shape,
+    # independent of the source-fence replacement. Check it before the generic
+    # refusal so it is admitted on its own terms rather than by loosening the
+    # fence contract.
+    client_edge_errors = validate_udp_client_edge_port_migration(boundary_changes)
+    if client_edge_errors is not None:
+        return errors + client_edge_errors
+
+    for raw in boundary_changes:
+        address = str(raw.get("address", ""))
         actions = tuple((raw.get("change") or {}).get("actions") or ())
         if actions != ("no-op",):
             if not allow_udp_source_fence_replacement:
@@ -4279,16 +4395,40 @@ def validate_plan(
         if resource.resource_type == "aws_lb_listener"
         and str(resource.values.get("protocol", "")).upper() in {"UDP", "TCP_UDP"}
     ]
+    expected_udp_listener_ports = {
+        "udp": EXPECTED_NHP_CLIENT_EDGE_PORT,
+        "udp_internal": EXPECTED_NHP_SERVER_PORT,
+    }
+
+    def udp_listener_port_ok(resource: PlannedResource) -> bool:
+        port = resource.values.get("port")
+        if port == expected_udp_listener_ports[resource.name]:
+            return True
+        # Sole tolerance: the one-time UDP source-fence migration REPLACES the
+        # public listener from a byte-pinned provider envelope captured while
+        # it was still on EXPECTED_NHP_SERVER_PORT. That whole transition is
+        # proved by validate_udp_source_fence_transition, so do not retroject
+        # today's client-edge port onto its recorded after-state. Steady-state
+        # plans (no-op/update) get no tolerance and must be on the client edge.
+        # The two accepted action shapes mirror the ones
+        # validate_udp_source_fence_transition itself admits: the ordinary
+        # delete+create replacement, and the bare create of a deposed retry.
+        return (
+            resource.name == "udp"
+            and set(resource.actions) in ({"delete", "create"}, {"create"})
+            and port == EXPECTED_NHP_SERVER_PORT
+        )
+
     v.require(
         len(udp_capable_listeners) == 2
         and {resource.name for resource in udp_capable_listeners}
-        == {"udp", "udp_internal"}
+        == set(expected_udp_listener_ports)
         and all(
             resource.values.get("protocol") == "UDP"
-            and resource.values.get("port") == EXPECTED_NHP_SERVER_PORT
+            and udp_listener_port_ok(resource)
             for resource in udp_capable_listeners
         ),
-        "assigned cell public NHP NLB must expose exactly one UDP listener on 62206; compute UDP-capable listener inventory must also contain only private udp_internal on UDP 62206",
+        "assigned cell public NHP NLB must expose exactly one UDP listener on the public client edge 443; compute UDP-capable listener inventory must also contain only private udp_internal on UDP 62206",
     )
     public_listener_config = config_resource(
         v, compute_config, "aws_lb_listener", "udp"
@@ -4537,12 +4677,12 @@ def validate_plan(
             and (ac_registration_expressions.get("from_port") or {}).get(
                 "constant_value"
             )
-            == EXPECTED_NHP_SERVER_PORT
+            == EXPECTED_NHP_CLIENT_EDGE_PORT
             and (ac_registration_expressions.get("to_port") or {}).get(
                 "constant_value"
             )
-            == EXPECTED_NHP_SERVER_PORT,
-            "assigned cell AC authored NLB SG rule inventory must be exactly the complete managed EIP registration pool on UDP 62206",
+            == EXPECTED_NHP_CLIENT_EDGE_PORT,
+            "assigned cell AC authored NLB SG rule inventory must be exactly the complete managed EIP registration pool on UDP 443",
         )
 
         def resources_by_index(
@@ -4642,15 +4782,15 @@ def validate_plan(
                     rule, "security_group_id", nlb_security_group_id
                 )
                 and rule.values.get("ip_protocol") == "udp"
-                and rule.values.get("from_port") == EXPECTED_NHP_SERVER_PORT
-                and rule.values.get("to_port") == EXPECTED_NHP_SERVER_PORT
+                and rule.values.get("from_port") == EXPECTED_NHP_CLIENT_EDGE_PORT
+                and rule.values.get("to_port") == EXPECTED_NHP_CLIENT_EDGE_PORT
                 and cidr_ok
                 and all(
                     rule.values.get(field) in (None, "")
                     and (rule.after_unknown or {}).get(field) in (None, False)
                     for field in AC_REGISTRATION_FORBIDDEN_SOURCE_FIELDS
                 ),
-                f"assigned cell AC registration rule {index} must admit only its matching managed EIP /32 on UDP 62206",
+                f"assigned cell AC registration rule {index} must admit only its matching managed EIP /32 on UDP 443",
             )
         v.require(
             len(resolved_ac_ips) in (0, EXPECTED_SANDBOX_AC_EIP_COUNT),
@@ -4692,12 +4832,12 @@ def validate_plan(
             )
             and nlb_public_ingress[0].values.get("ip_protocol") == "udp"
             and nlb_public_ingress[0].values.get("from_port")
-            == EXPECTED_NHP_SERVER_PORT
+            == EXPECTED_NHP_CLIENT_EDGE_PORT
             and nlb_public_ingress[0].values.get("to_port")
-            == EXPECTED_NHP_SERVER_PORT
+            == EXPECTED_NHP_CLIENT_EDGE_PORT
             and nlb_public_ingress[0].values.get("cidr_ipv4")
             == EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
-            "assigned cell public NLB ingress must be exactly proof-runner /32 UDP 62206",
+            "assigned cell public NLB ingress must be exactly proof-runner /32 UDP 443",
         )
         nlb_public_ingress_config = config_resource(
             v,

@@ -115,11 +115,11 @@ run "source_fenced_registration_admits_complete_managed_eip_pool" {
       for rule in aws_vpc_security_group_ingress_rule.server_nlb_registration :
       rule.security_group_id == "sg-0123456789abcdef0" &&
       rule.ip_protocol == "udp" &&
-      rule.from_port == 62206 &&
-      rule.to_port == 62206 &&
+      rule.from_port == 443 &&
+      rule.to_port == 443 &&
       rule.cidr_ipv4 == "198.51.100.42/32"
     ])
-    error_message = "Managed AC registration rules must be exact EIP /32 UDP 62206 ingress on only the assigned public NLB SG."
+    error_message = "Managed AC registration rules must be exact EIP /32 UDP 443 ingress on only the assigned public NLB SG."
   }
 }
 

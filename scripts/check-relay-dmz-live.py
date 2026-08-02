@@ -69,7 +69,7 @@ from typing import Any
 
 # The first committed live snapshot contract started at v2. Version 3 adds the
 # relay-owned native UDP edge. Version 6 removes that edge; version 7 binds the
-# replacement public UDP/62206 proof to the assigned-cell compute NLB. Version 8
+# replacement public UDP/443 proof to the assigned-cell compute NLB. Version 8
 # adds the active-color internal relay NLB target/ASG/SG proof and inventories
 # every public main-VPC NLB to detect a second NHP-owned edge. Version 9 resolves
 # IP targets and expands NHP ownership evidence to canonical server ASG, SG, and
@@ -168,7 +168,13 @@ EXPECTED_ENVIRONMENT_REGIONS = {
 }
 RELAY_HTTPS_PORT = 443
 RELAY_BACKEND_PORT = 8080
+# The server's own private UDP bind: target groups, registered targets, the
+# internal NLB listener, and every server-SG rule address the server here.
 RELAY_SERVER_UDP_PORT = 62206
+# The PUBLIC client-edge port: the assigned cell's public NLB listener and
+# that NLB security group's caller-facing ingress. The NLB translates between
+# the two — see nhp/common/constants.go.
+SERVER_CLIENT_EDGE_UDP_PORT = 443
 RELAY_ACK_UDP_PORT = 62207
 RELAY_HEALTH_PATH = "/health/live"
 # Proof-runner EIP admitted to the source-fenced sandbox server NLB. Matches the
@@ -2265,7 +2271,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
         )
     elif len(assigned_cell_nhp_listeners) != 1:
         errors.append(
-            "assigned cell must expose exactly one public UDP listener on 62206: "
+            "assigned cell must expose exactly one public UDP listener on 443: "
             f"{assigned_cell_nhp_listeners}"
         )
     else:
@@ -2284,7 +2290,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             or cell_edge.get("load_balancer_name") != expected_lb_name
             or not cell_edge.get("listener_arn")
             or cell_edge.get("protocol") != "UDP"
-            or cell_edge.get("port") != RELAY_SERVER_UDP_PORT
+            or cell_edge.get("port") != SERVER_CLIENT_EDGE_UDP_PORT
             or (
                 environment == "sandbox"
                 and len(cell_edge.get("load_balancer_security_group_ids") or []) != 1
@@ -2295,7 +2301,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             )
         ):
             errors.append(
-                "assigned cell public NHP listener is not the canonical tagged compute NLB UDP 62206 edge"
+                "assigned cell public NHP listener is not the canonical tagged compute NLB UDP 443 edge"
             )
         expected_target_group = {
             "arn": cell_edge.get("target_group_arn"),
@@ -3004,16 +3010,16 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             expected_nlb_in = [
                 {
                     "protocol": "udp",
-                    "from": RELAY_SERVER_UDP_PORT,
-                    "to": RELAY_SERVER_UDP_PORT,
+                    "from": SERVER_CLIENT_EDGE_UDP_PORT,
+                    "to": SERVER_CLIENT_EDGE_UDP_PORT,
                     "source_type": "cidr_ipv4",
                     "source": SANDBOX_PROOF_SOURCE_CIDR,
                 }
             ] + [
                 {
                     "protocol": "udp",
-                    "from": RELAY_SERVER_UDP_PORT,
-                    "to": RELAY_SERVER_UDP_PORT,
+                    "from": SERVER_CLIENT_EDGE_UDP_PORT,
+                    "to": SERVER_CLIENT_EDGE_UDP_PORT,
                     "source_type": "cidr_ipv4",
                     "source": source,
                 }
@@ -3037,7 +3043,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             ]
             if not _rules_equal(nlb_group.get("inbound", []), expected_nlb_in):
                 errors.append(
-                    "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 62206"
+                    "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 443"
                 )
             if not _rules_equal(nlb_group.get("outbound", []), expected_nlb_out):
                 errors.append(

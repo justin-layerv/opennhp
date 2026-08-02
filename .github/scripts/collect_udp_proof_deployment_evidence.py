@@ -2610,7 +2610,7 @@ def _verify_edge_security_groups(
         _permission_sources(
             nlb_egress,
             protocol="udp",
-            port=contract.UDP_PORT,
+            port=contract.UDP_TARGET_PORT,
             name=f"{host} NLB egress",
         )
         != [("sg", target_group_id)]
@@ -2620,7 +2620,7 @@ def _verify_edge_security_groups(
     target_sources = _permission_sources(
         target_group.get("IpPermissions"),
         protocol="udp",
-        port=contract.UDP_PORT,
+        port=contract.UDP_TARGET_PORT,
         name=f"{host} backend ingress",
     )
     expected_target_sources = sorted(
@@ -2909,7 +2909,9 @@ def _verify_dns_alias(
         or actions[0].get("Type") != "forward"
         or not isinstance(actions[0].get("TargetGroupArn"), str)
     ):
-        raise EvidenceError(f"{host} listener is not exact UDP 62206 forwarding")
+        raise EvidenceError(
+            f"{host} listener is not exact UDP {contract.UDP_PORT} forwarding"
+        )
     listener_arn = contract._arn(listener.get("ListenerArn"), f"{host} listener ARN")
     target_group_arn = actions[0]["TargetGroupArn"]
     forward_config = actions[0].get("ForwardConfig")
@@ -2953,7 +2955,7 @@ def _verify_dns_alias(
     if (
         target_group.get("TargetGroupArn") != target_group_arn
         or target_group.get("Protocol") != "UDP"
-        or target_group.get("Port") != contract.UDP_PORT
+        or target_group.get("Port") != contract.UDP_TARGET_PORT
         or target_group.get("TargetType") != edge_contract["target_type"]
         or target_group.get("VpcId") != nlb["VpcId"]
         or target_group.get("HealthCheckEnabled") is not True
@@ -2999,7 +3001,7 @@ def _verify_dns_alias(
         if (
             not isinstance(target_id, str)
             or not target_id
-            or target_port != contract.UDP_PORT
+            or target_port != contract.UDP_TARGET_PORT
             or not isinstance(target_health, dict)
             or target_health.get("State") != "healthy"
         ):

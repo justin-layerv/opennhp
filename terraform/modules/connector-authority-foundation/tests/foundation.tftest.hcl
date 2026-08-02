@@ -366,7 +366,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -376,7 +376,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         status                = "disabled"
         endpoint_revision     = 1
         nhp_host              = "cell1.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -397,7 +397,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
       status                = { S = "active" }
       endpoint_revision     = { N = "1" }
       nhp_host              = { S = "cell0.nhp.layerv.xyz" }
-      nhp_port              = { N = "62206" }
+      nhp_port              = { N = "443" }
       server_public_key_b64 = { S = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8=" }
       selection_weight      = { N = "1" }
       updated_at            = { S = "2026-07-25T00:00:00Z" }
@@ -413,7 +413,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
       status                = { S = "disabled" }
       endpoint_revision     = { N = "1" }
       nhp_host              = { S = "cell1.nhp.layerv.xyz" }
-      nhp_port              = { N = "62206" }
+      nhp_port              = { N = "443" }
       server_public_key_b64 = { S = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=" }
       selection_weight      = { N = "1" }
       updated_at            = { S = "2026-07-25T00:00:00Z" }
@@ -428,7 +428,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -438,7 +438,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         status                = "disabled"
         endpoint_revision     = 1
         nhp_host              = "cell1.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -463,7 +463,7 @@ run "sandbox_provisioned_cell_catalog_holdback_keeps_rows_unmaterialized" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -497,7 +497,7 @@ run "catalog_rejects_mismatched_cell_identity" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -524,7 +524,7 @@ run "catalog_accepts_draining_status" {
         status                = "draining"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -556,7 +556,7 @@ run "catalog_rejects_unknown_status" {
         status                = "enabled"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -582,7 +582,7 @@ run "catalog_rejects_endpoint_revision_outside_runtime_int64" {
         status                = "active"
         endpoint_revision     = 9223372036854775808
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -608,7 +608,7 @@ run "catalog_rejects_semantically_invalid_timestamp" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-13-25T00:00:00Z"
@@ -634,7 +634,7 @@ run "catalog_rejects_reserved_private_host_label" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "metadata.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -660,7 +660,7 @@ run "catalog_rejects_duplicate_endpoint_and_server_identity" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -670,7 +670,7 @@ run "catalog_rejects_duplicate_endpoint_and_server_identity" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -696,7 +696,7 @@ run "catalog_rejects_cloud_endpoint_zero_key_and_bad_timestamp" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "internal-nlb.elb.us-east-2.amazonaws.com"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         selection_weight      = "1"
         updated_at            = "not-a-timestamp"
@@ -723,7 +723,7 @@ run "catalog_accepts_and_canonicalizes_dynamodb_number_boundaries" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1E-130"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -733,7 +733,7 @@ run "catalog_accepts_and_canonicalizes_dynamodb_number_boundaries" {
         status                = "disabled"
         endpoint_revision     = 1
         nhp_host              = "cell1.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "9.9999999999999999999999999999999999999E+125"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -769,7 +769,7 @@ run "catalog_rejects_dynamodb_number_overprecision" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "12345678901234567890123456789012345678.1"
         updated_at            = "2026-07-25T00:00:00Z"
@@ -795,7 +795,7 @@ run "catalog_rejects_dynamodb_number_exponent_outside_domain" {
         status                = "active"
         endpoint_revision     = 1
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1E-131"
         updated_at            = "2026-07-25T00:00:00Z"

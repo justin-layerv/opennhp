@@ -95,10 +95,10 @@ if [ -n "$NHP_NLB" ] && [ "$NHP_NLB" != "None" ]; then
     fi
 
     # Check UDP port reachability (basic test)
-    if timeout 2 bash -c "echo -n '' | nc -u -w1 $NHP_NLB 62206" &>/dev/null; then
-        pass "UDP port 62206 reachable"
+    if timeout 2 bash -c "echo -n '' | nc -u -w1 $NHP_NLB 443" &>/dev/null; then
+        pass "UDP port 443 reachable"
     else
-        warn "UDP port 62206 test inconclusive (may be normal for NHP)"
+        warn "UDP port 443 test inconclusive (may be normal for NHP)"
     fi
 else
     # UDP SDKs require the public NHP server NLB for their assigned cell. The

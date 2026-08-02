@@ -144,13 +144,16 @@ resource "aws_vpc_security_group_egress_rule" "https" {
   to_port           = 443
 }
 
+# The runner is an NHP client: it dials the public Hub/cell NLB listeners on
+# the client-edge port (UDP 443), never the server's own 62206 bind. This is
+# UDP 443 and is distinct from the TCP 443 rule above.
 resource "aws_vpc_security_group_egress_rule" "nhp_udp" {
   security_group_id = aws_security_group.runner.id
   description       = "Public sandbox Hub and cell NHP UDP"
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "udp"
-  from_port         = 62206
-  to_port           = 62206
+  from_port         = 443
+  to_port           = 443
 }
 
 resource "aws_vpc_security_group_egress_rule" "time_sync" {

@@ -3426,9 +3426,9 @@ def _hub_edge_resource_changes() -> list[dict]:
                 {
                     "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
                     "cidr_ipv6": None,
-                    "from_port": 62206,
+                    "from_port": 443,
                     "ip_protocol": "udp",
-                    "to_port": 62206,
+                    "to_port": 443,
                 }
             )
         elif address == "module.control.aws_lb.hub[0]":
@@ -3768,8 +3768,8 @@ def hub_source_fence_partial_retry_fixture() -> dict[str, dict]:
             "security_group_id": sg_id,
             "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
             "ip_protocol": "udp",
-            "from_port": 62206,
-            "to_port": 62206,
+            "from_port": 443,
+            "to_port": 443,
         },
     )
     nlb_change = candidate["module.control.aws_lb.hub[0]"]["change"]
@@ -4239,7 +4239,7 @@ class PlanContractTests(unittest.TestCase):
         wrong_output = provisioned_cell_catalog_transition_fixture()
         wrong_output["planned_values"]["outputs"]["provisioned_cells"]["value"][
             "cell0"
-        ]["nhp_port"] = 443
+        ]["nhp_port"] = 62206
         self.assert_rejected(wrong_output)
 
         combined = provisioned_cell_catalog_transition_fixture()
@@ -4305,7 +4305,7 @@ class PlanContractTests(unittest.TestCase):
         for attribute, value in (
             ("status", {"S": "revoked"}),
             ("nhp_host", {"S": "attacker.example"}),
-            ("nhp_port", {"N": "443"}),
+            ("nhp_port", {"N": "62206"}),
             (
                 "server_public_key_b64",
                 {"S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
@@ -4313,7 +4313,7 @@ class PlanContractTests(unittest.TestCase):
             ("selection_weight", {"N": "2"}),
             ("updated_at", {"S": "2026-07-26T00:00:00Z"}),
             ("cell_id", {"S": "cell1"}),
-            ("endpoint_revision", {"N": "2"}),
+            ("endpoint_revision", {"N": "3"}),
             ("pk", {"S": "REGISTRY-SHADOW"}),
             ("sk", {"S": "CELL#cell1"}),
             # Decoding must not launder DynamoDB's numeric spelling: N values
@@ -10096,7 +10096,7 @@ class StateContractTests(unittest.TestCase):
         for attribute, value in (
             ("status", {"S": "revoked"}),
             ("nhp_host", {"S": "attacker.example"}),
-            ("nhp_port", {"N": "443"}),
+            ("nhp_port", {"N": "62206"}),
             (
                 "server_public_key_b64",
                 {"S": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
@@ -10664,8 +10664,8 @@ def live_edge_fixture(root: Path) -> None:
                     "IpPermissions": [
                         {
                             "IpProtocol": "udp",
-                            "FromPort": 62206,
-                            "ToPort": 62206,
+                            "FromPort": 443,
+                            "ToPort": 443,
                             "IpRanges": [{"CidrIp": CHECKER.PROOF_SOURCE_CIDR}],
                         }
                     ],
@@ -10760,7 +10760,7 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             ] = "0.0.0.0/0"
             write_json(root / "control-security-groups.json", payload)
             with self.assertRaisesRegex(
-                CHECKER.ContractError, "proof-runner /32 UDP 62206"
+                CHECKER.ContractError, "proof-runner /32 UDP 443"
             ):
                 CHECKER.check_live(root)
 
@@ -13074,8 +13074,107 @@ class ComposedTransitionTest(unittest.TestCase):
                 "authority-proof-enable",
                 "authority-proof-consumer-staging",
                 "authority-hub-exec-policy-update",
+                "hub-client-edge-port-migration",
             },
         )
+
+
+class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
+    """The public Hub UDP edge may move to 443, and only in that exact shape."""
+
+    LISTENER = "module.control.aws_lb_listener.hub[0]"
+    RULE = (
+        "module.control.aws_vpc_security_group_ingress_rule."
+        f'hub_nlb_udp["{CHECKER.PROOF_SOURCE_CIDR}"]'
+    )
+
+    def _by_address(self, listener=None, rule=None):
+        listener_change = {
+            "actions": ["update"],
+            "before": {
+                "port": 62206,
+                "protocol": "UDP",
+                "load_balancer_arn": "arn:lb",
+                "default_action": [{"type": "forward", "target_group_arn": "arn:tg"}],
+            },
+            "after": {
+                "port": 443,
+                "protocol": "UDP",
+                "load_balancer_arn": "arn:lb",
+                "default_action": [{"type": "forward", "target_group_arn": "arn:tg"}],
+            },
+        }
+        rule_change = {
+            "actions": ["update"],
+            "before": {
+                "from_port": 62206,
+                "to_port": 62206,
+                "ip_protocol": "udp",
+                "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                "security_group_id": "sg-hub-nlb",
+            },
+            "after": {
+                "from_port": 443,
+                "to_port": 443,
+                "ip_protocol": "udp",
+                "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                "security_group_id": "sg-hub-nlb",
+            },
+        }
+        if listener:
+            listener_change["after"].update(listener)
+        if rule:
+            rule_change["after"].update(rule)
+        return {
+            self.LISTENER: {"change": listener_change},
+            self.RULE: {"change": rule_change},
+        }
+
+    def _claim(self, by_address, changed=None):
+        changed = changed if changed is not None else set(by_address)
+        actual = {address: ["update"] for address in changed}
+        return CHECKER._claim_hub_client_edge_port_migration(
+            changed, actual, by_address
+        )
+
+    def test_exact_move_is_claimed_and_validates(self) -> None:
+        by_address = self._by_address()
+        claimed = self._claim(by_address)
+        self.assertEqual(claimed, CHECKER.HUB_CLIENT_EDGE_PORT_ADDRESSES)
+        CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
+
+    def test_partial_move_is_not_claimable(self) -> None:
+        # The listener alone would black-hole the edge; the rule alone would
+        # leave the old port reachable. Neither composes.
+        by_address = self._by_address()
+        for address in (self.LISTENER, self.RULE):
+            with self.subTest(only=address):
+                self.assertIsNone(self._claim(by_address, {address}))
+
+    def test_wrong_destination_port_is_rejected(self) -> None:
+        by_address = self._by_address(listener={"port": 8443})
+        claimed = self._claim(by_address)
+        with self.assertRaisesRegex(CHECKER.ContractError, "UDP 62206 -> 443"):
+            CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
+
+    def test_widened_source_is_rejected(self) -> None:
+        by_address = self._by_address(rule={"cidr_ipv4": "0.0.0.0/0"})
+        claimed = self._claim(by_address)
+        with self.assertRaisesRegex(CHECKER.ContractError, "proof-runner"):
+            CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
+
+    def test_retargeted_forward_is_rejected(self) -> None:
+        # The port may move; where it forwards may not.
+        by_address = self._by_address(
+            listener={
+                "default_action": [
+                    {"type": "forward", "target_group_arn": "arn:tg-other"}
+                ]
+            }
+        )
+        claimed = self._claim(by_address)
+        with self.assertRaisesRegex(CHECKER.ContractError, "target group"):
+            CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
 
 
 class ExecPolicyLanePrecedenceTest(unittest.TestCase):

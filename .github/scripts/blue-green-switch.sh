@@ -156,7 +156,7 @@ fi
 
 # Component-specific listener type mapping
 # Each component uses different NLB listener protocols:
-#   Server: primary=UDP (port 62206, knock packets), secondary=HTTPS (port 443, QURL plugin)
+#   Server: primary=UDP (port 443, knock packets), secondary=HTTPS (port 8443, QURL plugin)
 #   AC:     primary=TCP (port 443, TLS passthrough to Traefik), no secondary
 # SSM parameter names follow the pattern: /${env}/nhp/${component}/{color}-{protocol}-tg-arn
 if [[ "$COMPONENT" == "server" ]]; then
@@ -169,7 +169,7 @@ fi
 
 # Get primary listener ARN.
 #
-# The assigned-cell public UDP 62206 listener is required for UDP SDKs. The
+# The assigned-cell public UDP 443 listener is required for UDP SDKs. The
 # private internal listener is a second switch point for browser-relay traffic,
 # not a fallback for an absent public edge.
 PRIMARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${PRIMARY_LISTENER_TYPE}-listener-arn")

@@ -252,7 +252,7 @@ def valid_snapshot() -> dict[str, object]:
         "images": IMAGE_DIGESTS,
         "hub": {
             "host": "hub.nhp.layerv.xyz",
-            "port": 62206,
+            "port": 443,
             "server_public_key_sha256": hashlib.sha256(
                 base64.b64decode(HUB_KEY)
             ).hexdigest(),
@@ -261,7 +261,7 @@ def valid_snapshot() -> dict[str, object]:
             {
                 "cell_id": "cell0",
                 "host": "cell0.nhp.layerv.xyz",
-                "port": 62206,
+                "port": 443,
                 "server_public_key_sha256": hashlib.sha256(
                     base64.b64decode(CELL0_KEY)
                 ).hexdigest(),
@@ -269,7 +269,7 @@ def valid_snapshot() -> dict[str, object]:
             {
                 "cell_id": "cell1",
                 "host": "cell1.nhp.layerv.xyz",
-                "port": 62206,
+                "port": 443,
                 "server_public_key_sha256": hashlib.sha256(
                     base64.b64decode(CELL1_KEY)
                 ).hexdigest(),
@@ -288,20 +288,20 @@ def valid_snapshot() -> dict[str, object]:
         },
         "hub": {
             "host": "hub.nhp.layerv.xyz",
-            "port": 62206,
+            "port": 443,
             "server_public_key_b64": HUB_KEY,
         },
         "cells": [
             {
                 "cell_id": "cell0",
                 "host": "cell0.nhp.layerv.xyz",
-                "port": 62206,
+                "port": 443,
                 "server_public_key_b64": CELL0_KEY,
             },
             {
                 "cell_id": "cell1",
                 "host": "cell1.nhp.layerv.xyz",
-                "port": 62206,
+                "port": 443,
                 "server_public_key_b64": CELL1_KEY,
             },
         ],
@@ -341,7 +341,7 @@ def valid_snapshot() -> dict[str, object]:
     public_identities = {
         "hub": {
             "host": manifest["hub"]["host"],
-            "port": 62206,
+            "port": 443,
             "public_key_parameter_name": (
                 "/sandbox/nhp/control/hub/identity/public-key"
             ),
@@ -360,7 +360,7 @@ def valid_snapshot() -> dict[str, object]:
                 "selection_weight": "1",
                 "updated_at": "2026-07-25T00:00:00Z",
                 "host": manifest["cells"][index]["host"],
-                "port": 62206,
+                "port": 443,
                 "server_public_key_sha256": manifest["cells"][index][
                     "server_public_key_sha256"
                 ],

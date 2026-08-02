@@ -65,7 +65,7 @@ Data layer:
 ### ComputeStack
 NHP Server compute:
 - Auto Scaling Group with Launch Template
-- Network Load Balancer (UDP 62206)
+- Network Load Balancer (public UDP 443 → server UDP 62206)
 - Cloud Map service discovery
 - Route 53 DNS integration
 
@@ -83,7 +83,7 @@ DNS configuration:
               ┌─────────────────┐
               │  Network Load   │
               │   Balancer      │
-              │  (UDP 62206)    │
+              │   (UDP 443)     │
               └────────┬────────┘
                        │
         ┌──────────────┼──────────────┐

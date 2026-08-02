@@ -405,14 +405,20 @@ resource "aws_network_acl" "public" {
     to_port    = 80
   }
 
-  # Inbound: Allow NHP UDP knock packets
+  # Inbound: Allow NHP UDP knock packets on the public client edge.
+  #
+  # Clients dial UDP 443 (the public NLB listener port); the NLB then forwards
+  # to UDP 62206 on the server targets in the private subnets, which the
+  # private NACL admits separately. This rule is load-bearing: rule 100 above
+  # admits only TCP 443, and NACL rules are protocol-specific, so removing this
+  # black-holes every public knock.
   ingress {
     protocol   = "udp"
     rule_no    = 120
     action     = "allow"
     cidr_block = "0.0.0.0/0"
-    from_port  = 62206
-    to_port    = 62206
+    from_port  = 443
+    to_port    = 443
   }
 
   # Inbound: Allow NHP TCP connector

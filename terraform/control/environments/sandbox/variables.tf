@@ -64,22 +64,22 @@ variable "provisioned_cells" {
     cell0 = {
       cell_id               = "cell0"
       status                = "active"
-      endpoint_revision     = 1
+      endpoint_revision     = 2
       nhp_host              = "cell0.nhp.layerv.xyz"
-      nhp_port              = 62206
+      nhp_port              = 443
       server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
       selection_weight      = "1"
-      updated_at            = "2026-07-27T00:00:00Z"
+      updated_at            = "2026-08-01T18:00:00Z"
     }
     cell1 = {
       cell_id               = "cell1"
       status                = "active"
-      endpoint_revision     = 1
+      endpoint_revision     = 2
       nhp_host              = "cell1.nhp.layerv.xyz"
-      nhp_port              = 62206
+      nhp_port              = 443
       server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
       selection_weight      = "1"
-      updated_at            = "2026-08-01T15:00:00Z"
+      updated_at            = "2026-08-01T18:00:00Z"
     }
   }
 
@@ -88,22 +88,22 @@ variable "provisioned_cells" {
       cell0 = {
         cell_id               = "cell0"
         status                = "active"
-        endpoint_revision     = 1
+        endpoint_revision     = 2
         nhp_host              = "cell0.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
-        updated_at            = "2026-07-27T00:00:00Z"
+        updated_at            = "2026-08-01T18:00:00Z"
       }
       cell1 = {
         cell_id               = "cell1"
         status                = "active"
-        endpoint_revision     = 1
+        endpoint_revision     = 2
         nhp_host              = "cell1.nhp.layerv.xyz"
-        nhp_port              = 62206
+        nhp_port              = 443
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
-        updated_at            = "2026-08-01T15:00:00Z"
+        updated_at            = "2026-08-01T18:00:00Z"
       }
     })
     error_message = "The sandbox catalog must contain exactly active cell0 and active cell1 with the reviewed producer values; update this validation in the same review as any attended lifecycle or endpoint revision."
@@ -140,7 +140,7 @@ variable "authority_runtime_functions_enabled" {
 }
 
 variable "hub_edge_enabled" {
-  description = "Dark-first Step-5 gate for the Connector Hub public UDP edge (the three public edge subnets, the internet gateway and public route table + 0.0.0.0/0 route, and the public UDP-62206 Hub NLB, listener, and target group). Committed inputs leave it false; the Step-5 edge apply supplies it true (via -var or the generated tfvars). See the module variable of the same name."
+  description = "Dark-first Step-5 gate for the Connector Hub public UDP edge (the three public edge subnets, the internet gateway and public route table + 0.0.0.0/0 route, and the public UDP-443 Hub NLB, listener, and target group). Committed inputs leave it false; the Step-5 edge apply supplies it true (via -var or the generated tfvars). See the module variable of the same name."
   type        = bool
   default     = false
 }

@@ -144,7 +144,7 @@ type Config struct {
 	ServerEndpoint     string `json:"serverEndpoint"`     // Required: Server endpoint for registration (e.g., "server.nhp.sandbox.internal")
 	ACVersion          string `json:"acVersion"`          // AC software version for compatibility
 	ServerPubKeyBase64 string `json:"serverPubKeyBase64"` // Required: Shared registration public key (all servers share this for NLB)
-	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 62206)
+	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 443, the public NHP edge)
 	Environment        string `json:"environment"`        // Environment name for CloudWatch metrics (e.g., "sandbox", "prod")
 
 	// ============================================================================

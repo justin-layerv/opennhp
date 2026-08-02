@@ -3,12 +3,17 @@
 # var.hub_edge_enabled true, exactly like the authority runtime slice. When
 # dark, the Control VPC keeps its no-public-edge posture (see network.tf).
 #
-# The edge is the authority's ONLY public listener: a UDP-62206 network load
+# The edge is the authority's ONLY public listener: a UDP-443 network load
 # balancer in three PUBLIC subnets fronting the Hub workers (added dark, in the
 # ISOLATED subnets, by slice 5b). The isolated workload subnets are never
 # weakened -- only this new public route table carries the internet default
 # route, and the workers hold no public IP. The Hub speaks UDP only; the
 # separate TCP-62207 health port is connect-only (endpoints/server/hub).
+#
+# Callers dial UDP 443; the NLB translates to the target group's UDP 62206,
+# which is what the Hub container binds. Restrictive egress filters commonly
+# drop high-numbered outbound UDP but leave 443 open for QUIC, so connector
+# registration has to meet callers there.
 
 locals {
   # Single dark-first gate for the whole public edge. Kept separate from the
@@ -120,8 +125,8 @@ resource "aws_vpc_security_group_ingress_rule" "hub_nlb_udp" {
 
   security_group_id = aws_security_group.hub_nlb[0].id
   description       = "Connector Hub UDP proof source ${each.value}"
-  from_port         = 62206
-  to_port           = 62206
+  from_port         = 443
+  to_port           = 443
   ip_protocol       = "udp"
   cidr_ipv4         = each.value
 
@@ -130,7 +135,7 @@ resource "aws_vpc_security_group_ingress_rule" "hub_nlb_udp" {
   }
 }
 
-# Public UDP-62206 network load balancer. Internet-facing, in the edge subnets.
+# Public UDP-443 network load balancer. Internet-facing, in the edge subnets.
 # The authority has no other public listener; TLS/HTTP are never exposed. The
 # shortened, distinct name deliberately forces physical replacement of the
 # already-created sandbox NLB: AWS rejects attaching an SG to an NLB that was
@@ -148,7 +153,7 @@ resource "aws_lb" "hub" {
 
   # Pin the PrivateLink posture of the source fence instead of inheriting it.
   # This governs whether the SG above -- which admits exactly the reviewed
-  # proof-runner /32 on UDP 62206 -- is evaluated for traffic that reaches the
+  # proof-runner /32 on UDP 443 -- is evaluated for traffic that reaches the
   # NLB through a VPC endpoint service. Read the threat model precisely, because
   # the naive reading is wrong in BOTH directions:
   #
@@ -213,7 +218,7 @@ resource "aws_lb_listener" "hub" {
   count = local.hub_edge_toggle
 
   load_balancer_arn = aws_lb.hub[0].arn
-  port              = 62206
+  port              = 443
   protocol          = "UDP"
 
   default_action {

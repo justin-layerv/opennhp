@@ -365,22 +365,22 @@ PROVISIONED_CELL_CATALOG = {
     "cell0": {
         "cell_id": "cell0",
         "status": "active",
-        "endpoint_revision": 1,
+        "endpoint_revision": 2,
         "nhp_host": "cell0.nhp.layerv.xyz",
-        "nhp_port": 62206,
+        "nhp_port": 443,
         "server_public_key_b64": "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8=",
         "selection_weight": "1",
-        "updated_at": "2026-07-27T00:00:00Z",
+        "updated_at": "2026-08-01T18:00:00Z",
     },
     "cell1": {
         "cell_id": "cell1",
         "status": "active",
-        "endpoint_revision": 1,
+        "endpoint_revision": 2,
         "nhp_host": "cell1.nhp.layerv.xyz",
-        "nhp_port": 62206,
+        "nhp_port": 443,
         "server_public_key_b64": "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs=",
         "selection_weight": "1",
-        "updated_at": "2026-08-01T15:00:00Z",
+        "updated_at": "2026-08-01T18:00:00Z",
     },
 }
 PROVISIONED_CELL_DYNAMODB_ITEMS = {
@@ -4804,8 +4804,9 @@ def _check_planned_security(
             raise ContractError(f"{address} has unknown planned traffic rules")
 
     # The public Hub edge is source-fenced at the NLB. Its SG has no inline
-    # rules, its sole public rule is the persistent proof-runner /32 on UDP
-    # 62206, and the NLB attaches exactly one SG in the create request.
+    # rules, its sole public rule is the persistent proof-runner /32 on the
+    # public client edge UDP 443, and the NLB attaches exactly one SG in the
+    # create request.
     hub_edge_mode = "module.control.aws_security_group.hub_nlb[0]" in by_address
     if hub_edge_mode:
         nlb_sg, nlb_sg_unknown = values(
@@ -4843,7 +4844,7 @@ def _check_planned_security(
             # the create-time projection nor a rule collection. The rules'
             # CONTENTS stay pinned by their own exact resource checks
             # (aws_vpc_security_group_ingress_rule.hub_nlb_udp is proof-runner
-            # /32 UDP 62206; the egress pair is worker UDP 62206 + TCP 62207),
+            # /32 UDP 443; the egress pair is worker UDP 62206 + TCP 62207),
             # and check_live re-proves the live SG posture independently.
             if planned_rules is None and unknown_rules is not True:
                 raise ContractError(
@@ -4861,9 +4862,9 @@ def _check_planned_security(
             nlb_ingress,
             {
                 "cidr_ipv4": PROOF_SOURCE_CIDR,
-                "from_port": 62206,
+                "from_port": 443,
                 "ip_protocol": "udp",
-                "to_port": 62206,
+                "to_port": 443,
             },
             "Hub NLB public ingress",
         )
@@ -8141,6 +8142,93 @@ def _claim_provisioned_cell_status_update(changed, actual_non_noop, by_address):
             return None
     return frozenset(claimed)
 
+HUB_CLIENT_EDGE_PORT_ADDRESSES = frozenset(
+    {
+        "module.control.aws_lb_listener.hub[0]",
+        "module.control.aws_vpc_security_group_ingress_rule."
+        f'hub_nlb_udp["{PROOF_SOURCE_CIDR}"]',
+    }
+)
+
+
+def _claim_hub_client_edge_port_migration(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> "frozenset[str] | None":
+    """Admit ONLY the public Hub UDP edge moving to the client-edge port.
+
+    Both addresses must move together. The listener is what callers dial and
+    the NLB-SG rule is what admits them; a plan that moved one without the
+    other would either black-hole the edge or leave the old port reachable, so
+    a partial claim is refused rather than composed.
+    """
+    claimed = {
+        address
+        for address in changed
+        if address in HUB_CLIENT_EDGE_PORT_ADDRESSES
+        and (actual_non_noop.get(address) or ()) == ["update"]
+    }
+    if claimed != set(HUB_CLIENT_EDGE_PORT_ADDRESSES):
+        return None
+    return frozenset(claimed)
+
+
+def _validate_hub_client_edge_port_migration(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    """Pin an exact in-place 62206 -> 443 move and nothing else.
+
+    Everything that decides WHERE traffic goes -- the load balancer, the
+    forwarded target group, the admitted source CIDR, the security group -- must
+    be byte-identical across the move. Only the port may differ, and only in
+    that one direction. The target group itself stays on the server's private
+    bind: this edge translates, it does not renumber the backend.
+    """
+    listener_address = "module.control.aws_lb_listener.hub[0]"
+    rule_address = (
+        "module.control.aws_vpc_security_group_ingress_rule."
+        f'hub_nlb_udp["{PROOF_SOURCE_CIDR}"]'
+    )
+
+    change = (by_address.get(listener_address) or {}).get("change")
+    if not isinstance(change, dict) or list(change.get("actions") or ()) != ["update"]:
+        raise ContractError("Hub client-edge listener move is not an in-place update")
+    before = change.get("before") or {}
+    after = change.get("after") or {}
+    if (
+        before.get("port") != 62206
+        or after.get("port") != 443
+        or before.get("protocol") != "UDP"
+        or after.get("protocol") != "UDP"
+        or before.get("load_balancer_arn") != after.get("load_balancer_arn")
+        or before.get("default_action") != after.get("default_action")
+    ):
+        raise ContractError(
+            "Hub client-edge listener must move exactly UDP 62206 -> 443 on the "
+            "same load balancer and forwarded target group"
+        )
+
+    change = (by_address.get(rule_address) or {}).get("change")
+    if not isinstance(change, dict) or list(change.get("actions") or ()) != ["update"]:
+        raise ContractError("Hub client-edge NLB SG move is not an in-place update")
+    before = change.get("before") or {}
+    after = change.get("after") or {}
+    if (
+        before.get("from_port") != 62206
+        or before.get("to_port") != 62206
+        or after.get("from_port") != 443
+        or after.get("to_port") != 443
+        or before.get("ip_protocol") != "udp"
+        or after.get("ip_protocol") != "udp"
+        or before.get("cidr_ipv4") != PROOF_SOURCE_CIDR
+        or after.get("cidr_ipv4") != PROOF_SOURCE_CIDR
+        or before.get("security_group_id") != after.get("security_group_id")
+    ):
+        raise ContractError(
+            "Hub client-edge NLB SG ingress must move exactly the proof-runner "
+            f"{PROOF_SOURCE_CIDR} from UDP 62206 to UDP 443 on the same security group"
+        )
+
+
 def _claim_authority_hub_exec_policy_update(
     changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
 ) -> frozenset[str] | None:
@@ -8413,6 +8501,11 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-hub-exec-policy-update",
         _claim_authority_hub_exec_policy_update,
         _validate_authority_hub_exec_policy_update,
+    ),
+    (
+        "hub-client-edge-port-migration",
+        _claim_hub_client_edge_port_migration,
+        _validate_hub_client_edge_port_migration,
     ),
 )
 
@@ -11065,6 +11158,11 @@ def _check_hub_source_fence_transition(
             listener_before is not None
             or listener_change.get("actions") != ["create"]
             or listener_after.get("protocol") != "UDP"
+            # Stays on the server bind, not the client edge: this recovery
+            # replays the byte-pinned Hub source-fence provider envelope
+            # captured while the listener was on 62206. The live listener's
+            # client-edge port is proved by
+            # collect_udp_proof_deployment_evidence.py against contract.UDP_PORT.
             or listener_after.get("port") != 62206
             or load_balancer_arn != target_group_lb_arn
             or listener_change.get("after_unknown", {}).get(
@@ -11930,7 +12028,7 @@ def check_plan(
     # A bounded, post-fence hardening of the Hub public edge: pin ON
     # enforce_security_group_inbound_rules_on_private_link_traffic. The fence
     # (#3362) attached an SG admitting exactly the reviewed proof-runner /32 on
-    # UDP 62206; this makes that SG's PrivateLink posture Terraform-owned rather
+    # UDP 443; this makes that SG's PrivateLink posture Terraform-owned rather
     # than an inherited AWS default, so an out-of-band flip to "off" becomes
     # visible drift. collect_udp_proof_deployment_evidence.py has required the
     # literal "on" of the live edge since #3462 and cannot pass while
@@ -12368,7 +12466,8 @@ def check_plan(
             "exact proof-mutation DynamoDB decrypt grant, the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
             "image update, Hub PrivateLink "
-            "inbound-rule enforcement, or Hub UDP source-fence "
+            "inbound-rule enforcement, the exact Hub client-edge port "
+            "migration, or Hub UDP source-fence "
             "replacement; "
             f"got {actual_non_noop}"
         )
@@ -14040,10 +14139,10 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
                 "Control Hub NLB does not attach exactly the reviewed NLB SG"
             )
         if normalized_permissions(nlb_group, "IpPermissions") != {
-            ("udp", 62206, 62206, "cidr_ipv4", PROOF_SOURCE_CIDR)
+            ("udp", 443, 443, "cidr_ipv4", PROOF_SOURCE_CIDR)
         }:
             raise ContractError(
-                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP 62206"
+                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP 443"
             )
         if hub_worker_groups:
             if len(hub_worker_groups) != 1:

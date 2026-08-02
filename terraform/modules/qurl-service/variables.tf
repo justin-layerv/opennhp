@@ -1146,17 +1146,17 @@ variable "nhp_server_host" {
 }
 
 variable "nhp_server_port" {
-  description = "NHP UDP listener port. Conventionally 62206 — matches the UDP TG / SG rules in `modules/compute` and the AC ConnectorClient in `modules/ac` (grep `62206`; #2027 tracks consolidating all three sites into a shared local). Consumed only when deploy_qurl_bootstrap_chain = true."
+  description = "Public NHP client-edge UDP port advertised to agents via NHP_SERVER_PORT. This is the cell NLB's listener port (443), NOT the server's own 62206 bind — the NLB translates between them, so this must track `aws_lb_listener.udp` in `modules/compute` and `endpoints/ac.DefaultServerPort`, not the UDP target group. Consumed only when deploy_qurl_bootstrap_chain = true."
   type        = string
-  default     = "62206"
+  default     = "443"
 
-  # No leading zeros — `"062206"` would validate as 62206 but inject the
-  # literal `"062206"` into the env var, which a strict consumer parser
+  # No leading zeros — `"0443"` would validate as 443 but inject the
+  # literal `"0443"` into the env var, which a strict consumer parser
   # would reject at task startup. Anchor with `^[1-9][0-9]*$` so the
   # string representation matches what the consumer expects.
   validation {
     condition     = can(regex("^[1-9][0-9]*$", var.nhp_server_port)) && tonumber(var.nhp_server_port) <= 65535
-    error_message = "nhp_server_port must be a numeric string in [1, 65535] with no leading zeros (e.g., \"62206\")."
+    error_message = "nhp_server_port must be a numeric string in [1, 65535] with no leading zeros (e.g., \"443\")."
   }
 }
 

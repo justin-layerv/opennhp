@@ -313,9 +313,9 @@ def good_snapshot() -> dict:
             "id": server_nlb_sg,
             "vpc_id": main_vpc,
             "inbound": [
-                rule("udp", 62206, 62206, "cidr_ipv4", "3.141.109.76/32"),
+                rule("udp", 443, 443, "cidr_ipv4", "3.141.109.76/32"),
                 *(
-                    rule("udp", 62206, 62206, "cidr_ipv4", f"{address}/32")
+                    rule("udp", 443, 443, "cidr_ipv4", f"{address}/32")
                     for address in ac_public_ips
                 ),
             ],
@@ -684,7 +684,7 @@ def good_snapshot() -> dict:
             "canonical": True,
             "listener_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-edge/cell0/udp",
             "protocol": "UDP",
-            "port": checker.RELAY_SERVER_UDP_PORT,
+            "port": checker.SERVER_CLIENT_EDGE_UDP_PORT,
             "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp/cell0",
             "target_group": {
                 "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp/cell0",
@@ -1506,8 +1506,8 @@ class RecordedStructuralAws:
                                     [
                                         {
                                             "IpProtocol": "udp",
-                                            "FromPort": 62206,
-                                            "ToPort": 62206,
+                                            "FromPort": 443,
+                                            "ToPort": 443,
                                             "IpRanges": [
                                                 {"CidrIp": "3.141.109.76/32"},
                                                 *(
@@ -1624,7 +1624,7 @@ class RecordedStructuralAws:
                     "Listeners": [
                         {
                             "ListenerArn": "listener-public-main-nhp",
-                            "Port": 62206,
+                            "Port": 443,
                             "Protocol": self.public_main_vpc_nhp_protocol,
                             "DefaultActions": [
                                 {
@@ -2426,7 +2426,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                             "canonical": True,
                             "listener_arn": "listener-public-main-nhp",
                             "protocol": "UDP",
-                            "port": 62206,
+                            "port": 443,
                             "target_group_arn": "tg-server-public-recorded",
                             "target_group": {
                                 "arn": "tg-server-public-recorded",
@@ -2556,7 +2556,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         self.assertEqual(2, len(shared_target["assigned_cell_nhp_listeners"]))
         self.assertTrue(
             any(
-                "exactly one public UDP listener on 62206" in error
+                "exactly one public UDP listener on 443" in error
                 for error in checker.validate_structural(shared_target)
             )
         )
@@ -2580,7 +2580,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 self.assertEqual(2, len(distinct_target["assigned_cell_nhp_listeners"]))
                 self.assertTrue(
                     any(
-                        "exactly one public UDP listener on 62206" in error
+                        "exactly one public UDP listener on 443" in error
                         for error in checker.validate_structural(distinct_target)
                     )
                 )
@@ -2606,7 +2606,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "canonical tagged compute NLB UDP 62206 edge" in error
+                "canonical tagged compute NLB UDP 443 edge" in error
                 for error in checker.validate_structural(tcp_udp)
             )
         )
@@ -2634,7 +2634,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         self.assertEqual(2, len(second_nhp["assigned_cell_nhp_listeners"]))
         self.assertTrue(
             any(
-                "exactly one public UDP listener on 62206" in error
+                "exactly one public UDP listener on 443" in error
                 for error in checker.validate_structural(second_nhp)
             )
         )
@@ -3374,7 +3374,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             plan_checker,
         )
         self.assertIn(
-            "assigned cell public NHP NLB must expose exactly one UDP listener on 62206",
+            "assigned cell public NHP NLB must expose exactly one UDP listener on the public client edge 443",
             plan_checker,
         )
 
@@ -3608,7 +3608,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                     "load_balancer_arn": "rogue",
                     "listener_arn": "rogue",
                     "protocol": "UDP",
-                    "port": 62206,
+                    "port": 443,
                 }
             ),
             "missing internal relay edge": lambda data: data.update(
@@ -3637,10 +3637,10 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             ].append("udp-target"),
         }
         expected = {
-            "missing assigned-cell UDP edge": "exactly one public UDP listener on 62206",
-            "public ACK port": "canonical tagged compute NLB UDP 62206 edge",
-            "rogue cell NLB identity": "canonical tagged compute NLB UDP 62206 edge",
-            "wrong cell ownership tag": "canonical tagged compute NLB UDP 62206 edge",
+            "missing assigned-cell UDP edge": "exactly one public UDP listener on 443",
+            "public ACK port": "canonical tagged compute NLB UDP 443 edge",
+            "rogue cell NLB identity": "canonical tagged compute NLB UDP 443 edge",
+            "wrong cell ownership tag": "canonical tagged compute NLB UDP 443 edge",
             "listener target-group miswire": "canonical UDP 62206 instance target group",
             "public target disables client IP preservation": "canonical UDP 62206 instance target group",
             "unhealthy cell target": "healthy active-color server-ASG targets on 62206",
@@ -3649,7 +3649,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             "wrong target ASG": "active-color server-ASG targets",
             "wrong target server SG": "canonical server SG",
             "public server ACK SG rule": "server SG internet-wide UDP ingress",
-            "second assigned-cell UDP edge": "exactly one public UDP listener on 62206",
+            "second assigned-cell UDP edge": "exactly one public UDP listener on 443",
             "missing internal relay edge": "exactly one canonical internal server UDP 62206 listener",
             "internal relay ACK port": "canonical tagged UDP 62206 NLB edge",
             "rogue internal relay NLB identity": "canonical tagged UDP 62206 NLB edge",
@@ -3792,7 +3792,7 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
                     "inbound"
                 ][0].update({"source": "0.0.0.0/0"}),
-                "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 62206",
+                "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 443",
             ),
             "NLB target egress": (
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][

@@ -8,7 +8,8 @@ NLB, or public IP.
 
 Upcoming UDP SDKs use the control plane to discover their assigned cell and
 then connect directly to that cell's public NHP server NLB. Each cell server
-NLB exposes exactly one UDP listener, 62206. UDP 62207 is never a public NHP
+NLB exposes exactly one UDP listener, 443 (forwarded to the server's UDP
+62206 target group). UDP 62207 is never a public NHP
 listener.
 
 ## Data paths
@@ -23,14 +24,14 @@ Browser / JS agent
 
 UDP SDK
   -> assignment / cell discovery
-  -> assigned-cell public NHP server NLB UDP 62206
+  -> assigned-cell public NHP server NLB UDP 443
   -> assigned NHP server
 ```
 
 The relay wraps browser payloads in authenticated `NHP_RLY` messages. It sends
 to the server's internal-NLB UDP 62206 path and receives authenticated returns
 on its private UDP 62207 socket; those relay-specific paths are reachable only
-over VPC peering. Direct SDK UDP reaches the separate public server-NLB 62206
+over VPC peering. Direct SDK UDP reaches the separate public server-NLB 443
 path and does not traverse the relay or use the relay identity.
 
 ## DMZ boundary
@@ -41,7 +42,7 @@ path and does not traverse the relay or use the relay identity.
 - Relay return ingress: UDP 62207 from the canonical server SG only.
 - Relay AWS egress: TCP 443 to reviewed interface endpoints and the S3 prefix
   list; no NAT or default route.
-- Direct SDK ingress: assigned-cell server NLB UDP 62206 only.
+- Direct SDK ingress: assigned-cell server NLB UDP 443 only.
 
 The public server NLB and the relay ALB are separate trust and scaling
 boundaries. WAF applies to the relay HTTPS path, not to SDK UDP. SDK UDP relies
@@ -67,7 +68,7 @@ Terraform and CI must prove:
 2. The relay ASG attaches only to the HTTPS target group.
 3. The assigned-cell compute module retains its internet-facing server NLB,
    instance UDP 62206 target group, and exactly one public UDP listener on
-   62206.
+   443.
 4. The internal server NLB remains available on UDP 62206 for browser-relay
    traffic.
 5. Relay UDP 62207 ingress is SG-to-SG from the server and is never public.
@@ -84,8 +85,8 @@ public UDP surface. A relay rollback changes the browser path only. It must not
 remove or repoint the cell server NLB used by UDP SDKs.
 
 Before enabling UDP SDK traffic in an environment, prove cell assignment returns
-the correct server NLB endpoint, run a real external NHP UDP 62206 round trip,
-and retain evidence that no public UDP listener other than 62206 exists on the
+the correct server NLB endpoint, run a real external NHP UDP 443 round trip,
+and retain evidence that no public UDP listener other than 443 exists on the
 assigned cell edge.
 
 Direct assigned-cell availability under spoofed/distributed UDP floods is

@@ -215,7 +215,8 @@ the drift gate runs.
 
 | Port | Protocol | Component | Purpose |
 |------|----------|-----------|---------|
-| 62206 | UDP | NHP Server | Knock packets (via NLB) |
+| 443 | UDP | Public cell/Hub NLB | Client-facing knock edge (what SDKs dial) |
+| 62206 | UDP | NHP Server | Knock packets the NLB forwards to (private bind) |
 | 8888 | TCP | NHP Server | HTTP plugin endpoints |
 | 443 | TCP | AC Traefik | HTTPS (TLS termination) |
 

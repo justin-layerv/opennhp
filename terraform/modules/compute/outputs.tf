@@ -1,8 +1,13 @@
 # Required public resources retain indexed addresses for state compatibility;
 # their constant singleton counts make these outputs non-null.
 output "nlb_dns_name" {
-  description = "Public cell NLB DNS name for native SDK traffic on UDP 62206."
+  description = "Public cell NLB DNS name for native SDK traffic on UDP 443."
   value       = one(aws_lb.server[*].dns_name)
+}
+
+output "qurl_resolve_listener_port" {
+  description = "TCP port of the qURL-resolve TLS listener on the public cell NLB. Not 443 — that port is the public UDP client edge, and an NLB allows one listener per port. The CloudFront distribution in front of resolve.<domain> must set this as its custom origin https_port; consuming this output also orders the origin update after the listener move."
+  value       = local.qurl_resolve_port
 }
 
 output "nlb_arn" {

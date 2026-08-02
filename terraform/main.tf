@@ -833,6 +833,10 @@ module "compute" {
   # resource attributes" errors. The certificate_arn is only used at apply time.
   enable_qurl_resolve_endpoint = local.qurl_resolve_endpoint_enabled
   qurl_resolve_certificate_arn = local.qurl_resolve_endpoint_enabled ? aws_acm_certificate_validation.qurl_resolve[0].certificate_arn : null
+  # The resolve TLS listener no longer sits on 443 (that is the public UDP
+  # client edge), so the resolve edge is CloudFront-only. The module's
+  # precondition rejects enable_qurl_resolve_endpoint without this.
+  qurl_resolve_via_cloudfront = local.deploy_qurl_resolve_cf
 
   # HTTP server timeouts — CF↔server keep-alive contract (see top-of-file
   # locals + `terraform_data.http_keepalive_contract`'s preconditions). The
@@ -4219,8 +4223,12 @@ resource "aws_cloudfront_distribution" "qurl_resolve" {
     origin_id   = "nlb"
 
     custom_origin_config {
-      http_port              = 80
-      https_port             = 443
+      http_port = 80
+      # NOT 443. The server NLB's 443 is the public UDP client edge, so the
+      # resolve TLS listener moved to this port. Reading it from the module
+      # output (rather than hardcoding 8443) also orders this origin update
+      # after the listener actually moves.
+      https_port             = module.compute.qurl_resolve_listener_port
       origin_protocol_policy = "https-only"
       origin_ssl_protocols   = ["TLSv1.2"]
       # Sourced from the CF↔server keep-alive contract (see top-of-file

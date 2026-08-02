@@ -1984,8 +1984,11 @@ func (r *ACRegistration) registrationLoop() {
 	r.keepaliveLoop()
 }
 
-// DefaultServerPort is the default NHP server port.
-const DefaultServerPort = common.DefaultNHPPort
+// DefaultServerPort is the UDP port the AC dials to register with its cell.
+// Registration targets the cell's PUBLIC server NLB (`ServerEndpoint` is the
+// NLB DNS name), so this is the client-edge port, not the port the server
+// process binds. The NLB forwards to common.DefaultNHPPort on its targets.
+const DefaultServerPort = common.DefaultNHPClientPort
 
 // beginRegistrationAttempt installs and publishes the temporary NLB peer as
 // one atomic assignment transition. A concurrent redispatch that follows sees
@@ -2056,7 +2059,7 @@ func (r *ACRegistration) register() error {
 	r.metrics.IncrCounter(MetricRegistrationAttempts)
 	startTime := time.Now()
 
-	// Determine server port (default 62206)
+	// Determine server port (default: the public NHP client edge port)
 	serverPort := r.ac.config.ServerPort
 	if serverPort == 0 {
 		serverPort = DefaultServerPort

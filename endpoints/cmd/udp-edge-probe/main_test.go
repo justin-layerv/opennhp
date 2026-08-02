@@ -55,7 +55,7 @@ func TestKnockWithFreshRunIDPassesExactValueToExplicitSDKPath(t *testing.T) {
 		return wantRunID, nil
 	}, func(aspID, resourceID, runID, serverIP, serverHostname string, serverPort int) string {
 		called = true
-		if aspID != cfg.ASP || resourceID != cfg.Resource || runID != wantRunID || serverIP != "" || serverHostname != cfg.ServerHost || serverPort != 62206 {
+		if aspID != cfg.ASP || resourceID != cfg.Resource || runID != wantRunID || serverIP != "" || serverHostname != cfg.ServerHost || serverPort != 443 {
 			t.Fatalf("knock args = (%q, %q, %q, %q, %q, %d), want exact configured endpoint and generated RunID", aspID, resourceID, runID, serverIP, serverHostname, serverPort)
 		}
 		return `{"errCode":"0"}`

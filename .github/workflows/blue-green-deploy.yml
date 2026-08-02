@@ -352,7 +352,7 @@ jobs:
           fi
 
           # Server listeners: primary=required public SDK UDP, internal=browser-relay
-          # UDP, secondary=HTTPS. The public UDP 62206 listener must remain present.
+          # UDP, secondary=HTTPS. The public UDP 443 listener must remain present.
           PRIMARY_LISTENER=$(aws ssm get-parameter \
             --name "${SSM_BASE}/udp-listener-arn" \
             --query "Parameter.Value" --output text 2>/dev/null) || PRIMARY_LISTENER=""

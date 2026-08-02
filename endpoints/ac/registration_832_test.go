@@ -45,7 +45,7 @@ func TestACRegistration_HandleRedispatch_RejectsHostnameOnlyDrain(t *testing.T) 
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.1",
-				Port:         DefaultServerPort,
+				Port:         testServerListenPort,
 				PubKeyBase64: "key1",
 				AZ:           "us-east-2a",
 				ServerID:     "srv-1",
@@ -55,7 +55,7 @@ func TestACRegistration_HandleRedispatch_RejectsHostnameOnlyDrain(t *testing.T) 
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.2",
-				Port:         DefaultServerPort,
+				Port:         testServerListenPort,
 				PubKeyBase64: "key2",
 				AZ:           "us-east-2b",
 				ServerID:     "srv-2",
@@ -65,7 +65,7 @@ func TestACRegistration_HandleRedispatch_RejectsHostnameOnlyDrain(t *testing.T) 
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.3",
-				Port:         DefaultServerPort,
+				Port:         testServerListenPort,
 				PubKeyBase64: "key3",
 				AZ:           "us-east-2c",
 				ServerID:     "srv-3",

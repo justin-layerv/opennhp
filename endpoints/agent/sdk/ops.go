@@ -125,7 +125,7 @@ func SetKnockUser(userId, devId, orgId, userData string) bool {
 //   - pubkey: server's base64-encoded public key (required)
 //   - ip:     server IP address (required if host is empty)
 //   - host:   server hostname  (required if ip is empty)
-//   - port:   server UDP port  (0 → default 62206)
+//   - port:   server UDP port  (0 → default 443, the public NHP edge port)
 //   - expire: public key expiry as epoch seconds (0 → no expiry)
 //
 // Returns false if the agent is not initialized or inputs are invalid.
@@ -139,7 +139,7 @@ func AddServer(pubkey, ip, host string, port int, expire int64) bool {
 		return false
 	}
 	if port == 0 {
-		port = common.DefaultNHPPort
+		port = common.DefaultNHPClientPort
 	}
 	instance.AddServer(&core.UdpPeer{
 		Type:         core.NHP_SERVER,

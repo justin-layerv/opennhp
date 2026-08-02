@@ -24,7 +24,12 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-UDP_PORT = 62206
+# UDP_PORT is the PUBLIC client-edge port: what an SDK dials and what the
+# cell/Hub NLB listeners bind. UDP_TARGET_PORT is the server's own private
+# bind, which the NLB forwards to. They are deliberately different — see
+# nhp/common/constants.go (DefaultNHPClientPort vs DefaultNHPPort).
+UDP_PORT = 443
+UDP_TARGET_PORT = 62206
 MAX_MANIFEST_BYTES = 32 * 1024
 MAX_RUNTIME_BYTES = 8 * 1024
 MAX_PROVENANCE_BYTES = 64 * 1024

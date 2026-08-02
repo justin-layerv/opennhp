@@ -17,7 +17,7 @@ The result: **every server restart creates a window where knock requests fail**,
 
 ```
 AC Startup:
-  AC → NLB (UDP 62206) → random Server
+  AC → NLB (UDP 443) → random Server (UDP 62206)
   Server → NHP_ARD (redirect to 3 assigned servers)
   AC → connects directly to 3 assigned server IPs
   AC → sends NHP_KPL every 10s, NHP_AOL every 60s

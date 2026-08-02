@@ -448,8 +448,8 @@ def validate_transport_checkpoint(
             "http_trap_calls",
             "nhp_udp_lifecycle_success",
             "observed_cell_ids",
-            "udp_62206_inbound",
-            "udp_62206_outbound",
+            "udp_443_inbound",
+            "udp_443_outbound",
             "version",
         },
         "transport checkpoint",
@@ -469,12 +469,12 @@ def validate_transport_checkpoint(
         and HEX64_RE.fullmatch(checkpoint["capture_targets_sha256"]) is not None
         and type(checkpoint["captured_packet_count"]) is int
         and checkpoint["captured_packet_count"] >= 2
-        and type(checkpoint["udp_62206_outbound"]) is int
-        and checkpoint["udp_62206_outbound"] >= 1
-        and type(checkpoint["udp_62206_inbound"]) is int
-        and checkpoint["udp_62206_inbound"] >= 1
+        and type(checkpoint["udp_443_outbound"]) is int
+        and checkpoint["udp_443_outbound"] >= 1
+        and type(checkpoint["udp_443_inbound"]) is int
+        and checkpoint["udp_443_inbound"] >= 1
         and checkpoint["captured_packet_count"]
-        == checkpoint["udp_62206_outbound"] + checkpoint["udp_62206_inbound"]
+        == checkpoint["udp_443_outbound"] + checkpoint["udp_443_inbound"]
         and checkpoint["http_trap_calls"] == 0
         and checkpoint["observed_cell_ids"] == ["cell0", "cell1"]
         and checkpoint["nhp_udp_lifecycle_success"] is True

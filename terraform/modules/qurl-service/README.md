@@ -217,7 +217,7 @@ and `module.compute.nlb_dns_name` at the root.
 | `enable_qurl_agent_bootstrap` | Post-burn-in activation flag — drives `QURL_AGENT_BOOTSTRAP_ENABLED` | `bool` | `false` |
 | `nhp_server_public_key_b64` | NHP server responder public key (base64; raw 32-byte X25519). Plan-time validation guards against producer shape drift | `string` | `""` |
 | `nhp_server_host` | NHP server NLB DNS name (intentionally DNS not IP — TTL semantics are the consumer's responsibility) | `string` | `""` |
-| `nhp_server_port` | NHP UDP listener port. Matches the UDP TG / SG rules in `modules/compute` and the AC ConnectorClient in `modules/ac` (grep `62206`; #2027 tracks consolidation) | `string` | `"62206"` |
+| `nhp_server_port` | Public NHP client-edge UDP port advertised to agents. Matches the cell NLB listener in `modules/compute` and `endpoints/ac.DefaultServerPort`, not the server's 62206 bind (#2027 tracks consolidation) | `string` | `"443"` |
 
 Post-burn-in activation is a focused follow-up PR that flips
 `enable_qurl_agent_bootstrap = true` — matches the dark-launch pattern

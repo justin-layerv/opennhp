@@ -51,7 +51,7 @@ forbidden_resource_types=(
   aws_egress_only_internet_gateway
   # aws_internet_gateway, aws_lb, aws_lb_listener, and aws_route are legitimized
   # by the Connector Hub public UDP edge slice (Step 5): one edge IGW, one public
-  # route table with a single 0.0.0.0/0 route to it, and the public UDP-62206 Hub
+  # route table with a single 0.0.0.0/0 route to it, and the public UDP-443 Hub
   # NLB + listener in the public subnets. Like the authority runtime functions
   # they are NOT free here -- they are gated instead by the exact inventory +
   # transition contract in check-control-sandbox-first-apply.py, which admits

@@ -113,9 +113,9 @@ variable "provisioned_cells" {
       length(cell.nhp_host) <= 253 &&
       can(regex("^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+nhp\\.layerv\\.(ai|xyz)$", cell.nhp_host)) &&
       !contains(["internal", "localhost", "metadata", "private"], split(".", cell.nhp_host)[0]) &&
-      cell.nhp_port == 62206
+      cell.nhp_port == 443
     ])
-    error_message = "Each nhp_host must be a canonical LayerV-owned public DNS name under nhp.layerv.ai or nhp.layerv.xyz, must not use a private or metadata first label, and nhp_port must be UDP 62206."
+    error_message = "Each nhp_host must be a canonical LayerV-owned public DNS name under nhp.layerv.ai or nhp.layerv.xyz, must not use a private or metadata first label, and nhp_port must be the public UDP client-edge port 443. 62206 is the server's private listen port behind the NLB and must never be advertised to clients."
   }
 
   validation {
@@ -205,7 +205,7 @@ variable "hub_edge_enabled" {
   description = <<-EOT
     Dark-first enable gate for the Connector Hub public UDP edge (Step 5): the
     three public edge subnets, the internet gateway and public route table, and
-    the public UDP-62206 Hub network load balancer + listener + target group.
+    the public UDP-443 Hub network load balancer + listener + target group.
 
     Independent of the authority runtime gate: the Hub NLB is caller-facing
     while the runtime functions are dark, and they flip in separate applies.
@@ -219,7 +219,7 @@ variable "hub_edge_enabled" {
 
 variable "hub_public_udp_ingress_cidrs" {
   description = <<-EOT
-    Exact public IPv4 /32 sources admitted by the Hub UDP-62206 NLB security
+    Exact public IPv4 /32 sources admitted by the Hub UDP-443 NLB security
     group. A live Hub edge requires a non-empty, sorted, duplicate-free list;
     sandbox pins this to the proof runner's persistent EIP. null is allowed only
     while the edge is dark, which keeps production unchanged during sandbox

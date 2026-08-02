@@ -26,6 +26,13 @@ locals {
   # True when an SNS alert destination is actually wired. trimspace guards
   # against a whitespace-only ARN; try() handles the null default.
   sns_destination_present = try(trimspace(var.alerts_sns_topic_arn) != "", false)
+
+  # Port for the qURL-resolve TLS listener on the public server NLB. It is NOT
+  # 443: an NLB allows exactly one listener per port, and 443 is now the public
+  # UDP client edge (aws_lb_listener.udp). Only CloudFront reaches this
+  # listener, so a non-standard port is invisible to browsers — the root wires
+  # the matching custom origin port from the qurl_resolve_port output.
+  qurl_resolve_port = 8443
 }
 
 resource "terraform_data" "sns_alerts_contract" {
@@ -1517,13 +1524,15 @@ resource "aws_security_group" "server_nlb" {
   }
 }
 
+# Client-facing ingress: the listener port (443), not the target port. The
+# matching egress rule below stays on 62206 because the NLB translates.
 resource "aws_vpc_security_group_ingress_rule" "server_nlb_udp" {
   for_each = toset(coalesce(var.public_nhp_udp_ingress_cidrs, []))
 
   security_group_id = aws_security_group.server_nlb[0].id
   description       = "NHP UDP proof source ${each.value}"
-  from_port         = 62206
-  to_port           = 62206
+  from_port         = 443
+  to_port           = 443
   ip_protocol       = "udp"
   cidr_ipv4         = each.value
 
@@ -1698,11 +1707,27 @@ resource "aws_autoscaling_attachment" "server" {
 }
 
 # UDP Listener (required PUBLIC knock surface).
+#
+# Clients dial UDP 443, not the server's own listen port. Restrictive corporate
+# and hotel egress filters routinely drop high-numbered outbound UDP while
+# leaving 443 open for QUIC/HTTP-3, so the public edge meets clients there. The
+# NLB translates to the target group's port 62206, which is what the server
+# process binds — do NOT propagate 443 to the target group, SG, or instance:
+# that would require CAP_NET_BIND_SERVICE on the server for no benefit.
+#
+# An NLB permits only ONE listener per port, so this cannot coexist with the
+# qURL-resolve TLS listener that used to sit on 443. That listener now serves
+# aws_lb_listener.https on port 8443 (reached only by CloudFront, which sets a
+# matching custom origin port). depends_on forces the TLS listener to vacate
+# 443 BEFORE this one claims it; without it Terraform may order the two updates
+# the other way and the apply fails with DuplicateListener.
 resource "aws_lb_listener" "udp" {
   count             = 1
   load_balancer_arn = aws_lb.server[0].arn
-  port              = 62206
+  port              = 443
   protocol          = "UDP"
+
+  depends_on = [aws_lb_listener.https]
 
   default_action {
     type = "forward"
@@ -2042,13 +2067,24 @@ resource "aws_autoscaling_attachment" "https" {
   lb_target_group_arn    = aws_lb_target_group.https[0].arn
 }
 
-# TLS Listener (terminates TLS, forwards to TCP target group)
+# TLS Listener (terminates TLS, forwards to TCP target group).
+#
+# This listener used to sit on 443. It now sits on `local.qurl_resolve_port`
+# (8443) because an NLB permits exactly one listener per port and 443 is the
+# public UDP client edge — see aws_lb_listener.udp above.
+#
+# Moving it is safe because nothing dials this listener directly: the only
+# caller is the CloudFront distribution in front of resolve.qurl.link, which
+# reaches it via resolve-origin.<domain> with a matching custom origin port.
+# The precondition below refuses the CloudFront-less shape, where a browser
+# WOULD dial the NLB directly and find nothing on 443. TLS is unaffected — the
+# ACM cert is bound to the hostname, not the port.
 resource "aws_lb_listener" "https" {
   count = var.enable_qurl_resolve_endpoint ? 1 : 0
 
   # aws_lb.server retains its indexed state address and is always present.
   load_balancer_arn = aws_lb.server[0].arn
-  port              = 443
+  port              = local.qurl_resolve_port
   protocol          = "TLS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = var.qurl_resolve_certificate_arn
@@ -2065,6 +2101,10 @@ resource "aws_lb_listener" "https" {
   })
 
   lifecycle {
+    precondition {
+      condition     = var.qurl_resolve_via_cloudfront
+      error_message = "enable_qurl_resolve_endpoint requires qurl_resolve_via_cloudfront: the resolve TLS listener moved off 443 (now the public UDP client edge) to ${local.qurl_resolve_port}, and only CloudFront can be pointed at a non-443 origin port. Serving resolve.<domain> straight off the NLB would need a browser to dial :${local.qurl_resolve_port}."
+    }
     precondition {
       condition     = var.qurl_resolve_certificate_arn != null
       error_message = "qurl_resolve_certificate_arn is required when enable_qurl_resolve_endpoint is true."

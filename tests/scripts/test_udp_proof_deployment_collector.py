@@ -91,7 +91,7 @@ def protected_hub_groups() -> tuple[dict[str, object], dict[str, object]]:
         "IpPermissions": [
             security_group_permission(
                 "udp",
-                62206,
+                443,
                 cidrs=(collector.PROOF_SOURCE_CIDR,),
             )
         ],

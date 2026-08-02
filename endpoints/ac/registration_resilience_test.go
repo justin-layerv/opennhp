@@ -98,13 +98,13 @@ func TestCheckAllUnconnected_OneConnectedServerResetsCounter(t *testing.T) {
 	stopRegLater(t, reg)
 
 	connected := &AssignedServer{
-		Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k1"},
+		Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k1"},
 	}
 	connected.SetConnected(true)
 	connected.UpdateLastSeen()
 
 	dead := &AssignedServer{
-		Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: "k2"},
+		Target: common.RedirectTarget{IP: "10.0.0.2", Port: testServerListenPort, PubKeyBase64: "k2"},
 	}
 
 	reg.assignedServers = []*AssignedServer{connected, dead}
@@ -136,7 +136,7 @@ func TestCheckAllUnconnected_TriggersExactlyOnceAtThreshold(t *testing.T) {
 	reg.allUnconnectedThreshold = 3
 
 	srv := &AssignedServer{
-		Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k1"},
+		Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k1"},
 	}
 	reg.assignedServers = []*AssignedServer{srv}
 
@@ -192,13 +192,13 @@ func TestCheckAllUnconnected_DoesNotClobberConcurrentHandleRedispatch(t *testing
 	// Initial: one unconnected server. The detector will see this set
 	// and (under the buggy patch-6 implementation) try to nuke it.
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "stale"}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "stale"}},
 	}
 
 	// Fresh servers a concurrent HandleRedispatch would install.
 	fresh := []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.1.1", Port: DefaultServerPort, PubKeyBase64: "fresh-1"}},
-		{Target: common.RedirectTarget{IP: "10.0.1.2", Port: DefaultServerPort, PubKeyBase64: "fresh-2"}},
+		{Target: common.RedirectTarget{IP: "10.0.1.1", Port: testServerListenPort, PubKeyBase64: "fresh-1"}},
+		{Target: common.RedirectTarget{IP: "10.0.1.2", Port: testServerListenPort, PubKeyBase64: "fresh-2"}},
 	}
 
 	var wg sync.WaitGroup
@@ -247,7 +247,7 @@ func TestCheckPeriodicNLBReregistration_DoesNotTriggerWithinInterval(t *testing.
 	reg.nlbReregistrationInterval = 30 * time.Minute
 	reg.lastNLBRegistrationNano.Store(time.Now().UnixNano())
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k1"}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k1"}},
 	}
 
 	reg.checkPeriodicNLBReregistration()
@@ -284,7 +284,7 @@ func TestCheckPeriodicNLBReregistration_TriggersAfterInterval(t *testing.T) {
 	reg.nlbReregistrationInterval = 30 * time.Minute
 	reg.lastNLBRegistrationNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "k1"}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort, PubKeyBase64: "k1"}},
 	}
 
 	reg.checkPeriodicNLBReregistration()

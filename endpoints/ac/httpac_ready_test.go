@@ -44,7 +44,7 @@ func TestHttpACReadinessRequiresConnectedAssignedServer(t *testing.T) {
 			name: "only disconnected assignments are unavailable",
 			ha: &HttpAC{ua: &UdpAC{registration: &ACRegistration{
 				assignedServers: []*AssignedServer{
-					{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}},
+					{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort}},
 				},
 			}}},
 			want:     http.StatusServiceUnavailable,
@@ -55,7 +55,7 @@ func TestHttpACReadinessRequiresConnectedAssignedServer(t *testing.T) {
 			ha: &HttpAC{ua: &UdpAC{registration: &ACRegistration{
 				assignedServers: []*AssignedServer{
 					{
-						Target:    common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort},
+						Target:    common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort},
 						Connected: true,
 						LastSeen:  time.Now().Add(-(KeepaliveInterval*KeepaliveMaxRetries + time.Second)),
 					},
@@ -68,7 +68,7 @@ func TestHttpACReadinessRequiresConnectedAssignedServer(t *testing.T) {
 			name: "healthy assignment is ready",
 			ha: &HttpAC{ua: &UdpAC{registration: &ACRegistration{
 				assignedServers: []*AssignedServer{
-					{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}, Connected: true, LastSeen: time.Now()},
+					{Target: common.RedirectTarget{IP: "10.0.0.1", Port: testServerListenPort}, Connected: true, LastSeen: time.Now()},
 				},
 			}}},
 			want:     http.StatusOK,

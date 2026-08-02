@@ -77,7 +77,7 @@ jobs:
           LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$LB_ARN" --query 'Listeners[].{Protocol:Protocol,Port:Port}' --output json)
           UDP_LISTENERS=$(jq '[.[] | select(.Protocol == "UDP" or .Protocol == "TCP_UDP")]' <<<"$LISTENERS")
           [[ "$(jq length <<<"$UDP_LISTENERS")" == "1" ]] || { echo "::error::Assigned-cell public NLB must have exactly one UDP-capable listener: $UDP_LISTENERS"; exit 1; }
-          jq -e '.[0].Protocol == "UDP" and .[0].Port == 62206' <<<"$UDP_LISTENERS" >/dev/null || { echo "::error::Assigned-cell public UDP listener is not exactly UDP 62206: $UDP_LISTENERS"; exit 1; }
+          jq -e '.[0].Protocol == "UDP" and .[0].Port == 443' <<<"$UDP_LISTENERS" >/dev/null || { echo "::error::Assigned-cell public UDP listener is not exactly UDP 443: $UDP_LISTENERS"; exit 1; }
           jq -e 'all(.[]; .Port != 62207)' <<<"$LISTENERS" >/dev/null || { echo "::error::UDP 62207 is publicly exposed: $LISTENERS"; exit 1; }
           ACTIVE_COLOR=$(aws ssm get-parameter --name /sandbox/nhp/server/active-color --query Parameter.Value --output text)
           case "$ACTIVE_COLOR" in

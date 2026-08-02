@@ -584,7 +584,13 @@ variable "nhp_internal_auth_secret_arn" {
 }
 
 variable "enable_qurl_resolve_endpoint" {
-  description = "Enable the QURL resolve endpoint (TLS listener on port 443). When true, adds infrastructure for resolve.qurl.link to route directly to the NHP Server plugin endpoint."
+  description = "Enable the QURL resolve endpoint (TLS listener on the qurl_resolve_listener_port output, 8443). When true, adds infrastructure for resolve.qurl.link to route to the NHP Server plugin endpoint. The listener is deliberately not on 443: that port carries the public UDP client edge, and an NLB allows only one listener per port."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_resolve_via_cloudfront" {
+  description = "Whether resolve.<domain> is fronted by CloudFront. Required true whenever enable_qurl_resolve_endpoint is true: the resolve TLS listener sits on a non-443 port, and only CloudFront can be pointed at a custom origin port. A browser aliased straight at the NLB would dial 443 and reach the UDP client edge instead."
   type        = bool
   default     = false
 }

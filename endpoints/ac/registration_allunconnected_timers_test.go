@@ -23,7 +23,7 @@ import (
 // checkAllUnconnected toward the threshold.
 func unconnectedAssignedServer(ip, key string) *AssignedServer {
 	return &AssignedServer{
-		Target: common.RedirectTarget{IP: ip, Port: DefaultServerPort, PubKeyBase64: key},
+		Target: common.RedirectTarget{IP: ip, Port: testServerListenPort, PubKeyBase64: key},
 	}
 }
 
