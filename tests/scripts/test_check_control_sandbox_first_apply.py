@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import tempfile
+import pathlib
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -13584,6 +13585,151 @@ class ProofMutationDecryptUpdateTest(unittest.TestCase):
             CHECKER.ContractError, "decrypt statement drifted"
         ):
             CHECKER._check_authority_proof_mutation_decrypt_update(by_address)
+
+
+class SliceAndAuthorityDigestDriftCompositionTest(unittest.TestCase):
+    """The runtime-slice re-projection and the image digest, in one plan.
+
+    Each already has a reviewed kind; neither matched their UNION, so a plan
+    carrying both fell to the terminal rejection. They arrive together by
+    construction -- the digest rolls on every upstream publish while the slice
+    re-projects on every partial-apply retry -- and the result was a 27-entry
+    rejection that blocked every Control plan, including the ones that would
+    have fixed it.
+    """
+
+    DIGEST = CHECKER._AUTHORITY_DIGEST_ADDRESS
+    SLICE = sorted(CHECKER.AUTHORITY_RUNTIME_RESOURCES)[0]
+
+    def entry(self, address):
+        return {
+            "address": address,
+            "mode": "managed",
+            "type": "x",
+            "change": {"actions": ["no-op"], "before": {"a": 1}, "after": {"a": 2}},
+        }
+
+    def compose(self, addresses, digest_raises=None):
+        drift = [self.entry(a) for a in addresses]
+        def digest_check(item, by_address, *, spec):
+            if digest_raises:
+                raise CHECKER.ContractError(digest_raises)
+        with mock.patch.object(CHECKER, "_check_digest_normalization", digest_check), \
+             mock.patch.object(CHECKER, "_drift_is_first_projection_only", lambda item: False):
+            return CHECKER._check_state_normalization_drift(drift, {}, refresh_only=True)
+
+    def test_the_pair_composes(self) -> None:
+        self.assertEqual(
+            self.compose([self.SLICE, self.DIGEST]),
+            CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND,
+        )
+
+    def test_the_digest_half_still_runs_its_own_validator(self) -> None:
+        """Composition must not skip either half's checks."""
+        with self.assertRaisesRegex(CHECKER.ContractError, "digest rejected"):
+            self.compose([self.SLICE, self.DIGEST], digest_raises="digest rejected")
+
+    def test_the_digest_alone_does_not_take_the_composed_route(self) -> None:
+        """One kind must keep being judged by the stricter single-kind chain."""
+        self.assertNotEqual(
+            self.compose([self.DIGEST]),
+            CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND,
+        )
+
+    def test_the_slice_alone_does_not_take_the_composed_route(self) -> None:
+        self.assertEqual(
+            self.compose([self.SLICE]), "authority-runtime-slice-normalization"
+        )
+
+    def test_a_third_address_refuses_the_composition(self) -> None:
+        """One unaccounted address and the whole plan must fail closed."""
+        with self.assertRaises(CHECKER.ContractError):
+            self.compose(
+                [self.SLICE, self.DIGEST, "module.control.aws_iam_role.flow_logs"]
+            )
+
+    def test_the_pair_is_gated_to_the_stricter_half_plan_modes(self) -> None:
+        """Composing must not widen the plan surface beyond the slice half.
+
+        Behavioural on purpose. The first version of this asserted the error
+        STRING appeared in the source, which survived replacing the condition
+        with `if False` -- it reported the gate as covered when it was gone.
+        """
+        kind = CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND
+        allowed = sorted(CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES)[0]
+        CHECKER._require_slice_and_digest_plan_mode(kind, allowed)
+
+        rejected = "authority-image-update"
+        self.assertNotIn(
+            rejected,
+            CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES,
+            "fixture assumption: pick a mode the slice half rejects",
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "runtime-slice state normalization"
+        ):
+            CHECKER._require_slice_and_digest_plan_mode(kind, rejected)
+
+        # Other kinds must pass straight through this gate untouched.
+        CHECKER._require_slice_and_digest_plan_mode("no-op", rejected)
+
+    def test_one_gate_covers_the_slice_kind_and_the_composed_pair(self) -> None:
+        """A duplicated gate is a gate that drifts.
+
+        Code review flagged the risk directly: the composed kind originally
+        carried a private copy of the slice kind's plan-mode rule, so anything a
+        future change added under the slice kind would silently not apply to the
+        composed one -- and the composed one is the shape the sandbox actually
+        produces. Both now go through the same function, keyed on one set.
+        """
+        self.assertEqual(
+            CHECKER._RUNTIME_SLICE_NORMALIZATION_KINDS,
+            frozenset(
+                {
+                    "authority-runtime-slice-normalization",
+                    CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND,
+                }
+            ),
+        )
+        rejected = "authority-image-update"
+        for kind in sorted(CHECKER._RUNTIME_SLICE_NORMALIZATION_KINDS):
+            with self.subTest(kind=kind):
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._require_slice_and_digest_plan_mode(kind, rejected)
+
+        source = pathlib.Path(CHECKER.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(
+            'if normalization_drift_kind == "authority-runtime-slice-normalization":',
+            source,
+            "the slice kind must not regain a second, private gate",
+        )
+
+    def test_the_gate_is_actually_wired_into_check_plan(self) -> None:
+        """A gate nothing calls is a gate that does not exist.
+
+        The behavioural test above proves the function refuses; this proves
+        check_plan still invokes it. Deleting the call site passed every other
+        assertion in this class.
+        """
+        import ast
+
+        source = pathlib.Path(CHECKER.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        check_plan = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "check_plan"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(check_plan)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn(
+            "_require_slice_and_digest_plan_mode",
+            called,
+            "check_plan no longer gates the composed normalization kind",
+        )
 
 
 class DualDigestNormalizationTest(unittest.TestCase):

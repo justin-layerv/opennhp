@@ -1873,6 +1873,12 @@ _AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES = frozenset(
     }
 )
 _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND = "authority-enablement-normalization"
+# The runtime-slice re-projection composed with the Authority image digest.
+# Both halves keep their own validator; only their co-occurrence is new.
+_SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND = (
+    "authority-runtime-slice-with-authority-digest"
+)
+
 _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES = frozenset(
     {
         "no-op",
@@ -9553,6 +9559,44 @@ def _check_authority_proof_prepare_recovery_drift(
             )
 
 
+_RUNTIME_SLICE_NORMALIZATION_KINDS = frozenset(
+    {
+        "authority-runtime-slice-normalization",
+        _SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND,
+    }
+)
+
+
+def _require_slice_and_digest_plan_mode(
+    normalization_drift_kind: str, plan_mode: str
+) -> None:
+    """One gate for the slice kind AND the composed pair.
+
+    Both kinds go through here rather than the composed kind carrying a private
+    copy of the same rule. A duplicated gate is a gate that drifts: anything a
+    future change adds under the slice kind would silently not apply to the
+    composed one, and the composed one is the shape the sandbox actually
+    produces. Code review raised exactly this risk.
+
+    A named function rather than an inline branch so it can be tested directly.
+    The inline version's only test asserted the error STRING was present in the
+    source, which survived replacing the condition with ``if False`` -- a
+    vacuous test that reported the gate as covered when it was gone.
+
+    The digest half is strictly additive information: it rolls on every upstream
+    publish regardless of what the plan does. So composing must not widen the
+    plan surface beyond the runtime-slice half, which is the one that constrains
+    what may be applied.
+    """
+    if normalization_drift_kind not in _RUNTIME_SLICE_NORMALIZATION_KINDS:
+        return
+    if plan_mode not in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
+        raise ContractError(
+            "authority runtime-slice state normalization is admitted only for "
+            "a runtime-slice transition, proof rollout, or steady no-op re-read"
+        )
+
+
 def _require_normalization_plan_mode(
     normalization_drift_kind: str, plan_mode: str, plan: dict[str, Any]
 ) -> None:
@@ -9681,6 +9725,44 @@ def _check_state_normalization_drift(
         )
         return _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND
     drift_addresses = [item.get("address") for item in drift]
+    if (
+        all(isinstance(address, str) for address in drift_addresses)
+        and _AUTHORITY_DIGEST_ADDRESS in drift_addresses
+        and set(drift_addresses) - {_AUTHORITY_DIGEST_ADDRESS}
+        and set(drift_addresses)
+        <= (
+            set(AUTHORITY_RUNTIME_RESOURCES)
+            | AUTHORITY_RUNTIME_OPENED_ADDRESSES
+            | {_AUTHORITY_DIGEST_ADDRESS}
+        )
+    ):
+        # The runtime-slice re-projection and the Authority image digest, in one
+        # plan. Each already has a reviewed kind; neither matches their UNION, so
+        # a plan carrying both fell through to the terminal rejection -- and both
+        # arrive together by construction, because the digest rolls on every
+        # upstream publish while the slice re-projects on every partial-apply
+        # retry. Observed as a 27-entry rejection (26 slice + 1 digest) that
+        # blocked every Control plan, including the ones that would have fixed it.
+        #
+        # This is a PARTITION, not a relaxation, and it mirrors what
+        # ``_compose_admitted_transitions`` already does for planned changes and
+        # what ``_AUTHORITY_ENABLEMENT_NORMALIZATION_KIND`` already does for the
+        # Hub-publisher + digest pair:
+        #
+        #   * both halves must be NON-EMPTY, so this can never become a second,
+        #     looser route to a kind the single-kind chain judges on its own;
+        #   * the two halves must together be exactly the drift, so no third
+        #     address rides along unvalidated;
+        #   * each half runs its OWN existing validator, unchanged.
+        digest_item = next(
+            item
+            for item in drift
+            if item.get("address") == _AUTHORITY_DIGEST_ADDRESS
+        )
+        _check_digest_normalization(
+            digest_item, by_address, spec=_AUTHORITY_DIGEST_SPEC
+        )
+        return _SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND
     if all(isinstance(address, str) for address in drift_addresses) and set(
         drift_addresses
     ) <= (set(AUTHORITY_RUNTIME_RESOURCES) | AUTHORITY_RUNTIME_OPENED_ADDRESSES):
@@ -12695,23 +12777,7 @@ def check_plan(
                 "the benign Hub-publisher-role + authority-digest drift pair is "
                 "admitted only for the Authority contract enablement transition"
             )
-    if normalization_drift_kind == "authority-runtime-slice-normalization":
-        # Benign refresh re-projection of already-applied slice resources (and
-        # the dependency endpoints being opened) during a partial-apply RETRY.
-        # Admitted only for the runtime-slice completion transition itself, or a
-        # steady no-op re-read of the same objects. The steady re-read may be an
-        # applyable refresh-only plan (the immediate pre-apply convergence lane)
-        # or an ordinary non-applyable refresh-enabled plan (the post-apply
-        # verifier). Each drifted address was confined to the slice in
-        # ``_check_state_normalization_drift``; the ordinary plan's complete
-        # after-state has already passed every security validator above. Bind
-        # the drift to these exact plan modes and reject any unrelated resource
-        # transition.
-        if plan_mode not in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
-            raise ContractError(
-                "authority runtime-slice state normalization is admitted only for "
-                "a runtime-slice transition, proof rollout, or steady no-op re-read"
-            )
+    _require_slice_and_digest_plan_mode(normalization_drift_kind, plan_mode)
     if (
         normalization_drift_kind
         == AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
