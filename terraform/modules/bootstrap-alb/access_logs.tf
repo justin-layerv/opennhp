@@ -94,19 +94,17 @@ resource "aws_s3_bucket" "alb_access_logs" {
 
   tags = merge(local.tags, { Name = local.alb_access_logs_bucket_name })
 
-  # Production bootstrap forensics are irrecoverable, so this normally carries
-  # `lifecycle { prevent_destroy = true }`.
+  # Production bootstrap forensics are irrecoverable.
   #
-  # It is absent until sandbox's pending destroy is applied. prevent_destroy is
-  # evaluated from CONFIGURATION, not state, and it cannot be scoped to one
-  # environment because Terraform requires a literal there. So restoring it in
-  # the same revision that removes sandbox's module instance makes that
-  # revision block its own destroy — which is what #3607 did, and it took the
-  # entire sandbox root out of `terraform plan` until this was reverted.
-  #
-  # Restore the block in a follow-up revision, once sandbox's bucket is gone.
-  # Production is unaffected in the meantime: its module stays in
-  # configuration, so no production plan calls for this bucket to be destroyed.
+  # This guard is restored only AFTER a retiring environment's bucket is
+  # actually gone. prevent_destroy is evaluated from CONFIGURATION, not state,
+  # and Terraform requires a literal here, so it cannot be scoped to the
+  # surviving environment — restoring it while any instance still has a pending
+  # destroy makes that revision block its own destroy. See README ->
+  # "Teardown / cleanup" -> section 1.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "alb_access_logs" {
