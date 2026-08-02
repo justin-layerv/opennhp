@@ -305,6 +305,8 @@ def good_snapshot() -> dict:
             "inbound": [
                 rule("udp", 62206, 62206, "security_group", server_nlb_sg),
                 rule("tcp", 8888, 8888, "security_group", server_nlb_sg),
+                # In-VPC AC keepalive path; see SANDBOX_MAIN_VPC_CIDR.
+                rule("udp", 62206, 62206, "cidr_ipv4", "10.100.0.0/16"),
                 *(rule("udp", 62206, 62206, "cidr_ipv4", cidr) for cidr in relay_cidrs),
             ],
             "outbound": [],
@@ -796,6 +798,13 @@ def good_prod_snapshot() -> dict:
             if not (
                 item.get("source_type") == "security_group"
                 and item.get("source") == nlb_id
+            )
+            # server_nhp_udp_vpc is fenced-topology-only. Prod keeps the legacy
+            # 0.0.0.0/0 rule, whose source already covers in-VPC AC traffic, so
+            # the fenced replacement must not appear here.
+            and not (
+                item.get("source_type") == "cidr_ipv4"
+                and item.get("source") == "10.100.0.0/16"
             )
         ],
     ]

@@ -181,6 +181,16 @@ RELAY_HEALTH_PATH = "/health/live"
 # EXPECTED_SANDBOX_PROOF_SOURCE_CIDR pin in the sibling plan checker; re-homing
 # both to the proof-runner remote-state output is a tracked follow-up.
 SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# Main sandbox VPC, the source of the in-VPC AC keepalive rule
+# (module.compute's server_nhp_udp_vpc). ACs send NHP_KPL straight to their
+# assigned servers' private IPs rather than through the NLB, so this rule is
+# what keeps the fleet able to reach the servers it was assigned; without it
+# every keepalive times out and the periodic NLB re-registration loop never
+# fires. Pinned here for the same reason as SANDBOX_PROOF_SOURCE_CIDR above --
+# validate_structural reads a pre-collected snapshot that carries SG vpc_ids
+# but no VPC CIDRs, and re-homing both pins to remote-state output is the same
+# tracked follow-up.
+SANDBOX_MAIN_VPC_CIDR = "10.100.0.0/16"
 SANDBOX_AC_EIP_COUNT = 7
 SANDBOX_AC_EIP_POOL = "layerv-nhp-sandbox-ac"
 
@@ -3004,6 +3014,18 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                     "to": RELAY_SERVER_UDP_PORT,
                     "source_type": "security_group",
                     "source": nlb_id,
+                }
+            )
+            # In-VPC AC keepalive path (server_nhp_udp_vpc). Fencing the public
+            # edge zeroes server_nhp_udp, whose 0.0.0.0/0 source was also the
+            # only rule admitting in-VPC AC traffic, so this replaces it.
+            expected_server_nhp_rules.append(
+                {
+                    "protocol": "udp",
+                    "from": RELAY_SERVER_UDP_PORT,
+                    "to": RELAY_SERVER_UDP_PORT,
+                    "source_type": "cidr_ipv4",
+                    "source": SANDBOX_MAIN_VPC_CIDR,
                 }
             )
             nlb_group = by_id.get(nlb_id, {})
