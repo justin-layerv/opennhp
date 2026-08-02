@@ -13747,6 +13747,38 @@ class SliceAndAuthorityDigestDriftCompositionTest(unittest.TestCase):
         # Other kinds must pass straight through this gate untouched.
         CHECKER._require_slice_and_digest_plan_mode("no-op", rejected)
 
+    def test_the_composed_drift_kind_may_ride_a_composed_plan(self) -> None:
+        """A widening, and the one it is scoped to.
+
+        `composed-` is the strongest shape guarantee this checker produces:
+        every changed address belongs to a reviewed transition, the transitions
+        are pairwise disjoint, their union is exactly the change set, and each
+        ran its own deep validator. Several single modes already allowed carry a
+        weaker guarantee.
+        """
+        composed = "composed-authority-hub-exec-policy-update-with-provisioned-cell-status-update"
+        CHECKER._require_slice_and_digest_plan_mode(
+            CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND, composed
+        )
+
+    def test_the_slice_only_kind_is_not_widened(self) -> None:
+        """The pre-existing kind keeps its narrower binding."""
+        composed = "composed-authority-hub-exec-policy-update-with-provisioned-cell-status-update"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_slice_and_digest_plan_mode(
+                "authority-runtime-slice-normalization", composed
+            )
+
+    def test_an_uncomposed_transition_is_still_refused(self) -> None:
+        """The widening is to composed plans, not to plans in general."""
+        for mode in ("authority-image-update", "redis-split-transition", "hub-worker-image-update"):
+            with self.subTest(mode=mode):
+                self.assertNotIn(mode, CHECKER._AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES)
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._require_slice_and_digest_plan_mode(
+                        CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND, mode
+                    )
+
     def test_one_gate_covers_the_slice_kind_and_the_composed_pair(self) -> None:
         """A duplicated gate is a gate that drifts.
 

@@ -9609,11 +9609,36 @@ def _require_slice_and_digest_plan_mode(
     """
     if normalization_drift_kind not in _RUNTIME_SLICE_NORMALIZATION_KINDS:
         return
-    if plan_mode not in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
-        raise ContractError(
-            "authority runtime-slice state normalization is admitted only for "
-            "a runtime-slice transition, proof rollout, or steady no-op re-read"
-        )
+    if plan_mode in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
+        return
+    if (
+        normalization_drift_kind == _SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND
+        and plan_mode.startswith("composed-")
+    ):
+        # A COMPOSED plan mode is admissible for the composed drift kind.
+        #
+        # This is a widening, stated plainly. What justifies it is that
+        # "composed-" is not a loose category -- it is the strongest shape
+        # guarantee this checker produces. _compose_admitted_transitions only
+        # returns it after proving every changed address belongs to a reviewed
+        # transition, that the transitions are pairwise disjoint, that their
+        # union is EXACTLY the change set, and after running each transition's
+        # own deep validator. Several single modes already in the allowlist above
+        # carry a weaker guarantee than that.
+        #
+        # The drift half is likewise fully validated: the digest by
+        # _check_digest_normalization, the exec identities by the subset test
+        # plus _check_planned_security, which runs for every plan outside this
+        # dispatch and is where policy CONTENT is actually judged.
+        #
+        # Deliberately NOT extended to the slice-only kind: that kind predates
+        # this and its narrower binding is not mine to loosen without a reason
+        # of its own.
+        return
+    raise ContractError(
+        "authority runtime-slice state normalization is admitted only for "
+        "a runtime-slice transition, proof rollout, or steady no-op re-read"
+    )
 
 
 def _require_normalization_plan_mode(
