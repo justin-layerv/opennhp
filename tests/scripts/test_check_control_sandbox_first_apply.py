@@ -13244,6 +13244,149 @@ class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
             CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
 
 
+class HubWorkerServiceClaimTest(unittest.TestCase):
+    """A Hub image deploy is two addresses, so the lane must claim two.
+
+    An ECS task definition is immutable: a new image is delete+create, and the
+    service must then be updated to point at the new revision. The lane claimed
+    only the task definition, so the service was left unclaimed -- and since
+    composition requires the union of claims to equal the changed set exactly,
+    ONE unclaimed address refuses the whole plan. No composite plan containing a
+    Hub deploy could ever be admitted.
+    """
+
+    TD = CHECKER.HUB_WORKER_TASK_DEFINITION_ADDRESS
+    SVC = CHECKER.HUB_WORKER_SERVICE_ADDRESS
+
+    def claim(self, actual):
+        by = {
+            address: {
+                "address": address,
+                "change": {"actions": actions, "before": {}, "after": {}},
+            }
+            for address, actions in actual.items()
+        }
+        return CHECKER._claim_hub_worker_image_update(set(actual), actual, by)
+
+    def test_a_deploy_claims_the_task_definition_and_the_service(self) -> None:
+        self.assertEqual(
+            self.claim({self.TD: ["create", "delete"], self.SVC: ["update"]}),
+            frozenset({self.TD, self.SVC}),
+        )
+
+    def test_a_lone_service_update_is_never_claimed(self) -> None:
+        """The service rides along with a replacement or not at all.
+
+        Otherwise this lane becomes a route for editing the Hub service --
+        desired count, role, network -- with no immutable replacement forcing
+        the deeper validation.
+        """
+        self.assertIsNone(self.claim({self.SVC: ["update"]}))
+
+    def test_a_task_definition_replacement_alone_still_claims(self) -> None:
+        """Terraform can plan the revision without the service following yet."""
+        self.assertEqual(
+            self.claim({self.TD: ["create", "delete"]}), frozenset({self.TD})
+        )
+
+    def test_a_destructive_service_change_is_left_unclaimed(self) -> None:
+        """Only an in-place update rides along; a delete must fail closed.
+
+        Leaving it unclaimed is the fail-closed outcome: the union check then
+        refuses the composite rather than admitting a service teardown.
+        """
+        claimed = self.claim({self.TD: ["create", "delete"], self.SVC: ["delete"]})
+        self.assertEqual(claimed, frozenset({self.TD}))
+        self.assertNotIn(self.SVC, claimed)
+
+    def test_a_non_replacement_task_definition_claims_nothing(self) -> None:
+        self.assertIsNone(self.claim({self.TD: ["update"], self.SVC: ["update"]}))
+
+    def test_claiming_the_service_also_validates_it(self) -> None:
+        """Claiming without validating would be widening, not fixing."""
+        calls = []
+
+        def spy(by_address, *, require_planned_target=False):
+            calls.append(require_planned_target)
+
+        with mock.patch.object(
+            CHECKER, "_check_hub_worker_image_update", lambda by: None
+        ), mock.patch.object(
+            CHECKER, "_check_hub_service_task_revision_update", spy
+        ):
+            CHECKER._validate_hub_worker_image_update(
+                frozenset({self.TD, self.SVC}), {}, {}
+            )
+        self.assertEqual(
+            calls,
+            [True],
+            "the service slice must be validated, and bound to the revision "
+            "this same plan creates",
+        )
+
+    def test_the_real_service_validator_runs_end_to_end(self) -> None:
+        """Drive the REAL collaborator, not a spy.
+
+        Every other validation test here mocks
+        `_check_hub_service_task_revision_update`, so they assert the
+        interaction and never exercise the real call. A signature or
+        planned-target-resolution mismatch would keep the unit suite green and
+        fail only in CI against a live hub-deploy plan. Only
+        `_check_hub_worker_image_update` stays stubbed -- its field contract
+        needs a full task-definition fixture and is covered on its own.
+        """
+        new_arn = "arn:aws:ecs:us-east-2:767397897469:task-definition/hub:4"
+        by_address = {
+            self.TD: {
+                "address": self.TD,
+                "change": {"actions": ["create", "delete"], "after": {"arn": new_arn}},
+            },
+            self.SVC: {
+                "address": self.SVC,
+                "change": {
+                    "actions": ["update"],
+                    "before": {"task_definition": "…/hub:3", "desired_count": 2},
+                    "after": {"task_definition": new_arn, "desired_count": 2},
+                },
+            },
+        }
+        with mock.patch.object(
+            CHECKER, "_check_hub_worker_image_update", lambda by: None
+        ):
+            CHECKER._validate_hub_worker_image_update(
+                frozenset({self.TD, self.SVC}), by_address, {}
+            )
+
+            # A service pointed at some OTHER revision must be refused by the
+            # real check -- this is the "revision this same plan creates" bind.
+            by_address[self.SVC]["change"]["after"]["task_definition"] = "…/hub:9"
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._validate_hub_worker_image_update(
+                    frozenset({self.TD, self.SVC}), by_address, {}
+                )
+
+            # A second field moving alongside the revision must also be refused.
+            by_address[self.SVC]["change"]["after"]["task_definition"] = new_arn
+            by_address[self.SVC]["change"]["after"]["desired_count"] = 5
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._validate_hub_worker_image_update(
+                    frozenset({self.TD, self.SVC}), by_address, {}
+                )
+
+    def test_the_service_validator_is_not_run_when_unclaimed(self) -> None:
+        """A task-definition-only slice has no service to validate."""
+        calls = []
+        with mock.patch.object(
+            CHECKER, "_check_hub_worker_image_update", lambda by: None
+        ), mock.patch.object(
+            CHECKER,
+            "_check_hub_service_task_revision_update",
+            lambda by, **kw: calls.append(kw),
+        ):
+            CHECKER._validate_hub_worker_image_update(frozenset({self.TD}), {}, {})
+        self.assertEqual(calls, [])
+
+
 class ExecPolicyLanePrecedenceTest(unittest.TestCase):
     """The exec-policy lane must stand down when staging claims the same rows.
 

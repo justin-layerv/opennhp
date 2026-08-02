@@ -8110,13 +8110,37 @@ HUB_WORKER_TASK_DEFINITION_COMPUTED = frozenset(
 def _claim_hub_worker_image_update(
     changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
 ) -> frozenset[str] | None:
-    """Claim the Hub worker task definition when it is a pure replacement."""
+    """Claim the Hub worker task definition, and the service that follows it.
+
+    An ECS task definition is immutable, so a new Hub image is delete+create --
+    and the service must then be updated to point at the new revision. A Hub
+    image deploy therefore ALWAYS carries both addresses.
+
+    This lane used to claim only the task definition, which left the service
+    unclaimed. Composition requires the union of claims to equal the changed set
+    exactly, so a single unclaimed address refuses the whole plan: no COMPOSITE
+    plan containing a Hub deploy could ever be admitted, no matter how ordinary
+    the other slice was. Verified against the live registry -- three lanes fired
+    and `module.control.aws_ecs_service.hub[0]` was claimed by none of them.
+
+    The service is claimed only ALONGSIDE the immutable replacement, never on its
+    own: the task-definition guard above returns early first, so this cannot
+    become a route for a lone service edit. `_check_hub_service_task_revision_update`
+    then pins every service field except `task_definition` and binds that to the
+    revision this same plan creates -- the identical pairing the proof-rollout
+    lane already uses.
+    """
     address = HUB_WORKER_TASK_DEFINITION_ADDRESS
     if address not in changed:
         return None
     if sorted(actual_non_noop.get(address) or ()) != ["create", "delete"]:
         return None
-    return frozenset({address})
+    claimed = {address}
+    if HUB_WORKER_SERVICE_ADDRESS in changed and (
+        actual_non_noop.get(HUB_WORKER_SERVICE_ADDRESS) or ()
+    ) == ["update"]:
+        claimed.add(HUB_WORKER_SERVICE_ADDRESS)
+    return frozenset(claimed)
 
 
 def _check_hub_service_task_revision_update(
@@ -8491,6 +8515,15 @@ def _validate_hub_worker_image_update(
     claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
 ) -> None:
     _check_hub_worker_image_update(by_address)
+    if HUB_WORKER_SERVICE_ADDRESS in claimed:
+        # Claiming the service without validating it would be widening. This
+        # pins every service field except task_definition and requires that one
+        # to be the revision THIS plan creates, so the slice admits a deploy and
+        # nothing else -- not a role change, not a desired-count change, and not
+        # a jump to some other revision.
+        _check_hub_service_task_revision_update(
+            by_address, require_planned_target=True
+        )
 
 
 def _validate_authority_proof_enable(
