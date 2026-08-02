@@ -9559,6 +9559,25 @@ def _check_authority_proof_prepare_recovery_drift(
             )
 
 
+# Every Authority exec IDENTITY -- the role and its inline policy, for all
+# thirteen functions including the two proof ones (ca-pcr, ca-pm).
+#
+# AUTHORITY_RUNTIME_RESOURCES covers only the ELEVEN runtime functions, so the
+# two proof functions' exec role and policy sit outside the runtime slice. Their
+# drift therefore broke the slice subset test even though it is the same benign
+# re-projection as the other eleven. That was 4 of the 27 entries that blocked
+# every Control plan.
+#
+# Scoped to exec identities, deliberately NOT to AUTHORITY_PROOF_RESOURCES: that
+# set has 33 members, and admitting drift across all of them on membership alone
+# would be a widening. Policy CONTENT is validated for every plan by
+# _check_planned_security, outside this dispatch.
+_AUTHORITY_EXEC_IDENTITY_ADDRESSES = AUTHORITY_EXEC_POLICY_ADDRESSES | frozenset(
+    f'module.control.aws_iam_role.authority_exec["{_fn}"]'
+    for _fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+)
+
+
 _RUNTIME_SLICE_NORMALIZATION_KINDS = frozenset(
     {
         "authority-runtime-slice-normalization",
@@ -9733,6 +9752,7 @@ def _check_state_normalization_drift(
         <= (
             set(AUTHORITY_RUNTIME_RESOURCES)
             | AUTHORITY_RUNTIME_OPENED_ADDRESSES
+            | _AUTHORITY_EXEC_IDENTITY_ADDRESSES
             | {_AUTHORITY_DIGEST_ADDRESS}
         )
     ):

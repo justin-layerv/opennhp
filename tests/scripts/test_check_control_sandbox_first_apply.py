@@ -13618,6 +13618,80 @@ class SliceAndAuthorityDigestDriftCompositionTest(unittest.TestCase):
              mock.patch.object(CHECKER, "_drift_is_first_projection_only", lambda item: False):
             return CHECKER._check_state_normalization_drift(drift, {}, refresh_only=True)
 
+    def test_the_real_sandbox_shape_is_admitted(self) -> None:
+        """The exact 27-entry drift that blocked every Control plan.
+
+        22 runtime-slice + 4 proof-function exec identities + 1 digest.
+        AUTHORITY_RUNTIME_RESOURCES covers only the ELEVEN runtime functions, so
+        the two proof functions (ca-pcr, ca-pm) sit outside the slice and their
+        exec role and policy broke the subset test -- even though their drift is
+        the same benign re-projection as the other eleven.
+
+        Built from the constants rather than a literal list, so it keeps
+        describing reality if the function set changes.
+        """
+        drift = []
+        for function in sorted(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF):
+            for template in (
+                'module.control.aws_iam_role.authority_exec["{}"]',
+                'module.control.aws_iam_role_policy.authority_exec["{}"]',
+            ):
+                drift.append(self.entry(template.format(function)))
+        drift.append(self.entry(CHECKER._AUTHORITY_DIGEST_ADDRESS))
+        self.assertEqual(len(drift), 27)
+        with mock.patch.object(
+            CHECKER, "_check_digest_normalization", lambda *a, **k: None
+        ), mock.patch.object(
+            CHECKER, "_drift_is_first_projection_only", lambda item: False
+        ):
+            self.assertEqual(
+                CHECKER._check_state_normalization_drift(drift, {}, refresh_only=False),
+                CHECKER._SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND,
+            )
+
+    def test_the_extension_is_exec_identities_not_all_proof_resources(self) -> None:
+        """Scope guard: admitting all 33 proof resources would be a widening.
+
+        Only the exec role and its inline policy are added, because policy
+        CONTENT is validated for every plan by _check_planned_security outside
+        this dispatch. A proof lambda, alias or concurrency config drifting is
+        not covered by that and must keep failing closed.
+        """
+        self.assertTrue(
+            CHECKER._AUTHORITY_EXEC_IDENTITY_ADDRESSES
+            < set(CHECKER.AUTHORITY_PROOF_RESOURCES)
+            | set(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+            "exec identities must be a strict subset, never the whole proof set",
+        )
+        for address in sorted(CHECKER._AUTHORITY_EXEC_IDENTITY_ADDRESSES):
+            with self.subTest(address=address):
+                self.assertRegex(
+                    address,
+                    r"^module\.control\.aws_iam_role(_policy)?\.authority_exec\[",
+                )
+        # A proof resource that is NOT an exec identity must still fail closed.
+        other = sorted(
+            set(CHECKER.AUTHORITY_PROOF_RESOURCES)
+            - CHECKER._AUTHORITY_EXEC_IDENTITY_ADDRESSES
+            - set(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
+        )
+        self.assertTrue(other, "fixture assumption: proof set has non-exec members")
+        with mock.patch.object(
+            CHECKER, "_check_digest_normalization", lambda *a, **k: None
+        ), mock.patch.object(
+            CHECKER, "_drift_is_first_projection_only", lambda item: False
+        ):
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER._check_state_normalization_drift(
+                    [
+                        self.entry(sorted(CHECKER._AUTHORITY_EXEC_IDENTITY_ADDRESSES)[0]),
+                        self.entry(CHECKER._AUTHORITY_DIGEST_ADDRESS),
+                        self.entry(other[0]),
+                    ],
+                    {},
+                    refresh_only=False,
+                )
+
     def test_the_pair_composes(self) -> None:
         self.assertEqual(
             self.compose([self.SLICE, self.DIGEST]),
