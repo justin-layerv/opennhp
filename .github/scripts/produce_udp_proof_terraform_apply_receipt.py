@@ -37,8 +37,14 @@ def _read_bounded(path: Path, name: str) -> bytes:
     return raw
 
 
+# The HTTP bootstrap ALB is a whole MODULE, not a single retirement artifact.
+# Ordinary work legitimately deletes resources inside it, so on its own it does
+# not identify the retirement apply -- see the scope note in build_receipt.
+BOOTSTRAP_ALB = "module.nhp.module.bootstrap_alb[0]"
+
+
 def _logical_retirement_address(address: str) -> str | None:
-    bootstrap = "module.nhp.module.bootstrap_alb[0]"
+    bootstrap = BOOTSTRAP_ALB
     if address.startswith(f"{bootstrap}."):
         return bootstrap
     for expected in orchestrator.TERRAFORM_RETIREMENT_RESOURCES:
@@ -147,7 +153,24 @@ def build_receipt(
     # This producer runs on every sandbox apply, but only governs the exact
     # one-time UDP retirement. A plan with no retirement resource in it is out
     # of scope entirely.
-    if not any(logical is not None for _, _, logical in deletions):
+    #
+    # bootstrap_alb alone does NOT put a plan in scope. It is a whole module,
+    # and ordinary work legitimately deletes resources inside it: #3657 ("let CI
+    # empty the sandbox bootstrap-ALB buckets") deleted one, which scoped the
+    # plan in, found the other 24 retirement artifacts absent because they are
+    # still live, and turned Build and Deploy NHP red on main for a change that
+    # had nothing to do with the retirement.
+    #
+    # The other 24 addresses are HTTP-agent retirement artifacts -- the OTP
+    # pepper, its preconditions, the agent register/bootstrap metric filters and
+    # alarms. Nothing but the retirement deletes them, so they, and not the
+    # shared module, are what identifies the retirement apply. Once one of them
+    # appears the full all-or-nothing set is still required, so a genuinely
+    # partial retirement is still refused.
+    if not any(
+        logical is not None and logical != BOOTSTRAP_ALB
+        for _, _, logical in deletions
+    ):
         return None
 
     approved: set[str] = set()
