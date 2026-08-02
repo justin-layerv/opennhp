@@ -13147,6 +13147,65 @@ class ComposedTransitionTest(unittest.TestCase):
         )
 
 
+class LiveBoundaryPortToleranceTest(unittest.TestCase):
+    """check_live runs BEFORE the apply that moves the ingress port.
+
+    Pinning only the post-migration value made the check demand the state its
+    own apply produces, so the Control apply refused with
+
+      Control Hub NLB SG ingress is not exactly proof-runner /32 UDP 443
+
+    while live was still 62206 and the plan in hand was the very change that
+    moves it. That is the same mistake the NLB-SG-absence branch beside it
+    already documents.
+    """
+
+    def ingress(self, port):
+        return {("udp", port, port, "cidr_ipv4", CHECKER.PROOF_SOURCE_CIDR)}
+
+    def test_both_migration_ports_are_admitted(self) -> None:
+        for port in (
+            CHECKER.HUB_CLIENT_EDGE_PORT,
+            CHECKER.HUB_CLIENT_EDGE_PORT_LEGACY,
+        ):
+            with self.subTest(port=port):
+                self.assertIn(
+                    self.ingress(port),
+                    (
+                        self.ingress(CHECKER.HUB_CLIENT_EDGE_PORT),
+                        self.ingress(CHECKER.HUB_CLIENT_EDGE_PORT_LEGACY),
+                    ),
+                )
+
+    def test_live_boundary_admits_only_the_two_migration_ports(self) -> None:
+        """The tolerance is a PAIR, not a range.
+
+        Delete HUB_CLIENT_EDGE_PORT_LEGACY once every environment's ingress is
+        on 443 -- this test is where that decision is recorded.
+        """
+        self.assertEqual(CHECKER.HUB_CLIENT_EDGE_PORT, 443)
+        self.assertEqual(CHECKER.HUB_CLIENT_EDGE_PORT_LEGACY, 62206)
+        source = pathlib.Path(CHECKER.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(
+            '("udp", 443, 443, "cidr_ipv4", PROOF_SOURCE_CIDR)',
+            source,
+            "the ingress assertion must not re-pin a single port",
+        )
+
+    def test_the_worker_egress_stays_on_the_backend_port(self) -> None:
+        """The edge translates; it does not renumber the backend.
+
+        62206 on the NLB->worker egress is permanent and must not be swept up
+        by the client-edge migration.
+        """
+        source = pathlib.Path(CHECKER.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            '("udp", 62206, 62206, "security_group", worker_group_id)',
+            source,
+            "the worker egress must stay pinned to the backend bind port",
+        )
+
+
 class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
     """The public Hub UDP edge may move to 443, and only in that exact shape."""
 

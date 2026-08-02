@@ -8233,6 +8233,22 @@ def _claim_provisioned_cell_status_update(changed, actual_non_noop, by_address):
             return None
     return frozenset(claimed)
 
+# The public Hub UDP client edge, before and after nhp#3649.
+#
+# check_live runs BEFORE the apply that moves the ingress rule, so it must admit
+# the pre-migration port too. Pinning only the post value made the check demand
+# the state its own apply produces -- the identical mistake the NLB-SG-absence
+# branch below already documents ("Requiring a singular SG here demanded the
+# post-apply state and so rejected the exact state this check gates").
+#
+# The EGRESS to the worker is deliberately NOT part of this pair and stays 62206
+# permanently: the edge translates, it does not renumber the backend.
+#
+# Remove HUB_CLIENT_EDGE_PORT_LEGACY once every environment's ingress is on 443;
+# test_live_boundary_admits_only_the_two_migration_ports pins that decision.
+HUB_CLIENT_EDGE_PORT = 443
+HUB_CLIENT_EDGE_PORT_LEGACY = 62206
+
 HUB_CLIENT_EDGE_PORT_ADDRESSES = frozenset(
     {
         "module.control.aws_lb_listener.hub[0]",
@@ -14343,11 +14359,29 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             raise ContractError(
                 "Control Hub NLB does not attach exactly the reviewed NLB SG"
             )
-        if normalized_permissions(nlb_group, "IpPermissions") != {
-            ("udp", 443, 443, "cidr_ipv4", PROOF_SOURCE_CIDR)
-        }:
+        if normalized_permissions(nlb_group, "IpPermissions") not in (
+            {
+                (
+                    "udp",
+                    HUB_CLIENT_EDGE_PORT,
+                    HUB_CLIENT_EDGE_PORT,
+                    "cidr_ipv4",
+                    PROOF_SOURCE_CIDR,
+                )
+            },
+            {
+                (
+                    "udp",
+                    HUB_CLIENT_EDGE_PORT_LEGACY,
+                    HUB_CLIENT_EDGE_PORT_LEGACY,
+                    "cidr_ipv4",
+                    PROOF_SOURCE_CIDR,
+                )
+            },
+        ):
             raise ContractError(
-                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP 443"
+                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP "
+                f"{HUB_CLIENT_EDGE_PORT} or {HUB_CLIENT_EDGE_PORT_LEGACY}"
             )
         if hub_worker_groups:
             if len(hub_worker_groups) != 1:
