@@ -69,7 +69,7 @@ def edge_identity(name: str, target_id: str) -> dict[str, object]:
         "layerv-nhp-sandbox-cell1-edge": (
             "layerv-nhp-sandbox-cell1-sg-nlb",
             "layerv-nhp-sandbox-cell1-sg-server",
-            [],
+            ["10.104.0.0/16"],
             ["10.104.0.0/16"],
         ),
     }

@@ -128,7 +128,11 @@ PROTECTED_EDGE_IDENTITIES = {
             "layerv-nhp-sandbox-cell1-sg-nlb"
         ),
         "backend_security_group_name": "layerv-nhp-sandbox-cell1-sg-server",
-        "backend_udp_cidrs": (),
+        # In-VPC AC keepalive path, same rule as cell0 above: server_nhp_udp_vpc
+        # lives in the shared compute module, so every fenced cell gets it bound
+        # to that cell's own vpc_cidr. cell1 has no relay DMZ peer, so this is
+        # its only backend UDP CIDR source.
+        "backend_udp_cidrs": ("10.104.0.0/16",),
         "backend_health_cidrs": ("10.104.0.0/16",),
     },
 }
