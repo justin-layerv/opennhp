@@ -3307,7 +3307,18 @@ jobs:
           script="$(aws s3 cp "s3://layerv-nhp-sandbox-cell1-plugins/scripts/server-init.sh" -)"
           missing=0
           for key in AGENT_OTP_REGISTRATION_ENABLED QURL_V2_ADMISSION_ENABLED; do
-            if ! printf '%s' "${script}" | grep -q "^${key}="; then
+            # A HERESTRING, not a pipe. `printf ... | grep -q` is a false
+            # negative on a large input: grep -q exits at the first match, the
+            # write end gets EPIPE, and under `set -o pipefail` the pipeline
+            # takes printf's failure -- so a flag that IS present reports
+            # missing. This object is 69 KB, so it reproduced every time and
+            # blocked the cell1 deploy on a perfectly healthy cell:
+            #
+            #   printf: write error: Broken pipe
+            #   ::error::cell1 server-init.sh is missing AGENT_OTP_REGISTRATION_ENABLED
+            #
+            # while the live object had carried both flags, unchanged, for hours.
+            if ! grep -q "^${key}=" <<<"${script}"; then
               echo "::error::cell1 server-init.sh is missing ${key}; agents assigned to cell1 cannot enroll"
               missing=1
             fi

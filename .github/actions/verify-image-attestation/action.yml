@@ -210,7 +210,7 @@ runs:
           if [[ -n "$DIGEST" ]]; then break; fi
           # A genuinely-absent tag/repo is a verdict, not a transient blip — stop
           # retrying; the classifier below fails it CLOSED under enforce.
-          if printf '%s' "$DESCRIBE_OUT" | grep -qiE "$ABSENT_RE"; then break; fi
+          if grep -qiE "$ABSENT_RE" <<<"$DESCRIBE_OUT"; then break; fi
           if [[ "$attempt" -lt 3 ]]; then
             echo "::notice::verify-image-attestation: describe attempt ${attempt}/3 failed; retrying in $(( attempt * 3 ))s" >&2
             sleep "$(( attempt * 3 ))"
@@ -231,11 +231,11 @@ runs:
           # the tag — so "no image to verify" (#1334) fails closed regardless. Only
           # THEN fail OPEN on a recognized transient/permission signal; anything
           # else fails CLOSED. Inert under audit (every fail_* path exits 0).
-          if printf '%s' "$DESCRIBE_OUT" | grep -qiE "$ABSENT_RE"; then
+          if grep -qiE "$ABSENT_RE" <<<"$DESCRIBE_OUT"; then
             fail_verdict "no image to verify for ${REPOSITORY}:${IMAGE_TAG} (absent tag/repo): ${DESCRIBE_OUT}"
           fi
           SCRUBBED_OUT="${DESCRIBE_OUT//"$IMAGE_TAG"/<image-tag>}"
-          if printf '%s' "$SCRUBBED_OUT" | grep -qiE "$INFRA_RE"; then
+          if grep -qiE "$INFRA_RE" <<<"$SCRUBBED_OUT"; then
             fail_infra "could not resolve digest for ${REPOSITORY}:${IMAGE_TAG} (transient AWS/permission error): ${DESCRIBE_OUT}"
           fi
           fail_verdict "no image to verify for ${REPOSITORY}:${IMAGE_TAG} (unrecognized describe error): ${DESCRIBE_OUT}"
@@ -308,7 +308,7 @@ runs:
         # inputs (repo/tag), never attacker-controlled attestation identity.
         # Inert under audit (every fail_* path exits 0).
         GH_ERR="$(printf '%s\n' "$VOUT" | grep -iE '^[[:space:]]*Error:' || true)"
-        if printf '%s' "$GH_ERR" | grep -qiE "$INFRA_RE"; then
+        if grep -qiE "$INFRA_RE" <<<"$GH_ERR"; then
           fail_infra "could not complete attestation verify for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST}) — transient/permission error (see output above)"
         fi
         fail_verdict "no valid SLSA provenance from ${GH_REPO}/${SIGNER_WORKFLOW}@main for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST}) — unattested, or signed by a different workflow/ref"
