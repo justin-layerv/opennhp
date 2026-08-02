@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import hashlib
 import io
 import sys
@@ -88,11 +89,31 @@ class SavedPlanReceiptTest(unittest.TestCase):
         )
 
     def test_partial_retirement_deletion_fails_closed(self) -> None:
+        """A dropped resource that still EXISTS is drift, not a resumption.
+
+        prior_state lists every governed address, so the one missing from the
+        plan is provably still alive — the case the drift check is for. The
+        resumption path (missing because already destroyed) is covered by
+        test_resumed_retirement_accepts_the_remainder.
+        """
+        prior = {
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {"address": address}
+                        for address in orchestrator.TERRAFORM_RETIREMENT_RESOURCES
+                    ]
+                }
+            }
+        }
         with self.assertRaisesRegex(
             producer.TerraformApplyReceiptError, "deletion set drift"
         ):
             producer.build_receipt(
-                {"resource_changes": exact_retirement_changes()[:-1]},
+                {
+                    "resource_changes": exact_retirement_changes()[:-1],
+                    "prior_state": prior,
+                },
                 saved_plan_sha256=PLAN_SHA256,
                 run_id=RUN_ID,
                 run_attempt=RUN_ATTEMPT,
@@ -173,6 +194,87 @@ class SavedPlanReceiptTest(unittest.TestCase):
                     "aws_ecs_task_definition.qurl",
                     receipt["approved_deletions"],
                 )
+
+    def _prior_state(self, addresses):
+        return {
+            "values": {
+                "root_module": {
+                    "resources": [{"address": a} for a in addresses]
+                }
+            }
+        }
+
+    def test_resumed_retirement_accepts_the_remainder(self) -> None:
+        """A retirement may span applies; the remainder plan is still valid.
+
+        The real sandbox apply destroyed 41 of 43 resources and then failed
+        emptying the versioned access-log bucket on a missing IAM verb. The
+        remainder plan legitimately contained only what was left, and requiring
+        the whole set every time made the retirement unfinishable.
+        """
+        bootstrap = "module.nhp.module.bootstrap_alb[0]"
+        remainder = [
+            change(f"{bootstrap}.aws_s3_bucket.alb_access_logs", ["delete"])
+        ]
+        receipt = producer.build_receipt(
+            {
+                "resource_changes": remainder,
+                # Only the bootstrap module survives; everything else already went.
+                "prior_state": self._prior_state(
+                    [f"{bootstrap}.aws_s3_bucket.alb_access_logs"]
+                ),
+            },
+            saved_plan_sha256=PLAN_SHA256,
+            run_id=RUN_ID,
+            run_attempt=RUN_ATTEMPT,
+            head_sha=HEAD_SHA,
+        )
+        self.assertIsNotNone(receipt)
+        # The receipt still attests the canonical retirement set.
+        self.assertEqual(
+            receipt["approved_deletions"],
+            list(orchestrator.TERRAFORM_RETIREMENT_RESOURCES),
+        )
+
+    def test_missing_deletion_still_present_in_state_fails_closed(self) -> None:
+        """Absent from the plan but alive in state is drift, not resumption."""
+        bootstrap = "module.nhp.module.bootstrap_alb[0]"
+        survivor = "module.nhp.aws_secretsmanager_secret.agent_otp_pepper"
+        with self.assertRaisesRegex(
+            producer.TerraformApplyReceiptError, re.escape(survivor)
+        ):
+            producer.build_receipt(
+                {
+                    "resource_changes": [
+                        change(f"{bootstrap}.aws_s3_bucket.alb_access_logs", ["delete"])
+                    ],
+                    "prior_state": self._prior_state(
+                        [f"{bootstrap}.aws_s3_bucket.alb_access_logs", survivor]
+                    ),
+                },
+                saved_plan_sha256=PLAN_SHA256,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                head_sha=HEAD_SHA,
+            )
+
+    def test_partial_deletion_without_prior_state_fails_closed(self) -> None:
+        """No prior state cannot prove already-applied, so it must not pass."""
+        bootstrap = "module.nhp.module.bootstrap_alb[0]"
+        with self.assertRaisesRegex(
+            producer.TerraformApplyReceiptError, "omits prior state"
+        ):
+            producer.build_receipt(
+                {
+                    "resource_changes": [
+                        change(f"{bootstrap}.aws_s3_bucket.alb_access_logs", ["delete"])
+                    ]
+                },
+                saved_plan_sha256=PLAN_SHA256,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                head_sha=HEAD_SHA,
+            )
 
     def test_approved_target_replacement_fails_closed(self) -> None:
         changes = exact_retirement_changes()

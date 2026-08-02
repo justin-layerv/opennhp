@@ -49,6 +49,49 @@ def _logical_retirement_address(address: str) -> str | None:
     return None
 
 
+def _prior_state_addresses(plan_value: dict[str, Any]) -> "set[str] | None":
+    """Every resource address Terraform recorded as existing before this plan.
+
+    Returns None when the plan carries no prior state, so callers can fail
+    closed rather than read "no state" as "everything is already destroyed".
+    """
+    prior = plan_value.get("prior_state")
+    if not isinstance(prior, dict):
+        return None
+    values = prior.get("values")
+    if not isinstance(values, dict):
+        return None
+    root = values.get("root_module")
+    if not isinstance(root, dict):
+        return None
+
+    addresses: set[str] = set()
+
+    def walk(module: dict[str, Any]) -> None:
+        for resource in module.get("resources") or ():
+            if isinstance(resource, dict) and isinstance(
+                resource.get("address"), str
+            ):
+                addresses.add(resource["address"])
+        for child in module.get("child_modules") or ():
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(root)
+    return addresses
+
+
+def _retirement_address_present(expected: str, prior: "set[str]") -> bool:
+    """True when a governed retirement address still exists in prior state."""
+    prefix = f"{expected}."
+    for address in prior:
+        if address == expected or address.startswith(prefix):
+            return True
+        if re.fullmatch(rf"{re.escape(expected)}\[[^\]\r\n]+\]", address):
+            return True
+    return False
+
+
 def build_receipt(
     plan_value: Any,
     *,
@@ -125,12 +168,39 @@ def build_receipt(
             f"{sorted(unapproved_deletions)}"
         )
     expected = set(orchestrator.TERRAFORM_RETIREMENT_RESOURCES)
-    if approved != expected:
-        missing = sorted(expected - approved)
-        extra = sorted(approved - expected)
+    extra = sorted(approved - expected)
+    missing = sorted(expected - approved)
+    if extra:
         raise TerraformApplyReceiptError(
             f"retirement plan deletion set drift; missing={missing}, extra={extra}"
         )
+    if missing:
+        # The retirement can span more than one apply. The first sandbox apply
+        # destroyed 41 of 43 resources and then failed emptying the versioned
+        # access-log bucket on a missing IAM verb; the remainder plan legitimately
+        # contains only what is left. Requiring the WHOLE set in every plan made
+        # that remainder unappliable and the retirement unfinishable.
+        #
+        # A governed address may be absent from this plan only when it is also
+        # absent from prior state — already destroyed. Absent from the plan while
+        # still present in state is real drift and still fails closed. A plan with
+        # no prior state at all cannot prove either way, so it fails closed too.
+        prior = _prior_state_addresses(plan_value)
+        if prior is None:
+            raise TerraformApplyReceiptError(
+                "retirement plan omits prior state, so a partial deletion set "
+                f"cannot be proved already-applied; missing={missing}"
+            )
+        unfinished = sorted(
+            address
+            for address in missing
+            if _retirement_address_present(address, prior)
+        )
+        if unfinished:
+            raise TerraformApplyReceiptError(
+                "retirement plan deletion set drift; "
+                f"missing={unfinished}, extra=[]"
+            )
 
     receipt = {
         "schema_version": orchestrator.TERRAFORM_APPLY_RECEIPT_SCHEMA_VERSION,
