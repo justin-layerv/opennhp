@@ -3704,6 +3704,38 @@ resource "aws_iam_policy" "qurl_link_static" {
         ]
       },
       {
+        # bootstrap-alb bucket object cleanup, so `terraform` can empty the
+        # access-log and Athena buckets under `force_destroy = true` during the
+        # sandbox bootstrap-ALB retirement. Same shape and same reason as
+        # `S3QURLResolveLogsCleanup` above: the generic `bootstrap-alb-*`
+        # entry in the S3Buckets statement carries bucket-level verbs only, so
+        # force_destroy hits AccessDenied while emptying. Both *Versions verbs
+        # are required — force_destroy enumerates via ListObjectVersions and
+        # issues version-aware deletes even on a never-versioned bucket, and the
+        # access-log bucket IS versioned.
+        #
+        # Deliberately scoped to SANDBOX buckets. Production bootstrap forensics
+        # are irrecoverable and its module is not being retired, so CI must not
+        # be able to empty them — this mirrors in IAM the same protection
+        # `lifecycle { prevent_destroy = true }` gives in Terraform. A future
+        # production retirement should widen this in its own reviewed change,
+        # not inherit the grant from sandbox's.
+        Sid    = "S3BootstrapAlbSandboxCleanup"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:ListBucketVersions",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion"
+        ]
+        Resource = [
+          "arn:aws:s3:::bootstrap-alb-alb-logs-sandbox-*",
+          "arn:aws:s3:::bootstrap-alb-alb-logs-sandbox-*/*",
+          "arn:aws:s3:::bootstrap-alb-athena-sandbox-*",
+          "arn:aws:s3:::bootstrap-alb-athena-sandbox-*/*"
+        ]
+      },
+      {
         # ACM certificates for CloudFront must be in us-east-1
         Sid    = "ACMUsEast1"
         Effect = "Allow"

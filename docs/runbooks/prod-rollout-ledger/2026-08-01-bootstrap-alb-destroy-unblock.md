@@ -26,6 +26,12 @@ required, not optional.
       outside `module.nhp.module.bootstrap_alb` and its root-level companions
       (`terraform_data.bootstrap_alb_dns_preconditions`,
       `time_sleep.bootstrap_alb_iam_propagation`) should move.
+- [ ] Rollout: the CI apply role's `s3:DeleteObjectVersion` grant for these
+      buckets lands in the SAME apply as the destroy (both live in
+      `terraform/main.tf`), so IAM propagation can race it. If the apply fails
+      with `AccessDenied ... s3:DeleteObjectVersion` while emptying, simply
+      re-run the sandbox deploy — the grant is already in place by then. Do not
+      hand-empty the bucket to work around it.
 - [ ] Post-rollout: confirm the sandbox root plans clean, then re-run the
       Terraform Plan check on any PR blocked by this (e.g.
       [#3649](https://github.com/layervai/nhp/pull/3649)).
