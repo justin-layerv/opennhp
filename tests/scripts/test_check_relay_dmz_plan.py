@@ -3074,6 +3074,101 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             ),
         )
 
+    def _with_in_vpc_ac_rule(
+        self, plan: dict[str, Any], *, cidr_ref: str = "var.vpc_cidr"
+    ) -> dict[str, Any]:
+        """Add the in-VPC AC keepalive rule to a source-fenced plan."""
+        compute_config = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]["module_calls"]["compute"]["module"]
+        compute_config["resources"].append(
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "server_nhp_udp_vpc",
+                {
+                    "count": {
+                        "references": ["var.public_nhp_udp_ingress_cidrs"]
+                    },
+                    "from_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                    "ip_protocol": {"constant_value": "udp"},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.server.id",
+                            "aws_security_group.server",
+                        ]
+                    },
+                    "cidr_ipv4": {"references": [cidr_ref]},
+                    "to_port": {
+                        "constant_value": checker.EXPECTED_NHP_SERVER_PORT
+                    },
+                },
+            )
+        )
+        plan["resource_changes"].append(
+            {
+                "address": "module.nhp.module.compute."
+                "aws_vpc_security_group_ingress_rule.server_nhp_udp_vpc[0]",
+                "module_address": "module.nhp.module.compute",
+                "mode": "managed",
+                "type": "aws_vpc_security_group_ingress_rule",
+                "name": "server_nhp_udp_vpc",
+                "index": 0,
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "security_group_id": "sg-server",
+                        "referenced_security_group_id": None,
+                        "ip_protocol": "udp",
+                        "from_port": checker.EXPECTED_NHP_SERVER_PORT,
+                        "to_port": checker.EXPECTED_NHP_SERVER_PORT,
+                        "cidr_ipv4": "10.100.0.0/16",
+                    },
+                    "after_unknown": {},
+                },
+            }
+        )
+        return plan
+
+    def test_fenced_topology_admits_the_in_vpc_ac_rule_before_it_exists(
+        self,
+    ) -> None:
+        """The contract must admit the rule BEFORE the HCL can introduce it.
+
+        terraform-plan-pr.yml restores this checker from the merge-base, so the
+        compute PR that adds server_nhp_udp_vpc is graded by whatever is already
+        on main. If main's contract did not accept the rule, that PR could never
+        go green — the exact deadlock this transitional window exists to break.
+        Main's own shape (no rule yet) is covered by every other fenced test.
+        """
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                self._with_in_vpc_ac_rule(source_fenced_plan()),
+                require_udp_source_fenced_topology=True,
+            ),
+        )
+
+    def test_in_vpc_ac_rule_is_graded_exactly_once_present(self) -> None:
+        """Optional presence never means unreviewed shape.
+
+        The source must be the cell's own VPC CIDR; routing it through the
+        operator-supplied relay list would let an arbitrary CIDR reach the
+        servers on UDP 62206 under this rule's name.
+        """
+        self.assertNotEqual(
+            [],
+            checker.validate_plan(
+                self._with_in_vpc_ac_rule(
+                    source_fenced_plan(),
+                    cidr_ref="var.additional_nhp_udp_ingress_cidrs",
+                ),
+                require_udp_source_fenced_topology=True,
+            ),
+        )
+
     def test_source_fenced_topology_requires_explicit_unknown_sg_references(
         self,
     ) -> None:

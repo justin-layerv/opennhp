@@ -4944,6 +4944,20 @@ def validate_plan(
             )
             return str(protocol or "").lower() not in NON_UDP_PROTOCOLS
 
+        # In-VPC AC keepalive rule. ACs send NHP_KPL straight to their assigned
+        # servers' private IPs, never through the NLB, so fencing the public edge
+        # (which sets server_nhp_udp's count to 0) also removed the only rule
+        # admitting that traffic. server_nhp_udp_vpc restores it.
+        #
+        # OPTIONAL here on purpose, and only until the compute change lands.
+        # terraform-plan-pr.yml restores this checker from the merge-base, so a
+        # PR that adds the rule is graded by the checker already on main: the
+        # contract has to admit the rule BEFORE the HCL can introduce it, and it
+        # must keep admitting today's main (which does not have it yet) in the
+        # meantime. The compute PR flips both inventories and the counts below to
+        # require it exactly, closing this window in the same change that makes
+        # the rule real.
+        vpc_ac_rule = ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_vpc")
         expected_compute_udp_ingress_config = {
             ("aws_vpc_security_group_ingress_rule", "server_nhp_udp"),
             ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_additional"),
@@ -4958,7 +4972,10 @@ def validate_plan(
         }
         v.require(
             actual_compute_udp_ingress_config
-            == expected_compute_udp_ingress_config,
+            in (
+                expected_compute_udp_ingress_config,
+                expected_compute_udp_ingress_config | {vpc_ac_rule},
+            ),
             "assigned-cell compute authored UDP-capable ingress inventory must contain only the exact reviewed target and NLB rules",
         )
 
@@ -4978,7 +4995,11 @@ def validate_plan(
             and configured_udp_capable(configured)
         }
         v.require(
-            actual_server_udp_config == expected_server_udp_config,
+            actual_server_udp_config
+            in (
+                expected_server_udp_config,
+                expected_server_udp_config | {vpc_ac_rule},
+            ),
             "canonical server SG authored UDP-capable ingress inventory must be exactly legacy-disabled, relay, and NLB-scoped rules",
         )
 
@@ -5008,6 +5029,34 @@ def validate_plan(
             "canonical server SG relay UDP rule must bind only the reviewed relay source list on UDP 62206",
         )
 
+        # Reviewed as its own exact shape rather than folded into the relay list:
+        # the source is the cell's own vpc_cidr, not an operator-supplied list, so
+        # it must not become reachable through var.additional_nhp_udp_ingress_cidrs.
+        # Gated on presence only for the window described above -- once the rule
+        # exists it is graded exactly, so it can never be introduced unreviewed.
+        vpc_config = config_resource(
+            v,
+            compute_config,
+            "aws_vpc_security_group_ingress_rule",
+            "server_nhp_udp_vpc",
+        )
+        if vpc_config is not None:
+            vpc_expressions = vpc_config.get("expressions") or {}
+            v.require(
+                references_exact_resources(
+                    expression_refs(vpc_config, "security_group_id"),
+                    {"aws_security_group.server"},
+                )
+                and expression_refs(vpc_config, "cidr_ipv4") == {"var.vpc_cidr"}
+                and (vpc_expressions.get("ip_protocol") or {}).get("constant_value")
+                == "udp"
+                and (vpc_expressions.get("from_port") or {}).get("constant_value")
+                == EXPECTED_NHP_SERVER_PORT
+                and (vpc_expressions.get("to_port") or {}).get("constant_value")
+                == EXPECTED_NHP_SERVER_PORT,
+                "canonical server SG in-VPC AC rule must bind only the cell VPC CIDR on UDP 62206",
+            )
+
         server_udp_rules = [
             resource
             for resource in resources
@@ -5017,11 +5066,13 @@ def validate_plan(
         server_udp_counts = Counter(
             resource.name for resource in server_udp_rules
         )
+        planned_vpc_ac_rules = server_udp_counts["server_nhp_udp_vpc"]
         v.require(
-            len(server_udp_rules) == 4
+            planned_vpc_ac_rules <= 1
+            and len(server_udp_rules) == 4 + planned_vpc_ac_rules
             and server_udp_counts["server_nhp_udp_nlb"] == 1
             and server_udp_counts["server_nhp_udp_additional"] == 3,
-            "canonical server SG planned UDP-capable ingress must be exactly one NLB-scoped rule plus three relay /24 rules",
+            "canonical server SG planned UDP-capable ingress must be exactly one NLB-scoped rule, at most one in-VPC AC rule, and three relay /24 rules",
         )
         compute_addresses = {resource.address for resource in compute}
         unknown_external_sg_rules = [
@@ -5092,12 +5143,14 @@ def validate_plan(
         compute_udp_counts = Counter(
             resource.name for resource in compute_udp_rules
         )
+        compute_vpc_ac_rules = compute_udp_counts["server_nhp_udp_vpc"]
         v.require(
-            len(compute_udp_rules) == 5
+            compute_vpc_ac_rules <= 1
+            and len(compute_udp_rules) == 5 + compute_vpc_ac_rules
             and compute_udp_counts["server_nlb_udp"] == 1
             and compute_udp_counts["server_nhp_udp_nlb"] == 1
             and compute_udp_counts["server_nhp_udp_additional"] == 3,
-            "assigned-cell compute planned UDP-capable ingress inventory must contain only proof, NLB-scoped target, and relay rules",
+            "assigned-cell compute planned UDP-capable ingress inventory must contain only proof, NLB-scoped target, at most one in-VPC AC, and relay rules",
         )
 
         v.require(
