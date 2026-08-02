@@ -166,7 +166,26 @@ def build_receipt(
     # gone from state. That answers "is this the retirement resuming, or an
     # unrelated change?" with evidence instead of a heuristic.
     if not any(logical is not None for _, _, logical in deletions):
-        return None
+        # This is also the shape of every plan AFTER the retirement finishes:
+        # nothing governed left to delete. Returning None unconditionally made
+        # the receipt producible only while the retirement was still UNFINISHED,
+        # so the moment it completed, post_removal -- the phase whose entire
+        # premise is that the HTTP surface is gone -- lost its only input and
+        # became permanently unreachable. The receipt exists to certify that the
+        # retirement happened under governance; "it is provably complete" says
+        # that at least as strongly as "some of it is in this plan".
+        #
+        # Out of scope everywhere else, exactly as before: a plan with no prior
+        # state cannot prove absence, and any governed address still alive means
+        # this is an ordinary deploy with the retirement not yet done.
+        if not _retirement_is_complete(plan_value):
+            return None
+        return _receipt(
+            saved_plan_sha256=saved_plan_sha256,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            head_sha=head_sha,
+        )
 
     approved: set[str] = set()
     unapproved_deletions: list[str] = []
@@ -220,6 +239,37 @@ def build_receipt(
                 f"missing={unfinished}, extra=[]"
             )
 
+    return _receipt(
+        saved_plan_sha256=saved_plan_sha256,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        head_sha=head_sha,
+    )
+
+
+def _retirement_is_complete(plan_value: dict[str, Any]) -> bool:
+    """True when prior state proves every governed address is already gone.
+
+    Same evidence the resumption path above already trusts, read for the
+    opposite conclusion. No prior state cannot prove absence, so it is not
+    completion.
+    """
+    prior = _prior_state_addresses(plan_value)
+    if prior is None:
+        return False
+    return not any(
+        _retirement_address_present(address, prior)
+        for address in orchestrator.TERRAFORM_RETIREMENT_RESOURCES
+    )
+
+
+def _receipt(
+    *,
+    saved_plan_sha256: str,
+    run_id: int,
+    run_attempt: int,
+    head_sha: str,
+) -> dict[str, Any]:
     receipt = {
         "schema_version": orchestrator.TERRAFORM_APPLY_RECEIPT_SCHEMA_VERSION,
         "gate": orchestrator.GATE,

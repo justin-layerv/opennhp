@@ -250,6 +250,96 @@ class SavedPlanReceiptTest(unittest.TestCase):
             list(orchestrator.TERRAFORM_RETIREMENT_RESOURCES),
         )
 
+    def test_completed_retirement_still_emits_a_receipt(self) -> None:
+        """Once the retirement is done, no plan deletes anything governed again.
+
+        The producer used to return None for that shape, which meant the receipt
+        could only be produced while the retirement was UNFINISHED -- so finishing
+        it left post_removal with no obtainable input, forever. Prior state with
+        every governed address absent is the proof that it is complete.
+        """
+        receipt = producer.build_receipt(
+            {
+                "resource_changes": [
+                    change("module.nhp.aws_ecs_service.server", ["update"])
+                ],
+                "prior_state": self._prior_state(
+                    ["module.nhp.aws_ecs_service.server"]
+                ),
+            },
+            saved_plan_sha256=PLAN_SHA256,
+            run_id=RUN_ID,
+            run_attempt=RUN_ATTEMPT,
+            head_sha=HEAD_SHA,
+        )
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["phase"], "post_removal")
+        self.assertEqual(
+            receipt["approved_deletions"],
+            list(orchestrator.TERRAFORM_RETIREMENT_RESOURCES),
+        )
+
+    def test_completion_requires_prior_state(self) -> None:
+        """No prior state cannot prove absence, so it is not completion."""
+        self.assertIsNone(
+            producer.build_receipt(
+                {
+                    "resource_changes": [
+                        change("module.nhp.aws_ecs_service.server", ["update"])
+                    ]
+                },
+                saved_plan_sha256=PLAN_SHA256,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                head_sha=HEAD_SHA,
+            )
+        )
+
+    def test_any_surviving_governed_address_is_not_completion(self) -> None:
+        """One governed resource still alive means an ordinary, pre-retirement deploy.
+
+        Covered per address so a future addition to the governed set cannot be
+        silently certified as retired while it is still standing.
+        """
+        for address in orchestrator.TERRAFORM_RETIREMENT_RESOURCES:
+            with self.subTest(address=address):
+                self.assertIsNone(
+                    producer.build_receipt(
+                        {
+                            "resource_changes": [
+                                change(
+                                    "module.nhp.aws_ecs_service.server",
+                                    ["update"],
+                                )
+                            ],
+                            "prior_state": self._prior_state([address]),
+                        },
+                        saved_plan_sha256=PLAN_SHA256,
+                        run_id=RUN_ID,
+                        run_attempt=RUN_ATTEMPT,
+                        head_sha=HEAD_SHA,
+                    )
+                )
+
+    def test_a_surviving_bootstrap_alb_child_is_not_completion(self) -> None:
+        """The ALB is a module: a live child keeps the retirement unfinished."""
+        self.assertIsNone(
+            producer.build_receipt(
+                {
+                    "resource_changes": [
+                        change("module.nhp.aws_ecs_service.server", ["update"])
+                    ],
+                    "prior_state": self._prior_state(
+                        [f"{producer.BOOTSTRAP_ALB}.aws_s3_bucket.alb_access_logs"]
+                    ),
+                },
+                saved_plan_sha256=PLAN_SHA256,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                head_sha=HEAD_SHA,
+            )
+        )
+
     def test_missing_deletion_still_present_in_state_fails_closed(self) -> None:
         """Absent from the plan but alive in state is drift, not resumption."""
         bootstrap = "module.nhp.module.bootstrap_alb[0]"
