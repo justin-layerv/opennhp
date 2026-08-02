@@ -1280,6 +1280,48 @@ resource "aws_iam_role_policy" "qurl_agent_key_inventory" {
 #     managed policies, so this cannot be an 11th managed attachment.
 #
 # Scoped to instances under this environment's own services rather than "*".
+# The deploy role could not modify network ACL entries at all -- no attached
+# policy granted a single NetworkAcl action -- so moving the public UDP client
+# edge from 62206 to 443 failed mid-apply:
+#
+#   Error: updating EC2 Network ACL (acl-0b57c270c6ec7a018): deleting Entry:
+#   UnauthorizedOperation ... not authorized to perform: ec2:DeleteNetworkAclEntry
+#
+# A NACL entry is keyed by rule number, so terraform changes a port by deleting
+# and recreating the entry; without the delete verb the apply gets half way and
+# leaves the fleet on mixed ports.
+#
+# A NEW INLINE policy rather than an addition to an existing one: the role is at
+# the 10 attached-managed-policy limit, and the existing context-lookups policy
+# is a read-only lookup surface that must not grow write verbs.
+#
+# Scoped to network ACLs in this account and region. ReplaceNetworkAclEntry is
+# included because terraform uses it for an in-place rule-number-stable change;
+# CreateNetworkAcl/DeleteNetworkAcl are deliberately NOT granted -- this permits
+# editing the reviewed ACLs' rules, not creating or destroying the ACLs.
+resource "aws_iam_role_policy" "network_acl_entries" {
+  name = "network-acl-entries"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "NetworkAclEntryWrite"
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateNetworkAclEntry",
+          "ec2:DeleteNetworkAclEntry",
+          "ec2:ReplaceNetworkAclEntry",
+        ]
+        Resource = [
+          "arn:aws:ec2:${local.region}:${local.account_id}:network-acl/*",
+        ]
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "servicediscovery_instance_registration" {
   name = "servicediscovery-instance-registration"
   role = aws_iam_role.github_actions.id
