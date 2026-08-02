@@ -716,7 +716,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -749,7 +749,8 @@ jobs:
               exit 0
               ;;
           esac
-          if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' ]]; then
+          if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' \
+             || "$normalization_kind" == 'authority-runtime-slice-with-authority-digest' ]]; then
             # The runtime-slice completion's benign drift is a deterministic
             # re-read of ALREADY-APPLIED slice resources, not an externally
             # rolling value (unlike the digest kinds). A live refresh-only
@@ -762,6 +763,13 @@ jobs:
             # an unchanged state yields identical drift -- and check_plan already
             # bound the drift to the exact slice-confined set at plan time. So the
             # refresh-only re-observation is both impossible and redundant here.
+            #
+            # The -with-authority-digest variant is the UNION of this case and
+            # the provider-reprojection one above, and both rationales apply to
+            # it unchanged: the slice half cannot be re-observed at all, and the
+            # digest half is externally rolling, so re-observing it "is not a
+            # staleness guard, it is a coin flip". The staleness guard is the
+            # same immediately-before-apply state {serial, sha256} binding.
             exit 0
           fi
           terraform plan -refresh-only -input=false -lock-timeout=5m -no-color \
