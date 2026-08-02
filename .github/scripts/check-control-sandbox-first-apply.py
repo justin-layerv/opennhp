@@ -2824,6 +2824,10 @@ def _partition_first_projection_drift(
     return benign, substantive
 
 
+# Distinct un-indexed resources named in the histogram before the tail folds.
+_DRIFT_RESOURCE_HISTOGRAM_LIMIT = 12
+
+
 def _bounded_drift_identity_field(field: str, value: Any) -> tuple[str, bool]:
     """Render one public Terraform identity field without arbitrary values."""
     if not isinstance(value, str):
@@ -2854,6 +2858,50 @@ def _bounded_drift_identity_field(field: str, value: Any) -> tuple[str, bool]:
     return source[:low] + marker, True
 
 
+def _drift_resource_histogram(drift: list[dict[str, Any]]) -> dict[str, int]:
+    """Count drift per UN-INDEXED address, which is code rather than data.
+
+    The per-identity rows below redact any address carrying a for_each key, so a
+    rejection over N instances of one resource renders as N identical
+    ``<indexed-address>`` rows and says nothing about WHAT drifted. A real
+    rejection of 27 entries showed eight of those and no way to tell which
+    resources were involved; diagnosing it took a state download and a
+    resource-by-resource diff against live AWS.
+
+    Stripping the bracketed key leaves ``module.control.aws_iam_role.authority_exec``
+    -- a static identifier that already appears verbatim in this file's own
+    constants. It carries no instance key, no attribute, and no value, so it
+    crosses the value-free boundary the per-row redaction protects while
+    restoring the one fact an operator needs first: which resources, and how
+    many of each.
+    """
+    counts: dict[str, int] = {}
+    for item in drift:
+        address = item.get("address") if isinstance(item, dict) else None
+        if not isinstance(address, str):
+            base = "<malformed>"
+        else:
+            # Cap length with the SAME renderer the per-identity rows use. The
+            # bracket strip happens first, so the indexed-address redaction can
+            # never fire here -- what remains is the length bound, which is the
+            # part that matters: an unbounded key would blow the diagnostic
+            # ceiling and push every identity row out of the message.
+            base, _ = _bounded_drift_identity_field(
+                "address", address.split("[", 1)[0]
+            )
+        counts[base] = counts.get(base, 0) + 1
+    if len(counts) <= _DRIFT_RESOURCE_HISTOGRAM_LIMIT:
+        return counts
+    # Bounded by construction: keep the largest groups, which are the ones that
+    # explain a bulk rejection, and fold the tail into one counted bucket.
+    ranked = sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+    kept = dict(ranked[:_DRIFT_RESOURCE_HISTOGRAM_LIMIT])
+    kept["<other-resources>"] = sum(
+        count for _, count in ranked[_DRIFT_RESOURCE_HISTOGRAM_LIMIT:]
+    )
+    return kept
+
+
 def _drift_identity_diagnostic(drift: list[dict[str, Any]]) -> str:
     """Return bounded, value-free identities for rejected resource drift."""
     identities = []
@@ -2868,11 +2916,13 @@ def _drift_identity_diagnostic(drift: list[dict[str, Any]]) -> str:
             identity[field] = rendered
             fields_truncated = fields_truncated or truncated
         identities.append(identity)
+    resources: dict[str, int] | None = _drift_resource_histogram(drift)
     while True:
         identities_omitted = len(drift) > len(identities)
         rendered = _canonical_json(
             {
                 "count": len(drift),
+                **({} if resources is None else {"resources": resources}),
                 "identities": identities,
                 # True means some identity information was omitted, redacted,
                 # or shortened; consumers must not interpret it as row-only.
@@ -2887,6 +2937,17 @@ def _drift_identity_diagnostic(drift: list[dict[str, Any]]) -> str:
         # ``_canonical_json`` can expand one Unicode code point into multiple
         # ASCII escape characters. Drop whole identities until the emitted log
         # line, rather than only its source fields, satisfies the hard bound.
+        #
+        # The resource histogram competes for the same ceiling, so it is dropped
+        # BEFORE the last identity rather than after: an identity row is the
+        # older, load-bearing guarantee, and the histogram is a convenience that
+        # must never be able to squeeze it out.
+        if len(identities) > 1:
+            identities.pop()
+            continue
+        if resources is not None:
+            resources = None
+            continue
         identities.pop()
 
 

@@ -6072,10 +6072,70 @@ class PlanContractTests(unittest.TestCase):
         self.assertIn(
             'resource_drift_identity={"count":1,"identities":['
             '{"address":"module.control.aws_iam_role.flow_logs",'
-            '"mode":"managed","type":"aws_iam_role"}],"truncated":false}',
+            '"mode":"managed","type":"aws_iam_role"}],'
+            '"resources":{"module.control.aws_iam_role.flow_logs":1},'
+            '"truncated":false}',
             message,
         )
         self.assertNotIn(sentinel, message)
+
+    def test_unexpected_resource_drift_diagnostic_names_the_resources(self) -> None:
+        """A bulk rejection must say WHAT drifted, not just how many.
+
+        Every address carrying a for_each key renders as `<indexed-address>`, so
+        a 27-entry rejection over two resources showed eight identical rows and
+        nothing else. Diagnosing one took a state download and a
+        resource-by-resource diff against live AWS.
+
+        The un-indexed address is a static identifier that already appears in
+        this checker's own constants -- no instance key, no attribute, no value
+        -- so naming it costs nothing the per-row redaction protects.
+        """
+        drift = [
+            {
+                "address": f'module.control.aws_iam_role.authority_exec["fn{index}"]',
+                "mode": "managed",
+                "type": "aws_iam_role",
+            }
+            for index in range(20)
+        ] + [
+            {
+                "address": "module.control.aws_iam_role.hub_publisher",
+                "mode": "managed",
+                "type": "aws_iam_role",
+            }
+        ]
+        decoded = json.loads(CHECKER._drift_identity_diagnostic(drift))
+        self.assertEqual(decoded["count"], 21)
+        self.assertEqual(
+            decoded["resources"],
+            {
+                "module.control.aws_iam_role.authority_exec": 20,
+                "module.control.aws_iam_role.hub_publisher": 1,
+            },
+            "the histogram must separate the bulk group from the one outlier -- "
+            "that outlier is the whole reason a rejection is unexplained",
+        )
+        # Still value-free: no instance key survives anywhere in the message.
+        self.assertNotIn("fn0", json.dumps(decoded))
+        self.assertNotIn("[", json.dumps(decoded["resources"]))
+
+    def test_unexpected_resource_drift_histogram_is_bounded(self) -> None:
+        """The histogram must not be able to squeeze out an identity row."""
+        drift = [
+            {
+                "address": f"module.control.aws_iam_role.role_{index}",
+                "mode": "managed",
+                "type": "aws_iam_role",
+            }
+            for index in range(CHECKER._DRIFT_RESOURCE_HISTOGRAM_LIMIT + 5)
+        ]
+        decoded = json.loads(CHECKER._drift_identity_diagnostic(drift))
+        self.assertLessEqual(
+            len(decoded["resources"]), CHECKER._DRIFT_RESOURCE_HISTOGRAM_LIMIT + 1
+        )
+        self.assertIn("<other-resources>", decoded["resources"])
+        self.assertEqual(sum(decoded["resources"].values()), len(drift))
 
     def test_unexpected_resource_drift_diagnostic_is_bounded(self) -> None:
         hidden_suffix = "hidden-drift-suffix-2a282d43"
@@ -6105,8 +6165,14 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assertIn('"truncated":true', message)
         self.assertEqual(message.count('"address"'), CHECKER._DRIFT_IDENTITY_LIMIT)
+        # Count WITHIN the identity rows. The resource histogram now shares the
+        # message and caps its own keys with the same marker, so a whole-message
+        # count no longer isolates what this assertion is about: that every one
+        # of the three fields on every emitted identity was truncated.
+        decoded = json.loads(message.split("resource_drift_identity=", 1)[1])
         self.assertEqual(
-            message.count("<truncated>"), CHECKER._DRIFT_IDENTITY_LIMIT * 3
+            json.dumps(decoded["identities"]).count("<truncated>"),
+            CHECKER._DRIFT_IDENTITY_LIMIT * 3,
         )
         self.assertNotIn(hidden_suffix, message)
         self.assertLess(len(message), 8_000)
@@ -6232,7 +6298,8 @@ class PlanContractTests(unittest.TestCase):
         self.assertIn(
             'resource_drift_identity={"count":1,"identities":['
             '{"address":"<malformed>","mode":"<malformed>",'
-            '"type":"<malformed>"}],"truncated":true}',
+            '"type":"<malformed>"}],"resources":{"<malformed>":1},'
+            '"truncated":true}',
             message,
         )
         self.assertNotIn(sentinel, message)
