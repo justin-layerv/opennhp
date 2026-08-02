@@ -109,6 +109,13 @@ PROTECTED_EDGE_IDENTITIES = {
         "load_balancer_security_group_name": "layerv-nhp-sandbox-sg-nlb",
         "backend_security_group_name": "layerv-nhp-sandbox-sg-server",
         "backend_udp_cidrs": (
+            # In-VPC AC keepalive path (module.compute's server_nhp_udp_vpc).
+            # ACs send NHP_KPL straight to their assigned servers' private IPs
+            # rather than through the NLB; fencing the public edge zeroed
+            # server_nhp_udp, whose 0.0.0.0/0 source had been carrying that
+            # traffic, so this rule replaces it. Same VPC already reviewed as a
+            # backend_health_cidrs source below.
+            "10.100.0.0/16",
             "10.101.10.0/24",
             "10.101.11.0/24",
             "10.101.12.0/24",

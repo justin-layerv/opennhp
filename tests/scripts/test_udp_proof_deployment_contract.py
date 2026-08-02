@@ -58,7 +58,12 @@ def edge_identity(name: str, target_id: str) -> dict[str, object]:
         "layerv-nhp-sandbox-edge": (
             "layerv-nhp-sandbox-sg-nlb",
             "layerv-nhp-sandbox-sg-server",
-            ["10.101.10.0/24", "10.101.11.0/24", "10.101.12.0/24"],
+            [
+                "10.100.0.0/16",
+                "10.101.10.0/24",
+                "10.101.11.0/24",
+                "10.101.12.0/24",
+            ],
             ["10.100.0.0/16"],
         ),
         "layerv-nhp-sandbox-cell1-edge": (
