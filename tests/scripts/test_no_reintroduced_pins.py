@@ -122,6 +122,38 @@ class NoReintroducedPinsTest(unittest.TestCase):
             "longer main",
         )
 
+    def test_client_identity_is_reachability_never_equality(self) -> None:
+        """Resolving main is not enough if the comparison is then `==`.
+
+        Equality against a freshly-resolved main head IS a pin, just one that
+        re-acquires itself every run: any client commit landing between the
+        canary build and validation invalidates an image that was correct when
+        built. With many developers merging, the only way to satisfy it is to
+        re-select and race -- the same loop this file exists to prevent, which is
+        why absence of literal SHAs did not catch it.
+
+        The honest question is reachability, and the collector already answers it
+        for the Connector. Both clients must go through the same helper.
+        """
+        collector = COLLECTOR.read_text(encoding="utf-8")
+        self.assertIn(
+            "def _canary_commit_is_in_main",
+            collector,
+            "the collector must ask reachability through a named helper",
+        )
+        for client in CLIENTS:
+            with self.subTest(client=client):
+                self.assertRegex(
+                    collector,
+                    r"_canary_commit_is_in_main\(\s*" + re.escape('"' + client + '"'),
+                    f"{client} identity must be checked by reachability, not equality",
+                )
+        self.assertNotRegex(
+            collector,
+            r'!=\s*metadata\["candidates"\]\["qurl_go"\]\["head_sha"\]',
+            "qurl-go identity must not be an equality check against resolved main",
+        )
+
     def test_the_guard_is_not_vacuous(self) -> None:
         for path in PROOF_SURFACE:
             with self.subTest(file=path.name):

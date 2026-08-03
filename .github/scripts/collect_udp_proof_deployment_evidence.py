@@ -895,8 +895,22 @@ def _validate_canary_provenance(
     ):
         raise EvidenceError("canary qurl-go module contract drift")
     qurl_go_sha = contract._sha(qurl_go["sha"], "canary qurl-go SHA")
-    if qurl_go_sha != metadata["candidates"]["qurl_go"]["head_sha"]:
-        raise EvidenceError("canary qurl-go module is not the current candidate")
+    # Reachability, not equality -- the same question _canary_commit_is_in_main
+    # already asks of the Connector's own commit, and for the same reason its
+    # docstring gives: main advancing past the image "is expected while the
+    # proof runs".
+    #
+    # Equality here reintroduced exactly the pin _resolve_client_main removed.
+    # qurl-go merges continuously, so any qurl-go commit landing between the
+    # canary build and this check invalidated a canary that was correct when
+    # built, and the only way to satisfy it was to re-pin the Connector's module
+    # selection and race -- a loop that tightens instead of converging with many
+    # developers merging.
+    #
+    # Still fails closed on what matters: "ahead" or "diverged" means the image
+    # carries qurl-go code main does not have, which is refused.
+    if not _canary_commit_is_in_main("layervai/qurl-go", qurl_go_sha):
+        raise EvidenceError("canary qurl-go module is not reachable from qurl-go main")
     yamux = _exact(
         modules["yamux"],
         {"required_version", "replacement", "version", "sum"},
