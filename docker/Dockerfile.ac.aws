@@ -5,7 +5,7 @@
 # Tag participates in the GO_VERSION lockstep (see #1337). Canonical
 # source of all locations is .github/workflows/build-and-push.yml's
 # env.GO_VERSION block.
-FROM golang:1.26.5-bookworm@sha256:18aedc16aa19b3fd7ded7245fc14b109e054d65d22ed53c355c899582bbb2113 AS builder
+FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS builder
 
 WORKDIR /nhp-server
 
@@ -82,7 +82,7 @@ RUN make init acd ebpf-objects
 # the source authority, and Go's module checksums protect both explicit security
 # floors. Drop this whole source-rebuild stage once an upstream Traefik 3.6.x
 # release embeds x/text >= v0.39.0.
-FROM golang:1.26.5-bookworm@sha256:18aedc16aa19b3fd7ded7245fc14b109e054d65d22ed53c355c899582bbb2113 AS traefik-builder
+FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS traefik-builder
 
 WORKDIR /traefik-src
 
