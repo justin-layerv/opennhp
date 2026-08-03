@@ -385,6 +385,18 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	// err. One place rather than per-branch.
 	ppd.decryptedMsgCh = pd.DecryptedMsgCh
 
+	// Version gate, ahead of every key agreement. A sender below 1.1 does not
+	// fold the HeaderCommon into the body AAD, so its body tag can never verify
+	// here; reporting that as a version mismatch rather than an AEAD failure is
+	// what makes a staged rollout diagnosable. NHP_KPL never reaches this
+	// function (device.go short-circuits it) and carries no AEAD, so keepalives
+	// from an older peer are unaffected.
+	if major, minor := ppd.header.Version(); major != ProtocolVersionMajor || minor < MinimumRecvProtocolVersionMinor {
+		err = ErrUnsupportedProtocolVersion
+		// bare return: caller's err defer expects named ppd populated
+		return
+	}
+
 	// init chain hash -> ChainHash0
 	// Always reset per packet; intermediate chain-key carry-over was
 	// removed (Go-Go agreed on zeros, JS-Go did not). Ported from
@@ -509,6 +521,16 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 	// create header and init device ecdh
 	mad.header = mad.BasePacket.HeaderWithCipherScheme(mad.CipherScheme)
 	mad.deviceEcdh = mad.device.GetEcdhByCipherScheme(mad.CipherScheme)
+
+	// init version
+	//
+	// The with-prev branch of createMsgAssemblerData skips the fresh-assembler
+	// init, so without this every in-transaction reply (ACK, COK, LRT, RAK, AOP,
+	// ART) shipped whatever bytes 8-9 the recycled pool buffer happened to hold.
+	// Nothing read the field before, so the garbage was invisible; the receive
+	// gate added in createPacketParserData reads it, and a reply must not be
+	// rejected for a version its sender never wrote.
+	mad.header.SetVersion(ProtocolVersionMajor, ProtocolVersionMinor)
 
 	// continue with the sender's counter
 	mad.header.SetCounter(ppd.SenderTrxId)
@@ -1017,7 +1039,9 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		SetZero(ppd.hashBuf[:])
 	}()
 
-	// message body is empty, skip decryption
+	// message body is empty, skip decryption. No AEAD runs, so the HeaderCommon
+	// binding folded below never applies to this packet — see the matching note
+	// in initiator.go encryptBody for why that residual gap is contained.
 	if len(ppd.basePacket.Content) == ppd.header.Size() {
 		return nil
 	}
@@ -1033,6 +1057,13 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 	if IsForwardableKnockType(ppd.HeaderType) {
 		ppd.originalContent = bytes.Clone(ppd.basePacket.Content)
 	}
+
+	// evolve chainhash ChainHash3 -> ChainHash4: fold the HeaderCommon exactly as
+	// received, so the body tag verifies only when preamble, type, payload size,
+	// version, flags and counter are the ones the sender sealed under. The sender
+	// folds these same 24 bytes immediately before its body Seal (initiator.go
+	// encryptBody); any in-flight edit surfaces here as ErrAEADDecryptionFailed.
+	ppd.chainHash.Write(ppd.header.Bytes()[:HeaderCommonSize])
 
 	// decrypt body and reuse ppd.BasePacket.Content space
 	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(ppd.hashBuf[:0]))

@@ -50,6 +50,10 @@ func runResponderWithPrevHeaderDigestFailure(t *testing.T, dev *Device, configur
 		t.Fatal("AllocatePoolPacket returned nil")
 	}
 	pkt.Content = pkt.Buf[:prevMad.header.Size()]
+	// Stamp a supported version so the responder's version gate lets the packet
+	// through to the header-digest check this helper is about; without it every
+	// caller would trip the earlier gate instead.
+	pkt.Header().SetVersion(ProtocolVersionMajor, ProtocolVersionMinor)
 
 	pd := &PacketData{
 		BasePacket:        pkt,

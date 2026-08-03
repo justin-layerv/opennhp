@@ -39,7 +39,7 @@ const agentRegFixturePath = "testdata/agent_registration_golden.json"
 // agentRegFixtureSHA256 pins the byte-identity of the local testdata copy to the
 // qurl-conformance canonical artifact. Update it deliberately when re-syncing the
 // vectors after an upstream change.
-const agentRegFixtureSHA256 = "77dc8634eb15e8a986df1093923b70b341386ba3c15421814ffed1a668f2d2bc"
+const agentRegFixtureSHA256 = "2a8ff171220c3e179bf70895f03c8f7b8594de4caa45cc264e22804196a0159f"
 
 type agentRegDeterministicCase struct {
 	ServerStaticPrivHex string `json:"server_static_priv_hex"`

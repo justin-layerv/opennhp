@@ -110,4 +110,9 @@ var (
 	ErrHubLSTCookieProofRequired = newError(errNhpHubLSTCookieProofRequired, "hub LST return-routability proof required")
 	ErrInvalidHubLSTCookieProof  = newError(errNhpInvalidHubLSTCookieProof, "invalid hub LST cookie proof configuration")
 	ErrInvalidHubLSTFlags        = newError(errNhpInvalidHubLSTFlags, "invalid hub LST header flags")
+	// ErrUnsupportedProtocolVersion is raised before any key agreement, so a peer
+	// still speaking a pre-HeaderCommon-AAD minor (< 1.1) is told the version is
+	// wrong instead of failing later with an opaque AEAD error. Operators
+	// diagnosing a staged rollout key on this, not on "aead decryption failed".
+	ErrUnsupportedProtocolVersion = newError(errNhpUnsupportedProtocolVersion, "unsupported NHP protocol version")
 )

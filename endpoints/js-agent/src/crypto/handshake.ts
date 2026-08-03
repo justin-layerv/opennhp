@@ -4,6 +4,7 @@ import { x25519PublicKey, x25519SharedSecret } from "./dh.js";
 import { aeadSeal } from "./aead.js";
 import {
   HEADER_SIZE,
+  HEADER_COMMON_SIZE,
   NHP_KNK,
   NHP_RKN,
   OFF_EPHEMERAL,
@@ -11,6 +12,7 @@ import {
   OFF_TIMESTAMP,
   OFF_DIGEST,
   TIMESTAMP_SIZE,
+  GCM_TAG_SIZE,
   MAX_SEALED_BODY_SIZE,
   PROTOCOL_VERSION_MAJOR,
   PROTOCOL_VERSION_MINOR,
@@ -128,35 +130,42 @@ export function buildKnock(inp: KnockInputs): Uint8Array {
   header.set(sealedTs, OFF_TIMESTAMP);
   chainHash.update(sealedTs);
 
-  // Body AAD is ChainHash3 (captured before the final key derivation, which does
-  // not touch the chain hash). Then derive the body key from the ts ciphertext;
-  // this is the terminal derivation, so the evolved chain key is discarded
-  // (unlike the es/ss steps above, whose chain key feeds the next KeyGen2).
-  const bodyAad = chainHash.sum();
+  // Derive the body key from the ts ciphertext; this is the terminal derivation,
+  // so the evolved chain key is discarded (unlike the es/ss steps above, whose
+  // chain key feeds the next KeyGen2). The body AAD is deliberately NOT taken
+  // yet — the chain hash still has to absorb the finalized HeaderCommon.
   [, aeadKey] = keyGen2(T, chainKey, sealedTs);
   // Empty body: skip the seal entirely (payload size 0), matching Go encryptBody.
-  const sealedBody =
-    inp.body.length === 0
-      ? new Uint8Array(0)
-      : aeadSeal(aeadKey, nonce, inp.body, bodyAad);
-  if (sealedBody.length > MAX_SEALED_BODY_SIZE) {
+  const payloadSize =
+    inp.body.length === 0 ? 0 : inp.body.length + GCM_TAG_SIZE;
+  if (payloadSize > MAX_SEALED_BODY_SIZE) {
     // Fail loud rather than emit a packet the server's fixed buffer rejects.
     throw new Error(
-      `knock body too large: sealed ${sealedBody.length} bytes exceeds the ${MAX_SEALED_BODY_SIZE}-byte limit`,
+      `knock body too large: sealed ${payloadSize} bytes exceeds the ${MAX_SEALED_BODY_SIZE}-byte limit`,
     );
   }
 
-  // HeaderCommon — all of it must be set before the digest, which covers
-  // header[0:208]. Flag is 0: uncompressed, no extended length.
+  // HeaderCommon — all of it must be set before both the fold below and the
+  // digest, which covers header[0:208]. Flag is 0: uncompressed, no extended
+  // length. The payload size is only known here, which is why the header cannot
+  // be finalized before the body is prepared.
   setVersion(header, PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR);
   setCounter(header, inp.counter);
   setFlag(header, 0);
-  setTypeAndPayloadSize(
-    header,
-    inp.headerType,
-    sealedBody.length,
-    inp.preamble,
-  );
+  setTypeAndPayloadSize(header, inp.headerType, payloadSize, inp.preamble);
+
+  // ChainHash3 -> ChainHash4: fold the serialized HeaderCommon so the body tag
+  // authenticates preamble, type, payload size, version, flags and counter. The
+  // body seal is the first AEAD that can carry them, and the responder folds the
+  // same 24 bytes as received, so any in-flight edit breaks the open. Under 1.0
+  // these fields were forgeable by anyone holding the server's static public key.
+  chainHash.update(header.subarray(0, HEADER_COMMON_SIZE));
+  const bodyAad = chainHash.sum();
+
+  const sealedBody =
+    payloadSize === 0
+      ? new Uint8Array(0)
+      : aeadSeal(aeadKey, nonce, inp.body, bodyAad);
 
   // Unkeyed header digest over header[0:208] (+ cookie for NHP_RKN).
   header.set(headerDigest(inp.serverStaticPub, header, inp.cookie), OFF_DIGEST);

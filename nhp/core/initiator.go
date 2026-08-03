@@ -407,6 +407,15 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	mad.header.SetFlag(mad.HeaderFlag)
 
 	// message body is empty, skip encryption. Set header and compute the header digest
+	//
+	// Residual gap, deliberate: with no body there is no AEAD operation left to
+	// carry the HeaderCommon AAD folded below, so an empty-body packet's header
+	// stays covered only by the unkeyed digest. It is contained rather than
+	// exploitable — the COMPRESS branch below requires a non-empty body so the
+	// decode-side compress bit is inert, the type is confined by the receiver's
+	// CheckRecvHeaderType allowlist, and the counter is bound as the GCM nonce.
+	// Closing it needs a header-only AEAD (a second tag on the wire), which is a
+	// separate framing change; do not "fix" it by sealing a synthetic body.
 	if len(mad.bodyMessage) == 0 {
 		// set header type and payload size
 		mad.header.SetTypeAndPayloadSize(mad.HeaderType, 0)
@@ -472,6 +481,14 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 
 	// set header digest
 	mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
+
+	// evolve chainhash ChainHash3 -> ChainHash4: authenticate the finalized
+	// HeaderCommon under the body tag. This is the earliest AEAD that can cover
+	// it — the flag word and payload size are only known after compression, which
+	// runs after the static and timestamp seals — and the responder folds the
+	// same 24 bytes as received, so any in-flight edit to preamble, type, payload
+	// size, version, flags or counter breaks the body Open.
+	mad.chainHash.Write(mad.header.Bytes()[:HeaderCommonSize])
 
 	// encrypt body and write into the packet's writable buffer
 	mad.bodyAead.Seal(packetBuf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))

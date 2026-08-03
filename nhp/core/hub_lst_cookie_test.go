@@ -90,6 +90,9 @@ func (f hubLSTCookieFixture) sealEmptyAEADLST(t *testing.T, counter uint64) []by
 	mad.BodySize = GCMTagSize
 	mad.header.SetTypeAndPayloadSize(NHP_LST, mad.BodySize)
 	mad.addHeaderDigest(false)
+	// Mirror encryptBody's HeaderCommon fold; this helper hand-rolls the seal to
+	// produce a tag-only body that encryptBody itself will not emit.
+	mad.chainHash.Write(mad.header.Bytes()[:HeaderCommonSize])
 	buf := mad.BasePacket.writableBuffer()
 	mad.bodyAead.Seal(buf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), nil, mad.chainHash.Sum(mad.hashBuf[:0]))
 	mad.BasePacket.Content = buf[:mad.header.Size()+mad.BodySize]
@@ -319,7 +322,7 @@ func TestHubLSTCookieProofDigestKAT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	headerPrefix, err := hex.DecodeString("c1d2e3f4c1d7e331010000040000000000000000000000173a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe240000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e51c96e754bba5426ed4b5d6cf38cb3c173568c29010c70049925f42dd10c0c1cecf72766c7475288fd5da54d18c2cf7f6656361fcaefc4c25c8f5069da44db732656a2e235c7212")
+	headerPrefix, err := hex.DecodeString("c1d2e3f4c1d7e331010100040000000000000000000000173a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe240000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e51c96e754bba5426ed4b5d6cf38cb3c173568c29010c70049925f42dd10c0c1cecf72766c7475288fd5da54d18c2cf7f6656361fcaefc4c25c8f5069da44db732656a2e235c7212")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +348,7 @@ func TestHubLSTCookieProofDigestKAT(t *testing.T) {
 	h.Write(serverPublicKey)
 	h.Write(headerPrefix)
 	h.Write(cookie)
-	if got, want := hex.EncodeToString(h.Sum(nil)), "7aaa44aaf8f8876973120c8870b761603b6125bbe5322bb7c242fc9ca502efe3"; got != want {
+	if got, want := hex.EncodeToString(h.Sum(nil)), "394bf178250b4d78461193415e8c7f15b632b6b58a560b1ffb14f505583f0c30"; got != want {
 		t.Fatalf("proof digest = %s, want %s", got, want)
 	}
 }

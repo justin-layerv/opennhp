@@ -13,7 +13,11 @@ export const TIMESTAMP_SIZE = 8;
  * the NHP_RKN re-knock header digest. */
 export const COOKIE_SIZE = 32;
 
-const HEADER_COMMON_SIZE = 24;
+/** HeaderCommon is the 24-byte prefix (preamble, obfuscated type+size, version,
+ * flags, counter). Since protocol 1.1 these bytes are folded into the chain hash
+ * before the body AAD, so both the seal and the open must slice exactly this
+ * span — see `buildKnock` and `decryptReply`. */
+export const HEADER_COMMON_SIZE = 24;
 const MAX_IDENTITY_SIZE = 64;
 
 // Field offsets within the 240-byte HeaderCurve. Each field after the common
@@ -52,7 +56,15 @@ export const NHP_RKN = 8;
 export const NHP_FLAG_COMPRESS = 1 << 1;
 
 export const PROTOCOL_VERSION_MAJOR = 1;
-export const PROTOCOL_VERSION_MINOR = 0;
+/** Minor 1 is the transcript that folds HeaderCommon into the body AAD. Under
+ * 1.0 those bytes were covered only by the unkeyed header digest, whose inputs
+ * are all public. */
+export const PROTOCOL_VERSION_MINOR = 1;
+/** Oldest minor whose body AAD this codec can reproduce. A 1.0 sender folds a
+ * shorter transcript, so its tag can never verify here; `decryptReply` refuses it
+ * on the version so a mixed-version rollout is diagnosable instead of surfacing
+ * as an unexplained AEAD failure. */
+export const MIN_PROTOCOL_VERSION_MINOR = 1;
 
 // Noise init constants (`nhp/core/constants.go`) — the literal UTF-8 bytes.
 export const INITIAL_HASH = new TextEncoder().encode(
@@ -103,6 +115,19 @@ export function setVersion(
 ): void {
   header[8] = major & 0xff;
   header[9] = minor & 0xff;
+}
+
+/** Read HeaderCommon[8:10]. Receivers pin the major and FLOOR the minor at
+ * {@link MIN_PROTOCOL_VERSION_MINOR}: an older minor is a transcript this codec
+ * cannot open, while a newer one stays admissible so a compatible server release
+ * does not strand deployed browsers. Both bytes are inside the folded
+ * HeaderCommon, so an accepted value is the one the sender sealed under. */
+export function getVersion(header: Uint8Array): {
+  major: number;
+  minor: number;
+} {
+  const dv = headerView(header);
+  return { major: dv.getUint8(8), minor: dv.getUint8(9) };
 }
 
 /**

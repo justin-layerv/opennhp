@@ -74,15 +74,6 @@ func buildDecryptBodyPPD(t testing.TB, body []byte, compress bool) *PacketParser
 	// Determine header size from the curve header struct.
 	headerSize := int(unsafe.Sizeof(curve.HeaderCurve{}))
 
-	// Build associated data from chainHash (matches decryptBody's usage:
-	// ppd.chainHash.Sum(nil) is passed as the AD to AEAD.Open).
-	chainHash, err := NewHash(ciphers.HashType)
-	if err != nil {
-		t.Fatalf("NewHash failed: %v", err)
-	}
-	chainHash.Write([]byte("test-chain-hash-data"))
-	ad := chainHash.Sum(nil)
-
 	// Allocate a buffer large enough for header + AEAD ciphertext.
 	// The ciphertext is len(body) + GCMTagSize.
 	ciphertextLen := len(body) + GCMTagSize
@@ -101,12 +92,24 @@ func buildDecryptBodyPPD(t testing.TB, body []byte, compress bool) *PacketParser
 		header.SetFlag(common.NHP_FLAG_COMPRESS)
 	}
 
+	// Set type and payload size before sealing: decryptBody folds the finalized
+	// HeaderCommon into the body AAD, so every byte of it must be in place first.
+	header.SetTypeAndPayloadSize(NHP_KNK, ciphertextLen)
+
+	// Build associated data from chainHash (matches decryptBody's usage:
+	// the seed write stands in for the handshake evolution, then the HeaderCommon
+	// fold that binds the header under the body tag, then Sum as the AEAD AD).
+	chainHash, err := NewHash(ciphers.HashType)
+	if err != nil {
+		t.Fatalf("NewHash failed: %v", err)
+	}
+	chainHash.Write([]byte("test-chain-hash-data"))
+	chainHash.Write(header.Bytes()[:HeaderCommonSize])
+	ad := chainHash.Sum(nil)
+
 	// Encrypt the body using AEAD. The ciphertext (including GCM tag) is
 	// written directly into the packet buffer after the header.
 	bodyAead.Seal(packetBuf[headerSize:headerSize], nonce, body, ad)
-
-	// Set type and payload size in header.
-	header.SetTypeAndPayloadSize(NHP_KNK, ciphertextLen)
 
 	// Build the Packet. Buf is nil since we are not using the pool allocator;
 	// Content points to our dynamically-sized slice.

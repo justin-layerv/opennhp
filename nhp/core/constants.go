@@ -2,7 +2,20 @@ package core
 
 // protocol
 const ProtocolVersionMajor = 1
-const ProtocolVersionMinor = 0
+
+// ProtocolVersionMinor 1 is the transcript that binds the serialized
+// HeaderCommon (preamble, type, payload size, version, flags, counter) into the
+// AEAD chain hash before the body AAD. Under 1.0 those bytes were covered only
+// by the unkeyed HeaderDigest, which anyone holding the peer's static PUBLIC key
+// can recompute, so the flag word and header type were forgeable in flight.
+const ProtocolVersionMinor = 1
+
+// MinimumRecvProtocolVersionMinor is the oldest minor whose body AAD this codec
+// can reproduce. A 1.0 sender folds a shorter transcript, so its body tag can
+// never verify here; receivers reject it on the version instead, otherwise a
+// mixed-version rollout surfaces as an opaque AEAD failure that reads like key
+// mismatch or corruption. Raise this in lockstep with any further AAD change.
+const MinimumRecvProtocolVersionMinor = 1
 
 // device
 const (

@@ -5,6 +5,7 @@ import { aeadOpen } from "./aead.js";
 import { equalBytes } from "@noble/ciphers/utils.js";
 import {
   HEADER_SIZE,
+  HEADER_COMMON_SIZE,
   PACKET_BUFFER_SIZE,
   OFF_EPHEMERAL,
   OFF_STATIC,
@@ -16,9 +17,12 @@ import {
   INITIAL_HASH,
   INITIAL_CHAIN_KEY,
   NHP_FLAG_COMPRESS,
+  PROTOCOL_VERSION_MAJOR,
+  MIN_PROTOCOL_VERSION_MINOR,
   getTypeAndPayloadSize,
   getCounter,
   getFlag,
+  getVersion,
   nonceForCounter,
   headerDigest,
 } from "./packet.js";
@@ -114,6 +118,15 @@ export async function decryptReply(
       `reply too long: ${packet.length} bytes > ${PACKET_BUFFER_SIZE}-byte buffer`,
     );
   }
+  // Version gate, ahead of every key agreement. A server still speaking 1.0 does
+  // not fold HeaderCommon into the body AAD, so its body tag can never verify
+  // here; saying so beats the opaque AEAD failure it would otherwise produce.
+  const { major, minor } = getVersion(packet);
+  if (major !== PROTOCOL_VERSION_MAJOR || minor < MIN_PROTOCOL_VERSION_MINOR) {
+    throw new Error(
+      `unsupported NHP protocol version ${major}.${minor}, want ${PROTOCOL_VERSION_MAJOR}.${MIN_PROTOCOL_VERSION_MINOR} or a later minor`,
+    );
+  }
   const header = packet.subarray(0, HEADER_SIZE);
   const sealedBody = packet.subarray(HEADER_SIZE);
   const T = HashType.BLAKE2S;
@@ -191,7 +204,14 @@ export async function decryptReply(
   ).getBigUint64(0, false);
   chainHash.update(tsField);
 
-  // Body AAD = ChainHash3; the body key derives from the timestamp ciphertext.
+  // ChainHash3 -> ChainHash4: fold the HeaderCommon exactly as received, so the
+  // body tag verifies only against the header the server sealed under. Editing
+  // the flag word, the type, the declared size, the preamble or the version in
+  // flight now breaks the open below; under 1.0 all of them were forgeable by
+  // anyone holding this agent's static PUBLIC key. A zero-length body carries no
+  // tag, so that one case is still covered only by the unkeyed digest — the
+  // dispatcher's type gate is what contains it.
+  chainHash.update(header.subarray(0, HEADER_COMMON_SIZE));
   const bodyAad = chainHash.sum();
   const bodyKey = keyGen2(T, chainKey, tsField)[1];
   let body =

@@ -860,3 +860,77 @@ func TestIsAllowedAtOverload(t *testing.T) {
 		}
 	}
 }
+
+// TestCreatePacketParserData_RejectsPreBindingProtocolVersion is the
+// rollout-diagnosability fence for the protocol 1.1 HeaderCommon AAD binding.
+//
+// A peer still speaking 1.0 folds a shorter transcript into its body AAD, so its
+// body tag can never verify here. Without an explicit gate the operator would see
+// "aead decryption failed" — indistinguishable from a wrong key, a corrupted
+// datagram, or an attack — instead of a statement that the two ends disagree on
+// the protocol version. Both subcases therefore assert the error IDENTITY, not
+// merely that the packet was refused.
+//
+// The gate must also run before the header-digest check and before every key
+// agreement: the synthetic subcase carries no valid digest at all, so a gate
+// placed later would surface ErrHeaderDigestCheckFailed instead.
+func TestCreatePacketParserData_RejectsPreBindingProtocolVersion(t *testing.T) {
+	f := newHubLSTCookieFixture(t)
+	source := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 41000}
+
+	t.Run("real packet downgraded to 1.0", func(t *testing.T) {
+		wire := f.sealLST(t, bytes.Repeat([]byte{0xa5}, 64), 7, nil, false)
+		if wire[8] != ProtocolVersionMajor || wire[9] != ProtocolVersionMinor {
+			t.Fatalf("sealed version = %d.%d, want %d.%d", wire[8], wire[9], ProtocolVersionMajor, ProtocolVersionMinor)
+		}
+		wire[9] = MinimumRecvProtocolVersionMinor - 1
+		// Re-stamp the digest so the digest gate cannot be what rejects this. An
+		// off-path attacker can do exactly this with the server's PUBLIC key.
+		restampHeaderDigest(t, wire, f.server.staticEcdh.PublicKey())
+
+		_, err := f.parseOnHub(t, wire, source)
+		if !errors.Is(err, ErrUnsupportedProtocolVersion) {
+			t.Fatalf("downgraded packet error = %v, want ErrUnsupportedProtocolVersion", err)
+		}
+	})
+
+	t.Run("unsupported major, ahead of the digest check", func(t *testing.T) {
+		wire := f.sealLST(t, bytes.Repeat([]byte{0xa5}, 64), 8, nil, false)
+		wire[8] = ProtocolVersionMajor + 1
+		// Deliberately NOT re-stamped: the digest is now wrong too, and the
+		// version error must still be the one reported.
+		_, err := f.parseOnHub(t, wire, source)
+		if !errors.Is(err, ErrUnsupportedProtocolVersion) {
+			t.Fatalf("bad-major packet error = %v, want ErrUnsupportedProtocolVersion", err)
+		}
+	})
+
+	t.Run("current version still parses", func(t *testing.T) {
+		wire := f.sealLST(t, bytes.Repeat([]byte{0xa5}, 64), 9, nil, false)
+		if _, err := f.parseOnHub(t, wire, source); !errors.Is(err, ErrHubLSTCookieProofRequired) {
+			t.Fatalf("current-version packet error = %v, want the ordinary Hub proof challenge", err)
+		}
+	})
+}
+
+// restampHeaderDigest recomputes the ordinary (cookie-free) header digest over a
+// mutated packet, matching MsgAssemblerData.addHeaderDigest. It exists so a
+// version subcase can defeat the unkeyed digest gate on purpose and prove the
+// version gate is the one that fires.
+func restampHeaderDigest(t *testing.T, wire []byte, peerStaticPub []byte) {
+	t.Helper()
+	h, err := NewHash(HASH_BLAKE2S)
+	if err != nil {
+		t.Fatalf("NewHash: %v", err)
+	}
+	h.Write(initialHashBytes)
+	h.Write(peerStaticPub)
+	h.Write(wire[:curveHeaderDigestOffset])
+	copy(wire[curveHeaderDigestOffset:curveHeaderDigestOffset+HashSize], h.Sum(nil))
+}
+
+// curveHeaderDigestOffset is the HeaderCurve offset of the digest field: the
+// 24-byte common header, the ephemeral key, the identity field, and the sealed
+// static and timestamp fields all precede it.
+const curveHeaderDigestOffset = HeaderCommonSize + PublicKeySize +
+	(PublicKeySizeEx + GCMTagSize) + (PublicKeySize + GCMTagSize) + (TimestampSize + GCMTagSize)

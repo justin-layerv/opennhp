@@ -44,4 +44,5 @@ const (
 	errNhpHubLSTCookieProofRequired      = 32019
 	errNhpInvalidHubLSTCookieProof       = 32020
 	errNhpInvalidHubLSTFlags             = 32021
+	errNhpUnsupportedProtocolVersion     = 32022
 )
