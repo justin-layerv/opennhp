@@ -2925,6 +2925,174 @@ def run_checker_cli(
 
 
 
+class OpenEdgeFencedTopologyAcceptanceTests(unittest.TestCase):
+    """The full topology fixture must pass in BOTH the fenced and open shapes.
+
+    This is the integration counterpart to the unit cases below. #3701's plan
+    gate refused exactly these two assertions against main's checker; this proves
+    the same graph is admitted here once the edge is open, and -- just as
+    important -- that the fenced graph is still admitted, since the live estate
+    stays fenced until the reviewed applies land.
+    """
+
+    @staticmethod
+    def _open_the_edge(plan: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite the fenced fixture's public NLB ingress into the open shape."""
+        fenced = checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR
+        opened = checker.EXPECTED_SANDBOX_OPEN_EDGE_CIDR
+        for change in plan["resource_changes"]:
+            address = str(change.get("address", ""))
+            if f'server_nlb_udp["{fenced}"]' not in address:
+                continue
+            change["address"] = address.replace(
+                f'server_nlb_udp["{fenced}"]', f'server_nlb_udp["{opened}"]'
+            )
+            for state in ("before", "after"):
+                values = (change.get("change") or {}).get(state)
+                if isinstance(values, dict) and values.get("cidr_ipv4") == fenced:
+                    values["cidr_ipv4"] = opened
+        return plan
+
+    def test_fenced_topology_is_still_admitted(self) -> None:
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                source_fenced_plan(), require_udp_source_fenced_topology=True
+            ),
+        )
+
+    def test_open_topology_is_admitted(self) -> None:
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                self._open_the_edge(source_fenced_plan()),
+                require_udp_source_fenced_topology=True,
+            ),
+        )
+
+    def test_open_topology_still_refuses_an_internet_wide_target_rule(self) -> None:
+        """Opening the NLB must not open the instances behind it."""
+        plan = self._open_the_edge(source_fenced_plan())
+        for change in plan["resource_changes"]:
+            if "server_nhp_udp_nlb" in str(change.get("address", "")):
+                after = (change.get("change") or {}).get("after")
+                if isinstance(after, dict):
+                    after["cidr_ipv4"] = checker.EXPECTED_SANDBOX_OPEN_EDGE_CIDR
+                    after["referenced_security_group_id"] = None
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertNotEqual(
+            [], errors, "an internet-wide target SG rule must still be refused"
+        )
+
+
+class OpenEdgeTransitionBoundaryTests(unittest.TestCase):
+    """The fence-to-open swap is a third reviewed boundary shape.
+
+    Opening sandbox (qurl-go ADR 0001) replaces the proof-runner /32 ingress
+    rule with 0.0.0.0/0 on the same public NLB security group. It is admitted on
+    its own exact terms; anything that is not that exact pair falls through to
+    the normal refusal.
+    """
+
+    COMPUTE = "module.nhp.module.compute"
+    RULE = "aws_vpc_security_group_ingress_rule.server_nlb_udp"
+
+    def _delete(self, cidr=checker.EXPECTED_SANDBOX_PROOF_SOURCE_CIDR, **over):
+        before = {
+            "from_port": 443,
+            "to_port": 443,
+            "ip_protocol": "udp",
+            "cidr_ipv4": cidr,
+            "security_group_id": "sg-nlb",
+        }
+        before.update(over)
+        return {
+            "address": f'{self.COMPUTE}.{self.RULE}["{cidr}"]',
+            "mode": "managed",
+            "change": {"actions": ["delete"], "before": before, "after": None},
+        }
+
+    def _create(self, cidr=checker.EXPECTED_SANDBOX_OPEN_EDGE_CIDR, **over):
+        after = {
+            "from_port": 443,
+            "to_port": 443,
+            "ip_protocol": "udp",
+            "cidr_ipv4": cidr,
+            "security_group_id": "sg-nlb",
+        }
+        after.update(over)
+        return {
+            "address": f'{self.COMPUTE}.{self.RULE}["{cidr}"]',
+            "mode": "managed",
+            "change": {"actions": ["create"], "before": None, "after": after},
+        }
+
+    def test_complete_transition_is_admitted(self) -> None:
+        errors = checker.validate_dmz_boundary_noop(
+            {"resource_changes": [self._delete(), self._create()]},
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertEqual([], errors)
+
+    def test_delete_without_create_is_refused(self) -> None:
+        """Half the swap would black-hole the edge."""
+        errors = checker.validate_dmz_boundary_noop(
+            {"resource_changes": [self._delete()]},
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertNotEqual([], errors)
+
+    def test_create_without_delete_is_refused(self) -> None:
+        errors = checker.validate_dmz_boundary_noop(
+            {"resource_changes": [self._create()]},
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertNotEqual([], errors)
+
+    def test_moving_the_rule_to_another_security_group_is_refused(self) -> None:
+        """Same fields, different group, would change what is actually exposed."""
+        errors = checker.validate_dmz_boundary_noop(
+            {
+                "resource_changes": [
+                    self._delete(),
+                    self._create(security_group_id="sg-somewhere-else"),
+                ]
+            },
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertTrue(
+            any("same public" in error for error in errors),
+            f"expected a same-security-group refusal, got {errors}",
+        )
+
+    def test_wrong_open_port_is_refused(self) -> None:
+        errors = checker.validate_dmz_boundary_noop(
+            {
+                "resource_changes": [
+                    self._delete(),
+                    self._create(from_port=62206, to_port=62206),
+                ]
+            },
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertNotEqual([], errors)
+
+    def test_an_ordinary_apply_still_requires_a_noop_boundary(self) -> None:
+        """The new shape must not become a general boundary-mutation licence."""
+        errors = checker.validate_dmz_boundary_noop(
+            {
+                "resource_changes": [
+                    self._delete(),
+                    self._create(cidr="198.51.100.7/32"),
+                ]
+            },
+            allow_udp_source_fence_replacement=True,
+        )
+        self.assertNotEqual([], errors)
+
+
 class ClientEdgePortMigrationBoundaryTests(unittest.TestCase):
     """The 62206 -> 443 client-edge move is its own reviewed boundary shape.
 

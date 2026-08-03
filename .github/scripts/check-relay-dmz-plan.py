@@ -82,6 +82,16 @@ EXPECTED_SANDBOX_FENCED_SERVER_NLB_NAME = "layerv-nhp-sandbox-edge"
 # migration gate must move in lockstep with #3453's
 # public_nhp_udp_ingress_cidrs input if the proof-runner EIP is replaced.
 EXPECTED_SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# The open sandbox edge (qurl-go ADR 0001): sandbox admits developers inside and
+# outside the company on UDP 443. This checker accepts BOTH edges during the
+# transition -- the fence is still live until the reviewed applies land, and this
+# gate runs against the fenced estate in between. Drop the fenced value and this
+# dual acceptance once the applies are recorded.
+EXPECTED_SANDBOX_OPEN_EDGE_CIDR = "0.0.0.0/0"
+ACCEPTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDRS = (
+    EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
+    EXPECTED_SANDBOX_OPEN_EDGE_CIDR,
+)
 # Pin the reviewed sandbox AC pool: blue/green max_capacity=3 needs 2x plus
 # one refresh-slack EIP. Move this with modules/ac/eip.tf's eip_count contract.
 EXPECTED_SANDBOX_AC_EIP_COUNT = 7
@@ -1005,6 +1015,96 @@ def _client_edge_port_migration_addresses() -> "frozenset[str]":
     )
 
 
+def _open_edge_transition_addresses() -> "tuple[str, str]":
+    """The exact pair the fence-to-open transition is allowed to touch."""
+    compute = "module.nhp.module.compute"
+    rule = "aws_vpc_security_group_ingress_rule.server_nlb_udp"
+    return (
+        f'{compute}.{rule}["{EXPECTED_SANDBOX_PROOF_SOURCE_CIDR}"]',
+        f'{compute}.{rule}["{EXPECTED_SANDBOX_OPEN_EDGE_CIDR}"]',
+    )
+
+
+def validate_udp_open_edge_transition(
+    boundary_changes: list[dict[str, Any]],
+) -> "list[str] | None":
+    """Admit ONLY the complete fence-to-open edge swap, or nothing.
+
+    Opening sandbox to developers inside and outside the company (qurl-go ADR
+    0001) replaces the proof-runner /32 ingress rule with an 0.0.0.0/0 rule on
+    the same public NLB security group. That is a third reviewed boundary shape,
+    distinct from the source-fence replacement and the client-edge port move, so
+    it gets its own explicit shape rather than a relaxation of either.
+
+    All-or-nothing on purpose. A plan that deleted the fence without creating
+    the open rule would black-hole the edge; one that created the open rule
+    without deleting the fence would leave a redundant rule behind and hide a
+    half-applied migration. Returns None when this is not the transition at all,
+    so callers fall through to the normal refusal.
+
+    Remove once the three sandbox applies are recorded, together with
+    EXPECTED_SANDBOX_OPEN_EDGE_CIDR's dual acceptance above.
+    """
+    fenced_address, open_address = _open_edge_transition_addresses()
+    mutations = {
+        str(raw.get("address", "")): raw
+        for raw in boundary_changes
+        if tuple((raw.get("change") or {}).get("actions") or ()) != ("no-op",)
+    }
+    if not mutations or set(mutations) != {fenced_address, open_address}:
+        return None
+
+    errors: list[str] = []
+    fenced = mutations[fenced_address]
+    fenced_change = fenced.get("change") or {}
+    if (
+        tuple(fenced_change.get("actions") or ()) != ("delete",)
+        or fenced_change.get("after") is not None
+        or (fenced.get("deposed") is not None)
+        or (fenced_change.get("before") or {}).get("cidr_ipv4")
+        != EXPECTED_SANDBOX_PROOF_SOURCE_CIDR
+        or (fenced_change.get("before") or {}).get("ip_protocol") != "udp"
+        or (fenced_change.get("before") or {}).get("from_port")
+        != EXPECTED_NHP_CLIENT_EDGE_PORT
+        or (fenced_change.get("before") or {}).get("to_port")
+        != EXPECTED_NHP_CLIENT_EDGE_PORT
+    ):
+        errors.append(
+            "open-edge transition must delete exactly the proof-runner /32 UDP "
+            f"{EXPECTED_NHP_CLIENT_EDGE_PORT} ingress rule"
+        )
+
+    opened = mutations[open_address]
+    opened_change = opened.get("change") or {}
+    opened_after = opened_change.get("after") or {}
+    if (
+        tuple(opened_change.get("actions") or ()) != ("create",)
+        or opened_change.get("before") is not None
+        or (opened.get("deposed") is not None)
+        or opened_after.get("cidr_ipv4") != EXPECTED_SANDBOX_OPEN_EDGE_CIDR
+        or opened_after.get("ip_protocol") != "udp"
+        or opened_after.get("from_port") != EXPECTED_NHP_CLIENT_EDGE_PORT
+        or opened_after.get("to_port") != EXPECTED_NHP_CLIENT_EDGE_PORT
+    ):
+        errors.append(
+            "open-edge transition must create exactly the 0.0.0.0/0 UDP "
+            f"{EXPECTED_NHP_CLIENT_EDGE_PORT} ingress rule"
+        )
+
+    # Both rules must live on the same public NLB security group: a swap that
+    # moved the admitted source onto a different group would pass the two field
+    # checks above while changing what is actually exposed.
+    fenced_sg = (fenced_change.get("before") or {}).get("security_group_id")
+    opened_sg = opened_after.get("security_group_id")
+    if not errors and fenced_sg is not None and opened_sg is not None:
+        if fenced_sg != opened_sg:
+            errors.append(
+                "open-edge transition must keep both rules on the same public "
+                "NLB security group"
+            )
+    return errors
+
+
 def validate_udp_client_edge_port_migration(
     boundary_changes: list[dict[str, Any]],
 ) -> "list[str] | None":
@@ -1100,6 +1200,13 @@ def validate_dmz_boundary_noop(
     client_edge_errors = validate_udp_client_edge_port_migration(boundary_changes)
     if client_edge_errors is not None:
         return errors + client_edge_errors
+
+    # The fence-to-open swap is a third reviewed boundary shape, checked here for
+    # the same reason: admit it on its own exact terms rather than by loosening
+    # the fence contract for everything else.
+    open_edge_errors = validate_udp_open_edge_transition(boundary_changes)
+    if open_edge_errors is not None:
+        return errors + open_edge_errors
 
     for raw in boundary_changes:
         address = str(raw.get("address", ""))
@@ -4836,8 +4943,9 @@ def validate_plan(
             and nlb_public_ingress[0].values.get("to_port")
             == EXPECTED_NHP_CLIENT_EDGE_PORT
             and nlb_public_ingress[0].values.get("cidr_ipv4")
-            == EXPECTED_SANDBOX_PROOF_SOURCE_CIDR,
-            "assigned cell public NLB ingress must be exactly proof-runner /32 UDP 443",
+            in ACCEPTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDRS,
+            "assigned cell public NLB ingress must be exactly the proof-runner /32 "
+            "or the open sandbox edge on UDP 443",
         )
         nlb_public_ingress_config = config_resource(
             v,
@@ -5145,9 +5253,27 @@ def validate_plan(
             "assigned-cell compute planned UDP-capable ingress inventory must contain only proof, NLB-scoped target, in-VPC AC, and relay rules",
         )
 
+        # Once the open edge lands (qurl-go ADR 0001) the public NLB rule is
+        # internet-wide by decision. Everything else must stay narrow -- in
+        # particular the server target SG, which the checks below still require
+        # to be NLB-scoped. That is the invariant that protects the backend: the
+        # load balancer is public, the instances behind it are not.
+        #
+        # The exclusion is by resource name, which assumes server_nlb_udp only
+        # ever attaches to the public NLB SG. modules/compute/main.tf holds that:
+        # it is the sole for_each over public_nhp_udp_ingress_cidrs and its
+        # security_group_id is aws_security_group.server_nlb[0].id. The
+        # steady-state check above re-proves that SG reference explicitly, so a
+        # future same-named rule on a different SG is still caught there; if this
+        # rule is ever duplicated or renamed, revisit this exclusion.
         v.require(
-            not any(public_udp_capable_rule(resource) for resource in compute),
-            "assigned-cell compute must not contain internet-wide UDP ingress",
+            not any(
+                public_udp_capable_rule(resource)
+                for resource in compute
+                if resource.name != "server_nlb_udp"
+            ),
+            "assigned-cell compute must not contain internet-wide UDP ingress "
+            "outside the reviewed public NLB rule",
         )
         nlb_egress_specs = (
             ("server_nlb_udp", "udp", EXPECTED_NHP_SERVER_PORT),
