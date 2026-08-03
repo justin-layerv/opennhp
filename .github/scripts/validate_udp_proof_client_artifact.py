@@ -1508,7 +1508,10 @@ def validate_files(
             or evidence["pre_removal_deployment_sha256"] is not None
         ):
             raise ClientArtifactError("pre-removal client evidence has prior lineage")
-    else:
+    elif pre_removal_run_id or evidence["pre_removal_run_id"] is not None:
+        # Paired lineage: post_removal quoting a specific pre_removal run must
+        # still match it exactly, so an operator cannot swap in a different
+        # run's evidence.
         _positive_int_string(pre_removal_run_id, "pre-removal run ID")
         if evidence["pre_removal_run_id"] != pre_removal_run_id:
             raise ClientArtifactError("post-removal client evidence run lineage drift")
@@ -1520,6 +1523,28 @@ def validate_files(
             evidence["pre_removal_deployment_sha256"],
             "pre-removal deployment SHA-256",
         )
+    else:
+        # Unpaired post_removal. The sandbox HTTP retirement was applied before
+        # the proof ever gated it, so the "HTTP present and UDP working"
+        # observation was never taken and cannot be reconstructed from current
+        # state -- there is no pre_removal run to pair with, and pre_removal is
+        # itself unsatisfiable now that all 25 governed resources are gone.
+        #
+        # This narrows what the gate certifies, deliberately and only here: it
+        # proves the UDP substrate works with the HTTP surface absent, not that
+        # it kept working ACROSS the removal. Everything else about the phase is
+        # unchanged -- the retirement targets must still be observed absent and
+        # the deployment/canary provenance still has to authenticate.
+        #
+        # Fails closed on half-lineage: a run carrying one pre-removal field but
+        # not the others is rejected rather than treated as unpaired.
+        if (
+            evidence["pre_removal_evidence_sha256"] is not None
+            or evidence["pre_removal_deployment_sha256"] is not None
+        ):
+            raise ClientArtifactError(
+                "post-removal client evidence has partial pre-removal lineage"
+            )
 
     if client == "connector":
         if evidence["input_outcome"] != "success" or not isinstance(

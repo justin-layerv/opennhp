@@ -27,6 +27,7 @@ sys.path.insert(0, str(TESTS))
 
 import test_udp_proof_deployment_contract as producer_fixture  # noqa: E402
 import udp_proof_deployment_contract as contract  # noqa: E402
+import udp_proof_retirement_targets_contract as retirement_targets  # noqa: E402
 
 
 VALIDATOR_PATH = SCRIPTS / "validate_udp_proof_client_artifact.py"
@@ -621,11 +622,18 @@ def runtime_probe(phase: str) -> dict[str, object]:
 
 
 def retirement_targets_raw(phase: str) -> bytes:
-    route53 = lambda host, zone: {  # noqa: E731
-        "alias_dns_name": f"dualstack.{host}",
-        "record_name": host,
-        "zone_id": zone,
-    }
+    # The retired hosts only have an alias before the retirement applies; after
+    # it, post_removal asserts absence.
+    # The retired HTTP hosts only have an alias before the retirement applies;
+    # after it, post_removal asserts absence. The relay is NOT retired, so it
+    # keeps its alias in both phases.
+    def route53(host, zone, *, retired=True):
+        present = phase == "pre_removal" or not retired
+        return {
+            "alias_dns_name": f"dualstack.{host}" if present else None,
+            "record_name": host,
+            "zone_id": zone,
+        }
     document = {
         "gate": "udp_lifecycle_retirement",
         "http_operations": [
@@ -684,7 +692,9 @@ def retirement_targets_raw(phase: str) -> bytes:
             ],
             "base_url": "https://relay.qurl.link.layerv.xyz",
             "route53": route53(
-                "relay.qurl.link.layerv.xyz", "Z10394893FM38A1RXLL32"
+                "relay.qurl.link.layerv.xyz",
+                "Z10394893FM38A1RXLL32",
+                retired=False,
             ),
             "ssm": {
                 "name": "/sandbox/nhp/qurl/relay-url",
@@ -1296,6 +1306,85 @@ class FilesTest(unittest.TestCase):
                         "connector",
                         manifest_raw,
                         runtime_raw,
+                    )
+
+    def test_post_removal_rejects_a_surviving_retirement_alias(self) -> None:
+        """A retired host that still resolves must fail post_removal.
+
+        post_removal no longer requires a paired pre_removal run, so the
+        absence assertion is the only thing left proving the HTTP surface is
+        actually gone. If a surviving alias were merely recorded rather than
+        refused, the phase would certify nothing about the removal.
+        """
+        document = json.loads(
+            retirement_targets_raw("post_removal").decode("utf-8")
+        )
+        # Sanity: the honest post-removal shape validates.
+        retirement_targets.validate(
+            document,
+            proof_phase="post_removal",
+            producer_run_id=PRODUCER_RUN_ID,
+            producer_run_attempt=PRODUCER_RUN_ATTEMPT,
+            producer_head_sha=PRODUCER_HEAD_SHA,
+            deployment_provenance_sha256="a" * 64,
+        )
+        document["http_operations"][0]["route53"]["alias_dns_name"] = (
+            "dualstack.bootstrap.layerv.xyz"
+        )
+        with self.assertRaisesRegex(
+            retirement_targets.TargetsError, "must be absent"
+        ):
+            retirement_targets.validate(
+                document,
+                proof_phase="post_removal",
+                producer_run_id=PRODUCER_RUN_ID,
+                producer_run_attempt=PRODUCER_RUN_ATTEMPT,
+                producer_head_sha=PRODUCER_HEAD_SHA,
+                deployment_provenance_sha256="a" * 64,
+            )
+
+    def test_post_removal_rejects_partial_pre_removal_lineage(self) -> None:
+        """Half a lineage is drift, not an unpaired run.
+
+        The sandbox HTTP retirement applied before the proof ever gated it, so
+        post_removal is admitted with NO pre-removal lineage at all. That path
+        must not become a hole: a document carrying one pre-removal field while
+        pre_removal_run_id is null is a truncated or mismatched pairing and
+        fails closed rather than being read as unpaired.
+        """
+        for field in (
+            "pre_removal_evidence_sha256",
+            "pre_removal_deployment_sha256",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                manifest_raw, runtime_raw = write_client_files(
+                    directory, "connector", phase="post_removal"
+                )
+                path = directory / "strict-sandbox-proof.evidence.json"
+                document = json.loads(path.read_text(encoding="utf-8"))
+                # Genuinely unpaired: no run id, but one lineage digest left over.
+                document["pre_removal_run_id"] = None
+                document["pre_removal_evidence_sha256"] = None
+                document["pre_removal_deployment_sha256"] = None
+                document[field] = "a" * 64
+                path.write_bytes(
+                    canonical(
+                        document,
+                        validator.MAX_EVIDENCE_BYTES,
+                        path.name,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    validator.ClientArtifactError,
+                    "partial pre-removal lineage",
+                ):
+                    validate_files(
+                        directory,
+                        "connector",
+                        manifest_raw,
+                        runtime_raw,
+                        phase="post_removal",
                     )
 
     def test_rejects_manifest_bytes_drift(self) -> None:

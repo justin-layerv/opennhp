@@ -74,16 +74,30 @@ def _positive(value: Any, name: str) -> int:
     return value
 
 
-def _route53(value: Any, *, host: str, zone_id: str, name: str) -> dict[str, Any]:
+def _route53(
+    value: Any,
+    *,
+    host: str,
+    zone_id: str,
+    name: str,
+    expect_present: bool = True,
+) -> dict[str, Any]:
     route = _exact(
         value,
         {"alias_dns_name", "record_name", "zone_id"},
         name,
     )
+    if route["zone_id"] != zone_id or route["record_name"] != host:
+        raise TargetsError(f"{name} is not the exact observed Route53 alias")
+    if not expect_present:
+        # post_removal records the retired host's alias as gone. None is the
+        # only accepted value: a DNS name here would mean the surface survived
+        # the retirement, which must fail rather than be recorded as observed.
+        if route["alias_dns_name"] is not None:
+            raise TargetsError(f"{name} must be absent after the retirement applied")
+        return route
     if (
-        route["zone_id"] != zone_id
-        or route["record_name"] != host
-        or not isinstance(route["alias_dns_name"], str)
+        not isinstance(route["alias_dns_name"], str)
         or DNS_NAME_RE.fullmatch(route["alias_dns_name"]) is None
     ):
         raise TargetsError(f"{name} is not the exact observed Route53 alias")
@@ -200,6 +214,7 @@ def validate(
             host=host,
             zone_id=zone_id,
             name=f"retirement HTTP operation {index} Route53",
+            expect_present=proof_phase == "pre_removal",
         )
 
     relay = _exact(

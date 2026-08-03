@@ -20,7 +20,17 @@ import udp_proof_retirement_targets_contract as targets
 QURL_SURFACE_PATH = "tests/e2e/nativeudp/retired_lifecycle_surface.json"
 
 
-def _alias(host: str, zone_id: str) -> dict[str, str]:
+def _alias(
+    host: str, zone_id: str, *, expect_present: bool = True
+) -> dict[str, str | None]:
+    """Observe a retirement target's Route53 alias, or prove it is gone.
+
+    The retired HTTP hosts only have an alias BEFORE the retirement applies.
+    Requiring one unconditionally made post_removal -- the phase whose whole
+    premise is that the surface is gone -- unsatisfiable the moment the
+    retirement succeeded. Absence is the stronger post-removal claim, so it is
+    asserted rather than skipped: a surviving record still fails the phase.
+    """
     response = evidence._aws(
         "route53",
         [
@@ -46,7 +56,15 @@ def _alias(host: str, zone_id: str) -> dict[str, str]:
         and row.get("Name") == f"{host}."
         and row.get("Type") == "A"
     ]
-    if not isinstance(records, list) or len(records) > 10 or len(matches) != 1:
+    if not isinstance(records, list) or len(records) > 10:
+        raise targets.TargetsError(f"{host} Route53 lookup is not a bounded record set")
+    if not expect_present:
+        if matches:
+            raise targets.TargetsError(
+                f"{host} still has an A alias after the retirement applied"
+            )
+        return {"alias_dns_name": None, "record_name": host, "zone_id": zone_id}
+    if len(matches) != 1:
         raise targets.TargetsError(f"{host} does not have one exact A alias")
     record = matches[0]
     if set(record) != {"AliasTarget", "Name", "Type"}:
@@ -160,8 +178,11 @@ def collect(
     relay_parameter = evidence._ssm_parameter(targets.RELAY_PARAMETER)
     if relay_parameter["Value"] != targets.RELAY_BASE_URL:
         raise targets.TargetsError("relay SSM value differs from the public target")
+    # The retired HTTP hosts are present only before the retirement applies.
+    # relay.qurl.link.layerv.xyz below is NOT retired and stays present in both
+    # phases, so it keeps the unconditional lookup.
     route53_by_host = {
-        host: _alias(host, zone_id)
+        host: _alias(host, zone_id, expect_present=proof_phase == "pre_removal")
         for host, _, _, zone_id in targets.HTTP_OPERATIONS
     }
     route53_by_host["relay.qurl.link.layerv.xyz"] = _alias(
