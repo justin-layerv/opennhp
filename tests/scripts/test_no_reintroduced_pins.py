@@ -166,6 +166,15 @@ class NoReintroducedPinsTest(unittest.TestCase):
             r'!=\s*candidate\["head_sha"\]',
             "no client identity may be an equality check against a resolved head",
         )
+        # Third spelling: comparing to, or string-building from, the RESOLVED
+        # candidate map. Suffixing an artifact name with candidates[...] pins
+        # just as hard as `!=` does.
+        self.assertNotRegex(
+            collector,
+            r"candidates\[[^\]]+\]\[[\"']head_sha[\"']\]",
+            "client identity must come from the canary's own evidence, never "
+            "from the resolved candidate map",
+        )
 
     def test_the_guard_is_not_vacuous(self) -> None:
         for path in PROOF_SURFACE:

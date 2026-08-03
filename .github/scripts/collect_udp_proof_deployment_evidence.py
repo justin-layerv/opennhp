@@ -4102,12 +4102,20 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
         or not contract.CANARY_EVIDENCE_ARTIFACT_RE.fullmatch(
             str(canary.get("artifact_name") or "")
         )
+        # The artifact name must identify the commit THIS canary was built from,
+        # not whatever main has since become. Suffixing the resolved candidate
+        # was the same self-re-acquiring pin removed in #3698/#3699: both clients
+        # merge continuously, so main routinely advances between the canary build
+        # and this validation.
         or not str(canary.get("artifact_name") or "").endswith(
-            f"{candidates['qurl_connector']['head_sha']}"
+            f"{canary['head_sha']}"
         )
         or canary["image_ref"]
         != f"ghcr.io/layervai/qurl-connector-canary@{canary['image_digest']}"
-        or canary["qurl_go_sha"] != candidates["qurl_go"]["head_sha"]
+        or not _canary_commit_is_in_main(
+            "layervai/qurl-connector", canary["head_sha"]
+        )
+        or not _canary_commit_is_in_main("layervai/qurl-go", canary["qurl_go_sha"])
     ):
         raise EvidenceError("GitHub evidence canary identity drift")
     for field in ("run_id", "run_attempt", "artifact_id", "artifact_size"):
