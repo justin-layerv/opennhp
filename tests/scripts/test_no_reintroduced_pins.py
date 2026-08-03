@@ -153,6 +153,19 @@ class NoReintroducedPinsTest(unittest.TestCase):
             r'!=\s*metadata\["candidates"\]\["qurl_go"\]\["head_sha"\]',
             "qurl-go identity must not be an equality check against resolved main",
         )
+        # The same pin wearing the Connector's clothes: comparing the published
+        # canary's head_sha to the resolved candidate is equality against a
+        # moving head, and reachability already answers the real question.
+        self.assertNotRegex(
+            collector,
+            r'published\["head_sha"\]\s*!=\s*candidate\["head_sha"\]',
+            "the published canary must not be pinned to the resolved candidate head",
+        )
+        self.assertNotRegex(
+            collector,
+            r'!=\s*candidate\["head_sha"\]',
+            "no client identity may be an equality check against a resolved head",
+        )
 
     def test_the_guard_is_not_vacuous(self) -> None:
         for path in PROOF_SURFACE:

@@ -1000,7 +1000,15 @@ def validate_canary_files(
         or not _is_optional_pull_request_number(published.get("pr_number"))
         or not _canary_commit_is_in_main("layervai/qurl-connector", published["head_sha"])
         or published["head_ref"] != candidate["head_ref"]
-        or published["head_sha"] != candidate["head_sha"]
+        # NO head_sha equality against the resolved candidate. Reachability
+        # directly above already answers "is this image main's code", and
+        # equality additionally demanded "and main has not moved since", which
+        # is the same self-re-acquiring pin removed for qurl-go: the Connector
+        # merges continuously, so main routinely advances between the canary
+        # build and this validation, invalidating an image that was correct when
+        # built. head_ref still pins WHICH branch, and image_digest /
+        # provenance_sha256 / workflow_run below still bind the artifact to the
+        # exact run that produced it.
         or not isinstance(image_ref, str)
         or not IMAGE_REF_RE.fullmatch(image_ref)
         or published["image_digest"] != image_digest
