@@ -317,16 +317,30 @@ func TestHubLSTCookieDerivationKAT(t *testing.T) {
 	}
 }
 
+// The three inputs and the expected output below are one KAT that also exists in
+// layervai/qurl-conformance (vectors/connector_hub_lst_cookie_v1_vectors.json,
+// proof_digest_kat). They are hand-copied, so a one-sided edit would split the
+// two repos silently; the `nhp-golden-vector` markers are what
+// scripts/check-hub-lst-kat-drift.sh extracts to compare them. Keep the marker
+// comment directly after the quoted literal — that is the shape the extractor
+// matches (see scripts/check-golden-vectors.sh for the shared convention).
+const (
+	hubLSTProofServerPubKeyHex = "4d27bcee3135c4944b28d27dd809b07be10c35160d20131caa7e85575498d07c"                                                                                                                                                                                                                                                                                                                                                                 // nhp-golden-vector: hub-lst-proof-server-static-pubkey
+	hubLSTProofHeaderPrefixHex = "c1d2e3f4c1d7e331010100040000000000000000000000173a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe240000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e51c96e754bba5426ed4b5d6cf38cb3c173568c29010c70049925f42dd10c0c1cecf72766c7475288fd5da54d18c2cf7f6656361fcaefc4c25c8f5069da44db732656a2e235c7212" // nhp-golden-vector: hub-lst-proof-header-prefix
+	hubLSTProofRawCookieHex    = "606fc2b99882d8dc6254d89a8756493c5183d068c07475005127f1adf8ebacb6"                                                                                                                                                                                                                                                                                                                                                                 // nhp-golden-vector: hub-lst-proof-raw-cookie
+	hubLSTProofExpectedDigest  = "394bf178250b4d78461193415e8c7f15b632b6b58a560b1ffb14f505583f0c30"                                                                                                                                                                                                                                                                                                                                                                 // nhp-golden-vector: hub-lst-proof-expected-digest
+)
+
 func TestHubLSTCookieProofDigestKAT(t *testing.T) {
-	serverPublicKey, err := hex.DecodeString("4d27bcee3135c4944b28d27dd809b07be10c35160d20131caa7e85575498d07c")
+	serverPublicKey, err := hex.DecodeString(hubLSTProofServerPubKeyHex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	headerPrefix, err := hex.DecodeString("c1d2e3f4c1d7e331010100040000000000000000000000173a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe240000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e51c96e754bba5426ed4b5d6cf38cb3c173568c29010c70049925f42dd10c0c1cecf72766c7475288fd5da54d18c2cf7f6656361fcaefc4c25c8f5069da44db732656a2e235c7212")
+	headerPrefix, err := hex.DecodeString(hubLSTProofHeaderPrefixHex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cookie, err := hex.DecodeString("606fc2b99882d8dc6254d89a8756493c5183d068c07475005127f1adf8ebacb6")
+	cookie, err := hex.DecodeString(hubLSTProofRawCookieHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +362,7 @@ func TestHubLSTCookieProofDigestKAT(t *testing.T) {
 	h.Write(serverPublicKey)
 	h.Write(headerPrefix)
 	h.Write(cookie)
-	if got, want := hex.EncodeToString(h.Sum(nil)), "394bf178250b4d78461193415e8c7f15b632b6b58a560b1ffb14f505583f0c30"; got != want {
+	if got, want := hex.EncodeToString(h.Sum(nil)), hubLSTProofExpectedDigest; got != want {
 		t.Fatalf("proof digest = %s, want %s", got, want)
 	}
 }

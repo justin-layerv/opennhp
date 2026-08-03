@@ -416,6 +416,14 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	// CheckRecvHeaderType allowlist, and the counter is bound as the GCM nonce.
 	// Closing it needs a header-only AEAD (a second tag on the wire), which is a
 	// separate framing change; do not "fix" it by sealing a synthetic body.
+	//
+	// The version field is in that same unauthenticated span, so the receiver's
+	// version gate is NOT a security control for these packets: anyone holding
+	// the responder's static PUBLIC key can set any admitted version and
+	// re-stamp the digest. Containment is the type allowlist and the nonce
+	// binding above, nothing else. TestDecryptBody_EmptyBodyHeaderIsNotAADBound
+	// pins that residual; when the header-only AEAD lands, that test is the one
+	// that must change.
 	if len(mad.bodyMessage) == 0 {
 		// set header type and payload size
 		mad.header.SetTypeAndPayloadSize(mad.HeaderType, 0)

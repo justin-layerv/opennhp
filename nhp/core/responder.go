@@ -388,9 +388,28 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	// Version gate, ahead of every key agreement. A sender below 1.1 does not
 	// fold the HeaderCommon into the body AAD, so its body tag can never verify
 	// here; reporting that as a version mismatch rather than an AEAD failure is
-	// what makes a staged rollout diagnosable. NHP_KPL never reaches this
-	// function (device.go short-circuits it) and carries no AEAD, so keepalives
-	// from an older peer are unaffected.
+	// what makes a staged rollout diagnosable.
+	//
+	// THIS GATE IS A DIAGNOSABILITY AID, NOT A SECURITY BOUNDARY. The version
+	// lives in HeaderCommon, which is read here before anything authenticates
+	// it. On a packet that carries a body the fold below makes any edit fail the
+	// Open, so the gate is backed. On an EMPTY-BODY packet nothing is: no AEAD
+	// runs, so an off-path attacker holding only the responder's static PUBLIC
+	// key can set any admitted version and re-stamp the unkeyed digest — exactly
+	// what restampHeaderDigest does in responder_test.go. Do not later treat a
+	// passing version check as evidence of anything about an empty-body packet.
+	// Containment there is the CheckRecvHeaderType allowlist and the counter's
+	// binding as the GCM nonce; see the residual-gap note in initiator.go
+	// encryptBody.
+	//
+	// NHP_KPL never reaches this function and carries no AEAD, so keepalives
+	// from an older peer are unaffected. Two separate mechanisms hold that:
+	// the synchronous entry point short-circuits it directly (device.go
+	// PacketToMsg, on the RecvPrecheck type), and on the asynchronous path every
+	// endpoint receive loop drops it before RecvPacketToMsg ever queues it
+	// (endpoints/{agent/udpagent,server/udpserver,ac/udpac,db/udpdevice}.go).
+	// packetToMsgRoutine itself does NOT re-check, so a new caller that queues
+	// raw datagrams must drop NHP_KPL itself.
 	if major, minor := ppd.header.Version(); major != ProtocolVersionMajor || minor < MinimumRecvProtocolVersionMinor {
 		err = ErrUnsupportedProtocolVersion
 		// bare return: caller's err defer expects named ppd populated

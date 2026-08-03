@@ -129,6 +129,9 @@ on:
       # script so an edit re-fires its shellcheck + the fixture test here; the
       # test file rides tests/scripts/** below.
       - "scripts/check-agent-reg-vector-drift.sh"
+      # Same split for the Hub LST proof-KAT drift check: its fixture test runs
+      # in THIS workflow, its live cross-repo fetch in hub-lst-kat-drift.yml.
+      - "scripts/check-hub-lst-kat-drift.sh"
       # All cross-language golden-vector files are listed so a one-sided edit to
       # ANY of them fires the Go↔TS cross-check (scripts/check-golden-vectors.sh)
       # — including the Go-side files, which the path-scoped js-agent.yml never

@@ -486,6 +486,8 @@ lint-workflows:
 	@bash tests/scripts/check-conformance-parity_test.sh
 	@shellcheck scripts/check-agent-reg-vector-drift.sh tests/scripts/check-agent-reg-vector-drift_test.sh
 	@bash tests/scripts/check-agent-reg-vector-drift_test.sh
+	@shellcheck scripts/check-hub-lst-kat-drift.sh tests/scripts/check-hub-lst-kat-drift_test.sh
+	@bash tests/scripts/check-hub-lst-kat-drift_test.sh
 	@shellcheck tests/scripts/check-hub-image-contract.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh

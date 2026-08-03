@@ -2,11 +2,14 @@ package core
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // TestShouldCheckRecvAttack_AOPNoLongerExempt is the regression
@@ -934,3 +937,218 @@ func restampHeaderDigest(t *testing.T, wire []byte, peerStaticPub []byte) {
 // static and timestamp fields all precede it.
 const curveHeaderDigestOffset = HeaderCommonSize + PublicKeySize +
 	(PublicKeySizeEx + GCMTagSize) + (PublicKeySize + GCMTagSize) + (TimestampSize + GCMTagSize)
+
+// wireTypeAndSize / setWireTypeAndSize read and rewrite the obfuscated
+// type+payload-size word straight on the wire, mirroring
+// curve.HeaderCurve.TypeAndPayloadSize / SetTypeAndPayloadSize. The setter takes
+// the preamble as a parameter (the real one randomizes it) so a test can hold the
+// logical type and size fixed while changing the serialized bytes, or the reverse.
+func wireTypeAndSize(wire []byte) (int, int) {
+	tns := binary.BigEndian.Uint32(wire[0:4]) ^ binary.BigEndian.Uint32(wire[4:8])
+	return int(tns >> 16), int(tns & 0xFFFF)
+}
+
+func setWireTypeAndSize(wire []byte, preamble uint32, headerType int, payloadSize int) {
+	binary.BigEndian.PutUint32(wire[0:4], preamble)
+	binary.BigEndian.PutUint32(wire[4:8], preamble^(uint32(payloadSize&0xFFFF)|uint32((headerType&0xFFFF)<<16)))
+}
+
+// headerTamperFixture is a registered agent/server pair that seals an ordinary
+// non-empty-body NHP_KNK. Unlike newHubLSTCookieFixture it uses a registered peer
+// and a type with no per-type header gate in front of the body open, so a
+// mutated HeaderCommon reaches the AEAD instead of tripping the peer-pool check
+// or the Hub LST flag validator first.
+type headerTamperFixture struct {
+	agent  *Device
+	server *Device
+	body   []byte
+}
+
+func newHeaderTamperFixture(t *testing.T) headerTamperFixture {
+	t.Helper()
+	silenceGlobalLogger(t)
+
+	agent := NewDevice(NHP_AGENT, validatePeerPrivateKey(0x11), nil)
+	server := NewDevice(NHP_SERVER, validatePeerPrivateKey(0x51), nil)
+	if agent == nil || server == nil {
+		t.Fatal("create header-tamper devices")
+	}
+	agent.AddPeer(&UdpPeer{PubKeyBase64: server.PublicKeyBase64(), Ip: "127.0.0.1", Port: 12346, Type: NHP_SERVER})
+	server.AddPeer(&UdpPeer{PubKeyBase64: agent.PublicKeyBase64(), Ip: "127.0.0.1", Port: 12345, Type: NHP_AGENT})
+
+	return headerTamperFixture{
+		agent:  agent,
+		server: server,
+		body:   []byte(`{"type":"knock","resource":"test-service","user":"alice"}`),
+	}
+}
+
+func (f headerTamperFixture) sealKnock(t *testing.T, counter uint64) []byte {
+	t.Helper()
+	mad, err := f.agent.MsgToPacket(&MsgData{
+		ConnData:      validatePeerConnectionData(f.agent, 12345, 12346),
+		PeerPk:        f.server.staticEcdh.PublicKey(),
+		HeaderType:    NHP_KNK,
+		TransactionId: counter,
+		Message:       f.body,
+	})
+	if err != nil {
+		t.Fatalf("seal NHP_KNK: %v", err)
+	}
+	return bytes.Clone(mad.BasePacket.Content)
+}
+
+func (f headerTamperFixture) parseOnServer(t *testing.T, wire []byte) (*PacketParserData, error) {
+	t.Helper()
+	headerType, _ := wireTypeAndSize(wire)
+	return f.server.PacketToMsg(&PacketData{
+		BasePacket: &Packet{Content: bytes.Clone(wire), HeaderType: headerType},
+		ConnData:   validatePeerConnectionData(f.server, 12346, 12345),
+		InitTime:   time.Now().UnixNano(),
+	})
+}
+
+// TestDecryptBody_RejectsHeaderCommonTamper is the direct fence for the protocol
+// 1.1 binding, on a packet that actually carries a body seal.
+//
+// Every subcase re-stamps the unkeyed header digest, which an off-path attacker
+// can do holding nothing but the responder's static PUBLIC key — so the digest
+// gate is deliberately defeated and cannot be what rejects the packet. Under 1.0
+// all of these were accepted verbatim: HeaderCommon was covered by that digest
+// and by nothing else. The body tag is the only thing that rejects them now,
+// which is why each subcase asserts ErrAEADDecryptionFailed specifically rather
+// than "some error".
+//
+// The mutations are chosen to reach the AEAD: each leaves the packet
+// structurally valid, so RecvPrecheck's type/length checks, the version gate and
+// the peer-pool lookup all pass and the body Open is the first thing that can
+// object.
+func TestDecryptBody_RejectsHeaderCommonTamper(t *testing.T) {
+	f := newHeaderTamperFixture(t)
+
+	// Baseline: the untouched packet round-trips. Without it the subcases below
+	// could all be passing because the fixture never reached the body seal.
+	ppd, err := f.parseOnServer(t, f.sealKnock(t, 20))
+	if err != nil {
+		t.Fatalf("untampered packet: %v", err)
+	}
+	if !bytes.Equal(ppd.BodyMessage, f.body) {
+		t.Fatalf("untampered body = %q, want %q", ppd.BodyMessage, f.body)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, wire []byte)
+	}{
+		{
+			// The original exploit this change closes: raising COMPRESS on a
+			// packet sealed uncompressed made the receiver hand its caller a raw
+			// zlib stream in place of the plaintext.
+			name: "compress flag raised",
+			mutate: func(t *testing.T, wire []byte) {
+				t.Helper()
+				binary.BigEndian.PutUint16(wire[10:12], common.NHP_FLAG_COMPRESS)
+			},
+		},
+		{
+			// Payload size held fixed so RecvPrecheck's total-length check still
+			// passes, and the swapped type stays inside the server's
+			// CheckRecvHeaderType allowlist; the type is the only thing that moves.
+			name: "header type swapped, payload size preserved",
+			mutate: func(t *testing.T, wire []byte) {
+				t.Helper()
+				headerType, size := wireTypeAndSize(wire)
+				if headerType != NHP_KNK {
+					t.Fatalf("fixture header type = %d, want NHP_KNK", headerType)
+				}
+				setWireTypeAndSize(wire, binary.BigEndian.Uint32(wire[0:4]), NHP_EXT, size)
+			},
+		},
+		{
+			// Same logical type and payload size, different serialized bytes.
+			// Nothing above the AEAD can even see this edit — it is the proof
+			// that the fold covers the header AS SERIALIZED, which is what lets
+			// the two implementations interoperate over the masked flag word and
+			// the obfuscated type+size field.
+			name: "preamble rewritten, type and payload size preserved",
+			mutate: func(t *testing.T, wire []byte) {
+				t.Helper()
+				headerType, size := wireTypeAndSize(wire)
+				setWireTypeAndSize(wire, ^binary.BigEndian.Uint32(wire[0:4]), headerType, size)
+				if gotType, gotSize := wireTypeAndSize(wire); gotType != headerType || gotSize != size {
+					t.Fatalf("re-encoded type/size = %d/%d, want %d/%d", gotType, gotSize, headerType, size)
+				}
+			},
+		},
+		{
+			// A minor above the floor is admitted by design, so the version gate
+			// passes and the fold is what catches it. This is the shape a future
+			// 1.2 with a different AAD would take on a deployed 1.1 receiver —
+			// see MinimumRecvProtocolVersionMinor in constants.go.
+			name: "version minor raised above the floor",
+			mutate: func(t *testing.T, wire []byte) {
+				t.Helper()
+				wire[9] = ProtocolVersionMinor + 1
+			},
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := f.sealKnock(t, uint64(30+i))
+			tc.mutate(t, wire)
+			restampHeaderDigest(t, wire, f.server.staticEcdh.PublicKey())
+
+			_, err := f.parseOnServer(t, wire)
+			assertNHPError(t, err, ErrAEADDecryptionFailed)
+		})
+	}
+}
+
+// TestDecryptBody_EmptyBodyHeaderIsNotAADBound pins the residual gap documented
+// at initiator.go encryptBody, so it stays a KNOWN limitation rather than
+// quietly becoming an assumed-closed one.
+//
+// This test asserts that a forgery SUCCEEDS. That is the point: an empty-body
+// packet runs no AEAD, so there is no tag to carry the HeaderCommon AAD and the
+// header is covered only by the unkeyed digest — which an off-path attacker
+// re-stamps with the responder's static PUBLIC key alone. The 1.1 binding does
+// not reach these packets, and the version gate in createPacketParserData does
+// not either: a minor at or above the floor is admitted by design, so the
+// attacker simply picks one. Containment is CheckRecvHeaderType and the counter's
+// binding as the GCM nonce.
+//
+// WHEN THE HEADER-ONLY AEAD LANDS, THIS TEST MUST FAIL and be rewritten to
+// assert rejection. Do not relax it to keep it green.
+func TestDecryptBody_EmptyBodyHeaderIsNotAADBound(t *testing.T) {
+	f := newHeaderTamperFixture(t)
+	f.body = nil
+
+	// Header and nothing else: this is the no-AEAD shape decryptBody early-returns
+	// on, not the tag-only body that sealEmptyAEADLST builds (which does fold).
+	wire := f.sealKnock(t, 40)
+	if got, want := len(wire), curveHeaderDigestOffset+HashSize; got != want {
+		t.Fatalf("empty-body packet length = %d, want header-only %d", got, want)
+	}
+
+	// The documented invariant: an empty-body packet still round-trips.
+	ppd, err := f.parseOnServer(t, wire)
+	if err != nil {
+		t.Fatalf("empty-body packet: %v", err)
+	}
+	if len(ppd.BodyMessage) != 0 {
+		t.Fatalf("empty-body BodyMessage = %q, want empty", ppd.BodyMessage)
+	}
+
+	// The documented residual: the same edit that
+	// TestDecryptBody_RejectsHeaderCommonTamper proves is caught on a
+	// body-carrying packet is accepted here.
+	tampered := f.sealKnock(t, 41)
+	tampered[9] = ProtocolVersionMinor + 1
+	restampHeaderDigest(t, tampered, f.server.staticEcdh.PublicKey())
+	if _, err := f.parseOnServer(t, tampered); err != nil {
+		t.Fatalf("empty-body header tamper = %v; the residual gap documented in "+
+			"initiator.go encryptBody says this is accepted. If a header-only AEAD "+
+			"now closes it, update that note and rewrite this test to assert rejection", err)
+	}
+}

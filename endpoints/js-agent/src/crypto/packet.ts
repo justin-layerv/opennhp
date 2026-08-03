@@ -63,7 +63,17 @@ export const PROTOCOL_VERSION_MINOR = 1;
 /** Oldest minor whose body AAD this codec can reproduce. A 1.0 sender folds a
  * shorter transcript, so its tag can never verify here; `decryptReply` refuses it
  * on the version so a mixed-version rollout is diagnosable instead of surfacing
- * as an unexplained AEAD failure. */
+ * as an unexplained AEAD failure.
+ *
+ * THE RULE FOR ANY FUTURE MINOR — this gate pins the major and FLOORS the minor,
+ * so it admits every minor at or above this value. That is only sound while every
+ * admitted minor produces the same body AAD transcript. A minor that changes the
+ * AAD MUST raise this constant in the same change, or be a major bump; a minor
+ * that does not affect the AAD is the only kind safe to admit silently. A browser
+ * running the old value will otherwise ADMIT the newer packet here and then fail
+ * the AEAD open with no attributable reason — and cached bundles cannot be
+ * retroactively taught. Moves in lockstep with MinimumRecvProtocolVersionMinor in
+ * `nhp/core/constants.go`. */
 export const MIN_PROTOCOL_VERSION_MINOR = 1;
 
 // Noise init constants (`nhp/core/constants.go`) — the literal UTF-8 bytes.

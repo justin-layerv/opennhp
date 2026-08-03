@@ -1,0 +1,95 @@
+# Detect cross-repo drift of the Hub LST cookie-proof digest KAT.
+#
+# nhp/core/hub_lst_cookie_test.go's TestHubLSTCookieProofDigestKAT and
+# layervai/qurl-conformance's vectors/connector_hub_lst_cookie_v1_vectors.json
+# (`proof_digest_kat`) are the SAME known-answer test written down twice: same
+# server static public key, same 208-byte header prefix, same raw cookie, same
+# expected BLAKE2s digest. The Go copy is hand-typed.
+#
+# THE GAP — the Go test only proves this repo's implementation agrees with this
+# repo's own copy of the answer. Regenerate the vectors upstream (or edit the Go
+# literal to quiet a failing test) and both sides stay internally consistent
+# while the two repos disagree about the wire; every suite stays green. The
+# protocol 1.1 header binding is exactly that shape: the header prefix carries
+# the version bytes, so the KAT moved in both repos at once and nothing compared
+# them. scripts/check-hub-lst-kat-drift.sh is that missing comparison.
+#
+# WHY NOT scripts/check-golden-vectors.sh — that fence pairs a Go file with a
+# TypeScript file INSIDE this repo. Markers alone cannot cover this KAT: the
+# js-agent implements no Hub LST cookie proof, so there is no in-repo second copy.
+# The drift is cross-REPO, which is the shape agent-reg-vector-drift.yml already
+# handles; this workflow follows it.
+#
+# WHY A DEDICATED WORKFLOW (vs. an existing job):
+#   - Like the agent-reg check, this reaches OVER THE NETWORK to another repo, so
+#     it does not belong in validate-workflows.yml's toolchain-free lint job.
+#   - The failure mode is invisible to any PR-triggered check when the canonical
+#     drifts while NOBODY touches nhp — there is no PR. So a weekly SCHEDULE is
+#     the primary trigger, plus PRs touching the KAT / script / this workflow.
+#   - The DECISION logic is unit-tested WITHOUT the network by
+#     tests/scripts/check-hub-lst-kat-drift_test.sh, which runs in
+#     validate-workflows.yml + `make lint-workflows`. This workflow runs the REAL
+#     fetch.
+#
+# ROBUSTNESS — the script SKIPs (exit 0) only on a transient fetch failure
+# (network / GitHub outage / rate-limit). It FAILS (exit 1) on a real
+# present-but-different drift AND on the canonical being absent (HTTP 404):
+# unlike the agent-reg check, our canonical IS published on the source ref, so a
+# 404 means it moved or was removed upstream and must alarm rather than skip.
+# The source ref is a single re-point knob in the script — `main` today, to be
+# re-pointed at a qurl-conformance release tag once one carries the 1.1 vectors
+# (v0.11.0 and earlier still hold the 1.0 KAT).
+#
+# BRANCH-PROTECTION NOTE — the pull_request trigger is path-filtered, so do NOT
+# make this check *required* as-is: GitHub leaves a required path-filtered check
+# "pending" forever on PRs that do not touch these paths (see the same note in
+# agent-reg-vector-drift.yml / js-agent.yml). Keep it non-required.
+name: hub LST KAT drift
+
+on:
+  schedule:
+    # Mondays 12:20 UTC — the shared fleet-watchdog slot, offset from
+    # agent-reg-vector-drift.yml's 12:00 so the two cross-repo fetches do not
+    # contend for the same API burst. Weekly is ample: the KAT is a frozen golden
+    # value, and any intentional change is a reviewed qurl-conformance PR.
+    - cron: "20 12 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "nhp/core/hub_lst_cookie_test.go"
+      - "scripts/check-hub-lst-kat-drift.sh"
+      - "tests/scripts/check-hub-lst-kat-drift_test.sh"
+      - ".github/workflows/hub-lst-kat-drift.yml"
+
+# Serialize cron + manual dispatches + PR runs on a ref so two runs can't race.
+concurrency:
+  group: "hub-lst-kat-drift-${{ github.head_ref || github.ref_name }}"
+  cancel-in-progress: true
+
+# Least privilege: the check only reads this repo's checkout and calls the
+# GitHub API (public read of qurl-conformance) with the default token.
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: canonical vs local Hub LST proof KAT
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Self-contained: the script fetches the canonical vectors (via `gh api`,
+      # authenticated by GITHUB_TOKEN) and compares the four marked values.
+      # Same command run locally and in CI. shellcheck it here too — actionlint's
+      # -shellcheck only covers workflow-embedded scripts, and the fixture test
+      # that guards the decision logic runs in validate-workflows.yml, not here.
+      - name: Check Hub LST proof KAT drift
+        env:
+          # `gh` reads GH_TOKEN; the default GITHUB_TOKEN can read the public
+          # qurl-conformance repo and avoids anonymous API rate limits.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shellcheck scripts/check-hub-lst-kat-drift.sh
+          bash scripts/check-hub-lst-kat-drift.sh

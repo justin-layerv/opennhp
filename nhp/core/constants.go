@@ -14,7 +14,28 @@ const ProtocolVersionMinor = 1
 // can reproduce. A 1.0 sender folds a shorter transcript, so its body tag can
 // never verify here; receivers reject it on the version instead, otherwise a
 // mixed-version rollout surfaces as an opaque AEAD failure that reads like key
-// mismatch or corruption. Raise this in lockstep with any further AAD change.
+// mismatch or corruption.
+//
+// THE RULE FOR ANY FUTURE MINOR — the receive gate pins the major and FLOORS the
+// minor, so it admits every minor at or above this constant. That is deliberate
+// (a compatible release must not strand deployed clients) and it is only sound
+// while every admitted minor produces the SAME body AAD transcript. So:
+//
+//   - A minor that does NOT affect the AAD is the only kind safe to ship without
+//     touching this constant. Admitting it silently is the point.
+//   - A minor that DOES affect the AAD — anything that changes what is folded
+//     into the chain hash, in what order, or in what serialization — MUST raise
+//     this constant in the same change, or be a major bump instead.
+//
+// Getting that wrong cannot be repaired later: a fielded receiver at the old
+// minor will ADMIT the new packet at this gate and then fail the body Open with
+// ErrAEADDecryptionFailed — reintroducing exactly the opaque, unattributable
+// failure this gate exists to remove, on nodes that can no longer be taught
+// otherwise. The floor is a promise to already-deployed receivers, not just a
+// switch for new ones.
+//
+// MIN_PROTOCOL_VERSION_MINOR in endpoints/js-agent/src/crypto/packet.ts is the
+// same gate for the browser codec and moves in lockstep with this constant.
 const MinimumRecvProtocolVersionMinor = 1
 
 // device
