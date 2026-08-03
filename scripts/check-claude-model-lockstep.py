@@ -38,7 +38,7 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 WORKFLOW_DIR = Path(".github/workflows")
 ACTION_REPOSITORY = "anthropics/claude-code-action"
-PROVEN_ACTION_REF = "fa7e2f0a29a126f0b81cdcf360561b36e44cf608"
+PROVEN_ACTION_REF = "be7b93b1907a4abad570368f3c74b6fe3807510b"
 PROVEN_MODELS = frozenset({"claude-opus-4-8"})
 
 

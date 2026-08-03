@@ -17,7 +17,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHECKER = REPO_ROOT / "scripts/check-claude-model-lockstep.py"
-CLAUDE_ACTION_REF = "fa7e2f0a29a126f0b81cdcf360561b36e44cf608"
+CLAUDE_ACTION_REF = "be7b93b1907a4abad570368f3c74b6fe3807510b"
 REVIEW_EVENTS = ("opened", "synchronize", "reopened", "ready_for_review")
 REVIEW_JOB_IF = (
     "github.event.pull_request.user.type != 'Bot' &&\n"
@@ -1089,7 +1089,7 @@ class ClaudeWorkflowRepositoryContractTest(unittest.TestCase):
                 "1",
             )
 
-            # Pinned v1.0.180 tag mode fetches and checks out the same-repo PR
+            # Pinned v1.0.183 tag mode fetches and checks out the same-repo PR
             # branch, then restores startup-sensitive paths from the exact base
             # ref in the credential-free local origin before Claude starts.
             git("fetch", "origin", "--depth=25", head_ref)
@@ -1324,7 +1324,7 @@ class ClaudeWorkflowRepositoryContractTest(unittest.TestCase):
                 )
 
     def test_local_origin_rejects_nonregular_sensitive_tree_entries(self) -> None:
-        """Fence v1.0.180's dereferencing .claude-pr snapshot behavior."""
+        """Fence v1.0.183's dereferencing .claude-pr snapshot behavior."""
         _, _, steps = self.load_contract(WORKFLOWS[0], "claude")
         cases = (
             ("symlink", ".claude/settings.json"),

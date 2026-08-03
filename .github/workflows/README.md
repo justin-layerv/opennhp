@@ -328,7 +328,7 @@ workflow token input and use the action's OIDC/GitHub App token with commit
 signing for accepted edits;
 checkout credentials remain disabled. Before the pinned action performs that
 checkout, the workflow rejects symlinks, gitlinks, and other non-regular leaves
-under v1.0.180's startup-sensitive preservation paths; otherwise the action's
+under v1.0.183's startup-sensitive preservation paths; otherwise the action's
 dereferencing `.claude-pr/` snapshot could materialize an out-of-tree secret.
 Both workflows replace the GitHub remote
 with a local-origin shim that exposes only the validated head and base refs
@@ -342,7 +342,7 @@ Automatic review must retain its default-branch-trusted
 `pull_request_target` event, PR-author bot exclusion, same-repository head and
 base, ready-candidate guard, `opened`/`synchronize`/`reopened`/
 `ready_for_review` triggers, and per-PR cancellation. It uses the narrowly
-scoped workflow token with API signing so v1.0.180 does not install Git
+scoped workflow token with API signing so v1.0.183 does not install Git
 credentials. Its model receives only the enumerated read/comment GitHub MCP
 tools; local file, shell, network, delegation, and GitHub file-write tools stay
 denied. The interactive tag-mode entry point excludes only the exact
