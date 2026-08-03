@@ -75,9 +75,20 @@ permissions:
 # Push events get a unique group per run so rapid-fire merges (e.g. Dependabot batches)
 # never cancel each other — deploy jobs have their own concurrency groups to serialize.
 # Without this, pending push runs get cancelled by newer ones, silently skipping deploys.
+#
+# A dispatch carrying a correlation_id came from a parent pipeline that is now
+# blocking on this exact run (see find-dispatched-run.sh). It gets a unique group
+# for the same reason pushes do: an unrelated manual sandbox deploy must not be
+# able to cancel it. Without this, every dispatch shared one
+# nhp-sandbox-main-workflow_dispatch lane with cancel-in-progress, so any ad-hoc
+# deploy killed the scheduled-release pipeline's build and failed the release
+# after a ~85-minute wait, with no failure on the cancelled run to point at.
+#
+# A dispatch with no correlation_id is a human redeploying by hand; those still
+# supersede each other, which is what you want when you click the button twice.
 concurrency:
-  group: ${{ github.event_name == 'push' && format('nhp-push-{0}', github.run_id) || format('nhp-{0}-{1}-{2}', github.event.inputs.environment || 'sandbox', github.ref_name, github.event_name) }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.event_name == 'push' && format('nhp-push-{0}', github.run_id) || (github.event_name == 'workflow_dispatch' && inputs.correlation_id != '' && format('nhp-corr-{0}', inputs.correlation_id)) || format('nhp-{0}-{1}-{2}', github.event.inputs.environment || 'sandbox', github.ref_name, github.event_name) }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.correlation_id == '' }}
 
 env:
   AWS_REGION: us-east-2

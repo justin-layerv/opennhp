@@ -256,7 +256,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -323,6 +323,18 @@ lint-qurl-csp-gate-drift:
 # OR mask a real crasher. The fixture suite emulates each go-test
 # outcome via a PATH-shimmed `go` and asserts the wrapper's exit code.
 .PHONY: lint-run-fuzz
+# A build-and-push dispatch carrying a correlation_id has a parent pipeline
+# blocking on it, so an unrelated ad-hoc deploy must not be able to cancel it.
+lint-dispatch-concurrency-isolation:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking dispatch concurrency isolation...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-dispatch-concurrency-isolation.sh tests/scripts/check-dispatch-concurrency-isolation_test.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@bash tests/scripts/check-dispatch-concurrency-isolation_test.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] dispatch concurrency isolation check passed!$(END_COLOUR)"
+
 lint-run-fuzz:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Checking run-fuzz wrapper (#1653)...$(END_COLOUR)"
 	@if command -v shellcheck >/dev/null 2>&1; then \
