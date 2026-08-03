@@ -20,7 +20,7 @@ aws_account_id       = "767397897469" # sandbox account, shared with cell0
 # prod VPC         = 10.200.0.0/16 (separate account)
 # cell1 VPC        = 10.104.0.0/16  <-- distinct, non-overlapping
 vpc_cidr                     = "10.104.0.0/16"
-public_nhp_udp_ingress_cidrs = ["3.141.109.76/32"]
+public_nhp_udp_ingress_cidrs = ["0.0.0.0/0"] # open sandbox edge (qurl-go ADR 0001)
 
 # --- DNS ---------------------------------------------------------------------
 domain_name    = "nhp.layerv.xyz"        # sandbox domain (NOT .ai); server-identity hostname

@@ -281,6 +281,65 @@ run "hub_edge_enabled_without_source_fence_fails_closed" {
   expect_failures = [terraform_data.foundation_contract]
 }
 
+# Sandbox runs an open edge (qurl-go ADR 0001). Exactly ["0.0.0.0/0"] is the one
+# broad value the module accepts, so opening an edge stays a greppable act.
+run "hub_edge_accepts_the_exact_open_value" {
+  command = plan
+
+  variables {
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = ["0.0.0.0/0"]
+  }
+
+  assert {
+    condition = (
+      length(aws_vpc_security_group_ingress_rule.hub_nlb_udp) == 1 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"].cidr_ipv4 == "0.0.0.0/0" &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"].ip_protocol == "udp" &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"].from_port == 443 &&
+      aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"].to_port == 443
+    )
+    error_message = "The exact open value must produce one UDP-443 ingress rule admitting 0.0.0.0/0."
+  }
+}
+
+# A near-miss broad CIDR is still rejected: only the exact open literal passes,
+# so a fat-fingered supernet cannot quietly widen an edge.
+run "hub_edge_rejects_broad_cidrs_other_than_the_open_value" {
+  command = plan
+
+  variables {
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = ["10.0.0.0/8"]
+  }
+
+  expect_failures = [var.hub_public_udp_ingress_cidrs]
+}
+
+run "hub_edge_rejects_a_half_open_supernet" {
+  command = plan
+
+  variables {
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = ["0.0.0.0/1"]
+  }
+
+  expect_failures = [var.hub_public_udp_ingress_cidrs]
+}
+
+# Mixing the open value with anything else is rejected: an open edge is open,
+# and a list that pretends otherwise would be misleading in review.
+run "hub_edge_rejects_the_open_value_mixed_with_a_fence" {
+  command = plan
+
+  variables {
+    hub_edge_enabled             = true
+    hub_public_udp_ingress_cidrs = ["0.0.0.0/0", "3.141.109.76/32"]
+  }
+
+  expect_failures = [var.hub_public_udp_ingress_cidrs]
+}
+
 run "hub_edge_on_opens_only_the_public_udp_edge" {
   command = plan
 

@@ -219,24 +219,37 @@ variable "hub_edge_enabled" {
 
 variable "hub_public_udp_ingress_cidrs" {
   description = <<-EOT
-    Exact public IPv4 /32 sources admitted by the Hub UDP-443 NLB security
-    group. A live Hub edge requires a non-empty, sorted, duplicate-free list;
-    sandbox pins this to the proof runner's persistent EIP. null is allowed only
-    while the edge is dark, which keeps production unchanged during sandbox
-    proof. Broad public CIDRs are never valid.
+    Sources admitted by the Hub UDP-443 NLB security group. A live Hub edge
+    requires a non-empty, sorted, duplicate-free list; null is allowed only
+    while the edge is dark, which keeps production unchanged.
+
+    Two shapes are valid and nothing else:
+
+      * a list of exact public IPv4 /32 sources, for a fenced edge; or
+      * exactly ["0.0.0.0/0"], the deliberate open-edge value.
+
+    NHP is a network-hiding knock protocol: it never answers an unauthenticated
+    packet and it enforces cookie-based return routability, so a public edge is
+    the operating condition it was designed for. The open value is still spelled
+    out as one exact literal rather than admitting broad CIDRs generally, so
+    that opening an edge is a greppable, reviewable act and a fat-fingered
+    "10.0.0.0/8" or "0.0.0.0/1" still fails the plan. Sandbox uses the open
+    value (see qurl-go ADR 0001); production roots pin this to null separately.
   EOT
   type        = list(string)
   default     = null
 
   validation {
     condition = var.hub_public_udp_ingress_cidrs == null || (
-      length(var.hub_public_udp_ingress_cidrs) > 0 &&
-      alltrue([
-        for cidr in var.hub_public_udp_ingress_cidrs :
-        can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
-      ])
+      (length(var.hub_public_udp_ingress_cidrs) == 1 && var.hub_public_udp_ingress_cidrs[0] == "0.0.0.0/0") || (
+        length(var.hub_public_udp_ingress_cidrs) > 0 &&
+        alltrue([
+          for cidr in var.hub_public_udp_ingress_cidrs :
+          can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
+        ])
+      )
     )
-    error_message = "hub_public_udp_ingress_cidrs must be null or a non-empty list of exact IPv4 /32 CIDRs."
+    error_message = "hub_public_udp_ingress_cidrs must be null, exactly [\"0.0.0.0/0\"], or a non-empty list of exact IPv4 /32 CIDRs."
   }
 
   validation {

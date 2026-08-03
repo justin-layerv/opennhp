@@ -149,25 +149,36 @@ variable "additional_nhp_udp_ingress_cidrs" {
 
 variable "public_nhp_udp_ingress_cidrs" {
   description = <<-EOT
-    Optional exact public IPv4 /32 sources allowed to reach the assigned-cell
-    UDP-62206 NLB. null preserves the legacy NLB-without-security-group shape;
-    a non-null list creates an NLB security group at NLB creation and makes the
-    server target security group trust only that NLB security group. Sandbox
-    proof cells must set the proof runner's persistent EIP /32. Do not use this
-    as a broad internet allowlist.
+    Optional sources allowed to reach the assigned-cell public UDP NLB. null
+    preserves the legacy NLB-without-security-group shape; a non-null list
+    creates an NLB security group at NLB creation and makes the server target
+    security group trust only that NLB security group.
+
+    Two shapes are valid and nothing else:
+
+      * a list of exact public IPv4 /32 sources, for a fenced cell; or
+      * exactly ["0.0.0.0/0"], the deliberate open-cell value.
+
+    A cell reached through the Hub must admit whatever the Hub admits, or an
+    agent completes assignment and then stalls at registration one step later.
+    Sandbox cells therefore use the open value alongside the open Hub (see
+    qurl-go ADR 0001). The open value is one exact literal rather than a general
+    "any CIDR" allowance, so a fat-fingered "10.0.0.0/8" still fails the plan.
   EOT
   type        = list(string)
   default     = null
 
   validation {
     condition = var.public_nhp_udp_ingress_cidrs == null || (
-      length(var.public_nhp_udp_ingress_cidrs) > 0 &&
-      alltrue([
-        for cidr in var.public_nhp_udp_ingress_cidrs :
-        can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
-      ])
+      (length(var.public_nhp_udp_ingress_cidrs) == 1 && var.public_nhp_udp_ingress_cidrs[0] == "0.0.0.0/0") || (
+        length(var.public_nhp_udp_ingress_cidrs) > 0 &&
+        alltrue([
+          for cidr in var.public_nhp_udp_ingress_cidrs :
+          can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) == 32, false)
+        ])
+      )
     )
-    error_message = "public_nhp_udp_ingress_cidrs must be null or a non-empty list of exact IPv4 /32 CIDRs."
+    error_message = "public_nhp_udp_ingress_cidrs must be null, exactly [\"0.0.0.0/0\"], or a non-empty list of exact IPv4 /32 CIDRs."
   }
 
   validation {

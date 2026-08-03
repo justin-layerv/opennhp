@@ -92,7 +92,7 @@ def protected_hub_groups() -> tuple[dict[str, object], dict[str, object]]:
             security_group_permission(
                 "udp",
                 443,
-                cidrs=(collector.PROOF_SOURCE_CIDR,),
+                cidrs=(collector.PUBLIC_UDP_INGRESS_CIDR,),
             )
         ],
         "IpPermissionsEgress": [
@@ -382,10 +382,13 @@ class CollectorTrustBoundaryTest(unittest.TestCase):
             "all-protocol ingress": lambda n, b: n["IpPermissions"][0].update(
                 {"IpProtocol": "-1"}
             ),
-            "world ingress": lambda n, b: n["IpPermissions"][0].update(
-                {"IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
-            ),
-            "wrong proof CIDR": lambda n, b: n["IpPermissions"][0].update(
+            # The edge is open over IPv4 by decision (qurl-go ADR 0001), so an
+            # IPv4 world range is no longer a mutation. The reviewed shape is
+            # still IPv4-only, so an unreviewed IPv6 opening must be caught.
+            "unreviewed ipv6 world ingress": lambda n, b: n["IpPermissions"][
+                0
+            ].update({"Ipv6Ranges": [{"CidrIpv6": "::/0"}]}),
+            "wrong source CIDR": lambda n, b: n["IpPermissions"][0].update(
                 {"IpRanges": [{"CidrIp": "198.51.100.7/32"}]}
             ),
             "CIDR backend path": lambda n, b: b["IpPermissions"][0].update(

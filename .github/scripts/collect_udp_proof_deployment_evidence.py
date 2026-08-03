@@ -188,6 +188,7 @@ QRTS_VERIFIED_ATTESTATIONS_MAX_COUNT = 32
 COMMAND_STDERR_MAX_BYTES = 64 * 1024
 JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 PROOF_SOURCE_CIDR = contract.PROOF_SOURCE_CIDR
+PUBLIC_UDP_INGRESS_CIDR = contract.PUBLIC_UDP_INGRESS_CIDR
 AC_REGISTRATION_EIP_COUNT = 7
 AC_REGISTRATION_EIP_POOL = "layerv-nhp-sandbox-ac"
 KMS_KEY_ARN_RE = re.compile(
@@ -2612,8 +2613,11 @@ def _verify_edge_security_groups(
         raise EvidenceError(f"{host} NLB ingress is not the exact one-rule contract")
     if not isinstance(nlb_egress, list) or len(nlb_egress) != 2:
         raise EvidenceError(f"{host} NLB egress is not the exact two-rule contract")
+    # The edge admits every source (qurl-go ADR 0001). The managed AC
+    # registration /32s remain their own module's rules and are still asserted
+    # exactly, so an unreviewed registration source is still caught.
     expected_ingress = sorted(
-        [("ipv4", PROOF_SOURCE_CIDR)]
+        [("ipv4", PUBLIC_UDP_INGRESS_CIDR)]
         + [("ipv4", cidr) for cidr in registration_source_cidrs]
     )
     if (
@@ -2626,7 +2630,7 @@ def _verify_edge_security_groups(
         != expected_ingress
     ):
         raise EvidenceError(
-            f"{host} NLB UDP ingress is not the stable proof-runner plus reviewed registration /32 sources"
+            f"{host} NLB UDP ingress is not the open sandbox edge plus reviewed registration /32 sources"
         )
     if (
         _permission_sources(

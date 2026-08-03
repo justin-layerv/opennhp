@@ -3421,11 +3421,11 @@ def _hub_edge_resource_changes() -> list[dict]:
         if address == "module.control.aws_security_group.hub_nlb[0]":
             after.update({"ingress": [], "egress": []})
         elif address.endswith(
-            'aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]'
+            'aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"]'
         ):
             after.update(
                 {
-                    "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                    "cidr_ipv4": CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR,
                     "cidr_ipv6": None,
                     "from_port": 443,
                     "ip_protocol": "udp",
@@ -3759,7 +3759,7 @@ def hub_source_fence_partial_retry_fixture() -> dict[str, dict]:
     sg_address = "module.control.aws_security_group.hub_nlb[0]"
     rule_address = (
         'module.control.aws_vpc_security_group_ingress_rule.'
-        'hub_nlb_udp["3.141.109.76/32"]'
+        'hub_nlb_udp["0.0.0.0/0"]'
     )
     _make_exact_noop(candidate[sg_address], {"id": sg_id})
     _make_exact_noop(
@@ -3767,7 +3767,7 @@ def hub_source_fence_partial_retry_fixture() -> dict[str, dict]:
         {
             "id": "sgr-0123456789abcdef0",
             "security_group_id": sg_id,
-            "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+            "cidr_ipv4": CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR,
             "ip_protocol": "udp",
             "from_port": 443,
             "to_port": 443,
@@ -10734,7 +10734,7 @@ def live_edge_fixture(root: Path) -> None:
                             "IpProtocol": "udp",
                             "FromPort": 443,
                             "ToPort": 443,
-                            "IpRanges": [{"CidrIp": CHECKER.PROOF_SOURCE_CIDR}],
+                            "IpRanges": [{"CidrIp": CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR}],
                         }
                     ],
                     "IpPermissionsEgress": [],
@@ -10816,7 +10816,7 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             live_worker_fixture(root)
             self.assertEqual(CHECKER.check_live(root)["vpc_id"], "vpc-abc123")
 
-    def test_live_edge_rejects_global_udp_ingress(self) -> None:
+    def test_live_edge_rejects_an_unreviewed_ingress_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             live_edge_fixture(root)
@@ -10825,10 +10825,10 @@ class LiveHubWorkerBoundaryTests(unittest.TestCase):
             )
             payload["SecurityGroups"][0]["IpPermissions"][0]["IpRanges"][0][
                 "CidrIp"
-            ] = "0.0.0.0/0"
+            ] = "198.51.100.7/32"
             write_json(root / "control-security-groups.json", payload)
             with self.assertRaisesRegex(
-                CHECKER.ContractError, "proof-runner /32 UDP 443"
+                CHECKER.ContractError, "the open sandbox edge UDP 443"
             ):
                 CHECKER.check_live(root)
 
@@ -13161,7 +13161,7 @@ class LiveBoundaryPortToleranceTest(unittest.TestCase):
     """
 
     def ingress(self, port):
-        return {("udp", port, port, "cidr_ipv4", CHECKER.PROOF_SOURCE_CIDR)}
+        return {("udp", port, port, "cidr_ipv4", CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR)}
 
     def test_both_migration_ports_are_admitted(self) -> None:
         for port in (
@@ -13187,7 +13187,7 @@ class LiveBoundaryPortToleranceTest(unittest.TestCase):
         self.assertEqual(CHECKER.HUB_CLIENT_EDGE_PORT_LEGACY, 62206)
         source = pathlib.Path(CHECKER.__file__).read_text(encoding="utf-8")
         self.assertNotIn(
-            '("udp", 443, 443, "cidr_ipv4", PROOF_SOURCE_CIDR)',
+            '("udp", 443, 443, "cidr_ipv4", HUB_PUBLIC_UDP_INGRESS_CIDR)',
             source,
             "the ingress assertion must not re-pin a single port",
         )
@@ -13212,7 +13212,7 @@ class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
     LISTENER = "module.control.aws_lb_listener.hub[0]"
     RULE = (
         "module.control.aws_vpc_security_group_ingress_rule."
-        f'hub_nlb_udp["{CHECKER.PROOF_SOURCE_CIDR}"]'
+        f'hub_nlb_udp["{CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR}"]'
     )
 
     def _by_address(self, listener=None, rule=None):
@@ -13237,14 +13237,14 @@ class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
                 "from_port": 62206,
                 "to_port": 62206,
                 "ip_protocol": "udp",
-                "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                "cidr_ipv4": CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR,
                 "security_group_id": "sg-hub-nlb",
             },
             "after": {
                 "from_port": 443,
                 "to_port": 443,
                 "ip_protocol": "udp",
-                "cidr_ipv4": CHECKER.PROOF_SOURCE_CIDR,
+                "cidr_ipv4": CHECKER.HUB_PUBLIC_UDP_INGRESS_CIDR,
                 "security_group_id": "sg-hub-nlb",
             },
         }
@@ -13284,10 +13284,10 @@ class HubClientEdgePortMigrationLaneTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractError, "UDP 62206 -> 443"):
             CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
 
-    def test_widened_source_is_rejected(self) -> None:
-        by_address = self._by_address(rule={"cidr_ipv4": "0.0.0.0/0"})
+    def test_changed_source_is_rejected(self) -> None:
+        by_address = self._by_address(rule={"cidr_ipv4": "198.51.100.7/32"})
         claimed = self._claim(by_address)
-        with self.assertRaisesRegex(CHECKER.ContractError, "proof-runner"):
+        with self.assertRaisesRegex(CHECKER.ContractError, "admitted source"):
             CHECKER._validate_hub_client_edge_port_migration(claimed, by_address, {})
 
     def test_retargeted_forward_is_rejected(self) -> None:

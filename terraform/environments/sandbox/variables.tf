@@ -339,16 +339,24 @@ variable "nhp_udp_recv_buffer_bytes" {
 }
 
 variable "public_nhp_udp_ingress_cidrs" {
-  description = "Exact proof-runner /32 allowed at the sandbox cell0 public UDP NLB. This also enables the NLB security-group fence."
+  description = <<-EOT
+    Sources allowed at the sandbox cell0 public UDP NLB. A non-null list also
+    enables the NLB security-group attachment. Sandbox is open to developers
+    inside and outside the company (qurl-go ADR 0001), so this is the open-edge
+    value, matching the open Hub: an agent that clears the Hub has to be able to
+    register against its assigned cell.
+
+    This replaces the previous proof-runner /32, which 0.0.0.0/0 subsumes. The
+    seven managed AC EIP /32 rules on the same security group are emitted by the
+    ac module (aws_vpc_security_group_ingress_rule.server_nlb_registration) and
+    are unaffected; they become redundant but are left to that module to own.
+  EOT
   type        = list(string)
-  default     = ["3.141.109.76/32"]
+  default     = ["0.0.0.0/0"]
 
   validation {
-    condition = (
-      length(var.public_nhp_udp_ingress_cidrs) == 1 &&
-      var.public_nhp_udp_ingress_cidrs[0] == "3.141.109.76/32"
-    )
-    error_message = "Sandbox cell0 UDP ingress must remain pinned to the proof runner EIP 3.141.109.76/32."
+    condition     = length(var.public_nhp_udp_ingress_cidrs) == 1 && var.public_nhp_udp_ingress_cidrs[0] == "0.0.0.0/0"
+    error_message = "Sandbox cell0 UDP ingress is open by decision (qurl-go ADR 0001) and must remain exactly [\"0.0.0.0/0\"]; changing sandbox access requires superseding that ADR."
   }
 }
 

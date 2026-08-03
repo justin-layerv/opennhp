@@ -24,7 +24,12 @@ STATE_KMS_KEY_ARN = (
 # Locked by the active no-op plan contract and permanent live-state verifier.
 TF_VERSION = "1.14.3"
 CONTROL_PREFIX = "layerv-nhp-sandbox-control"
-PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# The CIDR the sandbox Control Hub NLB security group admits, and therefore the
+# for_each key of its ingress rule. Sandbox is open to developers inside and
+# outside the company (qurl-go ADR 0001), which replaced the proof runner /32
+# this pin previously carried. It must move in lockstep with the Control root's
+# hub_public_udp_ingress_cidrs input.
+HUB_PUBLIC_UDP_INGRESS_CIDR = "0.0.0.0/0"
 AUTHORITY_PROOF_OWNER_ID = "layerv-nhp-sandbox-udp-proof"
 AUTHORITY_PROOF_CONTROLLER_ROLE_ARN = (
     f"arn:aws:iam::{ACCOUNT_ID}:role/layerv-nhp-sandbox-udp-proof-controller"
@@ -508,6 +513,18 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
 # to combine with any other Control change. It is absent from EXPECTED_RESOURCES
 # because the state and state-list lanes run only AFTER that apply. Remove all
 # three names once the delete is applied and its no-op proof is recorded.
+# The Hub source-fence ingress rule the open-sandbox transition removes
+# (qurl-go ADR 0001, ledger 2026-08-03-open-sandbox-udp-edges). Source no longer
+# declares it, so a plan against the fenced state names it exactly once, as its
+# delete. Its replacement, hub_nlb_udp["0.0.0.0/0"], is an ordinary member of
+# HUB_EDGE_RESOURCES and needs no special handling.
+LEGACY_HUB_SOURCE_FENCE_ADDRESS = (
+    "module.control.aws_vpc_security_group_ingress_rule."
+    'hub_nlb_udp["3.141.109.76/32"]'
+)
+LEGACY_HUB_SOURCE_FENCE_CIDR = "3.141.109.76/32"
+LEGACY_HUB_SOURCE_FENCE_TYPE = "aws_vpc_security_group_ingress_rule"
+
 LEGACY_OTP_REDIS_USER_ADDRESS = "module.control.aws_elasticache_user.otp_authority"
 LEGACY_OTP_REDIS_USER_ID = f"{CONTROL_PREFIX}-otp-auth"
 LEGACY_OTP_REDIS_USER_TYPE = "aws_elasticache_user"
@@ -1049,7 +1066,7 @@ HUB_EDGE_RESOURCES: dict[str, str] = {
     "module.control.aws_route_table_association.hub_public[1]": "aws_route_table_association",
     "module.control.aws_route_table_association.hub_public[2]": "aws_route_table_association",
     "module.control.aws_security_group.hub_nlb[0]": "aws_security_group",
-    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]': "aws_vpc_security_group_ingress_rule",
+    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"]': "aws_vpc_security_group_ingress_rule",
     "module.control.aws_lb.hub[0]": "aws_lb",
     "module.control.aws_lb_target_group.hub[0]": "aws_lb_target_group",
     "module.control.aws_lb_listener.hub[0]": "aws_lb_listener",
@@ -1102,7 +1119,7 @@ HUB_SOURCE_FENCE_PROVIDER_ADDRESSES = (
 # NLB. The target group remains a validated no-op and is intentionally absent.
 HUB_SOURCE_FENCE_ACTIONS: dict[str, list[str]] = {
     "module.control.aws_security_group.hub_nlb[0]": ["create"],
-    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]': [
+    'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"]': [
         "create"
     ],
     "module.control.aws_vpc_security_group_egress_rule.hub_nlb_udp[0]": ["create"],
@@ -4323,6 +4340,45 @@ def _is_exact_legacy_authority_sg_deposed_delete(item: dict[str, Any]) -> bool:
     )
 
 
+def _is_exact_legacy_hub_source_fence_delete(item: dict[str, Any]) -> bool:
+    """Prove the one reviewed delete of the Hub proof-runner source fence.
+
+    Sandbox is open to developers inside and outside the company (qurl-go ADR
+    0001), so this exact /32 ingress rule is replaced by an 0.0.0.0/0 rule. The
+    only plan that may still name this address is its exact delete.
+
+    This pins the whole before-state -- the reviewed source CIDR, the protocol,
+    and both ports -- so a rule that has drifted (a different source, a widened
+    port range, or a non-UDP protocol) fails closed and is reviewed rather than
+    silently destroyed.
+
+    Remove once the delete is applied and its no-op proof is recorded. Four
+    coupled sites go together: the three LEGACY_HUB_SOURCE_FENCE_* constants,
+    this function, its hook in ``check_plan``, and the reviewed-destructive
+    branch in scripts/check-connector-authority-foundation.sh.
+    """
+    change = item.get("change")
+    if (
+        item.get("address") != LEGACY_HUB_SOURCE_FENCE_ADDRESS
+        or item.get("type") != LEGACY_HUB_SOURCE_FENCE_TYPE
+        or item.get("mode") != "managed"
+        or item.get("deposed") is not None
+        or not isinstance(change, dict)
+        or change.get("actions") != ["delete"]
+        or change.get("after") is not None
+    ):
+        return False
+    before = change.get("before")
+    if not isinstance(before, dict):
+        return False
+    return (
+        before.get("cidr_ipv4") == LEGACY_HUB_SOURCE_FENCE_CIDR
+        and before.get("ip_protocol") == "udp"
+        and before.get("from_port") == HUB_CLIENT_EDGE_PORT
+        and before.get("to_port") == HUB_CLIENT_EDGE_PORT
+    )
+
+
 def _is_exact_legacy_otp_user_delete(item: dict[str, Any]) -> bool:
     """Prove the one reviewed delete of the detached legacy OTP Redis user.
 
@@ -4871,7 +4927,7 @@ def _check_planned_security(
             raise ContractError(f"{address} has unknown planned traffic rules")
 
     # The public Hub edge is source-fenced at the NLB. Its SG has no inline
-    # rules, its sole public rule is the persistent proof-runner /32 on the
+    # rules, its sole public rule is the open sandbox edge on the
     # public client edge UDP 443, and the NLB attaches exactly one SG in the
     # create request.
     hub_edge_mode = "module.control.aws_security_group.hub_nlb[0]" in by_address
@@ -4910,7 +4966,7 @@ def _check_planned_security(
             # Admit the settled projection; reject only a shape that is neither
             # the create-time projection nor a rule collection. The rules'
             # CONTENTS stay pinned by their own exact resource checks
-            # (aws_vpc_security_group_ingress_rule.hub_nlb_udp is proof-runner
+            # (aws_vpc_security_group_ingress_rule.hub_nlb_udp is the open edge
             # /32 UDP 443; the egress pair is worker UDP 62206 + TCP 62207),
             # and check_live re-proves the live SG posture independently.
             if planned_rules is None and unknown_rules is not True:
@@ -4923,12 +4979,12 @@ def _check_planned_security(
                 )
 
         nlb_ingress, _ = values(
-            'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["3.141.109.76/32"]'
+            'module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp["0.0.0.0/0"]'
         )
         _require_fields(
             nlb_ingress,
             {
-                "cidr_ipv4": PROOF_SOURCE_CIDR,
+                "cidr_ipv4": HUB_PUBLIC_UDP_INGRESS_CIDR,
                 "from_port": 443,
                 "ip_protocol": "udp",
                 "to_port": 443,
@@ -8253,7 +8309,7 @@ HUB_CLIENT_EDGE_PORT_ADDRESSES = frozenset(
     {
         "module.control.aws_lb_listener.hub[0]",
         "module.control.aws_vpc_security_group_ingress_rule."
-        f'hub_nlb_udp["{PROOF_SOURCE_CIDR}"]',
+        f'hub_nlb_udp["{HUB_PUBLIC_UDP_INGRESS_CIDR}"]',
     }
 )
 
@@ -8293,7 +8349,7 @@ def _validate_hub_client_edge_port_migration(
     listener_address = "module.control.aws_lb_listener.hub[0]"
     rule_address = (
         "module.control.aws_vpc_security_group_ingress_rule."
-        f'hub_nlb_udp["{PROOF_SOURCE_CIDR}"]'
+        f'hub_nlb_udp["{HUB_PUBLIC_UDP_INGRESS_CIDR}"]'
     )
 
     change = (by_address.get(listener_address) or {}).get("change")
@@ -8326,13 +8382,13 @@ def _validate_hub_client_edge_port_migration(
         or after.get("to_port") != 443
         or before.get("ip_protocol") != "udp"
         or after.get("ip_protocol") != "udp"
-        or before.get("cidr_ipv4") != PROOF_SOURCE_CIDR
-        or after.get("cidr_ipv4") != PROOF_SOURCE_CIDR
+        or before.get("cidr_ipv4") != HUB_PUBLIC_UDP_INGRESS_CIDR
+        or after.get("cidr_ipv4") != HUB_PUBLIC_UDP_INGRESS_CIDR
         or before.get("security_group_id") != after.get("security_group_id")
     ):
         raise ContractError(
-            "Hub client-edge NLB SG ingress must move exactly the proof-runner "
-            f"{PROOF_SOURCE_CIDR} from UDP 62206 to UDP 443 on the same security group"
+            "Hub client-edge NLB SG ingress must move exactly the admitted source "
+            f"{HUB_PUBLIC_UDP_INGRESS_CIDR} from UDP 62206 to UDP 443 on the same security group"
         )
 
 
@@ -11608,6 +11664,20 @@ def check_plan(
     # state/state-list lanes -- which run only after this apply -- stay exact.
     # Any other action on this address (an update, a re-create, or a deposed
     # object) fails closed rather than widening the plan contract.
+    # Same shape as the legacy OTP user below: source no longer declares the
+    # fenced rule, so a plan against the pre-transition state carries its delete
+    # as one address outside the current inventory. Validate it field-for-field
+    # and retire it here, before the exact-set equality, so every other contract
+    # and the post-apply state lanes keep seeing only the current inventory.
+    if LEGACY_HUB_SOURCE_FENCE_ADDRESS in by_address:
+        if not _is_exact_legacy_hub_source_fence_delete(
+            by_address.pop(LEGACY_HUB_SOURCE_FENCE_ADDRESS)
+        ):
+            raise ContractError(
+                "the Hub proof-runner source fence may appear only as its exact "
+                "reviewed delete; review the drift rather than applying"
+            )
+
     legacy_otp_user_delete = LEGACY_OTP_REDIS_USER_ADDRESS in by_address
     if legacy_otp_user_delete and not _is_exact_legacy_otp_user_delete(
         by_address.pop(LEGACY_OTP_REDIS_USER_ADDRESS)
@@ -12264,7 +12334,7 @@ def check_plan(
     # fail-closed fallback.
     # A bounded, post-fence hardening of the Hub public edge: pin ON
     # enforce_security_group_inbound_rules_on_private_link_traffic. The fence
-    # (#3362) attached an SG admitting exactly the reviewed proof-runner /32 on
+    # (#3362) attached an SG admitting exactly the reviewed public source on
     # UDP 443; this makes that SG's PrivateLink posture Terraform-owned rather
     # than an inherited AWS default, so an out-of-band flip to "off" becomes
     # visible drift. collect_udp_proof_deployment_evidence.py has required the
@@ -14366,7 +14436,7 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
                     HUB_CLIENT_EDGE_PORT,
                     HUB_CLIENT_EDGE_PORT,
                     "cidr_ipv4",
-                    PROOF_SOURCE_CIDR,
+                    HUB_PUBLIC_UDP_INGRESS_CIDR,
                 )
             },
             {
@@ -14375,12 +14445,12 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
                     HUB_CLIENT_EDGE_PORT_LEGACY,
                     HUB_CLIENT_EDGE_PORT_LEGACY,
                     "cidr_ipv4",
-                    PROOF_SOURCE_CIDR,
+                    HUB_PUBLIC_UDP_INGRESS_CIDR,
                 )
             },
         ):
             raise ContractError(
-                "Control Hub NLB SG ingress is not exactly proof-runner /32 UDP "
+                "Control Hub NLB SG ingress is not exactly the open sandbox edge UDP "
                 f"{HUB_CLIENT_EDGE_PORT} or {HUB_CLIENT_EDGE_PORT_LEGACY}"
             )
         if hub_worker_groups:

@@ -453,6 +453,25 @@ if [[ -n "$plan_json" ]]; then
           and .change.before.authentication_mode[0].password_count == 0
           and ((.change.before.authentication_mode[0].passwords // []) == [])
         ) or (
+          # The one reviewed removal of the Hub proof-runner source fence
+          # (qurl-go ADR 0001, ledger 2026-08-03-open-sandbox-udp-edges): sandbox
+          # opens to developers inside and outside the company, so this exact /32
+          # ingress rule is replaced by the 0.0.0.0/0 rule, whose create is not
+          # destructive and needs no allowance. Admitted only as a net delete of
+          # exactly this address on UDP 443. Remove this branch once applied --
+          # the rule no longer exists afterwards, so it becomes inert.
+          .address
+            == "module.control.aws_vpc_security_group_ingress_rule.hub_nlb_udp[\"3.141.109.76/32\"]"
+          and .type == "aws_vpc_security_group_ingress_rule"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete"]
+          and .change.after == null
+          and .change.before.cidr_ipv4 == "3.141.109.76/32"
+          and .change.before.ip_protocol == "udp"
+          and .change.before.from_port == 443
+          and .change.before.to_port == 443
+        ) or (
           .address == "module.control.aws_lb.hub[0]"
           and .change.actions == ["create", "delete"]
         ) or (

@@ -94,6 +94,12 @@ ECR_REPOSITORY_RE = re.compile(
 )
 S3_KEY_RE = re.compile(r"^[\x21-\x7e]+$")
 PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# The sandbox public UDP edges admit every source: sandbox is open to
+# developers inside and outside the company (qurl-go ADR 0001). This is the
+# edge's permitted ingress and is deliberately distinct from
+# PROOF_SOURCE_CIDR above, which remains the proof runner's own EIP identity
+# and is still asserted against the runner's allocation.
+PUBLIC_UDP_INGRESS_CIDR = "0.0.0.0/0"
 PROTECTED_EDGE_IDENTITIES = {
     "hub.nhp.layerv.xyz": {
         "load_balancer_name": "layerv-nhp-sandbox-hub-edge",

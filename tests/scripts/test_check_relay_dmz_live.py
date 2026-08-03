@@ -315,7 +315,7 @@ def good_snapshot() -> dict:
             "id": server_nlb_sg,
             "vpc_id": main_vpc,
             "inbound": [
-                rule("udp", 443, 443, "cidr_ipv4", "3.141.109.76/32"),
+                rule("udp", 443, 443, "cidr_ipv4", "0.0.0.0/0"),
                 *(
                     rule("udp", 443, 443, "cidr_ipv4", f"{address}/32")
                     for address in ac_public_ips
@@ -1518,7 +1518,7 @@ class RecordedStructuralAws:
                                             "FromPort": 443,
                                             "ToPort": 443,
                                             "IpRanges": [
-                                                {"CidrIp": "3.141.109.76/32"},
+                                                {"CidrIp": "0.0.0.0/0"},
                                                 *(
                                                     {"CidrIp": f"{address}/32"}
                                                     for address in (
@@ -3800,8 +3800,8 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             "NLB public source": (
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][
                     "inbound"
-                ][0].update({"source": "0.0.0.0/0"}),
-                "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 443",
+                ][0].update({"source": "198.51.100.7/32"}),
+                "server NLB SG ingress is not exactly the open sandbox edge plus the complete managed AC EIP pool as /32 UDP 443",
             ),
             "NLB target egress": (
                 lambda data: data["security_groups"]["by_id"]["sg-server-nlb"][

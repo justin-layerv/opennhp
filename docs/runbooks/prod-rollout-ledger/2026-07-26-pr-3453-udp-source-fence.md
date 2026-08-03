@@ -1,5 +1,14 @@
 # 2026-07-26 · PR #3453 · Source-fence sandbox UDP edges
 
+> **Access policy superseded on 2026-08-03** by
+> [`2026-08-03-open-sandbox-udp-edges.md`](2026-08-03-open-sandbox-udp-edges.md)
+> and [qurl-go ADR 0001](https://github.com/layervai/qurl-go/blob/main/docs/decisions/0001-sandbox-nhp-access.md).
+> The sandbox Hub, cell0, and cell1 edges now admit `0.0.0.0/0` on UDP 443 so
+> developers inside and outside the company can use sandbox. The
+> SG-attached-NLB topology this rollout installed is retained and still
+> enforced; only *who* is admitted changed. The post-rollout item below that
+> requires "timeout from an unrelated public source" no longer applies.
+
 - **Owner:** sandbox UDP rollout coordinator
 - **Source:** [NHP PR #3453](https://github.com/layervai/nhp/pull/3453)
 

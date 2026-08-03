@@ -177,16 +177,23 @@ RELAY_SERVER_UDP_PORT = 62206
 SERVER_CLIENT_EDGE_UDP_PORT = 443
 RELAY_ACK_UDP_PORT = 62207
 RELAY_HEALTH_PATH = "/health/live"
-# Proof-runner EIP admitted to the source-fenced sandbox server NLB. Matches the
-# EXPECTED_SANDBOX_PROOF_SOURCE_CIDR pin in the sibling plan checker; re-homing
-# both to the proof-runner remote-state output is a tracked follow-up.
-SANDBOX_PROOF_SOURCE_CIDR = "3.141.109.76/32"
+# What the sandbox server NLB admits on UDP 443. Sandbox is open to developers
+# inside and outside the company (qurl-go ADR 0001), so this is the open edge,
+# not a source fence. Matches EXPECTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDR in the
+# sibling plan checker and must move with it.
+#
+# This is deliberately NOT the proof runner's identity. The runner still owns
+# 3.141.109.76/32 and that EIP is still asserted, under the distinct name
+# PROOF_SOURCE_CIDR in .github/scripts/udp_proof_deployment_contract.py. Keep
+# the two names apart: one is who the proof runner is, the other is what the
+# edge admits.
+SANDBOX_PUBLIC_UDP_INGRESS_CIDR = "0.0.0.0/0"
 # Main sandbox VPC, the source of the in-VPC AC keepalive rule
 # (module.compute's server_nhp_udp_vpc). ACs send NHP_KPL straight to their
 # assigned servers' private IPs rather than through the NLB, so this rule is
 # what keeps the fleet able to reach the servers it was assigned; without it
 # every keepalive times out and the periodic NLB re-registration loop never
-# fires. Pinned here for the same reason as SANDBOX_PROOF_SOURCE_CIDR above --
+# fires. Pinned here for the same reason as SANDBOX_PUBLIC_UDP_INGRESS_CIDR above --
 # validate_structural reads a pre-collected snapshot that carries SG vpc_ids
 # but no VPC CIDRs, and re-homing both pins to remote-state output is the same
 # tracked follow-up.
@@ -3035,7 +3042,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                     "from": SERVER_CLIENT_EDGE_UDP_PORT,
                     "to": SERVER_CLIENT_EDGE_UDP_PORT,
                     "source_type": "cidr_ipv4",
-                    "source": SANDBOX_PROOF_SOURCE_CIDR,
+                    "source": SANDBOX_PUBLIC_UDP_INGRESS_CIDR,
                 }
             ] + [
                 {
@@ -3065,7 +3072,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             ]
             if not _rules_equal(nlb_group.get("inbound", []), expected_nlb_in):
                 errors.append(
-                    "server NLB SG ingress is not exactly proof-runner plus the complete managed AC EIP pool as /32 UDP 443"
+                    "server NLB SG ingress is not exactly the open sandbox edge plus the complete managed AC EIP pool as /32 UDP 443"
                 )
             if not _rules_equal(nlb_group.get("outbound", []), expected_nlb_out):
                 errors.append(
