@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -953,5 +954,111 @@ func TestAllPortsEbpfRuleParams_Sentinel(t *testing.T) {
 	}
 	if got.SrcIP != srcIP {
 		t.Errorf("all-ports SrcIP = %q, want %q — the source IP must be threaded through unchanged so the rule is keyed on the admitted source", got.SrcIP, srcIP)
+	}
+}
+
+// TestIpsetHashHelpers_Format pins the exact entry strings the ipsetHash*
+// builders emit. These strings are a kernel-datapath contract, not an internal
+// detail: they are handed to ipset.Add for sets created as hash:ip,port,ip
+// (defaultset/defaultset_down) and hash:net,port (tempset) in
+// docker/iptables_defaults_*.sh. Drift in a separator, a proto prefix, or the
+// all-ports range makes the kernel reject or silently mis-key the entry, and the
+// admission it was supposed to open fails.
+//
+// SCOPE: this pins what each builder returns, not that every call site uses the
+// builder. All 21 former fmt.Sprintf sites were collapsed onto these helpers in
+// the same change, so today a format regression goes red here.
+func TestIpsetHashHelpers_Format(t *testing.T) {
+	const (
+		srcIP  = "10.1.2.3"
+		dstIP  = "10.4.5.6"
+		netStr = "10.0.0.0/8"
+	)
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+		// fields is the comma-separated field count the set family requires:
+		// 3 for hash:ip,port,ip and 2 for hash:net,port.
+		fields int
+	}{
+		{"tcp", ipsetHashTCP(srcIP, 443, dstIP), "10.1.2.3,443,10.4.5.6", 3},
+		{"tcp all ports", ipsetHashTCPAllPorts(srcIP, dstIP), "10.1.2.3,1-65535,10.4.5.6", 3},
+		{"udp", ipsetHashUDP(srcIP, 443, dstIP), "10.1.2.3,udp:443,10.4.5.6", 3},
+		{"udp all ports", ipsetHashUDPAllPorts(srcIP, dstIP), "10.1.2.3,udp:1-65535,10.4.5.6", 3},
+		{"icmp v4", ipsetHashICMP(srcIP, utils.ICMPEchoType(utils.IPV4), dstIP), "10.1.2.3,icmp:8/0,10.4.5.6", 3},
+		{"icmp v6", ipsetHashICMP("fd00::1", utils.ICMPEchoType(utils.IPV6), "fd00::2"), "fd00::1,icmpv6:128/0,fd00::2", 3},
+		{"net port", ipsetHashNetPort(netStr, 443), "10.0.0.0/8,443", 2},
+		{"net all ports", ipsetHashNetAllPorts(netStr), "10.0.0.0/8,1-65535", 2},
+		{"net udp port", ipsetHashNetUDPPort(netStr, 443), "10.0.0.0/8,udp:443", 2},
+		{"net udp all ports", ipsetHashNetUDPAllPorts(netStr), "10.0.0.0/8,udp:1-65535", 2},
+		{"net icmp v4", ipsetHashNetICMP(netStr, utils.ICMPEchoType(utils.IPV4)), "10.0.0.0/8,icmp:8/0", 2},
+		// Port 0 reaches the plain builders only when a call site skips its
+		// dstAddr.Port == 0 branch; pin the literal so that bug reads as "port
+		// 0" in a failure rather than looking like a legitimate all-ports rule.
+		{"tcp port zero is not all-ports", ipsetHashTCP(srcIP, 0, dstIP), "10.1.2.3,0,10.4.5.6", 3},
+		{"udp port zero is not all-ports", ipsetHashUDP(srcIP, 0, dstIP), "10.1.2.3,udp:0,10.4.5.6", 3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("entry = %q, want %q — this string goes straight to ipset.Add; any drift changes what the kernel firewall matches on", tc.got, tc.want)
+			}
+			if n := len(strings.Split(tc.got, ",")); n != tc.fields {
+				t.Errorf("entry %q has %d comma-separated fields, want %d — the set family's grammar is fixed (hash:ip,port,ip is 3, hash:net,port is 2); a gained or lost field is rejected by ipset and also defeats utils.NormalizeIPSetEntry's 3-way split", tc.got, n, tc.fields)
+			}
+		})
+	}
+}
+
+// TestIpsetHashHelpers_SurviveIPv6Normalization fences the three-field builders
+// against utils.NormalizeIPSetEntry, which rewrites IPv4 components into
+// IPv6-mapped form before an entry reaches an inet6 set. That function splits
+// with SplitN(entry, ",", 3) and returns the entry UNCHANGED when the split does
+// not yield three usable parts — so a builder that gained or lost a comma fails
+// silently: the entry is written to the v6 set unmapped instead of being
+// rejected. Asserting the mapped output (not just "no error") is what makes that
+// failure mode visible.
+func TestIpsetHashHelpers_SurviveIPv6Normalization(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			name: "tcp",
+			got:  utils.NormalizeIPSetEntry(utils.IPV6, ipsetHashTCP("10.1.2.3", 443, "10.4.5.6")),
+			want: "::ffff:10.1.2.3,443,::ffff:10.4.5.6",
+		},
+		{
+			name: "tcp all ports",
+			got:  utils.NormalizeIPSetEntry(utils.IPV6, ipsetHashTCPAllPorts("10.1.2.3", "10.4.5.6")),
+			want: "::ffff:10.1.2.3,1-65535,::ffff:10.4.5.6",
+		},
+		{
+			name: "udp",
+			got:  utils.NormalizeIPSetEntry(utils.IPV6, ipsetHashUDP("10.1.2.3", 443, "10.4.5.6")),
+			want: "::ffff:10.1.2.3,udp:443,::ffff:10.4.5.6",
+		},
+		{
+			name: "udp all ports",
+			got:  utils.NormalizeIPSetEntry(utils.IPV6, ipsetHashUDPAllPorts("10.1.2.3", "10.4.5.6")),
+			want: "::ffff:10.1.2.3,udp:1-65535,::ffff:10.4.5.6",
+		},
+		{
+			name: "icmp",
+			got:  utils.NormalizeIPSetEntry(utils.IPV6, ipsetHashICMP("10.1.2.3", utils.ICMPEchoType(utils.IPV6), "10.4.5.6")),
+			want: "::ffff:10.1.2.3,icmpv6:128/0,::ffff:10.4.5.6",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("normalized entry = %q, want %q — NormalizeIPSetEntry only rewrites an entry it can split into three parts, so an unmapped IPv4 component here means the builder's field layout drifted and the entry would reach an inet6 set unmapped", tc.got, tc.want)
+			}
+		})
 	}
 }

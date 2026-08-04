@@ -864,9 +864,11 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 			for _, dstAddr := range dstAddrs {
 				// for tcp
 				if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "tcp" || dstAddr.Protocol == "any" {
-					ipHashStr := fmt.Sprintf("%s,%d,%s", srcAddr.Ip, dstAddr.Port, dstAddr.Ip)
+					var ipHashStr string
 					if dstAddr.Port == 0 {
-						ipHashStr = fmt.Sprintf("%s,1-65535,%s", srcAddr.Ip, dstAddr.Ip)
+						ipHashStr = ipsetHashTCPAllPorts(srcAddr.Ip, dstAddr.Ip)
+					} else {
+						ipHashStr = ipsetHashTCP(srcAddr.Ip, dstAddr.Port, dstAddr.Ip)
 					}
 
 					switch a.config.FilterMode {
@@ -922,9 +924,11 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 
 				// for udp
 				if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "udp" || dstAddr.Protocol == "any" {
-					ipHashStr := fmt.Sprintf("%s,udp:%d,%s", srcAddr.Ip, dstAddr.Port, dstAddr.Ip)
+					var ipHashStr string
 					if dstAddr.Port == 0 {
-						ipHashStr = fmt.Sprintf("%s,udp:1-65535,%s", srcAddr.Ip, dstAddr.Ip)
+						ipHashStr = ipsetHashUDPAllPorts(srcAddr.Ip, dstAddr.Ip)
+					} else {
+						ipHashStr = ipsetHashUDP(srcAddr.Ip, dstAddr.Port, dstAddr.Ip)
 					}
 
 					switch a.config.FilterMode {
@@ -981,7 +985,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				// for icmp ping
 				if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
 					for _, dstAddr := range dstAddrs {
-						ipHashStr := fmt.Sprintf("%s,%s,%s", srcAddr.Ip, utils.ICMPEchoType(ipType), dstAddr.Ip)
+						ipHashStr := ipsetHashICMP(srcAddr.Ip, utils.ICMPEchoType(ipType), dstAddr.Ip)
 						switch a.config.FilterMode {
 						case FilterMode_IPTABLES:
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
@@ -1019,17 +1023,21 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 					switch a.config.FilterMode {
 					case FilterMode_IPTABLES:
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "tcp" || dstAddr.Protocol == "any" {
-							netHashStr := fmt.Sprintf("%s,%d", netStr, dstAddr.Port)
+							var netHashStr string
 							if dstAddr.Port == 0 {
-								netHashStr = fmt.Sprintf("%s,1-65535", netStr)
+								netHashStr = ipsetHashNetAllPorts(netStr)
+							} else {
+								netHashStr = ipsetHashNetPort(netStr, dstAddr.Port)
 							}
 							_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, netHashStr)
 						}
 
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "udp" || dstAddr.Protocol == "any" {
-							netHashStr := fmt.Sprintf("%s,udp:%d", netStr, dstAddr.Port)
+							var netHashStr string
 							if dstAddr.Port == 0 {
-								netHashStr = fmt.Sprintf("%s,udp:1-65535", netStr)
+								netHashStr = ipsetHashNetUDPAllPorts(netStr)
+							} else {
+								netHashStr = ipsetHashNetUDPPort(netStr, dstAddr.Port)
 							}
 							_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, netHashStr)
 						}
@@ -1037,7 +1045,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 						if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
 							// ICMP rules are supplementary (ping diagnostics) - failure is non-fatal
 							// because the user can still access the protected service via TCP/UDP.
-							netHashStr := fmt.Sprintf("%s,%s", netStr, utils.ICMPEchoType(ipType))
+							netHashStr := ipsetHashNetICMP(netStr, utils.ICMPEchoType(ipType))
 							_, addErr := a.ipset.Add(ipType, 4, tempOpenTimeSec, netHashStr)
 							if addErr != nil {
 								log.Warning("[HandleAccessControl] failed to add tempset entry %s: %v", netHashStr, addErr)
@@ -1076,9 +1084,11 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									}
 								}
 							}
-							netHashStr := fmt.Sprintf("%s,%d", netStr, dstAddr.Port)
+							var netHashStr string
 							if dstAddr.Port == 0 {
-								netHashStr = fmt.Sprintf("%s,1-65535", netStr)
+								netHashStr = ipsetHashNetAllPorts(netStr)
+							} else {
+								netHashStr = ipsetHashNetPort(netStr, dstAddr.Port)
 							}
 							if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); err != nil {
 								err = setArtMsgErrorFromKernelWrite(artMsg, err)
@@ -1111,9 +1121,11 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									}
 								}
 							}
-							netHashStr := fmt.Sprintf("%s,udp:%d", netStr, dstAddr.Port)
+							var netHashStr string
 							if dstAddr.Port == 0 {
-								netHashStr = fmt.Sprintf("%s,udp:1-65535", netStr)
+								netHashStr = ipsetHashNetUDPAllPorts(netStr)
+							} else {
+								netHashStr = ipsetHashNetUDPPort(netStr, dstAddr.Port)
 							}
 							if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); err != nil {
 								err = setArtMsgErrorFromKernelWrite(artMsg, err)
@@ -1134,7 +1146,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								}
 							}
 							if icmpMirrorReady {
-								netHashStr := fmt.Sprintf("%s,%s", netStr, utils.ICMPEchoType(ipType))
+								netHashStr := ipsetHashNetICMP(netStr, utils.ICMPEchoType(ipType))
 								if addErr := a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); addErr != nil {
 									log.Warning("[HandleAccessControl] failed to add supplementary eBPF iptables mirror tempset ICMP entry %s: %v", netHashStr, addErr)
 								}
@@ -1204,7 +1216,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 		log.Debug("open temporary tcp port %s", tlocalAddr.String())
 		switch a.config.FilterMode {
 		case FilterMode_IPTABLES:
-			portHashStr := fmt.Sprintf("%s,%d", netStr, tlocalAddr.Port)
+			portHashStr := ipsetHashNetPort(netStr, tlocalAddr.Port)
 			_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 
 			if err != nil {
@@ -1215,7 +1227,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 			// IPv4 requires two ranges (0.0.0.0/1 and 128.0.0.0/1) since ipset doesn't allow 0.0.0.0/0
 			// IPv6 uses ::/0 directly, so netStr1 is empty for IPv6
 			if netStr1 != "" {
-				portHashStr = fmt.Sprintf("%s,%d", netStr1, tlocalAddr.Port)
+				portHashStr = ipsetHashNetPort(netStr1, tlocalAddr.Port)
 				_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 				if err != nil {
 					log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
@@ -1233,13 +1245,13 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
 			}
-			portHashStr := fmt.Sprintf("%s,%d", netStr, tlocalAddr.Port)
+			portHashStr := ipsetHashNetPort(netStr, tlocalAddr.Port)
 			if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
 				err = setArtMsgErrorFromKernelWrite(artMsg, err)
 				return
 			}
 			if netStr1 != "" {
-				portHashStr = fmt.Sprintf("%s,%d", netStr1, tlocalAddr.Port)
+				portHashStr = ipsetHashNetPort(netStr1, tlocalAddr.Port)
 				if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
 					err = setArtMsgErrorFromKernelWrite(artMsg, err)
 					return
@@ -1278,7 +1290,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 
 		switch a.config.FilterMode {
 		case FilterMode_IPTABLES:
-			portHashStr := fmt.Sprintf("%s,udp:%d", netStr, tlocalAddr.Port)
+			portHashStr := ipsetHashNetUDPPort(netStr, tlocalAddr.Port)
 			_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 			if err != nil {
 				log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
@@ -1288,7 +1300,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 			// IPv4 requires two ranges (0.0.0.0/1 and 128.0.0.0/1) since ipset doesn't allow 0.0.0.0/0
 			// IPv6 uses ::/0 directly, so netStr1 is empty for IPv6
 			if netStr1 != "" {
-				portHashStr = fmt.Sprintf("%s,udp:%d", netStr1, tlocalAddr.Port)
+				portHashStr = ipsetHashNetUDPPort(netStr1, tlocalAddr.Port)
 				_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 				if err != nil {
 					log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
@@ -1306,13 +1318,13 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
 			}
-			portHashStr := fmt.Sprintf("%s,udp:%d", netStr, tlocalAddr.Port)
+			portHashStr := ipsetHashNetUDPPort(netStr, tlocalAddr.Port)
 			if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
 				err = setArtMsgErrorFromKernelWrite(artMsg, err)
 				return
 			}
 			if netStr1 != "" {
-				portHashStr = fmt.Sprintf("%s,udp:%d", netStr1, tlocalAddr.Port)
+				portHashStr = ipsetHashNetUDPPort(netStr1, tlocalAddr.Port)
 				if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
 					err = setArtMsgErrorFromKernelWrite(artMsg, err)
 					return
@@ -1503,9 +1515,11 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		// rationale: see flushSafetyMargin's comment.
 		flushDeadline := computeFlushDeadline(openTimeSec)
 		for _, dstAddr := range dstAddrs {
-			ipHashStr := fmt.Sprintf("%s,%d,%s", srcAddrIp, dstAddr.Port, dstAddr.Ip)
+			var ipHashStr string
 			if dstAddr.Port == 0 {
-				ipHashStr = fmt.Sprintf("%s,1-65535,%s", srcAddrIp, dstAddr.Ip)
+				ipHashStr = ipsetHashTCPAllPorts(srcAddrIp, dstAddr.Ip)
+			} else {
+				ipHashStr = ipsetHashTCP(srcAddrIp, dstAddr.Port, dstAddr.Ip)
 			}
 			switch a.config.FilterMode {
 			case FilterMode_IPTABLES:
@@ -1667,9 +1681,11 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 		flushDeadline := computeFlushDeadline(openTimeSec)
 		for _, dstAddr := range dstAddrs {
 			if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "udp" || dstAddr.Protocol == "any" {
-				ipHashStr := fmt.Sprintf("%s,udp:%d,%s", srcAddrIp, dstAddr.Port, dstAddr.Ip)
+				var ipHashStr string
 				if dstAddr.Port == 0 {
-					ipHashStr = fmt.Sprintf("%s,udp:1-65535,%s", srcAddrIp, dstAddr.Ip)
+					ipHashStr = ipsetHashUDPAllPorts(srcAddrIp, dstAddr.Ip)
+				} else {
+					ipHashStr = ipsetHashUDP(srcAddrIp, dstAddr.Port, dstAddr.Ip)
 				}
 				switch a.config.FilterMode {
 				case FilterMode_IPTABLES:
@@ -1732,7 +1748,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 				case FilterMode_IPTABLES:
 					// ICMP rules are supplementary (ping diagnostics) - failure is non-fatal
 					// because the user can still access the protected service via TCP/UDP.
-					ipHashStr := fmt.Sprintf("%s,%s,%s", remoteAddr.IP.String(), utils.ICMPEchoType(ipType), dstAddr.Ip)
+					ipHashStr := ipsetHashICMP(remoteAddr.IP.String(), utils.ICMPEchoType(ipType), dstAddr.Ip)
 					// Schedule unconditionally before the write so the
 					// in-flight Flush barrier holds; if the
 					// non-fatal write below fails the flush is a
@@ -1753,7 +1769,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 						return
 					}
-					ipHashStr := fmt.Sprintf("%s,%s,%s", remoteAddr.IP.String(), utils.ICMPEchoType(ipType), dstAddr.Ip)
+					ipHashStr := ipsetHashICMP(remoteAddr.IP.String(), utils.ICMPEchoType(ipType), dstAddr.Ip)
 					if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "udpTempAccessHandler"); err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add eBPF iptables mirror ICMP rule %s: %v", ipHashStr, err)
 					}
@@ -1799,4 +1815,114 @@ func incrementIP(ip net.IP) {
 			break
 		}
 	}
+}
+
+// ipsetHash* build the ipset entry strings the AC writes to the kernel, and are
+// the SINGLE source of truth for the two entry grammars in use. They exist to
+// keep the format off the admission hot path's per-src×dst inner loops, and in
+// one greppable place.
+//
+// Each builder makes exactly one heap allocation. The string-only builders
+// concatenate directly (a fixed-arity `+` chain lowers to one runtime.concatstring
+// call). The port-bearing ones fill a stack buffer with strconv.AppendInt rather
+// than concatenating strconv.Itoa's result, because Itoa allocates its own string
+// first — that form measures 2 allocs/op and is ~2x slower. See
+// msghandler_bench_test.go for the numbers behind both choices.
+//
+// Two set families, two grammars (created in docker/iptables_defaults_*.sh):
+//
+//	hash:ip,port,ip  defaultset / defaultset_down  ->  "srcIp,<portspec>,dstIp"
+//	hash:net,port    tempset                       ->  "<cidr>,<portspec>"
+//
+// <portspec> is one of:
+//
+//	443            bare decimal — ipset assumes TCP when no proto prefix is given
+//	udp:443        explicit UDP
+//	icmp:8/0       ICMP echo request (icmpv6:128/0 for v6) — see utils.ICMPEchoType
+//	1-65535        all ports, TCP (udp:1-65535 for UDP)
+//
+// The all-ports range is what an AOP's dstAddr.Port == 0 ("any port") lowers to:
+// an ipset port field has no wildcard, so the range is written out.
+//
+// The three-field grammar is load-bearing beyond ipset's own parser:
+// utils.NormalizeIPSetEntry splits the hash:ip,port,ip form with
+// SplitN(entry, ",", 3) to rewrite IPv4 components into IPv6-mapped form before
+// they reach an inet6 set, and returns the entry UNCHANGED when it does not
+// split into exactly three parts. A helper that gained or lost a comma would
+// therefore fail silently — the entry gets written unmapped rather than
+// rejected. TestIpsetHashHelpers_Format pins both the exact strings and the
+// field counts.
+//
+// Deliberate asymmetry with the eBPF datapath: all-ports is 1-65535 here, but
+// 0-65535 in the XDP port_list key (see allPortsEbpfRuleParams, whose
+// DstPortStart MUST be 0 to match a lookup built from the MIN_PORT compile-time
+// constant). The two kernel backends key differently; do not unify the
+// constants.
+// ipsetEntryBufSize is the stack scratch the port-bearing builders fill so the
+// only heap allocation is the returned string. It covers the longest entry the
+// AC can emit — two full-length IPv6 addresses (45 bytes each, INET6_ADDRSTRLEN
+// minus the NUL), a 5-digit port and two separators, 97 bytes — rounded up.
+// Longer input still yields the correct string; append simply spills to the heap
+// and costs an extra allocation. This is a performance bound, not a correctness
+// one.
+const ipsetEntryBufSize = 128
+
+func ipsetHashTCP(srcIp string, port int, dstIp string) string {
+	var buf [ipsetEntryBufSize]byte
+	b := append(buf[:0], srcIp...)
+	b = append(b, ',')
+	b = strconv.AppendInt(b, int64(port), 10)
+	b = append(b, ',')
+	b = append(b, dstIp...)
+	return string(b)
+}
+
+func ipsetHashTCPAllPorts(srcIp, dstIp string) string {
+	return srcIp + ",1-65535," + dstIp
+}
+
+func ipsetHashUDP(srcIp string, port int, dstIp string) string {
+	var buf [ipsetEntryBufSize]byte
+	b := append(buf[:0], srcIp...)
+	b = append(b, ",udp:"...)
+	b = strconv.AppendInt(b, int64(port), 10)
+	b = append(b, ',')
+	b = append(b, dstIp...)
+	return string(b)
+}
+
+func ipsetHashUDPAllPorts(srcIp, dstIp string) string {
+	return srcIp + ",udp:1-65535," + dstIp
+}
+
+func ipsetHashICMP(srcIp, icmpType, dstIp string) string {
+	return srcIp + "," + icmpType + "," + dstIp
+}
+
+func ipsetHashNetPort(netStr string, port int) string {
+	var buf [ipsetEntryBufSize]byte
+	b := append(buf[:0], netStr...)
+	b = append(b, ',')
+	b = strconv.AppendInt(b, int64(port), 10)
+	return string(b)
+}
+
+func ipsetHashNetAllPorts(netStr string) string {
+	return netStr + ",1-65535"
+}
+
+func ipsetHashNetUDPPort(netStr string, port int) string {
+	var buf [ipsetEntryBufSize]byte
+	b := append(buf[:0], netStr...)
+	b = append(b, ",udp:"...)
+	b = strconv.AppendInt(b, int64(port), 10)
+	return string(b)
+}
+
+func ipsetHashNetUDPAllPorts(netStr string) string {
+	return netStr + ",udp:1-65535"
+}
+
+func ipsetHashNetICMP(netStr, icmpType string) string {
+	return netStr + "," + icmpType
 }
