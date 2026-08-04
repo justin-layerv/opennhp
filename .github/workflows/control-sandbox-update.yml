@@ -697,7 +697,8 @@ jobs:
         run: |
           scripts/verify-control-sandbox-live-boundary.sh \
             "$RUNNER_TEMP/apply-tfplan.json" \
-            "$RUNNER_TEMP/control-live-before-apply"
+            "$RUNNER_TEMP/control-live-before-apply" \
+            pre-apply
 
       - name: Re-prove exact live refresh observation before apply
         working-directory: ${{ env.CONTROL_ROOT }}

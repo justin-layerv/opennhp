@@ -14110,7 +14110,18 @@ def check_state(state: Any) -> dict[str, Any]:
     return {"resource_count": len(resources), "vpc_id": vpc_id}
 
 
-def check_live(evidence_dir: Path) -> dict[str, Any]:
+def check_live(
+    evidence_dir: Path, *, pre_apply: bool = False
+) -> dict[str, Any]:
+    """Prove the live Control boundary.
+
+    ``pre_apply`` asserts INVARIANTS ONLY for anything a reviewed apply is
+    allowed to change. Asserting a transition TARGET before the apply makes the
+    apply that produces it unreachable, and that is structural rather than bad
+    luck: it deadlocked the 62206 -> 443 port migration, and again when the Hub
+    edge source opened. The target is asserted post-apply, where it exists, and
+    the exact rule change is separately reviewed by the plan gate.
+    """
     expected = load_json(evidence_dir / "expected-live.json")
     required_expected = {
         "dynamodb_endpoint_id",
@@ -14493,29 +14504,35 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             raise ContractError(
                 "Control Hub NLB does not attach exactly the reviewed NLB SG"
             )
-        if normalized_permissions(nlb_group, "IpPermissions") not in (
-            {
-                (
-                    "udp",
-                    HUB_CLIENT_EDGE_PORT,
-                    HUB_CLIENT_EDGE_PORT,
-                    "cidr_ipv4",
-                    HUB_PUBLIC_UDP_INGRESS_CIDR,
+        hub_ingress = normalized_permissions(nlb_group, "IpPermissions")
+        if pre_apply:
+            # Invariants only. Which port and which source are exactly what a
+            # reviewed apply moves, so pinning them here gates the apply on its
+            # own outcome. Still fails closed on the things no apply may do:
+            # more than one rule, a non-UDP rule, a port range, or a
+            # security-group/prefix-list source instead of a CIDR.
+            if len(hub_ingress) != 1 or not all(
+                protocol == "udp" and from_port == to_port and kind == "cidr_ipv4"
+                for protocol, from_port, to_port, kind, _ in hub_ingress
+            ):
+                raise ContractError(
+                    "Control Hub NLB SG ingress is not exactly one CIDR-sourced UDP rule"
                 )
-            },
-            {
-                (
-                    "udp",
-                    HUB_CLIENT_EDGE_PORT_LEGACY,
-                    HUB_CLIENT_EDGE_PORT_LEGACY,
-                    "cidr_ipv4",
-                    HUB_PUBLIC_UDP_INGRESS_CIDR,
-                )
-            },
-        ):
+        elif hub_ingress != {
+            (
+                "udp",
+                HUB_CLIENT_EDGE_PORT,
+                HUB_CLIENT_EDGE_PORT,
+                "cidr_ipv4",
+                HUB_PUBLIC_UDP_INGRESS_CIDR,
+            )
+        }:
+            # Exact, and no longer tolerant of the legacy port: the 62206 -> 443
+            # migration is complete on every edge, so accepting both here only
+            # weakened the steady-state assertion.
             raise ContractError(
                 "Control Hub NLB SG ingress is not exactly the open sandbox edge UDP "
-                f"{HUB_CLIENT_EDGE_PORT} or {HUB_CLIENT_EDGE_PORT_LEGACY}"
+                f"{HUB_CLIENT_EDGE_PORT}"
             )
         if hub_worker_groups:
             if len(hub_worker_groups) != 1:
@@ -14579,6 +14596,14 @@ def parse_args() -> argparse.Namespace:
     state.add_argument("state_json", type=Path)
     live = sub.add_parser("live")
     live.add_argument("evidence_dir", type=Path)
+    live.add_argument(
+        "--pre-apply",
+        action="store_true",
+        help=(
+            "Assert invariants only for boundary fields a reviewed apply may "
+            "change. Use before an apply; omit to assert the exact target."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -14606,7 +14631,7 @@ def main() -> int:
         elif args.command == "state":
             result = check_state(load_json(args.state_json))
         elif args.command == "live":
-            result = check_live(args.evidence_dir)
+            result = check_live(args.evidence_dir, pre_apply=args.pre_apply)
         else:
             raise AssertionError(args.command)
     except ContractError as exc:

@@ -13,6 +13,19 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plan_json="$1"
 evidence_dir="$2"
+# pre-apply | post-apply (default). Pre-apply asserts invariants only for the
+# boundary fields a reviewed apply may change; post-apply asserts the exact
+# target. See check_live's docstring for why asserting the target before the
+# apply deadlocks the apply.
+phase="${3:-post-apply}"
+case "$phase" in
+  pre-apply|post-apply) ;;
+  *) echo "usage: $0 <plan.json> <evidence-dir> [pre-apply|post-apply]" >&2; exit 2 ;;
+esac
+live_args=()
+if [[ "$phase" == "pre-apply" ]]; then
+  live_args+=(--pre-apply)
+fi
 region="us-east-2"
 state_bucket="layerv-terraform-state-767397897469"
 state_key="nhp/sandbox/control/terraform.tfstate"
@@ -209,5 +222,5 @@ aws ec2 describe-security-groups \
   --filters "Name=vpc-id,Values=$vpc_id" \
   --output json >"$evidence_dir/control-security-groups.json"
 
-python3 "$checker" live "$evidence_dir" \
+python3 "$checker" live "$evidence_dir" "${live_args[@]}" \
   | tee "$evidence_dir/live-boundary-summary.json"

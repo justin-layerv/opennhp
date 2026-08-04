@@ -10809,6 +10809,97 @@ def live_worker_fixture(root: Path) -> None:
     write_json(root / "control-security-groups.json", security)
 
 
+class LiveHubEdgePhaseTests(unittest.TestCase):
+    """Pre-apply asserts invariants; post-apply asserts the exact target.
+
+    Pinning the target pre-apply gates the apply on its own outcome. That is
+    structural, not incidental: it deadlocked the 62206 -> 443 port migration
+    and again when the Hub edge source opened to 0.0.0.0/0.
+    """
+
+    def _with_hub_ingress(self, root: Path, *, port: int, cidr: str) -> None:
+        payload = json.loads((root / "control-security-groups.json").read_text())
+        for group in payload["SecurityGroups"]:
+            if group["GroupId"] != "sg-a1b2c3":
+                continue
+            group["IpPermissions"] = [
+                {
+                    "IpProtocol": "udp",
+                    "FromPort": port,
+                    "ToPort": port,
+                    "IpRanges": [{"CidrIp": cidr}],
+                }
+            ]
+        write_json(root / "control-security-groups.json", payload)
+
+    def test_pre_apply_admits_the_source_the_apply_replaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            self._with_hub_ingress(root, port=443, cidr="3.141.109.76/32")
+            # Post-apply refuses it: the edge is not open yet.
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+            # Pre-apply admits it, which is what lets the opening apply run.
+            self.assertEqual(
+                CHECKER.check_live(root, pre_apply=True)["vpc_id"], "vpc-abc123"
+            )
+
+    def test_pre_apply_still_refuses_what_no_apply_may_do(self) -> None:
+        for label, mutate in (
+            (
+                "two rules",
+                lambda payload: payload["IpPermissions"].append(
+                    {
+                        "IpProtocol": "udp",
+                        "FromPort": 443,
+                        "ToPort": 443,
+                        "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+                    }
+                ),
+            ),
+            (
+                "non-UDP",
+                lambda payload: payload["IpPermissions"][0].update(IpProtocol="tcp"),
+            ),
+            (
+                "port range",
+                lambda payload: payload["IpPermissions"][0].update(ToPort=9999),
+            ),
+            (
+                "security-group source",
+                lambda payload: payload["IpPermissions"][0].update(
+                    IpRanges=[], UserIdGroupPairs=[{"GroupId": "sg-a1b2c3"}]
+                ),
+            ),
+        ):
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    live_edge_fixture(root)
+                    payload = json.loads(
+                        (root / "control-security-groups.json").read_text()
+                    )
+                    for group in payload["SecurityGroups"]:
+                        if group["GroupId"] == "sg-a1b2c3":
+                            mutate(group)
+                    write_json(root / "control-security-groups.json", payload)
+                    with self.assertRaises(CHECKER.ContractError):
+                        CHECKER.check_live(root, pre_apply=True)
+
+    def test_post_apply_requires_the_open_edge_on_the_current_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_edge_fixture(root)
+            self._with_hub_ingress(root, port=443, cidr="0.0.0.0/0")
+            self.assertEqual(CHECKER.check_live(root)["vpc_id"], "vpc-abc123")
+            # The legacy port is no longer tolerated: that migration is complete,
+            # and accepting both only weakened the steady-state assertion.
+            self._with_hub_ingress(root, port=62206, cidr="0.0.0.0/0")
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_live(root)
+
+
 class LiveHubWorkerBoundaryTests(unittest.TestCase):
     def test_live_worker_admits_the_s3_gateway_route(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
