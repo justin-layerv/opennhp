@@ -211,7 +211,8 @@ jobs:
               qurl-connector) key=qurl_connector ;;
               qurl-go)        key=qurl_go ;;
             esac
-            bound="$(jq -r --arg k "$key" '.candidates[$k].head_sha' evidence/deployment.json)"
+            bound="$(jq -r --arg k "$key" '.candidates[$k].head_sha' \
+              udp-proof-producer-artifact/deployment-provenance.json)"
             live="$(gh api "repos/layervai/${repo}/git/ref/heads/main" --jq '.object.sha')"
             if [[ -z "${bound}" || "${bound}" == "null" ]]; then
               echo "::error::producer artifact does not bind layervai/${repo}"
