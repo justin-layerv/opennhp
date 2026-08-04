@@ -187,6 +187,22 @@ def _run_bounded(
     return completed.stdout
 
 
+def _commit_is_in_main(repository: str, sha: str) -> bool:
+    """Is this commit part of the repository's main?
+
+    "identical" means it IS main; "behind" means main has advanced past it,
+    which is the normal state of a deployed environment while development
+    continues. "ahead" or "diverged" means the commit carries code main does
+    not have, and is refused.
+    """
+    comparison = _gh_json(
+        f"repos/{repository}/compare/main...{sha}",
+        f"{repository} apply-run reachability",
+    )
+    status = comparison.get("status") if isinstance(comparison, dict) else None
+    return status in ("identical", "behind")
+
+
 def _gh_json(path: str, name: str, *, allow_not_found: bool = False) -> Any:
     raw = _run_bounded(
         ["gh", "api", "--method", "GET", path],
@@ -275,6 +291,12 @@ def read_authenticated_terraform_apply_receipt(
     }
     if not isinstance(run, dict) or not required.issubset(run):
         raise OrchestratorEvidenceError("Terraform apply run metadata is incomplete")
+    try:
+        # Validated before it is interpolated into the compare URL below and
+        # before it is used as the receipt's expected identity.
+        deployment._sha(run["head_sha"], "Terraform retirement apply run head_sha")
+    except deployment.ContractError as exc:
+        raise OrchestratorEvidenceError(str(exc)) from exc
     repository = run["repository"]
     head_repository = run["head_repository"]
     if (
@@ -289,7 +311,15 @@ def read_authenticated_terraform_apply_receipt(
         or run["status"] != "completed"
         or run["conclusion"] != "success"
         or run["head_branch"] != "main"
-        or run["head_sha"] != expected_head_sha
+        # Reachability, not equality. expected_head_sha is nhp main's CURRENT
+        # tip, but the receipt is evidence about the DEPLOYED infrastructure,
+        # which is whatever commit last rolled sandbox. Requiring them equal
+        # means "sandbox is at main's tip at this instant" -- unattainable while
+        # nhp merges continuously, and not the property the receipt attests.
+        # The apply is still required to be a successful, main-branch,
+        # trusted-workflow run, so an apply from an abandoned branch or from
+        # code main never took is still refused.
+        or not _commit_is_in_main(NHP_REPOSITORY, run["head_sha"])
         or type(run["run_attempt"]) is not int
         or run["run_attempt"] < 1
     ):
@@ -381,7 +411,13 @@ def read_authenticated_terraform_apply_receipt(
         value,
         run_id=run_id,
         run_attempt=run["run_attempt"],
-        head_sha=expected_head_sha,
+        # The receipt is stamped by the apply with its OWN github.sha, so it
+        # must be validated against that run's commit. Passing expected_head_sha
+        # here re-imposed `run["head_sha"] == nhp main tip` transitively and
+        # nullified the reachability check above -- the exact equality this
+        # change exists to remove. Reachability is the legitimacy judge; this
+        # stays a receipt<->run consistency check.
+        head_sha=run["head_sha"],
     )
 
 

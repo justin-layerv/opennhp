@@ -461,7 +461,11 @@ class AuthenticatedReceiptReadTest(unittest.TestCase):
         archive = receipt_archive(exact_receipt())
         run, artifacts = self.metadata(f"sha256:{hashlib.sha256(archive).hexdigest()}")
         with (
-            mock.patch.object(collector, "_gh_json", side_effect=[run, artifacts]),
+            mock.patch.object(
+                collector,
+                "_gh_json",
+                side_effect=[run, {"status": "behind"}, artifacts],
+            ),
             mock.patch.object(collector, "_run_bounded", return_value=archive),
         ):
             observed = collector.read_authenticated_terraform_apply_receipt(
@@ -469,11 +473,68 @@ class AuthenticatedReceiptReadTest(unittest.TestCase):
             )
         self.assertEqual(observed, exact_receipt())
 
+    def test_accepts_an_apply_main_has_moved_past(self) -> None:
+        """The whole point: sandbox runs a commit that is BEHIND main.
+
+        The previous fixtures held run/receipt head_sha equal to
+        expected_head_sha, which is not what "behind" means -- an ancestor
+        differs from the tip. That internal inconsistency hid a transitive
+        equality: the receipt was validated against expected_head_sha, and since
+        the apply stamps the receipt with its OWN github.sha, that re-imposed
+        run["head_sha"] == main tip and nullified the reachability check.
+
+        Here they genuinely differ, so this fails on any build that re-couples
+        the receipt's identity to main's tip.
+        """
+        archive = receipt_archive(exact_receipt())
+        run, artifacts = self.metadata(f"sha256:{hashlib.sha256(archive).hexdigest()}")
+        main_tip = "c" * 40
+        self.assertNotEqual(run["head_sha"], main_tip)
+        with (
+            mock.patch.object(
+                collector,
+                "_gh_json",
+                side_effect=[run, {"status": "behind"}, artifacts],
+            ),
+            mock.patch.object(collector, "_run_bounded", return_value=archive),
+        ):
+            observed = collector.read_authenticated_terraform_apply_receipt(
+                RUN_ID, expected_head_sha=main_tip
+            )
+        self.assertEqual(observed, exact_receipt())
+
+    def test_rejects_an_apply_carrying_code_main_never_took(self) -> None:
+        """"ahead"/"diverged" is still refused -- reachability is the judge."""
+        for status in ("ahead", "diverged"):
+            with self.subTest(status=status):
+                archive = receipt_archive(exact_receipt())
+                run, artifacts = self.metadata(
+                    f"sha256:{hashlib.sha256(archive).hexdigest()}"
+                )
+                with (
+                    mock.patch.object(
+                        collector,
+                        "_gh_json",
+                        side_effect=[run, {"status": status}, artifacts],
+                    ),
+                    mock.patch.object(
+                        collector, "_run_bounded", return_value=archive
+                    ),
+                ):
+                    with self.assertRaises(collector.OrchestratorEvidenceError):
+                        collector.read_authenticated_terraform_apply_receipt(
+                            RUN_ID, expected_head_sha="c" * 40
+                        )
+
     def test_rejects_archive_bytes_that_do_not_match_github_digest(self) -> None:
         archive = receipt_archive(exact_receipt())
         run, artifacts = self.metadata(f"sha256:{'0' * 64}")
         with (
-            mock.patch.object(collector, "_gh_json", side_effect=[run, artifacts]),
+            mock.patch.object(
+                collector,
+                "_gh_json",
+                side_effect=[run, {"status": "behind"}, artifacts],
+            ),
             mock.patch.object(collector, "_run_bounded", return_value=archive),
             self.assertRaisesRegex(
                 collector.OrchestratorEvidenceError,
