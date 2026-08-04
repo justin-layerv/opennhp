@@ -248,6 +248,7 @@ _DYNAMODB_TABLES = (
 # refresh-only output-contract test parses that file and fails on either drift.
 EXPECTED_CONTROL_OUTPUTS = frozenset(
     {
+        "authority_cell_alias_targets",
         "authority_image_uri",
         "authority_data_kms_key_arn",
         "authority_ecr_repository_url",
@@ -13005,8 +13006,30 @@ def check_plan(
             "Authority proof rollout recovery transition"
         )
 
-    expected_applyable = plan_mode != "no-op" or (
-        normalization_drift_count > 0 and "resource_changes" not in plan
+    # A no-op plan is normally NOT applyable: nothing would be written. Two
+    # shapes legitimately break that, and both are enumerated rather than
+    # inferred from Terraform's own flag.
+    #
+    #  1. a refresh-only state normalization (drift absorbed, no resource_changes)
+    #  2. an OUTPUTS-ONLY change -- adding, removing or re-valuing a root output
+    #     touches no resource, so `changed` is empty and plan_mode is "no-op",
+    #     but the apply still rewrites state outputs and Terraform reports
+    #     applyable=true. Before this, any outputs-only Control change was
+    #     unmergeable: it failed here with an applyability mismatch no message
+    #     explained.
+    #
+    # This does not widen what may be applied. The output SET is still pinned to
+    # EXPECTED_CONTROL_OUTPUTS by _check_authority_proof_steady_output, and the
+    # empty `changed` set already proves no resource moves; all this recognises
+    # is that writing an output is real work.
+    output_only_change = any(
+        isinstance(change, dict) and change.get("actions") != ["no-op"]
+        for change in (plan.get("output_changes") or {}).values()
+    )
+    expected_applyable = (
+        plan_mode != "no-op"
+        or (normalization_drift_count > 0 and "resource_changes" not in plan)
+        or output_only_change
     )
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(

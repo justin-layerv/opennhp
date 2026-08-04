@@ -144,3 +144,23 @@ output "hub_udp_listener_arn" {
   description = "Public Hub UDP-62206 listener ARN; null while the edge is dark."
   value       = module.control.hub_udp_listener_arn
 }
+
+output "authority_cell_alias_targets" {
+  description = <<-DESC
+    Exact selected-color assigned-cell Authority alias ARNs, keyed by cell id then
+    operation (issue_registration_otp, activate_registration, complete_registration,
+    complete_credential_recovery), or null while the runtime is dark.
+
+    Single source of truth for the cell servers' NHP_CONNECTOR_REGISTRATION_* wiring.
+    The sandbox root reads this through terraform_remote_state rather than pinning a
+    literal alias color, so a reviewed authority-color selector flip carries to the
+    cells automatically instead of silently stranding them on a retired alias.
+
+    Derived from authority_selected_alias_targets.cells, which colors every cell
+    operation with var.authority_runtime_contract.selected_authority_color. Do NOT
+    source cell aliases from the proof outputs: mutate_proof_agent follows the
+    INDEPENDENT proof rollout selector and legitimately sits on a different color
+    (ca-pm was :green while selected_authority_color was blue).
+  DESC
+  value       = try(module.control.authority_selected_alias_targets.cells, null)
+}

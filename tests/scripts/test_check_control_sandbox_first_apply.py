@@ -11679,6 +11679,62 @@ else:
                 self.assertNotIn("put-secret-value", self.log_path.read_text())
 
 
+class OutputsOnlyApplyabilityTests(unittest.TestCase):
+    """An outputs-only Control change is a no-op plan that IS applyable.
+
+    Adding a root output touches no resource, so `changed` is empty and the
+    plan classifies as "no-op" -- but the apply still rewrites state outputs and
+    Terraform reports applyable=true. The gate previously expected a no-op plan
+    to be unapplyable unless it was a refresh-only normalization, so every
+    outputs-only Control change was unmergeable.
+    """
+
+    def plan(self, *, applyable, output_actions, with_resource_changes=True):
+        plan = {
+            "output_changes": {
+                "some_output": {"actions": output_actions},
+            },
+            "applyable": applyable,
+        }
+        if with_resource_changes:
+            plan["resource_changes"] = []
+        return plan
+
+    def expected(self, plan, plan_mode="no-op", drift=0):
+        output_only_change = any(
+            isinstance(change, dict) and change.get("actions") != ["no-op"]
+            for change in (plan.get("output_changes") or {}).values()
+        )
+        return (
+            plan_mode != "no-op"
+            or (drift > 0 and "resource_changes" not in plan)
+            or output_only_change
+        )
+
+    def test_a_changed_output_makes_a_no_op_plan_applyable(self) -> None:
+        plan = self.plan(applyable=True, output_actions=["update"])
+        self.assertTrue(self.expected(plan))
+
+    def test_a_created_output_makes_a_no_op_plan_applyable(self) -> None:
+        plan = self.plan(applyable=True, output_actions=["create"])
+        self.assertTrue(self.expected(plan))
+
+    def test_an_unchanged_output_leaves_a_no_op_plan_unapplyable(self) -> None:
+        """The fence: no-op outputs must NOT excuse an applyable no-op plan."""
+        plan = self.plan(applyable=False, output_actions=["no-op"])
+        self.assertFalse(self.expected(plan))
+
+    def test_a_resource_transition_is_unaffected(self) -> None:
+        plan = self.plan(applyable=True, output_actions=["no-op"])
+        self.assertTrue(self.expected(plan, plan_mode="hub-worker-image-update"))
+
+    def test_refresh_only_normalization_is_unaffected(self) -> None:
+        plan = self.plan(
+            applyable=True, output_actions=["no-op"], with_resource_changes=False
+        )
+        self.assertTrue(self.expected(plan, drift=1))
+
+
 class WorkflowContractTests(unittest.TestCase):
     def test_temporary_first_apply_workflow_is_retired(self) -> None:
         for path in (
