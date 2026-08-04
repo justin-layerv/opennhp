@@ -76,17 +76,81 @@ class CellActivationDefaultTests(unittest.TestCase):
                     ["null"],
                 )
 
-    def test_sandbox_cell_roots_retain_explicit_activation_seam(self) -> None:
+    def test_sandbox_cell_roots_activate_only_from_a_reviewed_source(self) -> None:
+        """The module argument must come from the var OR a Control-derived local.
+
+        This replaces a literal `= var.connector_authority_cell_config` match.
+        That literal encoded WHERE the value came from, but the property worth
+        protecting is that an auto-deployed root cannot activate the capability
+        on its own -- activation must trace to something a human reviewed.
+
+        Reading Control's published alias targets satisfies that: the output is
+        null until Control's authority runtime is live, and making it live is
+        itself a reviewed Control apply. The deliberate step moved from a
+        sandbox tfvars edit to the Control apply; it did not disappear. The
+        fail-closed half is asserted separately below.
+
+        A derived root must still honour an explicit var so prod parity and
+        break-glass overrides keep working.
+        """
         for relative_path in (
             "terraform/environments/sandbox/main.tf",
             "terraform/environments/sandbox-cell1/main.tf",
         ):
             with self.subTest(root=relative_path):
                 text = (ROOT / relative_path).read_text(encoding="utf-8")
-                self.assertIn(
+                direct = (
                     "connector_authority_cell_config = "
-                    "var.connector_authority_cell_config",
-                    text,
+                    "var.connector_authority_cell_config" in text
+                )
+                derived = (
+                    "connector_authority_cell_config = "
+                    "local.connector_authority_cell_config" in text
+                )
+                self.assertTrue(
+                    direct or derived,
+                    "root must pass either the var or a Control-derived local",
+                )
+                if derived:
+                    root_dir = (ROOT / relative_path).parent
+                    body = "\n".join(
+                        path.read_text(encoding="utf-8")
+                        for path in sorted(root_dir.glob("*.tf"))
+                    )
+                    self.assertIn(
+                        "var.connector_authority_cell_config != null",
+                        body,
+                        "a derived root must still let an explicit var win",
+                    )
+
+    def test_derived_cell_activation_fails_closed_without_control(self) -> None:
+        """A derived root stays dark when Control has published nothing.
+
+        This is the half that actually keeps an auto-deploy safe. The remote
+        state read must be wrapped so a missing output resolves to null rather
+        than erroring or, worse, partially populating the config.
+        """
+        for relative_path in (
+            "terraform/environments/sandbox/main.tf",
+            "terraform/environments/sandbox-cell1/main.tf",
+        ):
+            with self.subTest(root=relative_path):
+                root_dir = (ROOT / relative_path).parent
+                body = "\n".join(
+                    path.read_text(encoding="utf-8")
+                    for path in sorted(root_dir.glob("*.tf"))
+                )
+                if "local.connector_authority_cell_config" not in body:
+                    continue
+                self.assertIn("authority_cell_alias_targets", body)
+                self.assertRegex(
+                    body,
+                    r"try\(\s*\n?\s*data\.terraform_remote_state\.control"
+                    r"\.outputs\.authority_cell_alias_targets",
+                )
+                self.assertRegex(
+                    body,
+                    r"control_cell0_alias_targets == null \? null",
                 )
 
 

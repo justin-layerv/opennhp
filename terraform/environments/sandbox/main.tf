@@ -13,7 +13,7 @@ module "nhp" {
 
   environment                     = var.environment
   cell_id                         = var.cell_id
-  connector_authority_cell_config = var.connector_authority_cell_config
+  connector_authority_cell_config = local.connector_authority_cell_config
   aws_region                      = var.aws_region
   aws_account_id                  = var.aws_account_id
   server_ami_id                   = var.server_ami_id
