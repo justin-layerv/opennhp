@@ -628,7 +628,14 @@ def retirement_targets_raw(phase: str) -> bytes:
     # after it, post_removal asserts absence. The relay is NOT retired, so it
     # keeps its alias in both phases.
     def route53(host, zone, *, retired=True):
-        present = phase == "pre_removal" or not retired
+        # Only a host whose RECORD the retirement removed goes absent. The other
+        # operation hosts keep serving their remaining routes, so they resolve
+        # in both phases -- see RETIRED_DNS_HOSTS.
+        present = (
+            phase == "pre_removal"
+            or not retired
+            or host not in retirement_targets.RETIRED_DNS_HOSTS
+        )
         return {
             "alias_dns_name": f"dualstack.{host}" if present else None,
             "record_name": host,

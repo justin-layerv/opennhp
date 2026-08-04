@@ -22,6 +22,19 @@ RELAY_BASE_URL = "https://relay.qurl.link.layerv.xyz"
 SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 DNS_NAME_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}\.?$")
 
+# Hosts whose DNS RECORD is part of the retirement, as opposed to hosts that
+# merely stopped serving a retired PATH.
+#
+# HTTP_OPERATIONS is (host, method, path, zone): the retirement removed agent
+# lifecycle ROUTES. api.layerv.xyz and internal-api.qurl.layerv.xyz keep
+# serving everything else, so their records stay. bootstrap.layerv.xyz was a
+# dedicated host fronting the bootstrap ALB, which the retirement destroyed, so
+# its alias goes with it.
+#
+# Asserting absence for every operation host was wrong and is what this set
+# fixes: live sandbox has bootstrap at 0 A-records and the other two at 1 each.
+RETIRED_DNS_HOSTS = frozenset({"bootstrap.layerv.xyz"})
+
 HTTP_OPERATIONS = (
     ("bootstrap.layerv.xyz", "POST", "/v1/agent/bootstrap", PUBLIC_ZONE_ID),
     ("api.layerv.xyz", "GET", "/v1/agent/registration-info", PUBLIC_ZONE_ID),
@@ -214,7 +227,11 @@ def validate(
             host=host,
             zone_id=zone_id,
             name=f"retirement HTTP operation {index} Route53",
-            expect_present=proof_phase == "pre_removal",
+            # Only hosts whose RECORD the retirement removed may be absent
+            # post-removal; the rest still serve their remaining routes.
+            expect_present=(
+                proof_phase == "pre_removal" or host not in RETIRED_DNS_HOSTS
+            ),
         )
 
     relay = _exact(

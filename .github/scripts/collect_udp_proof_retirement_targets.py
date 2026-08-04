@@ -25,11 +25,16 @@ def _alias(
 ) -> dict[str, str | None]:
     """Observe a retirement target's Route53 alias, or prove it is gone.
 
-    The retired HTTP hosts only have an alias BEFORE the retirement applies.
-    Requiring one unconditionally made post_removal -- the phase whose whole
-    premise is that the surface is gone -- unsatisfiable the moment the
-    retirement succeeded. Absence is the stronger post-removal claim, so it is
-    asserted rather than skipped: a surviving record still fails the phase.
+    Requiring an alias unconditionally made post_removal -- the phase whose
+    premise is that the surface is gone -- unsatisfiable for the host the
+    retirement destroyed. Absence is the stronger claim there, so it is
+    asserted rather than skipped: a surviving record fails the phase.
+
+    Scoped by RETIRED_DNS_HOSTS, not by phase alone. HTTP_OPERATIONS names
+    (host, method, PATH): the retirement removed agent lifecycle ROUTES, and
+    only bootstrap.layerv.xyz was a dedicated host whose ALB went with them.
+    api.layerv.xyz and internal-api.qurl.layerv.xyz keep serving everything
+    else and must still resolve in both phases.
     """
     response = evidence._aws(
         "route53",
@@ -182,7 +187,17 @@ def collect(
     # relay.qurl.link.layerv.xyz below is NOT retired and stays present in both
     # phases, so it keeps the unconditional lookup.
     route53_by_host = {
-        host: _alias(host, zone_id, expect_present=proof_phase == "pre_removal")
+        host: _alias(
+            host,
+            zone_id,
+            # Only a host whose RECORD the retirement removed may be absent
+            # afterwards. Every other operation host still serves its remaining
+            # routes and must still resolve, in both phases.
+            expect_present=(
+                proof_phase == "pre_removal"
+                or host not in targets.RETIRED_DNS_HOSTS
+            ),
+        )
         for host, _, _, zone_id in targets.HTTP_OPERATIONS
     }
     route53_by_host["relay.qurl.link.layerv.xyz"] = _alias(
