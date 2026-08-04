@@ -616,6 +616,7 @@ lint-terraform-drift:
 	@python3 tests/scripts/test_check_terraform_plan_pr_policy_readonly.py
 	@python3 tests/scripts/test_compute_lifecycle_contract.py
 	@python3 tests/scripts/test_ac_tcp_target_group_contract.py
+	@python3 tests/scripts/test_security_group_rule_description_charset.py
 	@python3 .github/scripts/check-terraform-plan-pr-policy-readonly.py
 	@./tests/lints/terraform-tag-charset/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-tag-charset.py terraform

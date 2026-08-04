@@ -90,10 +90,13 @@ resource "aws_vpc_security_group_ingress_rule" "connector_authority_lambda_endpo
 
   security_group_id            = aws_security_group.connector_authority_lambda_endpoint[0].id
   referenced_security_group_id = aws_security_group.server.id
-  description                  = "HTTPS from this cell's NHP server"
-  from_port                    = 443
-  to_port                      = 443
-  ip_protocol                  = "tcp"
+  # No apostrophe: AWS restricts rule descriptions to
+  # a-zA-Z0-9 and ._-:/()#,@[]+=&;{}!$* plus spaces, and rejects the whole
+  # AuthorizeSecurityGroupIngress call otherwise.
+  description = "HTTPS from the NHP server in this cell"
+  from_port   = 443
+  to_port     = 443
+  ip_protocol = "tcp"
 }
 
 resource "aws_vpc_endpoint" "connector_authority_lambda" {
