@@ -196,11 +196,13 @@ class WorkflowContractTest(unittest.TestCase):
             "could not authenticate the producer run after bounded retries",
             "could not authenticate the producer artifact after bounded retries",
             "EXPECTED_AGENT_ID: qurl-go-sandbox-${{ github.run_id }}-${{ github.run_attempt }}",
-            # Main is the bible: the controller no longer binds frozen candidate
-            # heads. It re-reads each client's main and requires the producer
-            # artifact to agree, so these pin the replacement guarantee.
-            "producer artifact does not bind layervai/${repo}",
-            "but main is now",
+            # Main is the bible: the controller binds no frozen candidate head,
+            # and it no longer re-reads client main either. That re-read
+            # required bound == live -- "no client merged in between" -- which
+            # is the same pin, and it never ran (a path nothing writes, then a
+            # token that cannot read the client repos). The replacement
+            # guarantee is the collector's reachability check plus the
+            # immutable-ID artifact fetch below.
             "invoke_udp_proof_broker.sh",
             "wait_for_action_run.sh",
             "permission-actions: write",

@@ -113,17 +113,21 @@ class NoReintroducedPinsTest(unittest.TestCase):
                     f"{client} must be resolved through _resolve_client_main",
                 )
 
+        # The controller deliberately does NOT re-read client main any more.
+        # That step required bound == live -- "no client merged between the
+        # producer and the gate" -- which is the very pin this file exists to
+        # prevent, just spelled as a workflow step instead of a constant. It
+        # also never ran: a path nothing writes, then a token that cannot read
+        # the client repositories.
+        #
+        # De-pinning is carried by the collector (reachability from main) and by
+        # the artifact being fetched by immutable ID with digest-mismatch:
+        # error. Requiring the re-read here would reinstate the pin.
         controller = CONTROLLER.read_text(encoding="utf-8")
-        self.assertIn(
-            "git/ref/heads/main",
-            controller,
-            "the controller must re-read client main",
-        )
-        self.assertIn(
+        self.assertNotIn(
             "but main is now",
             controller,
-            "the controller must fail when the producer bound a commit that is no "
-            "longer main",
+            "the controller must not fail merely because main moved on",
         )
 
     def test_client_identity_is_reachability_never_equality(self) -> None:

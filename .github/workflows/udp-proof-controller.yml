@@ -189,55 +189,23 @@ jobs:
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
 
-      # github.token is scoped to THIS repository, so reading the clients' main
-      # refs with it 404s. Both clients are needed here, not just the selected
-      # one, so the token covers both. Contents-read only -- this step just
-      # reads two refs.
-      - name: Mint a read-only App token for the client main refs
-        id: gate_app
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
-          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
-          owner: layervai
-          repositories: "qurl-connector,qurl-go"
-          permission-contents: read
+      # The client-main re-read that used to live here is gone. It required
+      # bound == live -- "no client merged between the producer and this gate"
+      # -- the same self-re-acquiring pin removed from the collector in #3698,
+      # #3699, #3703, #3709 and #3712, unsatisfiable for the same reason.
+      #
+      # It also never actually ran: it read a path nothing writes (#3716), and
+      # once that was fixed it 404'd because github.token cannot read the client
+      # repositories (#3717). Giving this job cross-repo credentials means
+      # either the udp-proof-sandbox environment -- which has required_reviewers,
+      # so every proof run would pause for approval -- or minting a second App
+      # token to feed a check that should not exist.
+      #
+      # Nothing is lost. The producer artifact is downloaded by immutable ID
+      # with digest-mismatch: error, and the collector already proves each
+      # client commit REACHABLE from its main, which is the honest question to
+      # ask of a branch that keeps moving.
 
-      - name: Require the producer to bind current client main
-        env:
-          GH_TOKEN: ${{ steps.gate_app.outputs.token }}
-        run: |
-          set -euo pipefail
-          # Main is the bible. This step used to require the producer artifact to
-          # bind two frozen candidate SHAs, restated here and in each client
-          # repository. Any change to a client branch -- even absorbing main --
-          # moved a head and broke the binding, so the client branches could
-          # never converge. With many developers merging concurrently that never
-          # settles.
-          #
-          # Now the producer resolves each client's main at run time and this
-          # step re-reads main independently, so the two must agree on a commit
-          # neither of them chose. A client merge landing between the two reads
-          # is a genuine mismatch: the proof would otherwise attest a tree that
-          # is no longer main.
-          for repo in qurl-connector qurl-go; do
-            case "${repo}" in
-              qurl-connector) key=qurl_connector ;;
-              qurl-go)        key=qurl_go ;;
-            esac
-            bound="$(jq -r --arg k "$key" '.candidates[$k].head_sha' \
-              udp-proof-producer-artifact/deployment-provenance.json)"
-            live="$(gh api "repos/layervai/${repo}/git/ref/heads/main" --jq '.object.sha')"
-            if [[ -z "${bound}" || "${bound}" == "null" ]]; then
-              echo "::error::producer artifact does not bind layervai/${repo}"
-              exit 1
-            fi
-            if [[ "${bound}" != "${live}" ]]; then
-              echo "::error::producer bound layervai/${repo} ${bound} but main is now ${live}; re-run the producer"
-              exit 1
-            fi
-            echo "layervai/${repo} main = ${live}"
-          done
 
   proof:
     needs: gate
