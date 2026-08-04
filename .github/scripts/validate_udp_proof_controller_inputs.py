@@ -75,9 +75,20 @@ def select_dispatch(
         raise ValidationError("proof_phase must be pre_removal or post_removal")
 
     if proof_phase == "post_removal":
-        if not RUN_ID_RE.fullmatch(pre_removal_run_id):
+        # Unpaired post_removal is allowed, matching the client-artifact
+        # validator (#3694). The sandbox HTTP retirement was applied before the
+        # proof ever gated it, so no pre_removal run exists for either client
+        # and pre_removal is itself unsatisfiable now that all 25 governed
+        # resources are gone. Requiring the pairing here made post_removal
+        # permanently unreachable.
+        #
+        # When a pre-removal run IS supplied it must still be a well-formed run
+        # id, and the client artifact validator still binds its full lineage --
+        # evidence and deployment SHA-256 both -- so a paired run cannot be
+        # half-quoted.
+        if pre_removal_run_id and not RUN_ID_RE.fullmatch(pre_removal_run_id):
             raise ValidationError(
-                "post_removal requires the selected client's pre-removal run ID"
+                "post_removal pre-removal run ID must be a positive run id"
             )
     elif pre_removal_run_id:
         raise ValidationError("pre_removal_run_id must be empty during pre_removal")

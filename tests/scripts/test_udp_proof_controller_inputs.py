@@ -107,12 +107,28 @@ class ValidatorTest(unittest.TestCase):
             ),
         )
 
-    def test_rejects_missing_or_cross_client_linkage(self) -> None:
-        with self.assertRaisesRegex(validator.ValidationError, "pre-removal run ID"):
+    def test_admits_unpaired_post_removal(self) -> None:
+        """No pre_removal run exists, so requiring one bars post_removal entirely.
+
+        The sandbox HTTP retirement was applied before the proof gated it, and
+        pre_removal is unsatisfiable now that all 25 governed resources are
+        gone. Matches the client-artifact validator, which admits the unpaired
+        shape while still binding full lineage when a run IS quoted.
+        """
+        self.select_dispatch(
+            proof_phase="post_removal",
+            manifest=valid_manifest("post_removal"),
+        )
+
+    def test_rejects_a_malformed_pre_removal_run_id(self) -> None:
+        with self.assertRaisesRegex(validator.ValidationError, "positive run id"):
             self.select_dispatch(
                 proof_phase="post_removal",
                 manifest=valid_manifest("post_removal"),
+                pre_removal_run_id="not-a-run",
             )
+
+    def test_rejects_a_pre_removal_run_id_during_pre_removal(self) -> None:
         with self.assertRaisesRegex(validator.ValidationError, "must be empty"):
             self.select_dispatch(pre_removal_run_id="123")
 
