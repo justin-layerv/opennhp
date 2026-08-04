@@ -55,6 +55,22 @@ qurl_cookie_domain  = ".qurl.site.layerv.xyz"
 qurl_link_domain    = "qurl.link.layerv.xyz"
 qurl_site_domain    = "qurl.site.layerv.xyz"
 
+# --- Identity plane: agent-keys reads come from Control, not this cell ------
+# The sandbox identity plane runs in Control mode (see the cell0 root's
+# terraform.tfvars): the Connector Authority writes every agent registration
+# to layerv-nhp-sandbox-control-qurl-agent-keys. The Hub places registered
+# agents on this cell too, so the server must resolve knocks against the
+# Control table — its cell-local table never sees the registrations and every
+# registered-agent knock died as event="agent_unknown_pubkey". Values are the
+# SAME Control namespace as the cell0 root; the region must equal this cell's
+# region (the server's storage.toml renders a single DynamoDB region).
+control_identity_environment_id = "sandbox"
+control_identity_home_region    = "us-east-2"
+# The Control tables are encrypted with the Connector Authority key, which is
+# NOT this cell's DynamoDB key. Without decrypt on it the server boots fine
+# and then every agent-keys read returns AccessDeniedException.
+control_identity_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

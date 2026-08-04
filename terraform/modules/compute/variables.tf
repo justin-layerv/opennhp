@@ -414,6 +414,37 @@ variable "dynamodb_agent_keys_table" {
   default     = null
 }
 
+# Control-mode identity plane for the agent-keys read path.
+#
+# Identity is global, not cell-scoped (see the root variables.tf for the full
+# rationale): when the identity plane runs in Control mode, agent registration
+# (the Connector Authority) writes agent pubkey rows to the CONTROL
+# qurl-agent-keys table and the caller repoints var.dynamodb_agent_keys_table
+# at that table. The cell dynamodb module's read policy
+# (var.dynamodb_read_policy_arn) covers only cell-local table ARNs, so the
+# server role needs its own grant for the Control table — and, because the
+# Control tables are SSE-KMS encrypted with the Control identity key (NOT this
+# cell's key), kms:Decrypt on that key. All three variables travel together
+# with the repointed table name; empty disables the grant entirely (cell
+# compatibility mode).
+variable "control_identity_agent_keys_table_arn" {
+  description = "ARN of the Control qurl-agent-keys table the server resolves agent knocks against in Control identity mode. Empty keeps the cell-local grant surface only."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_kms_key_arn" {
+  description = "KMS key encrypting the Control identity tables. Required when control_identity_agent_keys_table_arn is set — DynamoDB reads of the SSE-KMS Control table fail with AccessDeniedException without decrypt on THIS key (the cell's own key does not cover it)."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_home_region" {
+  description = "Home region of the Control identity tables. Required when control_identity_agent_keys_table_arn is set; must equal the server's effective DynamoDB region because storage.toml renders a single [DynamoDB] Region for every table."
+  type        = string
+  default     = ""
+}
+
 variable "dynamodb_ack_tokens_table" {
   description = "DynamoDB table name for short-lived ACK token metadata used by /nhp/internal/token/validate."
   type        = string

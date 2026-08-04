@@ -70,6 +70,21 @@ locals {
     read  = 30000
     write = 30000
   }
+
+  # Control identity plane for the agent-keys read. Mirrors the cell0 root's
+  # locals (terraform/main.tf): the table name/ARN are derived rather than
+  # read across a state boundary — the prefix form is canonical and asserted
+  # by the authority module, so drift there fails loudly instead of silently
+  # mis-pointing this root. Name and ARN come from the same local so the
+  # compute wiring cannot grant one table while reading another.
+  control_identity_table_prefix          = var.control_identity_environment_id != "" ? "layerv-nhp-${var.control_identity_environment_id}-control" : ""
+  control_identity_agent_keys_table_name = var.control_identity_environment_id != "" ? "${local.control_identity_table_prefix}-qurl-agent-keys" : ""
+  control_identity_agent_keys_table_arn = var.control_identity_environment_id == "" ? "" : format(
+    "arn:aws:dynamodb:%s:%s:table/%s",
+    var.control_identity_home_region,
+    var.aws_account_id,
+    local.control_identity_agent_keys_table_name,
+  )
 }
 
 data "aws_region" "current" {}
@@ -414,8 +429,24 @@ module "compute" {
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
-  dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name
-  dynamodb_ack_tokens_table     = module.dynamodb.ack_tokens_table_name
+  # Agent keys follow the identity plane, not the cell. The Connector
+  # Authority registers agent pubkeys into the CONTROL qurl-agent-keys table
+  # (cell0 sandbox runs identity in Control mode), and the Hub places
+  # registered agents on this cell too — the cell-local table never sees the
+  # registrations, so reading it rejects every registered agent's knock as
+  # event="agent_unknown_pubkey". The other storage tables here are genuinely
+  # cell-local runtime state and stay on this cell's dynamodb module.
+  dynamodb_agent_keys_table = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
+  dynamodb_ack_tokens_table = module.dynamodb.ack_tokens_table_name
+
+  # IAM + KMS for the Control-mode agent-keys read path (empty in cell
+  # compatibility mode, which emits no grant at all). The cell dynamodb
+  # module's read policy cannot cover the Control table, and the Control
+  # tables are encrypted with the Control identity key rather than this
+  # cell's — the compute module carries the paired conditional grant.
+  control_identity_agent_keys_table_arn = local.control_identity_agent_keys_table_arn
+  control_identity_kms_key_arn          = var.control_identity_kms_key_arn
+  control_identity_home_region          = var.control_identity_home_region
 
   # Blue/green REQUIRED so the udp-listener-arn SSM parameter is published.
   enable_blue_green      = true

@@ -872,8 +872,25 @@ module "compute" {
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
-  dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name
-  dynamodb_ack_tokens_table     = module.dynamodb.ack_tokens_table_name
+  # Agent keys follow the identity plane, not the cell: in Control identity
+  # mode the Connector Authority writes agent pubkey rows to the CONTROL
+  # qurl-agent-keys table, so the server must resolve knocks against that
+  # table — the cell-local table never sees the registrations and every
+  # registered agent's knock dies as event="agent_unknown_pubkey". The other
+  # storage tables above/below are genuinely cell-local runtime state
+  # (assignments, ack tokens, licenses, resource catalog) and stay on this
+  # cell's dynamodb module.
+  dynamodb_agent_keys_table = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
+  dynamodb_ack_tokens_table = module.dynamodb.ack_tokens_table_name
+
+  # IAM + KMS for the Control-mode agent-keys read path (empty in cell
+  # compatibility mode, which emits no grant at all). The cell dynamodb
+  # module's read policy cannot cover the Control table, and the Control
+  # tables are encrypted with the Control identity key rather than this
+  # cell's — the compute module carries the paired conditional grant.
+  control_identity_agent_keys_table_arn = local.control_identity_agent_keys_table_arn
+  control_identity_kms_key_arn          = var.control_identity_kms_key_arn
+  control_identity_home_region          = var.control_identity_home_region
 
   # Cloud Map configuration for server health discovery
   # Filters stale AC assignments pointing to terminated servers
@@ -2754,6 +2771,22 @@ locals {
       name,
     )
   ]
+
+  # The NHP server's agent-keys read follows the identity plane, not the cell.
+  # In Control mode the Connector Authority registers agent pubkeys into the
+  # Control namespace, so a server still reading the cell-local
+  # qurl-agent-keys table rejects every registered agent's knock with
+  # event="agent_unknown_pubkey" (endpoints/server/nhpauth.go) — a dead
+  # Connector tunnel path for every enrolled device. Name and ARN are derived
+  # from the same local so the compute wiring cannot grant one table while
+  # reading another.
+  control_identity_agent_keys_table_name = var.control_identity_environment_id != "" ? "${local.control_identity_table_prefix}-qurl-agent-keys" : ""
+  control_identity_agent_keys_table_arn = var.control_identity_environment_id == "" ? "" : format(
+    "arn:aws:dynamodb:%s:%s:table/%s",
+    var.control_identity_home_region,
+    var.aws_account_id,
+    local.control_identity_agent_keys_table_name,
+  )
 }
 
 module "qurl_service" {

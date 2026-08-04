@@ -225,3 +225,37 @@ variable "qurl_v2_issuer_kid" {
   type        = string
   default     = "qurl-issuer-sandbox-2026-07"
 }
+
+# Control identity plane for the NHP server's agent-keys read.
+#
+# Identity is global, not cell-scoped: the Connector Authority registers agent
+# pubkeys for EVERY cell into the Control namespace, and the Hub can place a
+# registered agent on this cell. A cell1 server still reading the cell-local
+# qurl-agent-keys table therefore rejects every registered agent's knock with
+# event="agent_unknown_pubkey" — the registrations only ever land in Control.
+# These mirror the cell0 root's control_identity_* variables (terraform/
+# variables.tf); this lean root only threads the agent-keys read path, because
+# its private qurl-service is deliberately the cell-local data plane and holds
+# no Control identity access (see qurl_service.tf).
+#
+# Empty keeps the server on this cell's own agent-keys table, which is the
+# historical behavior. Setting it REQUIRES the Control table to be the live
+# registration namespace; flipping first would point the server at rows that
+# do not exist.
+variable "control_identity_environment_id" {
+  description = "Control namespace environment id for the agent-keys read (e.g. \"sandbox\"). Empty keeps the cell-local agent-keys table."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_home_region" {
+  description = "Home region of the Control identity tables. Required when control_identity_environment_id is set; must equal this cell's region because the server's storage.toml renders a single DynamoDB region."
+  type        = string
+  default     = ""
+}
+
+variable "control_identity_kms_key_arn" {
+  description = "KMS key encrypting the Control identity tables. Required when control_identity_environment_id is set — reads of the SSE-KMS Control agent-keys table fail with AccessDeniedException without decrypt on THIS key."
+  type        = string
+  default     = ""
+}

@@ -634,6 +634,12 @@ resource "time_sleep" "dynamodb_read_iam_propagation" {
     policy_doc_hash = var.dynamodb_read_policy_doc_hash
     policy_arn      = var.dynamodb_read_policy_arn
     attachment_id   = aws_iam_role_policy_attachment.server_dynamodb[0].id
+    # Content-keyed like policy_doc_hash above: re-fires the wait when the
+    # Control-mode agent-keys grant appears, changes, or is removed, so the
+    # identity-cutover apply's instance refresh cannot race the fresh inline
+    # policy into AccessDenied on first-boot DynamoDB calls. The reference
+    # also orders this wait after the policy write itself.
+    control_identity_agent_keys_policy_hash = try(sha256(aws_iam_role_policy.server_control_identity_agent_keys[0].policy), "disabled")
   }
 
   create_duration = "60s"
@@ -644,6 +650,86 @@ resource "aws_iam_role_policy_attachment" "server_keypair" {
   count      = var.attach_storage_policies ? 1 : 0
   role       = aws_iam_role.server.name
   policy_arn = var.keypair_policy_arn
+}
+
+# Control-mode agent-keys read grant (identity plane).
+#
+# When the identity plane runs in Control mode, agent registration (the
+# Connector Authority) writes agent pubkey rows to the CONTROL qurl-agent-keys
+# table and the caller repoints var.dynamodb_agent_keys_table at it. The cell
+# dynamodb module's read policy (var.dynamodb_read_policy_arn) covers only
+# cell-local table ARNs, so the resolve path needs its own grant here.
+#
+# Scope matches exactly what the server does with the table. The server's
+# whole agent-keys surface is the read-only AgentKeysQuerier in
+# endpoints/server/agent_peer_lookup.go: a Query against the pubkey-index GSI,
+# then a strongly consistent GetItem on the base row. There are no server
+# writes — last_seen/ttl keepalive bumps are qurl-service's (see the
+# KEYS_ONLY note on the table in modules/dynamodb/main.tf) — so no PutItem
+# and no kms:Encrypt/GenerateDataKey.
+#
+# The KMS statement is the classically-forgotten half: the Control tables are
+# SSE-KMS encrypted with the Control identity key, NOT this cell's key, so the
+# DynamoDB grant alone lets the server boot cleanly and then reject every
+# registered-agent knock at resolveAgentPeerForKnock with
+# AccessDeniedException. ViaService/CallerAccount mirror the cell read
+# policy's KMS statement (modules/dynamodb/main.tf) — decrypt only through
+# DynamoDB in the Control home region, only from this account.
+resource "aws_iam_role_policy" "server_control_identity_agent_keys" {
+  count = var.control_identity_agent_keys_table_arn != "" ? 1 : 0
+
+  name = "server-control-identity-agent-keys"
+  role = aws_iam_role.server.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ControlIdentityAgentKeysGetItem"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = var.control_identity_agent_keys_table_arn
+      },
+      {
+        Sid      = "ControlIdentityAgentKeysIndexQuery"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = "${var.control_identity_agent_keys_table_arn}/index/*"
+      },
+      {
+        Sid      = "ControlIdentityAgentKeysKMSDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.control_identity_kms_key_arn]
+        Condition = {
+          StringEquals = {
+            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+            "kms:ViaService"    = "dynamodb.${var.control_identity_home_region}.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+
+  lifecycle {
+    # A half-configured cutover is worse than either end state: the server
+    # would hold a DynamoDB grant it cannot use (every read fails on the
+    # missing KMS decrypt) or render a ViaService condition for region "".
+    precondition {
+      condition     = var.control_identity_kms_key_arn != "" && var.control_identity_home_region != ""
+      error_message = "control_identity_agent_keys_table_arn requires control_identity_kms_key_arn and control_identity_home_region; without the KMS half the server boots cleanly and every registered-agent knock fails with AccessDeniedException."
+    }
+    # storage.toml renders ONE [DynamoDB] Region for every table, including
+    # the repointed Control agent-keys table (user_data.sh.tpl). A Control
+    # home region different from the server's effective DynamoDB region would
+    # make every agent-keys read target a nonexistent same-name table in the
+    # local region — the same dead-tunnel outage this grant exists to fix,
+    # reintroduced cross-region and invisible until the first knock.
+    precondition {
+      condition     = var.control_identity_home_region == coalesce(var.dynamodb_region, data.aws_region.current.id)
+      error_message = "control_identity_home_region must equal the server's effective DynamoDB region (var.dynamodb_region, defaulting to the current region): the server's DynamoDB client uses the single storage.toml Region for every table it reads, so a cross-region Control agent-keys table cannot be reached."
+    }
+  }
 }
 
 # Note: Plugins are now baked into the Docker image - no S3 IAM policy needed
