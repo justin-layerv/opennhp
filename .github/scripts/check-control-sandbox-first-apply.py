@@ -12783,12 +12783,25 @@ def check_plan(
         # claim above already proved every other catalog field matches the
         # reviewed values byte-for-byte.
         plan_mode = "provisioned-cell-status-update"
-    elif changed == {HUB_WORKER_TASK_DEFINITION_ADDRESS}:
+    elif (
+        _hub_image_only := _claim_hub_worker_image_update(
+            changed, actual_non_noop, by_address
+        )
+    ) is not None and set(_hub_image_only) == changed and not deposed_by_address:
         # Deploying a reviewed Hub image. Immutable task definitions make this a
         # replacement by construction; _check_hub_worker_image_update proves the
         # replacement is image-only before it is admitted.
+        #
+        # Matched through the CLAIM rather than `changed == {task definition}`.
+        # Replacing the task definition of a resource an ECS SERVICE references
+        # always updates that service too, so the literal single-address form
+        # this branch used to require is a shape a real Hub image deploy never
+        # produces -- the plan fell through to the terminal reject, and the
+        # composer could not rescue it either because composition needs two or
+        # more claims and this is one. Same fix, and same reason, as
+        # authority-hub-exec-policy-update above.
         plan_mode = "hub-worker-image-update"
-        _check_hub_worker_image_update(by_address)
+        _validate_hub_worker_image_update(_hub_image_only, by_address, plan)
     elif hub_s3_correction:
         plan_mode = "hub-s3-endpoint-policy-correction"
         # A single in-place policy update on the already-created hub_s3 gateway

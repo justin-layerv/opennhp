@@ -13425,6 +13425,28 @@ class HubWorkerServiceClaimTest(unittest.TestCase):
             frozenset({self.TD, self.SVC}),
         )
 
+    def test_the_standalone_branch_admits_the_shape_a_real_deploy_produces(self) -> None:
+        """The dispatch predicate must be the CLAIM, not `changed == {TD}`.
+
+        Replacing the task definition a live ECS service references always
+        updates that service too, so `changed` on a real Hub image deploy is
+        {TD, SVC} -- never the single-address literal the branch used to
+        require. It therefore fell through to the terminal reject, and the
+        composer could not rescue it either: composition needs two or more
+        claims and a Hub deploy is one. The Hub image was undeployable through
+        the governed lane, which is why sandbox sat on a pre-1.1 image while
+        every other component rolled forward.
+        """
+        actual = {self.TD: ["delete", "create"], self.SVC: ["update"]}
+        changed = set(actual)
+        claimed = self.claim(actual)
+
+        # The new predicate matches.
+        self.assertIsNotNone(claimed)
+        self.assertEqual(set(claimed), changed)
+        # The old one did not -- this is the exact regression.
+        self.assertNotEqual(changed, {self.TD})
+
     def test_a_lone_service_update_is_never_claimed(self) -> None:
         """The service rides along with a replacement or not at all.
 
