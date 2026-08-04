@@ -28,7 +28,11 @@ ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR = ROOT / ".github/scripts/collect_udp_proof_deployment_evidence.py"
 CONTROLLER = ROOT / ".github/workflows/udp-proof-controller.yml"
 PRODUCER = ROOT / ".github/workflows/udp-proof-deployment-manifest.yml"
-PROOF_SURFACE = (CONTROLLER, PRODUCER, COLLECTOR)
+# The deployment CONTRACT holds its own copy of the client-identity rules, and
+# is where a pin survived after the collector was cleaned: the fence only
+# scanned the collector, so `!=` against a resolved head simply moved next door.
+DEPLOYMENT_CONTRACT = ROOT / ".github/scripts/udp_proof_deployment_contract.py"
+PROOF_SURFACE = (CONTROLLER, PRODUCER, COLLECTOR, DEPLOYMENT_CONTRACT)
 
 CLIENTS = ("layervai/qurl-connector", "layervai/qurl-go")
 
@@ -135,7 +139,9 @@ class NoReintroducedPinsTest(unittest.TestCase):
         The honest question is reachability, and the collector already answers it
         for the Connector. Both clients must go through the same helper.
         """
-        collector = COLLECTOR.read_text(encoding="utf-8")
+        collector = COLLECTOR.read_text(encoding="utf-8") + DEPLOYMENT_CONTRACT.read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             "def _canary_commit_is_in_main",
             collector,

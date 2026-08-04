@@ -23,6 +23,9 @@ import udp_proof_deployment_contract as contract  # noqa: E402
 PRODUCER_SHA = "a" * 40
 NHP_SHA = "b" * 40
 CONNECTOR_SHA = "c" * 40
+# The commit the canary was BUILT from. Deliberately != CONNECTOR_SHA so the
+# fixture exercises main advancing between the canary build and validation.
+CANARY_HEAD_SHA = "ab" * 20
 QURL_GO_SHA = "d" * 40
 FRP_SHA = "e" * 40
 QURL_SERVICE_SHA = "1" * 40
@@ -122,7 +125,7 @@ def repository_shas() -> dict[str, str]:
     return {
         "frp": FRP_SHA,
         "nhp": NHP_SHA,
-        "qurl_connector": CONNECTOR_SHA,
+        "qurl_connector": CANARY_HEAD_SHA,
         "qurl_go": QURL_GO_SHA,
         "qurl_integrations": OTHER_SHA,
         "qurl_mcp": "4" * 40,
@@ -390,9 +393,9 @@ def valid_snapshot() -> dict[str, object]:
         "workflow_path": ".github/workflows/connector-canary-publish.yml",
         "run_id": 12345,
         "run_attempt": 1,
-        "head_sha": "f" * 40,
+        "head_sha": CANARY_HEAD_SHA,
         "artifact_id": 67890,
-        "artifact_name": f"connector-canary-main-{CONNECTOR_SHA}",
+        "artifact_name": f"connector-canary-main-{CANARY_HEAD_SHA}",
         "artifact_digest": digest("a"),
         "image_ref": (
             f"ghcr.io/layervai/qurl-connector-canary@{IMAGE_DIGESTS['qurl_connector']}"
@@ -476,7 +479,7 @@ def valid_snapshot() -> dict[str, object]:
         "qurl_connector": {
             "kind": "connector_canary",
             "image_digest": IMAGE_DIGESTS["qurl_connector"],
-            "source_revision": CONNECTOR_SHA,
+            "source_revision": CANARY_HEAD_SHA,
             "canary_artifact_digest": canary["artifact_digest"],
         },
         "qurl_reverse_tunnel_server": {
@@ -803,10 +806,26 @@ class ContractTest(unittest.TestCase):
         with self.assertRaisesRegex(contract.ContractError, "40-character"):
             self.validate(snapshot)
 
-    def test_rejects_candidate_head_drift(self) -> None:
+    def test_admits_a_candidate_head_that_moved_past_the_artifact(self) -> None:
+        """Main advancing after the canary was built must not fail the proof.
+
+        This used to require candidates[key].head_sha == the manifest SHA. Once
+        the manifest records the commit the ARTIFACT was built from, that
+        equality says "main has not moved since", which is false for most of a
+        proof run with clients merging continuously.
+
+        Nothing is taken on trust in exchange: the artifact's commit is proved
+        reachable from main by the collector (_canary_commit_is_in_main), and
+        the candidate is still pinned to main by head_ref below.
+        """
         snapshot = valid_snapshot()
         snapshot["provenance"]["candidates"]["qurl_go"]["head_sha"] = "0" * 40
-        with self.assertRaisesRegex(contract.ContractError, "candidate head SHA"):
+        self.validate(snapshot)
+
+    def test_still_rejects_a_candidate_that_is_not_main(self) -> None:
+        snapshot = valid_snapshot()
+        snapshot["provenance"]["candidates"]["qurl_go"]["head_ref"] = "topic/x"
+        with self.assertRaisesRegex(contract.ContractError, "head_ref is not main"):
             self.validate(snapshot)
 
     def test_rejects_ambiguous_lambda_pair_order(self) -> None:

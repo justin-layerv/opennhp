@@ -784,11 +784,12 @@ def _validate_repository_evidence(
         elif key in {"qurl_connector", "qurl_go"}:
             candidate_key = "qurl_connector" if key == "qurl_connector" else "qurl_go"
             candidate = candidates[candidate_key]
-            if (
-                source != "candidate"
-                or ref != f"refs/heads/{candidate['head_ref']}"
-                or sha != candidate["head_sha"]
-            ):
+            # Ref, not SHA: the branch is the provenance claim, while the SHA
+            # is whatever commit the canary was built from. Requiring it to
+            # equal the freshly-resolved head is a pin -- the clients merge
+            # continuously -- and reachability from main is asserted by the
+            # collector, which is the check that survives a moving main.
+            if source != "candidate" or ref != f"refs/heads/{candidate['head_ref']}":
                 raise ContractError(f"{key} must come from its current candidate")
         elif key == "frp":
             if source != "canary_module" or not ref.startswith("refs/tags/"):
@@ -1728,9 +1729,10 @@ def _validate_canary(
         # must bind is the SHA: the evidence has to be for the connector commit
         # this manifest is about.
         or not CANARY_EVIDENCE_ARTIFACT_RE.fullmatch(str(canary["artifact_name"]))
-        or not str(canary["artifact_name"]).endswith(
-            f"-{candidates['qurl_connector']['head_sha']}"
-        )
+        # The artifact name identifies the commit the canary was BUILT from,
+        # not whatever main has since become -- same reasoning as the manifest
+        # SHAs above.
+        or not str(canary["artifact_name"]).endswith(f"-{canary['head_sha']}")
         or not isinstance(canary["artifact_digest"], str)
         or not DIGEST_RE.fullmatch(canary["artifact_digest"])
         or canary["image_ref"]
@@ -1806,8 +1808,12 @@ def validate_provenance(
         validate_branch(candidate["head_ref"], f"{key} head_ref")
         if candidate["head_ref"] != "main":
             raise ContractError(f"candidate {key} head_ref is not main")
-        if candidate["head_sha"] != manifest["repositories"][key]:
-            raise ContractError(f"candidate head SHA drift for {key}")
+        # NOT compared to manifest["repositories"][key]: that records the commit
+        # the artifact was built from, while this records where main is now.
+        # Requiring them equal is the same pin removed above -- it holds only
+        # while no client merges during a proof run. The candidate is still
+        # pinned to main by head_ref, and the artifact's commit is still proved
+        # reachable from main by the collector.
 
     files = _exact(
         provenance["files"],

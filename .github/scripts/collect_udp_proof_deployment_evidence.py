@@ -4265,9 +4265,17 @@ def collect_aws_and_build_snapshot(
     # provenance, not the coincidence that the numbers matched.
     _validate_deployed_revision_families(github_evidence, workloads)
     repository_shas = {
+        # Record what the ARTIFACT UNDER TEST actually contains, the way `frp`
+        # already did. These two used to record the freshly-resolved main head
+        # instead, which made the manifest describe whatever main had become
+        # rather than what was proven -- and the canary-vs-manifest equality
+        # below could then only hold if no client merged during the run.
+        #
+        # Reachability from main is still enforced, by _canary_commit_is_in_main
+        # on both clients; that is the check that belongs against a moving main.
         "frp": canary["frp_sha"],
-        "qurl_connector": github_evidence["candidates"]["qurl_connector"]["head_sha"],
-        "qurl_go": github_evidence["candidates"]["qurl_go"]["head_sha"],
+        "qurl_connector": canary["head_sha"],
+        "qurl_go": canary["qurl_go_sha"],
         "qurl_reverse_tunnel_server": workloads["qurl_reverse_tunnel_server"][
             "source_revision"
         ],
@@ -4308,13 +4316,21 @@ def collect_aws_and_build_snapshot(
         key: github_evidence["default_branches"][key]
         for key in contract.DEFAULT_BRANCH_REPOSITORIES
     }
+    # The SHA is the commit the canary was BUILT from; the ref stays the
+    # candidate branch it came from. Recording the resolved head here instead
+    # made this evidence describe main rather than the artifact, so it could
+    # only agree with the canary while no client merged mid-run.
+    canary_client_shas = {
+        "qurl_connector": canary["head_sha"],
+        "qurl_go": canary["qurl_go_sha"],
+    }
     for key in ("qurl_connector", "qurl_go"):
         candidate = github_evidence["candidates"][key]
         repository_evidence[key] = {
             "repository": candidate["repository"],
             "source": "candidate",
             "ref": f"refs/heads/{candidate['head_ref']}",
-            "sha": candidate["head_sha"],
+            "sha": canary_client_shas[key],
         }
     repository_evidence["frp"] = {
         "repository": "layervai/frp",
