@@ -189,9 +189,23 @@ jobs:
             --pre-removal-run-id "$PRE_REMOVAL_RUN_ID" \
             --github-output "$GITHUB_OUTPUT"
 
+      # github.token is scoped to THIS repository, so reading the clients' main
+      # refs with it 404s. Both clients are needed here, not just the selected
+      # one, so the token covers both. Contents-read only -- this step just
+      # reads two refs.
+      - name: Mint a read-only App token for the client main refs
+        id: gate_app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.UDP_PROOF_JIT_APP_ID }}
+          private-key: ${{ secrets.UDP_PROOF_JIT_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: "qurl-connector,qurl-go"
+          permission-contents: read
+
       - name: Require the producer to bind current client main
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.gate_app.outputs.token }}
         run: |
           set -euo pipefail
           # Main is the bible. This step used to require the producer artifact to
