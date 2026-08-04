@@ -109,6 +109,7 @@ variables {
   proof_account_credential_sha256      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   proof_mailbox_route53_zone_id        = "Z10394893FM38A1RXLL32"
   proof_mailbox_domain                 = "proof.notify.layerv.xyz"
+  ci_otp_mailbox_domain                = "ci.notify.layerv.xyz"
 }
 
 run "secure_ephemeral_runner_contract" {
@@ -616,6 +617,83 @@ run "secure_ephemeral_runner_contract" {
     )
     error_message = "The broker must serialize launch/cleanup and retain its independent five-minute sweep."
   }
+
+  assert {
+    condition = (
+      # The CI rule joins the module-owned regional-singleton set APPENDED
+      # after the attended proof rule -- never a second set, never a
+      # displacement of qurl-go-account-otp.
+      aws_ses_receipt_rule.ci_otp_mailbox.rule_set_name == aws_ses_receipt_rule_set.proof_otp_mailbox.rule_set_name &&
+      aws_ses_receipt_rule.ci_otp_mailbox.after == aws_ses_receipt_rule.proof_otp_mailbox.name &&
+      aws_ses_receipt_rule.ci_otp_mailbox.name == "qurl-ci-account-otp" &&
+      aws_ses_receipt_rule.ci_otp_mailbox.recipients == toset(["qurl-ci@ci.notify.layerv.xyz"]) &&
+      aws_ses_receipt_rule.ci_otp_mailbox.enabled &&
+      aws_ses_receipt_rule.ci_otp_mailbox.scan_enabled &&
+      aws_ses_receipt_rule.ci_otp_mailbox.tls_policy == "Require" &&
+      [for action in aws_ses_receipt_rule.ci_otp_mailbox.s3_action : action.bucket_name] == [aws_s3_bucket.ci_otp_mailbox.id] &&
+      [for action in aws_ses_receipt_rule.ci_otp_mailbox.s3_action : action.object_key_prefix] == ["otp/"] &&
+      aws_ses_receipt_rule.proof_otp_mailbox.recipients == toset(["qurl-go@proof.notify.layerv.xyz"])
+    )
+    error_message = "The CI OTP rule must be an additional Require-TLS rule appended after the untouched proof rule in the same active set."
+  }
+
+  assert {
+    condition = (
+      aws_s3_bucket.ci_otp_mailbox.bucket == "layerv-nhp-sandbox-qurl-ci-otp-mailbox" &&
+      aws_s3_bucket_ownership_controls.ci_otp_mailbox.rule[0].object_ownership == "BucketOwnerEnforced" &&
+      aws_s3_bucket_public_access_block.ci_otp_mailbox.block_public_acls &&
+      aws_s3_bucket_public_access_block.ci_otp_mailbox.block_public_policy &&
+      aws_s3_bucket_public_access_block.ci_otp_mailbox.ignore_public_acls &&
+      aws_s3_bucket_public_access_block.ci_otp_mailbox.restrict_public_buckets &&
+      [for rule in aws_s3_bucket_server_side_encryption_configuration.ci_otp_mailbox.rule : rule.apply_server_side_encryption_by_default[0].sse_algorithm] == ["AES256"] &&
+      aws_s3_bucket_lifecycle_configuration.ci_otp_mailbox.rule[0].filter[0].prefix == "otp/" &&
+      aws_s3_bucket_lifecycle_configuration.ci_otp_mailbox.rule[0].expiration[0].days == 1 &&
+      ({ for statement in jsondecode(aws_s3_bucket_policy.ci_otp_mailbox.policy).Statement : statement.Sid => statement })["DenyInsecureTransport"].Effect == "Deny" &&
+      ({ for statement in jsondecode(aws_s3_bucket_policy.ci_otp_mailbox.policy).Statement : statement.Sid => statement })["AllowExactSESReceiptRule"].Condition.StringEquals["aws:SourceAccount"] == "767397897469" &&
+      ({ for statement in jsondecode(aws_s3_bucket_policy.ci_otp_mailbox.policy).Statement : statement.Sid => statement })["AllowExactSESReceiptRule"].Condition.ArnEquals["aws:SourceArn"] == "arn:aws:ses:us-east-2:767397897469:receipt-rule-set/layerv-nhp-sandbox-udp-proof:receipt-rule/qurl-ci-account-otp" &&
+      ({ for statement in jsondecode(aws_s3_bucket_policy.ci_otp_mailbox.policy).Statement : statement.Sid => statement })["AllowExactSESReceiptRule"].Action == "s3:PutObject" &&
+      # The CI mailbox deliberately has no SQS queue or bucket notification:
+      # the proof queue's single-consumer semantics must never be shared.
+      aws_route53_record.ci_otp_mailbox_mx.name == "ci.notify.layerv.xyz" &&
+      aws_route53_record.ci_otp_mailbox_mx.type == "MX" &&
+      aws_route53_record.ci_otp_mailbox_mx.zone_id == "Z10394893FM38A1RXLL32" &&
+      aws_route53_record.ci_otp_mailbox_mx.records == toset(["10 inbound-smtp.us-east-2.amazonaws.com"])
+    )
+    error_message = "The CI OTP mailbox must be a private, encrypted, one-day, SES-write-only bucket with its own MX record and no queue."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.ci_otp_reader.name == "layerv-nhp-sandbox-qurl-ci-otp-reader" &&
+      jsondecode(aws_iam_role.ci_otp_reader.assume_role_policy).Statement[0].Principal.Federated == var.github_oidc_provider_arn &&
+      jsondecode(aws_iam_role.ci_otp_reader.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com" &&
+      toset(jsondecode(aws_iam_role.ci_otp_reader.assume_role_policy).Statement[0].Condition.StringLike["token.actions.githubusercontent.com:sub"]) == toset([
+        "repo:layervai/qurl-go:ref:refs/heads/main",
+        "repo:layervai/qurl-go:environment:sandbox",
+        "repo:layervai/qurl-service:ref:refs/heads/main",
+        "repo:layervai/qurl-service:environment:sandbox",
+        "repo:layervai/qurl-connector:ref:refs/heads/main",
+        "repo:layervai/qurl-connector:environment:sandbox",
+      ]) &&
+      !strcontains(aws_iam_role.ci_otp_reader.assume_role_policy, "pull_request") &&
+      toset([for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid]) == toset([
+        "ListExactCIOTPMailbox",
+        "ReadExactCIOTPMailboxObjects",
+      ]) &&
+      ({ for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid => statement })["ListExactCIOTPMailbox"].Action == "s3:ListBucket" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid => statement })["ListExactCIOTPMailbox"].Resource == aws_s3_bucket.ci_otp_mailbox.arn &&
+      ({ for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid => statement })["ListExactCIOTPMailbox"].Condition.StringLike["s3:prefix"] == "otp/*" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid => statement })["ReadExactCIOTPMailboxObjects"].Action == "s3:GetObject" &&
+      ({ for statement in jsondecode(aws_iam_role_policy.ci_otp_reader.policy).Statement : statement.Sid => statement })["ReadExactCIOTPMailboxObjects"].Resource == "${aws_s3_bucket.ci_otp_mailbox.arn}/otp/*" &&
+      # Read-only and CI-bucket-only: no queue consumption, no writes or
+      # deletes, and nothing that could reach the attended proof mailbox.
+      !strcontains(aws_iam_role_policy.ci_otp_reader.policy, "sqs:") &&
+      !strcontains(aws_iam_role_policy.ci_otp_reader.policy, "s3:PutObject") &&
+      !strcontains(aws_iam_role_policy.ci_otp_reader.policy, "s3:DeleteObject") &&
+      !strcontains(aws_iam_role_policy.ci_otp_reader.policy, aws_s3_bucket.proof_otp_mailbox.arn)
+    )
+    error_message = "The CI OTP reader must be a standalone read-only role trusting only the three qURL client repos' trusted-main or sandbox-Environment claims."
+  }
 }
 
 run "reject_cross_account_proof_key" {
@@ -700,6 +778,16 @@ run "accept_legacy_ami_length" {
   variables {
     ami_id = "ami-01234567"
   }
+}
+
+run "reject_ci_mailbox_domain_shared_with_proof_mailbox" {
+  command = plan
+
+  variables {
+    ci_otp_mailbox_domain = "proof.notify.layerv.xyz"
+  }
+
+  expect_failures = [var.ci_otp_mailbox_domain]
 }
 
 run "reject_non_x86_64_ami" {

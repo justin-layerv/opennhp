@@ -287,6 +287,21 @@ tasks, so it requires a prod-rollout-ledger entry (sandbox tasks only). This
 module-foundation PR creates no root instance and therefore has no rollout task
 of its own.
 
+## qURL CI OTP mailbox (`ci_otp_mailbox.tf`)
+
+SES permits one active receipt rule set per region and this module owns it, so
+the CI-readable qURL enrollment OTP inbox (`qurl-ci@<ci_otp_mailbox_domain>`)
+lives here as a sibling of the attended proof mailbox rather than in a root of
+its own. It is one additional receipt rule (`qurl-ci-account-otp`) appended
+with `after` behind the untouched `qurl-go-account-otp` rule, delivering into
+its own private one-day bucket. The proof mailbox's bucket and SQS queue are
+single-consumer and are never shared: the CI mailbox has no queue at all, and
+client-repo CI (`layervai/qurl-go`, `layervai/qurl-service`,
+`layervai/qurl-connector`) polls S3 through the dedicated read-only
+`<name_prefix>-qurl-ci-otp-reader` OIDC role — trusted-main or
+sandbox-Environment claims only, no `pull_request` claim, and no change to any
+pre-existing role.
+
 ## Validation
 
 From this directory:

@@ -117,6 +117,12 @@ variable "proof_mailbox_domain" {
   default     = "proof.notify.layerv.xyz"
 }
 
+variable "ci_otp_mailbox_domain" {
+  description = "Sandbox-only SES receiving subdomain for the qURL CI OTP mailbox (must differ from proof_mailbox_domain)."
+  type        = string
+  default     = "ci.notify.layerv.xyz"
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

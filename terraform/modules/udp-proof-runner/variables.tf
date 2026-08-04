@@ -208,6 +208,28 @@ variable "proof_mailbox_domain" {
   }
 }
 
+variable "ci_otp_mailbox_domain" {
+  description = "Sandbox-only SES receiving subdomain dedicated to the qURL CI OTP mailbox. Must differ from proof_mailbox_domain so neither inbox can capture the other's MX record."
+  type        = string
+
+  validation {
+    condition = (
+      var.ci_otp_mailbox_domain == lower(var.ci_otp_mailbox_domain) &&
+      can(regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", var.ci_otp_mailbox_domain))
+    )
+    error_message = "ci_otp_mailbox_domain must be a canonical lowercase DNS name."
+  }
+
+  # The attended proof mailbox is single-consumer (the proof runner deletes
+  # what it reads). A shared domain would put one MX record in front of both
+  # recipients' rules and invite exactly the message-stealing this module's
+  # split mailboxes exist to prevent.
+  validation {
+    condition     = var.ci_otp_mailbox_domain != var.proof_mailbox_domain
+    error_message = "ci_otp_mailbox_domain must differ from proof_mailbox_domain."
+  }
+}
+
 variable "provisioned_cell_catalog_kms_key_arn" {
   description = <<-EOT
     Exact Control data CMK ARN encrypting the provisioned-cell catalog table

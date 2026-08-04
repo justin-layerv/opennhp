@@ -77,3 +77,18 @@ output "assignment_handshake_kms_key_arn" {
   description = "Exact KMS key ARN clients must name explicitly when writing handshake objects."
   value       = aws_kms_key.assignment_handshake.arn
 }
+
+output "qurl_ci_otp_mailbox_recipient" {
+  description = "Exact SES recipient qURL client-repo CI enrolls with to receive OTP mail."
+  value       = local.ci_otp_mailbox_recipient
+}
+
+output "qurl_ci_otp_mailbox_bucket" {
+  description = "Private one-day S3 mailbox CI polls (otp/ prefix) for qURL enrollment OTP mail; deliberately has no SQS queue."
+  value       = aws_s3_bucket.ci_otp_mailbox.id
+}
+
+output "qurl_ci_otp_reader_role_arn" {
+  description = "Read-only OIDC role qurl-go/qurl-service/qurl-connector CI assumes to read the CI OTP mailbox."
+  value       = aws_iam_role.ci_otp_reader.arn
+}

@@ -62,3 +62,18 @@ output "assignment_handshake_kms_key_arn" {
   description = "KMS key ARN required on assignment proof checkpoint/receipt writes."
   value       = module.udp_proof_runner.assignment_handshake_kms_key_arn
 }
+
+output "qurl_ci_otp_mailbox_recipient" {
+  description = "Exact SES recipient qURL client-repo CI enrolls with to receive OTP mail."
+  value       = module.udp_proof_runner.qurl_ci_otp_mailbox_recipient
+}
+
+output "qurl_ci_otp_mailbox_bucket" {
+  description = "Private one-day CI OTP mailbox bucket polled directly over S3 (no SQS)."
+  value       = module.udp_proof_runner.qurl_ci_otp_mailbox_bucket
+}
+
+output "qurl_ci_otp_reader_role_arn" {
+  description = "Read-only OIDC role qurl-go/qurl-service/qurl-connector CI assumes to read the CI OTP mailbox."
+  value       = module.udp_proof_runner.qurl_ci_otp_reader_role_arn
+}

@@ -62,6 +62,7 @@ module "udp_proof_runner" {
   proof_account_credential_sha256      = var.proof_account_credential_sha256
   proof_mailbox_route53_zone_id        = var.proof_mailbox_route53_zone_id
   proof_mailbox_domain                 = var.proof_mailbox_domain
+  ci_otp_mailbox_domain                = var.ci_otp_mailbox_domain
 
   tags = local.common_tags
 }
