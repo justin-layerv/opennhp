@@ -5,8 +5,8 @@
 # attachments that remote-state equality cannot see.
 set -euo pipefail
 
-if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 <terraform-show-plan-json> <evidence-directory>" >&2
+if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+  echo "usage: $0 <terraform-show-plan-json> <evidence-directory> [pre-apply|post-apply]" >&2
   exit 2
 fi
 

@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -620,6 +621,66 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(marker, source)
         self.assertNotIn('attempt < 20', source)
         self.assertNotIn('within 20 checks', source)
+
+    def test_live_boundary_accepts_the_optional_phase_argument(self) -> None:
+        # #3705 gave the script an optional third `phase` argument but left the
+        # arity guard at `-ne 2`, so the workflow's own `pre-apply` call died on
+        # the usage error before doing any work. That deadlocked every Control
+        # sandbox apply -- including the one that opens the Hub UDP edge.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "evidence"
+            missing_plan = Path(tmp) / "absent-plan.json"
+            for args in ([], ["pre-apply"], ["post-apply"]):
+                with self.subTest(phase=args or ["<default>"]):
+                    result = subprocess.run(
+                        [str(LIVE_BOUNDARY_PATH), str(missing_plan), str(evidence), *args],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    # Must get PAST the arity/usage guard and fail on the real
+                    # precondition instead.
+                    self.assertNotIn("usage:", result.stderr)
+                    self.assertIn("Terraform plan JSON does not exist", result.stderr)
+
+            rejected = subprocess.run(
+                [str(LIVE_BOUNDARY_PATH), str(missing_plan), str(evidence), "mid-apply"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("usage:", rejected.stderr)
+
+    def test_every_live_boundary_caller_passes_an_accepted_argument_count(self) -> None:
+        # The bug above was an arity mismatch between the script and its
+        # callers, which no test compared. Assert the contract directly.
+        workflow_call = re.search(
+            r"scripts/verify-control-sandbox-live-boundary\.sh \\\n((?:\s+\S+ \\\n)*\s+\S+)",
+            WORKFLOW_PATH.read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(workflow_call, "workflow no longer invokes the live-boundary script")
+        assert workflow_call is not None
+        workflow_args = [
+            line.strip().rstrip("\\").strip()
+            for line in workflow_call.group(1).splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(workflow_args), 3, workflow_args)
+        self.assertEqual(workflow_args[-1], "pre-apply")
+
+        first_apply_call = re.search(
+            r'"\$repo_root/scripts/verify-control-sandbox-live-boundary\.sh" \\\n((?:\s+\S+ \\\n)*\s+\S+)',
+            VERIFY_PATH.read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(first_apply_call, "first-apply no longer invokes the live-boundary script")
+        assert first_apply_call is not None
+        first_apply_args = [
+            line.strip().rstrip("\\").strip()
+            for line in first_apply_call.group(1).splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(first_apply_args), 2, first_apply_args)
 
     def test_live_boundary_checks_control_and_authority_runtime_namespaces(self) -> None:
         source = LIVE_BOUNDARY_PATH.read_text(encoding="utf-8")
