@@ -224,7 +224,7 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
 		log.Error("agent(%s#%d)[KnockRequest] response error: %s", knkMsg.UserId, knkMd.TransactionId, ackMsg.ErrMsg)
-		err = common.ErrorCodeToError(ackMsg.ErrCode)
+		err = common.ErrorFromResponse(ackMsg.ErrCode, ackMsg.ErrMsg)
 		return ackMsg, err
 	}
 
@@ -345,7 +345,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
 		log.Error("agent(%s#%d)[ExitKnockRequest] response error: %s", knkMsg.UserId, knkMd.TransactionId, ackMsg.ErrMsg)
-		err = common.ErrorCodeToError(ackMsg.ErrCode)
+		err = common.ErrorFromResponse(ackMsg.ErrCode, ackMsg.ErrMsg)
 		return ackMsg, err
 	}
 
@@ -634,7 +634,7 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
 		log.Error("agent(%s#%d)[KnockDHP] response error: %s", knkMsg.UserId, knkMd.TransactionId, ackMsg.ErrMsg)
-		err = common.ErrorCodeToError(ackMsg.ErrCode)
+		err = common.ErrorFromResponse(ackMsg.ErrCode, ackMsg.ErrMsg)
 		return ackMsg, err
 	}
 

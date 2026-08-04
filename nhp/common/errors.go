@@ -57,6 +57,46 @@ func IsSuccessErrCode(errCode string) bool {
 	return errCode == "" || errCode == ErrSuccess.ErrorCode()
 }
 
+// ErrorFromResponse maps a protocol response's code to a concrete error. Known
+// NHP codes retain their canonical, localized error. Extension codes emitted by
+// an auth service or AC retain the authenticated response message instead of
+// becoming a nil *Error inside a non-nil error interface.
+//
+// Two deliberate properties, despite what the name might suggest:
+//
+//   - For a KNOWN code the wire message is DISCARDED, not preserved. The
+//     canonical string is the trusted one; there is no reason to surface remote
+//     text when we already have our own. The wire message is not lost to
+//     operators — every call site logs `ackMsg.ErrMsg` immediately before
+//     calling this.
+//
+//     The known-code return is the shared package-level sentinel itself (a
+//     pointer identity that TestErrorFromResponseKnownCodeUsesCanonicalError
+//     asserts), NOT a copy. Callers must treat it as read-only: mutating the
+//     returned *Error to attach a per-request message would corrupt that
+//     sentinel process-wide for every future caller. Use WithExtra, which
+//     returns a new Error, if you need to attach context.
+//
+//   - For an unknown code the returned message IS remote-controlled. Treat it
+//     as untrusted display text: log it, surface it, but never parse it or
+//     branch on it. Only the code is a contract.
+//
+// It never returns nil. That is load-bearing, not incidental: the replaced
+// `ErrorCodeToError` returns a nil *Error for unregistered codes, and assigning
+// a nil *Error to an `error` variable yields a non-nil interface wrapping a nil
+// pointer — `err != nil` is true and `err.Error()` then dereferences a nil
+// receiver and panics. Callers assign the result straight into an `error`, so
+// returning nil here would reopen that trap.
+func ErrorFromResponse(code, message string) *Error {
+	if e := ErrorCodeToError(code); e != nil {
+		return e
+	}
+	if message == "" {
+		message = "unknown NHP error code " + code
+	}
+	return &Error{code: code, msg: message}
+}
+
 // application errors
 var (
 	// generic

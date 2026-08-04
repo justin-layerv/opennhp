@@ -536,7 +536,8 @@ resource "aws_cloudwatch_dashboard" "main" {
           region = data.aws_region.current.id
           metrics = [
             ["LayerV/NHP", "ServerForwardTargetDrop", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Target Drop" }],
-            [aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].namespace, aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].name, { "label" : "Async Runtime Panic Recovery" }]
+            [aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].namespace, aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].name, { "label" : "Async Runtime Panic Recovery" }],
+            [aws_cloudwatch_log_metric_filter.server_handler_panic.metric_transformation[0].namespace, aws_cloudwatch_log_metric_filter.server_handler_panic.metric_transformation[0].name, { "label" : "Handler Panic Recovery" }]
           ]
           period  = 300
           stat    = "Sum"
@@ -2266,6 +2267,10 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
 # and parity tests without coupling the alarm to a field path. The scope is
 # intentionally limited to msgToPacketRoutine; add or widen a filter if another
 # structured recover() site starts converting ErrRuntimePanic into dropped work.
+# (server_handler_panic below is the second such site — dispatchHandler, added
+# in PR #3643. Each site gets its own narrow AND-matched filter rather than one
+# widened "runtime panic encountered" match, so a new recover site cannot join
+# an existing alarm silently and each alarm names the call site it pages for.)
 # The raw AND match is deliberate: only the recovery line should emit both terms.
 resource "aws_cloudwatch_log_metric_filter" "server_async_runtime_panic" {
   name           = "${var.name_prefix}-${var.cell_id}-server-async-runtime-panic"
@@ -2369,6 +2374,88 @@ resource "aws_cloudwatch_metric_alarm" "server_async_runtime_panic" {
     Component = "monitoring"
     Cell      = var.cell_id
     Issue     = "2679"
+  })
+}
+
+# Recovered dispatchHandler panics (PR #3643, synced from upstream 94a5ff67).
+# dispatchHandler now wraps each message-handler goroutine in a recover(), so a
+# parser panic on attacker-controlled bytes degrades to a dropped request
+# instead of killing the process. That REMOVED this class from the stderr
+# "panic:" detector above -- there is no longer a crash to observe -- so
+# without this filter a repeatable remote-triggerable handler panic would drop
+# every affected request silently.
+#
+# Same construction as server_async_runtime_panic: match the stable call-site
+# name plus ErrRuntimePanic's operator-facing message string in the raw JSON
+# log line, not a broad "panic" substring, so ordinary explanatory log lines do
+# not increment the alarm metric. Both terms are guarded by Go and parity tests
+# (endpoints/server/handler_panic_recovery_test.go asserts they land on ONE log
+# event, which is what the AND match requires).
+resource "aws_cloudwatch_log_metric_filter" "server_handler_panic" {
+  name           = "${var.name_prefix}-${var.cell_id}-server-handler-panic"
+  log_group_name = var.server_log_group_name
+  pattern        = "\"dispatchHandler\" \"runtime panic encountered\""
+
+  metric_transformation {
+    # Cell-scoped metric name because the Environment/Cell values are supplied
+    # by the log group and not by fields in the JSON log event.
+    name          = "ServerHandlerPanic-${local.metric_name_suffix}"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# A recovered handler panic is a zero-baseline security-and-availability
+# signal: the process stayed up, but a knock/register/list request was dropped
+# on a code path reachable from remote input. Page on the first recovery in a
+# 5-minute bucket, then auto-resolve after one clean bucket; use the structured
+# log line's stack trace to identify the panicking handler.
+resource "aws_cloudwatch_metric_alarm" "server_handler_panic" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-handler-panic"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = aws_cloudwatch_log_metric_filter.server_handler_panic.metric_transformation[0].name
+  namespace           = aws_cloudwatch_log_metric_filter.server_handler_panic.metric_transformation[0].namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server recovered >=1 handler panic in dispatchHandler in the last 5 minutes; the process stayed up but a remote-reachable request was dropped. Inspect the structured server log stack trace. PR #3643."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  # ok_actions is deliberate, not copy-paste. Returning to OK here means only
+  # "no new panic in the last 5 minutes", NOT "the bug is fixed" — which is the
+  # reasoning that puts relay single-event detectors on ok_actions = [] (see
+  # RELAY_SINGLE_EVENT_ALARM_NAMES in scripts/check-observability-parity.py).
+  # Panic alarms deliberately go the other way, matching BOTH siblings
+  # (server_async_runtime_panic here and udp_handler_panic in modules/ac): the
+  # OK transition is what re-arms the alarm, so a recurring panic pages again
+  # on the next occurrence instead of staying latched and silent. The AC alarm
+  # description states the same contract — acking without fixing means the next
+  # OK->ALARM transition pages again. Accepted on-call cost: one extra
+  # notification per resolved bucket, on a signal whose baseline is zero.
+  #
+  # Under a SUSTAINED remote trigger this re-arming becomes a paging amplifier:
+  # a repeatable handler panic that lands in some buckets and not others flaps
+  # ALARM/OK and pages on both edges, ~2 notifications per 5-minute cycle for
+  # the duration. That is the intended behavior for a zero-baseline security
+  # signal — an attacker-reachable panic SHOULD be loud, and silencing the OK
+  # edge would hide the recurrence rather than the attack — but it is a real
+  # on-call cost, so the rollout ledger carries an explicit acknowledgement
+  # task rather than leaving on-call to discover it mid-incident. If it does
+  # become a problem, suppress at the notification layer; do not drop
+  # ok_actions, which would latch the alarm and stop re-paging entirely.
+  ok_actions = [aws_sns_topic.alerts.arn]
+  # Same rationale as server_async_runtime_panic: the filter's default_value
+  # emits zero while structured logs flow, and the stderr blackout signal is
+  # owned by server_panic's insufficient_data_actions.
+  treat_missing_data = "notBreaching"
+
+  # No dimensions block: env/cell are baked into the metric_name
+  # (see server_handler_panic filter's metric_transformation above).
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
   })
 }
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	runtimemetrics "runtime/metrics"
 	"sort"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenNHP/opennhp/nhp/etcd"
 
@@ -415,6 +417,28 @@ type UdpServer struct {
 	// signal (a later, smaller shed burst may not cross a 1000-boundary
 	// and log nothing, but it always ticks the metric).
 	handlerShedCount atomic.Int64
+
+	// handlerPanicStackGates rate-limits the debug.Stack() carried by
+	// dispatchHandler's panic-recovery line to one per
+	// handlerPanicStackInterval PER HEADER TYPE. A remote-reachable handler
+	// panic is triggerable at packet rate, and a multi-KB stack per packet would
+	// let an attacker turn a correctness bug into unbounded log-ingestion cost.
+	// The alarm-bearing line is emitted on EVERY recovery regardless, so
+	// ServerHandlerPanic keeps counting them all; only the stack is sampled, and
+	// the suppressed count is carried on the next stack-bearing line rather than
+	// dropped.
+	//
+	// Per-type rather than global so a panic on one message type cannot swallow
+	// the stack of a different bug on another within the same window. Keys are
+	// header types (a small fixed registry), values *handlerPanicStackGate.
+	//
+	// The suppressed counter lives IN the gate, not beside it: a process-global
+	// counter would let one type's stack line report another type's suppressed
+	// count, and the "since the previous one" wording claims same-stream
+	// accounting. Per-type keeps the annotation true.
+	//
+	// Zero values are usable: the first recovery of each type emits a stack.
+	handlerPanicStackGates sync.Map
 
 	// Per-IP agent-conn eviction warning counter, for sampled logging.
 	// MetricAgentConnPerIPEvictions is the source of truth; this counter
@@ -3191,6 +3215,102 @@ func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.Pa
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		// SCOPE: this recovers panics on THIS goroutine's stack only. A handler
+		// that spawns its own `go func()` is not covered — handleNhpOpenResource's
+		// AC-open fan-out is the live example, and a panic in one of those inner
+		// goroutines still takes the process down. Do not read this guard as
+		// "handlers can no longer crash the server". dispatchAsync (NHP_AOL,
+		// NHP_FWD, NHP_FRT) has no recover at all, by the same reasoning.
+		//
+		// CLIENT-VISIBLE EFFECT: the request is dropped with no response
+		// synthesized, so the peer waits out its own timeout instead of getting
+		// a fast failure. No half-formed ack can escape: a response is built in
+		// full and handed to RemoteTransaction.SendMessage as one `NextMsgCh <-
+		// md` channel send, so a panic lands strictly before that handoff (peer
+		// sees nothing) or strictly after it (peer sees a complete, already-
+		// queued message). There is no incremental write to tear.
+		defer func() {
+			if r := recover(); r != nil {
+				// Every deref below is guarded. A panic raised inside this
+				// deferred function runs AFTER recover() has already returned,
+				// so nothing recovers it — it would crash the process and
+				// defeat the hardening this block exists to provide. ConnData
+				// is a *ConnectionData, so it needs its own check.
+				remote, htype := "<unknown>", "<unknown>"
+				// -1 is the gate key for a nil ppd: it cannot collide with a
+				// real header type, so an unknown-shape recovery gets its own
+				// stack budget instead of borrowing NHP_KPL's.
+				panicHeaderType := -1
+				if ppd != nil {
+					panicHeaderType = ppd.HeaderType
+					htype = core.HeaderTypeToString(ppd.HeaderType)
+					if ppd.ConnData != nil && ppd.ConnData.RemoteAddr != nil {
+						remote = ppd.ConnData.RemoteAddr.String()
+					}
+				}
+				// Recovering here removes the process crash that used to make
+				// this class visible to the stderr "panic:" filter
+				// (server_panic), so this log line is now the ONLY alarm
+				// signal for a handler panic. Keep "dispatchHandler" plus
+				// ErrRuntimePanic's message text in it; Terraform's
+				// server-handler-panic log filter keys on both.
+				//
+				// The filter is an AND match over one log event, and both terms
+				// land in one because slog's structured handlers escape control
+				// characters: debug.Stack()'s newlines become literal
+				// backslash-n, so the whole record is a single physical line
+				// whatever order the fields render in. THAT is the load-bearing
+				// invariant. It is a property of the structured handler, not of
+				// JSON specifically — slog.TextHandler escapes too, so a
+				// JSON->Text swap is safe; a handler that writes the message RAW
+				// is the hazard. TestLoggerEmitsSingleLineRecords (nhp/log) pins
+				// it at the source, and TestDispatchHandler_RecoverSurvives
+				// AdversarialPanicValue pins it end to end here.
+				//
+				// Field order is a second-order concern that only bites if the
+				// handler ever becomes line-oriented: Error() renders
+				// "<msg>: <extra>", keeping ErrRuntimePanic's message ahead of
+				// the stack, so even split per-line the first line would carry
+				// both terms. Reversing that in WithExtra would push the message
+				// past the stack. Under the JSON handler neither matters.
+				// (The AC solves the same problem with a direct
+				// MetricUDPHandlerPanic counter — see endpoints/ac/udpac.go
+				// recoverUDPHandler, nhp#1423. A counter is used there because
+				// the log line carries no stack; here the stack is the
+				// operator's root-cause handle, so the signal rides the log.)
+				// The stack is rate-limited; the alarm-bearing line is NOT. A
+				// remote-reachable parser panic is attacker-triggerable at packet
+				// rate, and a full debug.Stack() per packet turns a correctness
+				// bug into unbounded CloudWatch ingestion — a billing-DoS on the
+				// same signal that is supposed to page us. Every recovery still
+				// emits both filter terms, so ServerHandlerPanic counts them all;
+				// only the multi-KB stack is capped, and the suppressed count
+				// rides the next stack-bearing line so nothing is silently lost.
+				// The panic VALUE is bounded too, not just the stack. A runtime
+				// fault carries short text, but a handler that panics with an
+				// attacker-derived string would otherwise render it in full on
+				// every recovery — the same amplification the stack cap closes,
+				// just through the one field the cap doesn't cover.
+				value := truncateForLog(fmt.Sprintf("%v", r), maxHandlerPanicValueLen)
+				detail := value
+				gate := s.handlerPanicStackGateFor(panicHeaderType)
+				if gate.allow() {
+					// Swap on the same gate that admitted this stack, so the
+					// count describes THIS header type's suppressed stacks.
+					if suppressed := gate.suppressed.Swap(0); suppressed > 0 {
+						detail = fmt.Sprintf("%s (%d stack traces suppressed for this header type since the previous one)\n%s",
+							value, suppressed, debug.Stack())
+					} else {
+						detail = fmt.Sprintf("%s\n%s", value, debug.Stack())
+					}
+				} else {
+					gate.suppressed.Add(1)
+				}
+				err := core.ErrRuntimePanic.WithExtra(errors.New(detail))
+				log.Critical("dispatchHandler [%s] from %s recovered from panic: %v",
+					htype, remote, err)
+			}
+		}()
 		if usedGeneral {
 			defer func() {
 				<-s.handlerSem
@@ -3231,6 +3351,134 @@ func handlerPressureRecoveryThreshold(generalCapacity int) int64 {
 	// threshold derives from the actual channel capacity so production and
 	// deliberately small test partitions share one formula.
 	return int64(generalCapacity * 3 / 4)
+}
+
+// maxHandlerPanicValueLen bounds the recovered panic VALUE rendered into the
+// recovery line. Runtime faults carry short text, but a handler that panics
+// with an attacker-derived string would otherwise render it in full on every
+// recovery — the stack cap alone does not cover that field. 512 bytes keeps
+// every realistic runtime message intact (the longest in the tree are well
+// under it) while removing the amplification.
+const maxHandlerPanicValueLen = 512
+
+// truncateForLog clips s to limit bytes, marking the clip so a truncated value
+// is never mistaken for the whole one.
+//
+// The cut backs off to a rune boundary rather than splitting a multi-byte
+// character. Today's sink is the JSON logger, which would escape a partial rune
+// to U+FFFD rather than emit invalid output — so this is belt-and-braces for
+// that path, and correctness for any future caller with a sink that does not
+// sanitize.
+//
+// The back-off is bounded to UTFMax-1 bytes, which is all a boundary split can
+// ever require. An unbounded walk would keep deleting good bytes when the input
+// was ALREADY invalid UTF-8 before the limit — in the worst case consuming the
+// whole prefix and returning only the truncation marker. In that case the input
+// is malformed no matter where it is cut, so clip at the limit and let the sink
+// sanitize.
+func truncateForLog(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for back := 0; back < utf8.UTFMax-1 && cut > 0; back++ {
+		if utf8.ValidString(s[:cut]) {
+			break
+		}
+		cut--
+	}
+	if !utf8.ValidString(s[:cut]) {
+		cut = limit
+	}
+	return s[:cut] + fmt.Sprintf("...[truncated, %d bytes total]", len(s))
+}
+
+// handlerPanicStackInterval bounds how often dispatchHandler's recovery line
+// carries a full debug.Stack(). One per minute keeps a genuine (zero-baseline)
+// panic fully diagnosable on its first occurrence while capping what a
+// packet-rate attacker can drive into the log group. It is deliberately far
+// shorter than the alarm's 5-minute period, so every alarm window that fires
+// still has at least one stack to triage from.
+const handlerPanicStackInterval = time.Minute
+
+// handlerPanicStackGate is one header type's stack budget. Both fields belong
+// to the same type so the "N suppressed" annotation on a stack-bearing line
+// describes that type's own stream and nothing else.
+//
+// KNOWN PROPERTIES of the suppressed count, both deliberately not fixed. It is
+// a triage hint, NOT the source of truth: the alarm-bearing line is emitted on
+// every recovery, so ServerHandlerPanic in CloudWatch is the authoritative
+// occurrence count and is always exact and complete.
+//
+//  1. The count rides the NEXT stack-bearing line for its type, so the tail of
+//     a final burst is never emitted — if a type stops panicking (bug fixed,
+//     traffic shifted), its last N suppressed stacks go unreported. Flushing
+//     the tail would need a timer or a drain on Stop(), and Stop() carries six
+//     load-bearing ordering invariants (see the shutdown section in
+//     endpoints/server/CLAUDE.md).
+//  2. Under concurrent same-type panics the Swap(0) here can interleave with an
+//     Add(1) on a suppressed goroutine, so a given line's N can be off by one
+//     in either direction. Serializing it would mean a lock on the panic path
+//     to make a diagnostic annotation exact.
+//
+// Both are acceptable precisely because of the first paragraph: no count that
+// anything depends on is at stake.
+type handlerPanicStackGate struct {
+	lastNanos  atomic.Int64
+	suppressed atomic.Int64
+}
+
+// handlerPanicStackGateFor returns the gate for a header type, creating it on
+// first use. -1 is the shared key for "no usable header type": a nil ppd, or a
+// value outside the registry.
+//
+// The key domain is bounded HERE rather than relying on callers, so the map can
+// never exceed one entry per registered header type plus the -1 bucket (~34).
+// dispatchHandler is only reached with validated types today, so the fold is
+// unreachable — but this map is keyed by a field that originates in a received
+// packet, and "an attacker cannot choose this value" is exactly the kind of
+// invariant that quietly stops holding. Folding costs one bounds check and
+// removes the unbounded-growth vector by construction.
+func (s *UdpServer) handlerPanicStackGateFor(headerType int) *handlerPanicStackGate {
+	if core.HeaderTypeToString(headerType) == "UNKNOWN" {
+		headerType = -1
+	}
+	// Load before LoadOrStore: this runs once per recovered panic, which under
+	// a remote-triggerable handler panic is once per packet. LoadOrStore would
+	// allocate a throwaway gate on every one of those, on the exact path being
+	// hardened against amplification. After the first panic of a type the
+	// steady state is a lock-free read.
+	if gate, ok := s.handlerPanicStackGates.Load(headerType); ok {
+		return gate.(*handlerPanicStackGate)
+	}
+	gate, _ := s.handlerPanicStackGates.LoadOrStore(headerType, &handlerPanicStackGate{})
+	return gate.(*handlerPanicStackGate)
+}
+
+// allowHandlerPanicStack reports whether this recovery may emit a stack trace,
+// admitting at most one per handlerPanicStackInterval PER HEADER TYPE.
+//
+// Keyed per header type, not globally, because different header types are
+// different handlers and therefore different bugs: a global budget lets a
+// benign panic on one message type swallow the stack of an unrelated panic on
+// another within the same minute — losing distinct diagnostic information at
+// exactly the moment two things are failing at once. The bound stays small and
+// fixed: at most one stack per minute per header type, over a registry of ~33
+// types of which only the dispatched handlers can reach here.
+//
+// The CompareAndSwap makes concurrent panics on the SAME type elect exactly one
+// winner rather than all passing a read-then-write check.
+func (g *handlerPanicStackGate) allow() bool {
+	now := time.Now().UnixNano()
+	for {
+		prev := g.lastNanos.Load()
+		if prev != 0 && now-prev < int64(handlerPanicStackInterval) {
+			return false
+		}
+		if g.lastNanos.CompareAndSwap(prev, now) {
+			return true
+		}
+	}
 }
 
 // dispatchAsync tracks trusted-peer handlers without applying the public

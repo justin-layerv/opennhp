@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | 0589c360 |
-| **Last review date** | 2026-07-01 |
+| **Last reviewed upstream SHA** | 5381fc94 |
+| **Last review date** | 2026-08-01 |
 | **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log 0589c360..upstream/main --oneline
+> git log 5381fc94..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -96,6 +96,48 @@ Values where the fork intentionally diverges from upstream. **If an upstream com
 ---
 
 ## Sync History
+
+### 2026-08-01 - Routine Review (2 Bug Fixes Synced)
+
+- **Reviewed up to:** 5381fc94
+- **Commits reviewed:** 113 (non-merge)
+- **PRs created:** 1
+- **Commits synced:** 4
+- **Summary:**
+  - ~32 Dependabot/dependency updates (auto-skipped, includes 2 GMSM bumps)
+  - ~5 CI/GitHub Actions workflow changes (auto-skipped — claude-pr-review fixes, codecov, gosec G703)
+  - ~8 Documentation/sponsor changes (auto-skipped — AGENTS.md, Tencent Cloud sponsor, registration page docs)
+  - ~27 Agent registration feature (OTP/REG/RAK, SQLite keystore, WebAuthn, dual-cipher CLI) — upstream-only feature; fork uses QURL
+  - ~4 Registration page UI redesign — upstream-only
+  - ~7 JS-agent changes (email ID, CBOR token, relay routing) — upstream-only
+  - ~9 Upstream deploy/infra fixes (SMTP config, SES, server2 alignment) — upstream demo
+  - ~8 bootstrap-tls certbot fixes — upstream demo infra
+  - ~4 Lint/shadow analyzer changes — fork has own linting config
+  - ~2 Relay test fixes — relay-specific
+  - 1 dispatchHandler panic recovery (`94a5ff67`) — **SYNCED** (adapted): defense-in-depth recover in handler goroutines prevents remote DoS via parser panics. Only the `udpserver.go` portion; keystore.go CBOR/WebAuthn parts are agent-registration-specific.
+  - 1 preserve extension response errors (`bdaad29a`) — **SYNCED** (cherry-picked with conflict resolution): adds `ErrorFromResponse` to preserve auth-service error messages instead of silently dropping unknown error codes. By justin-layerv, contributed upstream.
+  - 2 core protocol test pins (`61eebfdc` timestamp, `9deb506b` registry) — **SYNCED**; pure test additions that pin wire-contract constants
+- **Notes:** The bulk of upstream activity this period is the agent registration feature (PR #1613, #1624, #1654, #1655, #1657, #1679) — a new OTP→REG→RAK flow with SQLite keystore, WebAuthn/FIDO2, and dual-cipher support. This is entirely skipped since the fork uses QURL for agent authentication. The `ReinitWithKey` recv-channel fix (`ba864ec3`) is also specific to this feature and N/A. The `ErrorFromResponse` fix by Justin was contributed upstream but not yet carried in the fork.
+
+  Two fork-side strengthenings landed alongside the synced code, both beyond upstream's intent:
+
+  - **`ErrorFromResponse` closes a latent panic, not just message loss.** The
+    replaced pattern `err = common.ErrorCodeToError(code)` is the Go typed-nil
+    trap: `ErrorCodeToError` returns a nil `*Error` for any unregistered
+    (extension) code, and assigning that nil pointer to an `error`-typed
+    variable yields a **non-nil interface wrapping a nil pointer**. A caller
+    that tests `err != nil` (true) and then calls `err.Error()` dereferences
+    `e.msg` on a nil receiver and panics. `ErrorFromResponse` never returns
+    nil, so the interface is always safe to call. `ErrorCodeToError` is now
+    reachable only from inside `ErrorFromResponse`.
+  - **The synced panic recovery needed a new alarm.** Recovering a
+    `dispatchHandler` panic removes the process crash that used to surface this
+    class on the stderr `"panic:"` detector (`server_panic`), so without a new
+    signal a remote-triggerable handler panic would drop requests silently.
+    The recovery line now carries `core.ErrRuntimePanic`'s message text plus the
+    `dispatchHandler` call-site term, matched by a new `server_handler_panic`
+    CloudWatch filter + alarm and fenced by `scripts/check-observability-parity.py`
+    — the same construction as the `msgToPacketRoutine` site.
 
 ### 2026-07-01 - Routine Review (No Direct Sync — 4 Follow-Up Ports Tracked)
 
@@ -296,6 +338,14 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | 5764feb1 | fix(deps): bump vite in docs for CVE | SKIP | Upstream docs website only | 2026-07-01 |
 | e5542bdf | fix(deps): fix basic-ftp and ws vulnerabilities in docs | SKIP | Upstream docs website only | 2026-07-01 |
 | 1d638cbd | chore: bump version to 0.8.0 | SKIP | Upstream versioning | 2026-07-01 |
+| 94a5ff67 | fix: bounds-check cborSkipValue and recover panics in message handlers | SYNCED (partial) | Adapted: only the `udpserver.go` dispatchHandler panic recovery; keystore.go CBOR/WebAuthn parts are agent-registration-specific | 2026-08-01 |
+| bdaad29a | fix(agent): preserve extension response errors | SYNCED | Cherry-picked with conflict resolution; adds `ErrorFromResponse` to `nhp/common/errors.go` | 2026-08-01 |
+| ba864ec3 | fix: repoint recv channel + restart routine on ReinitWithKey | SKIP | `ReinitWithKey` is agent-registration-specific (dual-cipher hot-swap); fork doesn't have this feature | 2026-08-01 |
+| 7fc976eb | feat: agent registration with OTP/REG/RAK, SQLite keystore, SES SMTP | SKIP | Upstream agent-registration feature; fork uses QURL | 2026-08-01 |
+| 61eebfdc | test(core): pin encrypted timestamp unit and encoding | SYNCED | Ports verbatim (`testPeerPk`/`TimestampSize`/`createMsgAssemblerData` all exist in the fork); pins UnixNano + 8-byte big-endian, a cross-repo contract for the qURL SDKs and the AC | 2026-08-01 |
+| 9deb506b | test(core): pin message type registry values and mappings | SYNCED (adapted) | Table extended with the fork's 5 appended types (NHP_FWD/FRT/ARD/REV/RVA, values 28-32); adds an exhaustiveness test upstream lacks so an appended type can't slip in unpinned | 2026-08-01 |
+| 0496ba85 | chore(lint): enable govet shadow analyzer | SKIP | Fork has own linting configuration | 2026-08-01 |
+| 6f8e4509 | fix: prevent DOM-based XSS in js-agent demo pages via innerHTML | SKIP | JS-agent demo pages; upstream-only | 2026-08-01 |
 
 ---
 

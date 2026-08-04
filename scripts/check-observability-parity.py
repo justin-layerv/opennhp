@@ -161,6 +161,14 @@ ASYNC_RUNTIME_PANIC_MESSAGE = "runtime panic encountered"
 ASYNC_RUNTIME_PANIC_FILTER_PATTERN = (
     r'"\"msgToPacketRoutine\" \"runtime panic encountered\""'
 )
+# The dispatchHandler recover (PR #3643) is the second structured recover site
+# that converts a panic into dropped work. Recovering removed this class from
+# the stderr "panic:" detector, so its structured log line is the ONLY alarm
+# signal — the Go line and this filter must stay in lockstep or a
+# remote-triggerable handler panic drops requests silently.
+HANDLER_PANIC_FILTER_PATTERN = r'"\"dispatchHandler\" \"runtime panic encountered\""'
+HANDLER_PANIC_LOG_CALL_SITE = "dispatchHandler"
+HANDLER_PANIC_LOG_WRAPPER = "core.ErrRuntimePanic.WithExtra("
 
 
 def _repo_root() -> Path:
@@ -838,6 +846,42 @@ def check_shared_resources(repo: Path) -> None:
         "pattern",
         ASYNC_RUNTIME_PANIC_FILTER_PATTERN,
     )
+
+    # dispatchHandler recover site (PR #3643). Same two-term AND match as the
+    # async filter, keyed on the call-site name plus ErrRuntimePanic's message
+    # (already pinned above -- both filters share that string).
+    handler_panic_filter = find_block(
+        monitoring_main,
+        'resource "aws_cloudwatch_log_metric_filter"',
+        "server_handler_panic",
+    )
+    require_assignment(
+        handler_panic_filter,
+        "pattern",
+        HANDLER_PANIC_FILTER_PATTERN,
+    )
+    # Both filter terms must be emitted by the recover block itself. The Go
+    # side is a method with a nested-paren signature, so this pins the log
+    # statement directly rather than parsing the enclosing function body.
+    server_udp = repo / "endpoints" / "server" / "udpserver.go"
+    server_udp_text = _read(server_udp)
+    require_file_regex(
+        server_udp,
+        server_udp_text,
+        r'log\.Critical\(\s*"'
+        + re.escape(HANDLER_PANIC_LOG_CALL_SITE)
+        + r'[^"]*recovered from panic',
+        f'log.Critical("{HANDLER_PANIC_LOG_CALL_SITE} ... recovered from panic"',
+        "CloudWatch server_handler_panic filter matches this call-site term",
+    )
+    require_file_tokens(
+        server_udp,
+        server_udp_text,
+        (HANDLER_PANIC_LOG_WRAPPER,),
+        "the recover line must render ErrRuntimePanic's message for the "
+        "server_handler_panic filter's second term",
+    )
+
     require_alarm_actions(
         find_block(
             monitoring_main, 'resource "aws_cloudwatch_metric_alarm"', "server_panic"
@@ -850,6 +894,14 @@ def check_shared_resources(repo: Path) -> None:
             monitoring_main,
             'resource "aws_cloudwatch_metric_alarm"',
             "server_async_runtime_panic",
+        ),
+        "[aws_sns_topic.alerts.arn]",
+    )
+    require_alarm_actions(
+        find_block(
+            monitoring_main,
+            'resource "aws_cloudwatch_metric_alarm"',
+            "server_handler_panic",
         ),
         "[aws_sns_topic.alerts.arn]",
     )

@@ -19,6 +19,76 @@ When acquiring multiple mutexes in `endpoints/server/`, follow this order
 to prevent deadlocks. New code that takes locks in a different order
 must update this list and audit all existing call sites.
 
+> **Always release with `defer`, never a bare unlock on the happy path.**
+> `dispatchHandler` recovers panics in message-handler goroutines (PR #3643,
+> synced from upstream `94a5ff67`), so a panicking handler no longer takes the
+> process down with it. A `defer mu.Unlock()` still runs during unwinding,
+> before the recover — but a handler that unlocks only on the success path
+> leaks the lock permanently, and every later request contending on it
+> deadlocks. That is strictly worse than the crash the recover replaced: the
+> crash was loud and self-healing via ASG restart, the leaked lock is a silent
+> hang. The recovery emits a `Critical` line that pages via the
+> `server_handler_panic` alarm; treat any occurrence as a bug to root-cause,
+> not a steady state to absorb.
+>
+> **Audited at PR #3643. The safety property is NOT "no bare unlock is
+> reachable" — several are. It is that every reachable one has a panic-free
+> critical section.** An AST reachability pass over the pinned handler set
+> (name-matched, so deliberately over-approximating) found bare unlocks on the
+> handler goroutine in `resolveAgentPeerForKnock`, `applyAspMapDelta`,
+> `loadPluginOnce`, `LoadPlugin`, `snapshotLiveACConns`, and
+> `handleNhpOpenResource`. Every one of them holds the lock across a pure map
+> read/write or an allocation (`slices.Clone`, `make`) and calls nothing that
+> can fault on attacker input, so a panic cannot occur while the lock is held.
+> `handleNhpOpenResource`'s is additionally a function-local mutex that cannot
+> outlive the call.
+>
+> That is the invariant to preserve. **Adding a call that can panic inside any
+> of those critical sections is the regression** — not the bare unlock itself.
+> When in doubt, use `defer`. `TestAuditedCriticalSectionsStayPanicFree`
+> enforces this: it fails if a call appears inside one of the audited sections.
+>
+> **Recovery is not transparent — it restores the lock, not the data.** A
+> `defer mu.Unlock()` fires correctly during unwinding, so a handler that
+> panics mid-critical-section releases its mutex — with the guarded structure
+> left half-updated, visible to every later goroutine. The crash this replaced
+> discarded that state wholesale on restart. This is an accepted trade, because
+> the class being hardened against is parser panics that fault on
+> attacker-controlled bytes *before* touching shared state; it is not a licence
+> to treat recovery as free. A handler that mutates shared state in several
+> steps should reach a consistent point before it can panic, or carry its own
+> rollback.
+>
+> **The same applies to every happy-path-only cleanup, not just unlocks.**
+> Mutexes get the tests above because they deadlock loudest, but a handler that
+> removes its transaction-map entry, stops a timer, returns a pooled buffer, or
+> decrements a counter *only on the success path* now leaks that resource on a
+> recovered panic where the process used to die and reset it. Before the
+> recover, "the process dies" was the cleanup of last resort for all of it. If
+> a handler acquires anything that must be given back, give it back with
+> `defer`.
+>
+> `connDataForOutboundAddr` is the named hazard and is **not** reachable today:
+> it holds the central `remoteConnectionMapMutex` across three helper calls
+> with bare unlocks on every branch, and a leak there deadlocks the whole
+> connection layer. Reachability analysis reports a false edge into it via
+> `forwardToTransaction -> SendMessage`; that `SendMessage` is
+> `core.RemoteTransaction`'s channel send, not `(*UdpServer).SendMessage`. If a
+> handler ever reaches it for real, convert it to `defer` first.
+>
+> The forwarder path (`FanoutKnock -> forwardToServer -> SendMessage ->
+> connDataForOutboundAddr`) *is* called from `handleNhpOpenResource`, but from
+> inside a nested `go func()`, so the recover does not cover it and those locks
+> are not at risk from this change.
+>
+> **The recover's blast radius is one goroutine.** `recover()` catches only
+> panics on its own stack, so a handler that spawns `go func()` is NOT
+> protected inside those children — `handleNhpOpenResource`'s AC-open fan-out
+> is the live example. `dispatchAsync` (NHP_AOL, NHP_FWD, NHP_FRT) has no
+> recover at all. Both still crash the process on panic, which is why the
+> stderr `server_panic` alarm remains load-bearing alongside
+> `server_handler_panic`.
+
 - **Peer maps before peers**: `acPeerMapMutex` / `dbPeerMapMutex` /
   `agentPeerMapMutex` are acquired before any `peer.Lock()` (which
   `MatchesIP`, `RecvAddr`, `UpdateRecv`, `LastSendTime`, etc. take

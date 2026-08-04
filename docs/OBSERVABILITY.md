@@ -109,6 +109,7 @@ must enumerate the cell-scoped metric names instead of grouping by dimensions.
 |--------|------------------|-------------|
 | `ServerPanic-<environment>-<cell>` | `/layerv/nhp/<env>/<cell>/server-stderr` | Raw Go `panic:` output written to stderr. Each match normally means the process restarted. |
 | `ServerAsyncRuntimePanic-<environment>-<cell>` | `/layerv/nhp/<env>/<cell>/server` | Structured `msgToPacketRoutine` async `ErrRuntimePanic` recovery. The process stayed up, but the outbound message was dropped. |
+| `ServerHandlerPanic-<environment>-<cell>` | `/layerv/nhp/<env>/<cell>/server` | Structured `dispatchHandler` panic recovery. The process stayed up, but a remote-reachable knock/register/list request was dropped. Because the handler no longer crashes the process, `ServerPanic` above does **not** cover this class. |
 
 ## AC Registration Metrics
 
@@ -256,6 +257,7 @@ and blue/green deployment-count namespaces in `terraform/modules/ecr/main.tf`.
 | `DiskUsagePercent` | `DiskUsagePercent` | AC (shell script) |
 | `server-forward-target-drop` | `ServerForwardTargetDrop` | Server direct counter |
 | `server-async-runtime-panic` | `ServerAsyncRuntimePanic-<environment>-<cell>` | Server log-derived filter |
+| `server-handler-panic` | `ServerHandlerPanic-<environment>-<cell>` | Server log-derived filter |
 | `RegistrationFailure` | `RegistrationFailure` | AC (>5 failures in 5 min) |
 | `ServerConnectionFailure` | `ServerConnectionFailure` | AC (>10 failures in 10 min, 2 consecutive periods) |
 | `ac-publisher-failures` | `PublisherFailures` | AC (>0 in 2 of last 3 five-min windows) |

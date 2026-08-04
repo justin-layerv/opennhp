@@ -256,7 +256,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -298,6 +298,22 @@ lint-disable-agent-validation:
 	@./tests/lints/disable-agent-validation/run-fixtures.sh
 	@./scripts/check-disable-agent-validation.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] DisableAgentValidation check passed!$(END_COLOUR)"
+
+# Enforces the ErrorCodeToError invariant that docs/UPSTREAM_SYNC.md records
+# (PR #3643). Deliberately a lint and not a Go test: a repo-walking Go test is
+# subject to Go's test-result cache, which returned a cached PASS after a fresh
+# offending file was added — a fence that passes exactly when it should fail.
+.PHONY: lint-errorcode-to-error-callers
+lint-errorcode-to-error-callers:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking ErrorCodeToError callers (PR #3643)...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-errorcode-to-error-callers.sh tests/lints/errorcode-to-error-callers/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/errorcode-to-error-callers/run-fixtures.sh
+	@./scripts/check-errorcode-to-error-callers.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] ErrorCodeToError caller check passed!$(END_COLOUR)"
 
 # Fence qurl.link CSP propagation wait drift from the smoke assertion it is
 # trying to de-flake. Wired into `make lint` so local runs catch a one-sided

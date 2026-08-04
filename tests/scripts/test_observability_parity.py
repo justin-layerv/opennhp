@@ -301,6 +301,9 @@ def build_fixture(root: Path) -> None:
             resource "aws_cloudwatch_log_metric_filter" "server_async_runtime_panic" {
               pattern = "\\"msgToPacketRoutine\\" \\"runtime panic encountered\\""
             }
+            resource "aws_cloudwatch_log_metric_filter" "server_handler_panic" {
+              pattern = "\\"dispatchHandler\\" \\"runtime panic encountered\\""
+            }
 
             resource "aws_cloudwatch_metric_alarm" "server_panic" {
               alarm_actions             = [aws_sns_topic.alerts.arn]
@@ -309,6 +312,11 @@ def build_fixture(root: Path) -> None:
             }
 
             resource "aws_cloudwatch_metric_alarm" "server_async_runtime_panic" {
+              alarm_actions = [aws_sns_topic.alerts.arn]
+              ok_actions    = [aws_sns_topic.alerts.arn]
+            }
+
+            resource "aws_cloudwatch_metric_alarm" "server_handler_panic" {
               alarm_actions = [aws_sns_topic.alerts.arn]
               ok_actions    = [aws_sns_topic.alerts.arn]
             }
@@ -348,6 +356,12 @@ def build_fixture(root: Path) -> None:
             {Name: aws.String("Environment"), Value: aws.String(environment)},
             {Name: aws.String("Cell"), Value: aws.String(cellID)},
           }
+        }
+
+        func recoverHandlerPanic(r any, htype, remote string) {
+          err := core.ErrRuntimePanic.WithExtra(fmt.Errorf("%v\\n%s", r, debug.Stack()))
+          log.Critical("dispatchHandler [%s] from %s recovered from panic: %v",
+            htype, remote, err)
         }
         """,
     )
@@ -1507,6 +1521,117 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ErrRuntimePanic", result.stderr)
         self.assertIn("runtime panic encountered", result.stderr)
+
+    # dispatchHandler recover site (PR #3643). Recovering removed this class
+    # from the stderr "panic:" detector, so the structured log line is the only
+    # alarm signal left — each half of that coupling gets a drift test.
+    def test_missing_handler_panic_filter_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_log_metric_filter" "server_handler_panic" {
+                      pattern = "\\"dispatchHandler\\" \\"runtime panic encountered\\""
+                    }
+                    """
+                    ).lstrip(),
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_handler_panic", result.stderr)
+
+    def test_handler_panic_filter_pattern_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    '\\"dispatchHandler\\"',
+                    '\\"dispatchHandlers\\"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_handler_panic", result.stderr)
+        self.assertIn("pattern", result.stderr)
+
+    def test_handler_panic_alarm_routing_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_metric_alarm" "server_handler_panic" {
+                      alarm_actions = [aws_sns_topic.alerts.arn]
+                    """
+                    ).lstrip(),
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_metric_alarm" "server_handler_panic" {
+                      alarm_actions = []
+                    """
+                    ).lstrip(),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_handler_panic", result.stderr)
+        self.assertIn("alarm_actions", result.stderr)
+
+    def test_handler_panic_go_log_call_site_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            udpserver_go = root / "endpoints" / "server" / "udpserver.go"
+            udpserver_go.write_text(
+                udpserver_go.read_text(encoding="utf-8").replace(
+                    'log.Critical("dispatchHandler [%s]',
+                    'log.Critical("handler [%s]',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dispatchHandler", result.stderr)
+
+    def test_handler_panic_go_error_wrapper_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            udpserver_go = root / "endpoints" / "server" / "udpserver.go"
+            udpserver_go.write_text(
+                udpserver_go.read_text(encoding="utf-8").replace(
+                    "core.ErrRuntimePanic.WithExtra(",
+                    "fmt.Errorf(",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("core.ErrRuntimePanic.WithExtra(", result.stderr)
 
     def test_forward_target_drop_alarm_routing_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
