@@ -9914,6 +9914,15 @@ def _check_state_normalization_drift(
             set(AUTHORITY_RUNTIME_RESOURCES)
             | AUTHORITY_RUNTIME_OPENED_ADDRESSES
             | _PROVIDER_REPROJECTION_ADDRESSES
+            # The per-function execution ROLES re-project `inline_policy` for
+            # the same reason the Hub roles already in the allowlist do: IAM
+            # canonicalises a policy document on read-back (a scalar `Action`
+            # comes back as a one-element list), so a role whose policy is owned
+            # by a separate aws_iam_role_policy drifts on refresh without
+            # anything having changed in AWS. Their POLICY addresses were
+            # already admitted; the roles that carry the read-back were not, so
+            # the set test failed and the whole branch was unreachable.
+            | _AUTHORITY_EXEC_IDENTITY_ADDRESSES
             | {_AUTHORITY_DIGEST_ADDRESS}
         )
     ):
@@ -10056,6 +10065,43 @@ _PROVIDER_REPROJECTION_ADDRESSES = frozenset(
 )
 
 
+def _require_hub_nlb_ingress_projection(value: Any, address: str) -> None:
+    """Require a hub NLB ``ingress`` re-projection to be exactly UDP edge rules.
+
+    The attribute is a deprecated read-back of the standalone
+    ``aws_vpc_security_group_ingress_rule.hub_nlb_udp`` rules, so a refreshed
+    plan re-projects whatever AWS holds. The SOURCE set is deliberately not
+    asserted here: it is owned by those rule resources in this same plan, and
+    check_live asserts the live group separately. Widening the sources is a
+    reviewed decision (qurl-go ADR 0001 opened the sandbox edge), and pinning
+    them in two places again is what made the port migration unappliable.
+
+    What is pinned is the shape: every projected rule must be UDP on the exact
+    client edge port. A rule on another protocol or port is not a projection of
+    the reviewed edge and fails closed.
+    """
+    if not isinstance(value, list) or not value:
+        raise ContractError(
+            f"{address} ingress projection must be a non-empty collection"
+        )
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ContractError(f"{address} ingress entry must be an object")
+        protocol = str(entry.get("protocol") or "").lower()
+        if protocol != "udp":
+            raise ContractError(
+                f"{address} ingress projection admits UDP only, got {protocol!r}"
+            )
+        if (
+            entry.get("from_port") != HUB_CLIENT_EDGE_PORT
+            or entry.get("to_port") != HUB_CLIENT_EDGE_PORT
+        ):
+            raise ContractError(
+                f"{address} ingress projection must be on the client edge port "
+                f"{HUB_CLIENT_EDGE_PORT}"
+            )
+
+
 def _require_inline_policy_projection(value: Any, address: str) -> None:
     """Require an ``inline_policy`` re-projection to be exactly that.
 
@@ -10162,6 +10208,24 @@ def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
             if address == _OTP_REDIS_SG_ADDRESS and key == "ingress":
                 # Same exact-shape gate used on the planned and state paths.
                 _check_otp_redis_ingress(after, {}, address)
+                continue
+            if (
+                address.split("[")[0]
+                == "module.control.aws_security_group.hub_nlb"
+                and key == "ingress"
+            ):
+                # Deprecated Optional+Computed read-back of the standalone
+                # aws_vpc_security_group_ingress_rule.hub_nlb_udp rules, exactly
+                # like `inline_policy` below. State keeps whatever the attribute
+                # held when the SG was last written, so every change made through
+                # the standalone rules re-projects here once.
+                #
+                # Content is NOT taken on trust. The rules are owned by their own
+                # resources in this same plan, and check_live asserts the LIVE
+                # security group separately. What is pinned here is the shape:
+                # UDP only, on the reviewed client edge port, and nothing else.
+                # A rule on another protocol or port still fails closed.
+                _require_hub_nlb_ingress_projection(after.get(key), address)
                 continue
             if key == "inline_policy" and ".aws_iam_role." in str(address):
                 # `inline_policy` is a deprecated Optional+Computed READ-BACK of
