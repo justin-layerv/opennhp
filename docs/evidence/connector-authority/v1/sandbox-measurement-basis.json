@@ -114,7 +114,7 @@
     },
     "global": {
       "authority_digest_parameter_name": "/sandbox/nhp/control/connector-authority/image-digest",
-      "authority_image_digest": "sha256:e147b20e41e7372f62d8f5f02e9d3390c1a18579ff13370a7de8871b378c33fb",
+      "authority_image_digest": "sha256:7d15a8ce1a9b34586c79d1ce3310b66041f8b55de2fda01b330f54ec94feaa9a",
       "authority_repository_url": "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority",
       "aws_account_id": "767397897469",
       "aws_partition": "aws",
