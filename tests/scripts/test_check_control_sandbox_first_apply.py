@@ -1181,6 +1181,43 @@ def with_provisioned_cell_catalog_transition(candidate: dict) -> dict:
     return result
 
 
+def provisioned_cell_general_assignable_flip_fixture(
+    cell_id: str = "cell1", value: bool = False
+) -> dict:
+    """A plan whose ONLY resource change is `cell_id` gaining an explicit
+    general_assignable Boolean.
+
+    Reuses the reviewed no-op catalog row as the steady before-state and adds
+    only the general_assignable attribute to the after-item, so every other
+    field -- status, weight, endpoint, keys, updated_at -- stays byte-identical.
+    The public output surfaces general_assignable as a resolved Boolean for every
+    cell (an assignable cell shows true even though its stored item omits it).
+    """
+    result = plan_fixture()
+    result["applyable"] = True
+    address = (
+        f'module.control.aws_dynamodb_table_item.provisioned_cell["{cell_id}"]'
+    )
+    change = next(
+        item["change"]
+        for item in result["resource_changes"]
+        if item["address"] == address
+    )
+    before_item = json.loads(change["before"]["item"])
+    after_item = {**before_item, "general_assignable": {"BOOL": value}}
+    change["actions"] = ["update"]
+    change["after"] = copy.deepcopy(change["before"])
+    change["after"]["item"] = json.dumps(after_item, sort_keys=True)
+    change["after_unknown"] = {}
+    out = result["planned_values"]["outputs"]["provisioned_cells"]["value"]
+    for cid in out:
+        out[cid] = {
+            **out[cid],
+            "general_assignable": (value if cid == cell_id else True),
+        }
+    return result
+
+
 def authority_enablement_drift_pair(candidate: dict) -> list[dict]:
     """Build the exact benign ``resource_drift`` pair the live Step-3 Connector
     Authority enablement plan carries, and align the planned no-op digest state
@@ -4375,6 +4412,139 @@ class PlanContractTests(unittest.TestCase):
             with self.subTest(rejection=label):
                 with self.assertRaisesRegex(CHECKER.ContractError, pattern):
                     CHECKER.check_plan(plan_with_item(rendered))
+
+    def test_general_assignable_is_an_optional_item_attribute(self) -> None:
+        """B6: general_assignable is admitted absent / {BOOL:true} / {BOOL:false}
+        and nothing else may ride in on that key."""
+        address = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+        frozen = dict(CHECKER.PROVISIONED_CELL_DYNAMODB_ITEMS["cell1"])
+
+        # (i) absent (pre-B6), (ii) explicit true, (iii) explicit false all pass.
+        for ga in (None, {"BOOL": True}, {"BOOL": False}):
+            item = dict(frozen)
+            if ga is not None:
+                item["general_assignable"] = ga
+            CHECKER._require_provisioned_cell_item(
+                {"item": json.dumps(item)}, "cell1", address
+            )
+
+        # Any non-Boolean spelling of the attribute is rejected.
+        for bad in ({"BOOL": "false"}, {"N": "0"}, {"S": "false"}, True, "true"):
+            item = {**frozen, "general_assignable": bad}
+            with self.assertRaisesRegex(
+                CHECKER.ContractError,
+                r"general_assignable must be an absent or Boolean",
+            ):
+                CHECKER._require_provisioned_cell_item(
+                    {"item": json.dumps(item)}, "cell1", address
+                )
+
+        # A real change to any OTHER field still fails closed and names it, even
+        # with a valid general_assignable present.
+        item = {
+            **frozen,
+            "status": {"S": "revoked"},
+            "general_assignable": {"BOOL": False},
+        }
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            r"provisioned-cell item attributes differ: \['status'\]",
+        ):
+            CHECKER._require_provisioned_cell_item(
+                {"item": json.dumps(item)}, "cell1", address
+            )
+
+    def test_general_assignable_flip_is_its_own_admitted_lane(self) -> None:
+        """Setting general_assignable=false on cell1 is admitted as its own plan
+        mode, leaving every other catalog field byte-identical (B6)."""
+        summary = CHECKER.check_plan(
+            provisioned_cell_general_assignable_flip_fixture("cell1", False)
+        )
+        self.assertEqual(
+            summary["plan_mode"], "provisioned-cell-general-assignable-update"
+        )
+        # Restoring assignability (true) rides the same lane.
+        summary_true = CHECKER.check_plan(
+            provisioned_cell_general_assignable_flip_fixture("cell1", True)
+        )
+        self.assertEqual(
+            summary_true["plan_mode"],
+            "provisioned-cell-general-assignable-update",
+        )
+
+    def test_already_flipped_cell_reads_back_as_no_op(self) -> None:
+        """A cell whose stored row already carries {BOOL:false} is a steady
+        no-op, and an assignable cell that still omits the attribute stays valid
+        alongside it (back-compat)."""
+        plan = plan_fixture()
+        address = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+        change = self.change(plan, address)
+        flipped = {
+            **json.loads(change["before"]["item"]),
+            "general_assignable": {"BOOL": False},
+        }
+        change["before"]["item"] = json.dumps(flipped, sort_keys=True)
+        change["after"]["item"] = json.dumps(flipped, sort_keys=True)
+        plan["planned_values"]["outputs"]["provisioned_cells"]["value"][
+            "cell1"
+        ]["general_assignable"] = False
+        self.assertEqual(CHECKER.check_plan(plan)["plan_mode"], "no-op")
+
+    def test_general_assignable_flip_admits_no_other_edit(self) -> None:
+        """Tightness: a plan that moves status, weight, endpoint, key, or
+        updated_at alongside general_assignable, or writes a non-Boolean, is
+        rejected -- the lane owns only the assignability flag."""
+        address = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+        for field, value in (
+            ("status", {"S": "draining"}),
+            ("selection_weight", {"N": "2"}),
+            ("cell_id", {"S": "cell9"}),
+            ("nhp_host", {"S": "attacker.example"}),
+            ("updated_at", {"S": "2026-09-01T00:00:00Z"}),
+        ):
+            with self.subTest(smuggled=field):
+                flip = provisioned_cell_general_assignable_flip_fixture(
+                    "cell1", False
+                )
+                change = self.change(flip, address)
+                after_item = json.loads(change["after"]["item"])
+                after_item[field] = value
+                change["after"]["item"] = json.dumps(after_item, sort_keys=True)
+                self.assert_rejected(flip)
+
+        # A non-Boolean general_assignable in the item is rejected outright.
+        bad_item = provisioned_cell_general_assignable_flip_fixture("cell1", False)
+        change = self.change(bad_item, address)
+        after_item = json.loads(change["after"]["item"])
+        after_item["general_assignable"] = {"N": "0"}
+        change["after"]["item"] = json.dumps(after_item, sort_keys=True)
+        self.assert_rejected(bad_item)
+
+    def test_general_assignable_output_inventory_is_optional_and_pinned(
+        self,
+    ) -> None:
+        """The public catalog output admits the resolved Boolean but still pins
+        every other projected field exactly."""
+        # A non-Boolean general_assignable in the output is rejected.
+        bad_type = provisioned_cell_general_assignable_flip_fixture("cell1", False)
+        bad_type["planned_values"]["outputs"]["provisioned_cells"]["value"][
+            "cell1"
+        ]["general_assignable"] = "false"
+        self.assert_rejected(bad_type)
+
+        # A drifted non-assignability field in the output still fails closed even
+        # though general_assignable is present and valid.
+        drifted = provisioned_cell_general_assignable_flip_fixture("cell1", False)
+        drifted["planned_values"]["outputs"]["provisioned_cells"]["value"][
+            "cell0"
+        ]["nhp_port"] = 62206
+        self.assert_rejected(drifted)
 
     def test_catalog_row_resource_id_matches_the_applied_provider_spelling(
         self,
@@ -13285,6 +13455,7 @@ class ComposedTransitionTest(unittest.TestCase):
             names,
             {
                 "provisioned-cell-status-update",
+                "provisioned-cell-general-assignable-update",
                 "hub-worker-image-update",
                 "authority-proof-enable",
                 "authority-proof-consumer-staging",

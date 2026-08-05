@@ -3255,6 +3255,66 @@ def _provisioned_cell_resource_id(cell_id: str) -> str:
     )
 
 
+# general_assignable is the single OPTIONAL provisioned-cell attribute (B6,
+# qurl-service #1351). It is a DynamoDB Boolean the weighted-HRW selector reads
+# to decide whether a cell may take NEW general placements. qurl-service decodes
+# an ABSENT attribute as true, so an assignable cell OMITS it and only a
+# non-assignable cell carries {"BOOL": false}. Exactly these three spellings are
+# admitted anywhere a catalog item is pinned; every OTHER attribute stays
+# byte-identical to the reviewed row.
+_GENERAL_ASSIGNABLE_ITEM_VALUES: tuple[dict[str, bool], ...] = (
+    {"BOOL": True},
+    {"BOOL": False},
+)
+
+
+def _split_general_assignable_item(
+    decoded: dict[str, Any], address: str
+) -> tuple[dict[str, Any], "dict[str, bool] | None"]:
+    """Peel the optional general_assignable Boolean off a decoded catalog item.
+
+    Returns the item with general_assignable removed (so the remaining
+    attributes can be compared byte-for-byte against the reviewed row) and the
+    attribute itself, or None when absent. Rejects any spelling other than
+    absent / {"BOOL": true} / {"BOOL": false}; nothing else about the row may
+    ride in on this key.
+    """
+    general_assignable = decoded.get("general_assignable", _MISSING)
+    if (
+        general_assignable is not _MISSING
+        and general_assignable not in _GENERAL_ASSIGNABLE_ITEM_VALUES
+    ):
+        raise ContractError(
+            f"{address} provisioned-cell general_assignable must be an absent or "
+            "Boolean DynamoDB attribute"
+        )
+    core = {k: v for k, v in decoded.items() if k != "general_assignable"}
+    return core, (None if general_assignable is _MISSING else general_assignable)
+
+
+def _strip_general_assignable_output(value: Any) -> "dict[str, Any] | None":
+    """Drop the resolved general_assignable Boolean from each cell of the public
+    catalog output so the remainder is pinned exactly. Returns None when the
+    shape is not the expected cell->object mapping, or when a present
+    general_assignable is not a Boolean.
+    """
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, Any] = {}
+    for cell_id, cell in value.items():
+        if not isinstance(cell, dict):
+            return None
+        general_assignable = cell.get("general_assignable", _MISSING)
+        if general_assignable is not _MISSING and not isinstance(
+            general_assignable, bool
+        ):
+            return None
+        normalized[cell_id] = {
+            k: v for k, v in cell.items() if k != "general_assignable"
+        }
+    return normalized
+
+
 def _require_provisioned_cell_item(
     values: dict[str, Any], cell_id: str, address: str
 ) -> None:
@@ -3275,11 +3335,15 @@ def _require_provisioned_cell_item(
     decoded = _decode_exact_json(values.get("item"), "item", address)
     if not isinstance(decoded, dict):
         raise ContractError(f"{address} provisioned-cell item is not a JSON object")
-    if decoded != expected_item:
+    # Admit the optional general_assignable Boolean; pin every other attribute
+    # (including updated_at) exactly to the reviewed row. An absent attribute is
+    # the pre-B6 shape and still validates unchanged.
+    core, _general_assignable = _split_general_assignable_item(decoded, address)
+    if core != expected_item:
         differing = sorted(
             attribute
-            for attribute in {*expected_item, *decoded}
-            if decoded.get(attribute) != expected_item.get(attribute)
+            for attribute in {*expected_item, *core}
+            if core.get(attribute) != expected_item.get(attribute)
         )
         raise ContractError(
             f"{address} provisioned-cell item attributes differ: {differing}"
@@ -3388,10 +3452,18 @@ def _require_provisioned_cell_planned_output(
     )
     output = outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
     expected = PROVISIONED_CELL_CATALOG if catalog_present else {}
-    if (
-        not _is_exact_nonsensitive_output_entry(output)
-        or output.get("value") != expected
-    ):
+    if not _is_exact_nonsensitive_output_entry(output):
+        raise ContractError(
+            "planned provisioned-cell output does not match the all-or-nothing "
+            "catalog inventory"
+        )
+    # The public catalog output surfaces general_assignable as a RESOLVED
+    # Boolean per cell (an assignable cell shows true even though its stored item
+    # omits the attribute). Admit that optional Boolean and pin every other
+    # projected field exactly. An output with no general_assignable at all is
+    # the pre-B6 shape and still matches unchanged.
+    normalized = _strip_general_assignable_output(output.get("value"))
+    if normalized != expected:
         raise ContractError(
             "planned provisioned-cell output does not match the all-or-nothing "
             "catalog inventory"
@@ -8288,6 +8360,12 @@ def _claim_provisioned_cell_status_update(changed, actual_non_noop, by_address):
             return None
         if item.get("updated_at") != expected["updated_at"]:
             return None
+        # This lane owns ONLY the status/updated_at revision. A row carrying any
+        # attribute beyond the reviewed set -- e.g. the general_assignable
+        # Boolean -- is a different transition and must fall through to its own
+        # lane rather than be admitted here without validating that attribute.
+        if set(item) != set(expected):
+            return None
     return frozenset(claimed)
 
 # The public Hub UDP client edge, before and after nhp#3649.
@@ -8649,11 +8727,90 @@ def _validate_provisioned_cell_status_update(claimed, by_address, plan):
             raise ContractError(f"composed provisioned-cell {address} has no before/after")
 
 
+def _claim_provisioned_cell_general_assignable_update(
+    changed, actual_non_noop, by_address
+):
+    """Admit ONLY setting/flipping the general_assignable Boolean on catalog rows.
+
+    Withdrawing (or restoring) a cell's general assignability is a reviewed
+    placement-eligibility decision: the weighted-HRW selector stops choosing the
+    cell for NEW general agents while status stays active and its weight stays
+    positive, so tenant-pinned and attended-proof placement still reach it. It
+    must NOT smuggle an endpoint, key, weight, status, or updated_at edit through
+    the same plan -- those decide where an agent is sent, which server identity
+    it trusts, and the optimistic cell fence for in-flight assignments. Only the
+    single general_assignable attribute may move, and only to a Boolean.
+    """
+    claimed = {
+        address
+        for address in changed
+        if address in set(PROVISIONED_CELL_ADDRESSES.values())
+        and (actual_non_noop.get(address) or ()) == ["update"]
+    }
+    if not claimed:
+        return None
+    for address in claimed:
+        cell_id = PROVISIONED_CELL_ID_BY_ADDRESS[address]
+        change = by_address[address].get("change", {})
+        try:
+            before = json.loads((change.get("before") or {}).get("item") or "{}")
+            after = json.loads((change.get("after") or {}).get("item") or "{}")
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return None
+        expected = PROVISIONED_CELL_DYNAMODB_ITEMS[cell_id]
+        # Everything except general_assignable must be byte-identical to the
+        # reviewed row on BOTH sides of the change: status, weight, endpoint,
+        # keys, and the updated_at fence all stay put.
+        try:
+            before_core, before_ga = _split_general_assignable_item(before, address)
+            after_core, after_ga = _split_general_assignable_item(after, address)
+        except ContractError:
+            return None
+        if before_core != expected or after_core != expected:
+            return None
+        # The plan must actually MOVE general_assignable to a Boolean; an
+        # unchanged attribute is a no-op, not this transition.
+        if after_ga is None or after_ga == before_ga:
+            return None
+    return frozenset(claimed)
+
+
+def _validate_provisioned_cell_general_assignable_update(claimed, by_address, plan):
+    """Pin the SHAPE. The claim already proved the exact reviewed after-state:
+    an in-place update that moves only general_assignable to a Boolean and
+    leaves every other catalog field byte-identical to the reviewed row.
+    """
+    del plan
+    for address in sorted(claimed):
+        change = by_address.get(address, {}).get("change")
+        if not isinstance(change, dict):
+            raise ContractError(
+                f"composed provisioned-cell {address} change is malformed"
+            )
+        if list(change.get("actions") or ()) != ["update"]:
+            raise ContractError(
+                f"composed provisioned-cell {address} is not an update"
+            )
+        if not isinstance(change.get("before"), dict) or not isinstance(
+            change.get("after"), dict
+        ):
+            raise ContractError(
+                f"composed provisioned-cell {address} has no before/after"
+            )
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
     (
         "provisioned-cell-status-update",
         _claim_provisioned_cell_status_update,
         _validate_provisioned_cell_status_update,
+    ),
+    (
+        "provisioned-cell-general-assignable-update",
+        _claim_provisioned_cell_general_assignable_update,
+        _validate_provisioned_cell_general_assignable_update,
     ),
     (
         "hub-worker-image-update",
@@ -12784,6 +12941,18 @@ def check_plan(
         # claim above already proved every other catalog field matches the
         # reviewed values byte-for-byte.
         plan_mode = "provisioned-cell-status-update"
+    elif (
+        _assignability_only := _claim_provisioned_cell_general_assignable_update(
+            changed, actual_non_noop, by_address
+        )
+    ) is not None and set(_assignability_only) == changed:
+        # Reviewed placement-eligibility flip (general_assignable). The claim
+        # above already proved status, weight, endpoint, keys, and updated_at are
+        # byte-identical to the reviewed row; only general_assignable moved.
+        plan_mode = "provisioned-cell-general-assignable-update"
+        _validate_provisioned_cell_general_assignable_update(
+            _assignability_only, by_address, plan
+        )
     elif (
         _hub_image_only := _claim_hub_worker_image_update(
             changed, actual_non_noop, by_address
