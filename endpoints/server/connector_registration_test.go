@@ -553,6 +553,152 @@ func TestConnectorRegistrationDarkAndOtherASPsUseGenericDispatch(t *testing.T) {
 	}
 }
 
+// TestConnectorRegistrationDarkCellDeniesAgentIntentInsteadOfFallthrough is the
+// regression for the assigned-cell (cell0) rollout incident: a first-time
+// native Connector registration that reaches an instance whose connector
+// authority is dark (no NHP_CONNECTOR_REGISTRATION_* env, or an instance that
+// predates its activation rollout) must be answered with a proper authenticated
+// aspId="agent" denial — NOT leaked to the generic qURL knock handler (whose
+// ServerRegisterAckMsg carries aspId "" / "qurl" and surfaces to qurl-go as
+// "native registration reply aspId is invalid") and NOT dropped (client stall).
+// The dark server deliberately leaves connectorRegistrationHandler nil AND
+// connectorRegistrationTiming zero, exactly as configureConnectorCellAuthority
+// does on a dark cell, so this also exercises the config-independent write
+// deadline.
+func TestConnectorRegistrationDarkCellDeniesAgentIntentInsteadOfFallthrough(t *testing.T) {
+	_, _, peer, otp, registration, completion := connectorRegistrationFixture(t)
+
+	t.Run("activation emits authenticated registration-disabled RAK", func(t *testing.T) {
+		// A plugin that WOULD answer with the wrong aspId if the generic path
+		// were reached, so a non-zero regCalls or an aspId != "agent" fails.
+		plugin := &recordingRegOTPPlugin{regAck: &common.ServerRegisterAckMsg{ErrCode: "0", AuthServiceId: "qurl"}}
+		server := &UdpServer{metrics: metrics.NewPublisherForTest(t), pluginHandlerMap: map[string]plugins.PluginHandler{"agent": plugin}}
+		server.device = newSpikeDevice(t, core.NHP_SERVER, 0xe2, &core.DeviceOptions{DisableAgentPeerValidation: true})
+		server.listenConn = mustUDPListener(t)
+		agent := newSpikeDevice(t, core.NHP_AGENT, 0xe1, nil)
+		agentListener := mustUDPListener(t)
+
+		request, responses, transaction := realDirectRegistrationRequest(
+			t, server, agent, agentListener, core.NHP_REG, 501, registration, time.Now(),
+		)
+		if err := server.HandleRegisterRequest(request); err != nil {
+			t.Fatalf("HandleRegisterRequest: %v", err)
+		}
+		response := readDirectRegistrationResponse(t, agent, agentListener, responses)
+		if response.HeaderType != core.NHP_RAK ||
+			string(response.BodyMessage) != `{"errCode":"52107","errMsg":"registration disabled","aspId":"agent"}` {
+			t.Fatalf("dark activation RAK type=%d body=%q", response.HeaderType, response.BodyMessage)
+		}
+		select {
+		case <-transaction.Done():
+		case <-time.After(time.Second):
+			t.Fatal("dark activation transaction did not complete")
+		}
+		counters, _ := server.metrics.CountersForTest(t)
+		if counters[MetricConnectorRegistrationHandlerAbsent] != 1 ||
+			counters[MetricConnectorRegistrationResponseSent] != 1 ||
+			counters[MetricConnectorRegistrationActivationRequest] != 0 {
+			t.Fatalf("dark activation counters=%v", counters)
+		}
+		if plugin.regCalls != 0 || !allZero(request.BodyMessage) {
+			t.Fatalf("dark activation leaked to generic plugin=%d wiped=%v", plugin.regCalls, allZero(request.BodyMessage))
+		}
+	})
+
+	t.Run("completion emits authenticated unavailable LRT", func(t *testing.T) {
+		plugin := &recordingRegOTPPlugin{}
+		server := &UdpServer{metrics: metrics.NewPublisherForTest(t), pluginHandlerMap: map[string]plugins.PluginHandler{"agent": plugin}}
+		server.device = newSpikeDevice(t, core.NHP_SERVER, 0xe4, &core.DeviceOptions{DisableAgentPeerValidation: true})
+		server.listenConn = mustUDPListener(t)
+		agent := newSpikeDevice(t, core.NHP_AGENT, 0xe3, nil)
+		agentListener := mustUDPListener(t)
+
+		request, responses, transaction := realDirectRegistrationRequest(
+			t, server, agent, agentListener, core.NHP_LST, 502, completion, time.Now(),
+		)
+		if err := server.HandleListRequest(request); err != nil {
+			t.Fatalf("HandleListRequest: %v", err)
+		}
+		response := readDirectRegistrationResponse(t, agent, agentListener, responses)
+		if response.HeaderType != core.NHP_LRT ||
+			string(response.BodyMessage) != `{"errCode":"52300","errMsg":"completion temporarily unavailable","retryAfterSeconds":5}` {
+			t.Fatalf("dark completion LRT type=%d body=%q", response.HeaderType, response.BodyMessage)
+		}
+		select {
+		case <-transaction.Done():
+		case <-time.After(time.Second):
+			t.Fatal("dark completion transaction did not complete")
+		}
+		counters, _ := server.metrics.CountersForTest(t)
+		if counters[MetricConnectorRegistrationHandlerAbsent] != 1 ||
+			counters[MetricConnectorRegistrationResponseSent] != 1 ||
+			counters[MetricConnectorRegistrationCompletionRequest] != 0 ||
+			counters[MetricConnectorRegistrationActivationRequest] != 0 {
+			t.Fatalf("dark completion counters=%v", counters)
+		}
+		if plugin.listCalls != 0 || !allZero(request.BodyMessage) {
+			t.Fatalf("dark completion leaked to generic plugin=%d wiped=%v", plugin.listCalls, allZero(request.BodyMessage))
+		}
+	})
+
+	t.Run("otp is claimed and dropped without generic dispatch", func(t *testing.T) {
+		plugin := &recordingRegOTPPlugin{}
+		server := &UdpServer{
+			device:           newSpikeDevice(t, core.NHP_SERVER, 0xe6, nil),
+			metrics:          metrics.NewPublisherForTest(t),
+			pluginHandlerMap: map[string]plugins.PluginHandler{"agent": plugin},
+		}
+		otpBody := bytes.Clone(otp)
+		ppd := directRegistrationPPD(otpBody, peer, core.NHP_OTP, 503, time.Now(), nil)
+		if err := server.HandleOTPRequest(ppd); err != nil {
+			t.Fatalf("HandleOTPRequest: %v", err)
+		}
+		counters, _ := server.metrics.CountersForTest(t)
+		if counters[MetricConnectorRegistrationHandlerAbsent] != 1 || counters[MetricConnectorRegistrationOTPRequest] != 0 {
+			t.Fatalf("dark otp counters=%v", counters)
+		}
+		if plugin.otpCalls != 0 || !allZero(otpBody) {
+			t.Fatalf("dark otp leaked to generic plugin=%d wiped=%v", plugin.otpCalls, allZero(otpBody))
+		}
+	})
+}
+
+// TestConnectorRegistrationResponseWriteDeadlineSelectsByAuthorityRan pins the
+// live-vs-dark write-deadline contract directly, complementing the full-path
+// dark test above: a live Authority response must use the receipt-anchored
+// ladder, while the handler-absent denial must use the fixed budget from now and
+// stay live even under the zero-value timing a dark cell carries.
+func TestConnectorRegistrationResponseWriteDeadlineSelectsByAuthorityRan(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	receipt := now.Add(-20 * time.Millisecond).UnixNano()
+
+	// authorityRan == true delegates to the receipt-anchored packet/write ladder,
+	// so a future regression that accidentally routes the live path through the
+	// fixed budget is caught here.
+	live := &UdpServer{connectorRegistrationTiming: validConnectorRegistrationTiming()}
+	wantDeadline, wantLive := live.connectorRegistrationWriteDeadline(receipt, now)
+	gotDeadline, gotLive := live.connectorRegistrationResponseWriteDeadline(receipt, true, now)
+	if !gotLive || gotLive != wantLive || !gotDeadline.Equal(wantDeadline) {
+		t.Fatalf("authorityRan=true deadline=%v live=%v, want %v live=%v", gotDeadline, gotLive, wantDeadline, wantLive)
+	}
+
+	// authorityRan == false uses the fixed budget from now and stays live even
+	// with the zero-value timing a dark cell carries — the property that keeps the
+	// dark denial from being computed non-live and dropped.
+	dark := &UdpServer{}
+	deadline, isLive := dark.connectorRegistrationResponseWriteDeadline(receipt, false, now)
+	if !isLive || !deadline.Equal(now.Add(connectorRegistrationHandlerAbsentWriteBudget)) {
+		t.Fatalf("authorityRan=false deadline=%v live=%v, want %v live=true", deadline, isLive, now.Add(connectorRegistrationHandlerAbsentWriteBudget))
+	}
+	// Prove the fixed budget is load-bearing: the receipt-anchored ladder is NOT
+	// live under a dark cell's zero timing, so without the authorityRan branch the
+	// denial would be dropped — the exact stall this path fixes.
+	if _, ladderLive := dark.connectorRegistrationWriteDeadline(receipt, now); ladderLive {
+		t.Fatal("zero-timing receipt ladder unexpectedly live")
+	}
+}
+
 func TestConnectorRegistrationDeadlinesAndTransportFailuresFailClosed(t *testing.T) {
 	_, vectors, peer, otp, registration, completion := connectorRegistrationFixture(t)
 	authority := newCapturingRegistrationAuthority(vectors)

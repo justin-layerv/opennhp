@@ -14,15 +14,28 @@ import (
 )
 
 const (
-	registrationAspID                  = "agent"
-	registrationOTPQuery               = "agent_registration_otp"
-	registrationCompletionQuery        = "agent_registration_completion"
-	registrationProtocolVersion        = 1
-	registrationPublicMaxBodyBytes     = 3840
-	registrationCredentialMaxBytes     = 128
-	registrationHostnameMaxRunes       = 253
-	registrationAgentVersionMaxRunes   = 64
-	registrationSuccessRAKJSON         = `{"errCode":"0","aspId":"agent"}`
+	registrationAspID                = "agent"
+	registrationOTPQuery             = "agent_registration_otp"
+	registrationCompletionQuery      = "agent_registration_completion"
+	registrationProtocolVersion      = 1
+	registrationPublicMaxBodyBytes   = 3840
+	registrationCredentialMaxBytes   = 128
+	registrationHostnameMaxRunes     = 253
+	registrationAgentVersionMaxRunes = 64
+	registrationSuccessRAKJSON       = `{"errCode":"0","aspId":"agent"}`
+	// registrationDisabledRAKJSON is the frozen authenticated activation denial
+	// an assigned cell emits when it structurally recognizes a Connector NHP_REG
+	// intent but has NO live Authority handler configured — the capability is
+	// dark (no NHP_CONNECTOR_REGISTRATION_* env) or an instance is mid-activation
+	// rollout. It is deliberately NOT a decodeRegistrationAuthorityResponse
+	// outcome (no Authority is reached); it exists so the server never leaks such
+	// a request to the generic qURL knock handler, whose ServerRegisterAckMsg
+	// carries the wrong aspId (empty for the static plugin, "qurl" for the
+	// deployed one) and surfaces to qurl-go as "native registration reply aspId
+	// is invalid". errCode 52107 is the same fail-closed code the generic
+	// register core already stamps (common.ErrRegistrationDisabled); the only
+	// thing wrong on the dark path was the aspId, which this pins to "agent".
+	registrationDisabledRAKJSON        = `{"errCode":"52107","errMsg":"registration disabled","aspId":"agent"}`
 	registrationInvalidRequestRAKJSON  = `{"errCode":"52109","errMsg":"invalid enrollment input","aspId":"agent"}`
 	registrationCredentialRAKJSON      = `{"errCode":"52100","errMsg":"registration credential invalid","aspId":"agent"}`
 	registrationTicketInvalidRAKJSON   = `{"errCode":"52110","errMsg":"assignment ticket invalid","aspId":"agent"}`

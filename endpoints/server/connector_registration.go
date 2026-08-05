@@ -27,6 +27,15 @@ const (
 	ConnectorRegistrationWriteBudgetEnvVar     = "NHP_CONNECTOR_REGISTRATION_WRITE_BUDGET"
 	connectorRegistrationMinLambdaTimeout      = 3 * time.Second
 	connectorRegistrationMaxPacketBudget       = time.Duration(core.RemoteTransactionProcessTimeoutMs) * time.Millisecond
+	// connectorRegistrationHandlerAbsentWriteBudget bounds the physical write of
+	// the frozen dark-cell denial. A dark cell loads no registration timing (see
+	// configureConnectorCellAuthority, which leaves connectorRegistrationTiming
+	// zero when the config is absent), so the receipt-anchored packet/write
+	// ladder is unavailable and a fixed, generous budget from now() is used
+	// instead. The denial body is a tiny constant, so this only ever bounds a
+	// blocked writer — never a legitimate slow Authority call, which the dark
+	// path does not make.
+	connectorRegistrationHandlerAbsentWriteBudget = 500 * time.Millisecond
 )
 
 var (
@@ -43,10 +52,19 @@ var (
 // No peer, source, agent, credential, query, or other attacker-derived value is
 // used as a dimension or metric name.
 const (
-	MetricConnectorRegistrationOTPRequest            = "ConnectorRegistrationOTPRequest"
-	MetricConnectorRegistrationActivationRequest     = "ConnectorRegistrationActivationRequest"
-	MetricConnectorRegistrationCompletionRequest     = "ConnectorRegistrationCompletionRequest"
-	MetricConnectorRegistrationIngressRejected       = "ConnectorRegistrationIngressRejected"
+	MetricConnectorRegistrationOTPRequest        = "ConnectorRegistrationOTPRequest"
+	MetricConnectorRegistrationActivationRequest = "ConnectorRegistrationActivationRequest"
+	MetricConnectorRegistrationCompletionRequest = "ConnectorRegistrationCompletionRequest"
+	MetricConnectorRegistrationIngressRejected   = "ConnectorRegistrationIngressRejected"
+	// MetricConnectorRegistrationHandlerAbsent counts assigned-cell registration
+	// intents (OTP, activation, or completion) that were structurally recognized
+	// but reached an instance with NO live Authority handler — the capability is
+	// dark, or the instance predates its connector-authority activation rollout.
+	// A non-zero value is the direct signal that a cell fleet is serving
+	// Connector registration from at least one un-activated instance; it is the
+	// alarm that turns the "registration reply aspId is invalid" / silent-stall
+	// class of incident into an attributable server-side counter.
+	MetricConnectorRegistrationHandlerAbsent         = "ConnectorRegistrationHandlerAbsent"
 	MetricConnectorRegistrationAuthoritySuccess      = "ConnectorRegistrationAuthoritySuccess"
 	MetricConnectorRegistrationRequestRejected       = "ConnectorRegistrationRequestRejected"
 	MetricConnectorRegistrationDeadlineRejected      = "ConnectorRegistrationDeadlineRejected"
@@ -243,14 +261,40 @@ func (s *UdpServer) connectorRegistrationWriteDeadline(receiptNanos int64, now t
 	return writeDeadline, true
 }
 
+// connectorRegistrationResponseWriteDeadline selects the bounded absolute write
+// deadline for a registration response. A live Authority response uses the
+// receipt-anchored packet/write ladder from config. The dark handler-absent
+// denial has no such config (a dark cell never loads it), so it uses a fixed
+// budget from now — the frozen body is tiny and idempotent, and the point is to
+// deliver a visible denial, not to honor a receipt deadline the request never
+// established. Without this the dark path would compute a non-live deadline from
+// the zero-value timing and drop the denial, re-creating the client stall.
+func (s *UdpServer) connectorRegistrationResponseWriteDeadline(receiptNanos int64, authorityRan bool, now time.Time) (time.Time, bool) {
+	if authorityRan {
+		return s.connectorRegistrationWriteDeadline(receiptNanos, now)
+	}
+	return now.Add(connectorRegistrationHandlerAbsentWriteBudget), true
+}
+
 // handleConnectorRegistrationOTP intercepts only the exact top-level
 // aspId=agent intent. The existing peer-key limiter remains ahead of the email-
 // bearing Authority operation. OTP is fire-and-forget for every outcome.
 func (s *UdpServer) handleConnectorRegistrationOTP(ppd *core.PacketParserData) (bool, error) {
-	if s.connectorRegistrationHandler == nil || ppd == nil || !connectorcell.IsRegistrationOTPIntent(ppd.BodyMessage) {
+	// The intent probe is pure and needs no handler; evaluate it before the
+	// handler-nil check so a recognized Connector OTP is CLAIMED even on a dark
+	// cell and never handed to the generic OTP plugin.
+	if ppd == nil || !connectorcell.IsRegistrationOTPIntent(ppd.BodyMessage) {
 		return false, nil
 	}
 	if s.rejectClaimedConnectorRegistrationOutsideDirectUDP(ppd) {
+		return true, nil
+	}
+	if s.connectorRegistrationHandler == nil {
+		// Capability dark: claim and drop the recognized Connector OTP intent
+		// rather than leaking its secret-bearing body to the generic OTP plugin.
+		// NHP_OTP is fire-and-forget, so there is no application reply either way.
+		clear(ppd.BodyMessage)
+		s.metrics.IncrCounter(MetricConnectorRegistrationHandlerAbsent)
 		return true, nil
 	}
 	defer clear(ppd.BodyMessage)
@@ -301,8 +345,15 @@ func (s *UdpServer) handleDirectConnectorRegistration(
 	ppd *core.PacketParserData,
 	operation connectorRegistrationOperation,
 ) (bool, error) {
-	if s.connectorRegistrationHandler == nil || ppd == nil ||
-		!isConnectorRegistrationIntent(ppd.BodyMessage, operation) {
+	// isConnectorRegistrationIntent is a pure, allocation-free structural probe
+	// of the body; it needs neither the Authority handler nor its config. It is
+	// evaluated BEFORE the handler-nil check so a genuine assigned-cell Connector
+	// registration is CLAIMED even when the capability is dark, and answered with
+	// the proper authenticated aspId="agent" denial produced below — never leaked
+	// to the generic qURL knock handler, whose ServerRegisterAckMsg carries the
+	// wrong aspId (empty for the static plugin, "qurl" for the deployed one) and
+	// surfaces to qurl-go as "native registration reply aspId is invalid".
+	if ppd == nil || !isConnectorRegistrationIntent(ppd.BodyMessage, operation) {
 		return false, nil
 	}
 	transaction := ppd.OwningRemoteTransaction()
@@ -314,7 +365,7 @@ func (s *UdpServer) handleDirectConnectorRegistration(
 		s.metrics.IncrCounter(MetricConnectorRegistrationInternalFailure)
 		return true, common.ErrTransactionIdNotFound
 	}
-	result := s.buildConnectorRegistrationResult(ppd, operation)
+	result, authorityRan := s.connectorRegistrationResult(ppd, operation)
 	defer clear(result.Body)
 	headerType, emit, err := connectorRegistrationResponse(result, operation)
 	if err != nil {
@@ -324,13 +375,17 @@ func (s *UdpServer) handleDirectConnectorRegistration(
 		)
 	}
 	// Authority outcome and response delivery are deliberately separate
-	// signals: ResponseAttempt/Sent/Failure below records the transport leg.
-	s.recordConnectorRegistrationOutcome(result.Classification)
+	// signals: ResponseAttempt/Sent/Failure below records the transport leg. The
+	// Authority-outcome metric applies only when the Authority actually ran; the
+	// dark path already recorded MetricConnectorRegistrationHandlerAbsent.
+	if authorityRan {
+		s.recordConnectorRegistrationOutcome(result.Classification)
+	}
 	if !emit {
 		return true, retireConnectorRegistrationTransaction(transaction)
 	}
 	s.metrics.IncrCounter(MetricConnectorRegistrationResponseAttempt)
-	deadline, live := s.connectorRegistrationWriteDeadline(ppd.LocalInitTime, time.Now())
+	deadline, live := s.connectorRegistrationResponseWriteDeadline(ppd.LocalInitTime, authorityRan, time.Now())
 	if !live {
 		s.metrics.IncrCounter(MetricConnectorRegistrationResponseDeadline)
 		return true, joinConnectorRegistrationTerminalError(
@@ -347,6 +402,30 @@ func (s *UdpServer) handleDirectConnectorRegistration(
 	}
 	s.metrics.IncrCounter(MetricConnectorRegistrationResponseSent)
 	return true, nil
+}
+
+// connectorRegistrationResult produces the RegistrationResult for a claimed
+// assigned-cell registration intent. When the Authority handler is live it runs
+// it and reports authorityRan=true so the Authority-outcome metric applies.
+// When the capability is dark it clears the request body, records only
+// MetricConnectorRegistrationHandlerAbsent, and returns the frozen authenticated
+// denial (aspId="agent") — a "registration disabled" RAK for activation, the
+// retryable "completion temporarily unavailable" LRT for completion — so the
+// request is answered visibly instead of falling through to the generic qURL
+// knock handler (wrong aspId) or being dropped (client stall).
+func (s *UdpServer) connectorRegistrationResult(
+	ppd *core.PacketParserData,
+	operation connectorRegistrationOperation,
+) (result connectorcell.RegistrationResult, authorityRan bool) {
+	if s.connectorRegistrationHandler != nil {
+		return s.buildConnectorRegistrationResult(ppd, operation), true
+	}
+	clear(ppd.BodyMessage)
+	s.metrics.IncrCounter(MetricConnectorRegistrationHandlerAbsent)
+	if operation == connectorRegistrationCompletion {
+		return connectorcell.RegistrationCompletionUnavailableLRT(), false
+	}
+	return connectorcell.RegistrationDisabledRAK(), false
 }
 
 func retireConnectorRegistrationTransaction(transaction *core.RemoteTransaction) error {

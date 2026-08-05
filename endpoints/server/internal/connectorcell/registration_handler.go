@@ -187,3 +187,41 @@ func registrationCompletionUnavailable(classification Classification) Registrati
 		RecoveryAction: RegistrationRecoveryNone, Classification: classification,
 	}
 }
+
+// RegistrationDisabledRAK is the frozen authenticated activation denial for a
+// claimed Connector NHP_REG intent that reaches a cell with NO live Authority
+// handler (the capability is dark, or the instance predates its activation
+// rollout). It carries no Authority state — the caller emits it INSTEAD of
+// dispatching to the Authority — so the server can answer a genuine
+// assigned-cell registration with a proper aspId="agent" RAK denial rather than
+// falling through to the generic qURL knock handler (wrong aspId) or dropping
+// the datagram (client stall). RecoveryAction is None: this is a terminal RAK
+// the client parses, not a bounded pending-exact retry. The aspId="agent"
+// guarantee stays sourced in this package, the only place that pins it.
+//
+// Classification here (and on RegistrationCompletionUnavailableLRT) is a benign
+// placeholder that is intentionally NOT consumed on the dark path: the server
+// records MetricConnectorRegistrationHandlerAbsent directly and gates the
+// Authority-outcome metric on authorityRan, so this value never reaches
+// recordConnectorRegistrationOutcome. It is a placeholder rather than a
+// fabricated Authority outcome; a future caller that records it unconditionally
+// must first give the dark path its own classification.
+func RegistrationDisabledRAK() RegistrationResult {
+	return RegistrationResult{
+		Body: []byte(registrationDisabledRAKJSON), Action: RegistrationActionEmitRAK,
+		RecoveryAction: RegistrationRecoveryNone, Classification: ClassificationInternalFailure,
+	}
+}
+
+// RegistrationCompletionUnavailableLRT is the completion-leg (NHP_LST → LRT)
+// counterpart to RegistrationDisabledRAK: the frozen retryable "completion
+// temporarily unavailable" LRT emitted when a post-RAK completion reaches a
+// dark cell. It reuses the existing completion-unavailable body so a completion
+// that lands on a different (dark) instance than its activation is answered
+// visibly instead of leaking to the generic ListService dispatch.
+func RegistrationCompletionUnavailableLRT() RegistrationResult {
+	return RegistrationResult{
+		Body: []byte(registrationCompletionRetryJSON), Action: RegistrationActionEmitLRT,
+		RecoveryAction: RegistrationRecoveryNone, Classification: ClassificationInternalFailure,
+	}
+}
