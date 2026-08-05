@@ -59,6 +59,7 @@ variable "provisioned_cells" {
     server_public_key_b64 = string
     selection_weight      = string
     updated_at            = string
+    general_assignable    = optional(bool, true)
   }))
   default = {
     cell0 = {
@@ -70,6 +71,7 @@ variable "provisioned_cells" {
       server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
       selection_weight      = "1"
       updated_at            = "2026-08-01T18:00:00Z"
+      general_assignable    = true
     }
     cell1 = {
       cell_id               = "cell1"
@@ -80,6 +82,7 @@ variable "provisioned_cells" {
       server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
       selection_weight      = "1"
       updated_at            = "2026-08-01T18:00:00Z"
+      general_assignable    = false
     }
   }
 
@@ -94,6 +97,7 @@ variable "provisioned_cells" {
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-08-01T18:00:00Z"
+        general_assignable    = true
       }
       cell1 = {
         cell_id               = "cell1"
@@ -104,9 +108,10 @@ variable "provisioned_cells" {
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
         updated_at            = "2026-08-01T18:00:00Z"
+        general_assignable    = false
       }
     })
-    error_message = "The sandbox catalog must contain exactly active cell0 and active cell1 with the reviewed producer values; update this validation in the same review as any attended lifecycle or endpoint revision."
+    error_message = "The sandbox catalog must contain exactly active cell0 and active cell1 with the reviewed producer values; cell1 is non-assignable (general_assignable=false) while staying active; update this validation in the same review as any attended lifecycle, endpoint, or assignability revision."
   }
 }
 

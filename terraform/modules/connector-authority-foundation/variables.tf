@@ -82,6 +82,12 @@ variable "provisioned_cells" {
     server_public_key_b64 = string
     selection_weight      = string
     updated_at            = string
+    # Whether the Authority may place general (non-pinned) agents on this cell.
+    # ABSENT in the materialized DynamoDB item means true, matching
+    # qurl-service's general_assignable decode ("absent defaults to true"); an
+    # explicit false stops general placement while status stays active so
+    # tenant-pinned and attended-proof moves still reach the cell.
+    general_assignable = optional(bool, true)
   }))
   default = {}
 

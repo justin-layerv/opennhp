@@ -432,6 +432,7 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
+        general_assignable    = true
       }
       cell1 = {
         cell_id               = "cell1"
@@ -442,9 +443,61 @@ run "sandbox_provisioned_cell_catalog_projects_exact_rows" {
         server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
         selection_weight      = "1"
         updated_at            = "2026-07-25T00:00:00Z"
+        general_assignable    = true
       }
     })
     error_message = "The public catalog projection must preserve the reviewed opaque endpoint and responder identity values."
+  }
+}
+
+run "sandbox_non_assignable_cell_writes_explicit_general_assignable_boolean" {
+  command = plan
+
+  variables {
+    environment                                      = "sandbox"
+    aws_account_id                                   = "767397897469"
+    vpc_cidr                                         = "10.102.0.0/16"
+    otp_email_from                                   = "noreply@notify.layerv.xyz"
+    ses_configuration_set_name                       = "layerv-nhp-sandbox-agent-otp"
+    provisioned_cell_catalog_materialization_enabled = true
+    provisioned_cells = {
+      cell0 = {
+        cell_id               = "cell0"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell0.nhp.layerv.xyz"
+        nhp_port              = 443
+        server_public_key_b64 = "9dVku2oF589tWz9/Hn01STtstgkum4MM4kgKEp7lCw8="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+      }
+      cell1 = {
+        cell_id               = "cell1"
+        status                = "active"
+        endpoint_revision     = 1
+        nhp_host              = "cell1.nhp.layerv.xyz"
+        nhp_port              = 443
+        server_public_key_b64 = "Sb4lH7rfkKTagGvpKeBx/ArYual9fM4EQCQkiqxGNBs="
+        selection_weight      = "1"
+        updated_at            = "2026-07-25T00:00:00Z"
+        general_assignable    = false
+      }
+    }
+  }
+
+  assert {
+    condition     = !contains(keys(jsondecode(aws_dynamodb_table_item.provisioned_cell["cell0"].item)), "general_assignable")
+    error_message = "An assignable cell must OMIT general_assignable so qurl-service's absent-defaults-true decode keeps its already-materialized row byte-identical."
+  }
+
+  assert {
+    condition     = jsondecode(aws_dynamodb_table_item.provisioned_cell["cell1"].item).general_assignable == { BOOL = false }
+    error_message = "A non-assignable active cell must write general_assignable as an explicit DynamoDB Boolean false."
+  }
+
+  assert {
+    condition     = output.provisioned_cells["cell0"].general_assignable == true && output.provisioned_cells["cell1"].general_assignable == false
+    error_message = "The public catalog output must expose general_assignable, defaulting true and honoring an explicit false."
   }
 }
 

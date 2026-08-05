@@ -17,22 +17,30 @@ locals {
       server_public_key_b64 = cell.server_public_key_b64
       selection_weight      = tostring(tonumber(cell.selection_weight))
       updated_at            = cell.updated_at
+      general_assignable    = cell.general_assignable
     }
   }
 
   provisioned_cell_dynamodb_items = {
-    for cell_id, cell in local.provisioned_cell_catalog : cell_id => {
-      pk                    = { S = "REGISTRY" }
-      sk                    = { S = "CELL#${cell_id}" }
-      cell_id               = { S = cell.cell_id }
-      status                = { S = cell.status }
-      endpoint_revision     = { N = tostring(cell.endpoint_revision) }
-      nhp_host              = { S = cell.nhp_host }
-      nhp_port              = { N = tostring(cell.nhp_port) }
-      server_public_key_b64 = { S = cell.server_public_key_b64 }
-      selection_weight      = { N = cell.selection_weight }
-      updated_at            = { S = cell.updated_at }
-    } if var.provisioned_cell_catalog_materialization_enabled
+    for cell_id, cell in local.provisioned_cell_catalog : cell_id => merge(
+      {
+        pk                    = { S = "REGISTRY" }
+        sk                    = { S = "CELL#${cell_id}" }
+        cell_id               = { S = cell.cell_id }
+        status                = { S = cell.status }
+        endpoint_revision     = { N = tostring(cell.endpoint_revision) }
+        nhp_host              = { S = cell.nhp_host }
+        nhp_port              = { N = tostring(cell.nhp_port) }
+        server_public_key_b64 = { S = cell.server_public_key_b64 }
+        selection_weight      = { N = cell.selection_weight }
+        updated_at            = { S = cell.updated_at }
+      },
+      # An assignable cell OMITS general_assignable: qurl-service treats an
+      # absent attribute as true, so only a non-assignable cell writes the
+      # explicit Boolean. This keeps every already-materialized assignable row
+      # byte-identical to its reviewed create item.
+      cell.general_assignable ? {} : { general_assignable = { BOOL = false } },
+    ) if var.provisioned_cell_catalog_materialization_enabled
   }
 }
 
