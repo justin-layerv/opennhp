@@ -179,9 +179,15 @@ class NoReintroducedPinsTest(unittest.TestCase):
         # Third spelling: comparing to, or string-building from, the RESOLVED
         # candidate map. Suffixing an artifact name with candidates[...] pins
         # just as hard as `!=` does.
+        # Both spellings: the bare local `candidates[...]` AND the map reached
+        # through a dict key, `github_evidence["candidates"][...]`. The fence
+        # used to match only the first, so a third instance of this exact pin
+        # sat in the connector workload builder in plain sight -- it simply
+        # spelled the map as ["candidates"] and the regex never fired.
         self.assertNotRegex(
             collector,
-            r"candidates\[[^\]]+\]\[[\"']head_sha[\"']\]",
+            r"(?:\[[\"']candidates[\"']\]|\bcandidates)"
+            r"\[[^\]]+\]\[[\"']head_sha[\"']\]",
             "client identity must come from the canary's own evidence, never "
             "from the resolved candidate map",
         )

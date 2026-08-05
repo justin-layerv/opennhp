@@ -4242,7 +4242,16 @@ def collect_aws_and_build_snapshot(
     workloads["qurl_connector"] = {
         "kind": "connector_canary",
         "image_digest": canary["image_digest"],
-        "source_revision": github_evidence["candidates"]["qurl_connector"]["head_sha"],
+        # canary["head_sha"], NOT the resolved candidate map. The deployed
+        # image was built by the canary from ONE commit; candidates re-reads
+        # connector main at collection time, so any merge landing between the
+        # canary build and this read makes the workload look unbound from the
+        # very canary that produced it. The manifest already records
+        # canary["head_sha"] for this repository (#3709), and the contract
+        # compares the two -- so using candidates here guaranteed a mismatch
+        # on an active repo. Third instance of this pin: see also #3709 and
+        # #3723.
+        "source_revision": canary["head_sha"],
         "canary_artifact_digest": canary["artifact_digest"],
     }
 
