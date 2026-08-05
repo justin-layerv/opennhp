@@ -51,13 +51,23 @@ def valid_manifest(phase: str = "pre_removal") -> dict[str, object]:
     }
 
 
+# Candidate head_sha is deliberately DIFFERENT from SHA[...] (which the manifest
+# carries, and which since #3709 records the commit the canary was built from).
+# The client workflow is dispatched by branch, so the run GitHub records carries
+# the branch tip -- the candidate -- and client_sha must follow that, not the
+# artifact commit.
+CANDIDATE_SHA = {"qurl_connector": "a" * 40, "qurl_go": "b" * 40}
+
+
 def valid_candidates() -> dict[str, object]:
     return {
         "qurl_connector": {
             "head_ref": "justin/fix/connector-routing-identity",
+            "head_sha": CANDIDATE_SHA["qurl_connector"],
         },
         "qurl_go": {
             "head_ref": "justin/feat/udp-credential-recovery",
+            "head_sha": CANDIDATE_SHA["qurl_go"],
         },
     }
 
@@ -79,7 +89,7 @@ class ValidatorTest(unittest.TestCase):
         self.assertEqual(outputs["client_repository"], "layervai/qurl-connector")
         self.assertEqual(outputs["client_workflow"], "sandbox-smoke.yml")
         self.assertEqual(outputs["client_ref"], "justin/fix/connector-routing-identity")
-        self.assertEqual(outputs["client_sha"], SHA["qurl_connector"])
+        self.assertEqual(outputs["client_sha"], CANDIDATE_SHA["qurl_connector"])
         self.assertEqual(
             outputs["connector_workflow_identity"],
             (
@@ -98,7 +108,7 @@ class ValidatorTest(unittest.TestCase):
         self.assertEqual(outputs["client_repository"], "layervai/qurl-go")
         self.assertEqual(outputs["client_workflow"], "native-udp-sandbox.yml")
         self.assertEqual(outputs["client_ref"], "justin/feat/udp-credential-recovery")
-        self.assertEqual(outputs["client_sha"], SHA["qurl_go"])
+        self.assertEqual(outputs["client_sha"], CANDIDATE_SHA["qurl_go"])
         self.assertEqual(
             outputs["qurl_go_workflow_identity"],
             (

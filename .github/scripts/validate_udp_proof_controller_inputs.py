@@ -113,5 +113,16 @@ def select_dispatch(
         "client_repository": target["repository"],
         "client_workflow": target["workflow"],
         "client_ref": client_ref,
-        "client_sha": repositories[target["repository_key"]],
+        # The candidate head, NOT manifest["repositories"][key]. The client
+        # workflow is dispatched by BRANCH, so the run GitHub records carries
+        # that branch's tip -- which is the candidate. #3709 repointed the
+        # manifest at the commit the CANARY was built from, which is correct for
+        # describing the artifact but is routinely behind main, so comparing the
+        # dispatched run against it fails with "did not preserve exact dispatch
+        # provenance" exactly when the canary is legitimately behind.
+        #
+        # This is a provenance check -- "the run I dispatched is the run I am
+        # verifying" -- not an identity pin, so the branch tip is the right
+        # reference.
+        "client_sha": candidates[target["repository_key"]]["head_sha"],
     }
