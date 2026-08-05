@@ -2312,8 +2312,26 @@ def _catalog_cells() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             "selection_weight",
             "updated_at",
         }
-        if not isinstance(item, dict) or set(item) != expected_keys:
+        # general_assignable is an OPTIONAL placement control written by
+        # qurl-service: cell1 carries BOOL false (it is the attended proof's
+        # assignment target and is withheld from general placement) while cell0
+        # omits the attribute entirely. Requiring an exact key set therefore
+        # failed every cell1 read once the field appeared.
+        #
+        # Still strict, in both directions: every required key must be present,
+        # and the ONLY tolerated extra is this one -- an unknown attribute is
+        # still drift, because a silently-added field is exactly what this
+        # check exists to catch.
+        optional_keys = {"general_assignable"}
+        if not isinstance(item, dict):
             raise EvidenceError(f"{cell_id} catalog row shape drift")
+        observed = set(item)
+        if not expected_keys <= observed or not (observed - expected_keys) <= optional_keys:
+            raise EvidenceError(f"{cell_id} catalog row shape drift")
+        if "general_assignable" in item:
+            flag = item["general_assignable"]
+            if not isinstance(flag, dict) or set(flag) != {"BOOL"} or type(flag["BOOL"]) is not bool:
+                raise EvidenceError(f"{cell_id} catalog general_assignable is malformed")
 
         def string_field(name: str) -> str:
             value = item.get(name)
