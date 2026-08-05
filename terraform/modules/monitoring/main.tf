@@ -1164,6 +1164,46 @@ resource "aws_cloudwatch_metric_alarm" "ack_token_shared_store_failure" {
   })
 }
 
+# Dark-cell Connector registration (#3729 follow-up). The nhp-server publisher
+# emits ConnectorRegistrationHandlerAbsent with the exact dimension set
+# {Environment, Cell} (buildServerMetricDimensions in
+# endpoints/server/udpserver.go), so keep these alarm dimensions in lockstep with
+# it — an Environment-only set selects a non-existent stream and never fires. The
+# counter increments only when a cell instance structurally recognizes a Connector
+# registration intent (NHP_REG / NHP_LST / NHP_OTP with aspId "agent") but has NO
+# live Authority handler — i.e. it served registration while dark (un-activated
+# env, or mid activation rollout). An activated cell holds this flat zero, so any
+# non-zero 5-minute bucket is actionable and pages. treat_missing_data stays
+# notBreaching because the metric only publishes when it fires: missing data is
+# the healthy "never served dark" state, matching the sibling fail-closed server
+# counters above. Alarm state alone is NOT coverage on this dark path — prove the
+# dim set selects a live stream with a synthetic HandlerAbsent and a recorded page
+# receipt (see the prod-rollout-ledger entry and NHP #3455).
+resource "aws_cloudwatch_metric_alarm" "connector_registration_handler_absent" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-connector-registration-handler-absent"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ConnectorRegistrationHandlerAbsent"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server served a Connector registration (NHP_REG/LST/OTP, aspId=agent) from a cell instance with no live Authority handler — the cell answered while dark. An activated cell holds this at zero, so any non-zero value means an un-activated or mid-activation-rollout instance is in the serving fleet. Deferred follow-up to #3729, which added the metric while root-causing the sandbox cell0 Connector Authority activation-rollout incident."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
 # Internal-surface security failures. The Go publisher emits a base stream at
 # {Environment, Cell}, which these aggregate alarms match. Token-validation
 # failures also emit bounded {Environment, Cell, Reason} and attribution
