@@ -283,7 +283,23 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("--created", workflow)
         self.assertNotIn("needs: connector", workflow)
         self.assertNotIn("mapfile -t repositories < <(\n            gh api", workflow)
-        self.assertEqual(workflow.count("secretsmanager create-secret"), 2)
+        # Three run-bound secrets, each named here so a fourth cannot appear
+        # unnoticed: the one-use JIT runner config, the recovery response, and
+        # the read-only proof-attestation token brokered to qurl-go (which is
+        # public and therefore cannot read the OPS_ROUTINES org secrets itself).
+        self.assertEqual(workflow.count("secretsmanager create-secret"), 3)
+        self.assertIn(
+            '--name "${JIT_SECRET_PREFIX}${{ github.run_id }}/${{ github.run_attempt }}"',
+            workflow,
+        )
+        self.assertIn(
+            '--name "${JIT_SECRET_PREFIX}attestation-token/'
+            '${{ github.run_id }}/${{ github.run_attempt }}"',
+            workflow,
+        )
+        # The token must never be minted for the connector leg: qurl-connector
+        # is private and reads the org secrets directly.
+        self.assertIn("if: inputs.client == 'qurl_go'", workflow)
         self.assertIn('request_secret="${RECOVERY_REQUEST_PREFIX}', workflow)
         self.assertIn('response_secret="${RECOVERY_RESPONSE_PREFIX}', workflow)
         self.assertIn('--name "${response_secret}"', workflow)
@@ -319,7 +335,13 @@ class WorkflowContractTest(unittest.TestCase):
             1,
         )
         self.assertEqual(workflow.count("permission-actions: write"), 4)
-        self.assertEqual(workflow.count("permission-actions: read"), 1)
+        # Two read-only actions grants now: the controller's own token plus the
+        # proof-attestation token brokered to qurl-go. Only the brokered one
+        # also reads contents and pull-requests, which is why those stay at 1 --
+        # the controller's token is NOT silently gaining them.
+        self.assertEqual(workflow.count("permission-actions: read"), 2)
+        self.assertEqual(workflow.count("permission-contents: read"), 1)
+        self.assertEqual(workflow.count("permission-pull-requests: read"), 1)
         self.assertEqual(
             workflow.count(
                 "repositories: ${{ inputs.client == 'connector' && "
