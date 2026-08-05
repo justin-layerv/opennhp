@@ -3430,7 +3430,8 @@ def _require_provisioned_cell_create_output(plan: dict[str, Any]) -> None:
         not isinstance(change, dict)
         or set(change) != _CHANGE_KEYS
         or not catalog_appears
-        or change.get("after") != PROVISIONED_CELL_CATALOG
+        or _strip_general_assignable_output(change.get("after"))
+        != PROVISIONED_CELL_CATALOG
         or change.get("after_unknown") is not False
         or change.get("before_sensitive") is not False
         or change.get("after_sensitive") is not False
@@ -13825,11 +13826,16 @@ def check_state(state: Any) -> dict[str, Any]:
     catalog_output = (
         outputs.get("provisioned_cells") if isinstance(outputs, dict) else None
     )
-    if (
-        not _is_exact_nonsensitive_output_entry(catalog_output)
-        or catalog_output.get("value")
-        != (PROVISIONED_CELL_CATALOG if catalog_present else {})
-    ):
+    expected_catalog = PROVISIONED_CELL_CATALOG if catalog_present else {}
+    if not _is_exact_nonsensitive_output_entry(catalog_output):
+        raise ContractError(
+            "refreshed state provisioned-cell catalog output is not exact"
+        )
+    # Admit the optional resolved general_assignable Boolean per cell (absent ⇒
+    # true) and pin every other projected field exactly, mirroring the plan-time
+    # output inventory. A refreshed output with no general_assignable at all is
+    # the pre-B6 shape and still matches unchanged.
+    if _strip_general_assignable_output(catalog_output.get("value")) != expected_catalog:
         raise ContractError(
             "refreshed state provisioned-cell catalog output is not exact"
         )

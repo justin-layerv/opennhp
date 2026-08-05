@@ -4291,6 +4291,37 @@ class PlanContractTests(unittest.TestCase):
         self.change(destructive, cell0)["actions"] = ["delete"]
         self.assert_rejected(destructive)
 
+    def test_catalog_create_output_admits_optional_general_assignable(
+        self,
+    ) -> None:
+        """The catalog-create output binding admits the resolved
+        general_assignable Boolean per cell (absent ⇒ true) and still pins every
+        other projected field exactly."""
+        # A create whose public output surfaces general_assignable is admitted.
+        with_ga = provisioned_cell_catalog_transition_fixture()
+        for surface in (
+            with_ga["planned_values"]["outputs"]["provisioned_cells"]["value"],
+            with_ga["output_changes"]["provisioned_cells"]["after"],
+        ):
+            surface["cell0"]["general_assignable"] = True
+            surface["cell1"]["general_assignable"] = False
+        self.assertEqual(
+            CHECKER.check_plan(with_ga)["plan_mode"], "provisioned-cell-catalog"
+        )
+
+        # A drifted field alongside a valid general_assignable still fails closed.
+        drifted = provisioned_cell_catalog_transition_fixture()
+        for surface in (
+            drifted["planned_values"]["outputs"]["provisioned_cells"]["value"],
+            drifted["output_changes"]["provisioned_cells"]["after"],
+        ):
+            surface["cell0"]["general_assignable"] = True
+            surface["cell1"]["general_assignable"] = False
+        drifted["output_changes"]["provisioned_cells"]["after"]["cell0"][
+            "nhp_port"
+        ] = 62206
+        self.assert_rejected(drifted)
+
     def test_catalog_item_admits_rendering_and_still_pins_every_value(
         self,
     ) -> None:
@@ -10375,6 +10406,57 @@ class StateContractTests(unittest.TestCase):
             CHECKER.ContractError, "steady key identity is not exact"
         ):
             CHECKER.check_state(pipe_id)
+
+    def test_state_admits_the_general_assignable_flip(self) -> None:
+        """The refreshed-state (post-apply / `verify`) lane admits the B6 flip:
+        cell1's applied row carries {BOOL:false}, the public output surfaces the
+        resolved Boolean per cell, and every other field stays pinned."""
+        cell1 = (
+            'module.control.aws_dynamodb_table_item.provisioned_cell["cell1"]'
+        )
+
+        def flipped_state(cell1_value: bool = False) -> dict:
+            state = state_fixture()
+            by_address = {
+                item["address"]: item["values"]
+                for item in state["values"]["root_module"]["resources"]
+            }
+            flipped = {
+                **json.loads(by_address[cell1]["item"]),
+                "general_assignable": {"BOOL": cell1_value},
+            }
+            by_address[cell1]["item"] = json.dumps(flipped, sort_keys=True)
+            out = state["values"]["outputs"]["provisioned_cells"]["value"]
+            out["cell0"]["general_assignable"] = True
+            out["cell1"]["general_assignable"] = cell1_value
+            return state
+
+        # The applied flip (and its restore) verify cleanly.
+        CHECKER.check_state(flipped_state(False))
+        CHECKER.check_state(flipped_state(True))
+
+        # A non-Boolean general_assignable in the refreshed output fails closed.
+        bad_type = flipped_state(False)
+        bad_type["values"]["outputs"]["provisioned_cells"]["value"]["cell1"][
+            "general_assignable"
+        ] = "false"
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "refreshed state provisioned-cell catalog output is not exact",
+        ):
+            CHECKER.check_state(bad_type)
+
+        # A drifted non-assignability output field still fails closed even with a
+        # valid general_assignable present.
+        drifted = flipped_state(False)
+        drifted["values"]["outputs"]["provisioned_cells"]["value"]["cell0"][
+            "nhp_port"
+        ] = 62206
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "refreshed state provisioned-cell catalog output is not exact",
+        ):
+            CHECKER.check_state(drifted)
 
     def test_exact_runtime_state_passes(self) -> None:
         self.assertEqual(
