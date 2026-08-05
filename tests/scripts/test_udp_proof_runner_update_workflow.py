@@ -64,7 +64,23 @@ class UDPProofRunnerUpdateWorkflowTest(unittest.TestCase):
         self.assertIn('.path == ".github/workflows/udp-proof-runner-sandbox-update.yml"', self.raw)
         self.assertIn('.conclusion == "success"', self.raw)
         self.assertIn('.head_branch == "main"', self.raw)
-        self.assertIn('test "$GITHUB_SHA" = "$PLANNED_COMMIT_SHA"', self.raw)
+        # The apply used to require GITHUB_SHA == PLANNED_COMMIT_SHA. That is an
+        # equality against a moving reference: it means "nothing merged during
+        # the plan->apply window", and run 30988795833 lost that race to an
+        # unrelated merge. workflow_dispatch can only target a branch, so the
+        # governed transition became unreachable while main kept moving.
+        #
+        # The binding it carried is preserved, not dropped: the planned commit
+        # must be an ancestor, and the plan's own inputs must be unchanged
+        # between the two commits.
+        self.assertIn("compare/${PLANNED_COMMIT_SHA}...${GITHUB_SHA}", self.raw)
+        self.assertIn("saved-plan inputs changed after the plan", self.raw)
+        for plan_input in (
+            "terraform/environments/sandbox-udp-proof-runner/",
+            "terraform/modules/udp-proof-runner/",
+            "capture-sandbox-udp-proof-account-binding",
+        ):
+            self.assertIn(plan_input, self.raw)
 
     def test_saved_plan_binds_unchanged_versioned_state(self) -> None:
         self.assertEqual(

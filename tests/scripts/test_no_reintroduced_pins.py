@@ -196,5 +196,82 @@ class NoReintroducedPinsTest(unittest.TestCase):
                 )
 
 
+RUNNER_UPDATE = ROOT / ".github/workflows/udp-proof-runner-sandbox-update.yml"
+
+
+class RunnerRootApplyIsNotCommitPinned(unittest.TestCase):
+    """The saved-plan apply must survive unrelated merges landing on main.
+
+    Two equalities used to live in "Check dispatch contract":
+
+      test "$GITHUB_SHA" = "$main_sha"
+      test "$GITHUB_SHA" = "$PLANNED_COMMIT_SHA"
+
+    Both resolve a moving reference and then demand equality against it, so
+    each really means "nothing merged during this window". Run 30988795833
+    lost that race to an unrelated merge (02667638 -> 7e66f7d8) and the
+    governed apply could not be completed at all.
+    """
+
+    def setUp(self) -> None:
+        self.assertTrue(RUNNER_UPDATE.exists(), f"{RUNNER_UPDATE} is missing")
+        self.text = RUNNER_UPDATE.read_text()
+
+    def test_dispatch_commit_is_checked_by_reachability(self) -> None:
+        self.assertNotIn(
+            'test "$GITHUB_SHA" = "$main_sha"',
+            self.text,
+            "dispatch commit is pinned to main's tip again; use compare reachability",
+        )
+        self.assertIn(
+            'gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}"',
+            self.text,
+            "the reachability check for the dispatch commit is gone",
+        )
+
+    def test_planned_commit_is_an_ancestor_not_an_equal(self) -> None:
+        self.assertNotIn(
+            'test "$GITHUB_SHA" = "$PLANNED_COMMIT_SHA"',
+            self.text,
+            "the apply is commit-pinned again; require ancestry + input stability",
+        )
+        self.assertIn(
+            "compare/${PLANNED_COMMIT_SHA}...${GITHUB_SHA}",
+            self.text,
+            "the planned-commit ancestry check is gone",
+        )
+
+    def test_relaxation_is_paid_for_by_a_path_scoped_drift_check(self) -> None:
+        """Ancestry alone would admit a plan whose own inputs changed.
+
+        This is the failure mode from the #3712 review: relaxing one line while
+        the guarantee it carried is not re-established somewhere else.
+        """
+        for required in (
+            "terraform/environments/sandbox-udp-proof-runner/",
+            "terraform/modules/udp-proof-runner/",
+            "udp-proof-runner-sandbox-update",
+            "capture-sandbox-udp-proof-account-binding",
+        ):
+            self.assertIn(
+                required,
+                self.text,
+                f"{required} is not covered by the plan-input drift check",
+            )
+        self.assertIn(
+            "saved-plan inputs changed after the plan",
+            self.text,
+            "nothing fails the apply when a plan input changed",
+        )
+
+    def test_truncated_compare_fails_closed(self) -> None:
+        """A 300-file cap makes a truncated list look exactly like no drift."""
+        self.assertIn(
+            "-lt 300",
+            self.text,
+            "a truncated compare response would read as an empty drift list",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

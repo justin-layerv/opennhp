@@ -79,8 +79,23 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
-          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
-          test "$GITHUB_SHA" = "$main_sha"
+          # main is a MOVING ref on a pipeline with many devs. Resolving its tip
+          # and then requiring equality does not mean "dispatched from main"; it
+          # means "nothing merged between dispatch and this check", which is
+          # unsatisfiable rather than strict. Require reachability: this run's
+          # commit must be ON main.
+          if [ "$GITHUB_SHA" != "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)" ]; then
+            main_status=$(
+              gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq '.status'
+            )
+            case "$main_status" in
+              identical|behind) ;;
+              *)
+                echo "::error::dispatch commit ${GITHUB_SHA} is not on main (${main_status})" >&2
+                exit 1
+                ;;
+            esac
+          fi
           gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" \
             --jq '.commit.verification | .verified == true and .reason == "valid"' |
             grep -qx true
@@ -100,7 +115,42 @@ jobs:
               test -n "$PLANNED_STATE_VERSION_ID"
               [[ "$PLANNED_STATE_SERIAL" =~ ^(0|[1-9][0-9]*)$ ]]
               [[ "$PLANNED_STATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-              test "$GITHUB_SHA" = "$PLANNED_COMMIT_SHA"
+              # A saved plan must be applied against the code that produced it,
+              # but requiring GITHUB_SHA == PLANNED_COMMIT_SHA fails whenever ANY
+              # unrelated commit lands on main during the plan->apply window. On
+              # this pipeline that window is minutes wide and the equality
+              # frequently never closes -- run 30988795833 lost the race to an
+              # unrelated merge (02667638 -> 7e66f7d8).
+              #
+              # Keep the real invariant instead: the planned commit must be an
+              # ancestor of this run's commit, and nothing that FEEDS this root's
+              # plan may have changed between them. The broker zip is carried in
+              # the plan artifact, so it is pinned independently of the commit.
+              if [ "$GITHUB_SHA" != "$PLANNED_COMMIT_SHA" ]; then
+                compare_json="$RUNNER_TEMP/plan-input-drift.json"
+                gh api \
+                  "repos/${GITHUB_REPOSITORY}/compare/${PLANNED_COMMIT_SHA}...${GITHUB_SHA}" \
+                  > "$compare_json"
+                test "$(jq -r '.status' "$compare_json")" = ahead || {
+                  echo "::error::planned commit ${PLANNED_COMMIT_SHA} is not an ancestor of ${GITHUB_SHA}" >&2
+                  exit 1
+                }
+                # The compare API truncates its file list at 300 entries, and a
+                # truncated list is indistinguishable from "no drift". Fail closed.
+                test "$(jq '.files | length' "$compare_json")" -lt 300 || {
+                  echo "::error::plan->apply diff is too large to prove input stability; re-plan" >&2
+                  exit 1
+                }
+                plan_input_drift=$(
+                  jq -r '.files[].filename' "$compare_json" |
+                    grep -E '^(terraform/environments/sandbox-udp-proof-runner/|terraform/modules/udp-proof-runner/|\.github/workflows/udp-proof-runner-sandbox-update\.yml$|scripts/capture-sandbox-udp-proof-account-binding\.sh$)' ||
+                    true
+                )
+                test -z "$plan_input_drift" || {
+                  echo "::error::saved-plan inputs changed after the plan: ${plan_input_drift}" >&2
+                  exit 1
+                }
+              fi
               ;;
             verify)
               test "$CONFIRMATION" = VERIFY_SANDBOX_UDP_PROOF_RUNNER
