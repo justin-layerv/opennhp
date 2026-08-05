@@ -43,7 +43,17 @@ TIMESTAMP_RE = re.compile(
     r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
 )
 PHASES = frozenset({"pre_removal", "post_removal"})
-ARM_LEASE_SECONDS = 2100
+# The Connector Authority refuses any arm lease longer than
+# repository.AgentAssignmentLeaseLifetime, a hard 30-minute ceiling in
+# layervai/qurl-service (internal/repository/agent_placement.go), enforced by
+# ProofMutationService.validLeaseSeconds. This asked for 2100s (35 minutes), so
+# every arm was rejected as invalid_request -- the Authority does not clamp an
+# over-long lease, it refuses the whole mutation.
+#
+# 1800 is that ceiling exactly. Raising it requires raising
+# AgentAssignmentLeaseLifetime in qurl-service FIRST; a larger value here alone
+# only re-breaks the handshake.
+ARM_LEASE_SECONDS = 1800
 EXPIRE_LEASE_SECONDS = 30
 PROOF_SOURCE_IP = "3.141.109.76"
 TRANSPORT_HTTP_HOSTS = [

@@ -44,8 +44,11 @@ def descriptor():
         ),
         "pinned_cell_id": "cell0",
         "target_cell_id": "cell1",
-        "arm_lease_seconds": 2100,
-        "expire_lease_seconds": 30,
+        # Derived, not literal: validate_descriptor requires these to equal the
+        # module constants, so a hardcoded copy silently pins the very value a
+        # lease-ceiling fix has to change.
+        "arm_lease_seconds": handshake.ARM_LEASE_SECONDS,
+        "expire_lease_seconds": handshake.EXPIRE_LEASE_SECONDS,
         "arm_request_id": "a" * 64,
         "move_request_id": "b" * 64,
         "expire_request_id": "c" * 64,
@@ -229,7 +232,10 @@ class AssignmentHandshakeTest(unittest.TestCase):
                 "previous_assignment_generation": 7,
                 "new_cell_id": "cell1",
                 "new_assignment_generation": 8,
-                "lease_expires_at": "2026-07-28T20:35:00Z",
+                "lease_expires_at": (
+                    datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc)
+                    + timedelta(seconds=handshake.ARM_LEASE_SECONDS)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "mutated_at": "2026-07-28T20:00:00Z",
             },
         }
@@ -256,7 +262,10 @@ class AssignmentHandshakeTest(unittest.TestCase):
                 "previous_assignment_generation": 7,
                 "new_cell_id": "cell1",
                 "new_assignment_generation": 8,
-                "lease_expires_at": "2026-07-28T20:35:00Z",
+                "lease_expires_at": (
+                    datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc)
+                    + timedelta(seconds=handshake.ARM_LEASE_SECONDS)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "mutated_at": "2026-07-28T20:00:00Z",
             },
         }
@@ -503,6 +512,44 @@ class AssignmentHandshakeTest(unittest.TestCase):
                 handshake._write_once(
                     assignment_path, handshake._canonical(normalized_assignment)
                 )
+
+
+class ArmLeaseStaysWithinTheAuthorityCeiling(unittest.TestCase):
+    """The Authority REFUSES an over-long lease; it does not clamp it.
+
+    ProofMutationService.validLeaseSeconds in layervai/qurl-service rejects any
+    lease above repository.AgentAssignmentLeaseLifetime (30 minutes), returning
+    ErrProofMutationInvalid -- which reaches this side only as an opaque
+    {'code': 'invalid_request'}. ARM_LEASE_SECONDS was 2100, so every arm
+    failed. The step had never executed before, so nothing caught it.
+    """
+
+    # Mirrors repository.AgentAssignmentLeaseLifetime (30 * time.Minute) in
+    # layervai/qurl-service internal/repository/agent_placement.go.
+    AUTHORITY_LEASE_CEILING_SECONDS = 1800
+
+    def test_arm_lease_is_grantable(self) -> None:
+        self.assertGreater(handshake.ARM_LEASE_SECONDS, 0)
+        self.assertLessEqual(
+            handshake.ARM_LEASE_SECONDS,
+            self.AUTHORITY_LEASE_CEILING_SECONDS,
+            "the Authority refuses this arm outright; raise "
+            "AgentAssignmentLeaseLifetime in qurl-service first",
+        )
+
+    def test_expire_lease_is_grantable(self) -> None:
+        self.assertGreater(handshake.EXPIRE_LEASE_SECONDS, 0)
+        self.assertLessEqual(
+            handshake.EXPIRE_LEASE_SECONDS,
+            self.AUTHORITY_LEASE_CEILING_SECONDS,
+        )
+
+    def test_expire_shortens_the_arm_lease(self) -> None:
+        """expire_lease exists to cut the arm lease short, so it must be less."""
+        self.assertLess(
+            handshake.EXPIRE_LEASE_SECONDS,
+            handshake.ARM_LEASE_SECONDS,
+        )
 
 
 if __name__ == "__main__":
