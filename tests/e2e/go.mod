@@ -3,10 +3,10 @@ module github.com/layerv/nhp/tests/e2e
 go 1.26.5
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.43.0
+	github.com/aws/aws-sdk-go-v2 v1.43.2
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.63.0
-	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.61.0
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.2
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.100.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.42.3
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.44.0
@@ -16,15 +16,15 @@ require (
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.29 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.31 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.31 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.33 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.33 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.30 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.8 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.14 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.10 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.29 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.2.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.31.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
-	github.com/aws/smithy-go v1.27.3 // indirect
+	github.com/aws/smithy-go v1.27.5 // indirect
 )
