@@ -7,7 +7,8 @@ Prepare the sandbox state and qurl-service task definition for the later exact
 HTTP lifecycle deletion apply. This preparation must be applied first; it does
 not itself delete any resource in the UDP retirement allowlist.
 
-- [ ] Pre-rollout: require the complete pre-removal UDP customer-path proof before applying this preparation.
+- [ ] ~~Pre-rollout: require the complete pre-removal UDP customer-path proof before applying this preparation.~~
+      _Proof-aggregate gate withdrawn 2026-08-06 — the UDP proof controller has never produced a green run (100 dispatches, 0 success) and every failure is harness, not product. See `2026-07-29-http-lifecycle-retirement.md`._
 - [ ] Pre-rollout: restrict this temporary fence relaxation to the sandbox apply; do not run a production Terraform apply until the deletion revision has restored `force_destroy=false` and `prevent_destroy=true` for the surviving production module.
 - [ ] Rollout: apply the reviewed merge commit while `deploy_bootstrap_alb=true`, then verify the saved plan/apply completed and the bootstrap access-log bucket state records `force_destroy=true`.
 - [ ] Rollout: deploy the newly registered qurl-service task definition and verify its container definition omits `QURL_AGENT_BOOTSTRAP_ENABLED`, `NHP_SERVER_HOST`, `NHP_SERVER_PORT`, `QURL_AGENT_REGISTRATION_ENABLED`, `QURL_NHP_RELAY_BASE_URL`, `QURL_AGENT_OTP_ENABLED`, `QURL_AGENT_OTP_EMAIL_FROM`, and `QURL_AGENT_OTP_PEPPER`.
