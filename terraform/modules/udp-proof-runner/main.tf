@@ -156,6 +156,22 @@ resource "aws_vpc_security_group_egress_rule" "nhp_udp" {
   to_port           = 443
 }
 
+# The connector under proof establishes its reverse tunnel to the AC edge on
+# the FRPS control channels. Without this the TCP SYN never leaves the runner:
+# the client fails with `dial tcp <ac-nlb>:7001: i/o timeout`, and the AC never
+# sees the packet at all -- its kernel log carries no [NHP-ACCEPT] or [NHP-DENY]
+# for DPT=7001, which is how this was isolated. The port is NHP-gated at the
+# AC's kernel ipset, so egress here does not grant access; it only lets the
+# knocked-open path be used.
+resource "aws_vpc_security_group_egress_rule" "frps_control" {
+  security_group_id = aws_security_group.runner.id
+  description       = "FRPS control channels at the sandbox AC edge"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 7000
+  to_port           = 7002
+}
+
 resource "aws_vpc_security_group_egress_rule" "time_sync" {
   security_group_id = aws_security_group.runner.id
   description       = "Amazon Time Sync Service"
