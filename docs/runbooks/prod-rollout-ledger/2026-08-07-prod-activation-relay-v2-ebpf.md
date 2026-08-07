@@ -4,8 +4,28 @@
 - **Source:** this PR
 
 Turns on the customer-facing surfaces for the release: the NHP relay, qURL v2
-keyed identity end to end, the qurl.link browser js-agent, and the AC eBPF/XDP
-datapath. Three of the four take effect at apply; the fourth does not.
+keyed identity, the qurl.link browser js-agent, and the AC eBPF/XDP datapath.
+
+**This is a two-apply rollout.** `promote-to-prod` runs `terraform-apply` before
+`deploy-server`, so anything Terraform publishes for browsers goes live before
+the fleet that serves it. Apply 1 therefore ships everything that does not
+depend on a rolled fleet; apply 2 is the customer-visible cutover.
+
+| | apply 1 | apply 2 |
+| --- | --- | --- |
+| `deploy_relay` | true | — |
+| `ac_filter_mode` | 1 (template only) | — |
+| `qurl_v2_issuer_key_enabled` / `resource_keys` | true | — |
+| `qurl_v2_admission_enabled` | true | — |
+| `qurl_v2_issuance_enabled` | **false** | true |
+| `qurl_link_js_agent_enabled` | **false** | true |
+
+Issuance and the js-agent flip together because both `qurl_browser_relay_base_url`
+and the portal's `server_public_key_b64` are gated on `qurl_link_js_agent_enabled`
+— minting qv2 links while the portal is qv1-only produces links nothing can
+open. Admission stays on in apply 1 because the plan enforces only
+issuance -> admission, so the fleet can be ready to admit before the first link
+exists.
 
 - [ ] Pre-rollout (**relay DNS is cross-account and new**): the relay's cert
       validation records and A-alias are written into the layerv.ai zone in
@@ -37,10 +57,12 @@ datapath. Three of the four take effect at apply; the fourth does not.
       on iptables while the config claims otherwise. Invoke the Tier 1 smoke
       with `allow_ssm_probes=true` — the AC eBPF object gate skips by policy
       without it and proves nothing.
-- [ ] Rollout ordering (js-agent): publish the regenerated
-      `terraform/modules/qurl-link/frontend/nhp-agent.min.js` and its SRI
-      immediately after the fleet cutover. The gap between the two is the
-      browser outage window; keep it minutes.
+- [ ] **Apply 2 (after the fleet and AC rolls are healthy):** flip
+      `qurl_v2_issuance_enabled` and `qurl_link_js_agent_enabled` to true
+      together and apply. This publishes the protocol-1.1 browser bundle and its
+      SRI, and starts minting qv2 links. Do not run it before the server fleet
+      reports 1.1 and the relay target group is healthy — that ordering is the
+      whole reason for the split.
 - [ ] Post-rollout: mint a qURL and confirm the link is
       `https://qurl.link/#qv2.<claims>.<secret>.<sig>`, that the portal verifies
       the issuer signature locally, knocks through `relay.layerv.ai`, and the

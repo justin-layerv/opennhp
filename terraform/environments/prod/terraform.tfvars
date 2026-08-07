@@ -168,7 +168,23 @@ cloudmap_enabled          = true
 # zero/no datapoints across the 14-day burn-in and fresh-smoke windows.
 nhp_internal_auth_require = true
 
-# ── qURL v2 keyed identity — LIVE ──
+# ── Two-apply activation ──
+# APPLY 1 (this file as committed): relay live, v2 issuer key + resource keys +
+# server-side admission on, eBPF launch template updated. No qv2 link is minted
+# and qurl.link keeps its current legacy flow, so nothing customer-facing
+# depends on a fleet that has not rolled yet.
+#
+#   -> roll the server fleet (protocol 1.1) and the AC ASG (eBPF), confirm the
+#      relay target group is healthy
+#
+# APPLY 2: flip qurl_v2_issuance_enabled and qurl_link_js_agent_enabled to true
+# together. That is the customer-visible cutover.
+#
+# This split is not caution about the flag values; it is the promote pipeline's
+# job order. terraform-apply runs before deploy-server, so anything Terraform
+# publishes for browsers goes live before the fleet that serves it.
+
+# ── qURL v2 keyed identity ──
 # The four gates flip together by contract, enforced at plan time by
 # terraform_data.qurl_v2_flag_invariants:
 #   issuance  -> requires admission (else minted links have no issuer in the
@@ -186,9 +202,19 @@ nhp_internal_auth_require = true
 qurl_v2_issuer_key_enabled            = true
 qurl_v2_resource_keys_enabled         = true
 qurl_v2_resource_key_software_default = true
-qurl_v2_issuance_enabled              = true
-qurl_v2_admission_enabled             = true
-qurl_v2_issuer_kid                    = "qurl-issuer-prod-2026-08"
+# ── APPLY 2 ── issuance flips with the js-agent, for a reason that is easy to
+# miss: minting is useless without a portal that can open the link. Both
+# qurl_browser_relay_base_url (threaded to qurl-service) and the portal's
+# server_public_key_b64 are gated on qurl_link_js_agent_enabled, so with the
+# js-agent off a minted #qv2. link reaches a qv1-only portal and fails closed.
+# Issuance-on + js-agent-off would mint links nothing can open.
+qurl_v2_issuance_enabled = false
+# Admission stays ON in apply 1 on purpose. The plan only enforces
+# issuance -> admission, never the reverse ("admission on, issuance off is
+# harmless"), so the server fleet can be ready to admit qv2 before the first
+# qv2 link exists. That ordering is the safe direction.
+qurl_v2_admission_enabled = true
+qurl_v2_issuer_kid        = "qurl-issuer-prod-2026-08"
 
 # relay_url is stamped into every signed claim and must be ON the allowlist, so
 # these two move together and both must match relay_dns_name below. A mismatch
@@ -280,18 +306,23 @@ deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link"
 qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone (in layerv-mgmt account)
 qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-account provider
-# LIVE. qURL v2 links are minted on qurl.link (qurl_link_frontend_domain above),
-# so the browser opens https://qurl.link/#qv2.<claims>.<secret>.<sig>, verifies
-# the issuer signature locally against the shipped trust store, and knocks
-# through relay.layerv.ai. That flow does not exist without the js-agent, so
-# this flips together with qurl_v2_issuance_enabled below and deploy_relay.
+# ── APPLY 2 ── flip to true only AFTER the fleet is rolled. See the
+# "Two-apply activation" note beside qurl_v2_issuance_enabled above.
 #
-# It also swaps the qurl.link CSP and cache policy: HTML and /nhp-agent.min.js
-# move to Cache-Control: no-cache and the rendered script integrity must match
-# the served bundle. After the fleet cutover, publish the regenerated
-# nhp-agent.min.js and its SRI immediately — the gap between fleet and bundle is
-# the browser outage window.
-qurl_link_js_agent_enabled = true
+# Terraform is what publishes the browser bundle (module.qurl_link reads
+# frontend/nhp-agent.min.js and its .sri), and promote-to-prod runs
+# terraform-apply BEFORE deploy-server. Leaving this true would therefore put a
+# protocol-1.1 bundle on qurl.link while the fleet is still 1.0 and the relay
+# has no healthy targets — a ~20-minute browser outage across the blue/green
+# roll, and exactly the inversion PR #3693's ledger warns against ("Fleet
+# marginally first so a freshly-fetched 1.1 bundle always finds a 1.1
+# receiver"). No Terraform ordering can fix that: the fleet roll happens in a
+# later workflow job, outside the graph.
+#
+# When flipped it swaps the qurl.link CSP and cache policy — HTML and
+# /nhp-agent.min.js move to Cache-Control: no-cache and the rendered script
+# integrity must match the served bundle.
+qurl_link_js_agent_enabled = false
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true
