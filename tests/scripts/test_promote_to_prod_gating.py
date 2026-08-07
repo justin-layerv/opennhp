@@ -2069,6 +2069,116 @@ def _assert_every_image_deploy_has_sns_row(jobs: dict, failures: list[str]) -> N
             )
 
 
+def _assert_ecr_checks_are_independent(workflow_text: str, failures: list[str]) -> None:
+    """Every preflight ECR replication check must be independently reachable.
+
+    Each check is guarded by its own `if [[ "$DEPLOY_X" == "true" ]]`, but that
+    guard is worthless if the block sits *inside* another component's gate: a
+    single-component promotion would then skip the verification entirely. That
+    is not hypothetical — the relay check shipped nested inside the DEPLOY_AC
+    gate, so a relay-only promotion (a first-class path: trigger-prod-deploy.sh
+    emits exactly that when only the relay tag moved, and deploy-relay's `if:`
+    permits server/ac being skipped) would have called deploy-relay.sh with
+    app_changed=true and an unverified tag, crash-looping the instance refresh
+    on docker pull after a ~15-minute poll instead of failing fast at preflight.
+
+    Indentation does not settle this — a nested block can be indented to match
+    its siblings, which is exactly how it went unnoticed. Compute real nesting
+    depth instead.
+    """
+    lines = workflow_text.splitlines()
+    try:
+        start = next(
+            i
+            for i, line in enumerate(lines)
+            if "Verify images replicated to prod ECR" in line
+        )
+    except StopIteration:
+        failures.append("preflight ECR verification step not found")
+        return
+
+    # Bound the walk to this step's own body. A fixed line window can spill into
+    # the next step once the if/fi count balances — which would let it pick up
+    # unrelated DEPLOY_* guards — or miss checks pushed past the window as the
+    # step grows. Stop at the next line indented at or above the `- name:` level.
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        if indent <= step_indent:
+            end = i
+            break
+
+    depth = 0
+    depths: dict[str, int] = {}
+    for line in lines[start:end]:
+        stripped = line.strip()
+        match = re.match(r'if \[\[ "\$(DEPLOY_[A-Z]+)" == "true"', stripped)
+        if match:
+            depths[match.group(1)] = depth
+        if stripped.startswith("if "):
+            depth += 1
+        elif stripped == "fi":
+            depth -= 1
+            if depth < 0:
+                break
+
+    if not depths:
+        failures.append("no DEPLOY_* ECR checks found in the preflight step")
+        return
+
+    nested = sorted(name for name, d in depths.items() if d != 0)
+    if nested:
+        failures.append(
+            "preflight ECR check(s) nested inside another component's gate, so "
+            f"a single-component promotion skips them: {', '.join(nested)}"
+        )
+
+
+def _assert_ecr_checks_are_independent_self_test() -> bool:
+    """Canary for the nesting-depth walk in `_assert_ecr_checks_are_independent`.
+
+    Takes raw workflow text rather than parsed jobs, so it cannot use the shared
+    `cases` fixture harness (which feeds YAML-parsed jobs) and carries its own
+    canary here instead, like `_assert_sns_row_widths_boundary`.
+
+    Two synthetic step bodies:
+      - siblings: every DEPLOY_* check at depth 0 (must NOT fail);
+      - nested: the relay check inside the AC gate, exactly the shape that
+        shipped and would let a relay-only promotion skip its ECR verification
+        (MUST fail).
+
+    Both are indented identically, because indentation is what made the real
+    defect invisible — the walk must key on `if`/`fi` structure, not columns.
+    """
+    siblings = """      - name: Verify images replicated to prod ECR
+        run: |
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo ac
+          fi
+          if [[ "$DEPLOY_RELAY" == "true" ]]; then
+            echo relay
+          fi
+"""
+    nested = """      - name: Verify images replicated to prod ECR
+        run: |
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo ac
+          if [[ "$DEPLOY_RELAY" == "true" ]]; then
+            echo relay
+          fi
+          fi
+"""
+    ok_failures: list[str] = []
+    _assert_ecr_checks_are_independent(siblings, ok_failures)
+    bad_failures: list[str] = []
+    _assert_ecr_checks_are_independent(nested, bad_failures)
+    return not ok_failures and bool(bad_failures)
+
+
 def _assert_manifest_rejects_no_op(jobs: dict, failures: list[str]) -> None:
     """The manifest job must hard-reject a no-op dispatch.
 
@@ -5318,6 +5428,9 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
         _assert_preflight,
         _assert_qrts_smoke_after_deploy_qrts,
         _assert_terraform_apply_needs_schema_compat,
+        # _assert_ecr_checks_are_independent takes raw workflow text, not
+        # parsed jobs, so it cannot use this fixture harness; its canary is
+        # _assert_ecr_checks_are_independent_self_test().
         # _assert_sns_row_widths is exercised by its own dedicated
         # self-test (`_assert_sns_row_widths_boundary` covers the
         # row-width math). Listing here would require a fixture
@@ -5364,6 +5477,13 @@ def main() -> int:
         "self-test: _assert_sns_row_widths handles the boundary correctly",
         _assert_sns_row_widths_boundary(),
         "boundary check accepted >width or rejected exactly-at-width",
+    ):
+        return 1
+
+    if not _check(
+        "self-test: ECR-check independence walk rejects a nested check",
+        _assert_ecr_checks_are_independent_self_test(),
+        "the independence walk did not reject a known-nested fixture",
     ):
         return 1
 
@@ -5455,6 +5575,7 @@ def main() -> int:
     for fn in action_assertions:
         fn(build_lambda_action, failures)
 
+    _assert_ecr_checks_are_independent(WORKFLOW.read_text(), failures)
     _assert_revocation_ageout_alarm_rules(monitoring_tf_text, failures)
     _assert_deploy_window_iam_hardening(
         compute_tf_text,

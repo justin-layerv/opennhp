@@ -84,6 +84,7 @@ SSM_SANDBOX_STATE="/sandbox/nhp/deploy/state"
 # back to reading the blue /image-tag slot directly.
 SSM_SANDBOX_QURL_TAG="/layerv-nhp-sandbox/qurl-api-image-tag"
 SSM_SANDBOX_QRTS_TAG="/sandbox/nhp/reverse-tunnel-server/image-tag"
+SSM_SANDBOX_RELAY_TAG="/sandbox/nhp/relay/image-tag"
 # Prod (AWS_PROFILE=layerv-prod)
 SSM_PROD_COMMIT="/prod/nhp/deploy/deployed-commit"
 SSM_PROD_DEPLOYED_AT="/prod/nhp/deploy/deployed-at"
@@ -92,6 +93,7 @@ SSM_PROD_SERVER_TAG="/prod/nhp/server/image-tag"
 SSM_PROD_AC_TAG="/prod/nhp/ac/image-tag"
 SSM_PROD_QURL_TAG="/layerv-nhp-prod/qurl-api-image-tag"
 SSM_PROD_QRTS_TAG="/prod/nhp/reverse-tunnel-server/image-tag"
+SSM_PROD_RELAY_TAG="/prod/nhp/relay/image-tag"
 
 # Color codes
 RED='\033[0;31m'
@@ -101,11 +103,15 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-pass() { echo -e "  ${GREEN}[PASS]${NC} $1"; }
-fail() { echo -e "  ${RED}[FAIL]${NC} $1"; PREFLIGHT_FAILED=1; }
-warn() { echo -e "  ${YELLOW}[WARN]${NC} $1"; }
-info() { echo -e "         $1"; }
-header() { echo -e "\n  ${BOLD}${CYAN}$1${NC}"; echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 ${#1}))${NC}"; }
+# Human-facing progress goes to stderr, not stdout. --json is a documented
+# machine interface (CLAUDE.md, Common Commands) and stdout must carry only the
+# JSON document, or `... --json | jq` fails to parse. On a terminal both streams
+# still render, so interactive and --dry-run output is unchanged.
+pass() { echo -e "  ${GREEN}[PASS]${NC} $1" >&2; }
+fail() { echo -e "  ${RED}[FAIL]${NC} $1" >&2; PREFLIGHT_FAILED=1; }
+warn() { echo -e "  ${YELLOW}[WARN]${NC} $1" >&2; }
+info() { echo -e "         $1" >&2; }
+header() { echo -e "\n  ${BOLD}${CYAN}$1${NC}" >&2; echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 ${#1}))${NC}" >&2; }
 
 # read_ssm — read an SSM parameter from a given AWS profile
 # Returns the parameter value, or empty string on failure
@@ -186,10 +192,10 @@ audit_log() {
 # Section 1: Preflight Checks — credentials and environment
 # =============================================================================
 
-echo ""
-echo "  =============================================="
-echo "    PROD DEPLOYMENT — layerv-nhp"
-echo "  =============================================="
+echo "" >&2
+echo "  ==============================================" >&2
+echo "    PROD DEPLOYMENT — layerv-nhp" >&2
+echo "  ==============================================" >&2
 
 header "PREFLIGHT"
 
@@ -281,6 +287,7 @@ SANDBOX_SERVER_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION=
 SANDBOX_AC_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" bash "$RESOLVE_ACTIVE_TAG" sandbox ac || echo "")
 SANDBOX_QURL_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QURL_TAG")
 SANDBOX_QRTS_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QRTS_TAG")
+SANDBOX_RELAY_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_RELAY_TAG")
 
 info "Sandbox SSM parameters loaded"
 
@@ -293,6 +300,7 @@ PROD_SERVER_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_SERVER_TAG")
 PROD_AC_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_AC_TAG")
 PROD_QURL_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QURL_TAG")
 PROD_QRTS_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QRTS_TAG")
+PROD_RELAY_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_RELAY_TAG")
 
 info "Prod SSM parameters loaded"
 
@@ -303,6 +311,7 @@ SANDBOX_SERVER_TAG="${SANDBOX_SERVER_TAG:-(not set)}"
 SANDBOX_AC_TAG="${SANDBOX_AC_TAG:-(not set)}"
 SANDBOX_QURL_TAG="${SANDBOX_QURL_TAG:-(not set)}"
 SANDBOX_QRTS_TAG="${SANDBOX_QRTS_TAG:-(not set)}"
+SANDBOX_RELAY_TAG="${SANDBOX_RELAY_TAG:-(not set)}"
 PROD_COMMIT="${PROD_COMMIT:-(not set)}"
 PROD_DEPLOYED_AT="${PROD_DEPLOYED_AT:-(not set)}"
 PROD_STATE="${PROD_STATE:-(not set)}"
@@ -310,6 +319,7 @@ PROD_SERVER_TAG="${PROD_SERVER_TAG:-(not set)}"
 PROD_AC_TAG="${PROD_AC_TAG:-(not set)}"
 PROD_QURL_TAG="${PROD_QURL_TAG:-(not set)}"
 PROD_QRTS_TAG="${PROD_QRTS_TAG:-(not set)}"
+PROD_RELAY_TAG="${PROD_RELAY_TAG:-(not set)}"
 
 # Hard block: no sandbox commit means nothing to deploy
 if [[ -z "$SANDBOX_COMMIT" ]]; then
@@ -424,6 +434,7 @@ if [[ -n "$IMAGE_CI" && "$IMAGE_CI" != "[]" ]]; then
         # Found the exact build that produced our images
         IMG_CI_ID=$(echo "$MATCHING_RUN" | jq -r '.databaseId // "?"')
         IMG_CI_CONCLUSION=$(echo "$MATCHING_RUN" | jq -r '.conclusion // "unknown"')
+        IMG_CI_STATUS=$(echo "$MATCHING_RUN" | jq -r '.status // "unknown"')
 
         if [[ "$IMG_CI_CONCLUSION" == "success" ]]; then
             pass "CI run for image ${PROMOTION_TAG:0:7}: success (#${IMG_CI_ID})"
@@ -440,7 +451,15 @@ if [[ -n "$IMAGE_CI" && "$IMAGE_CI" != "[]" ]]; then
                 fail "CI run for image ${PROMOTION_TAG:0:7}: ${IMG_CI_CONCLUSION} (#${IMG_CI_ID}). Could not find Build jobs to verify."
             elif [[ "$BUILD_FAILURES" -eq 0 ]]; then
                 pass "Build jobs for image ${PROMOTION_TAG:0:7}: success (run #${IMG_CI_ID} overall: ${IMG_CI_CONCLUSION})"
-                msg="CI run #${IMG_CI_ID} failed on non-build steps (${IMG_CI_CONCLUSION}) but images were built successfully"
+                # An unfinished run has a null conclusion, which is NOT a
+                # failure — reporting it as "failed on non-build steps ()" both
+                # reads as a real problem and trains the operator to ignore the
+                # warning that would flag one.
+                if [[ "$IMG_CI_STATUS" != "completed" ]]; then
+                    msg="CI run #${IMG_CI_ID} is still ${IMG_CI_STATUS}; no build job has failed, but builds or later jobs may still fail"
+                else
+                    msg="CI run #${IMG_CI_ID} failed on non-build steps (${IMG_CI_CONCLUSION}) but images were built successfully"
+                fi
                 warn "$msg"
                 WARNINGS+=("$msg")
             else
@@ -566,6 +585,7 @@ deploy_server=false
 deploy_ac=false
 deploy_qurl=false
 deploy_qrts=false
+deploy_relay=false
 run_terraform=false
 SERVER_REASON=""
 AC_REASON=""
@@ -645,6 +665,25 @@ else
         QURL_REASON="tag changed: ${PROD_QURL_TAG} → ${SANDBOX_QURL_TAG}"
     fi
 
+    # NHP-Relay. Unlike server/ac this is not blue/green: the relay is a plain
+    # ASG whose user_data reads /<env>/nhp/relay/image-tag from SSM at boot, so
+    # the deploy is put-parameter + instance-refresh (deploy-relay.sh).
+    #
+    # Terraform seeds that parameter once with `ignore_changes = [value]`, so it
+    # is the deploy leg — not Terraform — that advances it on every subsequent
+    # release. Without this detection the relay silently pins to whatever tag
+    # the first apply seeded and never receives another patch.
+    #
+    # A missing prod parameter means the relay is still dark there (Terraform
+    # creates it only when deploy_relay=true), which is the pre-activation state
+    # and correctly reads as "nothing to deploy" rather than as drift.
+    if [[ "$SANDBOX_RELAY_TAG" != "(not set)" && "$PROD_RELAY_TAG" == "(not set)" ]]; then
+        RELAY_REASON="[SKIP] relay is dark in prod (no /prod/nhp/relay/image-tag yet — Terraform creates it when deploy_relay=true)"
+    elif [[ "$SANDBOX_RELAY_TAG" != "(not set)" && "$SANDBOX_RELAY_TAG" != "$PROD_RELAY_TAG" ]]; then
+        deploy_relay=true
+        RELAY_REASON="tag changed: ${PROD_RELAY_TAG} → ${SANDBOX_RELAY_TAG}"
+    fi
+
     # qurl-reverse-tunnel-server (separate repo — the qrts image SSM tag + ASG
     # instance-refresh, ported into promote-to-prod.yml's deploy-qrts job).
     # Skip the bootstrap placeholder — that resolves nothing real.
@@ -701,6 +740,7 @@ DEPLOY_COMPONENTS=()
 if [[ "$deploy_server" == "true" ]]; then DEPLOY_COMPONENTS+=("NHP Server"); fi
 if [[ "$deploy_ac" == "true" ]]; then DEPLOY_COMPONENTS+=("Access Controller"); fi
 if [[ "$deploy_qurl" == "true" ]]; then DEPLOY_COMPONENTS+=("QURL Service"); fi
+if [[ "$deploy_relay" == "true" ]]; then DEPLOY_COMPONENTS+=("NHP-Relay"); fi
 if [[ "$deploy_qrts" == "true" ]]; then DEPLOY_COMPONENTS+=("qurl-reverse-tunnel-server"); fi
 if [[ "$run_terraform" == "true" ]]; then DEPLOY_COMPONENTS+=("Terraform"); fi
 
@@ -717,7 +757,7 @@ fi
 GH_CMD=(gh workflow run promote-to-prod.yml --ref main
     -f "image_tag=${PROMOTION_TAG}"
     -f "deploy_server=${deploy_server}" -f "deploy_ac=${deploy_ac}"
-    -f "deploy_qurl=${deploy_qurl}" -f "deploy_qrts=${deploy_qrts}"
+    -f "deploy_qurl=${deploy_qurl}" -f "deploy_qrts=${deploy_qrts}" -f "deploy_relay=${deploy_relay}"
     -f "run_terraform=${run_terraform}"
 )
 if [[ -n "$QURL_TAG_FOR_COMMAND" ]]; then
@@ -760,6 +800,7 @@ if [[ "$MODE" == "json" ]]; then
         --arg sandbox_ac_tag "$SANDBOX_AC_TAG" \
         --arg sandbox_qurl_tag "$SANDBOX_QURL_TAG" \
         --arg sandbox_qrts_tag "$SANDBOX_QRTS_TAG" \
+        --arg sandbox_relay_tag "$SANDBOX_RELAY_TAG" \
         --arg prod_commit "$PROD_COMMIT" \
         --arg prod_deployed_at "$PROD_DEPLOYED_AT" \
         --arg prod_state "$PROD_STATE" \
@@ -767,10 +808,12 @@ if [[ "$MODE" == "json" ]]; then
         --arg prod_ac_tag "$PROD_AC_TAG" \
         --arg prod_qurl_tag "$PROD_QURL_TAG" \
         --arg prod_qrts_tag "$PROD_QRTS_TAG" \
+        --arg prod_relay_tag "$PROD_RELAY_TAG" \
         --argjson deploy_server "$deploy_server" \
         --argjson deploy_ac "$deploy_ac" \
         --argjson deploy_qurl "$deploy_qurl" \
         --argjson deploy_qrts "$deploy_qrts" \
+        --argjson deploy_relay "$deploy_relay" \
         --argjson run_terraform "$run_terraform" \
         --arg command "$GH_COMMAND" \
         --arg image_tag "$PROMOTION_TAG" \
@@ -789,7 +832,8 @@ if [[ "$MODE" == "json" ]]; then
             server_tag: $sandbox_server_tag,
             ac_tag: $sandbox_ac_tag,
             qurl_tag: $sandbox_qurl_tag,
-            qrts_tag: $sandbox_qrts_tag
+            qrts_tag: $sandbox_qrts_tag,
+            relay_tag: $sandbox_relay_tag
           },
           prod: {
             commit: $prod_commit,
@@ -798,13 +842,15 @@ if [[ "$MODE" == "json" ]]; then
             server_tag: $prod_server_tag,
             ac_tag: $prod_ac_tag,
             qurl_tag: $prod_qurl_tag,
-            qrts_tag: $prod_qrts_tag
+            qrts_tag: $prod_qrts_tag,
+            relay_tag: $prod_relay_tag
           },
           components: {
             deploy_server: $deploy_server,
             deploy_ac: $deploy_ac,
             deploy_qurl: $deploy_qurl,
             deploy_qrts: $deploy_qrts,
+            deploy_relay: $deploy_relay,
             run_terraform: $run_terraform
           },
           command: $command,
@@ -875,6 +921,15 @@ else
         echo -e "  ${YELLOW}[SKIP]${NC}    QURL Service      — no QURL tag configured"
     fi
 fi
+if [[ "$deploy_relay" == "true" ]]; then
+    echo -e "  ${GREEN}[DEPLOY]${NC}  NHP-Relay         — ${RELAY_REASON}"
+elif [[ -n "${RELAY_REASON:-}" ]]; then
+    echo -e "  ${YELLOW}[SKIP]${NC}    NHP-Relay         — ${RELAY_REASON#\[SKIP\] }"
+elif [[ "$SANDBOX_RELAY_TAG" == "(not set)" ]]; then
+    echo -e "  ${YELLOW}[SKIP]${NC}    NHP-Relay         — no relay tag configured"
+else
+    echo -e "  ${YELLOW}[SKIP]${NC}    NHP-Relay         — same tag (${SANDBOX_RELAY_TAG})"
+fi
 if [[ "$deploy_qrts" == "true" ]]; then
     echo -e "  ${GREEN}[DEPLOY]${NC}  qurl-reverse-tunnel-server — ${QRTS_REASON}"
 else
@@ -898,6 +953,7 @@ echo "    -f deploy_server=${deploy_server} \\"
 echo "    -f deploy_ac=${deploy_ac} \\"
 echo "    -f deploy_qurl=${deploy_qurl} \\"
 echo "    -f deploy_qrts=${deploy_qrts} \\"
+echo "    -f deploy_relay=${deploy_relay} \\"
 echo "    -f run_terraform=${run_terraform} \\"
 if [[ -n "$QURL_TAG_FOR_COMMAND" ]]; then
     echo "    -f qurl_image_tag=${QURL_TAG_FOR_COMMAND} \\"

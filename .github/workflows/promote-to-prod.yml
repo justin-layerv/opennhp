@@ -78,6 +78,11 @@ on:
         required: false
         default: false
         type: boolean
+      deploy_relay:
+        description: 'Deploy NHP-Relay: write prod image-tag SSM + ASG instance-refresh. No-ops cleanly while deploy_relay=false in tfvars (asg-name param absent).'
+        required: false
+        default: false
+        type: boolean
       cell_id:
         description: 'Target cell identifier'
         required: false
@@ -143,6 +148,7 @@ env:
   ECR_AC_REPO: 'layerv/nhp-ac'
   ECR_QURL_REPO: 'layerv/nhp-qurl'
   ECR_QRTS_REPO: 'layerv/qurl-reverse-tunnel-server'
+  ECR_RELAY_REPO: 'layerv/nhp-relay'
   PROD_SSM_PREFIX: 'layerv-nhp-prod'
   # Table-name prefix for the qurl agent-identity tables the pre-deploy
   # inventory gate scans (qurl-service#1237). Prod runs a single cell; if a
@@ -897,6 +903,7 @@ jobs:
           DEPLOY_SERVER: ${{ inputs.deploy_server }}
           DEPLOY_AC: ${{ inputs.deploy_ac }}
           DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          DEPLOY_RELAY: ${{ inputs.deploy_relay }}
         run: |
           set -euo pipefail
           echo "Verifying images in prod ECR (replicated from sandbox)..."
@@ -927,6 +934,25 @@ jobs:
               echo "  Found in prod ECR: $ECR_AC_REPO:$IMAGE_TAG"
             else
               echo "::error::Image $ECR_AC_REPO:$IMAGE_TAG not found in prod ECR. ECR cross-account replication may have failed."
+              echo "::error::See runbook: docs/runbooks/ecr-replication-failure.md"
+              FAILED=1
+            fi
+          fi
+
+          # deploy-relay.sh advances the SSM image tag, and its contract only
+          # permits that when the caller has verified the tag exists in ECR —
+          # otherwise the instance refresh crash-loops on docker pull. This is
+          # that verification.
+          if [[ "$DEPLOY_RELAY" == "true" ]]; then
+            echo "Checking prod $ECR_RELAY_REPO:$IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_RELAY_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imageDigest" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found in prod ECR: $ECR_RELAY_REPO:$IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_RELAY_REPO:$IMAGE_TAG not found in prod ECR. ECR cross-account replication may have failed."
               echo "::error::See runbook: docs/runbooks/ecr-replication-failure.md"
               FAILED=1
             fi
@@ -3200,6 +3226,67 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+  deploy-relay:
+    name: Deploy NHP-Relay
+    # Mirrors the sandbox leg's ordering rationale: the private relay/server wire
+    # uses a versioned request-ID return envelope, so the server blue/green must
+    # converge before relay nodes roll. A new relay expecting RelayReturnMsg
+    # while an old server still emits the former raw inner reply is the failure
+    # this ordering prevents.
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac]
+    # Same terraform-apply and chained-deploy shape as deploy-qurl below: relay
+    # ships only if every upstream image-deploy either succeeded or was
+    # operator-skipped.
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      inputs.deploy_relay
+    runs-on: ubuntu-latest
+    environment: production
+    # deploy-relay.sh starts the instance refresh and POLLS it to completion —
+    # it is not fire-and-forget. The sandbox leg budgets 45 min for the same
+    # script (observed healthy 3-instance roll ~8m15s, script caps the refresh
+    # poll at 15 min); prod carries the same bound so the script can emit its own
+    # terminal error rather than being cut off by the job timeout.
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-prod-relay
+      cancel-in-progress: false # Never cancel an in-flight relay roll.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # app_changed is "true" here, which the script's contract explicitly
+      # permits when "the caller has already verified the tag exists in ECR" —
+      # preflight's ECR replication gate does exactly that for ECR_RELAY_REPO,
+      # added in this change (it previously covered only server/ac/qurl/qrts, so
+      # the relay tag was unverified). Passing false would refresh the fleet
+      # without advancing the SSM tag, which is the wrong half of the deploy.
+      #
+      # The helper no-ops cleanly while the relay is dark (deploy_relay=false in
+      # tfvars -> asg-name param absent -> ParameterNotFound -> skip), so this
+      # job is safe to leave enabled across the activation boundary.
+      - name: Deploy relay (SSM image-tag + ASG instance refresh)
+        env:
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+        run: ./.github/scripts/deploy-relay.sh prod true "$IMAGE_TAG"
+
   deploy-qurl:
     name: Deploy QURL Service
     needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, qurl-agent-key-inventory]
@@ -3402,15 +3489,16 @@ jobs:
   # its own post-deploy smoke job below, gated only on deploy-qrts success.
   smoke-test:
     name: Smoke Test
-    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-relay, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-relay.result == 'success' || needs.deploy-relay.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
-      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-relay.result == 'success' || needs.deploy-qurl.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -3482,15 +3570,16 @@ jobs:
   # =============================================================================
   qurl-smoke-tests:
     name: QURL Smoke Tests
-    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-relay, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-relay.result == 'success' || needs.deploy-relay.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
-      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-relay.result == 'success' || needs.deploy-qurl.result == 'success')
     uses: layervai/qurl-service/.github/workflows/smoke-tests.yml@eafec9fe74f298e4ffee28411866d0432c6f5676 # main as of 2026-04-24
     with:
       environment: prod
@@ -3516,15 +3605,16 @@ jobs:
   # =============================================================================
   nhp-smoke-tests:
     name: NHP Smoke Tests
-    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-relay, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-relay.result == 'success' || needs.deploy-relay.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
-      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-relay.result == 'success' || needs.deploy-qurl.result == 'success')
     uses: ./.github/workflows/nhp-smoke-tests.yml
     with:
       environment: prod
@@ -3700,7 +3790,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, deploy-qrts, smoke-test, qurl-smoke-tests, nhp-smoke-tests, qrts-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-relay, deploy-qurl, deploy-qrts, smoke-test, qurl-smoke-tests, nhp-smoke-tests, qrts-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -3726,6 +3816,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           QRTS_RESULT: ${{ needs.deploy-qrts.result }}
+          RELAY_RESULT: ${{ needs.deploy-relay.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -3749,7 +3840,7 @@ jobs:
           # cancelled run does not silently report success, matching the
           # treatment of every other job's cancelled state.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$QRTS_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$QRTS_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$QRTS_RESULT" "$RELAY_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$QRTS_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -3891,6 +3982,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           QRTS_RESULT: ${{ needs.deploy-qrts.result }}
+          RELAY_RESULT: ${{ needs.deploy-relay.result }}
         # Lock layering: the SSM `/prod/nhp/deploy/state` parameter is
         # informational/post-hoc. Real concurrency enforcement is the
         # workflow-level `concurrency: group: promote-to-prod, cancel-
@@ -3932,7 +4024,8 @@ jobs:
                && "$TRAEFIK_PLUGINS_RESULT" == "skipped" \
                && "$AC_RESULT" == "skipped" \
                && "$QURL_RESULT" == "skipped" \
-               && "$QRTS_RESULT" == "skipped" ]]; then
+               && "$QRTS_RESULT" == "skipped" \
+               && "$RELAY_RESULT" == "skipped" ]]; then
             LOCK_VALUE="rejected"
           else
             LOCK_VALUE="failed"
@@ -4066,6 +4159,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           QRTS_RESULT: ${{ needs.deploy-qrts.result }}
+          RELAY_RESULT: ${{ needs.deploy-relay.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -4158,6 +4252,7 @@ jobs:
           MSG+=$(row "AC"            "$AC_RESULT")
           MSG+=$(row "QURL"          "$QURL_RESULT")
           MSG+=$(row "QRTS"          "$QRTS_RESULT")
+          MSG+=$(row "Relay"         "$RELAY_RESULT")
           MSG+=$(row "Smoke Test"    "$SMOKE_RESULT")
           MSG+=$(row "QURL Smoke"    "$QURL_SMOKE_RESULT")
           MSG+=$(row "NHP Smoke"     "$NHP_SMOKE_RESULT")
@@ -4228,6 +4323,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           QRTS_RESULT: ${{ needs.deploy-qrts.result }}
+          RELAY_RESULT: ${{ needs.deploy-relay.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -4272,6 +4368,7 @@ jobs:
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
             echo "| Deploy qurl-reverse-tunnel-server | $(result_emoji "$QRTS_RESULT") $QRTS_RESULT |"
+            echo "| Deploy NHP-Relay | $(result_emoji "$RELAY_RESULT") $RELAY_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
             echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
             echo "| NHP Smoke Tests | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
