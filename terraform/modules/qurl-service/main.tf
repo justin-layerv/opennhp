@@ -896,6 +896,41 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           [for arn in var.control_identity_table_arns : "${arn}/index/*"],
         )
       }] : [],
+      var.control_device_credential_authority_table_arn != "" ? [{
+        Sid      = "ControlDeviceCredentialHeadRead"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [var.control_device_credential_authority_table_arn]
+        # DynamoDB IAM can fence the partition key but not the sort key. This
+        # excludes registry, proof, replay, and other non-owner partitions;
+        # qurl-service still issues an exact DEVICE_CREDENTIAL# GetItem and
+        # rejects any row whose key or record shape does not match.
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OWNER#*"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      }] : [],
+      var.control_device_credential_authority_table_arn != "" ? [{
+        Sid      = "ControlDeviceCredentialHeadRevoke"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = [var.control_device_credential_authority_table_arn]
+        Condition = {
+          "ForAnyValue:StringEquals" = {
+            "dynamodb:EnclosingOperation" = ["TransactWriteItems"]
+          }
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OWNER#*"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      }] : [],
       var.nhp_resources_table_arn != "" ? [{
         Sid    = "NHPResourceCatalogWrite"
         Effect = "Allow"
@@ -1837,8 +1872,16 @@ resource "aws_ecs_task_definition" "qurl" {
       error_message = "control identity mode requires control_identity_kms_key_arn; DynamoDB reads of the SSE-KMS Control tables fail with AccessDenied without it."
     }
     precondition {
+      condition     = var.control_identity_environment_id == "" || var.control_device_credential_authority_table_arn != ""
+      error_message = "control identity mode requires control_device_credential_authority_table_arn; native device-credential revocation otherwise fails with AccessDenied."
+    }
+    precondition {
       condition     = var.control_identity_environment_id != "" || length(var.control_identity_table_arns) == 0
       error_message = "control_identity_table_arns is granted without control_identity_environment_id; the service would still read cell identity tables while holding Control write access."
+    }
+    precondition {
+      condition     = var.control_identity_environment_id != "" || var.control_device_credential_authority_table_arn == ""
+      error_message = "control_device_credential_authority_table_arn is granted without control_identity_environment_id; cell mode must not hold Control Authority access."
     }
     precondition {
       condition     = (var.image_uri == null) == (var.source_revision == null)

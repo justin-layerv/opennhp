@@ -591,6 +591,20 @@ variable "control_identity_table_arns" {
   default     = []
 }
 
+variable "control_device_credential_authority_table_arn" {
+  description = <<-EOT
+    ARN of the Control Connector Authority table whose permanent device head
+    qurl-service reads and atomically revokes with a device API key. Required
+    when control_identity_environment_id is set. Kept separate from the broad
+    identity table list so the public API task receives only GetItem and
+    transaction-enclosed PutItem, fenced to owner partitions. DynamoDB IAM
+    cannot constrain the sort-key prefix; the runtime enforces the exact
+    device-head key and record shape.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "apikey_idempotency_table_arn" {
   description = "DynamoDB table ARN for API key mint idempotency storage"
   type        = string

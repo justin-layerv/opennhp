@@ -2772,6 +2772,13 @@ locals {
     )
   ]
 
+  control_device_credential_authority_table_arn = var.control_identity_environment_id == "" ? "" : format(
+    "arn:aws:dynamodb:%s:%s:table/%s-connector-authority",
+    var.control_identity_home_region,
+    var.aws_account_id,
+    local.control_identity_table_prefix,
+  )
+
   # The NHP server's agent-keys read follows the identity plane, not the cell.
   # In Control mode the Connector Authority registers agent pubkeys into the
   # Control namespace, so a server still reading the cell-local
@@ -2795,10 +2802,11 @@ module "qurl_service" {
 
   # Identity store selection. Empty environment id keeps this cell's own
   # identity tables; see variables.tf for why identity is not cell-scoped.
-  control_identity_environment_id = var.control_identity_environment_id
-  control_identity_home_region    = var.control_identity_home_region
-  control_identity_table_arns     = local.control_identity_table_arns
-  control_identity_kms_key_arn    = var.control_identity_kms_key_arn
+  control_identity_environment_id               = var.control_identity_environment_id
+  control_identity_home_region                  = var.control_identity_home_region
+  control_identity_table_arns                   = local.control_identity_table_arns
+  control_identity_kms_key_arn                  = var.control_identity_kms_key_arn
+  control_device_credential_authority_table_arn = local.control_device_credential_authority_table_arn
 
   environment = var.environment
   name_prefix = local.name_prefix

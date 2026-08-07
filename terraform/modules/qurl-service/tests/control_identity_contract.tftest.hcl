@@ -142,9 +142,13 @@ run "default_is_cell_identity_with_no_control_grant" {
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
-      statement.Sid != "ControlIdentityAccess"
+      !contains([
+        "ControlIdentityAccess",
+        "ControlDeviceCredentialHeadRead",
+        "ControlDeviceCredentialHeadRevoke",
+      ], statement.Sid)
     ])
-    error_message = "cell identity mode emitted a Control identity IAM statement"
+    error_message = "cell identity mode emitted a Control identity or device-credential IAM statement"
   }
 
   assert {
@@ -195,7 +199,7 @@ run "control_identity_grants_and_selects_the_control_namespace" {
     control_identity_environment_id = "sandbox"
     control_identity_home_region    = "us-east-2"
     control_identity_kms_key_arn    = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"
-    # All four tables the root passes. The mint idempotency table is included
+    # All four identity tables the root passes. The mint idempotency table is included
     # deliberately: naming it in the env var without granting IAM boots cleanly
     # and then fails with AccessDenied on the first mint.
     control_identity_table_arns = [
@@ -204,6 +208,7 @@ run "control_identity_grants_and_selects_the_control_namespace" {
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-agent-keys",
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-apikey-idempotency",
     ]
+    control_device_credential_authority_table_arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority"
   }
 
   assert {
@@ -246,6 +251,45 @@ run "control_identity_grants_and_selects_the_control_namespace" {
       ]) if statement.Sid == "ControlIdentityAccess"
     ])
     error_message = "Control identity grant does not cover the mint idempotency table the env var names"
+  }
+
+  # Native Connector enrollment records a permanent device-credential head in
+  # Connector Authority. Direct reads support ownership/state validation; the
+  # head write is restricted to a transaction so the task cannot mutate it
+  # independently of the API-key row.
+  assert {
+    condition = (
+      length([
+        for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+        statement if statement.Sid == "ControlDeviceCredentialHeadRead"
+        ]) == 1 && alltrue([
+        for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+        statement.Action == ["dynamodb:GetItem"] &&
+        statement.Resource == ["arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority"] &&
+        statement.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["OWNER#*"] &&
+        statement.Condition["Null"]["dynamodb:LeadingKeys"] == "false"
+        if statement.Sid == "ControlDeviceCredentialHeadRead"
+      ])
+    )
+    error_message = "device-credential head read is not scoped to GetItem on Connector Authority owner partitions"
+  }
+
+  assert {
+    condition = (
+      length([
+        for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+        statement if statement.Sid == "ControlDeviceCredentialHeadRevoke"
+        ]) == 1 && alltrue([
+        for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+        statement.Action == ["dynamodb:PutItem"] &&
+        statement.Resource == ["arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority"] &&
+        statement.Condition["ForAnyValue:StringEquals"]["dynamodb:EnclosingOperation"] == ["TransactWriteItems"] &&
+        statement.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["OWNER#*"] &&
+        statement.Condition["Null"]["dynamodb:LeadingKeys"] == "false"
+        if statement.Sid == "ControlDeviceCredentialHeadRevoke"
+      ])
+    )
+    error_message = "device-credential head revoke is not limited to transactional PutItem on Connector Authority owner partitions"
   }
 
   # Reading an SSE-KMS table needs decrypt on that table's key. Granting the
@@ -322,6 +366,21 @@ run "control_identity_without_region_or_tables_is_rejected" {
   expect_failures = [aws_ecs_task_definition.qurl]
 }
 
+run "control_identity_without_device_authority_is_rejected" {
+  command = plan
+
+  variables {
+    control_identity_environment_id = "sandbox"
+    control_identity_home_region    = "us-east-2"
+    control_identity_kms_key_arn    = "arn:aws:kms:us-east-2:767397897469:key/83680792-1ed7-4825-beb2-2e67f8056aee"
+    control_identity_table_arns = [
+      "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
+    ]
+  }
+
+  expect_failures = [aws_ecs_task_definition.qurl]
+}
+
 run "control_identity_grant_without_mode_is_rejected" {
   command = plan
 
@@ -329,6 +388,16 @@ run "control_identity_grant_without_mode_is_rejected" {
     control_identity_table_arns = [
       "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-qurl-api-keys",
     ]
+  }
+
+  expect_failures = [aws_ecs_task_definition.qurl]
+}
+
+run "device_authority_grant_without_mode_is_rejected" {
+  command = plan
+
+  variables {
+    control_device_credential_authority_table_arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-control-connector-authority"
   }
 
   expect_failures = [aws_ecs_task_definition.qurl]
