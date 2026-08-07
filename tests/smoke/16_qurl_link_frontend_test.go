@@ -825,23 +825,6 @@ func cspDirectiveFields(csp, directiveName string) []string {
 	return nil
 }
 
-func sameStringSet(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	counts := make(map[string]int, len(want))
-	for _, field := range want {
-		counts[field]++
-	}
-	for _, field := range got {
-		if counts[field] == 0 {
-			return false
-		}
-		counts[field]--
-	}
-	return true
-}
-
 func scriptHashSource(script string) string {
 	sum := sha256.Sum256([]byte(script))
 	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"

@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
@@ -153,6 +154,7 @@ type TestConfig struct {
 	CWLogsClient *cloudwatchlogs.Client
 	DDBClient    *dynamodb.Client
 	ELBClient    *elasticloadbalancingv2.Client
+	IAMClient    *iam.Client
 	SNSClient    *sns.Client
 }
 

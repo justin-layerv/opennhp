@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
@@ -120,6 +121,7 @@ func TestMain(m *testing.M) {
 	testConfig.CWLogsClient = cloudwatchlogs.NewFromConfig(awsCfg)
 	testConfig.DDBClient = dynamodb.NewFromConfig(awsCfg)
 	testConfig.ELBClient = elasticloadbalancingv2.NewFromConfig(awsCfg)
+	testConfig.IAMClient = iam.NewFromConfig(awsCfg)
 	testConfig.SNSClient = sns.NewFromConfig(awsCfg)
 
 	// Resolve deploy mode + cell ID from SSM in one batch. Fail

@@ -12,6 +12,25 @@ import (
 	"time"
 )
 
+// sameStringSet reports whether got and want contain the same strings with the
+// same multiplicity, independent of order.
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(want))
+	for _, value := range want {
+		counts[value]++
+	}
+	for _, value := range got {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
+}
+
 // assertEventually polls check until it returns nil or maxWait elapses.
 // Polls at pollInterval. Logs elapsed-on-success at INFO level; fails
 // only on timeout. This is the standard shape for "the system needs a

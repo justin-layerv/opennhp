@@ -112,13 +112,13 @@ esac
 # ----------------------------------------------------------------------------
 case "$TIER" in
   tier1)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlDeviceCredentialAuthorityIAM|PublicALB|ResolveOrigin)_'
     ;;
   tier1+tier2)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlDeviceCredentialAuthorityIAM|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
     ;;
   tier3-no-ssm)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|AuthorityAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlDeviceCredentialAuthorityIAM|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
     ;;
   local)
     # Curated local-safe subset: pure NHP wire/HTTP contract that runs against
