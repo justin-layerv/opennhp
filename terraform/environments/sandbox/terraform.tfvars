@@ -578,6 +578,11 @@ frps_desired_capacity = 3
 qurl_reverse_tunnel_server_cloud_map_routing_policy = "MULTIVALUE"
 enable_instance_hrw                                 = true
 
+# Current qURL Connectors register FRP with the API-issued c-* routing
+# identity. Keep the router on the same identity so r_* qURL hosts reach the
+# admitted proxy instead of being forwarded to FRP under the legacy r_* host.
+require_connector_routing_id = true
+
 # Opt sandbox into knock-token-as-identity auth on qurl-reverse-tunnel-server.
 # See `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode`
 # for the mode semantics, cross-repo prereqs, and per-mode env shape.
