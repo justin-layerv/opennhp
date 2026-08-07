@@ -34,29 +34,30 @@ require_once() {
   fi
 }
 
-require_once 'https://github.com/traefik/traefik/releases/download/v3.6.24/traefik-v3.6.24.src.tar.gz' \
-  'the pinned Traefik v3.6.24 source URL'
-require_once 'bdd5ac1d6d8a046a518d7f4493f15d0b4a919fab51654852c9e75c54720edbcf  /tmp/traefik-src.tar.gz' \
+require_once 'https://github.com/traefik/traefik/releases/download/v3.6.25/traefik-v3.6.25.src.tar.gz' \
+  'the pinned Traefik v3.6.25 source URL'
+require_once 'bc72a87f59e9d81f62cf3a44ef34df4fe99aebdc1549e69f864087aff07983b7  /tmp/traefik-src.tar.gz' \
   'the pinned Traefik source SHA256 check'
 require_once 'sha256sum -c -' \
   'the Traefik source checksum verifier'
-require_once 'git fetch --depth=1 origin cc336581846996ffbd01b1290fd5b44787bad324' \
+require_once 'git fetch --depth=1 origin 4b18b24b0b002dcc80e0640c6088a87d813de29a' \
   'the pinned upstream Traefik commit fetch'
-require_once "test \"\$(git rev-parse HEAD)\" = cc336581846996ffbd01b1290fd5b44787bad324" \
+require_once "test \"\$(git rev-parse HEAD)\" = 4b18b24b0b002dcc80e0640c6088a87d813de29a" \
   'the pinned upstream Traefik HEAD assertion'
-require_once 'go get google.golang.org/grpc@v1.82.1' \
-  'the grpc-go v1.82.1 selection'
-require_once 'golang.org/x/text@v0.39.0' \
-  'the x/text v0.39.0 selection'
+# No `go get` override is required any more: v3.6.25 ships grpc v1.82.1 and
+# x/text v0.40.0 in its own go.mod, and re-pinning x/text to v0.39.0 against it
+# would DOWNGRADE the dependency. The embedded assertions below carry the floor
+# guarantee instead — they now verify upstream rather than verifying our own
+# override, which is the stronger check.
 require_once '-buildvcs=true' \
   'the VCS-enabled Traefik build'
 require_once 'awk -v want=v1.82.1' \
   'the embedded grpc-go v1.82.1 assertion'
-require_once 'awk -v want=v0.39.0' \
-  'the embedded x/text v0.39.0 assertion'
-require_once "\$3 == \"v3.6.24+dirty\"" \
+require_once 'awk -v want=v0.40.0' \
+  'the embedded x/text v0.40.0 assertion'
+require_once "\$3 == \"v3.6.25+dirty\"" \
   'the versioned Traefik main-module assertion'
-require_once "\$2 == \"vcs.revision=cc336581846996ffbd01b1290fd5b44787bad324\"" \
+require_once "\$2 == \"vcs.revision=4b18b24b0b002dcc80e0640c6088a87d813de29a\"" \
   'the Traefik VCS revision assertion'
 require_once "\$2 == \"vcs.modified=true\"" \
   'the expected patched-source VCS state assertion'

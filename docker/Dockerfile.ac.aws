@@ -70,45 +70,59 @@ RUN make init acd ebpf-objects
 
 # Stage 2: Rebuild the current Traefik patch release with fixed Go dependencies.
 #
-# Traefik v3.6.24 includes the upstream CONNECT-request security fix and
-# grpc-go v1.82.1, but still embeds golang.org/x/text v0.37.0, which is
-# vulnerable to CVE-2026-56852. Override x/text to v0.39.0 (the live fix) and
-# retain the grpc-go v1.82.1 floor defensively: v3.6.24 already ships it, so the
-# grpc-go pin no longer patches a live CVE and only guards against a future
-# 3.6.x patch regressing it. Staying on the current 3.6.x patch avoids pulling a
-# Traefik minor upgrade into the AC edge. The official source release asset is
+# Traefik v3.6.25 carries the fix for CVE-2026-71327 (Gateway API route identity
+# collision allowing cross-namespace backend hijacking) via upstream #13580, and
+# ships grpc-go v1.82.1 and golang.org/x/text v0.40.0 in its own go.mod — so it
+# also supersedes the x/text v0.39.0 override this stage previously applied for
+# CVE-2026-56852.
+#
+# The Gateway API provider is Kubernetes-only and the AC runs Traefik with the
+# file provider alone, so CVE-2026-71327 was not reachable here. It is patched
+# rather than ignored because a fix exists, which is what .trivyignore's own
+# policy requires. Staying on the 3.6.x line avoids pulling a Traefik minor
+# upgrade into the AC edge. The official source release asset is
 # SHA256-pinned. The matching upstream commit is fetched only to restore the
 # tagged main-module identity in Go build metadata; the release tarball remains
 # the source authority, and Go's module checksums protect both explicit security
-# floors. Drop this whole source-rebuild stage once an upstream Traefik 3.6.x
-# release embeds x/text >= v0.39.0.
+# floors.
+#
+# v3.6.25 ships grpc v1.82.1 and x/text v0.40.0 in its own go.mod, so the
+# `go get` override this stage used to carry is gone: pinning x/text@v0.39.0
+# against it would now DOWNGRADE the dependency. The two version assertions
+# below are kept and re-pointed at upstream's versions, which turns them from a
+# check on our own override into a check that upstream has not regressed.
+#
+# That also satisfies the condition this stage was built to wait for (an
+# upstream 3.6.x embedding x/text >= v0.39.0), so the stage itself can now be
+# retired in favour of the published binary. Doing that swaps how the binary is
+# obtained, so it is deliberately left for its own change rather than folded
+# into a CVE fix.
 FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS traefik-builder
 
 WORKDIR /traefik-src
 
 RUN curl -fsSL --retry 3 --retry-delay 5 \
-        "https://github.com/traefik/traefik/releases/download/v3.6.24/traefik-v3.6.24.src.tar.gz" \
+        "https://github.com/traefik/traefik/releases/download/v3.6.25/traefik-v3.6.25.src.tar.gz" \
         -o /tmp/traefik-src.tar.gz \
-    && echo "bdd5ac1d6d8a046a518d7f4493f15d0b4a919fab51654852c9e75c54720edbcf  /tmp/traefik-src.tar.gz" | sha256sum -c - \
+    && echo "bc72a87f59e9d81f62cf3a44ef34df4fe99aebdc1549e69f864087aff07983b7  /tmp/traefik-src.tar.gz" | sha256sum -c - \
     && tar xzf /tmp/traefik-src.tar.gz --strip-components=1 \
     && git init \
     && git remote add origin https://github.com/traefik/traefik.git \
-    && git fetch --depth=1 origin cc336581846996ffbd01b1290fd5b44787bad324 \
-    && git reset --mixed cc336581846996ffbd01b1290fd5b44787bad324 \
-    && git tag v3.6.24 cc336581846996ffbd01b1290fd5b44787bad324 \
-    && test "$(git rev-parse HEAD)" = cc336581846996ffbd01b1290fd5b44787bad324 \
-    && go get google.golang.org/grpc@v1.82.1 golang.org/x/text@v0.39.0 \
+    && git fetch --depth=1 origin 4b18b24b0b002dcc80e0640c6088a87d813de29a \
+    && git reset --mixed 4b18b24b0b002dcc80e0640c6088a87d813de29a \
+    && git tag v3.6.25 4b18b24b0b002dcc80e0640c6088a87d813de29a \
+    && test "$(git rev-parse HEAD)" = 4b18b24b0b002dcc80e0640c6088a87d813de29a \
     && go mod verify \
     && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
         -trimpath \
         -buildvcs=true \
         -ldflags "-s -w \
-          -X github.com/traefik/traefik/v3/pkg/version.Version=3.6.24 \
+          -X github.com/traefik/traefik/v3/pkg/version.Version=3.6.25 \
           -X github.com/traefik/traefik/v3/pkg/version.Codename=ramequin \
-          -X github.com/traefik/traefik/v3/pkg/version.BuildDate=2026-07-24T12:25:48Z" \
+          -X github.com/traefik/traefik/v3/pkg/version.BuildDate=2026-07-31T12:26:41Z" \
         -o /usr/local/bin/traefik ./cmd/traefik \
     && /usr/local/bin/traefik version > /tmp/traefik-version.txt \
-    && awk -v want_version=3.6.24 -v want_codename=ramequin \
+    && awk -v want_version=3.6.25 -v want_codename=ramequin \
         '$1 == "Version:" && $2 == want_version { version = 1 } \
          $1 == "Codename:" && $2 == want_codename { codename = 1 } \
          END { exit !(version && codename) }' \
@@ -117,12 +131,12 @@ RUN curl -fsSL --retry 3 --retry-delay 5 \
     && awk -v want=v1.82.1 \
         '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == want { found = 1 } END { exit !found }' \
         /tmp/traefik-build-info.txt \
-    && awk -v want=v0.39.0 \
+    && awk -v want=v0.40.0 \
         '$1 == "dep" && $2 == "golang.org/x/text" && $3 == want { found = 1 } END { exit !found }' \
         /tmp/traefik-build-info.txt \
     && awk \
-        '$1 == "mod" && $2 == "github.com/traefik/traefik/v3" && $3 == "v3.6.24+dirty" { module = 1 } \
-         $1 == "build" && $2 == "vcs.revision=cc336581846996ffbd01b1290fd5b44787bad324" { revision = 1 } \
+        '$1 == "mod" && $2 == "github.com/traefik/traefik/v3" && $3 == "v3.6.25+dirty" { module = 1 } \
+         $1 == "build" && $2 == "vcs.revision=4b18b24b0b002dcc80e0640c6088a87d813de29a" { revision = 1 } \
          $1 == "build" && $2 == "vcs.modified=true" { modified = 1 } \
          END { exit !(module && revision && modified) }' \
         /tmp/traefik-build-info.txt
