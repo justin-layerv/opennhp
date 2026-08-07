@@ -89,10 +89,46 @@ resource "terraform_data" "relay_control_plane_preconditions" {
   }
 }
 
-# Resolve the same-account zone only when certificate validation or alias
-# management needs it. Prod remains a count-zero, operator-managed path.
+locals {
+  relay_dns_managed = var.deploy_relay && (var.relay_provision_certificate || var.relay_manage_dns_alias)
+
+  # Whether the relay's zone lives in another account. Sandbox owns layerv.xyz
+  # directly, so it stays on the default provider. Prod's candidate parents
+  # (layerv.ai, qurl.link) are both in layerv-mgmt, so its records must be
+  # written by the cross-account role — the same provider every other prod DNS
+  # writer in this root already uses (connect, bootstrap_alb, qurl_api, qurl-link,
+  # SES DKIM/MAIL FROM). The relay was the sole outlier, which is why
+  # deploy_relay=true could not previously apply in prod at all: the default
+  # provider cannot write those zones.
+  relay_dns_cross_account = local.relay_dns_managed && var.cross_account_route53_role_arn != null
+
+  relay_zone_name = local.relay_dns_managed ? trimsuffix(
+    local.relay_dns_cross_account
+    ? one(data.aws_route53_zone.relay_selected_mgmt[*].name)
+    : one(data.aws_route53_zone.relay_selected[*].name),
+    "."
+  ) : ""
+}
+
+# Resolve the relay zone through whichever provider owns it. Exactly one of
+# these is ever count=1; both preconditions are duplicated rather than hoisted
+# so the failure names the provider that could not resolve the zone.
 data "aws_route53_zone" "relay_selected" {
-  count = var.deploy_relay && (var.relay_provision_certificate || var.relay_manage_dns_alias) ? 1 : 0
+  count = local.relay_dns_managed && !local.relay_dns_cross_account ? 1 : 0
+
+  zone_id = var.relay_route53_zone_id
+
+  lifecycle {
+    precondition {
+      condition     = var.relay_route53_zone_id != ""
+      error_message = "relay certificate provisioning or alias management requires relay_route53_zone_id."
+    }
+  }
+}
+
+data "aws_route53_zone" "relay_selected_mgmt" {
+  count    = local.relay_dns_cross_account ? 1 : 0
+  provider = aws.route53_mgmt
 
   zone_id = var.relay_route53_zone_id
 
@@ -127,8 +163,8 @@ resource "aws_acm_certificate" "relay" {
 
     precondition {
       condition = (
-        var.relay_dns_name == trimsuffix(data.aws_route53_zone.relay_selected[0].name, ".") ||
-        endswith(var.relay_dns_name, ".${trimsuffix(data.aws_route53_zone.relay_selected[0].name, ".")}")
+        var.relay_dns_name == local.relay_zone_name ||
+        endswith(var.relay_dns_name, ".${local.relay_zone_name}")
       )
       error_message = "relay_dns_name must be the apex of, or a subdomain of, relay_route53_zone_id."
     }
@@ -150,7 +186,25 @@ locals {
 }
 
 resource "aws_route53_record" "relay_cert_validation" {
-  for_each = var.deploy_relay && var.relay_provision_certificate ? toset([var.relay_dns_name]) : toset([])
+  for_each = var.deploy_relay && var.relay_provision_certificate && !local.relay_dns_cross_account ? toset([var.relay_dns_name]) : toset([])
+
+  zone_id         = var.relay_route53_zone_id
+  name            = local.relay_cert_dvo.resource_record_name
+  type            = local.relay_cert_dvo.resource_record_type
+  ttl             = 300
+  records         = [local.relay_cert_dvo.resource_record_value]
+  allow_overwrite = true
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  depends_on = [time_sleep.relay_route53_record_change_iam_propagation]
+}
+
+resource "aws_route53_record" "relay_cert_validation_mgmt" {
+  for_each = var.deploy_relay && var.relay_provision_certificate && local.relay_dns_cross_account ? toset([var.relay_dns_name]) : toset([])
+  provider = aws.route53_mgmt
 
   zone_id         = var.relay_route53_zone_id
   name            = local.relay_cert_dvo.resource_record_name
@@ -169,12 +223,19 @@ resource "aws_route53_record" "relay_cert_validation" {
 resource "aws_acm_certificate_validation" "relay" {
   count = var.deploy_relay && var.relay_provision_certificate ? 1 : 0
 
-  certificate_arn         = aws_acm_certificate.relay[0].arn
-  validation_record_fqdns = [for record in aws_route53_record.relay_cert_validation : record.fqdn]
+  certificate_arn = aws_acm_certificate.relay[0].arn
+  # Exactly one of these sets is populated. Concatenating rather than selecting
+  # keeps ACM waiting on whichever provider actually wrote the record, so a
+  # future same-account-to-cross-account move cannot validate against records
+  # that no longer exist.
+  validation_record_fqdns = concat(
+    [for record in aws_route53_record.relay_cert_validation : record.fqdn],
+    [for record in aws_route53_record.relay_cert_validation_mgmt : record.fqdn],
+  )
 }
 
 resource "aws_route53_record" "relay_alias" {
-  count = var.deploy_relay && var.relay_manage_dns_alias ? 1 : 0
+  count = var.deploy_relay && var.relay_manage_dns_alias && !local.relay_dns_cross_account ? 1 : 0
 
   zone_id = var.relay_route53_zone_id
   name    = var.relay_dns_name
@@ -194,8 +255,45 @@ resource "aws_route53_record" "relay_alias" {
 
     precondition {
       condition = (
-        var.relay_dns_name == trimsuffix(data.aws_route53_zone.relay_selected[0].name, ".") ||
-        endswith(var.relay_dns_name, ".${trimsuffix(data.aws_route53_zone.relay_selected[0].name, ".")}")
+        var.relay_dns_name == local.relay_zone_name ||
+        endswith(var.relay_dns_name, ".${local.relay_zone_name}")
+      )
+      error_message = "relay_dns_name must be the apex of, or a subdomain of, relay_route53_zone_id."
+    }
+  }
+
+  depends_on = [
+    terraform_data.relay_control_plane_preconditions,
+    time_sleep.relay_route53_record_change_iam_propagation,
+  ]
+}
+
+# Cross-account twin of relay_alias. No create_before_destroy, matching the
+# bootstrap-ALB cross-account record: CBD breaks for an RRSet name-keyed record.
+resource "aws_route53_record" "relay_alias_mgmt" {
+  count    = var.deploy_relay && var.relay_manage_dns_alias && local.relay_dns_cross_account ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.relay_route53_zone_id
+  name    = var.relay_dns_name
+  type    = "A"
+
+  alias {
+    name                   = one(module.relay[*].alb_dns_name)
+    zone_id                = one(module.relay[*].alb_zone_id)
+    evaluate_target_health = false
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.relay_route53_zone_id != ""
+      error_message = "relay_manage_dns_alias=true requires relay_route53_zone_id."
+    }
+
+    precondition {
+      condition = (
+        var.relay_dns_name == local.relay_zone_name ||
+        endswith(var.relay_dns_name, ".${local.relay_zone_name}")
       )
       error_message = "relay_dns_name must be the apex of, or a subdomain of, relay_route53_zone_id."
     }

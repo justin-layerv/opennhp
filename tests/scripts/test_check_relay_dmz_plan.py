@@ -7921,6 +7921,40 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
         self.assert_violation(plan, "legacy standalone")
 
+    def test_every_relay_root_route53_record_is_registered_durable(self) -> None:
+        """Every relay DNS record in the root must be in the durable registry.
+
+        test_durable_relay_resources_cannot_be_destroyed_or_replaced iterates
+        DURABLE_RELAY_RESOURCES, so it cannot notice a resource that was never
+        added — deleting an entry there just yields one fewer subtest and still
+        passes. This asserts the other direction: the registry is derived from
+        the Terraform, so a new relay route53 record (for instance a
+        cross-account twin) fails here until it is registered, rather than
+        silently becoming an unguarded participant the contract will reject at
+        plan time in whichever environment happens to instantiate it.
+        """
+        control_plane = (
+            REPO_ROOT / "terraform" / "relay_control_plane.tf"
+        ).read_text(encoding="utf-8")
+        declared = set(
+            re.findall(
+                r'resource\s+"aws_route53_record"\s+"([a-z0-9_]+)"', control_plane
+            )
+        )
+        self.assertTrue(declared, "no relay route53 records found in the root")
+
+        registered = {
+            name
+            for (resource_type, name) in checker.DURABLE_RELAY_RESOURCES
+            if resource_type == "aws_route53_record"
+        }
+        self.assertEqual(
+            declared - registered,
+            set(),
+            "relay route53 records declared in relay_control_plane.tf but absent "
+            "from DURABLE_RELAY_RESOURCES",
+        )
+
     def test_durable_relay_resources_cannot_be_destroyed_or_replaced(self) -> None:
         for index, ((resource_type, name), relative_parent) in enumerate(
             checker.DURABLE_RELAY_RESOURCES.items()

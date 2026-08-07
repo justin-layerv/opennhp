@@ -379,6 +379,15 @@ DURABLE_RELAY_RESOURCES = {
     ("aws_acm_certificate_validation", "relay"): DURABLE_RELAY_ROOT_PARENT,
     ("aws_route53_record", "relay_cert_validation"): DURABLE_RELAY_ROOT_PARENT,
     ("aws_route53_record", "relay_alias"): DURABLE_RELAY_ROOT_PARENT,
+    # Cross-account twins. Exactly one of each same-account/mgmt pair is ever
+    # instantiated — sandbox owns its zone directly, prod's lives in layerv-mgmt
+    # — but both must be registered, or the environment that uses the mgmt
+    # provider fails the contract as an unknown participant.
+    (
+        "aws_route53_record",
+        "relay_cert_validation_mgmt",
+    ): DURABLE_RELAY_ROOT_PARENT,
+    ("aws_route53_record", "relay_alias_mgmt"): DURABLE_RELAY_ROOT_PARENT,
     ("aws_ssm_parameter", "relay_image_tag"): DURABLE_RELAY_ROOT_PARENT,
     ("aws_ssm_parameter", "relay_asg_name"): DURABLE_RELAY_ROOT_PARENT,
     ("aws_s3_bucket", "alb_access_logs"): DURABLE_RELAY_FLEET_PARENT,
@@ -454,6 +463,7 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
         r"terraform_data\.relay_network_ready|"
         r"aws_cloudwatch_metric_alarm\.relay_dmz_dns_blocked|"
         r"aws_route53_record\.relay_alias|"
+        r"aws_route53_record\.relay_alias_mgmt|"
         r"aws_ssm_parameter\.relay_asg_name)(?:\[|$)"
     ),
     re.compile(

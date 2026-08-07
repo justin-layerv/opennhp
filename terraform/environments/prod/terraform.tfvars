@@ -39,7 +39,20 @@ ac_auth_service_id = "agent"
 ac_resource_ids = ["qurl", "qurl-tunnel-server"]
 ac_min_capacity = 3
 ac_max_capacity = 10
-ac_filter_mode  = 0
+# eBPF/XDP datapath (E5 flip). 1 = FilterMode_EBPFXDP, 0 = iptables.
+#
+# Applying this only updates the AC launch template — the datapath does not
+# change until the AC ASG is rolled, so the apply alone is a no-op at runtime
+# and the rollout MUST refresh the fleet. Two consequences that are easy to miss:
+#   * the Tier 1 AC eBPF object smoke stops being dormant and becomes a hard
+#     deploy-time check once any active AC reports FilterMode=EBPFXDP, so it
+#     must be invoked with allow_ssm_probes=true or it skips by policy and
+#     proves nothing;
+#   * v6 DENY telemetry changes shape (0-address DENYs, action tokens without
+#     the `6` suffix) — intended and v4-parity-justified, but it lands in
+#     CloudWatch only at this flip.
+# Rollback is symmetric: set 0 and roll the ASG again.
+ac_filter_mode = 1
 # L3 flush-on-expiry rollout levers (docs/runbooks/l3-flush-*.md). Off by
 # default via the module; the prod flip is the higher-stakes one, so drive it
 # from here — uncomment, enable with dry-run first, soak, then set
@@ -155,6 +168,52 @@ cloudmap_enabled          = true
 # zero/no datapoints across the 14-day burn-in and fresh-smoke windows.
 nhp_internal_auth_require = true
 
+# ── qURL v2 keyed identity — LIVE ──
+# The four gates flip together by contract, enforced at plan time by
+# terraform_data.qurl_v2_flag_invariants:
+#   issuance  -> requires admission (else minted links have no issuer in the
+#                NHP-server trust store and every knock denies)
+#   issuance  -> requires issuer_key + resource_keys
+#   admission -> requires issuer_key AND a non-empty issuer_kid (an empty kid
+#                renders the trust store as "{}" and denies every qv2 admission)
+#   issuance  -> requires a non-empty relay_url, embedded in signed claims
+#
+# The kid is environment-scoped on purpose. It is the trust-store key the NHP
+# server looks the issuer up by, so reusing the sandbox kid in prod would have
+# prod claims resolve against a key prod does not hold — ErrUnknownKID on every
+# admission. Rotating it later means re-minting: links already signed under the
+# old kid stop admitting once it leaves the trust store.
+qurl_v2_issuer_key_enabled            = true
+qurl_v2_resource_keys_enabled         = true
+qurl_v2_resource_key_software_default = true
+qurl_v2_issuance_enabled              = true
+qurl_v2_admission_enabled             = true
+qurl_v2_issuer_kid                    = "qurl-issuer-prod-2026-08"
+
+# relay_url is stamped into every signed claim and must be ON the allowlist, so
+# these two move together and both must match relay_dns_name below. A mismatch
+# mints links whose relay the issuer's own allowlist rejects.
+qurl_v2_relay_url       = "https://relay.layerv.ai"
+qurl_v2_relay_allowlist = "relay.layerv.ai"
+
+# ── qurl-scanner — deliberately still OFF, and it cannot join this apply ──
+# The scanner is a two-apply rollout per environment and prod has not had its
+# first apply: /layerv-nhp-prod/qurl-scanner-lambda-image-tag does not exist.
+# Terraform creates that parameter seeded "latest" with ignore_changes=[value]
+# and reads its CURRENT value through a plan-time data source, so enabling the
+# gate in the same apply that first creates it fails plan on ParameterNotFound —
+# and even if it resolved, "latest" is not a tag present in the prod repository.
+#
+# Sequence after this release lands:
+#   1. this apply creates the parameter (gate off) and the repo policy
+#   2. write the replicated image SHA to it — c13be39 is already present in the
+#      prod layerv/qurl-scanner-lambda repository (pushed 2026-08-05)
+#   3. a follow-up apply sets qurl_scanner_lambda_enabled = true, then
+#      sqs_emit, then tombstone_write, each after its own burn-in
+# qurl_scanner_lambda_enabled          = true
+# qurl_scanner_sqs_emit_enabled        = true
+# qurl_scanner_tombstone_write_enabled = true
+
 # qURL v2 immediate-revocation proof engine (#2793). ACK support is now in the
 # AC/server protocol; keep this enabled so NHP_REV retries until every targeted
 # AC slot ACKs or ages out to RevocationAgedOut.
@@ -221,10 +280,18 @@ deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link"
 qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone (in layerv-mgmt account)
 qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-account provider
-# Keep prod dark until the sandbox relay browser cutover is proven and a
-# dedicated prod-enable PR flips both the qurl.link client flow and this static
-# bundle/CSP switch together.
-qurl_link_js_agent_enabled = false
+# LIVE. qURL v2 links are minted on qurl.link (qurl_link_frontend_domain above),
+# so the browser opens https://qurl.link/#qv2.<claims>.<secret>.<sig>, verifies
+# the issuer signature locally against the shipped trust store, and knocks
+# through relay.layerv.ai. That flow does not exist without the js-agent, so
+# this flips together with qurl_v2_issuance_enabled below and deploy_relay.
+#
+# It also swaps the qurl.link CSP and cache policy: HTML and /nhp-agent.min.js
+# move to Cache-Control: no-cache and the rendered script integrity must match
+# the served bundle. After the fleet cutover, publish the regenerated
+# nhp-agent.min.js and its SRI immediately — the gap between fleet and bundle is
+# the browser outage window.
+qurl_link_js_agent_enabled = true
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true
@@ -420,11 +487,36 @@ bootstrap_alb_manage_dns_alias             = false                              
 bootstrap_alb_existing_certificate_arn     = "arn:aws:acm:us-east-2:235500187906:certificate/baf58cbf-b14d-454e-a13a-988a81594eb3" # bootstrap.layerv.ai, ISSUED (Step 0)
 bootstrap_alb_elb_5xx_threshold_per_minute = 1
 
-# ── NHP-Relay (#2208) — intentionally DARK in prod ──
-# deploy_relay stays false until the relay is validated end-to-end in sandbox
-# (5c registers it on the server + #6 migrates the page) and a dedicated
-# prod-enable PR flips it. Explicit here so the dark posture reads as deliberate.
-deploy_relay = false
+# ── NHP-Relay (#2208) — LIVE ──
+# The relay carries the browser qURL path (qurl.link js-agent) and is the
+# endpoint advertised to registering agents, so it goes live with this release.
+#
+# DNS is Terraform-managed through the cross-account layerv-mgmt provider, not
+# pre-provisioned out of band. `relay.layerv.ai` lives in the layerv.ai zone
+# (Z0748438C8EK6UAW94ST, layerv-mgmt 165115313779), which the default provider
+# cannot write — the same constraint every other prod DNS writer here already
+# handles. The relay root previously had no cross-account path at all, which is
+# why deploy_relay=true could not apply in prod before this release; the
+# `*_mgmt` twins in relay_control_plane.tf close that gap and engage
+# automatically because cross_account_route53_role_arn is set above.
+#
+# This differs deliberately from the bootstrap ALB's "Path 1" above, which
+# leaves its cert and A-alias operator-managed. Path 1 was a concession, not a
+# goal; the relay is the customer data path and its DNS stays in Terraform.
+#
+# relay_vpc_cidr MUST be set explicitly. Its default is 10.101.0.0/16 — the
+# SANDBOX relay block — and the relay DMZ is VPC-peered to the main VPC, so
+# inheriting a default here would bake a sandbox-shaped address plan into prod
+# and make any future prod<->sandbox or inter-region peering unroutable.
+# 10.201.0.0/16 keeps prod inside its own 10.2xx block: 10.200 main (live),
+# 10.201 relay (this), 10.202 Control. Audited against live prod on 2026-08-07 —
+# the only VPCs in the account are 10.200.0.0/16 and the 172.31.0.0/16 default.
+deploy_relay                = true
+relay_vpc_cidr              = "10.201.0.0/16"
+relay_dns_name              = "relay.layerv.ai"
+relay_route53_zone_id       = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account — written via aws.route53_mgmt)
+relay_provision_certificate = true
+relay_manage_dns_alias      = true
 
 # WAF go-live watch period (count-only). Unlike sandbox's dark launch, this PR
 # flips enable_qurl_agent_bootstrap=true simultaneously, so real customer agents
