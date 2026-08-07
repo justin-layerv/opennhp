@@ -8,6 +8,7 @@
     "source_sha256": "4221c9b816bcc6e1a104574f23afa8fcb24dd57f2e33abf38fe4aaf8779f4422",
     "workflow_terraform_version_files": [
       ".github/workflows/build-and-push.yml",
+      ".github/workflows/control-prod-update.yml",
       ".github/workflows/control-sandbox-update.yml",
       ".github/workflows/promote-to-prod.yml",
       ".github/workflows/qurl-agent-transact-iam.yml",

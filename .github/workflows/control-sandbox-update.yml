@@ -328,10 +328,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Prove exact sandbox apply identity
-        run: scripts/check-control-sandbox-aws-identity.sh "control-update-plan-${GITHUB_RUN_ID}"
+        run: scripts/check-control-aws-identity.sh sandbox "control-update-plan-${GITHUB_RUN_ID}"
 
       - name: Bind current versioned Control state
-        run: scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-before-plan"
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-before-plan"
 
       - name: Initialize sandbox Control state
         working-directory: ${{ env.CONTROL_ROOT }}
@@ -365,7 +365,7 @@ jobs:
       - name: Re-bind unchanged state after planning
         run: |
           set -euo pipefail
-          scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-after-plan"
+          scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-after-plan"
           cmp "$RUNNER_TEMP/control-state-before-plan/state-summary.json" \
             "$RUNNER_TEMP/control-state-after-plan/state-summary.json" || {
             echo '::error::Sandbox Control state changed while planning; discard this plan.'
@@ -393,7 +393,8 @@ jobs:
           [[ "$commit_sha" == "$GITHUB_SHA" ]] || { echo '::error::Checkout SHA drifted.'; exit 1; }
           plan_sha256="$(sha256sum tfplan | awk '{print $1}')"
           planned_at_epoch="$(date -u +%s)"
-          ../../../../.github/scripts/check-control-sandbox-update.py artifact-create \
+          ../../../../.github/scripts/check-control-update.py artifact-create \
+            --environment sandbox \
             --plan tfplan \
             --plan-text tfplan.txt \
             --contract-summary plan-contract-summary.json \
@@ -542,7 +543,8 @@ jobs:
           source_attempt="$(jq -er '.run_attempt' "$artifact/plan-metadata.json")"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_PLAN_RUN_ID" \
             >"$RUNNER_TEMP/source-plan-run.json"
-          .github/scripts/check-control-sandbox-update.py source-run \
+          .github/scripts/check-control-update.py source-run \
+            --environment sandbox \
             "$RUNNER_TEMP/source-plan-run.json" \
             --run-id "$SOURCE_PLAN_RUN_ID" \
             --run-attempt "$source_attempt" \
@@ -552,7 +554,8 @@ jobs:
           # The source-run check above already validated this JSON is the exact
           # source plan run before we trust its start time.
           run_started_at="$(jq -er '.run_started_at' "$RUNNER_TEMP/source-plan-run.json")"
-          .github/scripts/check-control-sandbox-update.py artifact-verify \
+          .github/scripts/check-control-update.py artifact-verify \
+            --environment sandbox \
             --plan "$artifact/tfplan" \
             --plan-text "$artifact/tfplan.txt" \
             --contract-summary "$artifact/plan-contract-summary.json" \
@@ -648,12 +651,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Prove exact sandbox apply identity
-        run: scripts/check-control-sandbox-aws-identity.sh "control-update-apply-${GITHUB_RUN_ID}"
+        run: scripts/check-control-aws-identity.sh sandbox "control-update-apply-${GITHUB_RUN_ID}"
 
       - name: Re-prove exact planned state before initialization
         run: |
           set -euo pipefail
-          scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-before-apply"
+          scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-before-apply"
           cmp "$RUNNER_TEMP/control-plan-artifact/planned-state-summary.json" \
             "$RUNNER_TEMP/control-state-before-apply/state-summary.json" || {
             echo '::error::Sandbox Control state moved after planning; dispatch a fresh plan.'
@@ -867,7 +870,7 @@ jobs:
         run: |
           set -euo pipefail
           ../../../../scripts/check-no-checkout-credentials.sh
-          ../../../../scripts/capture-control-sandbox-update-state.sh \
+          ../../../../scripts/capture-control-update-state.sh sandbox \
             "$RUNNER_TEMP/control-state-immediately-before-apply"
           cmp "$RUNNER_TEMP/control-plan-artifact/planned-state-summary.json" \
             "$RUNNER_TEMP/control-state-immediately-before-apply/state-summary.json" || {
@@ -881,7 +884,7 @@ jobs:
         id: partial-state
         if: failure() && steps.apply.outcome == 'failure'
         continue-on-error: true
-        run: scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-partial-apply-state"
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-partial-apply-state"
 
       - name: Upload sanitized partial-apply state identity
         if: failure() && steps.apply.outcome == 'failure' && steps.partial-state.outcome == 'success'
@@ -904,7 +907,7 @@ jobs:
       - name: Capture post-apply state identity
         id: post-state
         if: success()
-        run: scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-after-apply"
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-after-apply"
 
       - name: Upload sanitized post-apply state identity
         if: steps.post-state.outcome == 'success'
@@ -1051,10 +1054,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Prove exact sandbox apply identity
-        run: scripts/check-control-sandbox-aws-identity.sh "control-update-verify-${GITHUB_RUN_ID}"
+        run: scripts/check-control-aws-identity.sh sandbox "control-update-verify-${GITHUB_RUN_ID}"
 
       - name: Bind state before verification
-        run: scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-before-verify"
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-before-verify"
 
       - name: Initialize sandbox Control state
         working-directory: ${{ env.CONTROL_ROOT }}
@@ -1080,7 +1083,7 @@ jobs:
       - name: Re-bind unchanged state after verification
         run: |
           set -euo pipefail
-          scripts/capture-control-sandbox-update-state.sh "$RUNNER_TEMP/control-state-after-verify"
+          scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-after-verify"
           cmp "$RUNNER_TEMP/control-state-before-verify/state-summary.json" \
             "$RUNNER_TEMP/control-state-after-verify/state-summary.json" || {
             echo '::error::Sandbox Control state changed during no-op verification.'

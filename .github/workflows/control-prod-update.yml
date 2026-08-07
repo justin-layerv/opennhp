@@ -1,0 +1,424 @@
+name: Control Prod Update
+
+# Production Control apply path. It deliberately follows the SERVICE pipeline
+# model used by promote-to-prod.yml rather than the three-dispatch model
+# control-sandbox-update.yml uses:
+#
+#   one dispatch -> plan runs automatically and renders the diff
+#                -> apply waits on the `production` environment approval
+#                -> verify proves the applied root refreshes to a no-op
+#
+# The saved plan therefore never leaves the run. control-sandbox-update.yml has
+# the operator hand-carry a plan digest, commit, and state version between three
+# separate dispatches because sandbox has no approval gate to hold a run open;
+# production does, so the artifact is passed inside the run and the same
+# guarantees are enforced by re-rendering and byte-comparing before apply. That
+# removes a whole class of transcription error from the highest-risk apply we
+# run.
+#
+# Scope: the Control FOUNDATION and the Hub edge/worker gates. The Authority
+# runtime contract cannot be produced here yet — its generator must pin real
+# production resource identities (the QAT1 KMS key ARN, the Redis serverless
+# endpoint hostname) that do not exist until this workflow's first apply creates
+# them. The runtime step therefore fails closed with an explicit message rather
+# than emitting a contract against sandbox identities.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'plan-and-apply runs the full gated sequence; plan-only renders the diff and stops; verify re-proves convergence on the applied root'
+        required: true
+        type: choice
+        options:
+          - plan-and-apply
+          - plan-only
+          - verify
+      hub_edge_enabled:
+        description: 'Hub public UDP edge gate. Production ships the Hub, so this is normally true; false plans the foundation alone.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+      hub_worker_enabled:
+        description: 'Hub Fargate worker gate. Requires hub_edge_enabled=true AND a live Authority runtime, which is not yet producible in production (see the header).'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+      confirmation:
+        description: 'Exact confirmation string for the selected operation'
+        required: true
+        default: PLAN_PROD_CONTROL_UPDATE
+        type: string
+
+# Production Control shares this lock with nothing else today, but it is named
+# for the estate rather than the workflow so a future production Control writer
+# cannot run concurrently with this one against the same state.
+concurrency:
+  group: deploy-prod-control
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.14.3'
+  CONTROL_ROOT: terraform/control/environments/prod
+  PLAN_ARTIFACT: control-prod-update-plan
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Require main and exact operation contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Check dispatch boundary
+        env:
+          OPERATION: ${{ inputs.operation }}
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+          HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo '::error::Production Control updates run only from refs/heads/main.'
+            exit 1
+          fi
+
+          # The Hub worker consumes the Authority runtime, which production
+          # cannot yet produce. Fail here with the reason rather than emitting a
+          # contract built from sandbox identities.
+          if [[ "$HUB_WORKER_ENABLED" == 'true' ]]; then
+            echo '::error::The production Hub worker requires a live Authority runtime contract, which cannot be generated until the production Control foundation exists and its QAT1 key and Redis endpoint can be pinned. Apply the foundation first.'
+            exit 1
+          fi
+          if [[ "$HUB_WORKER_ENABLED" == 'true' && "$HUB_EDGE_ENABLED" != 'true' ]]; then
+            echo '::error::The Hub worker requires the Hub public edge.'
+            exit 1
+          fi
+
+          case "$OPERATION" in
+            plan-and-apply)
+              [[ "$CONFIRMATION" == 'APPLY_PROD_CONTROL_UPDATE' ]] || {
+                echo '::error::plan-and-apply confirmation must be exactly APPLY_PROD_CONTROL_UPDATE.'
+                exit 1
+              }
+              # A rerun would re-plan against state the first attempt may have
+              # already advanced, then apply it behind an approval the reviewer
+              # granted for a different diff.
+              [[ "$GITHUB_RUN_ATTEMPT" == '1' ]] || {
+                echo '::error::Apply reruns are forbidden; dispatch a fresh run so a reviewed plan cannot be replayed against advanced state.'
+                exit 1
+              }
+              ;;
+            plan-only)
+              [[ "$CONFIRMATION" == 'PLAN_PROD_CONTROL_UPDATE' ]] || {
+                echo '::error::plan-only confirmation must be exactly PLAN_PROD_CONTROL_UPDATE.'
+                exit 1
+              }
+              ;;
+            verify)
+              [[ "$CONFIRMATION" == 'VERIFY_PROD_CONTROL' ]] || {
+                echo '::error::verify confirmation must be exactly VERIFY_PROD_CONTROL.'
+                exit 1
+              }
+              ;;
+            *)
+              echo '::error::Unknown operation.'
+              exit 1
+              ;;
+          esac
+
+  plan:
+    name: Plan (prod Control)
+    if: inputs.operation == 'plan-and-apply' || inputs.operation == 'plan-only'
+    needs: guard
+    runs-on: ubuntu-latest
+    # Approval before ANY production credential is issued, matching
+    # promote-to-prod.yml: its terraform-plan job carries no environment of its
+    # own but runs `needs: [manifest, preflight]`, and preflight is
+    # `environment: production`. So no prod role is assumed there without an
+    # approval either. Planning is not read-only in the sense that matters — the
+    # role can read prod SSM SecureStrings, Secrets Manager values, and
+    # KMS-decrypted material during refresh. Gating only the apply would let any
+    # main-branch dispatcher reach all of that unreviewed.
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
+
+      - name: Configure prod apply role for live planning
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          role-session-name: control-prod-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove exact prod apply identity
+        run: scripts/check-control-aws-identity.sh prod "control-prod-plan-${GITHUB_RUN_ID}"
+
+      - name: Bind current versioned Control state
+        # The production Control state does not exist before the first apply.
+        # A first apply is the one legitimate case where there is nothing to
+        # bind, so record that explicitly rather than skipping the capture on
+        # any error.
+        run: |
+          set -euo pipefail
+          if aws s3api head-object \
+            --bucket "layerv-terraform-state-235500187906" \
+            --key "nhp/prod/control/terraform.tfstate" >/dev/null 2>&1; then
+            scripts/capture-control-update-state.sh prod "$RUNNER_TEMP/control-state-before-plan"
+            echo 'first_apply=false' >>"$GITHUB_ENV"
+          else
+            echo '::notice::No production Control state object exists; planning a first apply.'
+            echo 'first_apply=true' >>"$GITHUB_ENV"
+          fi
+
+      - name: Initialize prod Control state
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Build saved plan
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -lock-timeout=5m \
+            -var "hub_edge_enabled=${HUB_EDGE_ENABLED}" \
+            -out "$RUNNER_TEMP/tfplan"
+          terraform show -json "$RUNNER_TEMP/tfplan" >"$RUNNER_TEMP/tfplan.json"
+          terraform show -no-color "$RUNNER_TEMP/tfplan" >"$RUNNER_TEMP/tfplan.txt"
+
+      - name: Check the plan against the Authority foundation contract
+        run: scripts/check-connector-authority-foundation.sh "$RUNNER_TEMP/tfplan.json"
+
+      - name: Render the diff into the run summary
+        run: |
+          {
+            echo '## Production Control plan'
+            echo
+            echo '```terraform'
+            head -c 60000 "$RUNNER_TEMP/tfplan.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Bind the plan digest
+        run: |
+          set -euo pipefail
+          sha256sum "$RUNNER_TEMP/tfplan" | awk '{print $1}' >"$RUNNER_TEMP/plan.sha256"
+          echo "Plan digest: $(cat "$RUNNER_TEMP/plan.sha256")"
+
+      - name: Upload saved plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v5
+        with:
+          name: ${{ env.PLAN_ARTIFACT }}
+          path: |
+            ${{ runner.temp }}/tfplan
+            ${{ runner.temp }}/tfplan.json
+            ${{ runner.temp }}/tfplan.txt
+            ${{ runner.temp }}/plan.sha256
+          retention-days: 5
+          if-no-files-found: error
+
+  apply:
+    name: Apply (prod Control)
+    if: inputs.operation == 'plan-and-apply'
+    needs: [guard, plan]
+    runs-on: ubuntu-latest
+    # The approval gate. Same environment promote-to-prod.yml uses for its own
+    # terraform-apply, so production Control inherits the existing reviewer set
+    # rather than declaring a parallel one.
+    environment: production
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Download saved plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6
+        with:
+          name: ${{ env.PLAN_ARTIFACT }}
+          path: ${{ runner.temp }}/plan-artifact
+
+      - name: Verify the saved plan is byte-identical to the reviewed one
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/plan-artifact"
+          actual="$(sha256sum "$artifact/tfplan" | awk '{print $1}')"
+          expected="$(cat "$artifact/plan.sha256")"
+          [[ "$actual" == "$expected" ]] || {
+            echo "::error::Saved plan digest does not match the reviewed plan ($actual != $expected)."
+            exit 1
+          }
+
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
+
+      - name: Configure prod apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          role-session-name: control-prod-apply-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove exact prod apply identity
+        run: scripts/check-control-aws-identity.sh prod "control-prod-apply-${GITHUB_RUN_ID}"
+
+      - name: Initialize prod Control state
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Re-render and re-check the saved plan
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/plan-artifact"
+          # Re-render from the saved binary plan against current state. A plan
+          # that no longer shows the reviewed shape is stale; approving the diff
+          # does not authorize whatever it became.
+          terraform show -json "$artifact/tfplan" >"$RUNNER_TEMP/apply-tfplan.json"
+          cmp "$artifact/tfplan.json" "$RUNNER_TEMP/apply-tfplan.json" || {
+            echo '::error::Saved plan no longer renders to the reviewed JSON; state advanced. Dispatch a fresh run.'
+            exit 1
+          }
+          ../../../../scripts/check-connector-authority-foundation.sh \
+            "$RUNNER_TEMP/apply-tfplan.json"
+
+      - name: Apply the exact reviewed plan
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: terraform apply -input=false -lock-timeout=5m "$RUNNER_TEMP/plan-artifact/tfplan"
+
+      - name: Prove the applied root refreshes to a no-op
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -lock-timeout=5m -detailed-exitcode \
+            -var "hub_edge_enabled=${HUB_EDGE_ENABLED}" && rc=0 || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::Production Control does not refresh to a no-op after apply (exit ${rc}); investigate before treating the boundary as converged."
+            exit 1
+          fi
+
+  verify:
+    name: Verify converged prod Control boundary
+    if: inputs.operation == 'verify'
+    needs: guard
+    runs-on: ubuntu-latest
+    # Same reason as the plan job: verify refreshes state with the prod role and
+    # can therefore read prod secret material. Every job that touches a
+    # production credential is approval-gated; only `guard` runs unapproved, and
+    # it holds no credentials at all (`permissions: {}`).
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
+
+      - name: Configure prod apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          role-session-name: control-prod-verify-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove exact prod apply identity
+        run: scripts/check-control-aws-identity.sh prod "control-prod-verify-${GITHUB_RUN_ID}"
+
+      - name: Bind current versioned Control state
+        run: scripts/capture-control-update-state.sh prod "$RUNNER_TEMP/control-state-verify"
+
+      - name: Require a refresh-enabled no-op
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+          terraform plan -input=false -lock-timeout=5m -detailed-exitcode \
+            -var "hub_edge_enabled=${HUB_EDGE_ENABLED}" && rc=0 || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::Production Control is not converged (exit ${rc})."
+            exit 1
+          fi

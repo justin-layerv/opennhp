@@ -4197,7 +4197,15 @@ def authority_enablement_refresh_candidate() -> tuple[dict, dict]:
 
 
 class PlanContractTests(unittest.TestCase):
-    def test_prod_catalog_remains_hard_locked_empty(self) -> None:
+    def test_prod_catalog_is_pinned_to_the_reviewed_row(self) -> None:
+        """Production ships one cell, and its identity is review-pinned.
+
+        The catalog is no longer locked empty — production runs the Authority,
+        so it carries a live row. What must not drift is the row's *content*:
+        the endpoint identity is pinned from live production readback, and a
+        dispatch cannot substitute a different host, port, or server key
+        without editing this validation under review.
+        """
         variables = PROD_CONTROL_VARIABLES_PATH.read_text(encoding="utf-8")
         start = variables.index('variable "provisioned_cells" {')
         end = variables.index(
@@ -4205,16 +4213,49 @@ class PlanContractTests(unittest.TestCase):
             start,
         )
         catalog_block = variables[start:end]
-        self.assertIn("default = {}", catalog_block)
+
+        # Exactly one cell, and it must take general placement: production has
+        # no second cell to fall back to, so a non-assignable cell0 would
+        # strand every weight-placed agent.
+        self.assertIn("cell_id               = \"cell0\"", catalog_block)
+        self.assertNotIn("cell1", catalog_block)
+        self.assertIn("general_assignable    = true", catalog_block)
+        self.assertIn("status                = \"active\"", catalog_block)
+
+        # Endpoint identity pinned from live production readback. Port 443 is
+        # the post-#3649 client edge; a row advertising it against a 62206
+        # listener places agents on a dead port.
+        self.assertIn("nhp_host              = \"cell0.nhp.layerv.ai\"", catalog_block)
+        self.assertIn("nhp_port              = 443", catalog_block)
+
+        # The validation must pin the whole row by value, not merely constrain
+        # its shape, so any endpoint or lifecycle revision is a reviewed edit.
         self.assertIn(
-            "condition     = length(var.provisioned_cells) == 0",
+            "condition = jsonencode(var.provisioned_cells) == jsonencode({",
             catalog_block,
         )
-        self.assertIn(
-            "Production provisioned_cells must remain empty throughout "
-            "sandbox proof.",
-            catalog_block,
-        )
+
+    def test_prod_runtime_gates_default_closed(self) -> None:
+        """A plan that does not explicitly open production must stay dark.
+
+        Production Control accepts a real runtime contract now, so the
+        protection is no longer a validation that rejects every non-null value.
+        It is that each gate DEFAULTS closed: only the reviewed production
+        dispatch supplies the open value, and an unreviewed or accidental plan
+        creates no functions and no public listener.
+        """
+        variables = PROD_CONTROL_VARIABLES_PATH.read_text(encoding="utf-8")
+        for name, expected_default in (
+            ("authority_runtime_contract", "default     = null"),
+            ("authority_runtime_contract_evidence_verified", "default     = false"),
+            ("authority_runtime_functions_enabled", "default     = false"),
+            ("hub_edge_enabled", "default     = false"),
+            ("hub_worker_enabled", "default     = false"),
+        ):
+            with self.subTest(variable=name):
+                start = variables.index(f'variable "{name}" {{')
+                end = variables.index("\n}\n", start)
+                self.assertIn(expected_default, variables[start:end])
 
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(

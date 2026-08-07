@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chain-of-custody checks for reusable sandbox Control updates."""
+"""Chain-of-custody checks for reusable Control updates (sandbox and prod)."""
 
 from __future__ import annotations
 
@@ -14,17 +14,47 @@ from pathlib import Path
 from typing import Any
 
 
-ACCOUNT_ID = "767397897469"
 REPOSITORY = "layervai/nhp"
-WORKFLOW_NAME = "Control Sandbox Update"
-WORKFLOW_PATH = ".github/workflows/control-sandbox-update.yml"
 TF_VERSION = "1.14.3"
-STATE_BUCKET = f"layerv-terraform-state-{ACCOUNT_ID}"
-STATE_KEY = "nhp/sandbox/control/terraform.tfstate"
-STATE_KMS_KEY_ARN = (
-    "arn:aws:kms:us-east-2:767397897469:key/"
-    "289dbe35-ab5a-4752-8564-4c96c607c9f4"
-)
+
+# Per-environment identity. Every value here is a boundary: an environment that
+# silently inherited another's account, bucket, or state key would validate a
+# capture of the wrong estate and pass. Selection is by explicit --environment
+# with no default, so a caller that forgets it fails rather than guessing.
+CONTROL_ENVIRONMENTS = {
+    "sandbox": {
+        "account_id": "767397897469",
+        "workflow_name": "Control Sandbox Update",
+        "workflow_path": ".github/workflows/control-sandbox-update.yml",
+        "state_key": "nhp/sandbox/control/terraform.tfstate",
+        "state_kms_key_arn": (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "289dbe35-ab5a-4752-8564-4c96c607c9f4"
+        ),
+    },
+    "prod": {
+        "account_id": "235500187906",
+        "workflow_name": "Control Prod Update",
+        "workflow_path": ".github/workflows/control-prod-update.yml",
+        "state_key": "nhp/prod/control/terraform.tfstate",
+        "state_kms_key_arn": (
+            "arn:aws:kms:us-east-2:235500187906:key/"
+            "00a0e673-cef4-41f0-bfc0-5116a9ab3aa0"
+        ),
+    },
+}
+
+
+def environment_profile(name: str) -> dict[str, str]:
+    profile = CONTROL_ENVIRONMENTS.get(name)
+    if profile is None:
+        raise ContractError(f"unknown Control environment: {name}")
+    return {
+        **profile,
+        "state_bucket": f"layerv-terraform-state-{profile['account_id']}",
+    }
+
+
 PLAN_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
 STATE_SUMMARY_KEYS = {
     "account_id",
@@ -124,13 +154,13 @@ def _parse_iso8601_utc(value: object, label: str) -> int:
     return int(parsed.timestamp())
 
 
-def validate_state_summary(summary: Any) -> dict[str, Any]:
+def validate_state_summary(summary: Any, profile: dict[str, str]) -> dict[str, Any]:
     if not isinstance(summary, dict) or set(summary) != STATE_SUMMARY_KEYS:
         raise ContractError("state summary keys are not exact")
     if (
-        summary["account_id"] != ACCOUNT_ID
-        or summary["bucket"] != STATE_BUCKET
-        or summary["kms_key_arn"] != STATE_KMS_KEY_ARN
+        summary["account_id"] != profile["account_id"]
+        or summary["bucket"] != profile["state_bucket"]
+        or summary["kms_key_arn"] != profile["state_kms_key_arn"]
         or summary["terraform_version"] != TF_VERSION
         or summary["state_format_version"] != 4
     ):
@@ -153,7 +183,9 @@ def validate_state_summary(summary: Any) -> dict[str, Any]:
     return summary
 
 
-def check_state(state_path: Path, head_path: Path) -> dict[str, Any]:
+def check_state(
+    state_path: Path, head_path: Path, profile: dict[str, str]
+) -> dict[str, Any]:
     state = load_json(state_path)
     head = load_json(head_path)
     if not isinstance(state, dict) or not isinstance(head, dict):
@@ -168,7 +200,7 @@ def check_state(state_path: Path, head_path: Path) -> dict[str, Any]:
         raise ContractError("Terraform state header is not exact")
     if (
         head.get("ServerSideEncryption") != "aws:kms"
-        or head.get("SSEKMSKeyId") != STATE_KMS_KEY_ARN
+        or head.get("SSEKMSKeyId") != profile["state_kms_key_arn"]
         or not isinstance(head.get("ContentLength"), int)
         or head["ContentLength"] <= 0
         or not isinstance(head.get("VersionId"), str)
@@ -183,25 +215,29 @@ def check_state(state_path: Path, head_path: Path) -> dict[str, Any]:
         raise ContractError("downloaded state length does not match S3 head")
     return validate_state_summary(
         {
-            "account_id": ACCOUNT_ID,
-            "bucket": STATE_BUCKET,
+            "account_id": profile["account_id"],
+            "bucket": profile["state_bucket"],
             "content_length": actual_length,
             "etag": head["ETag"],
-            "kms_key_arn": STATE_KMS_KEY_ARN,
+            "kms_key_arn": profile["state_kms_key_arn"],
             "lineage": state["lineage"],
             "serial": state["serial"],
             "sha256": sha256_file(state_path),
             "state_format_version": 4,
             "terraform_version": TF_VERSION,
             "version_id": head["VersionId"],
-        }
+        },
+        profile,
     )
 
 
 def _validate_static_identity(args: argparse.Namespace) -> None:
     if args.repository != REPOSITORY or args.terraform_version != TF_VERSION:
         raise ContractError("artifact repository or Terraform version is wrong")
-    expected_workflow_ref = f"{REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main"
+    profile = environment_profile(args.environment)
+    expected_workflow_ref = (
+        f"{REPOSITORY}/{profile['workflow_path']}@refs/heads/main"
+    )
     if args.workflow_ref != expected_workflow_ref:
         raise ContractError("artifact workflow_ref is not exact main workflow")
     _require_hex(args.commit_sha, 40, "commit_sha")
@@ -214,7 +250,9 @@ def _artifact_values(
     args: argparse.Namespace, planned_at_epoch: int
 ) -> dict[str, Any]:
     _validate_static_identity(args)
-    state = validate_state_summary(load_json(args.state_summary))
+    state = validate_state_summary(
+        load_json(args.state_summary), environment_profile(args.environment)
+    )
     contract_summary = load_json(args.contract_summary)
     if not isinstance(contract_summary, dict) or not contract_summary:
         raise ContractError("Control plan contract summary is malformed")
@@ -222,7 +260,7 @@ def _artifact_values(
     if plan_digest != args.plan_sha256:
         raise ContractError("saved plan digest does not match supplied digest")
     return {
-        "account_id": ACCOUNT_ID,
+        "account_id": environment_profile(args.environment)["account_id"],
         "commit_sha": args.commit_sha,
         "contract_checker_sha256": sha256_file(args.contract_checker),
         "contract_summary_sha256": sha256_file(args.contract_summary),
@@ -237,7 +275,11 @@ def _artifact_values(
         "state": state,
         "state_summary_sha256": sha256_file(args.state_summary),
         "terraform_version": TF_VERSION,
-        "workflow_ref": f"{REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main",
+        "workflow_ref": (
+            f"{REPOSITORY}/"
+            f"{environment_profile(args.environment)['workflow_path']}"
+            "@refs/heads/main"
+        ),
     }
 
 
@@ -297,6 +339,7 @@ def verify_artifact(args: argparse.Namespace) -> dict[str, Any]:
 
 def check_source_run(args: argparse.Namespace) -> dict[str, Any]:
     run = load_json(args.run_json)
+    profile = environment_profile(args.environment)
     expected = {
         "id": _require_positive_int(args.run_id, "run_id"),
         "run_attempt": _require_positive_int(args.run_attempt, "run_attempt"),
@@ -305,8 +348,8 @@ def check_source_run(args: argparse.Namespace) -> dict[str, Any]:
         "conclusion": "success",
         "head_branch": "main",
         "head_sha": args.commit_sha,
-        "name": WORKFLOW_NAME,
-        "path": WORKFLOW_PATH,
+        "name": profile["workflow_name"],
+        "path": profile["workflow_path"],
     }
     _require_hex(args.commit_sha, 40, "commit_sha")
     if not isinstance(run, dict):
@@ -343,16 +386,29 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_environment(sub_parser: argparse.ArgumentParser) -> None:
+        # Required with no default: an omitted environment must fail rather than
+        # silently validate one estate's capture against another's identity.
+        sub_parser.add_argument(
+            "--environment",
+            required=True,
+            choices=sorted(CONTROL_ENVIRONMENTS),
+        )
+
+
     state = sub.add_parser("state")
+    add_environment(state)
     state.add_argument("state_json", type=Path)
     state.add_argument("state_head_json", type=Path)
 
     create = sub.add_parser("artifact-create")
+    add_environment(create)
     _add_artifact_arguments(create)
     create.add_argument("--planned-at-epoch", required=True)
     create.add_argument("--output", type=Path, required=True)
 
     verify = sub.add_parser("artifact-verify")
+    add_environment(verify)
     _add_artifact_arguments(verify)
     verify.add_argument("--metadata", type=Path, required=True)
     verify.add_argument("--state-version-id", required=True)
@@ -362,6 +418,7 @@ def main() -> int:
     verify.add_argument("--now-epoch", type=int)
 
     source = sub.add_parser("source-run")
+    add_environment(source)
     source.add_argument("run_json", type=Path)
     source.add_argument("--run-id", required=True)
     source.add_argument("--run-attempt", required=True)
@@ -370,7 +427,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "state":
-            result = check_state(args.state_json, args.state_head_json)
+            result = check_state(
+                args.state_json,
+                args.state_head_json,
+                environment_profile(args.environment),
+            )
         elif args.command == "artifact-create":
             result = create_artifact(args)
         elif args.command == "artifact-verify":

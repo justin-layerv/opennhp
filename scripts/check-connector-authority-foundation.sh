@@ -579,13 +579,14 @@ if ! cmp -s "$sandbox_wrapper" "$prod_wrapper"; then
   exit 1
 fi
 
-# The Authority-first holdback is complete, so this source guard now pins the
-# true-only sandbox latch the rollout ledger described: sandbox must hard-lock
-# materialization TRUE (removing a live catalog row is a drain/migrate
-# procedure, not an input flip), while production keeps its unchanged
-# hard-locked FALSE until a separately reviewed production cell inventory
-# exists. Either way exactly one default and one condition must be present and
-# agree on the environment's pinned polarity; a mismatch fails closed.
+# Both roots now hard-lock materialization TRUE: removing a live catalog row is
+# a drain/migrate procedure, not an input flip. Production reached that polarity
+# once it gained the "separately reviewed production cell inventory" this guard
+# previously waited on — the review-pinned cell0 row in
+# environments/prod/variables.tf, whose endpoint identity comes from live
+# production readback. Either way exactly one default and one condition must be
+# present and agree on the environment's pinned polarity; a mismatch fails
+# closed.
 require_catalog_materialization_latch() {
   local variables_file="$1"
   local environment="$2"
@@ -665,13 +666,10 @@ for environment in sandbox prod; do
     echo "ERROR: ${environment} Control wrapper must pass the provisioned-cell materialization gate exactly once from its root variable" >&2
     exit 1
   fi
-  # Sandbox owns the two reviewed rows after the restoration; production keeps
-  # provisioned_cells={} and stays dark until its own reviewed cell inventory.
-  if [[ "$environment" == 'sandbox' ]]; then
-    expected_catalog_latch='true'
-  else
-    expected_catalog_latch='false'
-  fi
+  # Sandbox owns the two reviewed rows after the restoration; production owns
+  # the single review-pinned cell0 row. Both catalogs are live, so both latch
+  # materialization on.
+  expected_catalog_latch='true'
   require_catalog_materialization_latch \
     "${environment_root}/variables.tf" "$environment" "$expected_catalog_latch"
   # Reject any COMMITTED tfvars in the Control root (a committed *.auto.tfvars /
@@ -693,11 +691,41 @@ for environment in sandbox prod; do
 done
 
 prod_variables="${control_dir}/environments/prod/variables.tf"
-for required in \
-  'Production Authority runtime contract must remain null throughout sandbox measurement.' \
-  'Production Authority evidence latch must remain false throughout sandbox measurement.'; do
-  if ! grep -Fq "$required" "$prod_variables"; then
-    echo "ERROR: production Control variables must fail closed: ${required}" >&2
+# Production Control no longer hard-locks these variables closed — production
+# ships the Authority runtime, so the root must be able to accept a real
+# contract. The fail-closed property that matters is unchanged and is now
+# asserted directly: every gate that would create or arm runtime state must
+# DEFAULT closed, so a plan that does not explicitly supply it through the
+# reviewed production dispatch can never assert one. Checking the defaults is
+# strictly stronger than the error-string grep it replaces, which only proved a
+# validation block was present.
+for gate in \
+  'authority_runtime_contract:null' \
+  'authority_runtime_contract_evidence_verified:false' \
+  'authority_runtime_functions_enabled:false' \
+  'hub_edge_enabled:false' \
+  'hub_worker_enabled:false'; do
+  gate_name="${gate%%:*}"
+  gate_default="${gate#*:}"
+  # Match the block whether the variable opens inline (`variable "x" { ... }`)
+  # or across lines, and accept any interior whitespace: `terraform fmt` aligns
+  # `default` into a column, so a fixed-string compare would bind this contract
+  # to one particular alignment.
+  block="$(
+    awk -v name="$gate_name" '
+      $0 ~ "^[[:space:]]*variable[[:space:]]+\"" name "\"[[:space:]]*\\{" { inside = 1 }
+      inside { print }
+      inside && $0 ~ "^\\}[[:space:]]*$" { exit }
+      inside && $0 ~ "\\}[[:space:]]*$" && $0 ~ "\\{" { exit }
+    ' "$prod_variables"
+  )"
+  if [[ -z "$block" ]]; then
+    echo "ERROR: production Control variables must declare ${gate_name}" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$block" |
+    grep -Eq "^[[:space:]]*default[[:space:]]*=[[:space:]]*${gate_default}[[:space:]]*\$|[[:space:]]default[[:space:]]*=[[:space:]]*${gate_default}[[:space:]]*\\}"; then
+    echo "ERROR: production Control gate ${gate_name} must fail closed with 'default = ${gate_default}'; a reviewed production dispatch supplies the open value, never the committed default" >&2
     exit 1
   fi
 done

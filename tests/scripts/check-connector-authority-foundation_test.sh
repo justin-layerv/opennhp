@@ -60,18 +60,15 @@ write_clean_fixture() {
     '}' \
     >"${control_dir}/environments/sandbox/variables.tf"
   printf '%s\n' \
-    'variable "authority_runtime_contract" {' \
-    '  default = null' \
-    '  validation { error_message = "Production Authority runtime contract must remain null throughout sandbox measurement." }' \
-    '}' \
-    'variable "authority_runtime_contract_evidence_verified" {' \
-    '  default = false' \
-    '  validation { error_message = "Production Authority evidence latch must remain false throughout sandbox measurement." }' \
-    '}' \
+    'variable "authority_runtime_contract" { default = null }' \
+    'variable "authority_runtime_contract_evidence_verified" { default = false }' \
+    'variable "authority_runtime_functions_enabled" { default = false }' \
+    'variable "hub_edge_enabled" { default = false }' \
+    'variable "hub_worker_enabled" { default = false }' \
     'variable "provisioned_cell_catalog_materialization_enabled" {' \
-    '  default = false' \
+    '  default = true' \
     '  validation {' \
-    '    condition = !var.provisioned_cell_catalog_materialization_enabled' \
+    '    condition = var.provisioned_cell_catalog_materialization_enabled' \
     '  }' \
     '}' >"${control_dir}/environments/prod/variables.tf"
   printf '%s\n' \
@@ -690,15 +687,12 @@ expect_failure 'sandbox Control variables must declare exactly one closed provis
 # Flipping either half of either latch -- including flipping one environment to
 # the OTHER environment's pinned polarity -- must fail closed.
 for environment in sandbox prod; do
-  if [[ "$environment" == 'sandbox' ]]; then
-    expected='true'
-    wrong='false'
-    condition_flip='s/condition = var\./condition = !var./'
-  else
-    expected='false'
-    wrong='true'
-    condition_flip='s/condition = !var\./condition = var./'
-  fi
+  # Both roots now latch materialization TRUE: sandbox owns its two reviewed
+  # rows, production owns the review-pinned cell0 row. Removing a live catalog
+  # row is a drain/migrate procedure, not an input flip, in either environment.
+  expected='true'
+  wrong='false'
+  condition_flip='s/condition = var\./condition = !var./'
 
   write_clean_fixture
   sed -i.bak \
@@ -740,11 +734,37 @@ write_clean_fixture
 printf '%s\n' '{}' >"${control_dir}/environments/sandbox/evil.tfvars.json"
 expect_failure 'must not commit runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
-write_clean_fixture
-sed -i.bak '/Production Authority evidence latch must remain false/d' \
-  "${control_dir}/environments/prod/variables.tf"
-rm "${control_dir}/environments/prod/variables.tf.bak"
-expect_failure 'production Control variables must fail closed' env NHP_REPO_ROOT="$fixture_root" "$checker"
+# Production Control accepts a real runtime contract now, so the fail-closed
+# property is no longer "a validation rejects every open value" — it is that
+# every gate DEFAULTS closed, so only the reviewed production dispatch can open
+# one. Mutate each gate's default open in turn and require the checker to catch
+# it; a gate that is simply absent must also fail.
+for gate_case in \
+  'authority_runtime_contract:null:"opened"' \
+  'authority_runtime_contract_evidence_verified:false:true' \
+  'authority_runtime_functions_enabled:false:true' \
+  'hub_edge_enabled:false:true' \
+  'hub_worker_enabled:false:true'; do
+  gate_name="${gate_case%%:*}"
+  gate_rest="${gate_case#*:}"
+  gate_closed="${gate_rest%%:*}"
+  gate_open="${gate_rest#*:}"
+
+  write_clean_fixture
+  sed -i.bak \
+    "s/variable \"${gate_name}\" { default = ${gate_closed} }/variable \"${gate_name}\" { default = ${gate_open} }/" \
+    "${control_dir}/environments/prod/variables.tf"
+  rm "${control_dir}/environments/prod/variables.tf.bak"
+  expect_failure "production Control gate ${gate_name} must fail closed" \
+    env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+  write_clean_fixture
+  sed -i.bak "/variable \"${gate_name}\" {/d" \
+    "${control_dir}/environments/prod/variables.tf"
+  rm "${control_dir}/environments/prod/variables.tf.bak"
+  expect_failure "production Control variables must declare ${gate_name}" \
+    env NHP_REPO_ROOT="$fixture_root" "$checker"
+done
 
 write_clean_fixture
 rm "${module_dir}/ecr.tf"

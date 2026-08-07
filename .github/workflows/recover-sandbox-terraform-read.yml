@@ -135,7 +135,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Prove exact sandbox deploy identity
-        run: scripts/check-control-sandbox-aws-identity.sh "sandbox-read-recover-${GITHUB_RUN_ID}"
+        run: scripts/check-control-aws-identity.sh sandbox "sandbox-read-recover-${GITHUB_RUN_ID}"
 
       - name: Initialize normal sandbox state
         working-directory: ${{ env.TERRAFORM_ROOT }}

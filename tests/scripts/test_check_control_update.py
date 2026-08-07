@@ -17,10 +17,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CHECKER_PATH = ROOT / ".github/scripts/check-control-sandbox-update.py"
+CHECKER_PATH = ROOT / ".github/scripts/check-control-update.py"
 WORKFLOW_PATH = ROOT / ".github/workflows/control-sandbox-update.yml"
-CAPTURE_PATH = ROOT / "scripts/capture-control-sandbox-update-state.sh"
-AWS_IDENTITY_PATH = ROOT / "scripts/check-control-sandbox-aws-identity.sh"
+CAPTURE_PATH = ROOT / "scripts/capture-control-update-state.sh"
+AWS_IDENTITY_PATH = ROOT / "scripts/check-control-aws-identity.sh"
 LIVE_MAIN_PATH = ROOT / "scripts/check-live-main-ref.sh"
 NO_CREDENTIALS_PATH = ROOT / "scripts/check-no-checkout-credentials.sh"
 VERIFY_SECRET_PATH = ROOT / "scripts/verify-control-otp-pepper.sh"
@@ -33,6 +33,9 @@ SPEC = importlib.util.spec_from_file_location("control_update_checker", CHECKER_
 assert SPEC and SPEC.loader
 CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
+
+# The checker is per-environment now; these cases assert the sandbox profile.
+SANDBOX = CHECKER.environment_profile("sandbox")
 
 
 def write_json(path: Path, value: object) -> None:
@@ -59,7 +62,7 @@ def state_fixture(root: Path, *, serial: int = 4) -> tuple[Path, Path]:
             "ContentLength": state_path.stat().st_size,
             "ETag": '"0123456789abcdef0123456789abcdef"',
             "ServerSideEncryption": "aws:kms",
-            "SSEKMSKeyId": CHECKER.STATE_KMS_KEY_ARN,
+            "SSEKMSKeyId": SANDBOX["state_kms_key_arn"],
             "VersionId": "state-version-4",
         },
     )
@@ -70,10 +73,10 @@ class StateContractTests(unittest.TestCase):
     def test_exact_versioned_kms_state_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_path, head_path = state_fixture(Path(directory))
-            summary = CHECKER.check_state(state_path, head_path)
+            summary = CHECKER.check_state(state_path, head_path, SANDBOX)
         self.assertEqual(summary["serial"], 4)
         self.assertEqual(summary["version_id"], "state-version-4")
-        self.assertEqual(summary["bucket"], CHECKER.STATE_BUCKET)
+        self.assertEqual(summary["bucket"], SANDBOX["state_bucket"])
         self.assertEqual(len(summary["sha256"]), 64)
 
     def test_sse_kms_etag_is_an_opaque_nonempty_identity(self) -> None:
@@ -82,7 +85,7 @@ class StateContractTests(unittest.TestCase):
             head = json.loads(head_path.read_text())
             head["ETag"] = '"opaque-sse-kms-identity"'
             write_json(head_path, head)
-            summary = CHECKER.check_state(state_path, head_path)
+            summary = CHECKER.check_state(state_path, head_path, SANDBOX)
         self.assertEqual(summary["etag"], '"opaque-sse-kms-identity"')
 
     def test_state_header_s3_identity_and_download_length_fail_closed(self) -> None:
@@ -107,7 +110,7 @@ class StateContractTests(unittest.TestCase):
                     head["ContentLength"] = state_path.stat().st_size
                 write_json(head_path, head)
                 with self.assertRaises(CHECKER.ContractError):
-                    CHECKER.check_state(state_path, head_path)
+                    CHECKER.check_state(state_path, head_path, SANDBOX)
 
 
 class ArtifactContractTests(unittest.TestCase):
@@ -115,7 +118,7 @@ class ArtifactContractTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         state_path, head_path = state_fixture(self.root)
-        summary = CHECKER.check_state(state_path, head_path)
+        summary = CHECKER.check_state(state_path, head_path, SANDBOX)
         self.state_summary = self.root / "planned-state-summary.json"
         CHECKER.write_json(self.state_summary, summary)
         self.plan = self.root / "tfplan"
@@ -155,7 +158,7 @@ class ArtifactContractTests(unittest.TestCase):
             "run_id": "12345",
             "run_attempt": "2",
             "planned_at_epoch": "200000",
-            "workflow_ref": f"{CHECKER.REPOSITORY}/{CHECKER.WORKFLOW_PATH}@refs/heads/main",
+            "workflow_ref": f"{CHECKER.REPOSITORY}/{SANDBOX["workflow_path"]}@refs/heads/main",
             "terraform_version": CHECKER.TF_VERSION,
             "output": self.metadata,
             "metadata": self.metadata,
@@ -168,6 +171,7 @@ class ArtifactContractTests(unittest.TestCase):
             "run_started_at": "1970-01-03T07:16:40Z",
             "now_epoch": 200001,
         }
+        values.setdefault("environment", "sandbox")
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -253,8 +257,8 @@ class SourceRunTests(unittest.TestCase):
             "conclusion": "success",
             "head_branch": "main",
             "head_sha": "b" * 40,
-            "name": CHECKER.WORKFLOW_NAME,
-            "path": CHECKER.WORKFLOW_PATH,
+            "name": SANDBOX["workflow_name"],
+            "path": SANDBOX["workflow_path"],
             "repository": {"full_name": CHECKER.REPOSITORY},
             "actor": {"login": "planner"},
             "triggering_actor": {"login": "planner"},
@@ -263,7 +267,11 @@ class SourceRunTests(unittest.TestCase):
             path = Path(directory) / "run.json"
             write_json(path, run)
             args = argparse.Namespace(
-                run_json=path, run_id="12345", run_attempt="2", commit_sha="b" * 40
+                environment="sandbox",
+                run_json=path,
+                run_id="12345",
+                run_attempt="2",
+                commit_sha="b" * 40,
             )
             self.assertEqual(CHECKER.check_source_run(args)["run_id"], 12345)
             for field, value in (
@@ -412,14 +420,14 @@ else:
             }
             evidence = root / "evidence"
             captured = subprocess.run(
-                [str(CAPTURE_PATH), str(evidence)], env=env, capture_output=True, text=True
+                [str(CAPTURE_PATH), "sandbox", str(evidence)], env=env, capture_output=True, text=True
             )
             self.assertEqual(captured.returncode, 0, captured.stderr)
             self.assertEqual(json.loads((evidence / "state-summary.json").read_text())["serial"], 4)
 
             env["FAKE_LOCK"] = "1"
             locked = subprocess.run(
-                [str(CAPTURE_PATH), str(root / "locked")], env=env, capture_output=True, text=True
+                [str(CAPTURE_PATH), "sandbox", str(root / "locked")], env=env, capture_output=True, text=True
             )
             self.assertNotEqual(locked.returncode, 0)
             self.assertIn("state is locked", locked.stderr)
@@ -432,7 +440,7 @@ else:
             write_json(moved_head_path, moved_head)
             env["FAKE_HEAD_AFTER"] = str(moved_head_path)
             moved = subprocess.run(
-                [str(CAPTURE_PATH), str(root / "moved")],
+                [str(CAPTURE_PATH), "sandbox", str(root / "moved")],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -455,8 +463,8 @@ else:
             fake_aws.chmod(0o755)
             session = "control-update-plan-12345"
             exact = {
-                "Account": CHECKER.ACCOUNT_ID,
-                "Arn": f"arn:aws:sts::{CHECKER.ACCOUNT_ID}:assumed-role/nhp-sandbox-github-actions/{session}",
+                "Account": SANDBOX["account_id"],
+                "Arn": f"arn:aws:sts::{SANDBOX["account_id"]}:assumed-role/nhp-sandbox-github-actions/{session}",
                 "UserId": f"role-id:{session}",
             }
             env = {
@@ -465,20 +473,20 @@ else:
                 "FAKE_IDENTITY": json.dumps(exact),
             }
             accepted = subprocess.run(
-                [str(AWS_IDENTITY_PATH), session], env=env, capture_output=True, text=True
+                [str(AWS_IDENTITY_PATH), "sandbox", session], env=env, capture_output=True, text=True
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
             for label, arn, account in (
                 (
                     "wrong-role",
-                    f"arn:aws:sts::{CHECKER.ACCOUNT_ID}:assumed-role/other/{session}",
-                    CHECKER.ACCOUNT_ID,
+                    f"arn:aws:sts::{SANDBOX["account_id"]}:assumed-role/other/{session}",
+                    SANDBOX["account_id"],
                 ),
                 (
                     "wrong-session",
-                    f"arn:aws:sts::{CHECKER.ACCOUNT_ID}:assumed-role/nhp-sandbox-github-actions/other",
-                    CHECKER.ACCOUNT_ID,
+                    f"arn:aws:sts::{SANDBOX["account_id"]}:assumed-role/nhp-sandbox-github-actions/other",
+                    SANDBOX["account_id"],
                 ),
                 (
                     "wrong-account",
@@ -489,7 +497,7 @@ else:
                 with self.subTest(label=label):
                     env["FAKE_IDENTITY"] = json.dumps({"Account": account, "Arn": arn})
                     rejected = subprocess.run(
-                        [str(AWS_IDENTITY_PATH), session],
+                        [str(AWS_IDENTITY_PATH), "sandbox", session],
                         env=env,
                         capture_output=True,
                         text=True,
@@ -710,8 +718,8 @@ class WorkflowContractTests(unittest.TestCase):
             "artifact-verify",
             "source-run",
             "Re-read live main and consume saved plan immediately before exact apply",
-            "capture-control-sandbox-update-state.sh",
-            "check-control-sandbox-aws-identity.sh",
+            "capture-control-update-state.sh",
+            "check-control-aws-identity.sh",
             "verify-control-sandbox-live-boundary.sh",
             "terraform apply -input=false -lock-timeout=5m -no-color",
             "plan_mode=(-refresh-only)",
@@ -796,7 +804,7 @@ class WorkflowContractTests(unittest.TestCase):
             "scripts/check-no-checkout-credentials.sh", 0, apply_index
         )
         final_state = workflow.rfind(
-            "scripts/capture-control-sandbox-update-state.sh", 0, apply_index
+            "scripts/capture-control-update-state.sh", 0, apply_index
         )
         live_boundary = workflow.rfind(
             "scripts/verify-control-sandbox-live-boundary.sh", 0, apply_index
@@ -894,7 +902,7 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(session_name=session_name):
                 identity_index = workflow.index(
-                    f'check-control-sandbox-aws-identity.sh "{session_name}"'
+                    f'check-control-aws-identity.sh sandbox "{session_name}"'
                 )
                 state_index = workflow.index(capture_marker, identity_index)
                 self.assertLess(identity_index, state_index)
@@ -914,8 +922,8 @@ class WorkflowContractTests(unittest.TestCase):
             "      - name: Test sandbox Control foundation boundary\n", 1
         )[1].split("\n      - name:", 1)[0]
         for helper in (
-            "scripts/capture-control-sandbox-update-state.sh",
-            "scripts/check-control-sandbox-aws-identity.sh",
+            "scripts/capture-control-update-state.sh",
+            "scripts/check-control-aws-identity.sh",
             "scripts/check-live-main-ref.sh",
             "scripts/check-no-checkout-credentials.sh",
             "scripts/verify-control-otp-pepper.sh",
@@ -925,8 +933,8 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(f'- "{helper}"', validate)
             self.assertIn(helper, boundary)
             self.assertIn(helper, makefile)
-        self.assertIn("test_check_control_sandbox_update.py", boundary)
-        self.assertIn("test_check_control_sandbox_update.py", makefile)
+        self.assertIn("test_check_control_update.py", boundary)
+        self.assertIn("test_check_control_update.py", makefile)
 
 
 if __name__ == "__main__":

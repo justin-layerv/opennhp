@@ -45,9 +45,9 @@ on:
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
-      - "scripts/capture-control-sandbox-update-state.sh"
+      - "scripts/capture-control-update-state.sh"
       - "scripts/capture-sandbox-udp-proof-account-binding.sh"
-      - "scripts/check-control-sandbox-aws-identity.sh"
+      - "scripts/check-control-aws-identity.sh"
       - "scripts/check-live-main-ref.sh"
       - "scripts/check-no-checkout-credentials.sh"
       - "scripts/ensure-control-otp-pepper.sh"
@@ -596,8 +596,8 @@ jobs:
       - name: Test sandbox Control foundation boundary
         run: |
           shellcheck \
-            scripts/capture-control-sandbox-update-state.sh \
-            scripts/check-control-sandbox-aws-identity.sh \
+            scripts/capture-control-update-state.sh \
+            scripts/check-control-aws-identity.sh \
             scripts/check-control-global-routing.sh \
             scripts/check-control-vpc-cidr-overlap.sh \
             scripts/check-live-main-ref.sh \
@@ -609,7 +609,7 @@ jobs:
             tests/fixtures/control-vpc-cidr-overlap/aws \
             tests/scripts/check-control-global-routing_test.sh
           python3 tests/scripts/test_check_control_sandbox_first_apply.py
-          python3 tests/scripts/test_check_control_sandbox_update.py
+          python3 tests/scripts/test_check_control_update.py
           python3 tests/scripts/test_generate_connector_authority_runtime_contract.py
           tests/scripts/check-control-global-routing_test.sh
 
