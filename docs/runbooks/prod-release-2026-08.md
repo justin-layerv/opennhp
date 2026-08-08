@@ -28,11 +28,25 @@ no machine gate behind them.
 
 ## 1 · Catalog backfill — **hard blocker, run twice**
 
-Prod has **533 active qURL resources and zero `q_` catalog rows**. From
-`deploy-server` onward the NHP server resolves routing from the catalog and
-**fails closed with HTTP 500** on a miss — no body fallback. Prod qurl-service
-(`db5d703`) predates the catalog writer (#855), so nothing has ever written
-those rows and there is no automatic backfill.
+Prod has **zero `q_` catalog rows**. From `deploy-server` onward the NHP server
+resolves routing from the catalog and **fails closed with HTTP 500** on a miss
+— no body fallback. Prod qurl-service (`db5d703`) predates the catalog writer
+(#855), so nothing has ever written those rows and there is no automatic
+backfill.
+
+**Expect 25 rows written, not 533.** These are three different counts and
+confusing them will read as a failed run:
+
+| count | what it is |
+| --- | --- |
+| 533 | `r_` resource records in the resources table |
+| **25** | active, non-expired qURL tokens needing a `q_` catalog row |
+| 83 | tokens skipped as `not active` (revoked/consumed — correctly no row) |
+
+Measured by a dry run against prod on **2026-08-08**; it drifts with minting
+(~0.6/day), so re-read the dry run's own `rows pending` line rather than
+treating 25 as fixed. A run reporting `FAILED: 0` and a `rows pending` count in
+this range is healthy.
 
 - [ ] **Run 1 — must COMPLETE before `deploy-server` starts.** Running it
       earlier is harmless: until `deploy-server` the old server still resolves
