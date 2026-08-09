@@ -148,9 +148,13 @@ class CellActivationDefaultTests(unittest.TestCase):
                     r"try\(\s*\n?\s*data\.terraform_remote_state\.control"
                     r"\.outputs\.authority_cell_alias_targets",
                 )
+                # Cell-agnostic on purpose: each derived root names its local
+                # after its own cell (control_cell1_alias_targets in the cell1
+                # root), so pinning cell0 here would force every future cell to
+                # mislabel its local after cell0.
                 self.assertRegex(
                     body,
-                    r"control_cell0_alias_targets == null \? null",
+                    r"control_cell[0-9]+_alias_targets == null \? null",
                 )
 
 

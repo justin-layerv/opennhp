@@ -37,6 +37,16 @@ from botocore.exceptions import ClientError
 
 # Env vars an assigned agent needs its cell's NHP server to have. Each maps to a
 # concrete failure a customer would hit if the cell is assignable without it.
+#
+# The flags alone are not enough, and checking only them is how sandbox cell1
+# stayed broken after #3739 turned its flags on: the flags say the server WILL
+# handle native registration, the alias ARNs are what it handles it WITH. cell1
+# had AGENT_OTP_REGISTRATION_ENABLED=true and no NHP_CONNECTOR_* line at all,
+# so configureConnectorCellAuthority returned early and every enrollment placed
+# there died. The OTP leg is the cruelest of these: NHP_OTP carries no
+# acknowledgement, so a missing issuer alias is not an error the agent can see —
+# it waits in its own OTP callback until the assignment ticket expires and no
+# code is ever emailed.
 REQUIRED_SERVER_CONFIG = {
     "AGENT_OTP_REGISTRATION_ENABLED": (
         "native agent registration (NHP_OTP -> NHP_REG -> NHP_RAK); "
@@ -45,7 +55,29 @@ REQUIRED_SERVER_CONFIG = {
     "QURL_V2_ADMISSION_ENABLED": (
         "independent qURL v2 admission; without it the cell admits no v2 knock"
     ),
+    "NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN": (
+        "the Authority alias that emails the one-time code; without it NHP_OTP "
+        "is silently dropped and the agent waits out its ticket with no code"
+    ),
+    "NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN": (
+        "the Authority alias that activates a registration; without it "
+        "assigned-cell NHP_REG cannot be served"
+    ),
+    "NHP_CONNECTOR_REGISTRATION_COMPLETE_ALIAS_ARN": (
+        "the Authority alias that completes a registration; without it an "
+        "activated agent can never be issued its device credential"
+    ),
+    "NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN": (
+        "the Authority alias that replaces a revoked device credential; "
+        "without it a recoverable agent on this cell is stranded"
+    ),
 }
+
+# Values that are present but mean "off". `NAME=` with nothing after it renders
+# whenever a Terraform local resolves to an empty string, and a flag can be
+# rendered false. Both satisfy a presence-only test while leaving the capability
+# just as absent, so treat them as missing.
+DISABLED_VALUES = {"", "false", "0", "null", "none"}
 
 ASSIGNABLE_STATUS = "active"
 
@@ -104,13 +136,18 @@ def main() -> int:
             print(f"  {cell_id}: status=active but s3://{bucket}/{args.script_key} is unreadable")
             failures += 1
             continue
+        rendered = {}
+        for line in script.splitlines():
+            name, sep, value = line.strip().partition("=")
+            if sep and name in REQUIRED_SERVER_CONFIG:
+                rendered[name] = value.strip().strip("\"'")
         missing = [
             name for name in REQUIRED_SERVER_CONFIG
-            if not any(line.startswith(f"{name}=") for line in script.splitlines())
+            if rendered.get(name, "").lower() in DISABLED_VALUES
         ]
         if missing:
             failures += 1
-            print(f"  {cell_id}: status=ACTIVE but its NHP server is missing:")
+            print(f"  {cell_id}: status=ACTIVE but its NHP server is missing or has disabled:")
             for name in missing:
                 print(f"      {name} - {REQUIRED_SERVER_CONFIG[name]}")
         else:

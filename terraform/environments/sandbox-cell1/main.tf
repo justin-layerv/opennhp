@@ -329,8 +329,8 @@ module "compute" {
   environment                     = var.environment
   protocol_environment            = var.protocol_environment
   cell_id                         = var.cell_id
-  connector_authority_cell_config = var.connector_authority_cell_config
-  server_ami_id                   = var.server_ami_id # null -> reads /sandbox-cell1/nhp/server/ami-id
+  connector_authority_cell_config = local.connector_authority_cell_config # connector_authority_cell.tf; var still wins
+  server_ami_id                   = var.server_ami_id                     # null -> reads /sandbox-cell1/nhp/server/ami-id
   domain_name                     = var.domain_name
   multi_tenant                    = true
   min_capacity                    = var.min_capacity

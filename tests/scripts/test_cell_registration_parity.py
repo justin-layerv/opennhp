@@ -43,6 +43,15 @@ CELL_ROOTS = (
     ROOT / "terraform/environments/sandbox-cell1/main.tf",
 )
 
+# Environment roots that OWN a cell's Authority caller graph — the layer that
+# decides the value rather than threading it. terraform/main.tf is deliberately
+# absent: it is the shared module both cell0 and prod source, so taking the
+# variable is correct there and the environment above it supplies the value.
+CELL_ENVIRONMENT_ROOTS = (
+    ROOT / "terraform/environments/sandbox/main.tf",
+    ROOT / "terraform/environments/sandbox-cell1/main.tf",
+)
+
 
 class CellRegistrationParityTest(unittest.TestCase):
     def _compute_block(self, path: Path) -> str:
@@ -76,6 +85,87 @@ class CellRegistrationParityTest(unittest.TestCase):
                     "qurl_service_deployable", assignment.group(1),
                     f"{name} must share the gate that turns the QURL plugin on; "
                     "ungated it drops silently whenever the plugin is off.",
+                )
+
+    def test_every_cell_root_derives_the_authority_caller_graph(self) -> None:
+        """Turning the flags on is half the wiring; the alias ARNs are the rest.
+
+        agent_otp_registration_enabled tells the server it WILL serve native
+        registration. connector_authority_cell_config is what it serves it WITH.
+        cell1 shipped with the first and not the second: its root passed
+        `var.connector_authority_cell_config`, whose default is null, so
+        user_data emitted no NHP_CONNECTOR_REGISTRATION_* line at all,
+        configureConnectorCellAuthority returned early, and every agent the
+        Authority placed there was unservable while the cell advertised itself
+        `active`. The OTP leg hid it best: NHP_OTP carries no acknowledgement, so
+        a missing issuer alias is not an error the agent can see — it waits out
+        its assignment ticket and no code is ever emailed.
+
+        Each root must DERIVE the graph from Control's published alias targets
+        (a local), never leave it to an unset variable. Reading Control is also
+        what makes a reviewed authority-color flip carry to the cells instead of
+        stranding them on a retired alias.
+        """
+        for path in CELL_ENVIRONMENT_ROOTS:
+            with self.subTest(root=str(path.parent.name)):
+                source = path.read_text(encoding="utf-8")
+                assignment = re.search(r"connector_authority_cell_config\s*=\s*(\S+)", source)
+                self.assertIsNotNone(
+                    assignment,
+                    f"{path.relative_to(ROOT)} does not supply connector_authority_cell_config; "
+                    "agents assigned to that cell cannot enroll and, on the OTP leg, are never "
+                    "told why.",
+                )
+                self.assertIn(
+                    "local.connector_authority_cell_config", assignment.group(1),
+                    f"{path.relative_to(ROOT)} supplies the raw variable rather than the local that "
+                    "derives the caller graph from Control. The variable defaults to null, which "
+                    "renders no NHP_CONNECTOR_REGISTRATION_* config and silently disables "
+                    "assigned-cell registration.",
+                )
+                derivation = path.parent / "connector_authority_cell.tf"
+                self.assertTrue(
+                    derivation.exists() and "authority_cell_alias_targets" in derivation.read_text(encoding="utf-8"),
+                    f"{path.parent.relative_to(ROOT)} must derive its alias targets from Control's "
+                    "published authority_cell_alias_targets; a pinned literal color strands the "
+                    "cell the day the selector moves.",
+                )
+
+    def test_derived_authority_config_uses_the_protocol_environment(self) -> None:
+        """The Authority environment is not always this root's var.environment.
+
+        cell1 splits the two: var.environment is the INFRASTRUCTURE namespace
+        ("sandbox-cell1") that keeps resource names and SSM paths from colliding
+        with cell0, while the Authority/ticket environment is "sandbox" for both
+        cells and travels as var.protocol_environment.
+
+        Feeding var.environment into the caller graph is unbuildable rather than
+        merely wrong: modules/compute requires
+        contains(["sandbox","prod"], config.environment), and this root's
+        variables.tf validates var.environment is neither, so the precondition
+        could never pass. It would also reconstruct the expected alias ARNs as
+        layerv-nhp-sandbox-cell1-ca-*-cell1 when Control publishes
+        layerv-nhp-sandbox-ca-*-cell1.
+        """
+        for path in CELL_ENVIRONMENT_ROOTS:
+            derivation = path.parent / "connector_authority_cell.tf"
+            if not derivation.exists():
+                continue
+            source = derivation.read_text(encoding="utf-8")
+            variables = (path.parent / "variables.tf").read_text(encoding="utf-8")
+            if "protocol_environment" not in variables:
+                # Roots without the split legitimately use var.environment.
+                continue
+            with self.subTest(root=str(path.parent.name)):
+                assignment = re.search(r"^\s*environment\s*=\s*(\S+)", source, re.M)
+                self.assertIsNotNone(
+                    assignment, f"{derivation.relative_to(ROOT)} sets no environment"
+                )
+                self.assertEqual(
+                    assignment.group(1),
+                    "var.protocol_environment",
+                    f"{derivation.relative_to(ROOT)} feeds the infrastructure namespace into the "
+                    "Authority caller graph; modules/compute can never accept it.",
                 )
 
     def test_cell1_reads_the_shared_issuer_key(self) -> None:
