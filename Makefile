@@ -256,7 +256,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation lint-prod-deploy-relay-activation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -350,6 +350,16 @@ lint-dispatch-concurrency-isolation:
 	fi
 	@bash tests/scripts/check-dispatch-concurrency-isolation_test.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] dispatch concurrency isolation check passed!$(END_COLOUR)"
+
+lint-prod-deploy-relay-activation:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking prod-deploy relay activation detection...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/trigger-prod-deploy.sh tests/scripts/trigger-prod-deploy-relay-activation_test.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@bash tests/scripts/trigger-prod-deploy-relay-activation_test.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] prod-deploy relay activation check passed!$(END_COLOUR)"
 
 lint-run-fuzz:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Checking run-fuzz wrapper (#1653)...$(END_COLOUR)"

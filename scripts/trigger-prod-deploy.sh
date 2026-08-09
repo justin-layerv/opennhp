@@ -587,6 +587,7 @@ deploy_qurl=false
 deploy_qrts=false
 deploy_relay=false
 run_terraform=false
+RELAY_FIRST_ACTIVATION=false
 SERVER_REASON=""
 AC_REASON=""
 QURL_REASON=""
@@ -674,11 +675,41 @@ else
     # release. Without this detection the relay silently pins to whatever tag
     # the first apply seeded and never receives another patch.
     #
-    # A missing prod parameter means the relay is still dark there (Terraform
-    # creates it only when deploy_relay=true), which is the pre-activation state
-    # and correctly reads as "nothing to deploy" rather than as drift.
+    # A missing prod parameter means one of two very different things, and the
+    # prod tfvars is what tells them apart:
+    #
+    #   deploy_relay = false -> relay is genuinely dark in prod. Nothing to
+    #                           deploy; skipping is correct.
+    #   deploy_relay = true  -> THIS promote's terraform-apply creates the
+    #                           parameter, and deploy-relay runs after it
+    #                           (needs: [... terraform-apply ...]). Skipping
+    #                           here would ship the activation release with the
+    #                           relay still dark -- the parameter would be
+    #                           created and then never advanced.
+    #
+    # Reading only the live parameter cannot see the second case, because the
+    # thing it is looking for does not exist until the apply this very command
+    # is about to trigger.
+    prod_tfvars="$SCRIPT_DIR/../terraform/environments/prod/terraform.tfvars"
+    tfvars_deploy_relay="unknown"
+    if [[ -f "$prod_tfvars" ]]; then
+        if grep -qE '^[[:space:]]*deploy_relay[[:space:]]*=[[:space:]]*true' "$prod_tfvars"; then
+            tfvars_deploy_relay="true"
+        elif grep -qE '^[[:space:]]*deploy_relay[[:space:]]*=[[:space:]]*false' "$prod_tfvars"; then
+            tfvars_deploy_relay="false"
+        fi
+    fi
+
     if [[ "$SANDBOX_RELAY_TAG" != "(not set)" && "$PROD_RELAY_TAG" == "(not set)" ]]; then
-        RELAY_REASON="[SKIP] relay is dark in prod (no /prod/nhp/relay/image-tag yet — Terraform creates it when deploy_relay=true)"
+        if [[ "$tfvars_deploy_relay" == "true" ]]; then
+            deploy_relay=true
+            RELAY_FIRST_ACTIVATION=true
+            RELAY_REASON="first activation: prod tfvars sets deploy_relay=true, so this apply creates /prod/nhp/relay/image-tag and deploy-relay seeds ${SANDBOX_RELAY_TAG}"
+        elif [[ "$tfvars_deploy_relay" == "false" ]]; then
+            RELAY_REASON="[SKIP] relay is dark in prod (deploy_relay=false in prod tfvars)"
+        else
+            RELAY_REASON="[SKIP] relay tag unset in prod and deploy_relay not resolvable from prod tfvars — set -f deploy_relay explicitly"
+        fi
     elif [[ "$SANDBOX_RELAY_TAG" != "(not set)" && "$SANDBOX_RELAY_TAG" != "$PROD_RELAY_TAG" ]]; then
         deploy_relay=true
         RELAY_REASON="tag changed: ${PROD_RELAY_TAG} → ${SANDBOX_RELAY_TAG}"
@@ -701,6 +732,13 @@ else
     # change detection above (a commit diff with no qurl/qrts tag change
     # means nothing to roll for them). Keep the message accurate to that
     # behavior rather than claiming "all".
+    # deploy_relay is deliberately absent from this condition. A relay-only
+    # promote with no server/ac/terraform diff would trip the fallback and
+    # redeploy server/ac at the same tag -- wasteful but coherent, and in
+    # practice unreachable for the activation case because the tfvars edit that
+    # sets deploy_relay = true lives under terraform/, so run_terraform is
+    # already true. Adding deploy_relay here would suppress the fallback for
+    # genuine no-change promotes, which is the case it exists to catch.
     if [[ "$deploy_server" == "false" && "$deploy_ac" == "false" && "$run_terraform" == "false" && "$deploy_qurl" == "false" && "$deploy_qrts" == "false" ]]; then
         warn "No component changes detected but commits differ. Deploying nhp server/ac + terraform as safety fallback (qurl/qrts left to their own tag-change detection)."
         deploy_server=true
@@ -711,6 +749,20 @@ else
         TF_REASON="safety fallback (no specific changes detected)"
         WARNINGS+=("No specific component changes detected — deploying nhp server/ac + terraform as safety fallback (qurl/qrts excluded by design)")
     fi
+fi
+
+# The relay's first activation is only coherent WITH terraform: the parameter
+# and the relay ASG do not exist until terraform-apply creates them, and
+# deploy-relay (needs: [... terraform-apply ...]) fires an instance refresh
+# against that ASG. Emitting deploy_relay=true with run_terraform=false would
+# hand the operator an internally inconsistent command that refreshes an ASG
+# Terraform never created. Nothing else couples these -- run_terraform comes
+# from independent change detection -- so force it here and say so.
+if [[ "$RELAY_FIRST_ACTIVATION" == "true" && "$run_terraform" != "true" ]]; then
+    run_terraform=true
+    TF_REASON="forced: the relay's first activation needs terraform-apply to create /prod/nhp/relay/image-tag and the relay ASG"
+    warn "Relay first activation forced run_terraform=true — deploy-relay refreshes an ASG that this apply creates."
+    WARNINGS+=("run_terraform forced to true: relay first activation cannot proceed without the apply that creates its parameter and ASG")
 fi
 
 # =============================================================================
