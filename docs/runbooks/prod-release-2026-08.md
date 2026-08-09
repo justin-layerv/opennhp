@@ -34,19 +34,22 @@ resolves routing from the catalog and **fails closed with HTTP 500** on a miss
 (#855), so nothing has ever written those rows and there is no automatic
 backfill.
 
-**Expect 25 rows written, not 533.** These are three different counts and
-confusing them will read as a failed run:
+**Expect a couple of dozen rows written, not 533.** These are three different
+counts and confusing them will read as a failed run:
 
 | count | what it is |
 | --- | --- |
 | 533 | `r_` resource records in the resources table |
-| **25** | active, non-expired qURL tokens needing a `q_` catalog row |
-| 83 | tokens skipped as `not active` (revoked/consumed — correctly no row) |
+| **~23** | active, non-expired qURL tokens needing a `q_` catalog row |
+| ~79 | tokens skipped as `not active` (revoked/consumed — correctly no row) |
 
-Measured by a dry run against prod on **2026-08-08**; it drifts with minting
-(~0.6/day), so re-read the dry run's own `rows pending` line rather than
-treating 25 as fixed. A run reporting `FAILED: 0` and a `rows pending` count in
-this range is healthy.
+**Do not treat any of these as fixed — read the dry run's own `rows pending`
+line.** Two prod dry runs about four hours apart on 2026-08-08 returned 25/83
+and then 23/79: the pending count drifts *down* as tokens expire, which moves it
+faster than the ~0.6/day mint rate moves it up, and the total shrinks as expired
+rows are reaped. A run reporting `FAILED: 0` and a `rows pending` count in this
+range is healthy; an exact match to a number written here is not the
+test.
 
 - [ ] **Run 1 — must COMPLETE before `deploy-server` starts.** Running it
       earlier is harmless: until `deploy-server` the old server still resolves
