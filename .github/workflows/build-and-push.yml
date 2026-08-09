@@ -3712,12 +3712,34 @@ jobs:
             -var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
             -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt \
             || plan_exit="${PIPESTATUS[0]}"
-          case "$plan_exit" in
-            0) echo "control_status=converged" >>"$GITHUB_OUTPUT" ;;
-            2) echo "control_status=applied" >>"$GITHUB_OUTPUT" ;;
-            *) echo '::error::Control plan failed.'; exit 1 ;;
-          esac
+          if [[ "$plan_exit" != 0 && "$plan_exit" != 2 ]]; then
+            echo '::error::Control plan failed.'
+            exit 1
+          fi
           terraform show -json tfplan >tfplan.json
+
+          # Derive the status from the saved plan, NOT from the pipeline's exit
+          # code. On run 31305584132 terraform planned "0 to add, 1 to change,
+          # 0 to destroy" and this step still recorded control_status=converged,
+          # so `${PIPESTATUS[0]}` through `| tee` did not survive as 2 the way it
+          # does in isolation. The plan JSON is the same artifact the contract
+          # checkers read, it cannot disagree with what would be applied, and it
+          # also counts output-only changes — which a resource scan alone misses
+          # and which are still a real apply.
+          resource_changes="$(jq '[.resource_changes[]? | select(.change.actions != ["no-op"])] | length' tfplan.json)"
+          output_changes="$(jq '[(.output_changes // {}) | to_entries[] | select(.value.actions != ["no-op"])] | length' tfplan.json)"
+          total_changes=$(( resource_changes + output_changes ))
+          if [[ "$total_changes" -gt 0 ]]; then
+            echo "control_status=applied" >>"$GITHUB_OUTPUT"
+          else
+            echo "control_status=converged" >>"$GITHUB_OUTPUT"
+          fi
+          # Report both readings. They should agree; when they do not, the plan
+          # JSON wins and this line is the only record of the disagreement.
+          expected_exit=$([[ "$total_changes" -gt 0 ]] && echo 2 || echo 0)
+          if [[ "$plan_exit" != "$expected_exit" ]]; then
+            echo "::warning::Control plan exit ${plan_exit} disagrees with the saved plan (${resource_changes} resource + ${output_changes} output changes); trusting the plan JSON."
+          fi
           # The source-owned contract checks run on every plan, including the
           # no-change one: they are what decides whether a diff is an accepted
           # transition or an unreviewed one, and a clean run of them on a no-op
