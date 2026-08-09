@@ -101,6 +101,7 @@ func newWorkerMetrics() *workerMetrics {
 			connectorhub.WorkerOutcomeResponseQueueRejected,
 			connectorhub.WorkerOutcomeResponseEncodeRejected,
 			connectorhub.WorkerOutcomeWriteFailed,
+			connectorhub.WorkerOutcomeResponseOversize,
 		}),
 		classifications: newCounterSet([]connectorhub.Classification{
 			connectorhub.ClassificationSuccess,

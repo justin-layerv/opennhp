@@ -486,6 +486,14 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 		w.observer.ObserveWorkerOutcome(WorkerOutcomeDeadlineRejected)
 		return
 	}
+	// Record, but still send. A reply over the ceiling is undeliverable across
+	// anything that drops IP fragments, yet the write succeeds and the existing
+	// counters look healthy -- so without this the condition is invisible. The
+	// datagram still goes out because a path that does carry fragments should
+	// keep working; the point here is that the operator learns either way.
+	if responseIsOversize(len(response)) {
+		w.observer.ObserveWorkerOutcome(WorkerOutcomeResponseOversize)
+	}
 	w.enqueueResponse(response, remote, WorkerOutcomeResponseSent, 0, deadline, result.mode, result.authorityCompletedAt)
 }
 
