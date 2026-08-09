@@ -58,10 +58,74 @@ this steady-state fence. The
 [sandbox relay DMZ runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
 documents normal deployment and verification.
 
+#### Sandbox Control auto-deploy (`deploy-sandbox-control`)
+
+`build-and-push.yml` applies the isolated sandbox Control root
+(`terraform/control/environments/sandbox` — the Connector Authority foundation,
+the `ca-*` runtime functions, and the Hub edge + Fargate worker) on every
+sandbox deploy, ordered after `deploy-sandbox-infra` and holding the same
+`deploy-sandbox-infra` writer lock, because Control and cell0 must never apply
+concurrently. It plans with `-detailed-exitcode`, reports `converged` and stops
+when there is nothing to do, and otherwise applies in-run. `Control` renders in
+the Slack pipeline between Relay and Validate, distinguishing an apply from a
+no-op convergence, from a leg superseded by a newer push. Validation orders
+after it so smoke sees a settled Control plane, but does not gate on its
+success — a failed Control apply must not suppress the server/AC/qURL smoke
+assertions that never touch the Hub.
+
+Turning all seven gates dark is a teardown of the Hub and the Authority
+runtime, not a deploy. The reader accepts that shape (it is the documented
+rollback) but the automatic leg fails closed on it, so a full rollback stays
+attended. A partial rollback auto-applies.
+
+The seven Authority/Hub runtime gates come from
+`.github/control-sandbox-runtime-gates.json`. That file exists because every
+gate's committed Terraform default is the DARK value while live sandbox is the
+opposite on all seven: an unattended plan that fell back to those defaults would
+not deploy the Hub, it would destroy it — returning the gates to their
+committed-closed defaults is the documented *rollback*. `control-sandbox-update.yml`
+asserts its own dispatch inputs against the same file, so the attended and
+unattended paths cannot diverge and then revert one another. Changing a value
+there changes live sandbox on the next main push; land it in the same commit as
+the Terraform that needs it. `scripts/check-control-leg-surfaced.sh` fences the
+wiring, the shared writer lock, and the gate-file sourcing.
+
+On an infra-skipped push (a gate-file or docs-only change) Control applies and
+`deploy-sandbox-validate` does not run, because validate still requires infra
+success. That is deliberate: smoke exercises server, AC, and qURL, none of which
+route through the Hub or the Authority runtime, so widening validate would add
+pipeline time on every docs push while asserting nothing about what changed. The
+in-job post-apply refresh-enabled no-op and live dark-boundary proof are what
+cover a Control apply.
+
+**Keep this workflow's rationale short.** `build-and-push.yml` sits near a size
+ceiling that GitHub does not surface as a normal error: a file that grows past
+it stops producing `pull_request` runs entirely and instead emits a `push` run
+named after the file path, with zero jobs and a bare `failure`, no annotations
+and no logs. Because `Test`, `Build server`, and `Build ac` are required checks
+that live here, they simply never report and the PR is unmergeable with nothing
+saying why. Detail belongs in this README; the workflow keeps pointers.
+
+Plan and apply share one job and one state binding, so the attended workflow's
+cross-run artifact custody (saved-plan digests, the two-day window, single-use
+artifact consumption, the apply-rerun ban) does not apply here; the staleness
+guard is the state `{serial, sha256}` re-proved immediately before apply, which
+is what it is in that workflow too. Every source-owned CONTENT check still runs:
+`check-control-sandbox-first-apply.py`, `check-connector-authority-foundation.sh`,
+the pre-apply live dark-boundary proof, and the post-apply refresh-enabled no-op.
+A failed apply does not retry: it directs recovery to an attended
+`control-sandbox-update.yml` plan from current main and current live state.
+
 ### `control-sandbox-update.yml` — Control Sandbox Update
 
 Manually plans, applies, or verifies the isolated sandbox Connector Control
-Terraform root. `plan` and `apply` are separate dispatches: the apply operator
+Terraform root. Routine convergence is now automatic (see the
+`deploy-sandbox-control` section above); this workflow remains the attended path
+for reviewing a diff before it lands and for recovering from a failed automatic
+apply. Its guard binds the seven runtime-gate inputs to
+`.github/control-sandbox-runtime-gates.json` before any AWS access, so a
+dispatch cannot apply gates the automatic leg would then revert.
+`plan` and `apply` are separate dispatches: the apply operator
 must copy the reviewed plan run, commit, saved-plan digest, and exact versioned
 state identity from the plan summary. The apply then revalidates the successful
 source run, two-day age window, artifact hashes, live `main`, source-owned

@@ -26,6 +26,15 @@ on:
       # skipped. Adding the path here so packer-only changes still run.
       - 'packer/**'
       - '.github/workflows/build-and-push.yml'
+      # Same failure mode as packer/** above, with a worse blast radius. These
+      # two files ARE the sandbox Control deploy input: flipping a gate is the
+      # rollout action, not a description of one. Without them here a
+      # gate-only push never starts this workflow, so the change sits in main
+      # looking merged while live sandbox still runs the old shape — and the
+      # next unrelated push applies it, attributing a Hub change to a commit
+      # that had nothing to do with it.
+      - '.github/control-sandbox-runtime-gates.json'
+      - '.github/scripts/control-sandbox-runtime-gates.py'
       # See the matching entry in the changes:app filter — .trivyignore
       # gates the image-scan job, so pushes that edit it must trigger
       # this workflow on main too.
@@ -3465,6 +3474,463 @@ jobs:
             || echo "::warning::Failed to update SSM /sandbox-cell1/nhp/deploy/deployed-at"
           echo "::notice::cell1 deployment tracking updated: deployed-commit = $SERVER_TAG"
 
+  # ============================================================================
+  # DEPLOY SANDBOX - Control (Connector Authority foundation + Hub)
+  #
+  # Applies terraform/control/environments/sandbox — the Connector Authority
+  # foundation, the ca-* runtime functions, and the Hub edge + Fargate worker —
+  # which was previously reachable only through control-sandbox-update.yml's
+  # attended dispatch and appeared in no Slack message.
+  #
+  # Two load-bearing properties, both explained in full in
+  # .github/workflows/README.md ("Sandbox Control auto-deploy"):
+  #   1. The seven runtime gates come from the committed
+  #      .github/control-sandbox-runtime-gates.json, never from Terraform's
+  #      defaults. Every default is the DARK value and live sandbox is the
+  #      opposite on all seven, so falling back would destroy the Hub, not
+  #      deploy it.
+  #   2. Plan and apply share one job and one state binding, so the staleness
+  #      guard is the state {serial, sha256} re-proved immediately before apply.
+  #      Every source-owned CONTENT check still runs.
+  #
+  # Shares the deploy-sandbox-infra writer lock so Control and cell0 can never
+  # apply concurrently; that makes this leg preemptable, which notify reports as
+  # a superseded run rather than a failure.
+  # ============================================================================
+  deploy-sandbox-control:
+    name: Deploy Sandbox - Control
+    # Same minimal shape as deploy-sandbox-qurl: this job consumes no setup
+    # outputs, and infra already orders after setup.
+    needs: [deploy-sandbox-infra]
+    # Runs on every sandbox deploy, not only when terraform/control changed: the
+    # Authority image digest is republished out of band, so "main did not touch
+    # the Control root" does not mean it is converged. A SKIPPED infra leg still
+    # lets Control converge; a FAILED one does not, since stacking a Control
+    # apply on a half-applied cell0 estate turns one bad push into two.
+    #
+    # Accepted consequence: an infra-skipped push applies Control without
+    # validate/smoke. Smoke never routes through the Hub, and the in-job
+    # post-apply proofs are what cover a Control apply. See the README.
+    if: |
+      always() &&
+      (needs.deploy-sandbox-infra.result == 'success' || needs.deploy-sandbox-infra.result == 'skipped') &&
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
+      )
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 60
+    concurrency:
+      group: deploy-sandbox-infra
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      # applied | converged | superseded. notify renders this so a no-op
+      # convergence and a real apply are not both reported as a bare green tick.
+      control_status: ${{ steps.plan.outputs.control_status || steps.freshness.outputs.control_status }}
+      # Whether terraform apply actually STARTED. On a failed leg this is what
+      # separates "the estate may be half-applied" from "a pre-apply check
+      # refused and nothing was touched" — a distinction the step summary makes
+      # and Slack could not, because every pre-apply failure also reads as a
+      # plain job failure from outside the job.
+      apply_outcome: ${{ steps.apply.outcome }}
+    env:
+      CONTROL_ROOT: terraform/control/environments/sandbox
+      AUTHORITY_RUNTIME_BASIS: docs/evidence/connector-authority/v1/sandbox-measurement-basis.json
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          # fetch-depth: 0 is REQUIRED, not just conservative. The runtime
+          # contract generator resolves the manifest's own source commit with
+          # `git log -1 --format=%H -- <path>` and `git ls-tree`, and refuses
+          # outright when `rev-parse --is-shallow-repository` is not "false". A
+          # shallower fetch fails the generator; it does not merely slow it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      # A moved main is ordinary on the push path (the newer push runs this same
+      # leg), so report superseded instead of painting every merge burst red.
+      # Everything below is gated on fresh, which also leaves the AWS role
+      # unassumed on the superseded path.
+      - name: Bind live main before AWS access
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          ref_exit=0
+          scripts/check-live-main-ref.sh "$GITHUB_SHA" || ref_exit=$?
+          # Exit 1 is the only "main moved" answer. Exit 2 (misuse) and anything
+          # else say nothing about main, so they fail the leg rather than report
+          # a supersession never observed.
+          case "$ref_exit" in
+            0)
+              echo "fresh=true" >>"$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "fresh=false" >>"$GITHUB_OUTPUT"
+              echo "control_status=superseded" >>"$GITHUB_OUTPUT"
+              echo "::notice::live main moved past ${GITHUB_SHA}; a newer run converges Control."
+              {
+                echo '## Sandbox Control: superseded'
+                echo
+                echo "Live \`refs/heads/main\` moved past \`${GITHUB_SHA}\` before this leg reached AWS."
+                echo 'The run that carries the newer commit applies the Control root against the newer tree.'
+                if [[ "$GITHUB_EVENT_NAME" != 'push' ]]; then
+                  echo
+                  # An operator who deliberately dispatched a deploy and got a
+                  # no-op deserves to be told the ask was not ignored, and that
+                  # re-dispatching this same commit will land here again.
+                  echo "You dispatched this deploy manually, so this no-op is worth a second look:"
+                  echo "this run targets \`${GITHUB_SHA}\`, which is no longer the tip of \`main\`."
+                  echo 'Re-dispatching the same commit reaches this branch again — dispatch from current main instead.'
+                fi
+              } >>"$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              # Every other failure branch in this job writes a tailored
+              # recovery block; this one used to emit only an ::error:: line,
+              # leaving the summary page blank for the one operator who most
+              # needs to know that NOTHING was read, let alone applied.
+              echo "::error::live-main read failed (exit ${ref_exit}); refusing to guess whether main moved."
+              {
+                echo '## Sandbox Control: could not read live main'
+                echo
+                echo "The authenticated \`refs/heads/main\` read failed with exit \`${ref_exit}\`, which says"
+                echo 'nothing about whether main moved — so this leg stopped rather than guessing.'
+                echo 'No AWS role was assumed, no plan ran, and live sandbox is untouched.'
+                echo 'Usually a GitHub API blip: the next push converges Control on its own. If it'
+                # Escaped backticks, not single quotes: shellcheck reads a bare
+                # backtick inside single quotes as command substitution (SC2016),
+                # and the Markdown code formatting is worth keeping.
+                echo "persists, check the token and \`GITHUB_REPOSITORY\` before dispatching anything."
+              } >>"$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+      - name: Generate verified Authority runtime input from committed gates
+        if: steps.freshness.outputs.fresh == 'true'
+        run: |
+          set -euo pipefail
+          # Deliberately NOT `mapfile -t flags < <(...)`: process substitution
+          # discards the reader's exit status, so a failure would yield an empty
+          # flag array and fall through to the dark Terraform defaults. A plain
+          # assignment keeps `set -e` able to see it. Fenced by C6.
+          gate_flag_text="$(.github/scripts/control-sandbox-runtime-gates.py flags)"
+          mapfile -t gate_flags <<<"$gate_flag_text"
+          # The reader already succeeded, so an empty result is not a failure —
+          # it is the one shape emitting no flags: fully dark. That shape is
+          # VALID (the documented rollback) but means "tear down the Hub and the
+          # ca-* runtime", which this leg must not do unattended off a config
+          # edit. Fail closed; the operator dispatches control-sandbox-update.yml
+          # and reads the destroy plan. The asymmetry is intended. Fenced by C7.
+          if [[ "${#gate_flags[@]}" -eq 0 || -z "${gate_flags[0]}" ]]; then
+            echo '::error::The committed Control gate file is fully dark. That is a teardown of the Hub and the Authority runtime, not a deploy; run it attended via control-sandbox-update.yml.'
+            exit 1
+          fi
+          .github/scripts/generate-connector-authority-runtime-contract.py \
+            --mode sandbox-exact-main \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --manifest "$AUTHORITY_RUNTIME_BASIS" \
+            --expected-checkout-commit "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
+            "${gate_flags[@]}"
+          # The flags are the instruction; this is the receipt. A generator
+          # rename or dropped flag would still emit a plausible tfvars and apply
+          # a shape nobody chose, so bind the emitted keys back to the file.
+          .github/scripts/control-sandbox-runtime-gates.py verify-tfvars \
+            --tfvars "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
+          # Publish the colours through the SAME validated reader, so the gate
+          # file has exactly one parser in this job; a jq read below would be a
+          # second one, free to drift from the Python rules.
+          .github/scripts/control-sandbox-runtime-gates.py env >>"$GITHUB_ENV"
+
+      - name: Prove checkout credentials are absent before Terraform
+        if: steps.freshness.outputs.fresh == 'true'
+        run: scripts/check-no-checkout-credentials.sh
+
+      - name: Configure sandbox apply role
+        if: steps.freshness.outputs.fresh == 'true'
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: control-auto-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove exact sandbox apply identity
+        if: steps.freshness.outputs.fresh == 'true'
+        run: scripts/check-control-aws-identity.sh sandbox "control-auto-deploy-${GITHUB_RUN_ID}"
+
+      - name: Bind current versioned Control state
+        if: steps.freshness.outputs.fresh == 'true'
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-before-plan"
+
+      - name: Initialize sandbox Control state
+        if: steps.freshness.outputs.fresh == 'true'
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Plan and check the Control root
+        id: plan
+        if: steps.freshness.outputs.fresh == 'true'
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          terraform show -json \
+            "$RUNNER_TEMP/control-state-before-plan/state.tfstate" \
+            >"$RUNNER_TEMP/control-state-before-plan/state.json"
+          # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error. The
+          # `|| plan_exit=$?` keeps `set -e` from treating the 2 as a failure.
+          plan_exit=0
+          terraform plan -detailed-exitcode \
+            -var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
+            -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt \
+            || plan_exit="${PIPESTATUS[0]}"
+          case "$plan_exit" in
+            0) echo "control_status=converged" >>"$GITHUB_OUTPUT" ;;
+            2) echo "control_status=applied" >>"$GITHUB_OUTPUT" ;;
+            *) echo '::error::Control plan failed.'; exit 1 ;;
+          esac
+          terraform show -json tfplan >tfplan.json
+          # The source-owned contract checks run on every plan, including the
+          # no-change one: they are what decides whether a diff is an accepted
+          # transition or an unreviewed one, and a clean run of them on a no-op
+          # is the evidence that the root really is converged.
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
+            tfplan.json "$RUNNER_TEMP/control-state-before-plan/state.json" \
+            | tee plan-contract-summary.json
+          ../../../../scripts/check-connector-authority-foundation.sh tfplan.json
+
+      - name: Re-bind unchanged state after planning
+        if: steps.freshness.outputs.fresh == 'true'
+        run: |
+          set -euo pipefail
+          scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-after-plan"
+          cmp "$RUNNER_TEMP/control-state-before-plan/state-summary.json" \
+            "$RUNNER_TEMP/control-state-after-plan/state-summary.json" || {
+            echo '::error::Sandbox Control state changed while planning; discard this plan.'
+            exit 1
+          }
+
+      - name: Prove current live dark boundary before apply
+        if: steps.plan.outputs.control_status == 'applied'
+        env:
+          # Same rationale as control-sandbox-update.yml: the flow log is
+          # already steady-state pre-apply, so keep the readiness wait short
+          # rather than spinning inside the held deploy-sandbox-infra lock.
+          FLOW_LOG_MAX_ATTEMPTS: "3"
+        run: |
+          scripts/verify-control-sandbox-live-boundary.sh \
+            "$CONTROL_ROOT/tfplan.json" \
+            "$RUNNER_TEMP/control-live-before-apply" \
+            pre-apply
+
+      - name: Require exact warm pools before a proof selector apply
+        if: steps.plan.outputs.control_status == 'applied'
+        run: |
+          set -euo pipefail
+          # Both colours come from the validated reader via $GITHUB_ENV in the
+          # generate step; this job has one parser of the gate file, not two.
+          selected="${CONTROL_SELECTED_COLOR:?gate colours were not published}"
+          prepared="${CONTROL_PREPARED_COLOR:?gate colours were not published}"
+          if [[ "$selected" == 'none' || "$selected" != "$prepared" ]]; then
+            echo "Not a proof selector apply (selected=$selected prepared=$prepared); skipping."
+            exit 0
+          fi
+          python3 .github/scripts/verify_udp_proof_authority_evidence.py readiness \
+            --selected-color "$selected"
+
+      - name: Apply the checked plan without GitHub credentials
+        id: apply
+        if: steps.plan.outputs.control_status == 'applied'
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          ../../../../scripts/check-no-checkout-credentials.sh
+          # The staleness guard. Plan and apply share one job and one state
+          # binding, so an unchanged {serial, sha256} here is the proof that
+          # nothing moved underneath the plan we just checked.
+          ../../../../scripts/capture-control-update-state.sh sandbox \
+            "$RUNNER_TEMP/control-state-immediately-before-apply"
+          cmp "$RUNNER_TEMP/control-state-before-plan/state-summary.json" \
+            "$RUNNER_TEMP/control-state-immediately-before-apply/state-summary.json" || {
+            echo '::error::Sandbox Control state moved immediately before apply; this run does not apply it.'
+            exit 1
+          }
+          terraform apply -input=false -lock-timeout=5m -no-color tfplan
+
+      - name: Verify refresh-enabled no-op and live dark boundary
+        id: verify
+        if: steps.apply.outcome == 'success'
+        run: |
+          # The tfvars path must be absolute: the verifier runs Terraform with
+          # -chdir into the Control root, so a workspace-relative -var-file
+          # would resolve against the wrong directory. It also requires the file
+          # at exact mode 600, which the generator writes and RUNNER_TEMP keeps.
+          scripts/verify-control-sandbox-first-apply.sh \
+            "$CONTROL_ROOT" \
+            "$RUNNER_TEMP/control-update-verification" \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
+
+      - name: Capture post-apply state identity
+        id: post-state
+        if: steps.apply.outcome == 'success'
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-state-after-apply"
+
+      - name: Upload sanitized apply evidence
+        if: steps.post-state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-sandbox-auto-deploy-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/control-state-after-apply/state-summary.json
+            ${{ runner.temp }}/control-update-verification/state-list-summary.json
+            ${{ runner.temp }}/control-update-verification/post-apply-plan-summary.json
+            ${{ runner.temp }}/control-update-verification/refreshed-state-summary.json
+            ${{ runner.temp }}/control-update-verification/live-boundary-summary.json
+            ${{ runner.temp }}/control-update-verification/secret-verification-summary.json
+            ${{ runner.temp }}/control-update-verification/verification-summary.json
+          retention-days: 14
+          if-no-files-found: error
+
+      # Fires for BOTH post-apply incidents: a failed apply (estate possibly
+      # partial) and a successful apply whose proof then failed. The second one
+      # needs a snapshot just as much — the operator is being told to go re-run
+      # verify against live state, and the normal post-apply evidence upload is
+      # skipped in that case because its implicit success() is already false.
+      - name: Capture recovery state identity
+        id: partial-state
+        if: failure() && (steps.apply.outcome == 'failure' || steps.verify.outcome == 'failure')
+        continue-on-error: true
+        run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-recovery-state"
+
+      - name: Upload sanitized recovery state identity
+        if: failure() && steps.partial-state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-sandbox-auto-deploy-recovery-state-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-recovery-state/state-summary.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Explain the Control outcome
+        if: always() && steps.freshness.outputs.fresh == 'true'
+        env:
+          CONTROL_STATUS: ${{ steps.plan.outputs.control_status }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          # The catch-all. Naming intermediate steps means remembering to add each
+          # new one, and forgetting is silent: the state re-bind, boundary proof
+          # and warm-pool gate all fail with apply merely SKIPPED.
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          # Branch on what the STEPS did, never on control_status alone: it is
+          # written from the plan's exit code BEFORE the contract checks, so a
+          # rejected transition already reads 'applied'. The trailing else means
+          # no state falls through to silence. Order matters once — the
+          # applied-and-verified arm precedes the generic job-failed arm, so a
+          # failed evidence upload after a good apply still reports honestly.
+          if [[ "$APPLY_OUTCOME" == 'failure' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control apply failed
+
+          > The estate may be partially applied. Do NOT re-run this job: dispatch
+          > `control-sandbox-update.yml` with `operation=plan` from current main and
+          > current live state, review the resulting diff, and apply it attended. The
+          > source-owned checker must explicitly accept the partial-retry shape before
+          > any further apply — including the next automatic one.
+          EOF
+          # A successful apply whose post-apply proof then failed is its OWN
+          # outcome, not a success. Branching on APPLY_OUTCOME alone would print
+          # "applied and verified" for it and skip every word of recovery
+          # guidance — during precisely the incident (live state not matching the
+          # plan that was just applied) where an operator most needs it.
+          elif [[ "$APPLY_OUTCOME" == 'success' && "$VERIFY_OUTCOME" != 'success' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control applied but the post-apply proof failed
+
+          > The apply itself succeeded; the refresh-enabled no-op or the live dark-boundary
+          > proof did not. Do NOT re-run this job. Dispatch `control-sandbox-update.yml`
+          > with `operation=verify` from current main to re-run the read-only convergence
+          > proof. If live state is not converged, dispatch a fresh `plan` and apply it
+          > attended before the next automatic run reaches this root.
+          EOF
+          elif [[ "$APPLY_OUTCOME" == 'success' && "$VERIFY_OUTCOME" == 'success' ]]; then
+            {
+              echo '## Sandbox Control: applied'
+              echo
+              echo 'The Control root had changes and they were applied and verified.'
+            } >>"$GITHUB_STEP_SUMMARY"
+          elif [[ "$PLAN_OUTCOME" == 'failure' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control did not apply
+
+          > The plan failed, or a source-owned contract check refused the transition —
+          > nothing was applied and live sandbox is unchanged. Read the plan step's log
+          > for which check refused, then dispatch `control-sandbox-update.yml` with
+          > `operation=plan` to review the diff attended. If the transition is intended,
+          > the checker must be taught to accept it before any apply, automatic or not.
+          EOF
+          elif [[ "$JOB_STATUS" != 'success' ]]; then
+            # A pre-apply step failed after a SUCCESSFUL plan. Each leaves apply
+            # merely SKIPPED, so without this arm a failed re-bind on a no-op
+            # plan printed the benign "already matched" while the job was red.
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control did not apply
+
+          > The plan succeeded but a pre-apply check failed — the state re-bind, the
+          > live dark-boundary proof, or the warm-pool gate. Nothing was applied and
+          > live sandbox is unchanged. Read the failed step's log; a moved state means
+          > something else wrote to the Control root during this run, which is worth
+          > understanding before the next automatic run plans against it.
+          EOF
+          elif [[ "$PLAN_OUTCOME" == 'success' && "$CONTROL_STATUS" == 'converged' ]]; then
+            {
+              echo '## Sandbox Control: converged'
+              echo
+              echo 'The Control root already matched this commit; nothing to apply.'
+            } >>"$GITHUB_STEP_SUMMARY"
+          else
+            # Unreachable by construction. Kept so no state falls through to an
+            # empty summary, and so an edit that breaks the enumeration
+            # announces itself instead of going quiet.
+            {
+              echo '## Sandbox Control: unrecognized outcome'
+              echo
+              echo "The job reports success but the outcome does not match any known state"
+              echo "(plan=\`${PLAN_OUTCOME}\` apply=\`${APPLY_OUTCOME}\` verify=\`${VERIFY_OUTCOME}\` status=\`${CONTROL_STATUS:-unset}\`)."
+              echo "Treat live Control as unverified and dispatch \`control-sandbox-update.yml\` with \`operation=verify\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
     # deploy-sandbox-qurl is in needs (#1634) so validation never runs against
@@ -3500,12 +3966,26 @@ jobs:
     # now ORDERS after deploy-sandbox-relay, but only the relay smoke and
     # deployment tracking gate on relay success. That keeps unrelated
     # integration/E2E/CSP validation visible when the relay leg is already red.
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl, deploy-sandbox-relay]
+    # deploy-sandbox-control is in needs for the same reason deploy-sandbox-qurl
+    # is: ORDER validation after it, so smoke observes a settled Control plane
+    # rather than racing an in-flight Hub/Authority apply — and so the Slack
+    # pipeline's `… → Control → Validate → Smoke` describes the real dependency
+    # rather than only the render order.
+    #
+    # Same order-but-don't-gate rule as qURL, for the same reason: a FAILED
+    # Control apply leaves a partially applied Control plane, and suppressing
+    # every other smoke assertion (server, AC, qURL — none of which route
+    # through the Hub) because of it trades one loud signal for no signal. The
+    # Control failure is already loud: red in Slack and in notify's
+    # DEPLOY_FAILED loop. Only 'cancelled' — indeterminate, run being torn
+    # down — skips validation.
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl, deploy-sandbox-relay, deploy-sandbox-control]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
       needs.deploy-sandbox-blue-green.result == 'success' &&
-      needs.deploy-sandbox-qurl.result != 'cancelled'
+      needs.deploy-sandbox-qurl.result != 'cancelled' &&
+      needs.deploy-sandbox-control.result != 'cancelled'
     runs-on: ubuntu-latest
     environment: sandbox
     # Overall budget covers the existing validation/integration/E2E phases, the
@@ -3882,6 +4362,11 @@ jobs:
       # failed relay roll should not be masked by a green build/blue-green.
       # Skips (success) cleanly while the relay is dark (deploy_relay=false).
       - deploy-sandbox-relay
+      # Control/Hub/Authority root. Before this leg existed, the Control root
+      # was reachable only by attended dispatch and appeared nowhere in this
+      # message, so it could sit behind main indefinitely with every Slack
+      # notification still reading fully green.
+      - deploy-sandbox-control
       - deploy-sandbox-validate
       - nhp-smoke-sandbox
     # Skip Slack when the waiter was cancelled (concurrency preempt or
@@ -3926,6 +4411,15 @@ jobs:
           SANDBOX_CELL1_BLUE_GREEN: ${{ needs.deploy-sandbox-cell1-blue-green.result }}
           SANDBOX_QURL: ${{ needs.deploy-sandbox-qurl.result }}
           SANDBOX_RELAY: ${{ needs.deploy-sandbox-relay.result }}
+          SANDBOX_CONTROL: ${{ needs.deploy-sandbox-control.result }}
+          # applied | converged | superseded. Distinguishes "Control changed and
+          # was applied" from "Control already matched main" — both are job
+          # successes, and collapsing them would make a leg that has silently
+          # stopped applying anything indistinguishable from a healthy one.
+          SANDBOX_CONTROL_STATUS: ${{ needs.deploy-sandbox-control.outputs.control_status }}
+          # 'failure' only when terraform apply itself failed. Anything else on
+          # a red Control leg means the failure landed before apply started.
+          SANDBOX_CONTROL_APPLY: ${{ needs.deploy-sandbox-control.outputs.apply_outcome }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
           # true when a new app image was built this run: either this commit
@@ -3997,7 +4491,9 @@ jobs:
           # Push events get a unique workflow-level group per run, but several
           # jobs hold shared cross-run groups to serialize the things that must
           # not interleave: the per-environment Packer AMI lock, and the sandbox
-          # infra / qURL / relay deploys. GitHub cancels the previously-pending
+          # infra / qURL / relay / Control deploys (Control shares the infra
+          # writer lock rather than holding its own). GitHub cancels the
+          # previously-pending
           # job in a concurrency group as soon as a newer one queues behind it,
           # so a cancelled leg on a push almost always means "a newer push to
           # this branch queued behind us" — not that anything broke.
@@ -4022,10 +4518,15 @@ jobs:
           # `cancel-in-progress: true` and its own notify-level suppression (see
           # the job `if:` above), which is a separate decision from #1082.
           # First match wins, and the order is the dependency cascade, so at
-          # most one of these is ever 'cancelled' in a single run: packer gates
-          # terraform-plan, which gates deploy-sandbox-infra, which gates both
-          # qURL and relay. A cancelled job leaves its dependents *skipped*, not
-          # cancelled — so naming the first match names the only one.
+          # most one of these is USUALLY 'cancelled' in a single run: packer
+          # gates terraform-plan, which gates deploy-sandbox-infra, which gates
+          # qURL, relay, and Control alike, and a cancelled job leaves its
+          # dependents *skipped* rather than cancelled. It is not a strict
+          # invariant — these legs hold different (and, for Control, shared)
+          # concurrency groups, so a newer push can in principle cancel more
+          # than one pending sibling. That only affects WHICH leg gets named:
+          # every one of them routes to the same run-level "preempted"
+          # classification, which is the fact being reported.
           PREEMPTED_LEG=""
           if [[ "$PACKER_RESULT" == "cancelled" ]]; then
             PREEMPTED_LEG="Packer AMI bake"
@@ -4035,6 +4536,12 @@ jobs:
             PREEMPTED_LEG="qURL service deploy"
           elif [[ "$SANDBOX_RELAY" == "cancelled" ]]; then
             PREEMPTED_LEG="relay deploy"
+          elif [[ "$SANDBOX_CONTROL" == "cancelled" ]]; then
+            # Control holds the shared deploy-sandbox-infra writer lock (it must
+            # not apply while cell0 does), so a newer run's infra job queuing
+            # behind it cancels this one. Benign for exactly the reason the
+            # others are: the superseding run runs this same leg.
+            PREEMPTED_LEG="Control deploy"
           fi
           # Every way this lookup can come up empty — a genuinely stranded run,
           # a rate-limited or 5xx `gh api`, a token blip, a jq regression, or a
@@ -4084,16 +4591,38 @@ jobs:
             fi
           fi
 
-          # Check if any sandbox deploy ran
+          # Check if any sandbox deploy ran.
+          #
+          # Control is tested separately because it is the one leg that runs
+          # when infra is SKIPPED. Keying solely on infra would drop the whole
+          # pipeline line on such a push, hiding a Control apply that happened.
           SANDBOX_DEPLOYED="false"
-          if [[ "$SANDBOX_INFRA" != "skipped" ]]; then
+          if [[ "$SANDBOX_INFRA" != "skipped" || "$SANDBOX_CONTROL" != "skipped" ]]; then
             SANDBOX_DEPLOYED="true"
           fi
+
+          # Control renders from its own status output when the job succeeded,
+          # so a converged no-op and a real apply are visibly different and a
+          # superseded leg does not claim a deploy it skipped. Any non-success
+          # result (failure, cancelled, skipped) falls through to the ordinary
+          # result emoji.
+          control_emoji() {
+            if [[ "$SANDBOX_CONTROL" != "success" ]]; then
+              status_emoji "$SANDBOX_CONTROL"
+              return
+            fi
+            case "$SANDBOX_CONTROL_STATUS" in
+              applied) echo ":white_check_mark:" ;;
+              converged) echo ":heavy_minus_sign:" ;;
+              superseded) echo ":fast_forward:" ;;
+              *) echo ":grey_question:" ;;
+            esac
+          }
 
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_RELAY") Relay → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_RELAY") Relay → $(control_emoji) Control → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
           fi
 
           # Determine overall status and header.
@@ -4145,7 +4674,7 @@ jobs:
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_CELL1_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_CELL1_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_CONTROL" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
@@ -4286,6 +4815,48 @@ jobs:
                 \"type\": \"mrkdwn\",
                 \"text\": \"*Sandbox:* $SANDBOX_STATUS\"
               }
+            }"
+          fi
+
+          # Unattended apply removed the human plan-review gate, so this message
+          # is the last chance for a person to notice a Hub/Authority/KMS/control-
+          # table change — and a green tick among green ticks is not noticing.
+          # A failed leg needs it MORE, since terraform may have mutated the
+          # estate before stopping. Split by whether apply STARTED: most red legs
+          # never reach apply, and claiming "partially applied" for those would
+          # contradict the job summary and spend the alarm on the benign case.
+          # The converged no-op stays quiet so the signal keeps meaning.
+          CONTROL_NOTE=""
+          if [[ "$SANDBOX_CONTROL" == "success" && "$SANDBOX_CONTROL_STATUS" == "applied" ]]; then
+            CONTROL_NOTE=":closed_lock_with_key: *Control plane changed* — the Connector Authority root applied on this push (no human plan review; gates from \`.github/control-sandbox-runtime-gates.json\`)."
+          elif [[ "$SANDBOX_CONTROL" == "failure" && "$SANDBOX_CONTROL_APPLY" == "skipped" ]]; then
+            CONTROL_NOTE=":lock: *Control deploy failed before applying* — a contract check or pre-apply proof refused it, so live sandbox is unchanged. See the Control job summary."
+          elif [[ "$SANDBOX_CONTROL" == "failure" && "$SANDBOX_CONTROL_APPLY" == "success" ]]; then
+            # terraform apply COMPLETED; a post-apply proof or the evidence
+            # capture is what failed. Still route the operator to attended
+            # recovery, but do not tell them the apply failed part-way — it
+            # didn't, the job summary says so, and a Slack note that contradicts
+            # the summary burns exactly the trust this note exists to earn.
+            CONTROL_NOTE=":closed_lock_with_key: *Control applied, but a post-apply proof failed* — \`terraform apply\` succeeded; the refresh-enabled no-op, the live boundary proof, or the evidence capture did not. Do NOT re-run; verify attended via \`control-sandbox-update.yml\` with \`operation=verify\`."
+          elif [[ "$SANDBOX_CONTROL" == "failure" ]]; then
+            # Polarity is deliberate: ONLY an explicit 'skipped' — apply
+            # provably never started — earns the reassuring message. A
+            # 'failure', an empty value because the output did not propagate off
+            # a failed job, or anything unrecognised lands here. Under-warning
+            # about a half-applied Control plane is the one error this message
+            # must not make.
+            CONTROL_NOTE=":closed_lock_with_key: *Control plane may be partially applied* — \`terraform apply\` of the Connector Authority root failed part-way. Do NOT re-run; see the Control job summary, then plan attended via \`control-sandbox-update.yml\`."
+          fi
+          if [[ -n "$CONTROL_NOTE" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"context\",
+              \"elements\": [
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"$CONTROL_NOTE\"
+                }
+              ]
             }"
           fi
 

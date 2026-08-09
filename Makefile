@@ -523,6 +523,9 @@ lint-workflows:
 	@bash tests/scripts/check-app-image-line-rendered_test.sh
 	@shellcheck scripts/check-packer-failure-surfaced.sh tests/lints/packer-failure-surfaced/run-fixtures.sh
 	@bash tests/lints/packer-failure-surfaced/run-fixtures.sh
+	@shellcheck scripts/check-control-leg-surfaced.sh tests/scripts/check-control-leg-surfaced_test.sh
+	@bash tests/scripts/check-control-leg-surfaced_test.sh
+	@python3 tests/scripts/test_control_sandbox_runtime_gates.py
 	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh

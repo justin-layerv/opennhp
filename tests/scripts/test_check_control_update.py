@@ -751,14 +751,58 @@ class WorkflowContractTests(unittest.TestCase):
             workflow.count("generate-connector-authority-runtime-contract.py"),
             3,
         )
+        # Three generator call sites (plan/apply/verify) plus one in the guard,
+        # which binds these same seven gate names to the committed
+        # .github/control-sandbox-runtime-gates.json before any AWS access. The
+        # generator count above stays at 3 and is what pins the contract-
+        # producing sites; this looser count would otherwise be the only thing
+        # standing between a fourth occurrence and a fifth, so assert the guard
+        # binding positively rather than trusting the number alone.
         self.assertEqual(
             workflow.count("--proof-mutation-controls-enabled"),
-            3,
+            4,
         )
+        self.assertIn("control-sandbox-runtime-gates.py check", workflow)
+        # The gate binding lives in `guard`, so it only BLOCKS anything while
+        # every AWS-touching job still depends on that job. Drop an edge and the
+        # binding still runs and still passes — it just stops gating, which is
+        # the failure mode no content assertion can see.
+        for job in ("plan", "apply", "verify"):
+            job_block = workflow.split(f"\n  {job}:\n", 1)[1].split("\n    steps:", 1)[0]
+            self.assertIn(
+                "needs: guard",
+                job_block,
+                f"{job} must depend on guard, or the gate binding does not gate it",
+            )
+        gate_binding = workflow.split(
+            "      - name: Bind dispatch gates to the committed gate file\n", 1
+        )[1]
+        for gate_flag in (
+            "--enable-runtime-functions",
+            "--hub-edge-enabled",
+            "--hub-worker-enabled",
+            "--proof-mutation-controls-enabled",
+            "--proof-policy-consumers-staged",
+            "--proof-policy-selected-color",
+            "--proof-policy-prepared-color",
+        ):
+            self.assertIn(gate_flag, gate_binding)
         self.assertNotIn("--proof-controller-role-arn", workflow)
         self.assertNotIn("AUTHORITY_PROOF_CONTROLLER_ROLE_ARN", workflow)
+        # Still exactly the three AWS-touching jobs (plan/apply/verify). The
+        # guard's checkout is source-only and deliberately carries no
+        # environment, so this count must NOT move with the checkout count below.
         self.assertEqual(workflow.count("environment: sandbox"), 3)
-        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        # Four checkouts now: plan, apply, verify, and the guard's source-only
+        # one for the gate-file binding. Pin the invariant rather than the
+        # number — EVERY checkout must decline credentials, so a fifth one added
+        # without persist-credentials: false fails here even though a bare count
+        # bumped to 4 would have let it through.
+        self.assertEqual(
+            workflow.count("uses: actions/checkout@"),
+            workflow.count("persist-credentials: false"),
+        )
+        self.assertEqual(workflow.count("persist-credentials: false"), 4)
         self.assertNotIn("persist-credentials: true", workflow)
         self.assertNotIn("ensure-control-otp-pepper.sh", workflow)
         self.assertNotIn("check-control-global-routing.sh", workflow)

@@ -13,7 +13,7 @@ on:
           - apply
           - verify
       enable_runtime_functions:
-        description: 'Step-4 runtime-slice gate. true emits authority_runtime_functions_enabled=true into the generated tfvars; false keeps the committed default (dark). Pass the SAME value to plan, apply, and verify — the apply job re-generates and byte-compares against the reviewed plan input.'
+        description: 'Step-4 runtime-slice gate. true emits authority_runtime_functions_enabled=true into the generated tfvars; false keeps the committed default (dark). Pass the SAME value to plan, apply, and verify — the apply job re-generates and byte-compares against the reviewed plan input. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -21,7 +21,7 @@ on:
           - 'true'
         default: 'false'
       hub_edge_enabled:
-        description: 'Step-5 Hub public UDP edge gate. true emits hub_edge_enabled=true into the generated tfvars; false keeps the committed default (dark). Pass the SAME value to plan, apply, and verify.'
+        description: 'Step-5 Hub public UDP edge gate. true emits hub_edge_enabled=true into the generated tfvars; false keeps the committed default (dark). Pass the SAME value to plan, apply, and verify. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -29,7 +29,7 @@ on:
           - 'true'
         default: 'false'
       hub_worker_enabled:
-        description: 'Step-5 Hub Fargate worker gate (slice 5b). true emits hub_worker_enabled=true into the generated tfvars; false keeps the committed default (dark). Requires hub_edge_enabled=true and a live authority runtime. Pass the SAME value to plan, apply, and verify.'
+        description: 'Step-5 Hub Fargate worker gate (slice 5b). true emits hub_worker_enabled=true into the generated tfvars; false keeps the committed default (dark). Requires hub_edge_enabled=true and a live authority runtime. Pass the SAME value to plan, apply, and verify. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -37,7 +37,7 @@ on:
           - 'true'
         default: 'false'
       proof_mutation_controls_enabled:
-        description: 'Sandbox-only dark MutateProofAgent capability. true adds exactly proof_controller capacity + ca-pm and emits the canonical proof owner/controller variables; it does not wire IA/RA/ICR or run proof. Requires enable_runtime_functions=true. Pass the SAME value to plan, apply, and verify.'
+        description: 'Sandbox-only dark MutateProofAgent capability. true adds exactly proof_controller capacity + ca-pm and emits the canonical proof owner/controller variables; it does not wire IA/RA/ICR or run proof. Requires enable_runtime_functions=true. Pass the SAME value to plan, apply, and verify. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -45,7 +45,7 @@ on:
           - 'true'
         default: 'false'
       proof_policy_consumers_staged:
-        description: 'Sandbox-only staging of read-only PROOF policy on a new IA/RA/ICR version. Both live aliases remain unchanged; governed activation is a separate required rollout. Requires proof_mutation_controls_enabled=true.'
+        description: 'Sandbox-only staging of read-only PROOF policy on a new IA/RA/ICR version. Both live aliases remain unchanged; governed activation is a separate required rollout. Requires proof_mutation_controls_enabled=true. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -53,7 +53,7 @@ on:
           - 'true'
         default: 'false'
       proof_policy_selected_color:
-        description: 'Sandbox proof rollout selector. Use only with a separately prepared READY color; selector applies must not retarget aliases.'
+        description: 'Sandbox proof rollout selector. Use only with a separately prepared READY color; selector applies must not retarget aliases. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -62,7 +62,7 @@ on:
           - 'green'
         default: 'none'
       proof_policy_prepared_color:
-        description: 'Inactive proof-policy color prepared by Terraform. Keep unchanged during a selector apply.'
+        description: 'Inactive proof-policy color prepared by Terraform. Keep unchanged during a selector apply. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
         required: false
         type: choice
         options:
@@ -123,7 +123,11 @@ jobs:
     name: Require main and exact operation contract
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    permissions: {}
+    # contents: read is the minimum the gate-file assertion below needs. The
+    # checkout is source-only and carries no credentials; this job still touches
+    # no AWS state and holds no writer lock.
+    permissions:
+      contents: read
     steps:
       - name: Check dispatch boundary
         env:
@@ -223,6 +227,42 @@ jobs:
               exit 1
               ;;
           esac
+
+      # The seven runtime gates are now committed in
+      # .github/control-sandbox-runtime-gates.json, because build-and-push.yml's
+      # unattended deploy-sandbox-control leg has to read them from somewhere
+      # that is not an operator's memory. That makes divergence the new failure
+      # mode: an attended dispatch that applies gates the file does not carry
+      # leaves live sandbox in a shape the very next main push silently reverts,
+      # and on these gates "revert" means tearing down the Hub or the Authority
+      # runtime. So bind the two paths to one another here, before any AWS
+      # access. To change a gate, change the file — in the same commit as the
+      # Terraform that needs it.
+      - name: Checkout exact dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind dispatch gates to the committed gate file
+        env:
+          ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
+          HUB_EDGE_ENABLED: ${{ inputs.hub_edge_enabled }}
+          HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
+          PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
+          PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
+          PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
+        run: |
+          .github/scripts/control-sandbox-runtime-gates.py check \
+            --enable-runtime-functions "$ENABLE_RUNTIME_FUNCTIONS" \
+            --hub-edge-enabled "$HUB_EDGE_ENABLED" \
+            --hub-worker-enabled "$HUB_WORKER_ENABLED" \
+            --proof-mutation-controls-enabled "$PROOF_MUTATION_CONTROLS_ENABLED" \
+            --proof-policy-consumers-staged "$PROOF_POLICY_CONSUMERS_STAGED" \
+            --proof-policy-selected-color "$PROOF_POLICY_SELECTED_COLOR" \
+            --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR"
 
   plan:
     name: Build immutable sandbox Control update plan

@@ -116,6 +116,13 @@ on:
       - "scripts/verify-relay-dmz-flow-evidence.py"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
+      - "scripts/check-control-leg-surfaced.sh"
+      # The gate file is not a script, but it is the input every Control deploy
+      # reads. An edit to it must re-fire the contract test here, because a gate
+      # file that no longer validates is how an automatic apply reaches
+      # Terraform with the dark defaults.
+      - ".github/control-sandbox-runtime-gates.json"
+      - ".github/scripts/control-sandbox-runtime-gates.py"
       - "scripts/check-app-image-line-rendered.sh"
       - "scripts/ssm-read-optional.sh"
       - "scripts/check-golden-vectors.sh"
@@ -988,6 +995,32 @@ jobs:
 
       - name: Check Packer Build AMI failures are surfaced in notify (#2252)
         run: bash scripts/check-packer-failure-surfaced.sh
+
+      # Same family as the packer fence above, for the sandbox Control leg. The
+      # Control root carries the Authority foundation and the Hub, and until the
+      # deploy-sandbox-control job existed it was reachable only by attended
+      # dispatch and appeared in no Slack message — so it could sit behind main
+      # indefinitely with every notification still green. Two of the assertions
+      # guard things nothing else would catch: that the job shares the
+      # deploy-sandbox-infra writer lock (Control and cell0 must never apply
+      # concurrently), and that it sources its runtime gates from the committed
+      # gate file rather than the dark Terraform defaults, which would tear the
+      # Hub down rather than deploy it. Fixtures run first so an
+      # extractor/assertion regression surfaces against synthetic inputs.
+      - name: Shellcheck + test the Control leg fence fixtures
+        run: |
+          shellcheck scripts/check-control-leg-surfaced.sh tests/scripts/check-control-leg-surfaced_test.sh
+          bash tests/scripts/check-control-leg-surfaced_test.sh
+
+      - name: Check the sandbox Control leg is wired and surfaced in notify
+        run: bash scripts/check-control-leg-surfaced.sh
+
+      # The gate file is the single source of truth for both the unattended
+      # deploy leg and the attended control-sandbox-update.yml dispatch. These
+      # cover its validation rules (which mirror that workflow's own guard) and
+      # the flag emission the deploy leg depends on.
+      - name: Test the committed Control runtime gate contract
+        run: python3 tests/scripts/test_control_sandbox_runtime_gates.py
 
       # Sibling of the packer fence above, different invariant family: that one
       # guards "a failure must surface"; this one guards "a success must be

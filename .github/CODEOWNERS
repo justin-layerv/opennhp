@@ -26,3 +26,29 @@
 /.github/workflows/promote-to-prod.yml              justin@layerv.ai
 /tests/scripts/test_promote_to_prod_gating.py       justin@layerv.ai
 /docs/runbooks/promote-to-prod-lambda-artifacts.md  justin@layerv.ai
+
+# Sandbox Control runtime gates. build-and-push.yml applies the Connector
+# Authority root (KMS keys, control tables, the OTP pepper, the Hub) unattended
+# on every qualifying main push, which deliberately removed the human
+# plan-review gate. Merging a change to the gate file IS the apply — it is on
+# on.push.paths, so the next push mutates live sandbox to match it — which
+# makes this file the one remaining human control point, and the natural
+# replacement for the review gate that was given up.
+#
+# The reader is owned alongside it because it is what decides whether a gate
+# file is valid at all: weaken its validation and a shape the guard would have
+# refused reaches Terraform. The fence and its fixtures are owned for the same
+# reason one step out: C5 (the shared writer lock), C6 (the gate-reader capture
+# form) and C7 (the fully-dark teardown refusal) are what keep the deploy leg's
+# safety logic from being edited away, and build-and-push.yml itself is too
+# broad to own.
+#
+# NOTE, so this is not mistaken for more than it is: as of 2026-08-09 main's
+# branch protection has require_code_owner_reviews=false and
+# enforce_admins=false, so these entries REQUEST review, they do not require it.
+# Making this a real gate is a branch-protection change, not a CODEOWNERS one.
+# See the prod-rollout ledger entry for that open decision.
+/.github/control-sandbox-runtime-gates.json         justin@layerv.ai
+/.github/scripts/control-sandbox-runtime-gates.py   justin@layerv.ai
+/scripts/check-control-leg-surfaced.sh              justin@layerv.ai
+/tests/scripts/check-control-leg-surfaced_test.sh   justin@layerv.ai
