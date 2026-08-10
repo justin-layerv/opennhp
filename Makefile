@@ -637,8 +637,8 @@ lint-workflows:
 .PHONY: lint-terraform-drift
 lint-terraform-drift:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running terraform-prod-drift detectors (#1324)...$(END_COLOUR)"
-	@python3 -c 'import hcl2' >/dev/null || { \
-		echo "$(COLOUR_RED)[OpenNHP] python-hcl2 missing. Install: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt$(END_COLOUR)"; \
+	@python3 -c 'import hcl2, pytest' >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] python-hcl2 or pytest missing. Install: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt$(END_COLOUR)"; \
 		exit 1; \
 	}
 	@if command -v shellcheck >/dev/null 2>&1; then \
@@ -649,6 +649,7 @@ lint-terraform-drift:
 	@./tests/lints/terraform-prod-drift/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-iam-coverage.py
 	@python3 .github/scripts/check-terraform-policy-conditions.py
+	@python3 -m pytest -q tests/scripts/test_auth0_not_terraform_managed.py
 	@python3 .github/scripts/check-connector-control-table-schemas.py
 	@python3 tests/scripts/test_check_connector_control_table_schemas.py
 	@bash tests/scripts/check-connector-authority-foundation_test.sh

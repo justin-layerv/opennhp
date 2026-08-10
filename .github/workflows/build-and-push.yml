@@ -1886,8 +1886,28 @@ jobs:
           cache: pip
           cache-dependency-path: .github/scripts/terraform-prod-drift-requirements.txt
 
-      - name: Install python-hcl2
+      - name: Install python-hcl2 and pytest
         run: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt
+
+      # Auth0 must stay out of Terraform (#3284) — a security decision, not a
+      # stylistic one. terraform-plan-pr.yml executes PR-head HCL, so a
+      # Terraform-managed Auth0 tenant would put a tenant-management credential
+      # inside a plan a PR author controls. docs/design/AUTH0_IDENTITY_POLICY.md is
+      # the policy; this fence is what makes it true, and until now nothing ran it.
+      #
+      # It belongs in *this* job rather than validate-workflows.yml because it
+      # parses the entire terraform tree: proving no auth0 resource exists anywhere
+      # means reading every .tf file, so a path-triggered workflow would need
+      # `terraform/**` to be honest about it. This job has no path gating at all
+      # (`if: github.event_name == 'pull_request'`), so the fence runs on every PR
+      # and cannot be bypassed by adding an auth0 resource to a file that some
+      # other trigger list happens not to watch.
+      #
+      # pytest, not unittest: this is the one fence written as bare `def test_*`
+      # functions, and unittest collects zero tests from it and exits "NO TESTS
+      # RAN". pytest is pinned alongside python-hcl2 in the requirements file above.
+      - name: Fence Auth0 out of Terraform
+        run: python3 -m pytest -q tests/scripts/test_auth0_not_terraform_managed.py
 
       - name: Shellcheck the fixture runners
         # validate-workflows.yml's actionlint -shellcheck only covers

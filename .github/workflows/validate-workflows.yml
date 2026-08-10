@@ -230,6 +230,46 @@ on:
       # need their own entry: they live under tests/lints/, which no glob reaches.
       - "tests/lints/ssm-read-failure/**"
       - "scripts/trigger-prod-deploy.sh"
+      # Inputs of the Python fences wired into the job below. Each fence compares
+      # two surfaces, so it has to fire when *either* moves — a fence watching
+      # only its own file is a fence that never runs on the edit that breaks it.
+      # The fences themselves ride tests/scripts/** above, and their workflow and
+      # .github/scripts inputs ride the .github globs above; this is the remainder.
+      #
+      # This list came from *running* each fence under an audit hook that records
+      # every file it opens, not from reading the source for quoted paths. The
+      # reading missed six of them, including three Go files and two cell1
+      # siblings reached via `path.parent / ...`, because a static scan cannot
+      # resolve a path the test composes at runtime.
+      #
+      # UDP edge readiness metrics: the probe, the Go constants it measures
+      # against, and the verifier scripts the readiness workflow runs.
+      - "endpoints/cmd/udp-edge-probe/main.go"
+      - "endpoints/server/constants.go"
+      - "nhp/core/constants.go"
+      - "scripts/udp-edge-flood.py"
+      - "scripts/verify-udp-edge-overlap.py"
+      - "scripts/verify-udp-edge-readiness.py"
+      - "terraform/modules/compute/udp_edge_metrics.py"
+      # The server and relay surfaces the UDP proof orchestrator contract reads.
+      - "endpoints/relay/relay.go"
+      - "endpoints/server/relay.go"
+      - "endpoints/server/msghandler.go"
+      - "endpoints/server/udpserver.go"
+      - "nhp/core/packet.go"
+      # Cell-registration parity reads every file in each cell root, not just
+      # main.tf. sandbox and prod already ride their own /** globs above; cell1
+      # gets the same treatment rather than an enumerated list that would go stale
+      # the moment the fence reads one more sibling.
+      - "terraform/environments/sandbox-cell1/**"
+      # A glob, not a file list: the runtime-attestation fence exists to catch
+      # drift in the SHA-256-pinned collector asset or the launch-template binding
+      # beside it, and an enumerated list would miss a newly added file — the
+      # thing it is looking for.
+      - "terraform/modules/runtime-attestation-store/**"
+      # The FRPS user-data template the same fence reads for its boot-capture
+      # binding.
+      - "terraform/modules/qurl-reverse-tunnel-server/user_data.sh.tpl"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -950,6 +990,149 @@ jobs:
         run: |
           shellcheck scripts/check-sandbox-cell1-vpc-relocation-preflight.sh tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
           bash tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
+
+      # The five steps below run fourteen Python fences that were registered
+      # nowhere — not in the Makefile, not in any workflow — so nothing had ever
+      # run them on a PR. That is a step past #3790, which wired the suites the
+      # Makefile at least knew about; an audit for suites referenced by *neither*
+      # turned these up. All fourteen passed unmodified on the tree they were
+      # added to, and each was mutation-tested before being wired, because a step
+      # that cannot fail is worse than no step.
+      #
+      # Grouped by what they guard rather than one step per file, so a failure
+      # names a subsystem. Modules are listed by dotted name (not path) to match
+      # the two UDP-proof steps above; test_udp_proof_deployment_contract is
+      # deliberately absent everywhere below — the step above owns it, and the
+      # comment there records why duplicating it adds nothing.
+      - name: Test UDP proof controller, evidence and pin contracts
+        run: >-
+          python3 -m unittest -v
+          tests.scripts.test_udp_proof_accepts_main_canary
+          tests.scripts.test_udp_proof_controller_attestation
+          tests.scripts.test_udp_proof_controller_bundle
+          tests.scripts.test_udp_proof_orchestrator_contract
+          tests.scripts.test_udp_proof_runtime_evidence
+          tests.scripts.test_udp_proof_server_receipt
+          tests.scripts.test_no_reintroduced_pins
+
+      # Terraform-side source contracts. Each compares a Terraform surface against
+      # the thing that must agree with it — the cell roots against what an assigned
+      # agent needs on arrival, the cell0 publisher boundary against its module, the
+      # first-apply checker's normalization kinds against the apply workflow's
+      # `case` allow-list, and the runtime-attestation collector against the
+      # launch-template binding that SHA-256 pins it.
+      - name: Test Terraform source contracts
+        run: >-
+          python3 -m unittest -v
+          tests.scripts.test_cell_registration_parity
+          tests.scripts.test_sandbox_cell0_qurl_service_publisher
+          tests.scripts.test_apply_admits_every_checker_kind
+          tests.scripts.test_runtime_attestation_collector
+
+      # The Auth0 Terraform fence is deliberately NOT here. It parses the whole
+      # terraform tree, so its trigger would have to be `terraform/**` — every
+      # terraform PR would run this entire job to serve one fence. It lives in
+      # build-and-push.yml's terraform-prod-drift-lint job instead, which already
+      # runs on every PR with python-hcl2 pinned and pip-cached. Same reason the
+      # ErrorCodeToError fence sits in ubuntu-build.yml: a fence belongs wherever
+      # it can actually fire.
+
+      # `cmd | grep -q` under `set -o pipefail` is a false negative on large input:
+      # grep -q exits at its first match, the writer takes EPIPE, and pipefail
+      # promotes that to a failed pipeline — so the check "passes" only while its
+      # input stays small. This fence scans the workflows and composite actions for
+      # the pattern.
+      - name: Fence pipefail grep -q pipelines
+        run: python3 -m unittest -v tests.scripts.test_no_pipefail_grep_q_pipelines
+
+      # UDP edge readiness metrics: the probe, the Go-side constants it measures
+      # against, and the verifier scripts the readiness workflow runs must stay in
+      # agreement, or the gate reports readiness it never checked.
+      - name: Test UDP edge metric contracts
+        run: python3 -m unittest -v tests.scripts.test_udp_edge_metrics
+
+      # Every module above must contribute at least one test.
+      #
+      # `python3 -m unittest modA modB` exits 0 as long as the *combined* suite is
+      # non-empty, so one module that stops being discovered — a renamed TestCase,
+      # a class demoted to plain functions — contributes nothing while its step
+      # stays green. That is the failure this whole line of work is about, one
+      # level down: not a step that never runs, but a step that runs and asserts
+      # nothing. (A module that is renamed or deleted outright is already loud:
+      # unittest turns the load error into a _FailedTest.)
+      #
+      # The module list is parsed out of this workflow rather than restated here,
+      # so adding a fence above cannot forget to register it below — a hand-kept
+      # copy would be one more thing to drift. The floor is a canary: if a
+      # refactor stops the regex matching, the count collapses and this fails
+      # loudly instead of vacuously passing on an empty list.
+      - name: Every Python fence must contribute at least one test
+        run: |
+          python3 - <<'GUARD'
+          import os
+          import re
+          import sys
+          import unittest
+          from pathlib import Path
+
+          # Put the repo root on sys.path explicitly. `python3 - <<EOF` already
+          # puts cwd there, but `python3 some_file.py` puts the *script's*
+          # directory there instead, and with tests/ an implicit namespace package
+          # that difference decides whether the fence modules import at all. It
+          # matters more than it looks: a module that fails to import still loads
+          # as a single _FailedTest, so every module would count as "non-empty"
+          # and this guard would pass while checking nothing — the exact failure
+          # it exists to catch. Pin it here rather than depend on how someone
+          # invokes it later.
+          sys.path.insert(0, os.getcwd())
+
+          workflow = Path(".github/workflows/validate-workflows.yml").read_text()
+          # Only names with a file behind them. The regex sees the whole workflow,
+          # comments included, so a prose mention of a module-shaped name would
+          # otherwise be loaded as a phantom fence and fail this step. (It did,
+          # while this guard was being written.) A step naming a module that does
+          # not exist is already loud on its own.
+          modules = sorted(
+              name
+              for name in set(re.findall(r"\btests\.scripts\.[A-Za-z0-9_]+", workflow))
+              if Path("tests/scripts", name.split(".")[-1] + ".py").is_file()
+          )
+
+          FLOOR = 15
+          if len(modules) < FLOOR:
+              sys.exit(
+                  f"found only {len(modules)} fence modules in this workflow "
+                  f"(expected at least {FLOOR}) — the parse above is broken, "
+                  f"not the fences: {modules}"
+              )
+
+          empty = []
+          broken = []
+          for module in modules:
+              # A fresh loader per module: loader.errors accumulates, and a load
+              # error is the one case where countTestCases() lies (it reports the
+              # _FailedTest as a test).
+              loader = unittest.TestLoader()
+              count = loader.loadTestsFromName(module).countTestCases()
+              if loader.errors:
+                  broken.append(module)
+                  continue
+              print(f"{count:5d}  {module}")
+              if count == 0:
+                  empty.append(module)
+
+          if broken:
+              sys.exit(
+                  "these modules failed to load, so their test count proves "
+                  "nothing: " + ", ".join(broken)
+              )
+          if empty:
+              sys.exit(
+                  "these modules contribute zero tests, so the step running them "
+                  "cannot fail: " + ", ".join(empty)
+              )
+          print(f"\nok: {len(modules)} fence modules, all non-empty")
+          GUARD
 
       # Two cross-module lockstep contracts that surfaced as #1976
       # cutover follow-ups (PR #2141): the Go-side

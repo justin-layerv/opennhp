@@ -4,3 +4,13 @@
 #   - Makefile (lint-terraform-drift target — install hint)
 # Bump in lockstep with python-hcl2 upstream releases.
 python-hcl2==8.1.2
+
+# pytest is here so the terraform-prod-drift-lint job can run the Auth0 Terraform
+# fence (tests/scripts/test_auth0_not_terraform_managed.py), the one fence in the
+# repo written as bare `def test_*` functions rather than unittest.TestCase.
+# Pinned, not floating: that fence's whole guarantee rests on pytest's collection
+# and exit semantics — exit 5 on zero collected is what stops a future rename from
+# turning it into a silent no-op — and a major bump could move either. Listed here
+# rather than installed inline so it shares the job's pip cache key, which is
+# keyed on this file.
+pytest==9.1.1
