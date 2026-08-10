@@ -60,6 +60,15 @@ const (
 // this counter.
 const unfragmentedUDPResponseCeiling = 1472
 
+// ipv6MinimumUnfragmentedCeiling is the stricter bound: 1280 - 40 IPv6 - 8 UDP.
+// It is what qurl-go enforces on receipt as nativeudp.maxUnfragmentedPayload,
+// and what the assignment authority now refuses to exceed when it mints a
+// reply. The outcome metric above deliberately stays on the IPv4 bound, since
+// that is the one whose breach means the datagram cannot cross ANY path; this
+// value is the target the size tests hold the assignment reply to, so a reply
+// between the two is caught in CI rather than only on an IPv6-minimum segment.
+const ipv6MinimumUnfragmentedCeiling = 1232
+
 // responseIsOversize is the exact predicate handlePacket applies. A payload of
 // exactly the ceiling still fits (1472 + 8 UDP + 20 IP = 1500), so the
 // comparison is strictly greater-than, and it lives here so the boundary is

@@ -1,70 +1,113 @@
 package connectorhub
 
 import (
+	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	conformance "github.com/layervai/qurl-conformance"
+
+	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
-// TestAssignmentLRTSizeBudgetIsDeliverable is the regression test for the
-// sandbox enrollment black hole, asserted where the defect lives: the wire
-// contract, not either implementation.
-//
-// Measured against the deployed sandbox Hub on 2026-08-08. A client sent 14
-// datagrams; the Hub recorded 4 challenge_sent, 5 response_sent, 5
-// replay_rejected, every other outcome zero, write_failed zero. A null control
-// window with no probe traffic recorded zero on every outcome, so that
-// accounting is exact. The client received all four challenges (340-342 bytes)
-// and none of the five replies. An unregistered credential over the identical
-// path got its 302-byte 52106 rejection back immediately.
-//
-// The live IssueAssignment body is 1426 bytes, 996 of it assignment_ticket,
-// sealing to roughly 1682 bytes on the wire. The Hub sits behind a Network Load
-// Balancer, and an NLB does not forward fragmented UDP. The kernel fragments,
-// the middle discards it, and the write still succeeds — which is exactly why
-// the Hub records response_sent with write_failed zero while nothing arrives.
-//
-// Both implementations conform. qurl-go and nhp/core interoperate cleanly on
-// loopback (8/8 unique packets, 4/4 cookie proofs accepted) and agree on the
-// proof flag and both pinned KATs. What is wrong is that the contract licenses
-// an LRT packet far larger than the deployed transport can carry.
-//
-// The delivery failure itself is fixed, on the producer side: layervai/qurl-
-// service#1367 moved the signed ticket off the wire behind a short handle and
-// made the Connector Authority refuse to encode a reply over the unfragmented
-// bound, so a real reply now seals to about 817 bytes.
-//
-// What this test asserts is not fixed. The CONTRACT still licenses a 4096-byte
-// LRT packet, which means the deliverability of an assignment reply rests
-// entirely on one producer choosing to check its own output. A second producer,
-// or a regression in that check, reopens exactly this hole. Closing it needs
-// qurl-conformance to lower NHPPacketMaxBytes to the unfragmented bound.
-//
-// It stays SKIPPED rather than red because it would fail on a contract this
-// repository does not own. Un-skip it in the change that lowers that ceiling.
-func TestAssignmentLRTSizeBudgetIsDeliverable(t *testing.T) {
-	t.Skip("KNOWN GAP: the assignment contract permits a 4096-byte LRT packet against " +
-		"a 1472-byte IPv4 unfragmented ceiling. The producer now enforces the bound " +
-		"itself (qurl-service#1367); un-skip when qurl-conformance lowers the contract.")
-
-	file, err := conformance.AssignmentTicket()
-	if err != nil {
-		t.Fatalf("load assignment-ticket contract: %v", err)
+// assignmentSuccessCarrying returns the authority's IssueAssignment success
+// envelope with assignment_ticket replaced by the supplied value. Everything
+// else stays the released golden, so the envelope remains exactly what strict
+// decoding accepts; only the one field whose size actually varies in production
+// is substituted.
+func assignmentSuccessCarrying(t *testing.T, assignmentTicket string) []byte {
+	t.Helper()
+	golden := authorityVectors(t).
+		Operations[conformance.ConnectorAuthorityOperationIssueAssignment].SuccessGolden.BodyJSON
+	const placeholder = `"conformance-account-assignment-ticket-0001"`
+	if !strings.Contains(golden, placeholder) {
+		t.Fatalf("golden no longer carries the placeholder ticket; update this helper")
 	}
-	maxPacket := file.Contract.NHPPacketMaxBytes
+	return []byte(strings.Replace(golden, placeholder, `"`+assignmentTicket+`"`, 1))
+}
 
-	t.Logf("contract NHP packet max   = %d bytes", maxPacket)
-	t.Logf("IPv4 unfragmented ceiling = %d bytes", unfragmentedUDPResponseCeiling)
+// TestAssignmentLRTFitsOneUnfragmentedDatagram is the regression test for the
+// enrollment black hole, and it measures the thing that actually broke: the
+// size of the sealed datagram leaving the Hub.
+//
+// Nothing here is simulated. A real agent device completes the cookie
+// challenge over a real UDP socket, the real worker calls the authority, seals
+// the reply through the real NHP_LRT path, and writes it back; the assertion is
+// on the bytes the client receives.
+//
+// Measured against deployed sandbox on 2026-08-08, the failure this prevents: a
+// 1682-byte reply was fragmented by the kernel, discarded by the NLB, and still
+// recorded by the Hub as response_sent with write_failed zero, so the agent
+// waited out its ticket and no counter anywhere said why.
+//
+// The second subtest is the load-bearing one. A test that only asserts today's
+// reply fits would have passed all through the outage, because no fixture ever
+// carried a production-sized ticket. Sealing the pre-handle shape proves this
+// test detects the defect rather than merely coexisting with its absence.
+func TestAssignmentLRTFitsOneUnfragmentedDatagram(t *testing.T) {
+	sealEnrollReply := func(t *testing.T, assignmentTicket string) int {
+		t.Helper()
+		authority := &fakeHubAuthority{issueResponse: assignmentSuccessCarrying(t, assignmentTicket)}
+		f := newWorkerFixtureWithAuthority(t, authority)
+		// The assignment golden carries a placeholder credential; the enroll
+		// codec requires the canonical one or the request is refused as 52109
+		// before the authority is ever called.
+		f.request = []byte(strings.Replace(
+			assignmentVectors(t).InitialAssignment.Request.BodyJSON,
+			conformance.AgentAssignmentBootstrapCredentialFixture,
+			authorityVectors(t).Fixtures.Credential, 1,
+		))
 
-	if maxPacket > unfragmentedUDPResponseCeiling {
-		t.Fatalf("the assignment contract permits a %d-byte LRT packet, %d bytes beyond the "+
-			"%d-byte IPv4 unfragmented ceiling.\n"+
-			"A conforming producer may therefore emit a reply an NLB silently discards while "+
-			"its own write succeeds and it records response_sent. Either lower the contract "+
-			"ceiling to the unfragmented bound, or stop fronting the Hub with a transport "+
-			"that drops fragments.",
-			maxPacket, maxPacket-unfragmentedUDPResponseCeiling, unfragmentedUDPResponseCeiling)
+		cookie, _ := f.challenge(t, 4001)
+		proof := f.sealLST(t, 4002, &cookie)
+		clear(cookie[:])
+		f.send(t, proof)
+		wire := f.read(t, 2*time.Second)
+
+		// Prove it is the assignment reply and that it decrypts, so a truncated
+		// or unrelated datagram cannot pass as a small one.
+		ppd := f.decrypt(t, wire, core.NHP_LRT)
+		if !json.Valid(ppd.BodyMessage) || !bytes.Contains(ppd.BodyMessage, []byte(`"nhp_udp_endpoint"`)) {
+			t.Fatalf("sealed datagram is not an assignment LRT: %s", ppd.BodyMessage)
+		}
+		return len(wire)
 	}
+
+	t.Run("a handle-bearing reply fits with room to spare", func(t *testing.T) {
+		handle := "ath_" + strings.Repeat("x", 22)
+		sealed := sealEnrollReply(t, handle)
+		t.Logf("handle reply seals to %d bytes (IPv6-minimum ceiling %d, IPv4 %d)",
+			sealed, ipv6MinimumUnfragmentedCeiling, unfragmentedUDPResponseCeiling)
+
+		if responseIsOversize(sealed) {
+			t.Fatalf("sealed datagram is %d bytes, over the %d-byte IPv4 ceiling",
+				sealed, unfragmentedUDPResponseCeiling)
+		}
+		// The stricter bound qurl-go enforces on receipt. Meeting only the IPv4
+		// one would still be undeliverable across an IPv6-minimum segment.
+		if sealed > ipv6MinimumUnfragmentedCeiling {
+			t.Fatalf("sealed datagram is %d bytes, over the %d-byte IPv6-minimum ceiling",
+				sealed, ipv6MinimumUnfragmentedCeiling)
+		}
+	})
+
+	t.Run("the pre-handle reply this replaced does not fit", func(t *testing.T) {
+		// The signed qat1 token the wire used to carry. If a change ever puts a
+		// ticket-sized value back into assignment_ticket, the subtest above
+		// starts failing -- this one proves that is a real detection and not an
+		// accident of the fixture being unrepresentative.
+		token := "qat1." + strings.Repeat("x", 990)
+		sealed := sealEnrollReply(t, token)
+		t.Logf("pre-handle reply seals to %d bytes", sealed)
+
+		if !responseIsOversize(sealed) {
+			t.Fatalf("a %d-byte reply carrying a %d-character ticket was judged deliverable; "+
+				"this test can no longer detect the defect it exists for",
+				sealed, len(token))
+		}
+	})
 }
 
 // TestGoldenAssignmentEnvelopeIsNotRepresentativeOfProduction records why every
