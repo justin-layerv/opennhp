@@ -962,30 +962,6 @@ jobs:
           shellcheck scripts/check-sandbox-cell1-vpc-relocation-preflight.sh tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
           bash tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 
-      # The five steps below run fourteen Python fences that were registered
-      # nowhere — not in the Makefile, not in any workflow — so nothing had ever
-      # run them on a PR. That is a step past #3790, which wired the suites the
-      # Makefile at least knew about; an audit for suites referenced by *neither*
-      # turned these up. All fourteen passed unmodified on the tree they were
-      # added to, and each was mutation-tested before being wired, because a step
-      # that cannot fail is worse than no step.
-      #
-      # Grouped by what they guard rather than one step per file, so a failure
-      # names a subsystem. Modules are listed by dotted name (not path) to match
-      # the two UDP-proof steps above; test_udp_proof_deployment_contract is
-      # deliberately absent everywhere below — the step above owns it, and the
-      # comment there records why duplicating it adds nothing.
-      - name: Test UDP proof controller, evidence and pin contracts
-        run: >-
-          python3 -m unittest -v
-          tests.scripts.test_udp_proof_accepts_main_canary
-          tests.scripts.test_udp_proof_controller_attestation
-          tests.scripts.test_udp_proof_controller_bundle
-          tests.scripts.test_udp_proof_orchestrator_contract
-          tests.scripts.test_udp_proof_runtime_evidence
-          tests.scripts.test_udp_proof_server_receipt
-          tests.scripts.test_no_reintroduced_pins
-
       # Terraform-side source contracts. Each compares a Terraform surface against
       # the thing that must agree with it — the cell roots against what an assigned
       # agent needs on arrival, the cell0 publisher boundary against its module, the
@@ -1069,7 +1045,19 @@ jobs:
               if Path("tests/scripts", name.split(".")[-1] + ".py").is_file()
           )
 
-          FLOOR = 15
+          # Lowered from 15 to 6 after #3799 removed the attended UDP proof.
+          #
+          # Note the arithmetic: `modules` is filtered by is_file(), so names of
+          # already-deleted modules were NEVER counted -- deleting this step's
+          # names does not move the number. The count fell because #3799 deleted
+          # fence FILES that OTHER, surviving steps still name; those stopped
+          # qualifying.
+          #
+          # This floor only guards against the regex above silently matching
+          # nothing. It is not an assertion about how many fences the repo ought
+          # to have, so it tracks reality rather than the other way round. 6 is
+          # the true current count and still catches a collapse to 0.
+          FLOOR = 6
           if len(modules) < FLOOR:
               sys.exit(
                   f"found only {len(modules)} fence modules in this workflow "
