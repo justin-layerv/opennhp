@@ -72,6 +72,9 @@ RESOLVE_ACTIVE_TAG="$SCRIPT_DIR/../.github/scripts/resolve-active-image-tag.sh"
 # Script state
 PREFLIGHT_FAILED=0
 declare -a WARNINGS=()
+# Parameters whose read errored rather than returning a value. A non-empty
+# list means the state below is incomplete and must not be acted on.
+declare -a SSM_READ_FAILED=()
 
 # SSM parameter paths — centralized for easy maintenance if paths change
 # Sandbox (AWS_PROFILE=layerv)
@@ -113,16 +116,125 @@ warn() { echo -e "  ${YELLOW}[WARN]${NC} $1" >&2; }
 info() { echo -e "         $1" >&2; }
 header() { echo -e "\n  ${BOLD}${CYAN}$1${NC}" >&2; echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 ${#1}))${NC}" >&2; }
 
-# read_ssm — read an SSM parameter from a given AWS profile
-# Returns the parameter value, or empty string on failure
+# Scratch file holding one command's stderr. Captured separately from the value
+# rather than merged with 2>&1: the AWS CLI can emit a deprecation or
+# credential-source warning on an otherwise-successful call, and splicing that
+# into the parameter value would fail the downstream SHA check as "corrupted" —
+# the exact misdiagnosis this code exists to prevent.
+SSM_ERR_FILE="$(mktemp)"
+trap 'rm -f "$SSM_ERR_FILE"' EXIT
+
+# read_ssm — read one SSM parameter, distinguishing "absent" from "unreadable".
+#
+# This used to be `... 2>/dev/null || echo ""`, which collapsed every failure —
+# throttling, a timeout, expired credentials, a denied permission — into the
+# same empty string a genuinely absent parameter produces. Downstream that
+# became "(not set)" and then a hard failure reading
+# "SSM parameter may be corrupted", sending the operator to investigate
+# corruption that did not exist. Observed 2026-08-08 during an AWS slow period:
+# /sandbox/nhp/server/active-color read empty twice and aborted the preflight,
+# then returned "green" on retry.
+#
+# ParameterNotFound is the only failure that legitimately means "absent", and
+# the only one that still returns empty with exit 0. Any other failure exits 1
+# and prints the AWS error in place of the value, for the caller to record.
+#
+# MUST be called from a condition context — `if out=$(read_ssm ...)`, as
+# read_into does — never as a bare `out=$(read_ssm ...)`. The script runs under
+# set -e, which a bare assignment from a failing command substitution would
+# trip, exiting before `status=$?` and before the classification below: a failed
+# read would abort the script instead of being reported as unreadable, silently
+# defeating the whole point of this function.
+#
+# The absent/unreadable split keys off the AWS CLI's error text, the only signal
+# the CLI gives here. Were AWS to reword it, a genuinely absent optional
+# parameter would be classed unreadable and trip the gate — noisy, but the
+# fail-closed direction.
 read_ssm() {
-    local profile="$1" param="$2"
-    AWS_PROFILE="$profile" aws ssm get-parameter \
+    local profile="$1" param="$2" out status err
+    out=$(AWS_PROFILE="$profile" aws ssm get-parameter \
         --name "$param" \
         --query "Parameter.Value" \
         --output text \
         --region "$REGION" \
-        --no-cli-pager 2>/dev/null || echo ""
+        --no-cli-pager 2>"$SSM_ERR_FILE")
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        printf '%s' "$out"
+        return 0
+    fi
+    # Match across the whole of stderr rather than its first line. The CLI emits
+    # its TLS/import-time warnings before the API error, so reading only line 1
+    # finds the warning and misses the ParameterNotFound behind it — turning a
+    # merely absent parameter into a blocked promote, on the same warning class
+    # this function exists to keep out of the value.
+    if grep -q 'ParameterNotFound' "$SSM_ERR_FILE"; then
+        return 0
+    fi
+    # Report the API error for the same reason, not whatever warning happens to
+    # come first. Falls back to the last line if the CLI ever drops the prefix.
+    err="$(grep -m1 'An error occurred' "$SSM_ERR_FILE" || tail -1 "$SSM_ERR_FILE")"
+    printf '%s' "${err:-aws ssm get-parameter exited ${status} with no stderr}"
+    return 1
+}
+
+# read_into — read one parameter into a named variable, in the *parent* shell.
+#
+# read_ssm hands the value back on stdout, so every call is a command
+# substitution, and a command substitution is a subshell. A failure recorded
+# inside that subshell dies with it, so the recording has to happen out here, in
+# the shell that owns SSM_READ_FAILED. An unreadable parameter leaves the
+# variable empty, exactly as an absent one does — the gate below, not the value,
+# is what tells those two apart.
+read_into() {
+    local var="$1" profile="$2" param="$3" out
+    if out=$(read_ssm "$profile" "$param"); then
+        printf -v "$var" '%s' "$out"
+    else
+        SSM_READ_FAILED+=("${param}: ${out}")
+        printf -v "$var" '%s' ""
+    fi
+}
+
+# resolve_into — resolve a blue/green active tag into a named variable.
+#
+# Same parent-shell requirement as read_into. The resolver fails closed on both
+# an unreadable parameter and an unexpected active-color, and only the first is
+# a transient AWS fault; it labels the read case "Failed to read ... from SSM",
+# so match that and leave every other failure on the "(not set)" path, where a
+# genuinely bad active-color still reads as bad state.
+#
+# The profile is fixed to layerv rather than taken as a parameter: the resolver
+# accepts only the sandbox and sandbox-cell1 namespaces (blue/green lives
+# nowhere else — prod is canary on a single slot), and both are in the sandbox
+# account. Take a profile argument here if that ever stops being true, or this
+# silently resolves a tag from the wrong account.
+resolve_into() {
+    local var="$1" environment="$2" component="$3" out err recorded=0
+    if out=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
+        bash "$RESOLVE_ACTIVE_TAG" "$environment" "$component" 2>"$SSM_ERR_FILE"); then
+        printf -v "$var" '%s' "$out"
+    else
+        printf -v "$var" '%s' ""
+        # head -1 is sufficient here, unlike in read_ssm: what lands in this
+        # file is the resolver's own stderr, and the resolver emits exactly one
+        # ::error:: line. The raw CLI stderr — where a warning could precede the
+        # error — went into the resolver's private scratch file, not this one.
+        err="$(head -1 "$SSM_ERR_FILE")"
+        if [[ "$err" == *"Failed to read"* ]]; then
+            SSM_READ_FAILED+=("${environment} ${component} active tag: ${err#*::error::}")
+            recorded=1
+        fi
+    fi
+    # Unlike the promote-to-prod.yml caller (which adds 2>/dev/null because its
+    # ::error:: output renders as CI annotations), we let the resolver's stderr
+    # through: this is an interactive operator tool, so naming the specific
+    # failure cause (which active-color/slot read failed, and why) inline is
+    # worth more than cosmetic quiet. Skip it once the line is already bound for
+    # the gate summary below, so the operator reads each failure once.
+    if [ "$recorded" -eq 0 ]; then
+        cat "$SSM_ERR_FILE" >&2
+    fi
 }
 
 # time_ago — convert ISO 8601 timestamp to human-readable relative time
@@ -165,9 +277,14 @@ commit_subject() {
     git log -1 --format="%s" "$1" 2>/dev/null || echo "(unknown)"
 }
 
-# Audit log — append deployment events to a local log file
+# Audit log — append deployment events to a local log file. Both steps are
+# best-effort: a home directory we cannot write is not a reason to block a
+# release. Spelled as if/then rather than `touch && chmod || true`, which reads
+# as if-then-else but runs the fallback when *either* command fails (SC2015).
 AUDIT_LOG="${HOME}/.nhp-deploy.log"
-touch "$AUDIT_LOG" && chmod 600 "$AUDIT_LOG" 2>/dev/null || true
+if touch "$AUDIT_LOG"; then
+    chmod 600 "$AUDIT_LOG" 2>/dev/null || true
+fi
 OPERATOR=""
 
 get_operator() {
@@ -260,49 +377,53 @@ fi
 header "READING DEPLOYMENT STATE"
 
 # Sandbox (profile=layerv)
-SANDBOX_COMMIT=$(read_ssm "layerv" "$SSM_SANDBOX_COMMIT")
-SANDBOX_DEPLOYED_AT=$(read_ssm "layerv" "$SSM_SANDBOX_DEPLOYED_AT")
-SANDBOX_STATE=$(read_ssm "layerv" "$SSM_SANDBOX_STATE")
+read_into SANDBOX_COMMIT "layerv" "$SSM_SANDBOX_COMMIT"
+read_into SANDBOX_DEPLOYED_AT "layerv" "$SSM_SANDBOX_DEPLOYED_AT"
+read_into SANDBOX_STATE "layerv" "$SSM_SANDBOX_STATE"
 # Server and AC are blue/green-managed: sandbox alternates the active color on
 # every deploy, and the LIVE tag lives in the active color's slot. Reading
 # image-tag (the blue slot) unconditionally would promote the standby (stale)
 # image whenever active=green. Resolve via the canonical active-color → slot
 # resolver instead. It exits non-zero (fail-closed) on a read error or an
-# unexpected/corrupt active-color, so `|| echo ""` maps any failure to "" →
+# unexpected/corrupt active-color, and resolve_into maps either to "" →
 # "(not set)" → a clean preflight fail rather than promoting a guessed/stale
-# tag. The resolver omits --region, so we pin it via env: set BOTH AWS_REGION
-# and AWS_DEFAULT_REGION (AWS precedence is --region > AWS_REGION >
+# tag; it additionally records the read-error case in SSM_READ_FAILED so a
+# transient AWS fault is reported as unreadable rather than as corrupt state.
+# The resolver omits --region, so resolve_into pins it via env: it sets BOTH
+# AWS_REGION and AWS_DEFAULT_REGION (AWS precedence is --region > AWS_REGION >
 # AWS_DEFAULT_REGION), so an operator's ambient AWS_REGION can't silently send
 # only these two reads to a different region while the rest of the script's
 # explicit --region calls stay on us-east-2.
 # (QURL/QRTS below are single-tag, not blue/green; prod is canary — read directly.)
-#
-# Unlike the promote-to-prod.yml caller (which adds 2>/dev/null because its
-# ::error:: output renders as CI annotations), we intentionally let the
-# resolver's stderr through: this is an interactive operator tool, so showing
-# the specific failure cause (which active-color/slot read failed, and why)
-# inline is worth more than cosmetic quiet — the gating signal is still the
-# exit code, which `|| echo ""` turns into a clean "(not set)" preflight fail.
-SANDBOX_SERVER_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" bash "$RESOLVE_ACTIVE_TAG" sandbox server || echo "")
-SANDBOX_AC_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" bash "$RESOLVE_ACTIVE_TAG" sandbox ac || echo "")
-SANDBOX_QURL_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QURL_TAG")
-SANDBOX_QRTS_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QRTS_TAG")
-SANDBOX_RELAY_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_RELAY_TAG")
+resolve_into SANDBOX_SERVER_TAG sandbox server
+resolve_into SANDBOX_AC_TAG sandbox ac
+read_into SANDBOX_QURL_TAG "layerv" "$SSM_SANDBOX_QURL_TAG"
+read_into SANDBOX_QRTS_TAG "layerv" "$SSM_SANDBOX_QRTS_TAG"
+read_into SANDBOX_RELAY_TAG "layerv" "$SSM_SANDBOX_RELAY_TAG"
 
-info "Sandbox SSM parameters loaded"
+# "loaded" only if they were. Announcing success over a section that just
+# recorded a read failure reads as a contradiction of the gate a few lines
+# below, and the progress line is not worth misleading an operator mid-release.
+if [ ${#SSM_READ_FAILED[@]} -eq 0 ]; then
+    info "Sandbox SSM parameters loaded"
+fi
 
 # Prod (profile=layerv-prod). Prod is canary-deployed: server/AC each have a
 # single image-tag slot and no active-color, so a direct read is correct here.
-PROD_COMMIT=$(read_ssm "layerv-prod" "$SSM_PROD_COMMIT")
-PROD_DEPLOYED_AT=$(read_ssm "layerv-prod" "$SSM_PROD_DEPLOYED_AT")
-PROD_STATE=$(read_ssm "layerv-prod" "$SSM_PROD_STATE")
-PROD_SERVER_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_SERVER_TAG")
-PROD_AC_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_AC_TAG")
-PROD_QURL_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QURL_TAG")
-PROD_QRTS_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QRTS_TAG")
-PROD_RELAY_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_RELAY_TAG")
+read_into PROD_COMMIT "layerv-prod" "$SSM_PROD_COMMIT"
+read_into PROD_DEPLOYED_AT "layerv-prod" "$SSM_PROD_DEPLOYED_AT"
+read_into PROD_STATE "layerv-prod" "$SSM_PROD_STATE"
+read_into PROD_SERVER_TAG "layerv-prod" "$SSM_PROD_SERVER_TAG"
+read_into PROD_AC_TAG "layerv-prod" "$SSM_PROD_AC_TAG"
+read_into PROD_QURL_TAG "layerv-prod" "$SSM_PROD_QURL_TAG"
+read_into PROD_QRTS_TAG "layerv-prod" "$SSM_PROD_QRTS_TAG"
+read_into PROD_RELAY_TAG "layerv-prod" "$SSM_PROD_RELAY_TAG"
 
-info "Prod SSM parameters loaded"
+# Same as above. A sandbox failure suppresses this line too, which is correct:
+# the state as a whole is incomplete, whichever account the failure came from.
+if [ ${#SSM_READ_FAILED[@]} -eq 0 ]; then
+    info "Prod SSM parameters loaded"
+fi
 
 # Replace empty values with "(not set)" for display
 SANDBOX_DEPLOYED_AT="${SANDBOX_DEPLOYED_AT:-(not set)}"
@@ -320,6 +441,22 @@ PROD_AC_TAG="${PROD_AC_TAG:-(not set)}"
 PROD_QURL_TAG="${PROD_QURL_TAG:-(not set)}"
 PROD_QRTS_TAG="${PROD_QRTS_TAG:-(not set)}"
 PROD_RELAY_TAG="${PROD_RELAY_TAG:-(not set)}"
+
+# An unreadable parameter is not a corrupt one, and it is not an absent one
+# either. This runs before every check that reads a value, so neither the
+# empty-commit block below nor a value-shape check can claim a definite state
+# the reads never established and send the operator down the wrong path.
+if [ ${#SSM_READ_FAILED[@]} -gt 0 ]; then
+    # Counts entries, not raw SSM calls: a failed active-tag resolve is one
+    # entry covering the two reads (active-color, then the slot it names).
+    fail "Could not read ${#SSM_READ_FAILED[@]} deployment parameter(s); deployment state is incomplete."
+    for entry in "${SSM_READ_FAILED[@]}"; do
+        echo -e "    ${RED}${entry}${NC}" >&2
+    done
+    echo "" >&2
+    echo -e "  ${RED}Not a corrupted parameter — the read itself failed. Retry; if it persists, check credentials and SSM availability.${NC}" >&2
+    exit 1
+fi
 
 # Hard block: no sandbox commit means nothing to deploy
 if [[ -z "$SANDBOX_COMMIT" ]]; then

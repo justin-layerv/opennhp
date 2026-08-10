@@ -76,10 +76,27 @@ fi
 
 BASE="/${ENVIRONMENT}/nhp/${COMPONENT}"
 
+# Scratch file holding one read's stderr. Kept separate from the value rather
+# than merged with 2>&1: the AWS CLI can emit a deprecation or
+# credential-source warning on an otherwise-successful call, and merging the two
+# splices that warning into the value. A polluted colour then fails the
+# blue/green check below as "Unexpected active-color", failing the deploy over a
+# parameter that is perfectly healthy — and a polluted tag propagates a
+# non-existent image tag to the caller.
+ERR_FILE="$(mktemp)"
+trap 'rm -f "$ERR_FILE"' EXIT
+
+# ssm_error — the API error from the last read, not whatever the CLI happened to
+# print first. Those same warnings are emitted at TLS/import time, ahead of the
+# error line, so `head -1` would report the warning and drop the actual cause.
+ssm_error() {
+  grep -m1 'An error occurred' "$ERR_FILE" || tail -1 "$ERR_FILE"
+}
+
 if ! COLOR=$(aws ssm get-parameter \
     --name "${BASE}/active-color" \
-    --query "Parameter.Value" --output text --no-cli-pager 2>&1); then
-  echo "::error::Failed to read ${BASE}/active-color from SSM: $COLOR" >&2
+    --query "Parameter.Value" --output text --no-cli-pager 2>"$ERR_FILE"); then
+  echo "::error::Failed to read ${BASE}/active-color from SSM: $(ssm_error)" >&2
   exit 1
 fi
 
@@ -105,8 +122,8 @@ esac
 
 if ! TAG=$(aws ssm get-parameter \
     --name "$PARAM" \
-    --query "Parameter.Value" --output text --no-cli-pager 2>&1); then
-  echo "::error::Failed to read $PARAM from SSM: $TAG" >&2
+    --query "Parameter.Value" --output text --no-cli-pager 2>"$ERR_FILE"); then
+  echo "::error::Failed to read $PARAM from SSM: $(ssm_error)" >&2
   exit 1
 fi
 

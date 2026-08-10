@@ -41,6 +41,10 @@ for a in "\$@"; do
 done
 val=\$(grep -E "^\${name} " "$fixture" 2>/dev/null | head -1 | cut -d' ' -f2-)
 if [[ -z "\$val" ]]; then echo "An error occurred (ParameterNotFound) when calling GetParameter on \$name" >&2; exit 255; fi
+# A real AWS CLI can write to stderr on an otherwise-successful call
+# (deprecation notice, credential-source warning). Emitted here when the case
+# asks for it, so the resolver's stdout/stderr split stays fenced.
+[[ -n "\${AWS_SHIM_STDERR_NOISE:-}" ]] && echo "\$AWS_SHIM_STDERR_NOISE" >&2
 printf '%s\n' "\$val"
 EOF
   chmod +x "$dir/aws"
@@ -66,6 +70,24 @@ _run() {
 _assert_tag() {
   local name="$1" env="$2" comp="$3" slot="$4" want="$5" body="$6"
   _run "$env" "$comp" "$slot" "$body"
+  if [[ "$RC" -eq 0 && "$GOT" == "$want" ]]; then report_pass "$name"
+  else report_fail "$name" "rc=$RC out='$GOT' (want rc=0 out='$want')"; fi
+}
+
+# _assert_tag_noisy <name> <env> <comp> <slot-or-default> <expected-stdout> <body>
+#
+# As _assert_tag, but the fake AWS CLI also writes a warning to stderr on every
+# *successful* read. The resolver used to capture its reads with 2>&1, which
+# spliced that warning into the value: a polluted colour then failed the
+# blue/green check and hard-failed the deploy over a perfectly healthy
+# parameter, and a polluted tag propagated an image tag that does not exist.
+# Fenced here rather than only through trigger-prod-deploy.sh's fixtures,
+# because this resolver is the shared source of truth for four callers.
+_assert_tag_noisy() {
+  local name="$1" env="$2" comp="$3" slot="$4" want="$5" body="$6"
+  export AWS_SHIM_STDERR_NOISE="urllib3 v2 only supports OpenSSL 1.1.1+, currently the ssl module is compiled with LibreSSL 2.8.3"
+  _run "$env" "$comp" "$slot" "$body"
+  unset AWS_SHIM_STDERR_NOISE
   if [[ "$RC" -eq 0 && "$GOT" == "$want" ]]; then report_pass "$name"
   else report_fail "$name" "rc=$RC out='$GOT' (want rc=0 out='$want')"; fi
 }
@@ -106,6 +128,20 @@ _assert_tag "ac component honours active=green" sandbox ac active "ACGREEN" \
 "/sandbox/nhp/ac/active-color green
 /sandbox/nhp/ac/image-tag ACBLUE
 /sandbox/nhp/ac/green-image-tag ACGREEN"
+
+# A CLI warning on a successful read must not reach the value. Both reads are
+# covered: active-color (a polluted colour fails the blue/green check and takes
+# the deploy down with it) and the resolved slot (a polluted tag is returned to
+# the caller as a real image tag).
+_assert_tag_noisy "stderr warning does not pollute the resolved tag" sandbox server - "GREENTAG" \
+"/sandbox/nhp/server/active-color green
+/sandbox/nhp/server/image-tag BLUETAG
+/sandbox/nhp/server/green-image-tag GREENTAG"
+
+_assert_tag_noisy "stderr warning does not pollute a blue active-color" sandbox server active "BLUETAG" \
+"/sandbox/nhp/server/active-color blue
+/sandbox/nhp/server/image-tag BLUETAG
+/sandbox/nhp/server/green-image-tag GREENTAG"
 
 # Fail-closed: unexpected/corrupt active-color is rejected, never guessed.
 _assert_fail "unexpected active-color rejected" sandbox server active \

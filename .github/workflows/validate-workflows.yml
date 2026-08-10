@@ -207,6 +207,11 @@ on:
       - ".github/actions/verify-image-attestation/**"
       - "tests/lints/attestation-verify-watchdog/**"
       - ".github/scripts/scan-attestation-soak.sh"
+      # The absent-vs-unreadable SSM split. Watch the fixture dir and both
+      # scripts it drives: the resolver is already listed below for its own
+      # suite, and trigger-prod-deploy.sh has no other trigger here.
+      - "tests/lints/ssm-read-failure/**"
+      - "scripts/trigger-prod-deploy.sh"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -855,6 +860,18 @@ jobs:
         run: |
           shellcheck .github/scripts/scan-attestation-soak.sh tests/lints/attestation-verify-watchdog/run-fixtures.sh
           bash tests/lints/attestation-verify-watchdog/run-fixtures.sh
+
+      # Lock the absent-vs-unreadable split in scripts/trigger-prod-deploy.sh:
+      # a read that errors is neither "absent" nor "corrupted", and reporting it
+      # as either sends the release operator chasing a fault that isn't there.
+      # These fixtures *execute* the failure paths against fake aws/gh shims,
+      # because the first attempt at this fix recorded the failure inside a
+      # command substitution — a subshell — so the gate was dead code that
+      # `bash -n` and `shellcheck` both passed clean.
+      - name: Test ssm-read-failure fixtures
+        run: |
+          shellcheck scripts/trigger-prod-deploy.sh tests/lints/ssm-read-failure/run-fixtures.sh
+          bash tests/lints/ssm-read-failure/run-fixtures.sh
 
       # Two cross-module lockstep contracts that surfaced as #1976
       # cutover follow-ups (PR #2141): the Go-side
