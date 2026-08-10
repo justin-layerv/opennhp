@@ -66,6 +66,18 @@ env:
   PROOF_ACCOUNT_KEY_ID: key_UdpProofOtp1
   PROOF_ACCOUNT_EMAIL: qurl-go@proof.notify.layerv.xyz
   PROOF_ACCOUNT_JIT_SECRET_PREFIX: layerv-nhp-sandbox/udp-proof/jit/credential/
+  PROOF_AUTHORITY_TABLE: layerv-nhp-sandbox-control-connector-authority
+  # The Connector Authority owner partition for the proof account. This is a
+  # stable IDENTITY, not a moving reference, so a literal is correct here --
+  # unlike a commit SHA there is nothing for it to drift against. It is NOT a
+  # plain digest of PROOF_ACCOUNT_OWNER_ID; if the proof account is ever
+  # re-created, re-read it with:
+  #   aws dynamodb scan --table-name $PROOF_AUTHORITY_TABLE \
+  #     --filter-expression 'begins_with(pk,:p) AND begins_with(sk,:s)' \
+  #     --expression-attribute-values \
+  #       '{":p":{"S":"OWNER#"},":s":{"S":"AGENT#"}}' \
+  #     --query 'Items[].pk.S' --output text | tr '\t' '\n' | sort | uniq -c
+  PROOF_AGENT_OWNER_PK: OWNER#9e97203bf2fa05e5abb85bd7fab107427c53274b4befd50293dadce2834992e0
   # Frozen client candidate heads. These MUST equal the live head SHAs of the
   # open qurl-connector/qurl-go candidate PRs at the moment the trusted-main
   # producer runs, because the producer resolves `repositories.qurl_connector`
@@ -1334,6 +1346,19 @@ jobs:
           set -euo pipefail
           bash .github/scripts/manage_udp_proof_account.sh \
             cleanup "${{ github.run_id }}" "${{ github.run_attempt }}"
+
+      - name: Reclaim the run-bound Connector Authority rows
+        # Runs for BOTH clients: every proof run enrolls a connector, binding an
+        # AGENT#, DEVICE_CREDENTIAL# and COMPLETION# row and incrementing
+        # META.assignment_count. Nothing released any of it, so the proof
+        # bricked itself at the 25-per-owner cap with errCode 52112 and the
+        # connector leg could not get past enrollment. Reclaiming per run is a
+        # precondition for gating PRs, not cleanup hygiene: continuous PR
+        # traffic exhausts the cap in 25 runs.
+        if: always() && steps.aws.outcome == 'success'
+        run: |
+          set -euo pipefail
+          bash .github/scripts/reclaim_udp_proof_agents.sh
 
       - name: Stop the broker (always)
         if: always() && steps.aws.outcome == 'success'

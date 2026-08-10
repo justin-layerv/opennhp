@@ -825,6 +825,18 @@ jobs:
       # drift coincides with the bug. shellcheck both scripts — actionlint's
       # -shellcheck only covers workflow-embedded scripts, and the lint itself
       # was previously unchecked.
+      # The reclaim script guards against a SILENT counter corruption: it
+      # reconciles META.assignment_count, and a wrong or swallowed value there
+      # sets the quota to a number no row supports. Its fixtures must run in CI
+      # for that guard to mean anything. A Makefile target is not sufficient --
+      # `make lint` is not on any CI path (see the note above about
+      # `make lint-workflows` never running in CI), so an unwired fixture is
+      # indistinguishable from no test at all.
+      - name: Shellcheck + test udp-proof-agent-reclaim fixtures
+        run: |
+          shellcheck .github/scripts/reclaim_udp_proof_agents.sh tests/lints/udp-proof-agent-reclaim/run-fixtures.sh
+          bash tests/lints/udp-proof-agent-reclaim/run-fixtures.sh
+
       - name: Shellcheck + test lockdown-body-drift fixtures
         run: |
           shellcheck scripts/check-lockdown-body-drift.sh tests/lints/lockdown-body-drift/run-fixtures.sh
