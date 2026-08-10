@@ -440,5 +440,47 @@ class FinalizeJobWiringTests(unittest.TestCase):
         self.assertIn("ttl-seconds: '14400'", self.block)
 
 
+
+class WarmStandbyConvergenceTest(unittest.TestCase):
+    """The scale-down wait must test SERVING capacity, not the ASG's raw
+    instance list.
+
+    Run 31425138552 failed for its full 300 s deadline on
+    `desired=1 total=2 healthy-in-service=1`: warm standby had been reached
+    immediately, and the gate was blocked by a second instance already out of
+    service, held in Terminating:Wait by layerv-nhp-sandbox-termination-hook —
+    whose 300 s heartbeat timeout equals the deadline, so the wait could never
+    reliably outlast the hook it was waiting on. The red run retained the
+    sandbox live-env lock for four hours.
+
+    A revert to length(Instances) reintroduces exactly that, so it is fenced
+    rather than only commented.
+    """
+
+    def setUp(self):
+        self.body = WORKFLOW.read_text()
+
+    def test_convergence_counts_inservice_not_every_instance(self):
+        self.assertIn(
+            "length(Instances[?LifecycleState==`InService`])",
+            self.body,
+            "the warm-standby query must count InService instances",
+        )
+        self.assertNotIn(
+            "[DesiredCapacity,length(Instances),",
+            self.body,
+            "counting every instance re-couples this wait to the termination "
+            "lifecycle hook, which can hold a draining instance for the whole "
+            "deadline (run 31425138552)",
+        )
+
+    def test_convergence_condition_uses_inservice(self):
+        self.assertIn(
+            '"$desired" == "1" && "$in_service" == "1" && "$healthy_in_service" == "1"',
+            self.body,
+            "warm standby is desired=1 with exactly one healthy InService "
+            "instance; draining instances do not serve",
+        )
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

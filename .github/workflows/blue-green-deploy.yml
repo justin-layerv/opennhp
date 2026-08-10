@@ -1375,23 +1375,43 @@ jobs:
             for index in "${!asgs[@]}"; do
               label=${labels[$index]}
               asg=${asgs[$index]}
+              # in_service, NOT length(Instances). An instance the ASG is
+              # terminating stays in the Instances list while it sits in
+              # Terminating:Wait, and this ASG carries
+              # layerv-nhp-sandbox-termination-hook with a 300 s heartbeat
+              # timeout — exactly the deadline below. Requiring the list to
+              # drain to one therefore waited on a hook that could hold an
+              # instance for the entire budget.
+              #
+              # Run 31425138552 failed that way: for the full 300 s it read
+              # `desired=1 total=2 healthy-in-service=1`, i.e. warm standby had
+              # been reached immediately and the gate was blocked solely by a
+              # second instance already out of service. The failure retained the
+              # sandbox live-env lock for its four-hour TTL — the same
+              # converged-state-read-as-failure class as the post-switch crash
+              # gate (#3800, #3808).
+              #
+              # Warm standby is a statement about SERVING capacity: desired 1,
+              # exactly one InService instance, and it is healthy. Draining
+              # instances do not serve and are reconciled by the next run's
+              # Prepare, so they are not part of the condition.
               # Backticks are JMESPath literals, not shell substitutions.
               # shellcheck disable=SC2016
-              read -r desired total healthy_in_service < <(
+              read -r desired in_service healthy_in_service < <(
                 aws autoscaling describe-auto-scaling-groups \
                   --auto-scaling-group-names "$asg" \
-                  --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances),length(Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])]' \
+                  --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances[?LifecycleState==`InService`]),length(Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])]' \
                   --output text
               )
 
-              if [[ ! "$desired" =~ ^[0-9]+$ || ! "$total" =~ ^[0-9]+$ || ! "$healthy_in_service" =~ ^[0-9]+$ ]]; then
-                echo "::error::Could not read $label previous-color ASG convergence state for $asg: desired=$desired total=$total healthy-in-service=$healthy_in_service"
+              if [[ ! "$desired" =~ ^[0-9]+$ || ! "$in_service" =~ ^[0-9]+$ || ! "$healthy_in_service" =~ ^[0-9]+$ ]]; then
+                echo "::error::Could not read $label previous-color ASG convergence state for $asg: desired=$desired in-service=$in_service healthy-in-service=$healthy_in_service"
                 exit 1
               fi
-              if [[ "$desired" == "1" && "$total" == "1" && "$healthy_in_service" == "1" ]]; then
-                echo "$label previous-color ASG is at warm standby: $asg (desired=1 total=1 healthy-in-service=1)"
+              if [[ "$desired" == "1" && "$in_service" == "1" && "$healthy_in_service" == "1" ]]; then
+                echo "$label previous-color ASG is at warm standby: $asg (desired=1 in-service=1 healthy-in-service=1)"
               else
-                echo "$label previous-color ASG is still converging: $asg (desired=$desired total=$total healthy-in-service=$healthy_in_service)"
+                echo "$label previous-color ASG is still converging: $asg (desired=$desired in-service=$in_service healthy-in-service=$healthy_in_service)"
                 all_converged=false
               fi
             done
@@ -1400,7 +1420,7 @@ jobs:
               break
             fi
             if (( SECONDS >= deadline )); then
-              echo "::error::Previous-color ASGs did not reach one healthy InService warm-standby instance within 300 seconds"
+              echo "::error::Previous-color ASGs did not reach one healthy InService warm-standby instance within 300 seconds (desired=1, exactly one InService instance, healthy)"
               exit 1
             fi
             sleep 10
