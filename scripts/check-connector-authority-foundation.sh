@@ -730,14 +730,16 @@ for gate in \
   fi
 done
 
-# The deployed Authority image is selected by the reviewed measurement basis,
-# never by the publisher-owned SSM parameter. qurl-service's build-and-deploy
-# workflow rewrites that parameter on every push to its main, so reading it here
-# let an unrelated repository's release invalidate every Control plan the moment
-# it published. Forbid the read outright rather than requiring it.
-ssm_read_count="$(
+# Which image is deployed is chosen by the contract's declared source, and the
+# digest is deliberately NOT compared against the reviewed basis inside
+# authority_contract_identity_valid. That comparison is what let qurl-service
+# CI invalidate every Control plan the moment it published, and pinning the
+# digest to escape it stopped sandbox from running new builds at all. These
+# checks pin the replacement shape so neither failure can be reintroduced by
+# edit.
+ssm_publish_read_count="$(
   { grep -R -h -E --include='*.tf' \
-      'data[[:space:]]+"aws_ssm_parameter"[[:space:]]+"authority_runtime_digest"' \
+      'data[[:space:]]+"aws_ssm_parameter"[[:space:]]+"authority_image_publish"' \
       "$module_dir" || true; } | wc -l | tr -d ' '
 )"
 ecr_read_count="$(
@@ -745,19 +747,66 @@ ecr_read_count="$(
       'data[[:space:]]+"aws_ecr_image"[[:space:]]+"authority_runtime"' \
       "$module_dir" || true; } | wc -l | tr -d ' '
 )"
-if [[ "$ssm_read_count" -ne 0 ]]; then
-  echo "ERROR: Connector Authority runtime must not read the publisher-owned SSM digest; the reviewed basis selects the deployed image" >&2
+if [[ "$ssm_publish_read_count" -ne 1 ]]; then
+  echo "ERROR: Connector Authority runtime must declare exactly one publish-parameter read" >&2
   exit 1
 fi
 if [[ "$ecr_read_count" -ne 1 ]]; then
   echo "ERROR: Connector Authority runtime must declare exactly one conditional ECR digest read" >&2
   exit 1
 fi
-# The ECR read must resolve the basis digest, which is what proves the reviewed
-# pin refers to a real published image.
-if ! grep -Fq 'image_digest    = local.authority_contract_global.authority_image_digest' \
+# The publish read must be gated on the declared source, so a pinned contract
+# performs no publisher-owned read at all.
+if ! grep -Fq 'count = local.authority_runtime_contract_enabled && local.authority_image_tracks_publish ? 1 : 0' \
   "${module_dir}/ecr.tf"; then
-  echo "ERROR: Connector Authority ECR read must resolve the reviewed basis digest" >&2
+  echo "ERROR: Connector Authority publish-parameter read must be gated on the contract AND the publish_parameter source" >&2
+  exit 1
+fi
+# It must read the known local, never the managed parameter's attribute. The
+# resource reference adds a dependency edge that defers the read to apply, and a
+# digest unknown at plan cannot be checked at plan -- the seeded UNPUBLISHED
+# value would become an apply failure instead of a refused plan.
+if ! grep -Fq 'name = local.authority_image_digest_parameter_name' \
+  "${module_dir}/ecr.tf"; then
+  echo "ERROR: Connector Authority publish-parameter read must resolve the known parameter-name local so the digest is checkable at plan" >&2
+  exit 1
+fi
+# The ECR read must resolve whatever the declared source produced, which is what
+# proves the deployed digest refers to a real published image under either mode.
+if ! grep -Fq 'image_digest    = local.authority_runtime_image_digest' \
+  "${module_dir}/ecr.tf"; then
+  echo "ERROR: Connector Authority ECR read must resolve the source-selected digest" >&2
+  exit 1
+fi
+# publish_parameter hands an environment's deployed image to qurl-service CI
+# without review here. Prod may not make that trade. The rule cannot be proved
+# by a module test -- a prod-flavoured plan fails identity for a dozen unrelated
+# reasons, so an expect_failures case there passes with the rule deleted -- so
+# it is pinned statically instead: the local must exist AND be consumed by the
+# identity check. Defining it and forgetting to use it would be silent.
+if ! grep -REq --include='*.tf' \
+  'authority_image_source_permitted[[:space:]]*=[[:space:]]*!local\.authority_image_tracks_publish[[:space:]]*\|\|[[:space:]]*var\.environment[[:space:]]*!=[[:space:]]*"prod"' \
+  "$module_dir"; then
+  echo "ERROR: Connector Authority must define authority_image_source_permitted as the non-prod publish rule" >&2
+  exit 1
+fi
+if ! grep -REq --include='*.tf' \
+  '^[[:space:]]*local\.authority_image_source_permitted[[:space:]]*&&' \
+  "$module_dir"; then
+  echo "ERROR: authority_image_source_permitted must be consumed by the contract identity check" >&2
+  exit 1
+fi
+# The reviewed basis must never be compared against the live publish parameter
+# again; that coupling is the original defect.
+# The defect shape is "reviewed basis compared against the published digest",
+# and it can now be spelled through the intermediate locals as well as through
+# the original names. Match all three spellings; the identity check and the
+# Python checker are the real backstop, but a tripwire that only catches the
+# historical wording is not a tripwire.
+if grep -REq --include='*.tf' \
+  'authority_contract_global\.authority_image_digest[[:space:]]*==|==[[:space:]]*.*aws_ssm_parameter\.authority_image_publish|authority_image_basis_digest[[:space:]]*==[[:space:]]*local\.authority_runtime_image_digest|authority_runtime_image_digest[[:space:]]*==[[:space:]]*local\.authority_image_basis_digest' \
+  "$module_dir"; then
+  echo "ERROR: the reviewed basis digest must not be compared against the publish parameter; that coupling let an unrelated repository invalidate every Control plan" >&2
   exit 1
 fi
 if ! grep -Fq 'count = local.authority_runtime_contract_enabled ? 1 : 0' \

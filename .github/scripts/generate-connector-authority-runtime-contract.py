@@ -92,6 +92,10 @@ CONTRACT_KEYS = {
     "global",
     "functions",
 }
+IMAGE_SOURCES = ("pinned_digest", "publish_parameter")
+# authority_image_digest is NOT in this set. It belongs to exactly one image
+# source and is added back below only for that one, so a basis cannot both track
+# published images and name a digest.
 GLOBAL_KEYS = {
     "environment",
     "aws_partition",
@@ -99,7 +103,7 @@ GLOBAL_KEYS = {
     "aws_region",
     "authority_repository_url",
     "authority_digest_parameter_name",
-    "authority_image_digest",
+    "authority_image_source",
     "qat1_raw_key_arn",
     "qat1_alias_arn",
     "otp_redis_cache_name",
@@ -324,7 +328,21 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         if cell["caller_role_arn"] != expected_role:
             fail(f"{cell_id} caller role is not the canonical role ARN")
 
-    global_value = exact_keys(contract["global"], GLOBAL_KEYS, "global")
+    raw_global = contract["global"]
+    if not isinstance(raw_global, dict):
+        fail("global must be an object")
+    image_source = raw_global.get("authority_image_source")
+    if image_source not in IMAGE_SOURCES:
+        fail(f"authority_image_source must be one of {sorted(IMAGE_SOURCES)}")
+    # publish_parameter is how an environment tracks main: Terraform resolves the
+    # digest from the publish parameter, so a build reaches it without a commit,
+    # a review and an attended apply. pinned_digest names one image and is what
+    # to use while bisecting a bad build.
+    expected_global_keys = (
+        GLOBAL_KEYS if image_source == "publish_parameter"
+        else GLOBAL_KEYS | {"authority_image_digest"}
+    )
+    global_value = exact_keys(raw_global, expected_global_keys, "global")
     expected_identity = {
         "environment": EXPECTED_ENVIRONMENT,
         "aws_partition": EXPECTED_PARTITION,
@@ -343,7 +361,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     )
     if mismatches:
         fail(f"global environment/AWS identity differs: {mismatches}")
-    if IMAGE_DIGEST.fullmatch(
+    if image_source == "pinned_digest" and IMAGE_DIGEST.fullmatch(
         exact_string(global_value["authority_image_digest"], "authority_image_digest")
     ) is None:
         fail("authority image digest must be canonical lowercase sha256")

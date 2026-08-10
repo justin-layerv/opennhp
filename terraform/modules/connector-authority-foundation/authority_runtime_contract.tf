@@ -36,14 +36,14 @@ locals {
     "functions",
   ])
   authority_contract_cell_keys = toset(["caller_role_arn"])
-  authority_contract_global_keys = toset([
+  authority_contract_global_base_keys = toset([
     "environment",
     "aws_partition",
     "aws_account_id",
     "aws_region",
     "authority_repository_url",
     "authority_digest_parameter_name",
-    "authority_image_digest",
+    "authority_image_source",
     "qat1_raw_key_arn",
     "qat1_alias_arn",
     "otp_redis_cache_name",
@@ -56,6 +56,17 @@ locals {
     "basis_evidence",
     "result_evidence",
   ])
+  # authority_image_digest is present for exactly one source. Making the closed
+  # key set mode-dependent is what makes "tracks published images AND names a
+  # digest" unrepresentable, rather than something the identity check has to
+  # catch after the fact. An absent or unrecognized source falls to the pinned
+  # shape, so a contract that omits the field cannot silently start tracking
+  # whatever qurl-service published last.
+  authority_contract_global_keys = (
+    local.authority_image_tracks_publish
+    ? local.authority_contract_global_base_keys
+    : setunion(local.authority_contract_global_base_keys, ["authority_image_digest"])
+  )
   authority_contract_dependency_headroom_keys = toset([
     "dynamodb_max_in_flight",
     "kms_max_in_flight",
@@ -354,16 +365,27 @@ locals {
     local.authority_contract_global.aws_region == data.aws_region.current.region &&
     local.authority_contract_global.authority_repository_url == aws_ecr_repository.authority.repository_url &&
     local.authority_contract_global.authority_digest_parameter_name == local.authority_image_digest_parameter_name &&
-    can(regex("^sha256:[0-9a-f]{64}$", local.authority_contract_global.authority_image_digest)) &&
-    # The reviewed basis digest IS local.authority_runtime_image_digest now, so
-    # the old basis-equals-live-SSM-parameter assertion has been removed rather
-    # than reduced to a tautology. It compared the reviewed pin against a value
-    # qurl-service CI rewrites on every push to its main, which coupled nhp
-    # Control planning to an unrelated repository's release cadence without
-    # adding a trust boundary: that CI both builds the image and writes the
-    # parameter, so it was never an independent attestation. The binding that
-    # matters is below and still fails closed -- the reviewed digest must
-    # resolve to a real image in the Authority ECR repository.
+    # The contract must state which image source applies, and carry a basis
+    # digest under exactly one of them. A contract that tracks published images
+    # while also naming a digest is ambiguous about which one governs, so it is
+    # rejected rather than resolved by precedence.
+    contains(["pinned_digest", "publish_parameter"], local.authority_image_source) &&
+    # publish_parameter is not a trade prod may make; see the local.
+    local.authority_image_source_permitted &&
+    (local.authority_image_tracks_publish
+      ? local.authority_image_basis_digest == null
+    : local.authority_image_basis_digest != null) &&
+    # Shape is checked on the RESOLVED digest, so it covers a published value
+    # just as strictly as a pinned one -- including the seeded UNPUBLISHED
+    # placeholder, which fails here on a fresh environment.
+    #
+    # Note what is deliberately absent: no comparison of the basis against the
+    # live publish parameter. That comparison is what let qurl-service CI
+    # invalidate every open Control plan, and it was never an independent
+    # attestation anyway -- the same CI both builds the image and writes the
+    # parameter. The binding that matters is below and still fails closed: the
+    # resolved digest must be a real image in the Authority ECR repository.
+    can(regex("^sha256:[0-9a-f]{64}$", local.authority_runtime_image_digest)) &&
     data.aws_ecr_image.authority_runtime[0].image_digest == local.authority_runtime_image_digest &&
     data.aws_ecr_image.authority_runtime[0].image_uri == "${aws_ecr_repository.authority.repository_url}@${local.authority_runtime_image_digest}" &&
     local.authority_contract_global.qat1_raw_key_arn == aws_kms_key.qat1_signing.arn &&

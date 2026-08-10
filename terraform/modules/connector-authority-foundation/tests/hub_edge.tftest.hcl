@@ -126,6 +126,7 @@ variables {
       aws_region                         = "us-east-2"
       authority_repository_url           = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
       authority_digest_parameter_name    = "/sandbox/nhp/control/connector-authority/image-digest"
+      authority_image_source             = "pinned_digest"
       authority_image_digest             = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
       qat1_raw_key_arn                   = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
       qat1_alias_arn                     = "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1"

@@ -37,9 +37,22 @@ write_clean_fixture() {
     '# Provider documentation belongs outside this zero-HTTP Terraform root.' \
     'resource "aws_vpc" "control" {}' >"${module_dir}/main.tf"
   printf '%s\n' \
+    'locals {' \
+    '  authority_image_source_permitted = !local.authority_image_tracks_publish || var.environment != "prod"' \
+    '}' \
+    'locals {' \
+    '  identity = (' \
+    '    local.authority_image_source_permitted &&' \
+    '    true' \
+    '  )' \
+    '}' \
+    'data "aws_ssm_parameter" "authority_image_publish" {' \
+    '  count = local.authority_runtime_contract_enabled && local.authority_image_tracks_publish ? 1 : 0' \
+    '  name = local.authority_image_digest_parameter_name' \
+    '}' \
     'data "aws_ecr_image" "authority_runtime" {' \
     '  count = local.authority_runtime_contract_enabled ? 1 : 0' \
-    '  image_digest    = local.authority_contract_global.authority_image_digest' \
+    '  image_digest    = local.authority_runtime_image_digest' \
     '}' >"${module_dir}/ecr.tf"
   printf '%s\n' \
     'module "connector_authority_foundation" {' \
@@ -767,25 +780,61 @@ for gate_case in \
 done
 
 write_clean_fixture
-rm "${module_dir}/ecr.tf"
+# Remove only the ECR block; both reads share ecr.tf, and deleting the file
+# would trip the publish-read check first and prove nothing about this one.
+sed -i.bak '/data "aws_ecr_image" "authority_runtime"/,+3d' "${module_dir}/ecr.tf"
+rm "${module_dir}/ecr.tf.bak"
 expect_failure 'must declare exactly one conditional ECR digest read' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
-# Reintroducing the publisher-owned SSM digest read must fail closed. That read
-# is what let a qurl-service publish invalidate every Control plan, so the
-# contract forbids it rather than merely not requiring it.
+# Dropping the publish read entirely would silently strip an environment's
+# ability to track main.
 write_clean_fixture
-printf '%s\n' \
-  'data "aws_ssm_parameter" "authority_runtime_digest" {' \
-  '  count = local.authority_runtime_contract_enabled ? 1 : 0' \
-  '}' >>"${module_dir}/ecr.tf"
-expect_failure 'must not read the publisher-owned SSM digest' env NHP_REPO_ROOT="$fixture_root" "$checker"
+sed -i.bak '/data "aws_ssm_parameter" "authority_image_publish"/,+3d' "${module_dir}/ecr.tf"
+rm "${module_dir}/ecr.tf.bak"
+expect_failure 'exactly one publish-parameter read' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
-# The ECR read must resolve the reviewed basis digest, not some other source.
+# Ungating the publish read would make a pinned contract perform a
+# publisher-owned read it has no business performing.
 write_clean_fixture
-sed -i.bak 's#image_digest    = local.authority_contract_global.authority_image_digest#image_digest    = "sha256:deadbeef"#' \
+sed -i.bak 's#count = local.authority_runtime_contract_enabled \&\& local.authority_image_tracks_publish ? 1 : 0#count = local.authority_runtime_contract_enabled ? 1 : 0#' \
   "${module_dir}/ecr.tf"
 rm "${module_dir}/ecr.tf.bak"
-expect_failure 'ECR read must resolve the reviewed basis digest' env NHP_REPO_ROOT="$fixture_root" "$checker"
+expect_failure 'gated on the contract AND the publish_parameter source' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# Reading the managed resource's attribute instead of the known local defers the
+# read to apply, and a digest unknown at plan cannot be gated at plan.
+write_clean_fixture
+sed -i.bak 's#name = local.authority_image_digest_parameter_name#name = aws_ssm_parameter.authority_image_digest.name#' \
+  "${module_dir}/ecr.tf"
+rm "${module_dir}/ecr.tf.bak"
+expect_failure 'known parameter-name local' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# The ECR read must resolve whatever the declared source produced.
+write_clean_fixture
+sed -i.bak 's#image_digest    = local.authority_runtime_image_digest#image_digest    = "sha256:deadbeef"#' \
+  "${module_dir}/ecr.tf"
+rm "${module_dir}/ecr.tf.bak"
+expect_failure 'ECR read must resolve the source-selected digest' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# Deleting the prod rule, or defining it and never consuming it, must both fail.
+write_clean_fixture
+sed -i.bak '/authority_image_source_permitted = /d' "${module_dir}/ecr.tf"
+rm -f "${module_dir}/ecr.tf.bak"
+expect_failure 'must define authority_image_source_permitted' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+sed -i.bak '/^    local.authority_image_source_permitted &&$/d' "${module_dir}/ecr.tf"
+rm -f "${module_dir}/ecr.tf.bak"
+expect_failure 'must be consumed by the contract identity check' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+# The original defect: comparing the reviewed basis against the live publish
+# parameter. Reintroducing that coupling must fail closed.
+write_clean_fixture
+printf '%s\n' \
+  'locals {' \
+  '  drifted = local.authority_contract_global.authority_image_digest == "sha256:deadbeef"' \
+  '}' >>"${module_dir}/ecr.tf"
+expect_failure 'must not be compared against the publish parameter' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
 printf '%s\n' '# unintended output drift' >>"${control_dir}/environments/prod/outputs.tf"

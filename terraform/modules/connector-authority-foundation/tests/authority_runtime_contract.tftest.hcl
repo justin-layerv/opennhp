@@ -117,6 +117,7 @@ variables {
       aws_region                         = "us-east-2"
       authority_repository_url           = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority"
       authority_digest_parameter_name    = "/sandbox/nhp/control/connector-authority/image-digest"
+      authority_image_source             = "pinned_digest"
       authority_image_digest             = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
       qat1_raw_key_arn                   = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
       qat1_alias_arn                     = "arn:aws:kms:us-east-2:767397897469:alias/layerv-nhp-sandbox-control-qat1"
@@ -286,7 +287,7 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
 # be reintroduced without this assertion noticing. If a future change routes
 # the deployed digest back through the parameter, the plan below stops
 # resolving to the reviewed digest and this fails.
-run "deployed_image_tracks_reviewed_basis_not_the_publisher_parameter" {
+run "pinned_source_deploys_the_basis_digest" {
   command = plan
 
   variables {
@@ -295,10 +296,207 @@ run "deployed_image_tracks_reviewed_basis_not_the_publisher_parameter" {
 
   assert {
     condition = (
+      local.authority_image_source == "pinned_digest" &&
+      local.authority_image_tracks_publish == false &&
       local.authority_runtime_image_digest == local.authority_contract_global.authority_image_digest
     )
-    error_message = "The deployed Authority image must come from the reviewed basis digest, never from the publisher-owned SSM parameter."
+    error_message = "A pinned contract must deploy the digest named in the reviewed basis."
   }
+}
+
+# The counterpart mode, and the reason this split exists: an environment that is
+# supposed to track main must be able to run a new build without a commit, a
+# review and an attended apply. Before this, sandbox could not, so its deployed
+# image drifted days behind and it stopped measuring the builds whose
+# measurements the basis records.
+run "publish_source_deploys_the_published_digest" {
+  command = plan
+
+  # Deliberately NOT the digest the pinned fixtures use. If the resolved digest
+  # matched the basis value by coincidence this assertion would pass while
+  # reading the wrong source, so the parameter carries a distinct one.
+  override_data {
+    target          = data.aws_ssm_parameter.authority_image_publish[0]
+    override_during = plan
+    values = {
+      insecure_value = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  }
+
+  override_data {
+    target          = data.aws_ecr_image.authority_runtime[0]
+    override_during = plan
+    values = {
+      image_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      image_uri    = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/qurl-connector-authority@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  }
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          {
+            for key, value in run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global :
+            key => value if key != "authority_image_digest"
+          },
+          { authority_image_source = "publish_parameter" },
+        )
+      },
+    )
+  }
+
+  assert {
+    condition = (
+      local.authority_image_tracks_publish &&
+      local.authority_image_basis_digest == null &&
+      local.authority_runtime_image_digest == "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    )
+    error_message = "A publish-tracking contract must deploy the digest currently in the publish parameter."
+  }
+
+  # The ECR leg is deliberately not asserted here. data.aws_ecr_image depends on
+  # the managed repository, so its read defers to apply and cannot be evaluated
+  # in a plan-only run -- the same reason the pinned tests never assert on it.
+  # The shape gate above is the part that must hold at plan, and
+  # publish_source_rejects_an_unpublished_parameter proves it does.
+}
+
+# The trust trade publish tracking makes -- qurl-service CI decides what runs,
+# without review here -- is acceptable for an environment whose job is to track
+# main. It is not acceptable for prod, and CR asked for a constraint rather than
+# a convention resting on prod simply not having a contract yet.
+#
+# Asserted on the named local, not via expect_failures: a prod-flavoured plan
+# fails identity for a dozen unrelated reasons (prod resource names against a
+# sandbox contract), so an expect_failures test here passes with the rule
+# deleted and proves nothing. Verified: it did.
+run "publish_source_is_permitted_outside_prod" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          {
+            for key, value in run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global :
+            key => value if key != "authority_image_digest"
+          },
+          { authority_image_source = "publish_parameter" },
+        )
+      },
+    )
+  }
+
+  assert {
+    condition     = local.authority_image_tracks_publish && local.authority_image_source_permitted
+    error_message = "A sandbox contract must be allowed to track the publish parameter."
+  }
+}
+
+run "pinned_source_is_permitted_anywhere" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract
+  }
+
+  assert {
+    condition     = local.authority_image_source_permitted
+    error_message = "A pinned contract must be permitted in every environment."
+  }
+}
+
+# The seeded value on a fresh environment. Shape is checked on the RESOLVED
+# digest precisely so that tracking a parameter cannot deploy a placeholder.
+run "publish_source_rejects_an_unpublished_parameter" {
+  command = plan
+
+  override_data {
+    target          = data.aws_ssm_parameter.authority_image_publish[0]
+    override_during = plan
+    values = {
+      insecure_value = "UNPUBLISHED"
+    }
+  }
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          {
+            for key, value in run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global :
+            key => value if key != "authority_image_digest"
+          },
+          { authority_image_source = "publish_parameter" },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+# Naming a digest while tracking published images leaves it ambiguous which one
+# governs. The closed key set makes that unrepresentable rather than resolving
+# it by precedence.
+run "rejects_publish_source_that_also_names_a_digest" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          { authority_image_source = "publish_parameter" },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_pinned_source_with_no_digest" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = {
+          for key, value in run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global :
+          key => value if key != "authority_image_digest"
+        }
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+# An unrecognized source must not fall through to tracking whatever was
+# published last; it falls to the pinned shape and is rejected there.
+run "rejects_unknown_image_source" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          { authority_image_source = "latest" },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
 }
 
 run "ready_requires_and_accepts_exact_two_cell_graph" {

@@ -325,6 +325,23 @@ _AUTHORITY_DIGEST_ADDRESS = (
 )
 _HUB_DIGEST_ADDRESS = "module.control.aws_ssm_parameter.hub_image_digest"
 _DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+# An immutable digest reference into the canonical Authority repository. This
+# is the invariant that survives BOTH image sources: a pinned contract names
+# one digest, a publish-tracking contract lets it advance, but neither may ever
+# deploy a mutable tag.
+_AUTHORITY_IMAGE_URI_PATTERN = re.compile(
+    r"[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/layerv/"
+    r"qurl-connector-authority@sha256:[0-9a-f]{64}"
+)
+
+
+def _authority_image_tracks_publish(contract: Any) -> bool:
+    if not isinstance(contract, dict):
+        return False
+    global_contract = contract.get("global")
+    if not isinstance(global_contract, dict):
+        return False
+    return global_contract.get("authority_image_source") == "publish_parameter"
 _AUTHORITY_DIGEST_SPEC = {
     "address": _AUTHORITY_DIGEST_ADDRESS,
     "description": (
@@ -1964,6 +1981,7 @@ INTERFACE_ENDPOINT_SERVICES = (
 )
 EXPECTED_DATA_RESOURCES = {
     "module.control.data.aws_ecr_image.authority_runtime[0]": "aws_ecr_image",
+    "module.control.data.aws_ssm_parameter.authority_image_publish[0]": "aws_ssm_parameter",
     "module.control.data.aws_availability_zones.available": "aws_availability_zones",
     "module.control.data.aws_caller_identity.current": "aws_caller_identity",
     "module.control.data.aws_partition.current": "aws_partition",
@@ -2057,6 +2075,11 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
             "aws_ecr_image",
             "aws",
         ),
+        "module.control.data.aws_ssm_parameter.authority_image_publish": (
+            "data",
+            "aws_ssm_parameter",
+            "aws",
+        ),
     }
 )
 # The runtime-slice resources are declared unconditionally in the module (their
@@ -2097,12 +2120,19 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
         ],
         ("item",): ["each.value"],
     },
+    "module.control.data.aws_ssm_parameter.authority_image_publish": {
+        ("count",): [
+            "local.authority_runtime_contract_enabled",
+            "local.authority_image_tracks_publish",
+        ],
+        # The known local, not the managed parameter's attribute. Referencing the
+        # resource would defer this read to apply, and an unknown digest cannot
+        # be checked by authority_contract_identity_valid at plan time.
+        ("name",): ["local.authority_image_digest_parameter_name"],
+    },
     "module.control.data.aws_ecr_image.authority_runtime": {
         ("count",): ["local.authority_runtime_contract_enabled"],
-        ("image_digest",): [
-            "local.authority_contract_global.authority_image_digest",
-            "local.authority_contract_global",
-        ],
+        ("image_digest",): ["local.authority_runtime_image_digest"],
         ("repository_name",): [
             "aws_ecr_repository.authority.name",
             "aws_ecr_repository.authority",
@@ -3732,20 +3762,47 @@ def _require_authority_runtime_binding(
             "foundation runtime carries proof-controller capacity while the proof "
             "function is absent"
         )
+    # The invariant here is that the functions run an immutable digest
+    # reference, never a tag. That holds under both image sources, so the
+    # digest is read out of the RESOLVED uri rather than assumed to be in the
+    # contract -- a publish-tracking contract deliberately names none.
+    # A contract applied before this key existed carries no source. It is the
+    # pinned shape by definition -- it names a digest and nothing resolves one
+    # for it -- so absence means pinned, exactly as the Terraform closed key set
+    # treats it. This is what lets the currently-applied state, captured under
+    # the old schema, still be validated as the "before" side of a plan. An
+    # unrecognized non-empty value is still refused below: absent is legacy,
+    # wrong is wrong.
+    source = global_contract.get("authority_image_source", "pinned_digest")
     digest = global_contract.get("authority_image_digest")
     repository = global_contract.get("authority_repository_url")
     image_uri = payload.get("authority_image_uri")
+    expected_repository = (
+        f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
+        "layerv/qurl-connector-authority"
+    )
     if (
-        repository
-        != (
-            f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/"
-            "layerv/qurl-connector-authority"
-        )
-        or not isinstance(digest, str)
-        or _DIGEST_PATTERN.fullmatch(digest) is None
-        or image_uri != f"{repository}@{digest}"
+        repository != expected_repository
+        or not isinstance(image_uri, str)
+        or not image_uri.startswith(f"{repository}@")
+        or _DIGEST_PATTERN.fullmatch(image_uri[len(repository) + 1 :]) is None
     ):
         raise ContractError("foundation runtime image URI is not exact repository@digest")
+    resolved_digest = image_uri[len(repository) + 1 :]
+    if source == "pinned_digest":
+        # A pinned contract must deploy the digest it names; anything else means
+        # the resolution path ignored the pin.
+        if digest != resolved_digest:
+            raise ContractError(
+                "foundation runtime image URI does not match the pinned basis digest"
+            )
+    elif source == "publish_parameter":
+        if digest is not None:
+            raise ContractError(
+                "publish-tracking contract must not also name a basis digest"
+            )
+    else:
+        raise ContractError("foundation runtime image source is not a known value")
     evidence_objects = [
         evidence,
         global_contract.get("basis_evidence"),
@@ -4202,6 +4259,17 @@ def _is_exact_legacy_hub_runtime_expansion(
         else None
     )
     repository = after_global.get("authority_repository_url")
+    # This admits ONE historical hub expansion, whose predecessor was captured
+    # under the pinned-digest shape. A publish-tracking contract cannot be that
+    # predecessor: the reconstruction below injects a basis digest and compares
+    # byte-equal, and a publish-tracking payload names none. Refusing here keeps
+    # the byte-equality honest instead of silently reshaping it. The sibling
+    # already-expanded branch covers the current state, where this expansion has
+    # long since applied.
+    if _authority_image_tracks_publish(
+        after_payload.get("authority_runtime_contract")
+    ) or _authority_image_tracks_publish(before_contract):
+        return False
     # qurl-service publishes a new immutable exact-main image independently of
     # this one-time infrastructure expansion. If that happens before apply, the
     # live predecessor is still bound to the previous digest while the reviewed
@@ -7576,6 +7644,75 @@ def _check_authority_image_foundation_update(
 
     before_contract = before_input["authority_runtime_contract"]
     after_contract = after_input["authority_runtime_contract"]
+
+    # Under publish tracking there is no enumerated migration to match: the
+    # digest advances whenever qurl-service publishes, which is the point. The
+    # invariant becomes narrower AND stronger than the pinned one -- the image
+    # uri is the only field permitted to differ at all, and both sides must be
+    # immutable digest references.
+    if _authority_image_tracks_publish(after_contract):
+        before_uri = before_input.get("authority_image_uri")
+        after_uri = after_input.get("authority_image_uri")
+        for label, uri in (("before", before_uri), ("after", after_uri)):
+            if not isinstance(uri, str) or _AUTHORITY_IMAGE_URI_PATTERN.fullmatch(uri) is None:
+                raise ContractError(
+                    f"Authority image foundation {label} uri is not an immutable "
+                    "repository@sha256 reference"
+                )
+        if after_contract["global"].get("authority_image_digest") is not None:
+            raise ContractError(
+                "publish-tracking contract must not also name a basis digest"
+            )
+        # One reconstruction covers both shapes of this update, and refuses
+        # everything else. In steady state the before side already tracks
+        # publishes, so the pop and the set are no-ops and only the image uri
+        # may differ. On the one-time migration the before side is the pinned
+        # or pre-key contract, so exactly two things change: the digest goes and
+        # the source arrives. Any other field moving still fails byte-equality.
+        #
+        # The uris are deliberately NOT required to differ. The migration can
+        # land on the digest already deployed, and demanding a change would
+        # refuse the safest possible version of it.
+        # Basis evidence necessarily moves with this migration: switching the
+        # source EDITS the basis manifest, so its sha256 and blob-owning commit
+        # change. Admitting that is not a loosening, because the evidence is
+        # first required to be uniform and well formed across every object the
+        # contract carries, and it is then copied into the reconstruction -- so
+        # evidence may move, and nothing else may.
+        after_evidence = _authority_basis_evidence(after_input)
+        witness = after_evidence[0] if after_evidence else None
+        if not isinstance(witness, dict) or any(
+            not isinstance(evidence, dict)
+            or evidence.get("repository") != "layervai/nhp"
+            or evidence.get("path")
+            != "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json"
+            or evidence.get("schema_version") != 1
+            or not isinstance(evidence.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence["sha256"]) is None
+            or not isinstance(evidence.get("source_commit"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", evidence["source_commit"]) is None
+            or evidence.get("sha256") != witness.get("sha256")
+            or evidence.get("source_commit") != witness.get("source_commit")
+            for evidence in after_evidence
+        ):
+            raise ContractError(
+                "Authority image foundation basis evidence is not uniform and well formed"
+            )
+        expected_after = copy.deepcopy(before_input)
+        expected_after["authority_image_uri"] = after_uri
+        expected_global = expected_after["authority_runtime_contract"]["global"]
+        expected_global.pop("authority_image_digest", None)
+        expected_global["authority_image_source"] = "publish_parameter"
+        for evidence in _authority_basis_evidence(expected_after):
+            evidence["sha256"] = witness["sha256"]
+            evidence["source_commit"] = witness["source_commit"]
+        if not _json_equal(after_input, expected_after):
+            raise ContractError(
+                "Authority image foundation update changed an unrelated contract field"
+            )
+        _check_authority_image_foundation_envelope(change, after_contract)
+        return
+
     before_evidence = _authority_basis_evidence(before_input)
     after_evidence = _authority_basis_evidence(after_input)
     after_source = after_evidence[0].get("source_commit")
@@ -7620,6 +7757,13 @@ def _check_authority_image_foundation_update(
             "Authority image foundation migration changed an unrelated contract field"
         )
 
+    _check_authority_image_foundation_envelope(change, after_contract)
+
+
+def _check_authority_image_foundation_envelope(
+    change: dict[str, Any], after_contract: Any
+) -> None:
+    """Shared by both image sources; the envelope shape does not depend on one."""
     contract_shape = _mapping_shape(after_contract)
     expected_unknown = {
         "input": {"authority_runtime_contract": contract_shape},
@@ -7684,7 +7828,23 @@ def _check_authority_image_foundation_noop(
     payload = after["input"]
     contract = payload["authority_runtime_contract"]
     evidence_objects = _authority_basis_evidence(payload)
-    if (
+    if _authority_image_tracks_publish(contract):
+        # No enumerated target to bind to: the deployed digest is whatever was
+        # published. What must still hold is that it is an immutable reference
+        # and that the contract names no competing digest. Basis evidence is the
+        # generator's responsibility -- it derives it from the committed
+        # manifest -- so pinning it to a constant here would just go stale.
+        uri = payload.get("authority_image_uri")
+        if (
+            not isinstance(uri, str)
+            or _AUTHORITY_IMAGE_URI_PATTERN.fullmatch(uri) is None
+            or contract["global"].get("authority_image_digest") is not None
+        ):
+            raise ContractError(
+                "Authority image recovery foundation is not an immutable "
+                "repository@sha256 reference under publish tracking"
+            )
+    elif (
         payload.get("authority_image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
         or contract["global"].get("authority_image_digest")
         != AUTHORITY_IMAGE_UPDATE_TO_URI.rsplit("@", 1)[1]
@@ -8115,7 +8275,11 @@ def _check_authority_proof_steady_output(
 
 
 def _check_authority_image_output_changes(
-    plan: dict[str, Any], *, full_transition: bool
+    plan: dict[str, Any],
+    plan_from_uri: str,
+    plan_to_uri: str,
+    *,
+    full_transition: bool,
 ) -> None:
     """Bind the image migration to the exact root-output projection."""
     output_changes = plan.get("output_changes")
@@ -8129,8 +8293,8 @@ def _check_authority_image_output_changes(
     exact_image_transition = _is_exact_output_change(
         image_change,
         actions=["update"],
-        before=AUTHORITY_IMAGE_UPDATE_FROM_URI,
-        after=AUTHORITY_IMAGE_UPDATE_TO_URI,
+        before=plan_from_uri,
+        after=plan_to_uri,
     )
     if full_transition:
         if not exact_image_transition:
@@ -8140,8 +8304,8 @@ def _check_authority_image_output_changes(
     elif not exact_image_transition and not _is_exact_output_change(
             image_change,
             actions=["no-op"],
-            before=AUTHORITY_IMAGE_UPDATE_TO_URI,
-            after=AUTHORITY_IMAGE_UPDATE_TO_URI,
+            before=plan_to_uri,
+            after=plan_to_uri,
         ):
         raise ContractError(
             "Authority image recovery output changes are outside the bounded "
@@ -8177,6 +8341,7 @@ def _check_authority_image_new_noops(
     addresses: set[str],
 ) -> None:
     """Prove every already-applied runtime complement is an exact target no-op."""
+    _, plan_to_uri = _authority_image_plan_uris(by_address)
     for address in addresses:
         resource_type = AUTHORITY_IMAGE_UPDATE_RESOURCES[address]
         change = by_address[address]["change"]
@@ -8210,7 +8375,7 @@ def _check_authority_image_new_noops(
                 != _authority_function_identity(function_name)
                 or after.get("function_name") != function_name
                 or after.get("package_type") != "Image"
-                or after.get("image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+                or after.get("image_uri") != plan_to_uri
                 or re.fullmatch(r"[1-9][0-9]*", str(after.get("version"))) is None
             ):
                 raise ContractError(
@@ -9312,6 +9477,40 @@ def _loads_container_definitions(state: dict[str, Any], side: str) -> list:
     return parsed
 
 
+def _authority_image_plan_uris(
+    by_address: dict[str, dict[str, Any]],
+) -> tuple[str, str]:
+    """The (from, to) image uris this plan's foundation declares.
+
+    Under the pinned source this returns the enumerated constants unchanged, so
+    every assertion that used them keeps exactly its current meaning. Under
+    publish tracking there are no constants to return -- the digest advances on
+    its own -- so the pair is taken from the foundation change itself and each
+    side is required to be an immutable reference. Deriving both from one place
+    also means the function, output and no-op checks agree with the foundation
+    by construction rather than by coincidence.
+    """
+    item = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS) or {}
+    change = item.get("change") or {}
+    before_input = (change.get("before") or {}).get("input") or {}
+    after_input = (change.get("after") or {}).get("input") or {}
+    contract = after_input.get("authority_runtime_contract") or before_input.get(
+        "authority_runtime_contract"
+    )
+    if not _authority_image_tracks_publish(contract):
+        return AUTHORITY_IMAGE_UPDATE_FROM_URI, AUTHORITY_IMAGE_UPDATE_TO_URI
+    before_uri = before_input.get("authority_image_uri")
+    # A no-op foundation carries the same input on both sides; the applied image
+    # is then both the source and the target.
+    after_uri = after_input.get("authority_image_uri", before_uri)
+    for uri in (before_uri, after_uri):
+        if not isinstance(uri, str) or _AUTHORITY_IMAGE_URI_PATTERN.fullmatch(uri) is None:
+            raise ContractError(
+                "Authority image plan uris are not immutable repository@sha256 references"
+            )
+    return before_uri, after_uri
+
+
 def _check_authority_image_update(
     changed: set[str],
     by_address: dict[str, dict[str, Any]],
@@ -9320,6 +9519,7 @@ def _check_authority_image_update(
     refresh_disabled: bool,
 ) -> None:
     """Admit only the reviewed 65421e -> e147b2 sandbox image migration."""
+    plan_from_uri, plan_to_uri = _authority_image_plan_uris(by_address)
     foundation_changed = AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS in changed
     image_changed = changed & set(AUTHORITY_IMAGE_UPDATE_RESOURCES)
     recovery_replaces = changed & set(AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES)
@@ -9431,8 +9631,8 @@ def _check_authority_image_update(
                 or after.get("package_type") != "Image"
                 or change.get("before_identity") != expected_identity
                 or change.get("after_identity") != expected_identity
-                or before.get("image_uri") != AUTHORITY_IMAGE_UPDATE_FROM_URI
-                or after.get("image_uri") != AUTHORITY_IMAGE_UPDATE_TO_URI
+                or before.get("image_uri") != plan_from_uri
+                or after.get("image_uri") != plan_to_uri
                 or changed_fields != expected_changed_fields
                 or unknown_fields != _AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS
                 or any(
@@ -9470,6 +9670,8 @@ def _check_authority_image_update(
             )
     _check_authority_image_output_changes(
         plan,
+        plan_from_uri,
+        plan_to_uri,
         full_transition=(
             foundation_changed
             and image_changed == set(AUTHORITY_IMAGE_UPDATE_RESOURCES)

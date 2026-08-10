@@ -890,6 +890,10 @@ def authority_runtime_input_fixture() -> dict:
             "provisioned_cells_evidence": copy.deepcopy(evidence),
             "global": {
                 "authority_repository_url": repository,
+                # These fixtures exercise the pinned path, which is still a
+                # supported source and is what prod uses. Publish tracking has
+                # its own cases below.
+                "authority_image_source": "pinned_digest",
                 "authority_image_digest": digest,
                 "basis_evidence": copy.deepcopy(evidence),
                 "result_evidence": None,
@@ -9830,7 +9834,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 5, "managed_resource_count": 51},
+            {"data_resource_count": len(CHECKER.EXPECTED_DATA_RESOURCES), "managed_resource_count": 51},
         )
 
     def test_catalog_holdback_inventory_is_exact_all_or_nothing(self) -> None:
@@ -9841,7 +9845,7 @@ class StateListTests(unittest.TestCase):
         ]
         self.assertEqual(
             self.check(held_back),
-            {"data_resource_count": 5, "managed_resource_count": 49},
+            {"data_resource_count": len(CHECKER.EXPECTED_DATA_RESOURCES), "managed_resource_count": 49},
         )
 
         partial = [
@@ -9877,7 +9881,7 @@ class StateListTests(unittest.TestCase):
         self.assertEqual(
             self.check(runtime),
             {
-                "data_resource_count": 5,
+                "data_resource_count": len(CHECKER.EXPECTED_DATA_RESOURCES),
                 "managed_resource_count": (
                     len(CHECKER.EXPECTED_RESOURCES)
                     + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
@@ -9906,7 +9910,7 @@ class StateListTests(unittest.TestCase):
         self.assertEqual(
             self.check(full),
             {
-                "data_resource_count": 5 + len(worker_data),
+                "data_resource_count": len(CHECKER.EXPECTED_DATA_RESOURCES) + len(worker_data),
                 "managed_resource_count": (
                     51
                     + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES)
@@ -14530,3 +14534,404 @@ class ProvisionedCellStatusUpdateTest(unittest.TestCase):
         )
         self.assertEqual(claimed, frozenset({address}))
         self.assertNotIn(foreign, claimed or frozenset())
+
+
+def _legacy_pre_key_runtime_input() -> dict:
+    """The contract as it exists in APPLIED state: no authority_image_source.
+
+    Every fixture in this file describes the world under the current schema, so
+    a schema transition -- where the "before" side is the previously applied
+    shape -- was untested by construction. That is not hypothetical: the
+    pinned-to-publish change failed the live plan five separate times, each on
+    an assertion no local fixture could reach, because nothing here could
+    express the state being migrated FROM. This is the missing half.
+    """
+    payload = authority_runtime_input_fixture()
+    payload["authority_runtime_contract"]["global"].pop("authority_image_source")
+    return payload
+
+
+def _authority_foundation_change(before: dict, after: dict) -> dict:
+    """A realistic foundation_contract update between two runtime inputs.
+
+    Modelled on what Terraform actually emits for this resource, so the
+    envelope assertions in _check_authority_image_foundation_update are
+    exercised rather than bypassed: output mirrors input on the before side,
+    after carries no output, the id is stable, and the unknown/sensitive masks
+    are the value-free object shapes.
+    """
+    identifier = "8f14e45f-ceea-467a-9c1d-2b0aa0a1a1a1"
+    contract_shape = CHECKER._mapping_shape(
+        after["authority_runtime_contract"]
+    )
+    return {
+        "actions": ["update"],
+        "before": {
+            "id": identifier,
+            "input": copy.deepcopy(before),
+            "output": copy.deepcopy(before),
+            "triggers_replace": None,
+        },
+        "after": {
+            "id": identifier,
+            "input": copy.deepcopy(after),
+            "triggers_replace": None,
+        },
+        "after_unknown": {
+            "input": {"authority_runtime_contract": contract_shape},
+            "output": True,
+        },
+        "before_sensitive": {
+            "input": {"authority_runtime_contract": contract_shape},
+            "output": {"authority_runtime_contract": contract_shape},
+        },
+        "after_sensitive": {
+            "input": {"authority_runtime_contract": contract_shape},
+            "output": {},
+        },
+    }
+
+
+def _foundation_by_address(change: dict) -> dict:
+    return {
+        CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+            "mode": "managed",
+            "type": "terraform_data",
+            "change": change,
+        }
+    }
+
+
+def _migrated_publish_input(before: dict, image_uri: str | None = None) -> dict:
+    """Apply exactly the pinned-to-publish migration to a runtime input."""
+    after = copy.deepcopy(before)
+    global_contract = after["authority_runtime_contract"]["global"]
+    global_contract.pop("authority_image_digest", None)
+    global_contract["authority_image_source"] = "publish_parameter"
+    if image_uri is not None:
+        after["authority_image_uri"] = image_uri
+    for evidence in CHECKER._authority_basis_evidence(after):
+        # The migration edits the basis manifest, so its identity moves.
+        evidence["sha256"] = "d" * 64
+        evidence["source_commit"] = "e" * 40
+    return after
+
+
+def _publish_tracking_runtime_input() -> dict:
+    """The fixture as a publish-tracking contract: source switched, digest gone."""
+    payload = authority_runtime_input_fixture()
+    global_contract = payload["authority_runtime_contract"]["global"]
+    global_contract["authority_image_source"] = "publish_parameter"
+    global_contract.pop("authority_image_digest", None)
+    return payload
+
+
+class AuthorityImageSourceTests(unittest.TestCase):
+    """The image source the deploy path resolves through.
+
+    The invariant that survives both sources is that the Lambdas run an
+    immutable repository@sha256 reference. What differs is where the digest
+    comes from, and a contract must not be ambiguous about which applies.
+    """
+
+    def test_publish_tracking_binding_is_admitted(self) -> None:
+        payload = _publish_tracking_runtime_input()
+        self.assertTrue(
+            CHECKER._require_authority_runtime_binding({"input": payload})
+        )
+
+    def test_pinned_binding_is_still_admitted(self) -> None:
+        payload = authority_runtime_input_fixture()
+        self.assertTrue(
+            CHECKER._require_authority_runtime_binding({"input": payload})
+        )
+
+    def test_publish_tracking_must_not_also_name_a_digest(self) -> None:
+        payload = _publish_tracking_runtime_input()
+        payload["authority_runtime_contract"]["global"][
+            "authority_image_digest"
+        ] = "sha256:" + "1" * 64
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_authority_runtime_binding({"input": payload})
+
+    def test_pinned_uri_must_match_the_named_digest(self) -> None:
+        payload = authority_runtime_input_fixture()
+        repository = payload["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        payload["authority_image_uri"] = f"{repository}@sha256:" + "2" * 64
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_authority_runtime_binding({"input": payload})
+
+    def test_absent_source_is_the_legacy_pinned_shape(self) -> None:
+        """The currently-applied state predates the key and must still validate.
+
+        It is the "before" side of every plan until the first apply carrying
+        the new schema lands, so refusing it would make the change unappliable.
+        """
+        payload = authority_runtime_input_fixture()
+        payload["authority_runtime_contract"]["global"].pop(
+            "authority_image_source"
+        )
+        self.assertTrue(
+            CHECKER._require_authority_runtime_binding({"input": payload})
+        )
+
+    def test_absent_source_still_requires_a_matching_digest(self) -> None:
+        """Absent means pinned, not unconstrained -- it cannot track publishes."""
+        payload = authority_runtime_input_fixture()
+        global_contract = payload["authority_runtime_contract"]["global"]
+        global_contract.pop("authority_image_source")
+        global_contract["authority_image_digest"] = "sha256:" + "9" * 64
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_authority_runtime_binding({"input": payload})
+
+    def test_migration_from_pinned_to_publish_is_admitted(self) -> None:
+        """The one-time schema change this checker had to be taught.
+
+        Exactly two things move: the basis digest goes and the source arrives.
+        """
+        before = authority_runtime_input_fixture()
+        after = _publish_tracking_runtime_input()
+        expected = copy.deepcopy(before)
+        expected["authority_image_uri"] = after["authority_image_uri"]
+        expected_global = expected["authority_runtime_contract"]["global"]
+        expected_global.pop("authority_image_digest", None)
+        expected_global["authority_image_source"] = "publish_parameter"
+        self.assertEqual(expected, after)
+
+    def test_migration_must_not_move_anything_else(self) -> None:
+        before = authority_runtime_input_fixture()
+        after = _publish_tracking_runtime_input()
+        after["authority_runtime_contract"]["global"][
+            "regional_lambda_concurrency_quota"
+        ] = 999
+        expected = copy.deepcopy(before)
+        expected["authority_image_uri"] = after["authority_image_uri"]
+        expected_global = expected["authority_runtime_contract"]["global"]
+        expected_global.pop("authority_image_digest", None)
+        expected_global["authority_image_source"] = "publish_parameter"
+        self.assertNotEqual(expected, after)
+
+    def test_migration_evidence_must_be_uniform(self) -> None:
+        """Evidence may move with the manifest edit, but only in lockstep.
+
+        The migration edits the basis file, so its sha256 and blob-owning
+        commit necessarily change. Admitting that must not admit a contract
+        whose objects disagree about which basis they came from.
+        """
+        payload = _publish_tracking_runtime_input()
+        objects = CHECKER._authority_basis_evidence(payload)
+        self.assertGreater(len(objects), 1)
+        uniform = {
+            (evidence["sha256"], evidence["source_commit"])
+            for evidence in objects
+        }
+        self.assertEqual(len(uniform), 1)
+        objects[-1]["sha256"] = "c" * 64
+        divergent = {
+            (evidence["sha256"], evidence["source_commit"])
+            for evidence in CHECKER._authority_basis_evidence(payload)
+        }
+        self.assertEqual(len(divergent), 2)
+
+    def test_pinned_plan_uris_are_the_enumerated_constants(self) -> None:
+        """The pinned scenario must be byte-for-byte what it was.
+
+        Everything downstream now compares against this pair instead of the
+        constants directly, so if the resolver ever stopped returning them the
+        enumerated migration would silently start accepting other images.
+        """
+        by_address = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "before": {"input": authority_runtime_input_fixture()},
+                    "after": {"input": authority_runtime_input_fixture()},
+                }
+            }
+        }
+        self.assertEqual(
+            CHECKER._authority_image_plan_uris(by_address),
+            (
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FROM_URI,
+                CHECKER.AUTHORITY_IMAGE_UPDATE_TO_URI,
+            ),
+        )
+
+    def test_publish_plan_uris_come_from_the_foundation(self) -> None:
+        before = _publish_tracking_runtime_input()
+        after = _publish_tracking_runtime_input()
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}@sha256:" + "7" * 64
+        by_address = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {"before": {"input": before}, "after": {"input": after}}
+            }
+        }
+        self.assertEqual(
+            CHECKER._authority_image_plan_uris(by_address),
+            (before["authority_image_uri"], after["authority_image_uri"]),
+        )
+
+    def test_publish_plan_uris_refuse_a_mutable_tag(self) -> None:
+        before = _publish_tracking_runtime_input()
+        after = _publish_tracking_runtime_input()
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}:latest"
+        by_address = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {"before": {"input": before}, "after": {"input": after}}
+            }
+        }
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._authority_image_plan_uris(by_address)
+
+    def test_unknown_source_is_refused(self) -> None:
+        payload = _publish_tracking_runtime_input()
+        payload["authority_runtime_contract"]["global"][
+            "authority_image_source"
+        ] = "latest"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_authority_runtime_binding({"input": payload})
+
+    def test_a_mutable_tag_is_refused_under_publish_tracking(self) -> None:
+        """The whole point of tracking a digest parameter rather than a tag."""
+        payload = _publish_tracking_runtime_input()
+        repository = payload["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        payload["authority_image_uri"] = f"{repository}:latest"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._require_authority_runtime_binding({"input": payload})
+
+
+class AuthorityImageSchemaTransitionTests(unittest.TestCase):
+    """Drive the checker through a schema transition, not just steady state.
+
+    Every one of the five live-plan failures on the pinned-to-publish change
+    was an assertion reachable only when the BEFORE side carries the previously
+    applied shape. These cases reach all of them locally.
+    """
+
+    def test_legacy_to_publish_foundation_update_is_admitted(self) -> None:
+        before = _legacy_pre_key_runtime_input()
+        after = _migrated_publish_input(before)
+        change = _authority_foundation_change(before, after)
+        CHECKER._check_authority_image_foundation_update(
+            _foundation_by_address(change)
+        )
+
+    def test_pinned_to_publish_foundation_update_is_admitted(self) -> None:
+        before = authority_runtime_input_fixture()
+        after = _migrated_publish_input(before)
+        change = _authority_foundation_change(before, after)
+        CHECKER._check_authority_image_foundation_update(
+            _foundation_by_address(change)
+        )
+
+    def test_migration_may_also_move_the_image(self) -> None:
+        """Schema and image can move together; neither ordering is required."""
+        before = authority_runtime_input_fixture()
+        repository = before["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after = _migrated_publish_input(
+            before, image_uri=f"{repository}@sha256:" + "4" * 64
+        )
+        change = _authority_foundation_change(before, after)
+        CHECKER._check_authority_image_foundation_update(
+            _foundation_by_address(change)
+        )
+
+    def test_migration_may_not_move_an_unrelated_field(self) -> None:
+        before = authority_runtime_input_fixture()
+        after = _migrated_publish_input(before)
+        after["authority_runtime_contract"]["global"][
+            "regional_lambda_concurrency_quota"
+        ] = 999
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
+
+    def test_migration_may_not_leave_a_basis_digest_behind(self) -> None:
+        before = authority_runtime_input_fixture()
+        after = _migrated_publish_input(before)
+        after["authority_runtime_contract"]["global"][
+            "authority_image_digest"
+        ] = "sha256:" + "1" * 64
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
+
+    def test_migration_may_not_desynchronize_basis_evidence(self) -> None:
+        before = authority_runtime_input_fixture()
+        after = _migrated_publish_input(before)
+        CHECKER._authority_basis_evidence(after)[-1]["sha256"] = "f" * 64
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
+
+    def test_migration_may_not_deploy_a_mutable_tag(self) -> None:
+        before = authority_runtime_input_fixture()
+        repository = before["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after = _migrated_publish_input(before, image_uri=f"{repository}:latest")
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
+
+    def test_steady_state_publish_update_moves_only_the_image(self) -> None:
+        before = _publish_tracking_runtime_input()
+        repository = before["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after = copy.deepcopy(before)
+        after["authority_image_uri"] = f"{repository}@sha256:" + "5" * 64
+        change = _authority_foundation_change(before, after)
+        CHECKER._check_authority_image_foundation_update(
+            _foundation_by_address(change)
+        )
+
+    def test_steady_state_publish_update_refuses_other_movement(self) -> None:
+        before = _publish_tracking_runtime_input()
+        after = copy.deepcopy(before)
+        after["authority_runtime_contract"]["global"]["qat1_kid"] = "moved"
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
+
+    def test_pinned_migration_is_still_the_enumerated_one(self) -> None:
+        """The pinned scenario keeps its exact reviewed migration.
+
+        Teaching the checker a second source must not turn the pinned path into
+        "any image may replace any other".
+        """
+        before = authority_runtime_input_fixture()
+        after = copy.deepcopy(before)
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}@sha256:" + "6" * 64
+        after["authority_runtime_contract"]["global"]["authority_image_digest"] = (
+            "sha256:" + "6" * 64
+        )
+        change = _authority_foundation_change(before, after)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_image_foundation_update(
+                _foundation_by_address(change)
+            )
