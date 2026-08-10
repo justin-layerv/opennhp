@@ -2447,45 +2447,6 @@ def _proof_resource_changes(payload: dict) -> list[dict]:
         }
         for address, resource_type in CHECKER.AUTHORITY_PROOF_ALARM_RESOURCES.items()
     ]
-    changes.extend(
-        [
-            {
-                "address": CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
-                "mode": "managed",
-                "type": "aws_iam_role_policy",
-                "change": _runtime_create(
-                    {
-                        "name": "connector-authority-proof-invoke",
-                        "role": "layerv-nhp-sandbox-udp-proof-controller",
-                        "policy": json.dumps(
-                            {
-                                "Statement": [
-                                    {
-                                        "Action": ["lambda:InvokeFunction"],
-                                        "Effect": "Allow",
-                                        "Resource": [
-                                            (
-                                                "arn:aws:lambda:us-east-2:"
-                                                "767397897469:function:"
-                                                "layerv-nhp-sandbox-ca-pm:blue"
-                                            ),
-                                            (
-                                                "arn:aws:lambda:us-east-2:"
-                                                "767397897469:function:"
-                                                "layerv-nhp-sandbox-ca-pcr:blue"
-                                            ),
-                                        ],
-                                        "Sid": "InvokeSelectedProofMutationAlias",
-                                    }
-                                ],
-                                "Version": "2012-10-17",
-                            }
-                        ),
-                    }
-                ),
-            },
-        ]
-    )
     for fn, operation in CHECKER.AUTHORITY_PROOF_FUNCTIONS.items():
         spec = functions[fn]
         policy = (
@@ -7151,7 +7112,11 @@ class PlanContractTests(unittest.TestCase):
             for item in candidate["resource_changes"]
             if item["change"]["actions"] != ["no-op"]
         ]
-        self.assertEqual(actions.count(["create"]), 33)
+        # 32, not 33: the proof-controller invoke grant is no longer created
+        # here. It managed an inline policy on a role the udp-proof-runner root
+        # owned, and destroying that root (#3804) left it pointing at nothing,
+        # so the module released it through a `removed` block.
+        self.assertEqual(actions.count(["create"]), 32)
         self.assertEqual(actions.count(["update"]), 2)
         self.assertEqual(
             len(
@@ -7267,19 +7232,6 @@ class PlanContractTests(unittest.TestCase):
         policy_change["before"]["policy"] = json.dumps(policy)
         self.assert_rejected(replay)
 
-        controller = authority_proof_disable_fixture()
-        controller_policy = self.change(
-            controller, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
-        )
-        invoke = json.loads(controller_policy["before"]["policy"])
-        invoke["Statement"][0]["Resource"] = [
-            (
-                f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
-                f"function:{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"
-            )
-        ]
-        controller_policy["before"]["policy"] = json.dumps(invoke)
-        self.assert_rejected(controller)
 
     def test_authority_proof_enablement_rejects_partial_or_foreign_graph(
         self,
@@ -7377,19 +7329,6 @@ class PlanContractTests(unittest.TestCase):
         }
         self.assert_rejected(environment)
 
-        controller = authority_proof_enable_fixture()
-        controller_policy = self.change(
-            controller, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
-        )
-        invoke = json.loads(controller_policy["after"]["policy"])
-        invoke["Statement"][0]["Resource"] = [
-            (
-                f"arn:aws:lambda:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
-                f"function:{CHECKER.AUTHORITY_PROOF_FUNCTION_NAME}:green"
-            )
-        ]
-        controller_policy["after"]["policy"] = json.dumps(invoke)
-        self.assert_rejected(controller)
 
         output = authority_proof_enable_fixture()
         output["output_changes"][CHECKER.AUTHORITY_PROOF_ALIAS_OUTPUT][
@@ -9406,6 +9345,83 @@ class PlanContractTests(unittest.TestCase):
                     CHECKER.ContractError, "reviewed .* alarm shape"
                 ):
                     CHECKER.check_plan(candidate)
+
+    def orphan_forget_fixture(self) -> dict:
+        """A converged proof plan whose only work is releasing the orphan.
+
+        The proof-controller grant is gone from the module but still in state
+        until its `removed` block applies, so it presents as a state-only
+        `forget`. See _validate_authority_proof_controller_orphan_forget.
+        """
+        candidate = authority_proof_steady_fixture()
+        candidate["applyable"] = True
+        candidate["resource_changes"].append(
+            {
+                "address": CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
+                "mode": "managed",
+                "type": "aws_iam_role_policy",
+                "index": 0,
+                "provider_name": "registry.terraform.io/hashicorp/aws",
+                "action_reason": "delete_because_no_resource_config",
+                "change": {
+                    "actions": ["forget"],
+                    "before": {
+                        "name": CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_NAME,
+                        "role": CHECKER.AUTHORITY_PROOF_CONTROLLER_ROLE_NAME,
+                        "policy": "{}",
+                    },
+                    "after": None,
+                    "after_unknown": {},
+                    "before_sensitive": False,
+                    "after_sensitive": False,
+                },
+            }
+        )
+        return candidate
+
+    def test_orphaned_proof_controller_grant_may_be_forgotten(self) -> None:
+        CHECKER.check_plan(self.orphan_forget_fixture())
+
+    def test_orphaned_proof_controller_grant_may_not_be_deleted(self) -> None:
+        """A real destroy is not this lane.
+
+        Tearing the grant down while a live controller depends on it is the
+        `authority-proof-disable` transition's job, and it carries the alias
+        ordering this lane deliberately has no opinion about.
+        """
+        candidate = self.orphan_forget_fixture()
+        self.change(
+            candidate, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )["actions"] = ["delete"]
+        self.assert_rejected(candidate)
+
+    def test_forgotten_proof_controller_grant_may_not_plan_an_after_state(
+        self,
+    ) -> None:
+        candidate = self.orphan_forget_fixture()
+        self.change(
+            candidate, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )["after"] = {"name": CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_NAME}
+        self.assert_rejected(candidate)
+
+    def test_forgotten_grant_must_be_the_proof_controller_grant(self) -> None:
+        for field, value in (
+            ("role", "layerv-nhp-sandbox-some-other-role"),
+            ("name", "some-other-policy"),
+        ):
+            with self.subTest(field=field):
+                candidate = self.orphan_forget_fixture()
+                self.change(
+                    candidate, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+                )["before"][field] = value
+                self.assert_rejected(candidate)
+
+    def test_forgotten_proof_controller_grant_must_carry_prior_state(self) -> None:
+        candidate = self.orphan_forget_fixture()
+        self.change(
+            candidate, CHECKER.AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        )["before"] = None
+        self.assert_rejected(candidate)
 
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):

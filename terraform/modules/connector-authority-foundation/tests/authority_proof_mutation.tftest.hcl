@@ -703,22 +703,11 @@ run "runtime_fences_the_proof_execution_role_to_the_proof_tenant_partition" {
     authority_runtime_functions_enabled = true
   }
 
-  assert {
-    condition = (
-      length(aws_iam_role_policy.authority_proof_controller_invoke) == 1 &&
-      aws_iam_role_policy.authority_proof_controller_invoke[0].role == "layerv-nhp-sandbox-udp-proof-controller" &&
-      jsondecode(aws_iam_role_policy.authority_proof_controller_invoke[0].policy).Statement == [{
-        Sid    = "InvokeSelectedProofMutationAlias"
-        Effect = "Allow"
-        Action = ["lambda:InvokeFunction"]
-        Resource = [
-          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue",
-          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue",
-        ]
-      }]
-    )
-    error_message = "Control must atomically attach one exact selected ca-pm alias grant to the deterministic proof-controller role."
-  }
+  # The controller invoke grant that used to be asserted here is gone. It managed
+  # an inline policy on layerv-nhp-<env>-udp-proof-controller, a role owned by the
+  # separate udp-proof-runner root; destroying that root (#3804) left the grant
+  # pointing at a role AWS reports as NoSuchEntity. See the `removed` block in
+  # authority_runtime.tf.
 
   # This PR is dark ca-pm capability only. The consumer functions remain byte-
   # for-byte on their governed selected-alias versions until the later attended
@@ -1063,16 +1052,9 @@ run "proof_rollout_prepares_green_without_moving_blue_selector" {
       "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:blue" &&
       output.authority_selected_alias_targets.proof.mutate_proof_agent ==
       "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue" &&
-      length(local.hub_authority_alias_arns) == 6 &&
-      toset(
-        ({ for statement in jsondecode(aws_iam_role_policy.authority_proof_controller_invoke[0].policy).Statement : statement.Sid => statement })["InvokeSelectedProofMutationAlias"].Resource
-        ) == toset([
-          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:blue",
-          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pm:green",
-          "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-pcr:blue",
-      ])
+      length(local.hub_authority_alias_arns) == 6
     )
-    error_message = "Preparation must keep blue selected while expanding only the bounded Hub/controller caller sets to both colors."
+    error_message = "Preparation must keep blue selected while expanding only the bounded Hub caller set to both colors."
   }
 }
 

@@ -77,14 +77,16 @@ closed, so prod is code-only with no resource change.
 
 **Steps 1–3 are unreachable — see the next section before attempting them.**
 
-- [ ] Restore the `layerv-nhp-sandbox-udp-proof-controller` IAM role, and decide
-      which root owns it now. This clears the **Terraform** wedge (the apply);
-      it does not restore a caller for steps 1–3. See "the orphan is not
-      independently removable" below. Do **not** try to delete the orphaned
-      policy instead; the module forbids it.
-- [ ] Reinstate a caller for the controller, or widen its trust policy — it is
-      GitHub-OIDC-only and its workflow was revoked (#3806). Required before
-      steps 1–3, not before the apply unblock above.
+- [x] Release the orphaned `authority_proof_controller_invoke` grant. Done by
+      deleting the resource **and** adding a `removed` block with
+      `destroy = false`, which plans as a state-only `forget`. Measured: drift 0,
+      zero destroys, foundation fence clean, no alias/warm-pool/Hub movement.
+      Restoring the IAM role is **not** required — see "the orphan is
+      independently removable" below.
+- [ ] Claim the four pre-existing unclaimed addresses that also block the apply:
+      `terraform_data.foundation_contract` and `aws_iam_role_policy.authority_exec`
+      for ca-ia, ca-iro-cell0, ca-iro-cell1 (pending DynamoDB SSE `kms:Decrypt`
+      grants). Unrelated to the proof work; blocks the apply with or without it.
 - [ ] Decide the ordering for retiring the rollout selector now that it is known
       to replace the Hub task definition (measured below), then execute it.
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
@@ -116,11 +118,12 @@ This is a latent **apply** failure, not a guard failure: any plan that changes
 the proof alias set re-renders the policy and calls `PutRolePolicy` on a role
 that is gone. It is a no-op today only because the alias set has not moved.
 
-This must be resolved before anything else — **by restoring the role, not by
-deleting the policy**; see "the orphan is not independently removable" below for
-why the module forbids the latter. It is also why the sanctioned steps 1–3
-cannot simply be "restored": the identity they need was deleted out from under
-Control.
+It is **not** latent. Measured against live state (serial 95) at the committed
+gates, the baseline plan is `1 to add, 4 to change, 0 to destroy` — and the
+"add" is this policy, so the `PutRolePolicy` failure is live today. Resolved by
+forgetting the grant; see "the orphan is independently removable" below. Steps
+1–3 still cannot be "restored", but not because of this role — see the
+correction in that section.
 
 ### Blocker 2 — retiring the selector is not a small change
 
@@ -144,66 +147,61 @@ Hub task-definition replacement is a live Hub redeploy riding along with a
 "gate flip", which is what #3809's review caught. Decide deliberately whether to
 accept that or decompose it; do not let it arrive unattended.
 
-### The orphan is not independently removable — measured, then refused
+### The orphan IS independently removable — #3818's claim, corrected
 
-The obvious next move is to drop the orphaned policy on its own. **It does not
-work, and the module says so.** `authority_proof_mutation_fence_valid`
-(`authority_runtime_contract.tf`) requires, whenever
-`authority_proof_mutation_controls_enabled` is true, exactly one controller role
-ARN equal to the deterministic `layerv-nhp-<env>-udp-proof-controller` ARN. Its
-own comment states the intent: *the only admitted controller identity is the
-deterministic role whose selected-alias policy Control owns in this same plan.*
+#3818 recorded that dropping the orphaned policy alone "does not work, and the
+module says so", reasoning from `authority_proof_mutation_fence_valid`. **That
+is wrong, and it was measured before being corrected here.**
 
-Control owning that policy and the capability being enabled are welded together
-on purpose. So the policy cannot leave while the capability is on, and turning
-the capability off is the `authority-proof-disable` transition — step 4, which
-requires all six aliases to already be no-ops, which requires steps 1–3, which
-require the controller. That is the whole deadlock, and its cause is that an IAM
-role Control depends on was deleted by a different root.
+The precondition constrains the *variable*
+`authority_proof_mutation_controller_role_arns` — it never requires the policy
+**resource** to exist. The weld between "Control owns the policy" and "the
+capability is enabled" is asserted in a code comment, not in the condition. With
+the resource removed, `terraform plan` succeeds: `4 to change, 0 to destroy`.
 
-Two measured notes for whoever picks this up:
+Deleting the resource alone is still not sufficient, but for a different and
+smaller reason: the already-deleted policy stays in state, so a plain removal
+leaves a drift `delete` that `check-connector-authority-foundation.sh` folds
+into destructive actions and refuses. The fix is a `removed` block with
+`lifecycle { destroy = false }`, which plans as **`forget`** — Terraform
+releases the address from state and calls no AWS delete API, because AWS deleted
+it already. Measured: `DRIFT: 0`, zero destroys, and the fence passes on its own
+terms ("Connector Authority foundation contract is clean"). **No fence allowance
+was needed**, so this is not the `2026-08-06-unlock-prod-control-root.md`
+guard-deadlock class after all — the guard was refusing a *historical*
+out-of-band deletion, and `forget` states that fact instead of arguing with it.
 
-- `terraform plan -refresh-only` against live state does cleanly detect
-  `authority_proof_controller_invoke[0]` as *deleted outside Terraform*, and it
-  is the **only** drift in the root. But **do not run a refresh-only apply on its
-  own**: the module still declares the resource, so once state forgets it every
-  subsequent plan wants to create it against a role that does not exist, turning
-  a latent apply failure into a guaranteed one.
-- Because the capability must stay enabled until step 4, the cheapest correct
-  unblock is to **restore the IAM role** rather than to fight the contract.
-  Nothing needs to assume it for Control's plan to become applyable again — the
-  contract only requires the role to exist so Control can own a policy on it.
-  Its definition is recoverable from history at
-  `be7f2b5bd^:terraform/modules/udp-proof-runner/iam.tf`
-  (`aws_iam_role.controller`). Decide deliberately which root should own it now,
-  given the runner root that used to is gone.
+Restoring the IAM role — #3818's recommendation — is therefore unnecessary, and
+would recreate the cross-root ownership seam that caused this in the first
+place.
 
-  **Restoring the role does not restore the ability to run steps 1–3.** That
-  role's trust policy admits only `sts:AssumeRoleWithWebIdentity` federated to
-  the GitHub OIDC provider and conditioned on
-  `repo:<repo>:environment:<environment>` — there is no AWS principal in it, so
-  no operator or CLI session can assume it, and the workflow that did was
-  removed with its App credentials revoked in #3806. Treat these as two separate
-  wedges: restoring the role clears the **Terraform** one (the apply), while
-  invoking the controller additionally needs a caller that no longer exists.
-  Anyone planning steps 1–3 must budget for reinstating one, or for widening
-  that trust policy deliberately.
+Two corrections that travel with it:
 
-### The remaining blocker still needs a fence lane
+- `terraform plan -refresh-only` still must not be applied on its own, for the
+  reason #3818 gives: the resource would be recreated by every later plan. The
+  `removed` block is what makes the release safe, because it drops the resource
+  from the config in the same change.
+- **Steps 1–3 are unreachable for a stronger reason than a deleted role.** The
+  governed zero-spill alias controller was never *built* — it exists only as
+  prose in the design doc and module comments, and there is no `update-alias` or
+  `publish-version` anywhere in `.github/` or `scripts/`. Terraform is the sole
+  manager of the six aliases. `layerv-nhp-sandbox-udp-proof-controller` only
+  ever held `lambda:InvokeFunction` on ca-pm's alias; it was the attended proof
+  *invoke* identity, never an alias manager, so restoring it would not make
+  steps 1–3 reachable. The ordering is also unsatisfiable in principle: while
+  the gate is on, the standby colour reads
+  `data.aws_lambda_alias.authority_proof_policy_live`, so blue is frozen
+  (IA/RA/ICR blue=6, green=12) and the only lever that frees it is the
+  `authority-proof-disable` plan — the very plan required to move nothing.
 
-`scripts/check-connector-authority-foundation.sh` admits no proof-related delete
-in any lane, and retiring the selector requires four. The guard that rejects
-today's state also blocks its own remediation — the same class as
-`2026-08-06-unlock-prod-control-root.md`. The lane must be justified by the
-corrected live-first ordering; an allowance shaped to admit a **code-first**
-teardown stays forbidden, which is why #3809 was closed.
+### A third blocker: four pre-existing unclaimed addresses
 
-Note the pattern before reaching for that lane. This fence has now refused three
-separate proposals — #3810's gate flip, #3809's code-first teardown, and an
-attempt to drop the orphaned invoke policy on its own — and on all three it was
-right, the last one enforced by the module contract rather than the fence. Treat
-a fourth refusal as evidence the sequence is still wrong, not as a fourth
-allowance to write.
+`check-control-sandbox-first-apply.py` also refuses the **baseline** plan, on
+four addresses no transition claims: `terraform_data.foundation_contract` plus
+`aws_iam_role_policy.authority_exec` for ca-ia, ca-iro-cell0 and ca-iro-cell1
+(pending DynamoDB SSE `kms:Decrypt` grants). That is unrelated to the proof work
+and blocks the apply independently. Sandbox Control is therefore wedged on three
+gates, not one: this checker, the foundation fence, and the apply itself.
 
 ## Two traps for whoever does this
 

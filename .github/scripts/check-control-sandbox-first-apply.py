@@ -53,6 +53,8 @@ AUTHORITY_PROOF_ALIAS_OUTPUTS = {
 AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS = (
     "module.control.aws_iam_role_policy.authority_proof_controller_invoke[0]"
 )
+AUTHORITY_PROOF_CONTROLLER_POLICY_NAME = "connector-authority-proof-invoke"
+AUTHORITY_PROOF_CONTROLLER_ROLE_NAME = "layerv-nhp-sandbox-udp-proof-controller"
 # The single reviewed deposed object left by the Authority function-SG
 # generation change: its create-before-destroy replacement applied, but the
 # generation-1 delete could not complete while published function versions still
@@ -828,7 +830,6 @@ AUTHORITY_ALARM_RESOURCES = {
 AUTHORITY_RUNTIME_RESOURCES.update(AUTHORITY_ALARM_RESOURCES)
 AUTHORITY_PROOF_RESOURCES: dict[str, str] = {
     **AUTHORITY_PROOF_ALARM_RESOURCES,
-    AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS: "aws_iam_role_policy",
 }
 for _fn in AUTHORITY_PROOF_FUNCTIONS:
     AUTHORITY_PROOF_RESOURCES.update(
@@ -1499,11 +1500,6 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
     ),
     "module.control.aws_iam_role.authority_exec": ("managed", "aws_iam_role", "aws"),
     "module.control.aws_iam_role_policy.authority_exec": (
-        "managed",
-        "aws_iam_role_policy",
-        "aws",
-    ),
-    "module.control.aws_iam_role_policy.authority_proof_controller_invoke": (
         "managed",
         "aws_iam_role_policy",
         "aws",
@@ -7360,49 +7356,13 @@ def _check_authority_runtime_resources(
         if observed != expected:
             raise ContractError(f"{fn} attended-proof environment fence drifted")
 
-    if set(AUTHORITY_PROOF_FUNCTIONS).issubset(functions):
-        controller_policy = _authority_runtime_after(
-            by_address, AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
-        )
-        proof_colors = ("blue", "green") if proof_rollout else (selected,)
-        selected_aliases = [
-            (
-                f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
-                f"{AUTHORITY_PROOF_FUNCTION_NAME}:{color}"
-            )
-            for color in proof_colors
-        ]
-        selected_aliases.append(
-            (
-                f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
-                f"{AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME}:{selected}"
-            )
-        )
-        if (
-            controller_policy.get("name") != "connector-authority-proof-invoke"
-            or controller_policy.get("role")
-            != "layerv-nhp-sandbox-udp-proof-controller"
-            or _decode_exact_json(
-                controller_policy.get("policy"),
-                "policy",
-                AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
-            )
-            != {
-                "Statement": [
-                    {
-                        "Action": ["lambda:InvokeFunction"],
-                        "Effect": "Allow",
-                        "Resource": selected_aliases,
-                        "Sid": "InvokeSelectedProofMutationAlias",
-                    }
-                ],
-                "Version": "2012-10-17",
-            }
-        ):
-            raise ContractError(
-                "Control must own exactly the bounded ca-pm/ca-pcr alias invoke policy "
-                "on the deterministic proof-controller role"
-            )
+    # The controller invoke grant that used to be validated here is gone. It
+    # managed an inline policy on layerv-nhp-sandbox-udp-proof-controller, a
+    # role owned by the separate udp-proof-runner root; destroying that root
+    # (#3804) left it pointing at a role AWS reports as NoSuchEntity, so the
+    # module released it through a `removed` block. There is no grant left to
+    # pin -- and no caller either, the runner workflow was removed with its App
+    # credentials revoked (#3806).
 
     _check_authority_alarm_routing(by_address, functions)
 
@@ -9088,6 +9048,68 @@ def _validate_authority_image_uri_move(
 ) -> None:
     """Reuse the full foundation validator; the claim only selects the lane."""
     _check_authority_image_foundation_update(by_address)
+
+
+def _validate_authority_proof_controller_orphan_forget(
+    by_address: dict[str, Any],
+) -> None:
+    """Prove the orphaned proof-controller grant is being RELEASED, not destroyed.
+
+    `aws_iam_role_policy.authority_proof_controller_invoke` managed an inline
+    policy on `layerv-nhp-sandbox-udp-proof-controller`, a role owned by the
+    separate udp-proof-runner root. Destroying that root (#3804) deleted the
+    role, and the resource's `count` keyed off
+    `authority_proof_mutation_controls_enabled` rather than off the role
+    existing, so Control kept re-rendering a grant pointing at nothing -- and
+    any apply would call PutRolePolicy against a role AWS reports as
+    NoSuchEntity.
+
+    The module now drops the resource behind a `removed` block with
+    `destroy = false`, which plans as `forget`: Terraform releases the address
+    from state and calls no AWS API. Nothing is destroyed, because AWS deleted
+    the policy already.
+
+    The address is absent from the config resource map, so it never reaches the
+    change-set dispatch; the inventory gate is what admits it, and this is that
+    gate's deep check. A `delete` never gets here -- the caller admits only
+    `forget` -- which keeps this from becoming a route for tearing the grant
+    down while a live controller still depends on it. That ordering stays
+    reserved for the `authority-proof-disable` transition.
+    """
+    address = AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+    item = by_address.get(address)
+    if not isinstance(item, dict):
+        raise ContractError("the orphaned proof-controller forget must be planned")
+    change = item.get("change")
+    if not isinstance(change, dict):
+        raise ContractError("the orphaned proof-controller change must be an object")
+    if change.get("actions") != ["forget"]:
+        raise ContractError(
+            "the orphaned proof-controller grant must be forgotten, never "
+            f"destroyed; got {change.get('actions')!r}"
+        )
+    # A forget is state-only: Terraform plans no after-state because it is
+    # releasing the address, not managing it. An after-state would mean the
+    # resource is being re-created rather than released.
+    if change.get("after") is not None:
+        raise ContractError(
+            "a forgotten proof-controller grant must plan no after-state"
+        )
+    before = change.get("before")
+    if not isinstance(before, dict):
+        raise ContractError(
+            "the orphaned proof-controller forget must carry its prior state"
+        )
+    if before.get("name") != AUTHORITY_PROOF_CONTROLLER_POLICY_NAME:
+        raise ContractError(
+            "the forgotten grant must be the proof-controller invoke policy; "
+            f"got {before.get('name')!r}"
+        )
+    if before.get("role") != AUTHORITY_PROOF_CONTROLLER_ROLE_NAME:
+        raise ContractError(
+            "the forgotten grant must be attached to the deterministic "
+            f"proof-controller role; got {before.get('role')!r}"
+        )
 
 
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
@@ -12294,6 +12316,20 @@ def check_plan(
             "Hub worker slice requires both the Hub edge slice and the authority "
             "runtime slice to be present"
         )
+    # The orphaned proof-controller grant is no longer in the module, but it is
+    # still in state until its `forget` applies, so it legitimately appears in
+    # this pre-apply inventory exactly once. Tolerate it only while that release
+    # is the planned action -- any other action on the address (a create, or a
+    # real delete) falls straight back to the mismatch below. See
+    # _claim_authority_proof_controller_orphan_forget.
+    _orphan_change = by_address.get(AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS)
+    _orphan_forget_pending = (
+        isinstance(_orphan_change, dict)
+        and isinstance(_orphan_change.get("change"), dict)
+        and _orphan_change["change"].get("actions") == ["forget"]
+    )
+    if _orphan_forget_pending:
+        _validate_authority_proof_controller_orphan_forget(by_address)
     expected_inventory = (
         base_inventory
         | (catalog_extra if catalog_mode else set())
@@ -12302,6 +12338,11 @@ def check_plan(
         | (proof_rollout_extra if proof_rollout_mode else set())
         | (hub_edge_extra if hub_edge_mode else set())
         | (hub_worker_extra if hub_worker_mode else set())
+        | (
+            {AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS}
+            if _orphan_forget_pending
+            else set()
+        )
     )
     if actual_inventory != expected_inventory:
         missing = sorted(expected_inventory - actual_inventory)
@@ -12463,7 +12504,6 @@ def check_plan(
     }
     rollout_initial_changes = {
         authority_contract_address,
-        AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS,
         "module.control.aws_iam_role_policy.hub_task[0]",
         'module.control.aws_vpc_endpoint.interface["lambda"]',
         *AUTHORITY_PROOF_ROLLOUT_RESOURCES,
@@ -13522,14 +13562,28 @@ def check_plan(
     # EXPECTED_CONTROL_OUTPUTS by _check_authority_proof_steady_output, and the
     # empty `changed` set already proves no resource moves; all this recognises
     # is that writing an output is real work.
+    #  3. a state-only `forget` of the orphaned proof-controller grant. That
+    #     address is absent from the config resource map, so it never enters
+    #     `changed` and plan_mode stays "no-op" -- but releasing it from state
+    #     is still an apply, and Terraform reports applyable=true. Bounded to
+    #     the `forget` action on that one address, so a delete cannot borrow it;
+    #     see _validate_authority_proof_controller_orphan_forget.
     output_only_change = any(
         isinstance(change, dict) and change.get("actions") != ["no-op"]
         for change in (plan.get("output_changes") or {}).values()
+    )
+    orphan_forget_pending = any(
+        isinstance(item, dict)
+        and item.get("address") == AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS
+        and isinstance(item.get("change"), dict)
+        and item["change"].get("actions") == ["forget"]
+        for item in (plan.get("resource_changes") or [])
     )
     expected_applyable = (
         plan_mode != "no-op"
         or (normalization_drift_count > 0 and "resource_changes" not in plan)
         or output_only_change
+        or orphan_forget_pending
     )
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(

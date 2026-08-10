@@ -1042,36 +1042,33 @@ resource "aws_iam_role_policy" "authority_exec" {
   })
 }
 
-# Control owns the controller capability in the same saved plan as the selected
-# ca-pm alias. The role itself is pre-created by the udp-proof-runner root, but
-# that root owns no Authority policy, alias input, or cross-state output. Using
-# the alias resource (rather than a supplied ARN) gives Terraform an explicit
-# dependency: rollback removes this grant before deleting the alias.
-resource "aws_iam_role_policy" "authority_proof_controller_invoke" {
-  count = (
-    local.authority_runtime_functions_deploy &&
-    var.authority_proof_mutation_controls_enabled
-  ) ? 1 : 0
+# Control used to manage an inline `connector-authority-proof-invoke` policy on
+# `layerv-nhp-<env>-udp-proof-controller` — a role owned by the separate
+# udp-proof-runner root. That cross-root seam is why this resource is gone.
+#
+# The seam's `count` keyed off authority_proof_mutation_controls_enabled rather
+# than off the role existing, so destroying the runner root (#3804) left the
+# resource in Control's graph pointing at nothing. Live AWS reports the role as
+# NoSuchEntity, so every plan re-rendered the policy and every apply would call
+# PutRolePolicy against a deleted role. The grant is also dead weight in its own
+# right: it granted lambda:InvokeFunction to a principal that no longer exists,
+# and the runner workflow that could assume it was removed with its App
+# credentials revoked (#3806).
+#
+# Deleting the resource alone is not enough. The already-deleted policy is still
+# in state, so a plain removal leaves a drift `delete` that
+# scripts/check-connector-authority-foundation.sh folds into destructive actions
+# and refuses. The `removed` block below drops it from state with a state-only
+# `forget` — Terraform calls no AWS delete API, because AWS deleted it already.
+#
+# Retire this block once the forget has applied; it is a one-shot state
+# migration, not a permanent declaration.
+removed {
+  from = aws_iam_role_policy.authority_proof_controller_invoke
 
-  name = "connector-authority-proof-invoke"
-  role = local.authority_proof_controller_role_name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid    = "InvokeSelectedProofMutationAlias"
-      Effect = "Allow"
-      Action = ["lambda:InvokeFunction"]
-      Resource = concat(
-        local.authority_proof_policy_rollout_active
-        ? sort(values(local.authority_proof_policy_rollout_alias_arns["${local.authority_function_prefix}-pm"]))
-        : [local.authority_selected_alias_targets.proof.mutate_proof_agent],
-        [local.authority_selected_alias_targets.proof.prepare_proof_credential_recovery],
-      )
-    }]
-  })
-
-  depends_on = [aws_lambda_alias.authority]
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "aws_lambda_function" "authority" {

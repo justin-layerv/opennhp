@@ -546,11 +546,6 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
   }
 
   assert {
-    condition     = length(aws_iam_role_policy.authority_proof_controller_invoke) == 0
-    error_message = "The dark runtime must attach no proof-controller invoke policy."
-  }
-
-  assert {
     condition = (
       # The qat1 interface endpoint permits GetPublicKey only to IA/IRO/AR,
       # while Sign remains exclusive to IA. No operation receives kms:Verify.
