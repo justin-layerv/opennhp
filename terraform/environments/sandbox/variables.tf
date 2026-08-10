@@ -599,6 +599,12 @@ variable "agent_otp_registration_enabled" {
   default     = false
 }
 
+variable "agent_otp_ci_send_gate_enabled" {
+  description = "Creates the dedicated ses:SendEmail role qurl-service's per-PR live-email gate assumes (module nhp, agent_otp_ses.tf). Must be DECLARED here and PASSED THROUGH module.nhp below — setting it only in terraform.tfvars makes it an undeclared variable this root ignores, so the module keeps its false default and the role is silently never created. Non-prod only; a precondition in the module fails the plan otherwise. Default false."
+  type        = bool
+  default     = false
+}
+
 variable "agent_otp_email_from" {
   description = "From address for OTP emails (QURL_AGENT_OTP_EMAIL_FROM); the root derives the SES sender domain from it. Required when agent_otp_enabled. Empty when dark."
   type        = string

@@ -135,6 +135,7 @@ module "nhp" {
   agent_registration_enabled                             = var.agent_registration_enabled
   agent_otp_enabled                                      = var.agent_otp_enabled
   agent_otp_registration_enabled                         = var.agent_otp_registration_enabled
+  agent_otp_ci_send_gate_enabled                         = var.agent_otp_ci_send_gate_enabled
   agent_otp_email_from                                   = var.agent_otp_email_from
   agent_registration_relay_base_url                      = var.agent_registration_relay_base_url
   agent_otp_send_failed_threshold_per_minute             = var.agent_otp_send_failed_threshold_per_minute
