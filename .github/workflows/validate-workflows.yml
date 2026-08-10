@@ -45,6 +45,18 @@ on:
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
+      # Sandbox cell1 VPC relocation preflight: the script talks to live AWS, so
+      # only its fixture test runs here — driven by the fake `aws` under
+      # tests/fixtures/, which is watched so an edit to either side re-fires it.
+      # The test itself rides tests/scripts/** below.
+      - "scripts/check-sandbox-cell1-vpc-relocation-preflight.sh"
+      - "tests/fixtures/sandbox-cell1-vpc-relocation/**"
+      # build-and-push.yml's concurrency contract: a dispatch carrying a
+      # correlation_id has a parent pipeline blocking on it, so it must not share
+      # a cancellable lane with ad-hoc dispatches. The workflow it inspects rides
+      # .github/workflows/** above and its fixture test rides tests/scripts/**
+      # below, so only the lint itself needs an entry.
+      - "scripts/check-dispatch-concurrency-isolation.sh"
       - "scripts/capture-control-update-state.sh"
       - "scripts/capture-sandbox-udp-proof-account-binding.sh"
       - "scripts/check-control-aws-identity.sh"
@@ -73,6 +85,14 @@ on:
       - "endpoints/ac/expiry_conntrack_flusher.go"
       - "terraform/modules/ac/variables.tf"
       - "terraform/variables.tf"
+      # Do NOT fold these two into the terraform/environments/<env>/** globs
+      # below, even though those globs already match them. The L3 conntrack
+      # pool-size lockstep asserts both are listed *by name* here
+      # (tests/scripts/check-l3-conntrack-pool-lockstep_test.sh, "validate-workflows
+      # trigger paths and step cover lockstep sources"), so that its trigger is
+      # pinned to its own sources rather than inherited from a glob some other
+      # lint owns and could later narrow. Deleting them as redundant turns that
+      # fixture red — which is how this comment came to exist.
       - "terraform/environments/sandbox/variables.tf"
       - "terraform/environments/prod/variables.tf"
       - "terraform/modules/compute/variables.tf"
@@ -81,27 +101,22 @@ on:
       - "terraform/modules/compute/lambda/keygen/**"
       - "terraform/modules/ecr/main.tf"
       # eBPF load-path + FilterMode lockstep (#2810, #2812, #2815): trigger on
-      # the script + its fixture test and on the source-of-truth sites it
-      # compares that aren't watched elsewhere: Go object-path consts
-      # (ebpfegine.go), Go FilterMode enum (config.go), Makefile EBPF_OBJ_*
-      # paths, the local compose mount/load shape, and the local AC bpffs startup
-      # helper. The Dockerfile guards ride the docker/Dockerfile* globs below,
+      # the script and on the source-of-truth sites it compares that aren't
+      # watched elsewhere: Go object-path consts (ebpfegine.go), Go FilterMode
+      # enum (config.go), Makefile EBPF_OBJ_* paths, the local compose mount/load
+      # shape, and the local AC bpffs startup helper. The Dockerfile guards ride the docker/Dockerfile* globs below,
       # and tests/smoke/ssm_probe.go rides tests/smoke/** below; the script
-      # header inventories every site.
+      # header inventories every site. Every eBPF fixture test in this group
+      # rides tests/scripts/** below, so only the scripts are listed here.
       - "scripts/check-ebpf-load-path-lockstep.sh"
-      - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
       # eBPF arch lockstep (#2816): the AC image build platform must stay
       # in lockstep with terraform/modules/ac/main.tf's launch-template
       # instance families. The fixture test mutates both sides so extractor
       # regressions do not silently green.
       - "scripts/check-ac-ebpf-arch-lockstep.sh"
-      - "tests/scripts/check-ac-ebpf-arch-lockstep_test.sh"
       - "scripts/check-ebpf-toolchain-pin-lockstep.sh"
-      - "tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh"
       - "scripts/install-ebpf-toolchain.sh"
-      - "tests/scripts/install-ebpf-toolchain_test.sh"
       - "scripts/check-ebpf-committed-object-drift.sh"
-      - "tests/scripts/check-ebpf-committed-object-drift_test.sh"
       # eBPF required-check ruleset manager (#2861): re-run the fence when the
       # ruleset config-as-code it applies changes. Its script and test already
       # ride the .github/scripts/** and tests/scripts/** globs above.
@@ -120,9 +135,9 @@ on:
       # The gate file is not a script, but it is the input every Control deploy
       # reads. An edit to it must re-fire the contract test here, because a gate
       # file that no longer validates is how an automatic apply reaches
-      # Terraform with the dark defaults.
+      # Terraform with the dark defaults. Only the JSON needs listing — the
+      # validator beside it rides .github/scripts/** above.
       - ".github/control-sandbox-runtime-gates.json"
-      - ".github/scripts/control-sandbox-runtime-gates.py"
       - "scripts/check-app-image-line-rendered.sh"
       - "scripts/ssm-read-optional.sh"
       - "scripts/check-golden-vectors.sh"
@@ -205,11 +220,14 @@ on:
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
       - ".github/actions/verify-image-attestation/**"
+      # The watchdog script itself rides .github/scripts/** above.
       - "tests/lints/attestation-verify-watchdog/**"
-      - ".github/scripts/scan-attestation-soak.sh"
-      # The absent-vs-unreadable SSM split. Watch the fixture dir and both
-      # scripts it drives: the resolver is already listed below for its own
-      # suite, and trigger-prod-deploy.sh has no other trigger here.
+      # Two suites drive scripts/trigger-prod-deploy.sh: the absent-vs-unreadable
+      # SSM split plus the --json failure contract, and the relay activation
+      # decision. Only the script needs an entry — it has no other trigger here,
+      # while the relay suite's fixture test rides tests/scripts/** below and the
+      # resolver is already listed below for its own suite. The SSM fixtures do
+      # need their own entry: they live under tests/lints/, which no glob reaches.
       - "tests/lints/ssm-read-failure/**"
       - "scripts/trigger-prod-deploy.sh"
       - "terraform/modules/compute/user_data.sh.tpl"
@@ -872,6 +890,54 @@ jobs:
         run: |
           shellcheck scripts/trigger-prod-deploy.sh tests/lints/ssm-read-failure/run-fixtures.sh
           bash tests/lints/ssm-read-failure/run-fixtures.sh
+
+      # The relay activation decision in that same script (#3747, #3755). Prod's
+      # relay SSM tag does not exist until the activating apply creates it, so
+      # reading the live parameter alone cannot tell "relay is genuinely dark"
+      # from "this promote is what activates it" — and the script once printed
+      # `-f deploy_relay=false` on the very release that activates the relay,
+      # which would create the parameter and never advance it: the relay ships
+      # dark behind a green promote. The suite can't run the whole script offline
+      # (SSM/ECR/STS), so it extracts the decision block verbatim and drives it
+      # with controlled inputs, with a canary that fails loudly if the extraction
+      # markers stop matching rather than passing on zero assertions.
+      #
+      # Wired here because it lived only in `make lint-prod-deploy-relay-activation`,
+      # which no CI workflow runs — the same gap #2817 closed for the
+      # revocation-SLO lockstep. Mirrors that Makefile target command-for-command
+      # so the local and CI runs cannot drift; that is why the script's shellcheck
+      # repeats the step above rather than relying on it.
+      - name: Test prod-deploy relay activation fixtures
+        run: |
+          shellcheck scripts/trigger-prod-deploy.sh tests/scripts/trigger-prod-deploy-relay-activation_test.sh
+          bash tests/scripts/trigger-prod-deploy-relay-activation_test.sh
+
+      # build-and-push.yml's concurrency contract. A workflow_dispatch carrying a
+      # correlation_id has a parent pipeline blocking on that exact run, so it
+      # must not share a cancellable lane with ad-hoc dispatches: the group has to
+      # be discriminated by correlation_id and cancel-in-progress must exclude it.
+      # When both kinds shared one cancellable lane, any ad-hoc sandbox deploy
+      # silently killed the scheduled-release build; the pipeline then failed
+      # after a ~85-minute wait with no red build to point at, and prod stopped
+      # receiving promotions for weeks. Nothing but this lint keeps the two
+      # concurrency expressions honest — and it, like the two below, was reachable
+      # only through a `make lint-*` target that no CI workflow runs.
+      - name: Test + check dispatch concurrency isolation
+        run: |
+          shellcheck scripts/check-dispatch-concurrency-isolation.sh tests/scripts/check-dispatch-concurrency-isolation_test.sh
+          bash tests/scripts/check-dispatch-concurrency-isolation_test.sh
+          bash scripts/check-dispatch-concurrency-isolation.sh
+
+      # Sandbox cell1 VPC relocation preflight. Only the fixture test runs here:
+      # the script itself reads live AWS (EC2/ELB/ASG state for the source VPC),
+      # so the suite drives it against the recorded `aws` responses under
+      # tests/fixtures/sandbox-cell1-vpc-relocation/. That makes the fixture the
+      # only automated check that the phase gating and the account/region/CIDR
+      # guards still hold before an operator points this at a real relocation.
+      - name: Test sandbox cell1 VPC relocation preflight fixtures
+        run: |
+          shellcheck scripts/check-sandbox-cell1-vpc-relocation-preflight.sh tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
+          bash tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 
       # Two cross-module lockstep contracts that surfaced as #1976
       # cutover follow-ups (PR #2141): the Go-side

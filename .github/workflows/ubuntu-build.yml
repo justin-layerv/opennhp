@@ -41,6 +41,30 @@ jobs:
           ! -path "./node_modules/*" \
           -print0 | xargs -0 shellcheck --severity=warning
 
+    # ErrorCodeToError caller fence (#3643). common.ErrorCodeToError returns a
+    # bare nil *Error for any code it doesn't recognize — every extension code an
+    # auth service or AC can emit. Assigned into an error-typed variable that is
+    # the Go typed-nil trap: `err != nil` is true, and the `err.Error()` after it
+    # dereferences a nil receiver and panics. Five agent call sites did exactly
+    # that before #3643 moved them to common.ErrorFromResponse. The lint is what
+    # MAKES the "reachable only from inside ErrorFromResponse" invariant true
+    # rather than merely documenting it in docs/UPSTREAM_SYNC.md.
+    #
+    # It lives in this job, not validate-workflows.yml, because it scans Go
+    # source: this workflow runs on every PR (paths-ignore only skips docs), while
+    # validate-workflows.yml fires off an explicit path list that no Go file
+    # outside a handful of named ones would match — so a new caller in
+    # endpoints/agent/ would never have triggered it there. The lint is a shell
+    # script rather than a Go test on purpose (its own header explains why: Go
+    # test caching keyed on the package's inputs made it silently stale). The
+    # fixture suite runs first so an extractor regression surfaces against
+    # synthetic inputs before the real tree does; both scripts are already covered
+    # by the repo-wide shellcheck above.
+    - name: Test + check ErrorCodeToError caller fence
+      run: |
+        bash tests/lints/errorcode-to-error-callers/run-fixtures.sh
+        bash scripts/check-errorcode-to-error-callers.sh
+
     - name: Run shellcheck on FRPS user data scripts
       run: |
         set -euo pipefail
@@ -232,6 +256,21 @@ jobs:
       with:
         go-version: ${{ env.GO_VERSION }}
         cache-dependency-path: nhp/go.sum
+
+    # Fence the wrapper before trusting it. scripts/run-fuzz.sh is the only thing
+    # telling a real Go-fuzz crasher apart from the upstream coordinator's
+    # deadline-race flake, and it decides that from the shape of `go test` output.
+    # A regression either way is silent: false-red on every PR once the deadline
+    # race stops being soft-passed, or false-green that swallows a real crasher.
+    # These fixtures drive each branch of that decision tree with a fake `go` on
+    # PATH, so they cost seconds and need no toolchain. Running them here rather
+    # than in validate-workflows.yml keeps them next to the one job whose verdict
+    # depends on the wrapper — and it was reachable only via `make lint-run-fuzz`,
+    # which no CI workflow runs. After a Go toolchain bump, a red here is the
+    # expected signal that the deadline-race signature needs re-validating
+    # (CLAUDE.md says as much).
+    - name: Test run-fuzz wrapper decision tree
+      run: bash tests/lints/run-fuzz/run-fixtures.sh
 
     - name: Run quick fuzz pass
       run: make fuzz-quick
