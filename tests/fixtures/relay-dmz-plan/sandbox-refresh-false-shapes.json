@@ -14,7 +14,6 @@
       ".github/workflows/qurl-agent-transact-iam.yml",
       ".github/workflows/recover-sandbox-terraform-read.yml",
       ".github/workflows/terraform-plan-pr.yml",
-      ".github/workflows/udp-proof-runner-sandbox-update.yml",
       ".github/workflows/validate-workflows.yml"
     ]
   },

@@ -256,7 +256,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation lint-prod-deploy-relay-activation lint-udp-proof-agent-reclaim
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation lint-prod-deploy-relay-activation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -287,21 +287,6 @@ lint-qurl-link-og-image:
 # in a fresh CI image with no parser deps. Wired into `make lint` AND
 # .github/workflows/validate-workflows.yml so a one-sided edit trips
 # both locally and on PR.
-# Wired into `lint` (and therefore CI) deliberately: an unwired fixture is a
-# test that never runs, which is indistinguishable from no test at all. The
-# reclaim script guards against a silent counter corruption, so its fixtures
-# have to actually execute somewhere.
-.PHONY: lint-udp-proof-agent-reclaim
-lint-udp-proof-agent-reclaim:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Checking UDP proof agent reclaim...$(END_COLOUR)"
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck .github/scripts/reclaim_udp_proof_agents.sh tests/lints/udp-proof-agent-reclaim/run-fixtures.sh; \
-	else \
-		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
-	fi
-	@./tests/lints/udp-proof-agent-reclaim/run-fixtures.sh
-	@echo "$(COLOUR_GREEN)[OpenNHP] UDP proof agent reclaim check passed!$(END_COLOUR)"
-
 .PHONY: lint-disable-agent-validation
 lint-disable-agent-validation:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Checking DisableAgentValidation flag (#1157 F9)...$(END_COLOUR)"
@@ -577,13 +562,6 @@ lint-workflows:
 	@python3 tests/scripts/test_verify_relay_dmz_flow_evidence.py
 	@terraform -chdir=terraform/modules/relay-network init -backend=false >/dev/null
 	@terraform -chdir=terraform/modules/relay-network test
-	@shellcheck scripts/capture-sandbox-udp-proof-account-binding.sh
-	@python3 tests/scripts/test_udp_proof_runner_update_workflow.py
-	@python3 -m unittest -v tests.scripts.test_udp_proof_terraform_apply_receipt
-	@shellcheck terraform/modules/udp-proof-runner/user_data.sh.tpl
-	@python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
-	@terraform -chdir=terraform/modules/udp-proof-runner init -backend=false >/dev/null
-	@terraform -chdir=terraform/modules/udp-proof-runner test
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \
@@ -732,7 +710,6 @@ test-ebpf: $(EBPF_OBJ_XDP)
 test-lambdas: ## Run Lambda unit tests (Python)
 	@echo "[OpenNHP] Running Lambda Unit Tests..."
 	python3 -m pytest terraform/modules/billing/lambda/test_*.py terraform/modules/developer-portal/lambda/test_*.py -v
-	python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lambda Unit Tests Done!$(END_COLOUR)"
 
 test-local: ## Run local e2e tests (requires: docker compose -f tests/local/docker-compose.test.yaml up -d etcd)

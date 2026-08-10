@@ -867,17 +867,6 @@ jobs:
               ;;
           esac
 
-      - name: Require exact warm pools before a proof selector apply
-        if: >-
-          inputs.proof_policy_selected_color != 'none' &&
-          inputs.proof_policy_selected_color == inputs.proof_policy_prepared_color
-        env:
-          SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/verify_udp_proof_authority_evidence.py readiness \
-            --selected-color "$SELECTED_COLOR"
-
       - name: Re-read live main and consume saved plan immediately before exact apply
         env:
           GH_TOKEN: ${{ github.token }}

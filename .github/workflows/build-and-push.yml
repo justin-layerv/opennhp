@@ -1156,9 +1156,6 @@ jobs:
           echo '::group::Status Page Aggregator Lambda Tests'
           (cd terraform/modules/status-page/lambda && python -m pytest test_status_aggregator.py -v)
           echo '::endgroup::'
-          echo '::group::UDP Proof Runner Broker Tests'
-          python -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
-          echo '::endgroup::'
           echo '::group::Auth0 Rotation Lambda Tests (Node)'
           node --test terraform/modules/auth0/lambda/rotate_secret.test.js
           echo '::endgroup::'
@@ -1808,15 +1805,6 @@ jobs:
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/modules/relay-network
         run: |
-          terraform init -backend=false
-          terraform test
-
-      - name: Test UDP proof runner foundation
-        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
-        working-directory: terraform/modules/udp-proof-runner
-        run: |
-          shellcheck user_data.sh.tpl
-          python3 -m unittest -v lambda/test_broker.py
           terraform init -backend=false
           terraform test
 
@@ -2608,19 +2596,6 @@ jobs:
             --allow-udp-source-fence-replacement \
             plan-show.json
 
-      - name: Prepare UDP retirement apply receipt
-        id: udp-retirement-receipt
-        working-directory: terraform/environments/sandbox
-        run: |
-          set -euo pipefail
-          python3 ../../../.github/scripts/produce_udp_proof_terraform_apply_receipt.py \
-            --plan-json plan-show.json \
-            --saved-plan tfplan \
-            --output "${RUNNER_TEMP}/udp-proof-terraform-apply-receipt/udp-proof-terraform-apply-receipt.json" \
-            --github-output "${GITHUB_OUTPUT}" \
-            --run-id "${GITHUB_RUN_ID}" \
-            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --head-sha "${GITHUB_SHA}"
 
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
       # exported to GITHUB_ENV by the
@@ -2645,15 +2620,6 @@ jobs:
           echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
           terraform apply -auto-approve tfplan
 
-      - name: Upload authenticated UDP retirement apply receipt
-        if: steps.udp-retirement-receipt.outputs.produced == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: udp-proof-terraform-apply-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/udp-proof-terraform-apply-receipt/udp-proof-terraform-apply-receipt.json
-          if-no-files-found: error
-          retention-days: 30
-          include-hidden-files: false
 
       - name: Verify AWS CLI major for relay DMZ detector
         run: |
@@ -3310,10 +3276,11 @@ jobs:
   # parameters. cell1 therefore sat at image-tag `latest` with
   # deployed-commit=initial and deployed-at=never, and never converged to main.
   #
-  # That is what fails the UDP proof manifest producer: it requires nhp_cell0,
-  # nhp_cell1 and nhp_hub to report one shared source_revision, and raises
-  # "deployed NHP or qurl-service source revisions are mixed" otherwise
-  # (.github/scripts/collect_udp_proof_deployment_evidence.py).
+  # Mixed source revisions across nhp_cell0, nhp_cell1 and nhp_hub are a real
+  # deployment defect in their own right: the fleet is then running two
+  # different builds behind one boundary. (The attended UDP proof used to be
+  # the thing that surfaced this; it has been removed, but the convergence
+  # requirement below is independent of it.)
   #
   # Ordering: runs AFTER deploy-sandbox-blue-green, not beside it. Both cells'
   # blue/green runs take the same /layerv-nhp-sandbox/qurl-live-env-lock SSM
@@ -3838,8 +3805,19 @@ jobs:
             echo "Not a proof selector apply (selected=$selected prepared=$prepared); skipping."
             exit 0
           fi
-          python3 .github/scripts/verify_udp_proof_authority_evidence.py readiness \
-            --selected-color "$selected"
+          # FAIL CLOSED. The attended proof and its authority-evidence
+          # verifier are gone, so the readiness precondition this branch
+          # depended on no longer exists. The colour comparison above is NOT a
+          # substitute: it checks that selected == prepared, while readiness
+          # verified authority evidence (warm pools actually present). Letting
+          # the branch proceed with the precondition stubbed would apply infra
+          # with its safety gate silently removed.
+          #
+          # The proof_policy_* dispatch inputs are retained for a later
+          # governed pass, so this branch stays REACHABLE until then. Refuse it
+          # rather than run it unguarded.
+          echo "::error::proof selector apply is no longer supported: the attended proof and its authority-evidence readiness check were removed. Dispatch with proof_policy_selected_color=none, or land the governed change that removes the proof_policy_* inputs."
+          exit 1
 
       - name: Apply the checked plan without GitHub credentials
         id: apply

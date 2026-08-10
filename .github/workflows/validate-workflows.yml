@@ -58,7 +58,6 @@ on:
       # below, so only the lint itself needs an entry.
       - "scripts/check-dispatch-concurrency-isolation.sh"
       - "scripts/capture-control-update-state.sh"
-      - "scripts/capture-sandbox-udp-proof-account-binding.sh"
       - "scripts/check-control-aws-identity.sh"
       - "scripts/check-live-main-ref.sh"
       - "scripts/check-no-checkout-credentials.sh"
@@ -352,18 +351,7 @@ jobs:
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
 
-      - name: Test sandbox UDP proof runner update contract
-        run: |
-          shellcheck scripts/capture-sandbox-udp-proof-account-binding.sh
-          python3 tests/scripts/test_udp_proof_runner_update_workflow.py
 
-      - name: Test UDP proof deployment-manifest contracts
-        run: |
-          python3 -m unittest -v \
-            tests.scripts.test_udp_proof_deployment_collector \
-            tests.scripts.test_udp_proof_deployment_contract \
-            tests.scripts.test_udp_proof_deployment_workflow \
-            tests.scripts.test_udp_proof_terraform_apply_receipt
 
       # Both Claude entry points must use the same proven action SHA and explicit
       # model. Automatic review must remain a default-branch-trusted
@@ -381,19 +369,6 @@ jobs:
 
       - name: Check Claude workflow contracts
         run: python3 scripts/check-claude-model-lockstep.py
-
-      # test_udp_proof_deployment_contract is intentionally absent here: the
-      # "Test UDP proof deployment-manifest contracts" step above already owns
-      # that module. It was listed in both steps only because this step landed
-      # while the step above was still unmerged and carried its own copy of the
-      # shared contract module. Re-adding it here duplicates a run, it does not
-      # add coverage.
-      - name: Test UDP proof controller input and dispatch contracts
-        run: >-
-          python3 -m unittest
-          tests.scripts.test_udp_proof_controller_inputs
-          tests.scripts.test_udp_proof_producer_artifact
-          tests.scripts.test_udp_proof_client_artifact
 
       # resolve-app-image-required_test.sh verifies that the relay image's
       # hand-maintained path list covers the actual Go import surface. Pin and
@@ -872,10 +847,6 @@ jobs:
       # `make lint` is not on any CI path (see the note above about
       # `make lint-workflows` never running in CI), so an unwired fixture is
       # indistinguishable from no test at all.
-      - name: Shellcheck + test udp-proof-agent-reclaim fixtures
-        run: |
-          shellcheck .github/scripts/reclaim_udp_proof_agents.sh tests/lints/udp-proof-agent-reclaim/run-fixtures.sh
-          bash tests/lints/udp-proof-agent-reclaim/run-fixtures.sh
 
       - name: Shellcheck + test lockdown-body-drift fixtures
         run: |

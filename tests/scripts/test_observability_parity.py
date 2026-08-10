@@ -1132,36 +1132,6 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("observability parity surfaces are wired", result.stdout)
 
-    def test_exempt_udp_proof_runner_root_without_module_nhp_passes(self) -> None:
-        # sandbox-udp-proof-runner composes modules/udp-proof-runner (the isolated
-        # attended-proof compute boundary) and instantiates no `module "nhp"`; the
-        # servers it exercises + their alarms live in roots this lint checks. It
-        # must pass the guard by name while any other unexempted root fails closed.
-        self.assertIn(
-            "sandbox-udp-proof-runner",
-            CHECKER.OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            build_fixture(root)
-            write(
-                root
-                / "terraform"
-                / "environments"
-                / "sandbox-udp-proof-runner"
-                / "main.tf",
-                """
-                module "udp_proof_runner" {
-                  source = "../../modules/udp-proof-runner"
-                }
-                """,
-            )
-
-            result = run_check(root)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("observability parity surfaces are wired", result.stdout)
-
     def test_exempt_runtime_attestation_root_without_module_nhp_passes(self) -> None:
         # sandbox-runtime-attestation composes modules/runtime-attestation-store
         # (the immutable per-node runtime evidence channel) and instantiates no

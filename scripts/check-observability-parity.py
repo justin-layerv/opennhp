@@ -677,8 +677,6 @@ def require_alarm_registry(
 #   servers + their alarms live in other roots this lint already checks, so there
 #   is no server observability surface to enforce parity on here. Removing the
 #   record root should drop this entry too.
-#   sandbox-udp-proof-runner: a sandbox-only root composing
-#   modules/udp-proof-runner — the isolated, unpeered compute boundary (dedicated
 #   /28 VPC, one JIT runner at a time, a broker + sweeper) for the attended UDP
 #   proof. It instantiates no compute/AC/relay/security and no `module "nhp"`;
 #   the servers it exercises (cell0/cell1) + their alarms live in roots this lint
@@ -699,7 +697,6 @@ OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS: frozenset[str] = frozenset(
         "sandbox-cell1",
         "sandbox-hub-dns",
         "sandbox-runtime-attestation",
-        "sandbox-udp-proof-runner",
     }
 )
 
