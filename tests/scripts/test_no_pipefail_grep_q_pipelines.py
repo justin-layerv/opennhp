@@ -49,28 +49,93 @@ class NoPipefailGrepQTest(unittest.TestCase):
         24.04), and this test went red on main on 2026-08-10 for exactly that
         reason. Past that buffer grep always exits with bytes still unwritten,
         which is the property being fenced; the size at which it starts is not.
+
+        Both ends of that progression are demonstrated, because the small end
+        carries an argument of its own: 100 bytes must NOT false-negative. That
+        is the "invisible" leg above, and it is why the guard below is scoped to
+        the handful of large-object reads rather than banning the idiom repo-
+        wide. Asserting it here keeps that scoping honest -- if small input ever
+        did false-negative, the guard would be under-reaching and silent about
+        it. Both payloads put the pattern on their FIRST line, so `grep -q`
+        exits after its first read either way and the only difference is what
+        the writer still owes behind it.
+
+        The writer's own exit status is asserted alongside the pipeline result.
+        Without it a regression reports only that the pattern went missing, and
+        cannot separate a platform that stopped false-negating from unrelated
+        breakage that happens to look identical from the outside.
         """
         script = r"""
         set -euo pipefail
-        big="$(python3 -c "print('FLAG=true'); print('x'*(1024*1024))")"
-        piped=found;      printf '%s' "$big" | grep -q '^FLAG=' 2>/dev/null || piped=MISSING
-        herestring=found; grep -q '^FLAG=' <<<"$big" || herestring=MISSING
-        echo "$piped $herestring"
+
+        probe() {
+            big="$(python3 -c "import sys; sys.stdout.write('FLAG=true\n' + 'x' * $1)")"
+
+            piped=found
+            if printf '%s' "$big" | grep -q '^FLAG='; then
+                writer=${PIPESTATUS[0]}
+            else
+                writer=${PIPESTATUS[0]}
+                piped=MISSING
+            fi
+
+            herestring=found
+            grep -q '^FLAG=' <<<"$big" || herestring=MISSING
+
+            echo "bytes=${#big} piped=$piped writer=$writer herestring=$herestring"
+        }
+
+        probe 100                 # below the 64 KiB pipe buffer
+        probe $((1024 * 1024))    # past grep's 96 KiB initial read
         """
         result = subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, timeout=60
         )
-        # Without this the split below raises a bare ValueError -- the one
+        # Without this the unpacking below raises a bare ValueError -- the one
         # failure that says nothing about which of the two probes went wrong.
         self.assertEqual(result.returncode, 0, result.stderr)
-        piped, herestring = result.stdout.split()
-        self.assertEqual(
-            piped,
-            "MISSING",
-            "the pipe no longer false-negatives on 1 MiB; if the platform "
-            "changed, this fence can be reconsidered",
+        small, large = (
+            dict(field.split("=", 1) for field in line.split())
+            for line in result.stdout.strip().splitlines()
         )
-        self.assertEqual(herestring, "found", "the herestring must find it")
+
+        self.assertGreater(
+            int(large["bytes"]),
+            512 * 1024,
+            "the demonstration payload has been shrunk. It has to clear the "
+            "64 KiB pipe buffer plus grep's 96 KiB initial read with room to "
+            "spare, or whether the writer drains before grep exits goes back to "
+            "being a scheduling race and this test flakes on unrelated PRs",
+        )
+        self.assertEqual(
+            small["piped"],
+            "found",
+            "a payload below the pipe buffer must NOT false-negative -- the "
+            "writer lands its whole write in the buffer and never sees EPIPE. "
+            "If this fails the idiom is worse than documented and the guard "
+            "below is scoped too narrowly",
+        )
+        self.assertEqual(
+            large["piped"],
+            "MISSING",
+            f"the pipe no longer false-negatives on {large['bytes']} bytes "
+            f"(the writer exited {large['writer']}, stderr {result.stderr!r}); "
+            "if the platform changed, this fence can be reconsidered",
+        )
+        self.assertNotEqual(
+            large["writer"],
+            "0",
+            "the writer was supposed to die on EPIPE -- 141 for SIGPIPE, or 1 "
+            "where an ancestor left SIGPIPE ignored and printf reports the "
+            "write error itself, as the 2026-08-02 incident above shows. A "
+            "writer that succeeded leaves pipefail nothing to promote, so a "
+            "MISSING alongside it has some other cause",
+        )
+        for size, row in (("small", small), ("large", large)):
+            with self.subTest(size=size):
+                self.assertEqual(
+                    row["herestring"], "found", "the herestring must find it"
+                )
 
     def test_the_large_object_guards_do_not_pipe(self) -> None:
         """Scoped to the guards that read genuinely large objects.
