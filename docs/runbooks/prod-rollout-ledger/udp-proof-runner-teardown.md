@@ -75,7 +75,9 @@ the `authority_proof_policy_*` plumbing in
 branch in `build-and-push.yml`. Prod's six variables are validation-locked
 closed, so prod is code-only with no resource change.
 
-**Steps 1–3 are unreachable — see the next section before attempting them.**
+**Steps 1–3 are both unreachable and unnecessary — skip them.** See "Measured"
+below for why they cannot be run, and "The disable transition, measured" for why
+running them would not buy anything.
 
 - [x] Release the orphaned `authority_proof_controller_invoke` grant. Done by
       deleting the resource **and** adding a `removed` block with
@@ -87,10 +89,16 @@ closed, so prod is code-only with no resource change.
       `terraform_data.foundation_contract` and `aws_iam_role_policy.authority_exec`
       for ca-ia, ca-iro-cell0, ca-iro-cell1 (pending DynamoDB SSE `kms:Decrypt`
       grants). Unrelated to the proof work; blocks the apply with or without it.
-- [ ] Decide the ordering for retiring the rollout selector now that it is known
-      to replace the Hub task definition (measured below), then execute it.
+- [x] Prove the consumer image tolerates the four `CONNECTOR_AUTHORITY_PROOF_*`
+      variables being absent. It does, by construction — see "the image
+      tolerates their absence" below. **All four must go together**; a partial
+      removal fails closed.
+- [ ] Amend `AUTHORITY_PROOF_MUTATION_CONTROLS.md`: its six-aliases-no-op rule,
+      which the measured disable plan does not meet; and its description of the
+      slice as ca-pm only, which has been two functions since ca-pcr landed.
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
-      (step 5).
+      (step 5). This subsumes retiring the rollout selector — measured below,
+      it is not a separate step.
 - [ ] Delete the code once live state is dark.
 
 ## Measured 2026-08-10 — two blockers, both verified against live sandbox
@@ -202,6 +210,98 @@ four addresses no transition claims: `terraform_data.foundation_contract` plus
 (pending DynamoDB SSE `kms:Decrypt` grants). That is unrelated to the proof work
 and blocks the apply independently. Sandbox Control is therefore wedged on three
 gates, not one: this checker, the foundation fence, and the apply itself.
+
+## The disable transition, measured — steps 1–3 are also unnecessary
+
+The section above establishes steps 1–3 are unreachable. Measuring the plan they
+gate shows they are **unnecessary**, which is the stronger reason to skip them.
+
+Planned locally, read-only, refresh enabled, against live state with
+`authority_proof_mutation_controls_enabled` off (which forces the consumer and
+colour gates off with it): **`1 to add, 19 to change, 37 to destroy`**.
+
+The 37 destroys are the intended teardown: the whole graph for both proof
+functions — ca-pm (`mutate_proof_agent`) and its sibling ca-pcr
+(`prepare_proof_credential_recovery`) — covering functions, four aliases, exec
+roles/policies, log groups, sixteen alarms and their provisioned concurrency,
+plus the four `authority_proof_standby` pools. The DynamoDB and lambda interface
+endpoint policies drop the ca-pm principal.
+
+The single add is not a new resource. Plan actions are exactly `delete × 36`,
+`update × 19` and one `delete,create` — `aws_ecs_task_definition.hub[0]`, task
+definitions being immutable — so the Hub task definition is replaced and its
+service redeployed, because the Hub config embeds the proof alias ARNs and both
+outputs go null. `37 destroy` is the 36 deletes plus that replacement's delete;
+`1 add` is its create. This is the same Hub redeploy Blocker 2 measured, and it
+rides along with any path that drops the colours — so retiring the selector is
+not a separate step to sequence; this transition subsumes it.
+
+> **ca-pcr is real, and the design doc is what is stale.** The proof slice is
+> two functions, not one: `EXPECTED_PROOF_FUNCTIONS` in
+> `.github/scripts/generate-connector-authority-runtime-contract.py` binds both
+> `ca-pm → mutate_proof_agent` and `ca-pcr → prepare_proof_credential_recovery`,
+> and the module fence requires exactly two expected proof names. Live, ca-pcr's
+> v1 dates to 2026-07-29, it now sits at v5 with `blue = green = 5` and one
+> provisioned execution on blue. It is absent from "Live state" below because
+> that list covers the proof-policy *rollout* standby pools and ca-pcr was never
+> in the rollout set — which is why this plan deletes `authority_proof_standby`
+> for ia/icr/pm/ra but `authority["…ca-pcr"]` for pcr.
+
+**What steps 1–3 were protecting is benign in the current state.** Their job is
+to converge the consumer aliases onto a common non-proof version before the pin
+drops, and step 4's rule is that all six stay exact no-ops. They do not — all
+six move. But measured, the three consumers change by *exactly* one thing:
+
+    image_uri unchanged; removed env
+      CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX
+      CONNECTOR_AUTHORITY_PROOF_DIRECTIVE_TTL
+      CONNECTOR_AUTHORITY_PROOF_MIN_LEASE_SECONDS
+      CONNECTOR_AUTHORITY_PROOF_OWNER_ID
+
+so the alias moves are `green 12 → 13` and `blue 6 → 13` on an **unchanged
+image**. All three consumers were pinned together at the same pair, which is why
+one version pair describes all six aliases. **Green is what actually serves** —
+723 invocations over seven days against 7 on blue — and green is already on the
+configured image digest, so the serving path drops four environment variables
+and nothing else. Blue skips the six intermediate versions 7–12 because the
+proof pin froze it at v6 on 2026-07-26, but blue takes about one call a day.
+
+### The image tolerates their absence — by construction, not by luck
+
+The enablement fence in `2026-07-26-authority-proof-mutation-controls.md` warned
+that enabling ahead of image support fails closed at init with
+`configuration_invalid`, so removal needed proving rather than assuming. It is
+proven: `internal/connectorauthorityruntime/config.go` in qurl-service reads all
+four through `loadProofPolicy(lookup, requiredPolicy)`, whose first exit is
+
+    if presentCount == 0 && !requiredPolicy {
+        return nil
+    }
+
+and the consumer operations pass `requiredPolicy = false` — `issue_assignment`
+at one call site, `refresh_assignment` and `issue_credential_recovery` at
+another. With all four absent they return cleanly and leave
+`proofPolicyEnabled` false. Only `mutate_proof_agent` passes `true`, and ca-pcr
+has its own owner/prefix-only path.
+
+**The one real constraint: all four must be removed together.** Any partial set
+hits `presentCount != len(names)` and returns `errInvalidConfiguration`, so a
+half-applied change bricks the consumers at init. The measured plan removes all
+four in one step, which satisfies this — but do not let anything split them.
+
+Caveat on the evidence: this is qurl-service `origin/main`, not a checkout
+pinned to the deployed digest `sha256:3b32d89f…`. The gate is designed to be
+two-way — Terraform adds the consumer operations to
+`authority_proof_operations` only while `consumers_staged` is true, and
+IA/RA/ICR ran without these variables before 2026-07-26 — so a regression here
+would be a defect rather than a design change, but confirm the digest's commit
+if you want this airtight.
+
+One thing still to prove rather than assume before dispatching:
+
+- Step 4's six-aliases-no-op rule is genuinely not met. Amend
+  `AUTHORITY_PROOF_MUTATION_CONTROLS.md` to say what the rule protects and why
+  an env-only move on an unchanged image satisfies it — do not diverge silently.
 
 ## One trap for whoever does this
 

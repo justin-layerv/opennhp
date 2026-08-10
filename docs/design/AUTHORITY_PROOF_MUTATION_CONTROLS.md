@@ -354,9 +354,25 @@ simulated green result.
 > `layerv-nhp-sandbox-udp-proof-controller` returns `NoSuchEntity`, and ca-pm
 > carries no resource-based policy on the function or on its `green` alias — so
 > nothing can invoke the controller and nothing would be permitted to if it
-> could. See `docs/runbooks/prod-rollout-ledger/udp-proof-runner-teardown.md`
-> for the measured plan and the remaining blockers. Do not follow steps 1-3
-> until that entry says they are reachable again.
+> could.
+>
+> **They are also unnecessary, which is the stronger reason: skip them
+> permanently rather than waiting for them to become reachable.** Their purpose
+> is to converge the consumer aliases onto a common non-proof version before the
+> pin drops. Measured on the disable plan, the three consumers change by exactly
+> one thing — the four `CONNECTOR_AUTHORITY_PROOF_*` variables are removed, the
+> image is unchanged — so the alias moves are `green 12 → 13` and `blue 6 → 13`
+> on that same image, and green, the colour that serves, is already on the
+> configured digest. The governed alias controller was also never built: it
+> exists only as prose here and in module comments, Terraform is the sole
+> manager of the six aliases, and the proof-controller role only ever held
+> `lambda:InvokeFunction` on ca-pm's alias. Restoring it would not make steps
+> 1-3 reachable.
+>
+> Step 4 onward still applies. See
+> `docs/runbooks/prod-rollout-ledger/udp-proof-runner-teardown.md` for the
+> measured plan, the remaining blockers, and the open task to amend the
+> six-aliases-no-op invariant that step 4 states below.
 
 Rollback uses the governed alias controller plus two exact Control saved plans.
 First return IA/RA/ICR to the prior warm versions, then disable the
