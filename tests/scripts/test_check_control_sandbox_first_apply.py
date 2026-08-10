@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER_PATH = ROOT / ".github/scripts/check-control-sandbox-first-apply.py"
 VALIDATE_WORKFLOW_PATH = ROOT / ".github/workflows/validate-workflows.yml"
 TERRAFORM_PLAN_WORKFLOW_PATH = ROOT / ".github/workflows/terraform-plan-pr.yml"
+GATES_READER_PATH = ROOT / ".github/scripts/control-sandbox-runtime-gates.py"
 MAKEFILE_PATH = ROOT / "Makefile"
 SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
 REDIS_TF_PATH = (
@@ -12171,14 +12172,53 @@ class WorkflowContractTests(unittest.TestCase):
             "control.tfplan.json --refresh-disabled",
             plan_workflow,
         )
-        for flag in (
-            "--proof-mutation-controls-enabled",
-            "--proof-policy-consumers-staged",
-            "--proof-policy-selected-color green",
-            "--proof-policy-prepared-color green",
-        ):
-            self.assertIn(flag, plan_workflow)
-        self.assertNotIn("--proof-policy-selected-color blue", plan_workflow)
+        # The Authority runtime flags are DERIVED from
+        # .github/control-sandbox-runtime-gates.json, never written out here.
+        # This assertion used to pin the literal flag list, which made the gate
+        # file and this lane two sources of truth: a PR retiring a gate that
+        # forgot this workflow planned to re-create what it was retiring, and
+        # the pin held the stale list in place. Pin the reader instead.
+        self.assertIn(
+            'gate_flag_text="$(.github/scripts/control-sandbox-runtime-gates.py flags)"',
+            plan_workflow,
+        )
+        # Same reasoning as the C6 fence in check-control-leg-surfaced.sh, which
+        # covers only build-and-push.yml: reading the gates is necessary but not
+        # sufficient, because process substitution discards the reader's exit
+        # status. This is the PR lane's only coverage of that.
+        self.assertNotRegex(
+            plan_workflow, r"< *<\(.*control-sandbox-runtime-gates\.py"
+        )
+        # The receipt: bind the generated tfvars back to the gate file, so a
+        # generator rename cannot make this lane plan a shape nobody chose.
+        self.assertIn(
+            ".github/scripts/control-sandbox-runtime-gates.py verify-tfvars",
+            plan_workflow,
+        )
+        # The regression guard proper: any generator gate flag appearing
+        # literally in this workflow means the hard-coded list is back.
+        #
+        # The flag names are DERIVED from the reader's own tables, not copied
+        # here. Copying them would reintroduce this PR's own defect one level
+        # down — a silent one, at that: an eighth gate added to the reader
+        # would go uncovered forever with this test still green, where the
+        # stale workflow list at least produced a visibly wrong plan.
+        spec = importlib.util.spec_from_file_location(
+            "control_sandbox_runtime_gates", GATES_READER_PATH
+        )
+        assert spec and spec.loader
+        gates_reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gates_reader)
+        gate_flags = [
+            flag
+            for _, flag in gates_reader.BOOLEAN_GATES + gates_reader.COLOR_GATES
+        ]
+        # Not a count pin — the point is that an eighth gate is covered without
+        # touching this test. Only guard the vacuous pass: renamed or emptied
+        # tables would loop over nothing and stay green.
+        self.assertTrue(gate_flags, "gate reader exposed no flags to deny")
+        for flag in gate_flags:
+            self.assertNotIn(flag, plan_workflow)
         self.assertNotIn("--expected-action", plan_workflow)
         self.assertIn(
             "Fail closed on any unreviewed Control mutation",

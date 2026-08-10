@@ -296,34 +296,64 @@ jobs:
 
       # The committed dark Control config carries authority_runtime_contract =
       # null AND authority_runtime_functions_enabled = false, but LIVE sandbox
-      # Control state has BOTH the Connector Authority runtime contract bound
-      # (Step 3) AND the runtime-slice functions enabled (Step 4). Regenerate the
-      # same verified ephemeral tfvars that control-sandbox-update.yml plans with,
-      # including the runtime, Hub, proof mutation, and current green-selected /
-      # green-prepared proof rollout, so this PR-time convergence plan reflects
-      # the live-enabled slices instead of planning to destroy them. (Prod stays
-      # dark: this workflow is sandbox-only, and the prod var validation forbids
-      # the flags.) The generator is deterministic from the committed basis and
-      # the full Git history (fetch-depth: 0 above) and needs no AWS access; the
-      # read-only PR plan role can read the resulting data sources
-      # (data.aws_ssm_parameter -> ssm:GetParameter, data.aws_ecr_image ->
-      # ecr:DescribeImages).
-      - name: Generate verified ephemeral Authority runtime input
+      # Control state has the Connector Authority runtime contract bound (Step 3),
+      # the runtime-slice functions enabled (Step 4), the Hub slices open, and a
+      # proof rollout selected. Regenerate the same verified ephemeral tfvars that
+      # control-sandbox-update.yml and build-and-push.yml plan with, so this
+      # PR-time convergence plan reflects the enabled slices instead of planning
+      # to destroy them. (Prod stays dark: this workflow is sandbox-only, and the
+      # prod var validation forbids the flags.) The generator is deterministic
+      # from the committed basis and the full Git history (fetch-depth: 0 above)
+      # and needs no AWS access; the read-only PR plan role can read the resulting
+      # data sources (data.aws_ssm_parameter -> ssm:GetParameter,
+      # data.aws_ecr_image -> ecr:DescribeImages).
+      #
+      # The gates come from .github/control-sandbox-runtime-gates.json via the
+      # same reader the deploy legs use, NOT from a list written out here. A
+      # hard-coded list is read as "what live sandbox is", but what this lane
+      # actually needs is "what this PR proposes": the gate file is a plan input,
+      # so a PR that retires a gate must plan the retirement. While the list was
+      # duplicated here, a gate change that forgot this file planned to RE-CREATE
+      # what it was retiring, and the reviewer's evidence was of the wrong shape.
+      #
+      # Deliberately no fully-dark fail-closed guard, unlike the unattended leg in
+      # build-and-push.yml (its C7 fence). There, zero flags means applying a
+      # teardown of the Hub and the ca-* runtime off a config edit, so it stops.
+      # Here nothing is applied — the all-dark destroy plan IS the review evidence
+      # a rollback PR exists to produce, and refusing to render it would rebuild
+      # the same blind spot this step just closed. Whether that shape may merge
+      # stays with the convergence contract checker below, which admits only
+      # named, reviewed transitions.
+      - name: Generate verified ephemeral Authority runtime input from committed gates
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         run: |
+          set -euo pipefail
+          # Deliberately NOT `mapfile -t gate_flags < <(...)`: process
+          # substitution discards the reader's exit status, so a failing reader
+          # would yield an empty flag array and silently plan the committed dark
+          # defaults — a destroy plan presented as if the gates asked for it. A
+          # plain assignment keeps that exit visible to `set -e`.
+          gate_flag_text="$(.github/scripts/control-sandbox-runtime-gates.py flags)"
+          # A fully dark gate file emits no flags. `mapfile <<<""` would yield a
+          # single empty element and pass an empty argument to the generator, so
+          # build the empty array explicitly instead.
+          gate_flags=()
+          if [[ -n "$gate_flag_text" ]]; then
+            mapfile -t gate_flags <<<"$gate_flag_text"
+          fi
           .github/scripts/generate-connector-authority-runtime-contract.py \
             --mode sandbox-exact-main \
             --repository-root "$GITHUB_WORKSPACE" \
             --manifest "$AUTHORITY_RUNTIME_BASIS" \
             --expected-checkout-commit "$GITHUB_SHA" \
             --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json" \
-            --runtime-functions-enabled \
-            --hub-edge-enabled \
-            --hub-worker-enabled \
-            --proof-mutation-controls-enabled \
-            --proof-policy-consumers-staged \
-            --proof-policy-selected-color green \
-            --proof-policy-prepared-color green
+            "${gate_flags[@]}"
+          # The flags are the instruction; this is the receipt. A generator
+          # rename or dropped flag would still emit a plausible tfvars, and this
+          # lane would plan — and a reviewer approve — a Control shape nobody
+          # chose. Bind the emitted keys back to the gate file.
+          .github/scripts/control-sandbox-runtime-gates.py verify-tfvars \
+            --tfvars "$CONTROL_ROOT/authority-runtime.generated.tfvars.json"
 
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'

@@ -60,7 +60,13 @@ while IFS=$'\t' read -r status file _rest; do
 			terraform_changed=true
 			prod_env_changed=true
 			;;
-		terraform/*|.github/workflows/terraform-plan-pr.yml|.github/actions/build-lambda-packages/*|.github/scripts/classify-terraform-plan-pr-changes.sh|.github/scripts/check-relay-dmz-plan*.py|.github/scripts/check-control-sandbox-first-apply.py|.github/scripts/generate-connector-authority-runtime-contract.py|docs/evidence/connector-authority/v1/*|scripts/check-connector-authority-foundation.sh|scripts/check-control-vpc-cidr-overlap.sh|tests/scripts/test_generate_connector_authority_runtime_contract.py)
+		# Membership rule for this arm: the file can change the sandbox plan
+		# graph. Two entries are non-obvious —
+		# .github/control-sandbox-runtime-gates.json and its reader qualify
+		# because terraform-plan-pr.yml derives the Authority runtime generator
+		# flags from them, so a gate-only PR that did not land here would report
+		# success with no AWS credentials and no plan at all.
+		terraform/*|.github/workflows/terraform-plan-pr.yml|.github/actions/build-lambda-packages/*|.github/scripts/classify-terraform-plan-pr-changes.sh|.github/scripts/check-relay-dmz-plan*.py|.github/scripts/check-control-sandbox-first-apply.py|.github/scripts/generate-connector-authority-runtime-contract.py|.github/control-sandbox-runtime-gates.json|.github/scripts/control-sandbox-runtime-gates.py|docs/evidence/connector-authority/v1/*|scripts/check-connector-authority-foundation.sh|scripts/check-control-vpc-cidr-overlap.sh|tests/scripts/test_generate_connector_authority_runtime_contract.py)
 			terraform_changed=true
 			non_prod_plan_input_changed=true
 			;;

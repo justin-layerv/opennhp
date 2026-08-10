@@ -203,18 +203,18 @@ four addresses no transition claims: `terraform_data.foundation_contract` plus
 and blocks the apply independently. Sandbox Control is therefore wedged on three
 gates, not one: this checker, the foundation fence, and the apply itself.
 
-## Two traps for whoever does this
-
-`.github/workflows/terraform-plan-pr.yml` **hard-codes** the generator flags
-rather than reading the gate file, so its PR-time convergence plan reflects live
-instead of planning to destroy it. Every gate change must edit that list too, or
-the PR lane plans to re-create what was just retired. Switching it to
-`control-sandbox-runtime-gates.py flags` would end this drift class.
+## One trap for whoever does this
 
 `tests/scripts/test_control_sandbox_runtime_gates.py` holds `LIVE` as a literal
-mirror of the committed gates, deliberately, and
-`tests/scripts/test_check_control_sandbox_first_apply.py` pins the PR lane's
-flag list. Both must move with any gate change.
+mirror of the committed gates, deliberately. It must move with any gate change.
+
+Expect the gate edit itself to draw a plan: since #3822 the gate file is a
+registered plan input, and `terraform-plan-pr.yml` derives its flags from it, so
+a gate-only PR plans the retirement rather than skipping. That plan renders the
+all-dark shape rather than failing closed, and then meets
+`check-control-sandbox-first-apply.py`, which admits only named transitions —
+so the `authority-proof-disable` lane (step 4) is a prerequisite for the
+teardown PR going green, not a follow-up.
 
 ## Live state as of 2026-08-10
 

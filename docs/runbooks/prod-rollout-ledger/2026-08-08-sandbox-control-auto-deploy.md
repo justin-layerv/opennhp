@@ -65,3 +65,12 @@ mid-incident is the failure this section exists to prevent:
 Fastest real rollback is usually reverting the offending gate commit, not
 hand-editing to dark: it restores both files together and lands a shape the
 automatic leg will apply.
+
+Since #3822 the gate file is a registered plan input for `terraform-plan-pr.yml`,
+so expect the rollback PR to run a real sandbox Control plan instead of skipping.
+That is the point — you see what the revert does before it merges — but budget
+for it mid-incident: the plan must satisfy
+`scripts/check-connector-authority-foundation.sh` and
+`check-control-sandbox-first-apply.py`, and neither admits an unnamed destructive
+transition. A partial rollback to a previously-applied shape plans clean; a
+rollback that deletes proof resources does not, and needs the attended path.

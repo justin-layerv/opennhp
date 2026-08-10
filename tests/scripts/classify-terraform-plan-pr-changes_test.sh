@@ -90,6 +90,13 @@ run_case "Authority evidence manifest triggers sandbox plan" true false false \
 	$'M\tdocs/evidence/connector-authority/v1/sandbox-measurement-basis.json'
 run_case "Authority evidence generator tests trigger sandbox plan" true false false \
 	$'M\ttests/scripts/test_generate_connector_authority_runtime_contract.py'
+# The gate file supplies the generator flags, so editing it changes the planned
+# Control graph as surely as editing the Terraform. A gate-only PR is precisely
+# the one that must not report success without a plan.
+run_case "Control runtime gate file triggers sandbox plan" true false false \
+	$'M\t.github/control-sandbox-runtime-gates.json'
+run_case "Control runtime gate reader triggers sandbox plan" true false false \
+	$'M\t.github/scripts/control-sandbox-runtime-gates.py'
 run_case "control CIDR preflight triggers sandbox plan" true false false \
 	$'M\tscripts/check-control-vpc-cidr-overlap.sh'
 run_case "unrelated docs stay skipped" false false false \

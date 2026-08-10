@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Read the committed sandbox Control runtime gates and bind every consumer to them.
 
-Two consumers, one file:
+Every lane that plans or applies Control, one file:
 
   flags   emits the generate-connector-authority-runtime-contract.py flags the
           committed gates imply, newline-delimited, for the unattended
-          build-and-push.yml deploy leg.
+          build-and-push.yml deploy leg and for terraform-plan-pr.yml, which
+          plans the gates a PR proposes rather than a list of its own.
   check   asserts a set of control-sandbox-update.yml dispatch inputs equals the
           committed gates, so an attended dispatch cannot leave live sandbox in a
           shape the next automatic push would silently revert.
