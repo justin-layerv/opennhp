@@ -412,13 +412,22 @@ lint-cis-metric-filter-patterns:
 #   - validate-issue-templates.yml → shim to ops-routines-workflows reusable
 # `make lint-workflows` runs the equivalent of both locally.
 # Requires actionlint, shellcheck, check-jsonschema, Go, Node.js, and Python
-# 3.10+ with PyYAML
+# 3.10+ with the pinned lint dependencies from
+# .github/scripts/validate-workflows-requirements.txt (PyYAML + the jsonschema
+# LIBRARY, which is not the same thing as the check-jsonschema CLI below)
 # on PATH:
 #   macOS:  brew install actionlint shellcheck go node && pipx install 'check-jsonschema==0.37.1'
-#           && python3 -m pip install pyyaml
+#           && python3 -m pip install -r .github/scripts/validate-workflows-requirements.txt
 #   Linux:  see https://github.com/rhysd/actionlint#install,
-#           your distro's shellcheck + Go + Node.js + python3-yaml packages, and
-#           `pipx install 'check-jsonschema==0.37.1'` (or `pip install --user`)
+#           your distro's shellcheck + Go + Node.js packages,
+#           `pipx install 'check-jsonschema==0.37.1'` (or `pip install --user`), and
+#           `python3 -m pip install -r .github/scripts/validate-workflows-requirements.txt`
+# Both Python deps are proved in ONE preflight next to the other tool checks.
+# jsonschema used to be checked ~145 recipe lines in, so a machine that had
+# PyYAML but not jsonschema ran actionlint, two terraform module test suites,
+# the node suites and dozens of Python/bash fences before failing on a missing
+# import -- minutes of work to deliver an install hint. Add any new dep to the
+# requirements file AND that preflight, never to a check further down.
 # NB: check-jsonschema version is pinned in lockstep with the reusable
 # (layervai/ops-routines-workflows validate-issue-templates.yml); the
 # script will fail loud on version mismatch. Bump alongside the reusable.
@@ -454,8 +463,12 @@ lint-workflows:
 		exit 1; \
 	}
 	@python3 -c 'import sys; sys.version_info >= (3, 10) or sys.exit("[OpenNHP] Python 3.10 or newer is required for workflow contract checks")'
-	@python3 -c 'import yaml' 2>/dev/null || { \
-		echo "$(COLOUR_RED)[OpenNHP] PyYAML not found. Install: python3 -m pip install pyyaml$(END_COLOUR)"; \
+	@# Every pinned dep, up front. Keep in lockstep with the requirements file.
+	@python3 -c 'import jsonschema, yaml' 2>/dev/null || { \
+		echo "$(COLOUR_RED)[OpenNHP] lint-workflows needs the pinned Python deps (PyYAML + jsonschema).$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir -r .github/scripts/validate-workflows-requirements.txt$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  (See .github/workflows/validate-workflows.yml's 'Install lint dependencies' step.)$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  Most laptops also need --user, --break-system-packages, or a venv depending on python install.$(END_COLOUR)"; \
 		exit 1; \
 	}
 	@actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
@@ -562,13 +575,6 @@ lint-workflows:
 	@python3 tests/scripts/test_verify_relay_dmz_flow_evidence.py
 	@terraform -chdir=terraform/modules/relay-network init -backend=false >/dev/null
 	@terraform -chdir=terraform/modules/relay-network test
-	@python3 -c 'import yaml' 2>/dev/null || { \
-		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
-		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \
-		echo "$(COLOUR_RED)  (See .github/workflows/validate-workflows.yml's 'Install PyYAML' step.)$(END_COLOUR)"; \
-		echo "$(COLOUR_RED)  Most laptops also need --user, --break-system-packages, or a venv depending on python install.$(END_COLOUR)"; \
-		exit 1; \
-	}
 	@python3 tests/scripts/test_promote_to_prod_gating.py
 	@python3 tests/scripts/test_ac_readiness_dependency.py
 	@python3 tests/scripts/test_status_page_notification_iam_readiness.py
@@ -596,11 +602,6 @@ lint-workflows:
 	@bash tests/scripts/dependabot-go-tidy_test.sh
 	@bash tests/lints/paths-filter-coverage/run-fixtures.sh
 	@python3 scripts/check-paths-filter-coverage.py
-	@python3 -c 'import jsonschema, yaml' 2>/dev/null || { \
-		echo "$(COLOUR_RED)[OpenNHP] lint-workflows needs the pinned Python deps:$(END_COLOUR)"; \
-		echo "  python3 -m pip install -r .github/scripts/validate-workflows-requirements.txt"; \
-		exit 1; \
-	}
 	@shellcheck tests/lints/golangci-config-schema/run-fixtures.sh
 	@bash tests/lints/golangci-config-schema/run-fixtures.sh
 	@python3 scripts/check-golangci-config-schema.py
