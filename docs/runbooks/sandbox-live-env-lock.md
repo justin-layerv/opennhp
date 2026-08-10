@@ -159,6 +159,38 @@ TTL, whereupon run `30354530304` took it the moment the TTL lapsed, failed
 identically, and held it four hours more, stalling `Build and Deploy NHP` on
 main. Retention there protected nothing: the boundary had never moved.
 
+The other way a run reaches that retain set is a false post-switch failure, and
+one specific false positive is now fenced. `[Server] Verify Post-Switch Knock
+Readiness` runs in the `validate` job, so failing it also skips
+`scale-down-previous` — the listeners have already moved, the previous color
+stays scaled up, and `safe_to_release` is false for the full four-hour TTL. On
+2026-08-09, run `31340465407` reached that state because
+`verify-knock-ready.sh` read a systemd `NRestarts=1` and reported the PR #1096
+panic class. The actual journal was `Main process exited, code=exited,
+status=125/n/a` behind `Error response from daemon: ... failed to create
+Cloudwatch log stream`: docker's own exit code for a run it never started,
+recovered by `Restart=always` in six seconds. No nhp-server code had run at
+all.
+
+`.github/scripts/classify-nhp-server-restart-evidence.sh` now separates the two
+from the unit's exit status, plus panic and OOM evidence, and a container-start
+failure that self-healed passes the gate with a `::warning::` instead of
+failing it. Note that this is a **pass**, not a fail-with-release: after the
+switch, failing the gate is what strands the previous color scaled up, so a
+fleet that converged should be allowed to finish converging. A Go panic still
+fails — it exits the process with status 2, which is caught by the exit status
+alone even when the stack trace only reaches CloudWatch. Behaviour is pinned by
+`tests/lints/blue-green-restart-classification/run-fixtures.sh`.
+
+When the gate does fail, read the per-instance verdict in the job log before
+reaching for this runbook's Release section:
+
+| Verdict | Means | First move |
+|---|---|---|
+| `app_crash` | Panic, OOM kill, or a non-125 abnormal exit | Real regression — `journalctl -u nhp-server` on the named instance |
+| `infra_unstable` | All container-start failures, but not converged or past the self-heal budget | Container runtime, log driver, or registry fault — not an nhp-server defect |
+| `indeterminate` | Restarts with no recorded cause, or an unreadable report | Read the raw journal; the gate deliberately refuses to guess |
+
 This broader boundary was added after NHP run `29658670289` overlapped
 qurl-service exact-image smoke run `29658663594`. The smoke acquired the old
 ECS-only mutex while blue/green was still running both colors, then exercised

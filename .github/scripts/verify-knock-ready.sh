@@ -6,8 +6,16 @@
 # Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes> [check-nrestarts]
 #
 # Exits 0 if all instances report healthy across two consecutive
-# iterations AND (when check-nrestarts=true, the default) none have
-# a non-zero systemd NRestarts counter. Exits 1 otherwise.
+# iterations AND (when check-nrestarts=true, the default) none restarted
+# in a way that indicates an application crash. Exits 1 otherwise.
+#
+# A non-zero systemd NRestarts counter is the trigger for that second
+# check, not the verdict: docker failing to start the container (exit 125,
+# e.g. a transient CloudWatch Logs error in the awslogs driver) increments
+# it just as a Go panic does, but no nhp-server code ran and systemd's
+# Restart=always policy heals it in seconds. The evidence probe and
+# classify-nhp-server-restart-evidence.sh separate the two; treating them
+# alike cost four hours of blocked sandbox deploys on 2026-08-09.
 #
 # check-nrestarts (4th arg, default "true"): pass "false" when the
 # target ASG is long-lived (e.g., pre-switch invocations against the
@@ -41,6 +49,10 @@
 
 set -euo pipefail
 
+# Resolved from BASH_SOURCE, not $PWD: the workflow invokes this by repo-root
+# relative path, but the fixtures run it from elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 ASG_NAME="${1:?Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes> [check-nrestarts]}"
 LABEL="${2:?}"
 TIMEOUT_MINUTES="${3:?}"
@@ -72,7 +84,7 @@ echo "[$LABEL] Checking ${#INSTANCE_IDS[@]} instance(s): ${INSTANCE_IDS[*]}"
 #
 # ABI note: every failure path returns 1 -- callers MUST guard the
 # invocation with `if !` or `|| <fallback>`. verify_no_crashes fans
-# this out through check_nrestarts into background subshells that
+# this out through check_restart_evidence into background subshells that
 # inherit `set -euo pipefail`; an unguarded non-zero would kill the
 # subshell before the caller's result capture landed. Every AWS CLI
 # invocation inside this function is correspondingly guarded by
@@ -187,61 +199,131 @@ check_one() {
   echo "not_ready ${ac_msg}"
 }
 
-# _nrestarts_probe_once INSTANCE_ID → one NRestarts probe attempt.
-# Echoes the integer counter on success, or "probe_failed: <detail>"
-# on any failure. Never exits non-zero (see _ssm_run's contract).
-_nrestarts_probe_once() {
-  local instance_id="$1"
-  local output
+# RESTART_EVIDENCE_SCRIPT is the on-instance probe. NRestarts alone cannot
+# tell an application crash from a docker container-start failure that
+# systemd's Restart=always policy already healed, so the probe collects the
+# evidence that can: the unit's abnormal exit statuses (docker reports its own
+# failures as 125), whether a Go panic or OOM kill appears in the journal, and
+# whether the unit is running right now.
+#
+# Deliberately NOT collected: `systemctl show -p ExecMainStatus`. It reports
+# the SURVIVING process's status, so it reads 0 on exactly the instance whose
+# previous start attempt failed — it looks healthy when a start failed and is
+# not proof of anything.
+#
+# Scoped to `-b` (this boot) to match NRestarts' own per-boot semantics, which
+# is sound precisely because the crash probe only runs against a just-refreshed
+# fleet (see verify_no_crashes). `-n` bounds the scan on an instance that has
+# been up longer than expected.
+#
+# Every field is reduced to one line on the instance so the report stays a
+# small key=value document; DAEMONERR is additionally bounded and stripped of
+# the characters that would break the report's line framing.
+#
+# OOM matches only systemd's own unit-scoped message. The kernel's
+# "Out of memory: Killed process" line carries no _SYSTEMD_UNIT, so
+# `journalctl -u` never returns it — an earlier version grepped for it and
+# for `oom-kill:` too, which could not have matched anything. A container OOM
+# also surfaces as exit 137 (128+SIGKILL), which the exit-status branch fails
+# on regardless.
+#
+# DAEMONERR skips "No such container": the unit's own
+# `ExecStartPre=-/usr/bin/docker stop|rm nhp-server` emits that on every clean
+# start, so it is the LAST daemon error in the journal after a failed start
+# that systemd then retried successfully. Reporting it would name the harmless
+# line and hide the failure that actually caused the restart. Confirmed
+# against a live sandbox instance, where a healthy unit's only daemon error
+# is exactly this.
+# shellcheck disable=SC2016  # single-quoted on purpose: every $ and \ in here
+# is for the remote shell, not this one. Expanding locally would ship the
+# runner's empty variables to the instance.
+RESTART_EVIDENCE_SCRIPT='set -u
+u=nhp-server
+printf "NRESTARTS=%s\n" "$(systemctl show $u --property=NRestarts --value 2>/dev/null)"
+printf "ACTIVESTATE=%s\n" "$(systemctl show $u --property=ActiveState --value 2>/dev/null)"
+printf "SUBSTATE=%s\n" "$(systemctl show $u --property=SubState --value 2>/dev/null)"
+j=$(journalctl -u $u -b -n 20000 --no-pager -o cat 2>/dev/null || true)
+printf "EXITS=%s\n" "$(printf "%s\n" "$j" | sed -n "s/.*Main process exited, code=\([a-z]*\), status=\([0-9]*\).*/\1:\2/p" | tr "\n" ",")"
+printf "PANICS=%s\n" "$(printf "%s\n" "$j" | grep -cE "^(panic: |fatal error: |goroutine [0-9]+ \[running\]:)" || true)"
+printf "OOM=%s\n" "$(printf "%s\n" "$j" | grep -c "killed by the OOM killer" || true)"
+printf "DAEMONERR=%s\n" "$(printf "%s\n" "$j" | grep -oE "Error response from daemon: .*" | grep -v "No such container" | tail -n 1 | tr -d "\r" | tr "\n" " " | cut -c1-200)"'
 
-  if ! output=$(_ssm_run "$instance_id" \
-      'commands=["systemctl show nhp-server --property=NRestarts --value"]' \
-      2); then
+# _restart_evidence_probe_once INSTANCE_ID → one evidence probe attempt.
+# Echoes the multi-line evidence report on success, or a single
+# "probe_failed: <detail>" line on any failure. Never exits non-zero (see
+# _ssm_run's contract).
+_restart_evidence_probe_once() {
+  local instance_id="$1"
+  local output params
+
+  # Built with jq rather than the CLI's `commands=[...]` shorthand: the probe
+  # script contains quotes, brackets and backslashes that the shorthand parser
+  # would mangle.
+  params=$(jq -nc --arg c "$RESTART_EVIDENCE_SCRIPT" '{commands:[$c]}')
+
+  if ! output=$(_ssm_run "$instance_id" "$params" 2); then
     echo "probe_failed: $output"
     return
   fi
 
-  output=$(tr -d '[:space:]' <<<"$output")
-  if [[ "$output" =~ ^[0-9]+$ ]]; then
-    echo "$output"
-  else
-    echo "probe_failed: parse ${output:0:80}"
+  # NRESTARTS is the one field with no meaningful default — its absence means
+  # the probe ran but produced nothing usable, which must not reach the
+  # classifier as a parseable-but-empty report.
+  if ! grep -q '^NRESTARTS=[0-9]' <<<"$output"; then
+    echo "probe_failed: parse $(tr '\n' ' ' <<<"${output:0:120}")"
+    return
   fi
+
+  printf '%s\n' "$output"
 }
 
-# check_nrestarts INSTANCE_ID → echoes the systemd NRestarts counter
-# for nhp-server ("0" on a healthy never-crashed process), or
-# "probe_failed" if the SSM call itself errored. A user-driven
-# `systemctl restart` does NOT increment this counter — only
-# unexpected exits re-executed via Restart=. Any non-zero value is
-# therefore a direct signal that the process crashed during this
-# deploy window.
+# check_restart_evidence INSTANCE_ID → echoes the evidence report for
+# nhp-server, or a "probe_failed: ..." line if the SSM call itself errored.
 #
-# Wraps _nrestarts_probe_once with a single retry on probe_failed.
+# A user-driven `systemctl restart` does NOT increment NRestarts — only
+# unexpected exits re-executed via Restart=. A non-zero counter therefore
+# means the unit did restart unexpectedly during this deploy window; what it
+# does NOT tell you is whether nhp-server crashed or whether docker failed to
+# start the container at all. classify-nhp-server-restart-evidence.sh draws
+# that line from the rest of this report.
+#
+# Wraps _restart_evidence_probe_once with a single retry on probe_failed.
 # The readiness gate above has already proven SSM works against these
 # instances, so a single transient-throttle or eventual-consistency
 # hiccup should not turn the deploy red. A real IAM/connectivity
 # break re-fails after the retry and still produces the same
 # fail-closed probe_failed output.
-check_nrestarts() {
+check_restart_evidence() {
   local instance_id="$1"
   local result
 
-  result=$(_nrestarts_probe_once "$instance_id")
+  result=$(_restart_evidence_probe_once "$instance_id")
   if [[ "$result" != probe_failed* ]]; then
-    echo "$result"
+    printf '%s\n' "$result"
     return
   fi
 
   sleep 2
-  _nrestarts_probe_once "$instance_id"
+  _restart_evidence_probe_once "$instance_id"
 }
 
-# verify_no_crashes runs check_nrestarts against every instance and
-# echoes an "::error::" line for each non-zero counter. Returns 0 if
-# every instance reports NRestarts=0, 1 otherwise (including on probe
-# failures — we fail closed, because we cannot confirm the deploy was
-# clean without the counter).
+# verify_no_crashes runs check_restart_evidence against every instance and
+# classifies each report. Returns 0 when every instance either never
+# restarted or restarted only because docker could not start the container
+# and systemd already healed it; 1 otherwise (including on probe failures —
+# we fail closed, because we cannot confirm the deploy was clean without the
+# evidence).
+#
+# The pass-with-warning case is deliberate. Before it existed, a transient
+# CloudWatch Logs failure inside docker's awslogs driver (exit 125, container
+# never started, healthy again 6 s later) failed this gate as a #1096-class Go
+# panic. That failed the `validate` job, which skipped `scale-down-previous`
+# and left `safe_to_release=false`, retaining the shared sandbox lock for its
+# full four-hour TTL — see docs/runbooks/sandbox-live-env-lock.md. Failing the
+# gate but releasing the lock was the wrong trade: the listeners have already
+# moved by this point, so a failure here also strands the previous color
+# scaled up, which is exactly the unreconciled state the lock exists to fence.
+# A fleet that converged should finish converging.
 #
 # NRestarts is a per-boot counter (systemd resets it when the unit is
 # first started on the host). The "fresh instance" invariant (NRestarts
@@ -260,7 +342,7 @@ check_nrestarts() {
 # size. Results are read back in INSTANCE_IDS order for deterministic
 # log output.
 #
-# Throttling note: each check_nrestarts attempt issues up to 1
+# Throttling note: each check_restart_evidence attempt issues up to 1
 # send-command + 4 get-command-invocation calls, and retries once on
 # probe_failed (so ~10 SSM API calls per instance worst case, all
 # concurrent across the fleet). Current sandbox + prod fleets are
@@ -271,14 +353,14 @@ check_nrestarts() {
 # masking a real crash-free deploy as fail-closed.
 verify_no_crashes() {
   local failed=false
-  local inst n tmpdir
+  local inst report verdict detail line tmpdir
   local -a pids=()
 
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' RETURN
 
   for inst in "${INSTANCE_IDS[@]}"; do
-    check_nrestarts "$inst" > "$tmpdir/$inst" 2>&1 &
+    check_restart_evidence "$inst" > "$tmpdir/$inst" 2>&1 &
     pids+=("$!")
   done
 
@@ -289,20 +371,44 @@ verify_no_crashes() {
   done
 
   for inst in "${INSTANCE_IDS[@]}"; do
-    n=$(<"$tmpdir/$inst")
-    # The "crashed" branch only fires on a bare positive integer.
-    # Anything else (probe_failed prefix, empty file from a killed
-    # subshell, typo'd sentinel) falls through to the catch-all
-    # probe-failure branch -- never misreported as "crashed N times".
-    if [[ "$n" == "0" ]]; then
-      echo "[$LABEL] $inst: NRestarts=0"
-    elif [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
-      echo "::error::[$LABEL] $inst: nhp-server NRestarts=$n — the server process crashed $n time(s) during this deploy. This is the regression class fixed by PR #1096 (panic: send on closed channel). Investigate journalctl -u nhp-server on this instance before re-deploying."
+    report=$(<"$tmpdir/$inst")
+
+    # An unusable report (probe_failed prefix, empty file from a killed
+    # subshell) never reaches the classifier, so it can never be reported
+    # as a specific verdict about the deploy.
+    if [[ "$report" == probe_failed* || -z "$report" ]]; then
+      echo "::error::[$LABEL] $inst: restart-evidence probe failed — cannot confirm the deploy window was crash-free (${report:-empty response})"
       failed=true
-    else
-      echo "::error::[$LABEL] $inst: NRestarts probe failed — cannot confirm the deploy window was crash-free ($n)"
-      failed=true
+      continue
     fi
+
+    verdict=""
+    detail=""
+    while IFS= read -r line; do
+      case "$line" in
+        verdict=*) verdict="${line#verdict=}" ;;
+        detail=*) detail="${line#detail=}" ;;
+      esac
+    done < <(bash "$SCRIPT_DIR/classify-nhp-server-restart-evidence.sh" <<<"$report" || true)
+
+    case "$verdict" in
+      clean)
+        echo "[$LABEL] $inst: $detail"
+        ;;
+      infra_selfhealed)
+        # Pass, loudly. The deploy is sound but an operator should still see
+        # that the container runtime blipped.
+        echo "::warning::[$LABEL] $inst: nhp-server restarted during this deploy, but not because of an application crash. $detail"
+        ;;
+      app_crash|infra_unstable|indeterminate)
+        echo "::error::[$LABEL] $inst: nhp-server restart classified as '$verdict'. $detail"
+        failed=true
+        ;;
+      *)
+        echo "::error::[$LABEL] $inst: restart-evidence classifier returned no verdict — cannot confirm the deploy window was crash-free. Report: $(tr '\n' ' ' <<<"$report")"
+        failed=true
+        ;;
+    esac
   done
 
   [[ "$failed" == "false" ]]
@@ -366,7 +472,7 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
         echo "[$LABEL] All ${#INSTANCE_IDS[@]} instance(s) stable and crash-free"
         exit 0
       fi
-      echo "::error::[$LABEL] Knock-readiness converged but at least one instance crashed during the deploy window"
+      echo "::error::[$LABEL] Knock-readiness converged but at least one instance restarted for a reason this gate will not pass; see the per-instance classification above"
       exit 1
     fi
   else

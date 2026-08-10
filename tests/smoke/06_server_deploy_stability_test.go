@@ -33,8 +33,19 @@ const nRestartsProbeBudget = 2 * time.Minute
 // signal we have. It is incremented only when the unit exits
 // unexpectedly and is re-executed per Restart=; a user-driven
 // `systemctl restart` does not bump it. On a healthy freshly-launched
-// server instance, NRestarts is 0. Any non-zero value means a panic or
-// unexpected exit has happened during this boot.
+// server instance, NRestarts is 0.
+//
+// A non-zero value is the TRIGGER for a verdict, not the verdict. docker
+// failing to start the container increments the counter exactly as a Go
+// panic does — exit 125, no Go code executed, healed by Restart=always in
+// seconds. This test used to call that a crash and name PR #1096 in the
+// failure message; the blue/green deploy gate made the identical mistake
+// and sandbox deploy 31340465407 (2026-08-09) paid four hours of blocked
+// deploys for it when a transient CloudWatch Logs failure in docker's
+// awslogs driver tripped it. So on a non-zero counter this collects the
+// evidence that separates the two (see restart_evidence.go) and fails only
+// on an application crash, an unconverged unit, or evidence it cannot
+// account for.
 //
 // Tier 1 because:
 //   - it fences a specific bug class we've already paid for,
@@ -104,12 +115,30 @@ func TestServerDeployStability_NRestartsZero(t *testing.T) {
 				// cannot confirm the deploy was clean.
 				t.Fatalf("NRestarts probe failed: %v", err)
 			}
-			if n != 0 {
-				t.Fatalf("nhp-server NRestarts=%d — the process crashed %d time(s) during this deploy. "+
-					"This is the regression class fixed by PR #1096 (panic: send on closed channel). "+
-					"Investigate journalctl -u nhp-server on this instance before re-deploying.", n, n)
+			if n == 0 {
+				t.Logf("NRestarts=0 (OK)")
+				return
 			}
-			t.Logf("NRestarts=0 (OK)")
+
+			// Non-zero counter: the unit restarted, but the counter alone
+			// cannot say whether nhp-server crashed or whether docker
+			// failed to start the container at all. Collect the evidence
+			// that can. Only reached on the rare unhealthy path, so the
+			// healthy fleet still costs one SSM round-trip per instance.
+			ev, err := probeServerRestartEvidence(ctx, inst, n)
+			if err != nil {
+				t.Fatalf("nhp-server NRestarts=%d and the restart-evidence probe failed: %v — "+
+					"cannot confirm whether this was an application crash", n, err)
+			}
+
+			verdict, detail := classifyRestartEvidence(ev)
+			if !verdict.passes() {
+				t.Fatalf("nhp-server restart classified as %q. %s", verdict, detail)
+			}
+			// Passing, but an operator should still see that the container
+			// runtime blipped during the deploy.
+			t.Logf("WARNING: nhp-server restarted during this deploy, but not because of an "+
+				"application crash (%s). %s", verdict, detail)
 		})
 	}
 }

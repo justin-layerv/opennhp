@@ -24,6 +24,10 @@ on:
       - main
     paths:
       - "tests/smoke/**"
+      # The restart-evidence decision table shared with the blue/green deploy
+      # gate. A corpus-only edit changes what this suite must agree with, so it
+      # has to re-run the drift fence even though no Go file moved.
+      - "tests/fixtures/nhp-server-restart-evidence/**"
       - "scripts/run-smoke.sh"
       - "scripts/smoke-local-stack.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
@@ -68,6 +72,40 @@ jobs:
           set -euo pipefail
           go build -tags=smoke ./...
           go vet -tags=smoke ./...
+
+      # The offline half of the suite. These need no AWS, no deployed
+      # environment and no SSM (NHP_ENVIRONMENT=local short-circuits TestMain
+      # before it builds any AWS client), so they belong on the credential-free
+      # PR path — and they only run if something actually runs them: build+vet
+      # above compiles a test without executing a single assertion.
+      #
+      # TestRestartEvidenceCorpus is the drift fence between this suite's
+      # classifier and the blue/green deploy gate's shell one. The two answer
+      # the same question — is a non-zero systemd NRestarts an application
+      # crash, or a docker container-start failure that already self-healed? —
+      # and cannot share code, so they share
+      # tests/fixtures/nhp-server-restart-evidence/ and are each driven over
+      # it. Changing one decision table without the other turns this red.
+      # -v and the guard below are load-bearing, not verbosity for its own
+      # sake: `go test -run` EXITS 0 when its pattern matches nothing, printing
+      # "ok ... [no tests to run]". A future rename or a typo in that pattern
+      # would turn this whole step into a green no-op, which is exactly the
+      # kind of guard-that-cannot-fail this PR exists to remove. -v puts the
+      # executed test names in the log; the grep turns the silent pass red.
+      - name: Test restart-evidence classification (offline)
+        working-directory: tests/smoke
+        env:
+          NHP_ENVIRONMENT: local
+        run: |
+          set -euo pipefail
+          go test -tags=smoke -count=1 -v \
+            -run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError' \
+            ./... | tee test-output.txt
+          if grep -q 'no tests to run' test-output.txt; then
+            echo "::error::The -run pattern matched no tests — this step passed without asserting anything."
+            exit 1
+          fi
+          rm -f test-output.txt
 
       - name: Check smoke tier filter coverage
         run: bash scripts/check-smoke-tier-filter-coverage.sh

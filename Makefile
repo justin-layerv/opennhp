@@ -603,6 +603,10 @@ lint-workflows:
 	@bash tests/lints/attestation-verify-watchdog/run-fixtures.sh
 	@shellcheck scripts/trigger-prod-deploy.sh tests/lints/ssm-read-failure/run-fixtures.sh
 	@bash tests/lints/ssm-read-failure/run-fixtures.sh
+	@shellcheck .github/scripts/verify-knock-ready.sh \
+		.github/scripts/classify-nhp-server-restart-evidence.sh \
+		tests/lints/blue-green-restart-classification/run-fixtures.sh
+	@bash tests/lints/blue-green-restart-classification/run-fixtures.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
 
 # Run the terraform-prod-drift detectors (#1324). Static, AWS-creds-free
@@ -741,6 +745,17 @@ test-smoke-local: ## Run smoke tests against a self-contained local stack (Docke
 smoke-build: ## Compile + vet the smoke suite and check tier filter coverage (no creds)
 	@echo "[OpenNHP] Building + vetting smoke suite (-tags=smoke)..."
 	cd tests/smoke && go build -tags=smoke ./... && go vet -tags=smoke ./...
+	@echo "[OpenNHP] Running the credential-free smoke tests (restart-evidence classification)..."
+	@# `go test -run` exits 0 when its pattern matches nothing, so the grep is
+	@# what stops a renamed test from turning this into a green no-op.
+	cd tests/smoke && NHP_ENVIRONMENT=local go test -tags=smoke -count=1 -v \
+		-run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError' ./... \
+		| tee /tmp/nhp-smoke-restart-evidence.log
+	@if grep -q 'no tests to run' /tmp/nhp-smoke-restart-evidence.log; then \
+		echo "$(COLOUR_RED)[OpenNHP] The -run pattern matched no tests — nothing was asserted.$(END_COLOUR)"; \
+		rm -f /tmp/nhp-smoke-restart-evidence.log; exit 1; \
+	fi
+	@rm -f /tmp/nhp-smoke-restart-evidence.log
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Smoke build/vet done!$(END_COLOUR)"
 

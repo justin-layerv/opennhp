@@ -218,6 +218,13 @@ on:
       - "tests/lints/ebpf-load-path-lockstep/**"
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
+      # Blue/green post-switch restart classification. Both scripts it drives
+      # ride .github/scripts/** above; the fixture dir needs its own entry
+      # because no glob here reaches tests/lints/.
+      - "tests/lints/blue-green-restart-classification/**"
+      # ...and the corpus it shares with tests/smoke's Go classifier, so a
+      # corpus-only edit re-runs this side of the drift fence too.
+      - "tests/fixtures/nhp-server-restart-evidence/**"
       - ".github/actions/verify-image-attestation/**"
       # The watchdog script itself rides .github/scripts/** above.
       - "tests/lints/attestation-verify-watchdog/**"
@@ -913,6 +920,32 @@ jobs:
         run: |
           shellcheck scripts/trigger-prod-deploy.sh tests/lints/ssm-read-failure/run-fixtures.sh
           bash tests/lints/ssm-read-failure/run-fixtures.sh
+
+      # The blue/green post-switch crash gate's classification: what a non-zero
+      # systemd NRestarts counter on an nhp-server instance is allowed to
+      # conclude. It used to conclude "application crash" from the counter
+      # alone and name the PR #1096 panic class unconditionally. Sandbox deploy
+      # 31340465407 tripped it on `Main process exited, code=exited,
+      # status=125/n/a` — docker's own exit code, the awslogs driver failing to
+      # create a CloudWatch log stream, container never started, healthy again
+      # 6 s later. There was no panic. The red run was the cheap part: the
+      # failing `validate` job skipped `scale-down-previous` and left
+      # `safe_to_release=false`, retaining the shared sandbox lock for its full
+      # four-hour TTL.
+      #
+      # Wired HERE and not only in `make lint` — no CI workflow runs that
+      # target, so a Makefile-only fixture never executes on a PR (the same gap
+      # #2817 closed for the revocation-SLO lockstep). The suite drives the
+      # classifier, then the real verify-knock-ready.sh end to end against a
+      # fake AWS CLI, then the on-instance probe script against real systemd
+      # journal text — a classifier the gate never consults would pass the
+      # first of those three and fail the second.
+      - name: Test blue/green restart-classification fixtures
+        run: |
+          shellcheck .github/scripts/verify-knock-ready.sh \
+            .github/scripts/classify-nhp-server-restart-evidence.sh \
+            tests/lints/blue-green-restart-classification/run-fixtures.sh
+          bash tests/lints/blue-green-restart-classification/run-fixtures.sh
 
       # The relay activation decision in that same script (#3747, #3755). Prod's
       # relay SSM tag does not exist until the activating apply creates it, so

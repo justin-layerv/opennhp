@@ -1,0 +1,6 @@
+NRESTARTS=1
+ACTIVESTATE=activating
+SUBSTATE=auto-restart
+EXITS=exited:125,
+PANICS=0
+OOM=0
