@@ -85,10 +85,16 @@ running them would not buy anything.
       zero destroys, foundation fence clean, no alias/warm-pool/Hub movement.
       Restoring the IAM role is **not** required — see "the orphan is
       independently removable" below.
-- [ ] Claim the four pre-existing unclaimed addresses that also block the apply:
-      `terraform_data.foundation_contract` and `aws_iam_role_policy.authority_exec`
-      for ca-ia, ca-iro-cell0, ca-iro-cell1 (pending DynamoDB SSE `kms:Decrypt`
-      grants). Unrelated to the proof work; blocks the apply with or without it.
+- [ ] Claim the baseline plan so the apply can proceed. This is the critical
+      path: it lands #3797's grants and the `forget` from #3828 (checklist item
+      above) together, and unwedges Control. Four addresses are unclaimed, and
+      they are **two different kinds of change**: the three
+      `aws_iam_role_policy.authority_exec` entries for ca-ia, ca-iro-cell0 and
+      ca-iro-cell1 are #3797's ticket-handle grants — **not `kms:Decrypt`** —
+      while `terraform_data.foundation_contract` is a synthetic in-state marker
+      that re-renders when its inputs move, not a grant at all. See "the third
+      blocker, re-measured" below. Unrelated to the proof work; blocks the apply
+      with or without it.
 - [x] Prove the consumer image tolerates the four `CONNECTOR_AUTHORITY_PROOF_*`
       variables being absent. It does, by construction — see "the image
       tolerates their absence" below. **All four must go together**; a partial
@@ -206,10 +212,59 @@ Two corrections that travel with it:
 
 `check-control-sandbox-first-apply.py` also refuses the **baseline** plan, on
 four addresses no transition claims: `terraform_data.foundation_contract` plus
-`aws_iam_role_policy.authority_exec` for ca-ia, ca-iro-cell0 and ca-iro-cell1
-(pending DynamoDB SSE `kms:Decrypt` grants). That is unrelated to the proof work
-and blocks the apply independently. Sandbox Control is therefore wedged on three
-gates, not one: this checker, the foundation fence, and the apply itself.
+`aws_iam_role_policy.authority_exec` for ca-ia, ca-iro-cell0 and ca-iro-cell1.
+That is unrelated to the proof work and blocks the apply independently. Sandbox
+Control is therefore wedged on three gates, not one: this checker, the
+foundation fence, and the apply itself.
+
+### The third blocker, re-measured — and it is not `kms:Decrypt`
+
+Re-planned against live state after #3824 merged: **`0 to add, 39 to change,
+0 to destroy`**, not the `1 to add, 4 to change` measured earlier. Two things
+changed underneath.
+
+**The three IAM changes are #3797's, not DynamoDB SSE `kms:Decrypt`.** An
+earlier revision of this entry recorded them that way; measured, the three
+policies each gain one statement:
+
+| Address | Added statement |
+|---|---|
+| `authority_exec["…ca-ia"]` | `AuthorityTicketHandleWrite` — `dynamodb:PutItem` on `ASSIGNMENT_TICKET#*` |
+| `authority_exec["…ca-iro-cell0"]` | `AuthorityTicketHandleRead` — `dynamodb:GetItem` on `ASSIGNMENT_TICKET#*` |
+| `authority_exec["…ca-iro-cell1"]` | the same read grant |
+
+Those are the ticket-handle store grants from `ecc84cc89` (#3797, "grant the
+Authority the IAM its handle store needs"), merged and still unapplied. Same
+four addresses, different cause — and the difference matters: this is a merged
+fix waiting to land, so whoever writes the claiming transition should shape it
+around #3797's grants rather than an SSE change that is not in the plan.
+
+**The fourth address is a different kind of change entirely.**
+`terraform_data.foundation_contract` holds no IAM. It is the module's synthetic
+contract marker — a `merge()` of the account, table prefix, region, image URI,
+runtime contract and the proof gate values — so it re-renders whenever any of
+those inputs moves. Here that is the image digest below. A transition claiming
+these four must therefore admit one marker re-render plus three exact policy
+additions, not four grants.
+
+**A pending Authority image deploy has accumulated behind the wedge.**
+`image_uri` moves `…88493a → …0ef227` across all thirteen functions, carrying
+their aliases with it; that is the bulk of the 39. `authority-image-uri-move`
+already exists as a composable transition — confirm it claims this half rather
+than assuming it. #3828's `forget` does appear in the plan, so its code is in,
+but it only takes effect on the apply that is still blocked.
+
+Consequently the version numbers quoted below (`green 12 → 13`, `blue 6 → 13`)
+are stale and will shift once the image deploy lands. The *structural*
+conclusion is unaffected — the consumer delta is env-only on an unchanged image
+because it comes from the gate, not the digest — but re-measure the versions
+before quoting them.
+
+> Local plans cannot be validated with the checker:
+> `check-control-sandbox-first-apply.py` requires a plan produced by exactly
+> Terraform 1.14.3, and rejects one built with a newer CLI ("Terraform plan must
+> use exact 1.14.3"). Match the pinned version locally if you need to run the
+> checker against a plan you made yourself.
 
 ## The disable transition, measured — steps 1–3 are also unnecessary
 
