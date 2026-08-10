@@ -39,6 +39,12 @@ on:
       # gates the image-scan job, so pushes that edit it must trigger
       # this workflow on main too.
       - '.trivyignore'
+      # Same reason, for the changes:lambdas entry below. The status-page
+      # Lambda suite unit-tests this guard's helpers, and unlike the Terraform
+      # test inputs in that group, nothing else in on.push.paths covers this
+      # file — so without this line the filter entry never gets consulted on a
+      # push that touches only the script.
+      - '.github/scripts/check-status-page-public-surface.py'
   pull_request:
     branches:
       - main
@@ -218,6 +224,17 @@ jobs:
               - 'terraform/modules/custom-domain-cert/**'
               # Root qurl_link probe URL, asserted by the status-page suite.
               - 'terraform/main.tf'
+              # Same class, one door further out: the status-page suite also
+              # imports this guard script and unit-tests its helpers
+              # (_load_public_surface_guard). ubuntu-build.yml runs the script
+              # itself on every PR, so only the assertions *about* it can drift
+              # silently. This one needs the on.push.paths entry above too — an
+              # inner-filter entry alone is inert, because a push touching only
+              # this script never starts the workflow for the filter to be
+              # consulted, which is exactly what check-paths-filter-coverage.py
+              # rejects. Unlike the Terraform paths above, nothing else here
+              # matches it.
+              - '.github/scripts/check-status-page-public-surface.py'
             packer:
               - 'packer/**'
             packer_server:
