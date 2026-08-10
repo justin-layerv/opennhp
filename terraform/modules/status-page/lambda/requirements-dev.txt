@@ -6,5 +6,5 @@
 # unittest.mock, so no moto dependency is needed.
 
 pytest==9.1.1
-boto3==1.43.60
-botocore==1.43.60
+boto3==1.43.67
+botocore==1.43.67
