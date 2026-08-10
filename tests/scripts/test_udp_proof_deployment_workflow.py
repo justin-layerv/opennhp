@@ -26,13 +26,23 @@ class DeploymentManifestWorkflowTest(unittest.TestCase):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(
             set(inputs),
-            # No client selector inputs by design: main is the bible. The
-            # producer resolves each client's main at run time, so there is
-            # nothing for a dispatcher to choose -- and therefore nothing to
-            # keep in sync with the client repositories.
+            # Client selectors are PR NUMBERS and nothing else. Main is
+            # prod-eligible the moment something merges, so a change must prove
+            # itself while it is still a pull request -- that is what the
+            # candidate_* inputs are for. Empty binds main, preserving the
+            # previous behavior exactly.
+            #
+            # The forbidden-substring guard below is the real invariant and it
+            # still holds: a PR NUMBER is a single stable identifier whose head
+            # is resolved live, so no SHA/ref/digest is ever restated here. The
+            # earlier candidate binding was removed precisely because it froze
+            # head SHAs into three files across two repositories, which could
+            # not stay agreed under concurrent merges. A number cannot drift.
             {
                 "proof_phase",
                 "connector_canary_run_id",
+                "candidate_connector_pr",
+                "candidate_qurl_go_pr",
                 "terraform_apply_run_id",
             },
         )

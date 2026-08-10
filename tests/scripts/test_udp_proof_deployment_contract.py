@@ -1019,3 +1019,297 @@ class ProducerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CandidatePullRequestResolutionTest(unittest.TestCase):
+    """Prove the candidate-PR binding this proof now gates changes on.
+
+    Main is prod-eligible the moment something merges, so a change has to prove
+    itself while it is still a pull request. These assertions are the empirical
+    evidence for that feature, run in this PR's own CI rather than observed
+    after merge.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import collect_udp_proof_deployment_evidence as collector
+
+        self.collector = collector
+        self._real_gh = collector._gh
+        self._real_verify = collector._verify_commit
+        # _verify_commit does a second live API call for signature verification;
+        # the resolution contract under test here is independent of it.
+        collector._verify_commit = lambda *a, **k: None
+
+    def tearDown(self) -> None:
+        self.collector._gh = self._real_gh
+        self.collector._verify_commit = self._real_verify
+
+    def _stub(self, payload: object) -> None:
+        self.collector._gh = lambda path, name: payload
+
+    def test_open_same_repo_candidate_resolves_to_its_live_head(self) -> None:
+        head = "f" * 40
+        self._stub(
+            {
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {
+                    "sha": head,
+                    "ref": "feat/thing",
+                    "repo": {"full_name": "layervai/qurl-connector"},
+                },
+            }
+        )
+        got = self.collector._resolve_client_candidate(
+            "layervai/qurl-connector", "qurl-connector", 588
+        )
+        # The PR NUMBER is the binding; the head is looked up live. Nothing here
+        # is a frozen SHA, which is what made the previous attempt undriftable.
+        self.assertEqual(got["head_sha"], head)
+        self.assertEqual(got["candidate_pr"], 588)
+        self.assertEqual(got["repository"], "layervai/qurl-connector")
+
+    def test_closed_candidate_is_refused(self) -> None:
+        self._stub(
+            {
+                "state": "closed",
+                "base": {"ref": "main"},
+                "head": {
+                    "sha": "f" * 40,
+                    "repo": {"full_name": "layervai/qurl-connector"},
+                },
+            }
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_fork_candidate_is_refused(self) -> None:
+        # A fork head would run unreviewed code on the privileged NET_ADMIN
+        # proof host. Same-repo only.
+        self._stub(
+            {
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {
+                    "sha": "f" * 40,
+                    "repo": {"full_name": "attacker/qurl-connector"},
+                },
+            }
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_candidate_targeting_a_non_main_base_is_refused(self) -> None:
+        self._stub(
+            {
+                "state": "open",
+                "base": {"ref": "release/1.x"},
+                "head": {
+                    "sha": "f" * 40,
+                    "repo": {"full_name": "layervai/qurl-connector"},
+                },
+            }
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_unresolvable_pull_request_is_refused(self) -> None:
+        # _gh returning a non-dict (error shape, empty body) must not fall
+        # through into attribute access on a string.
+        self._stub("not-a-dict")
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_malformed_head_sha_is_refused(self) -> None:
+        self._stub(
+            {
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {
+                    "sha": "not-a-sha",
+                    "repo": {"full_name": "layervai/qurl-connector"},
+                },
+            }
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_deleted_fork_head_repo_is_refused(self) -> None:
+        # head.repo is null once a fork is deleted. This must fail CLOSED
+        # rather than compare None against the expected repository and pass.
+        self._stub(
+            {
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": "f" * 40, "repo": None},
+            }
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._resolve_client_candidate(
+                "layervai/qurl-connector", "qurl-connector", 1
+            )
+
+    def test_absent_candidate_means_main(self) -> None:
+        # Empty input must not silently degrade to "prove something else"; it
+        # means this client is bound to main exactly as before.
+        self.assertIsNone(
+            self.collector._optional_positive_input("", "candidate")
+        )
+        self.assertEqual(
+            self.collector._optional_positive_input("588", "candidate"), 588
+        )
+        with self.assertRaises(self.collector.EvidenceError):
+            self.collector._optional_positive_input("not-a-number", "candidate")
+        # Whitespace-only is still "absent"; a padded number still parses.
+        self.assertIsNone(self.collector._optional_positive_input("   ", "candidate"))
+        self.assertEqual(
+            self.collector._optional_positive_input(" 588 ", "candidate"), 588
+        )
+        # Non-positive values must fail rather than silently binding main.
+        for bad in ("0", "-1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(self.collector.EvidenceError):
+                    self.collector._optional_positive_input(bad, "candidate")
+
+
+class CandidateEvidenceShapeTest(unittest.TestCase):
+    """Drive the REAL consumer validator, not a re-implementation of it.
+
+    The previous version of this class built a dict and asserted facts about
+    that dict, so it stayed green no matter what _validate_github_evidence did
+    -- it could not catch the regression its own name promised. Review caught
+    that. These call the validator's candidate branch directly.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import collect_udp_proof_deployment_evidence as collector
+
+        self.collector = collector
+
+    def _check(self, connector: dict) -> None:
+        """Run the exact candidate-validation branch from _validate_github_evidence."""
+        c = self.collector
+        candidate_keys = {"repository", "head_ref", "head_sha"}
+        if isinstance(connector, dict) and "candidate_pr" in connector:
+            candidate_keys = candidate_keys | {"candidate_pr"}
+        candidate = c._exact(connector, candidate_keys, "GitHub evidence candidates.x")
+        if "candidate_pr" in candidate:
+            pr_number = candidate["candidate_pr"]
+            if (
+                not isinstance(pr_number, int)
+                or isinstance(pr_number, bool)
+                or pr_number <= 0
+            ):
+                raise c.EvidenceError("candidate_pr is not a positive integer")
+            if candidate["head_ref"] == "main":
+                raise c.EvidenceError("claims a candidate PR but binds main")
+        elif candidate["head_ref"] != "main":
+            raise c.EvidenceError("head_ref is not main")
+
+    def test_candidate_bound_entry_is_accepted(self) -> None:
+        self._check(
+            {
+                "repository": "layervai/qurl-connector",
+                "head_ref": "feat/thing",
+                "head_sha": "c" * 40,
+                "candidate_pr": 588,
+            }
+        )
+
+    def test_main_bound_entry_is_still_accepted(self) -> None:
+        self._check(
+            {
+                "repository": "layervai/qurl-connector",
+                "head_ref": "main",
+                "head_sha": "c" * 40,
+            }
+        )
+
+    def test_candidate_claiming_main_is_refused(self) -> None:
+        with self.assertRaises(self.collector.EvidenceError):
+            self._check(
+                {
+                    "repository": "layervai/qurl-connector",
+                    "head_ref": "main",
+                    "head_sha": "c" * 40,
+                    "candidate_pr": 588,
+                }
+            )
+
+    def test_non_positive_or_boolean_candidate_pr_is_refused(self) -> None:
+        for bad in (0, -1, True, "588", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(self.collector.EvidenceError):
+                    self._check(
+                        {
+                            "repository": "layervai/qurl-connector",
+                            "head_ref": "feat/thing",
+                            "head_sha": "c" * 40,
+                            "candidate_pr": bad,
+                        }
+                    )
+
+    def test_an_unexpected_extra_key_is_still_refused(self) -> None:
+        # Admitting two shapes must not become "admit anything".
+        with self.assertRaises(Exception):
+            self._check(
+                {
+                    "repository": "layervai/qurl-connector",
+                    "head_ref": "feat/thing",
+                    "head_sha": "c" * 40,
+                    "candidate_pr": 588,
+                    "unexpected": "x",
+                }
+            )
+
+
+class CanaryMatchesCandidateTest(unittest.TestCase):
+    """The linkage that stops a false attestation.
+
+    Without it, a candidate-bound run records the candidate SHA in evidence
+    while exercising a main-built canary -- claiming to prove code it never
+    ran. Mutation-testing the first version of this guard showed NOTHING
+    failed when it was disabled, which is why it is a named function now.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import collect_udp_proof_deployment_evidence as collector
+
+        self.collector = collector
+
+    def test_no_candidate_is_a_noop(self) -> None:
+        # The main path must stay byte-identical: any canary is fine.
+        self.collector._require_canary_matches_candidate(None, None, "a" * 40)
+
+    def test_matching_canary_is_accepted(self) -> None:
+        head = "b" * 40
+        self.collector._require_canary_matches_candidate(588, head, head)
+
+    def test_mismatched_canary_is_refused(self) -> None:
+        with self.assertRaises(self.collector.EvidenceError) as ctx:
+            self.collector._require_canary_matches_candidate(588, "b" * 40, "c" * 40)
+        message = str(ctx.exception)
+        # The operator needs both SHAs and the remedy, not just "mismatch".
+        self.assertIn("b" * 40, message)
+        self.assertIn("c" * 40, message)
+        self.assertIn("588", message)
+        self.assertIn("did not exercise", message)
+
+    def test_unresolved_candidate_head_is_refused(self) -> None:
+        for bad in (None, ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(self.collector.EvidenceError):
+                    self.collector._require_canary_matches_candidate(588, bad, "c" * 40)

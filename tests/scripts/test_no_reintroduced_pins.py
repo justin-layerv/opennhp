@@ -104,13 +104,37 @@ class NoReintroducedPinsTest(unittest.TestCase):
             collector,
             "_resolve_client_main must read the client repository's main ref",
         )
+        # Each client must still be resolvable at main. It may ALSO be resolved
+        # at an open candidate PR, because main is prod-eligible the moment
+        # something merges and a change has to prove itself while it is still a
+        # PR. Both paths route through the same two named resolvers, so accept
+        # either here.
+        #
+        # This does NOT reopen the defect this file guards. What was removed was
+        # a frozen head SHA restated across three files in two repositories,
+        # which could not stay agreed under concurrent merges. A candidate is
+        # bound by PR NUMBER and its head is read live, so there is no second
+        # copy to drift. The literal-SHA assertions elsewhere in this file
+        # remain the real fence and are unchanged.
+        self.assertIn(
+            "_resolve_client_candidate",
+            collector,
+            "candidate binding must go through a named resolver, not an inline lookup",
+        )
+        self.assertIn(
+            'f"repos/{repository}/pulls/{pr_number}"',
+            collector,
+            "_resolve_client_candidate must read the PR head LIVE by number",
+        )
         for client in CLIENTS:
             with self.subTest(client=client):
-                pattern = r"_resolve_client_main\(\s*" + re.escape('"' + client + '"')
+                pattern = (
+                    r"_resolve_client(?:_main)?\(\s*" + re.escape('"' + client + '"')
+                )
                 self.assertRegex(
                     collector,
                     pattern,
-                    f"{client} must be resolved through _resolve_client_main",
+                    f"{client} must be resolved through a named client resolver",
                 )
 
         # The controller deliberately does NOT re-read client main any more.

@@ -17,6 +17,22 @@ on:
         description: Successful trusted-main Connector canary workflow run ID
         required: true
         type: string
+      candidate_connector_pr:
+        description: >-
+          Optional open qurl-connector PR number to prove instead of main.
+          Main is prod-eligible, so a change proves itself while it is still a
+          PR. Empty binds main. A NUMBER, never a SHA -- the head is resolved
+          live, so there is no frozen copy to drift out of agreement.
+        required: false
+        default: ''
+        type: string
+      candidate_qurl_go_pr:
+        description: >-
+          Optional open qurl-go PR number to prove instead of main. Empty binds
+          main. Same live-resolution rule as candidate_connector_pr.
+        required: false
+        default: ''
+        type: string
       terraform_apply_run_id:
         description: Successful trusted-main NHP retirement apply run (post-removal only)
         required: false
@@ -117,12 +133,16 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           CANARY_RUN_ID: ${{ inputs.connector_canary_run_id }}
+          CANDIDATE_CONNECTOR_PR: ${{ inputs.candidate_connector_pr }}
+          CANDIDATE_QURL_GO_PR: ${{ inputs.candidate_qurl_go_pr }}
         run: |
           set -euo pipefail
           mkdir -m 700 evidence canary
           python3 .github/scripts/collect_udp_proof_deployment_evidence.py \
             github-metadata \
             --canary-run-id "${CANARY_RUN_ID}" \
+            --candidate-connector-pr "${CANDIDATE_CONNECTOR_PR}" \
+            --candidate-qurl-go-pr "${CANDIDATE_QURL_GO_PR}" \
             --output evidence/github-metadata.json \
             --github-output "${GITHUB_OUTPUT}"
 

@@ -444,6 +444,18 @@ def _positive_input(value: str, name: str) -> int:
     return int(value)
 
 
+def _optional_positive_input(value: str, name: str) -> int | None:
+    """Empty means 'no candidate for this client' -> bind main, as before.
+
+    Anything non-empty must still be a positive integer, so a typo fails loudly
+    instead of silently degrading to main and proving the wrong code.
+    """
+    value = (value or "").strip()
+    if value == "":
+        return None
+    return _positive_input(value, name)
+
+
 def _verify_commit(repository: str, sha: str, name: str) -> None:
     commit = _gh(f"repos/{repository}/commits/{sha}", f"{name} commit")
     if not isinstance(commit, dict):
@@ -507,6 +519,59 @@ def _resolve_client_main(repository: str, name: str) -> dict[str, Any]:
     }
 
 
+def _resolve_client_candidate(repository: str, name: str, pr_number: int) -> dict[str, Any]:
+    """Resolve an OPEN candidate pull request's current head commit.
+
+    Main is prod-eligible the moment something merges, so a change must prove
+    itself while it is still a pull request. This binds the client code under
+    test to that PR.
+
+    Bind the PR NUMBER, resolve the head LIVE. The previous candidate binding
+    was removed because it froze head SHAs that had to be restated in three
+    files across two repositories; with concurrent merges those copies were
+    guaranteed to disagree, and the branches drifted while frozen. A PR number
+    is a single stable identifier whose head is looked up at run time, so there
+    is no second copy to fall out of agreement. That distinction is the whole
+    reason this is safe to reintroduce.
+
+    The head is deliberately NOT required to be reachable from main -- an
+    unmerged candidate never is. That is the point.
+    """
+    pull = _gh(f"repos/{repository}/pulls/{pr_number}", f"{name} candidate pull request")
+    if not isinstance(pull, dict):
+        raise EvidenceError(f"{name} candidate pull request did not resolve")
+    if pull.get("state") != "open":
+        raise EvidenceError(
+            f"{name} candidate pull request #{pr_number} is not open; "
+            "a merged or closed candidate proves nothing about pending code"
+        )
+    base = (pull.get("base") or {}).get("ref")
+    if base != "main":
+        raise EvidenceError(
+            f"{name} candidate pull request #{pr_number} targets {base!r}, not main"
+        )
+    head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+    sha = head.get("sha")
+    if not isinstance(sha, str) or not contract.SHA_RE.fullmatch(sha):
+        raise EvidenceError(f"{name} candidate head did not resolve to a commit sha")
+    # A fork head would run unreviewed code on the privileged NET_ADMIN proof
+    # host. Same-repo only, matching the trust boundary terraform-plan-pr.yml
+    # already draws.
+    head_repo = (head.get("repo") or {}).get("full_name") if isinstance(head.get("repo"), dict) else None
+    if head_repo != repository:
+        raise EvidenceError(
+            f"{name} candidate pull request #{pr_number} head is on {head_repo!r}, "
+            f"not {repository}; fork candidates are refused"
+        )
+    _verify_commit(repository, sha, name)
+    return {
+        "repository": repository,
+        "head_ref": str(head.get("ref") or f"refs/pull/{pr_number}/head"),
+        "head_sha": sha,
+        "candidate_pr": pr_number,
+    }
+
+
 def _is_optional_pull_request_number(value: Any) -> bool:
     """A canary's pr_number: a real PR number, or null for a build from main.
 
@@ -552,9 +617,46 @@ def _resolve_default_branch(repository_key: str) -> dict[str, Any]:
     }
 
 
+def _require_canary_matches_candidate(
+    candidate_pr: int | None,
+    bound_head: str | None,
+    canary_head_sha: Any,
+) -> None:
+    """A candidate binding must describe the code the proof ACTUALLY EXERCISES.
+
+    The canary is the artifact the proof runs, and _canary_commit_is_in_main
+    admits only "identical" or "behind" main. A candidate head is by definition
+    AHEAD of main, so without this check a candidate-bound run would record the
+    candidate SHA in evidence while exercising a MAIN-built canary -- attesting
+    to code it never ran. A proof that lies about what it proved is worse than
+    no proof, so the run fails instead.
+
+    Equality is the right relation here, unlike the main path's reachability:
+    an unmerged pull request head is not rewritten, so there is no squash-merge
+    case to tolerate.
+
+    No-op when no candidate is bound, which keeps the main path byte-identical.
+    """
+    if candidate_pr is None:
+        return
+    if not isinstance(bound_head, str) or not bound_head:
+        raise EvidenceError(
+            f"connector candidate PR #{candidate_pr} did not resolve to a head"
+        )
+    if canary_head_sha != bound_head:
+        raise EvidenceError(
+            f"connector candidate PR #{candidate_pr} resolves to {bound_head}, "
+            f"but the supplied canary was built from {canary_head_sha}; the "
+            "proof would attest to code it did not exercise. Build a canary "
+            "from the candidate head and pass that run id."
+        )
+
+
 def collect_github_metadata(
     *,
     canary_run_id: int,
+    candidate_connector_pr: int | None = None,
+    candidate_qurl_go_pr: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     expected_context = {
         "GITHUB_REPOSITORY": "layervai/nhp",
@@ -583,20 +685,36 @@ def collect_github_metadata(
         raise EvidenceError("producer workflow is not the current NHP main commit")
     _verify_commit("layervai/nhp", producer_sha, "producer workflow")
 
+    # A client with a candidate PR is proven at that PR's live head; a client
+    # without one stays bound to main. Mixed is the normal case -- one repo has
+    # the change under test, the other is whatever main currently is.
+    def _resolve_client(repository: str, label: str, pr_number: int | None) -> dict[str, Any]:
+        nonlocal bound_connector_candidate_head
+        if pr_number is None:
+            return _resolve_client_main(repository, f"{label} main")
+        resolved = _resolve_client_candidate(repository, label, pr_number)
+        if repository == "layervai/qurl-connector":
+            bound_connector_candidate_head = resolved["head_sha"]
+        return resolved
+
+    bound_connector_candidate_head: str | None = None
     candidates = {
-        "qurl_connector": _resolve_client_main(
+        "qurl_connector": _resolve_client(
             "layervai/qurl-connector",
-            "qurl-connector main",
+            "qurl-connector",
+            candidate_connector_pr,
         ),
-        "qurl_go": _resolve_client_main(
+        "qurl_go": _resolve_client(
             "layervai/qurl-go",
-            "qurl-go main",
+            "qurl-go",
+            candidate_qurl_go_pr,
         ),
     }
     default_branches = {
         key: _resolve_default_branch(key)
         for key in sorted(contract.DEFAULT_BRANCH_REPOSITORIES)
     }
+
 
     run = _gh(
         f"repos/layervai/qurl-connector/actions/runs/{canary_run_id}",
@@ -706,6 +824,20 @@ def collect_github_metadata(
         or workflow_run.get("head_sha") != canary_head_sha
     ):
         raise EvidenceError("Connector canary artifact metadata is not run-bound")
+
+    # A candidate binding must describe the code the proof ACTUALLY EXERCISES.
+    #
+    # The canary is the artifact the proof runs, and _canary_commit_is_in_main
+    # admits only "identical" or "behind" main. A candidate head is by
+    # definition AHEAD of main, so without this check a candidate-bound run
+    # would record the candidate SHA in evidence while exercising a MAIN-built
+    # canary -- attesting to code it never ran. That is a vacuous attestation,
+    # and a proof that lies about what it proved is worse than no proof.
+    #
+    # So require the canary to have been built from that same candidate head.
+    _require_canary_matches_candidate(
+        candidate_connector_pr, bound_connector_candidate_head, canary_head_sha
+    )
 
     metadata = {
         "schema_version": 1,
@@ -4056,16 +4188,36 @@ def _validate_github_evidence(value: Any) -> dict[str, Any]:
         "GitHub evidence candidates",
     )
     for key in ("qurl_connector", "qurl_go"):
+        # A candidate-bound entry carries the extra candidate_pr field; a
+        # main-bound entry does not. Accept exactly one of those two shapes --
+        # still exact, just two known shapes instead of one, so an unexpected
+        # key is still refused.
+        raw_candidate = candidates[key]
+        candidate_keys = {"repository", "head_ref", "head_sha"}
+        if isinstance(raw_candidate, dict) and "candidate_pr" in raw_candidate:
+            candidate_keys = candidate_keys | {"candidate_pr"}
         candidate = _exact(
-            candidates[key],
-            {"repository", "head_ref", "head_sha"},
+            raw_candidate,
+            candidate_keys,
             f"GitHub evidence candidates.{key}",
         )
         if candidate["repository"] != contract.REPOSITORIES[key]:
             raise EvidenceError(f"GitHub evidence candidate repository drift for {key}")
-        # A resolved candidate carries no pull request number: the proof binds
-        # main, so head_ref is always "main" and there is nothing to select.
-        if candidate["head_ref"] != "main":
+        # Main-bound: head_ref must be exactly "main". Candidate-bound: the head
+        # is an unmerged PR head, which is never main -- that is the point --
+        # so require a positive PR number instead, and refuse the contradiction
+        # of a candidate that claims to be main.
+        if "candidate_pr" in candidate:
+            pr_number = candidate["candidate_pr"]
+            if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+                raise EvidenceError(
+                    f"GitHub evidence candidate {key} candidate_pr is not a positive integer"
+                )
+            if candidate["head_ref"] == "main":
+                raise EvidenceError(
+                    f"GitHub evidence candidate {key} claims a candidate PR but binds main"
+                )
+        elif candidate["head_ref"] != "main":
             raise EvidenceError(
                 f"GitHub evidence candidate {key} head_ref is "
                 f"{candidate['head_ref']!r}; the proof binds main"
@@ -4511,6 +4663,11 @@ def main() -> int:
 
     metadata = subparsers.add_parser("github-metadata")
     metadata.add_argument("--canary-run-id", required=True)
+    # Optional candidate PR numbers. Absent -> that client is proven at main,
+    # which is the pre-existing behavior. A NUMBER, never a SHA: the head is
+    # resolved live so there is no frozen copy to drift.
+    metadata.add_argument("--candidate-connector-pr", default="")
+    metadata.add_argument("--candidate-qurl-go-pr", default="")
     metadata.add_argument("--output", type=Path, required=True)
     metadata.add_argument("--github-output", type=Path, required=True)
 
@@ -4535,6 +4692,12 @@ def main() -> int:
             value, outputs = collect_github_metadata(
                 canary_run_id=_positive_input(
                     args.canary_run_id, "Connector canary run id"
+                ),
+                candidate_connector_pr=_optional_positive_input(
+                    args.candidate_connector_pr, "qurl-connector candidate PR number"
+                ),
+                candidate_qurl_go_pr=_optional_positive_input(
+                    args.candidate_qurl_go_pr, "qurl-go candidate PR number"
                 ),
             )
         elif args.command == "github-files":
