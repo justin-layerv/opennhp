@@ -342,3 +342,164 @@ resource "aws_sesv2_configuration_set_event_destination" "agent_otp_cloudwatch" 
     }
   }
 }
+
+# =====================================================================
+# Per-PR live-email gate — GitHub Actions ses:SendEmail grant (NON-PROD)
+# =====================================================================
+#
+# qurl-service runs a `livemail`-tagged Go test on every PR targeting main
+# (.github/workflows/email-live-send.yml). It sends a REAL message through REAL
+# SES, as the real sender identity, stamped with the real configuration set,
+# to the AWS mailbox simulator success address. That is the only way to prove
+# in a PR's own CI that the identity is verified, the config set exists, the
+# rendered MIME is something SES accepts, and the caller is actually authorized
+# — none of which a fake SES client can establish.
+#
+# WHY A NEW ROLE IS NEEDED AT ALL: the existing ses:SendEmail grants belong to
+# the qurl-service ECS task role (modules/qurl-service: task_agent_otp_ses) and
+# the Connector Authority ca-iro-cell* Lambda exec roles (Sid OTPSendEmail).
+# Neither is assumable from GitHub Actions, so without this the gate fails
+# closed with AccessDenied.
+#
+# SCOPE: the sender DOMAIN identity AND the configuration set (SESv2 SendEmail
+# with a configuration_set_name authorizes ses:SendEmail against BOTH; an
+# identity-only grant AccessDenies on the config-set), constrained by
+# ses:FromAddress to the configured sender and by ses:Recipients to the mailbox
+# simulator. Not Resource="*".
+#
+# NON-PROD ONLY, BY CONSTRAINT: the fence below fails the plan if this flag is
+# ever set in prod. CI must not be able to originate mail from the prod sender
+# identity (noreply@notify.layerv.ai) — a compromised or merely careless
+# workflow would be sending as the address customers receive real OTPs from.
+# The gate targets sandbox and that is the only place the grant may exist.
+locals {
+  agent_otp_ci_send_gate_permitted = var.agent_otp_ci_send_gate_enabled && local.agent_otp_ses_enabled
+
+  # The ONLY address the gate role may mail. AWS's mailbox simulator: SES
+  # delivers it, no real inbox receives it, and it does not touch sending
+  # reputation. Pinning it in IAM is what keeps the role harmless in the hands
+  # of an arbitrary PR branch.
+  agent_otp_ci_send_gate_recipient = "success@simulator.amazonses.com"
+}
+
+resource "terraform_data" "agent_otp_ci_send_gate_fence" {
+  count = var.agent_otp_ci_send_gate_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.environment != "prod"
+      error_message = "agent_otp_ci_send_gate_enabled must never be true in prod: it would let GitHub Actions send mail as the production OTP sender identity. The per-PR live-email gate targets sandbox only."
+    }
+    precondition {
+      condition     = local.agent_otp_ses_enabled
+      error_message = "agent_otp_ci_send_gate_enabled=true requires agent_otp_enabled=true — the grant scopes to the SES identity and configuration set that gate creates, and would reference resources that do not exist."
+    }
+    precondition {
+      # An empty repo name would produce the trust subject
+      # "repo:<org>/:pull_request", which matches nothing — the role would be
+      # created and every gate run would fail to assume it.
+      condition     = trimspace(var.qurl_github_repo) != "" && trimspace(var.github_org) != ""
+      error_message = "agent_otp_ci_send_gate_enabled=true requires non-empty github_org and qurl_github_repo: they form the OIDC trust subject the gate role is assumed under."
+    }
+  }
+}
+
+# A DEDICATED role, not a policy bolted onto nhp-<env>-github-actions.
+#
+# That role carries terraform-apply-equivalent permissions on the environment
+# (see the SECURITY #1121 block on aws_iam_role.github_actions: full Terraform
+# state + apply across compute/IAM/services/data, ECR push to every repo, ECS
+# and S3 deploys, broad ssm:PutParameter). A `pull_request` workflow runs the
+# workflow file FROM THE PR BRANCH, so granting PR-time access to that role
+# would let any PR author rewrite the workflow and assume it. Handing an
+# untrusted branch the keys to the environment is not an acceptable price for
+# sending one email.
+#
+# So the gate gets its own role whose entire capability is "send exactly this
+# email". Even with arbitrary workflow contents, a PR can do nothing with it
+# beyond what the gate already does.
+resource "aws_iam_role" "qurl_otp_email_gate" {
+  count = local.agent_otp_ci_send_gate_permitted ? 1 : 0
+
+  name        = "${local.name_prefix}-qurl-otp-email-gate"
+  description = "Per-PR live OTP email gate for ${var.github_org}/${var.qurl_github_repo} — ses:SendEmail to the mailbox simulator only"
+
+  # No environment: binding, deliberately. The `sandbox` GitHub environment's
+  # deployment-branch policy rejects PR merge refs (that rejection is what
+  # surfaced this design), and loosening it would re-open the privilege path
+  # above. Trust the pull_request subject directly instead: it is exactly the
+  # context the gate runs in, and nothing else.
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = module.ecr.github_oidc_provider_arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.qurl_github_repo}:pull_request"
+        }
+      }
+    }]
+  })
+
+  depends_on = [terraform_data.agent_otp_ci_send_gate_fence]
+
+  tags = merge(local.agent_otp_tags, {
+    Name = "${local.name_prefix}-qurl-otp-email-gate"
+  })
+}
+
+resource "aws_iam_role_policy" "qurl_otp_email_gate" {
+  count = local.agent_otp_ci_send_gate_permitted ? 1 : 0
+
+  name = "agent-otp-ses-send-pr-gate"
+  role = aws_iam_role.qurl_otp_email_gate[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "AgentOTPPRGateSendEmail"
+      Effect = "Allow"
+      Action = ["ses:SendEmail"]
+      Resource = [
+        "arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:identity/${local.agent_otp_sender_domain}",
+        "arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:configuration-set/${local.agent_otp_config_set_name}",
+      ]
+      Condition = {
+        # Single-valued: exactly one envelope From per message, so a plain
+        # operator is correct here.
+        StringEquals = {
+          "ses:FromAddress" = var.agent_otp_email_from
+        }
+
+        # MULTIVALUED. ses:Recipients resolves to every To/Cc/Bcc address on
+        # the request, so it must be evaluated with a set operator — AWS
+        # documents plain single-valued operators against a multivalued key as
+        # unreliable. This is the control that makes an untrusted PR branch
+        # holding this role uninteresting: IAM cannot scope trust to a
+        # workflow_ref, so ANY qurl-service PR can rewrite the gate workflow
+        # and assume this role. FromAddress alone would still let it send as
+        # the reputable, DKIM-signed OTP sender, so the recipient pin is the
+        # only thing standing between that and phishing from a trusted domain.
+        "ForAllValues:StringEquals" = {
+          "ses:Recipients" = [local.agent_otp_ci_send_gate_recipient]
+        }
+
+        # ForAllValues is VACUOUSLY TRUE when the key is absent from the
+        # request, which would let a call carrying no recipients context slip
+        # the pin entirely. Require the key to be present. (Same trap as the
+        # dynamodb:LeadingKeys guards on the authority runtime policies.)
+        Null = {
+          "ses:Recipients" = "false"
+        }
+      }
+    }]
+  })
+}
+
+output "qurl_otp_email_gate_role_arn" {
+  description = "Role the qurl-service per-PR live email gate assumes. Minimal by construction: ses:SendEmail as the OTP sender to the mailbox simulator, nothing else."
+  value       = local.agent_otp_ci_send_gate_permitted ? aws_iam_role.qurl_otp_email_gate[0].arn : ""
+}

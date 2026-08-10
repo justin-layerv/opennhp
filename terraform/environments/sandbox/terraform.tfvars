@@ -692,6 +692,12 @@ agent_otp_registration_enabled    = true
 agent_otp_email_from              = "noreply@notify.layerv.xyz"
 agent_registration_relay_base_url = "https://relay.qurl.link.layerv.xyz"
 
+# Lets qurl-service's per-PR live-email gate send a real message through real
+# SES as noreply@notify.layerv.xyz (recipient is always the AWS mailbox
+# simulator, so nothing reaches a real inbox). Sandbox only — the fence in
+# agent_otp_ses.tf fails the plan if this is ever set in prod.
+agent_otp_ci_send_gate_enabled = true
+
 # ==============================================================================
 # QURL Link Redirect Page
 # Hosts the redirect page that extracts tokens and sends users to NHP Server

@@ -1053,6 +1053,12 @@ variable "agent_otp_enabled" {
   default     = false
 }
 
+variable "agent_otp_ci_send_gate_enabled" {
+  description = "Grants the GitHub Actions role ses:SendEmail on the agent-OTP sender identity + configuration set, so qurl-service's per-PR live-email gate can send a real message through real SES before a PR merges. NON-PROD ONLY — a precondition in agent_otp_ses.tf fails the plan if this is true when environment == \"prod\", so prod refuses the grant by constraint rather than by convention. Requires agent_otp_enabled = true (the identity and config set it scopes to are created by that gate). Default false."
+  type        = bool
+  default     = false
+}
+
 variable "agent_otp_registration_enabled" {
   description = "PATH B gate (NHP-server QURL plugin side) — AGENT_OTP_REGISTRATION_ENABLED, rendered into nhp-server user_data only when qurl_config.enabled. Flip in lockstep with agent_otp_enabled (qurl-service side); enabling only one side leaves the OTP register flow half-wired. Default false → user_data byte-unchanged."
   type        = bool
