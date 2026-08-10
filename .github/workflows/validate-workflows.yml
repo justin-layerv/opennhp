@@ -208,6 +208,16 @@ on:
       - "tests/local/go.mod"
       - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
+      # Offline golangci config validation (replaces the action's
+      # network-fetching `config verify`). Watch every input: the config it
+      # validates, the vendored schema it validates against, and the lint
+      # plus its fixtures. The version pin it reads lives in
+      # ubuntu-build.yml, and its pinned requirements file rides
+      # .github/scripts/** — both already covered above.
+      - ".golangci.yml"
+      - ".github/schemas/**"
+      - "scripts/check-golangci-config-schema.py"
+      - "tests/lints/golangci-config-schema/**"
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
       - "tests/lints/smoke-tier-filter-coverage/**"
@@ -352,11 +362,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyYAML
+      - name: Install lint dependencies
         run: |
           set -euo pipefail
           python3 -m pip --version
-          python3 -m pip install --no-cache-dir pyyaml
+          # Pinned: these back structural fences, and a fence whose verdict can
+          # change without a code change is not a fence. jsonschema backs
+          # check-golangci-config-schema.py, which replaced the
+          # network-fetching `config verify`.
+          python3 -m pip install --no-cache-dir \
+            -r .github/scripts/validate-workflows-requirements.txt
+
+      # golangci-lint-action's built-in `config verify` fetched its JSON
+      # schema from golangci-lint.run on every run; a timeout there reds all
+      # four `lint (...)` legs at once in 7-15s. The action now runs with
+      # `verify: false` and this validates .golangci.yml against a vendored
+      # schema offline instead — which is not merely equivalent but load
+      # bearing: `golangci-lint run` silently ignores unknown top-level and
+      # nested config keys, so a typo'd key reads as an enabled setting doing
+      # nothing. Fixtures run first so a regex/validator regression surfaces
+      # against known inputs before the real config.
+      - name: Test + check golangci config against the vendored schema
+        run: |
+          shellcheck tests/lints/golangci-config-schema/run-fixtures.sh
+          bash tests/lints/golangci-config-schema/run-fixtures.sh
+          python3 scripts/check-golangci-config-schema.py
 
 
 

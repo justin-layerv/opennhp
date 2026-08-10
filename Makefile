@@ -596,6 +596,14 @@ lint-workflows:
 	@bash tests/scripts/dependabot-go-tidy_test.sh
 	@bash tests/lints/paths-filter-coverage/run-fixtures.sh
 	@python3 scripts/check-paths-filter-coverage.py
+	@python3 -c 'import jsonschema, yaml' 2>/dev/null || { \
+		echo "$(COLOUR_RED)[OpenNHP] lint-workflows needs the pinned Python deps:$(END_COLOUR)"; \
+		echo "  python3 -m pip install -r .github/scripts/validate-workflows-requirements.txt"; \
+		exit 1; \
+	}
+	@shellcheck tests/lints/golangci-config-schema/run-fixtures.sh
+	@bash tests/lints/golangci-config-schema/run-fixtures.sh
+	@python3 scripts/check-golangci-config-schema.py
 	@bash tests/lints/dispatch-ref-error/run-fixtures.sh
 	@shellcheck tests/lints/verify-image-attestation/run-fixtures.sh
 	@bash tests/lints/verify-image-attestation/run-fixtures.sh

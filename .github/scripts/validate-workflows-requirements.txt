@@ -1,0 +1,14 @@
+# Pinned Python dependencies for the validate-workflows lint suite.
+# Used by:
+#   - .github/workflows/validate-workflows.yml (Install lint dependencies step)
+#   - Makefile (lint-workflows target — install hint)
+#
+# Pinned rather than floating for the same reason the Lambda suites pin: these
+# back structural fences, and a fence whose verdict can change without a code
+# change is not a fence. A jsonschema minor can tighten or relax validation;
+# that should land as a reviewed bump, not as a surprise red on an unrelated PR.
+#
+# Bump in lockstep with upstream releases. Note the repo's 7-day dependency
+# quarantine (age-check) — pick a release at least a week old.
+jsonschema==4.26.0
+pyyaml==6.0.3
