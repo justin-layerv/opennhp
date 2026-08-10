@@ -38,5 +38,6 @@
   "proof_mutation_controls_enabled": true,
   "proof_policy_consumers_staged": true,
   "proof_policy_selected_color": "green",
-  "proof_policy_prepared_color": "green"
+  "proof_policy_prepared_color": "green",
+  "blue_green_alias_hold_enabled": false
 }

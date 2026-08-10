@@ -520,6 +520,7 @@ def generated_input(
     proof_policy_consumers_staged: bool = False,
     proof_policy_selected_color: str | None = None,
     proof_policy_prepared_color: str | None = None,
+    blue_green_alias_hold_enabled: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     if proof_mutation_controls_enabled:
@@ -597,6 +598,17 @@ def generated_input(
         if not proof_mutation_controls_enabled:
             fail("proof policy consumers require proof mutation controls")
         payload["authority_proof_policy_consumers_staged"] = True
+    # Sixth, blue/green alias semantics: the selected colour holds its live
+    # version and only standby advances. Independent of the proof gate --
+    # the hold scopes itself per function around the four the proof rollout
+    # pins, so it needs no ordering against it.
+    if blue_green_alias_hold_enabled:
+        if not runtime_functions_enabled:
+            fail(
+                "the blue/green alias hold requires authority runtime "
+                "functions to be enabled"
+            )
+        payload["authority_blue_green_alias_hold_enabled"] = True
     rollout_colors = (proof_policy_selected_color, proof_policy_prepared_color)
     if any(color is not None for color in rollout_colors):
         if not all(color in {"blue", "green"} for color in rollout_colors):
@@ -691,6 +703,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--blue-green-alias-hold-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Hold the selected alias colour at its live version and advance only "
+            "standby, so a new image lands on a warm standby instead of moving "
+            "both colours. Requires --runtime-functions-enabled."
+        ),
+    )
+    parser.add_argument(
         "--proof-policy-selected-color",
         choices=("blue", "green"),
         help=(
@@ -724,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
                 hub_edge_enabled=args.hub_edge_enabled,
                 hub_worker_enabled=args.hub_worker_enabled,
                 proof_mutation_controls_enabled=args.proof_mutation_controls_enabled,
+                blue_green_alias_hold_enabled=args.blue_green_alias_hold_enabled,
                 proof_policy_consumers_staged=args.proof_policy_consumers_staged,
                 proof_policy_selected_color=args.proof_policy_selected_color,
                 proof_policy_prepared_color=args.proof_policy_prepared_color,

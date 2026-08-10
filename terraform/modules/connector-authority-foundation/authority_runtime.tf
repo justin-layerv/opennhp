@@ -1173,15 +1173,24 @@ resource "aws_lambda_alias" "authority" {
   name          = each.value.color
   description   = "Closed ${each.value.color} deployment qualifier"
   function_name = aws_lambda_function.authority[each.value.function_name].function_name
-  # Blue/green hold takes precedence when enabled: the selected colour keeps the
-  # version live traffic is already on, and only standby advances. The proof
-  # branch below is the older, narrower form of the same idea, scoped to the
-  # IA/RA/ICR + ca-pm rollout; it is retired with the proof surface, after which
-  # this expression has a single owner.
+  # Blue/green hold: the selected colour keeps the version live traffic is
+  # already on, and only standby advances to the newly published one.
+  #
+  # It stands down ONLY for the functions the attended proof rollout actually
+  # pins (IA/RA/ICR + ca-pm). That rollout is the older, narrower form of this
+  # same idea and owns those four; every other function falls through to "both
+  # colours track newest", which is no owner at all. Scoping the hold per
+  # function rather than on the whole proof gate is what keeps blue/green off
+  # the proof retirement's critical path: the nine unpinned functions get it
+  # now, and the remaining four join them when the proof branch below is
+  # deleted.
   function_version = (
     var.authority_blue_green_alias_hold_enabled &&
     local.authority_runtime_functions_deploy &&
-    !var.authority_proof_mutation_controls_enabled
+    !(
+      var.authority_proof_mutation_controls_enabled &&
+      contains(keys(local.authority_proof_policy_pinned_functions), each.value.function_name)
+    )
     ? (
       each.value.color == local.authority_runtime_selected_color
       ? data.aws_lambda_alias.authority_live[each.key].function_version

@@ -70,6 +70,14 @@ on:
           - 'blue'
           - 'green'
         default: 'none'
+      blue_green_alias_hold_enabled:
+        description: 'Blue/green alias semantics: the selected color holds its live version and only standby advances, so a new image lands on a warm standby instead of moving both colors. Scoped per function around the four the proof rollout pins, so it needs no ordering against the proof gate. MUST equal the committed .github/control-sandbox-runtime-gates.json; the guard rejects any dispatch that disagrees, so the dark default below is only correct while the committed file is dark.'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
       source_plan_run_id:
         description: 'Apply only: successful plan workflow run ID'
         required: false
@@ -135,6 +143,7 @@ jobs:
           ENABLE_RUNTIME_FUNCTIONS: ${{ inputs.enable_runtime_functions }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          BLUE_GREEN_ALIAS_HOLD_ENABLED: ${{ inputs.blue_green_alias_hold_enabled }}
           PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
           PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
           SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
@@ -252,6 +261,7 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          BLUE_GREEN_ALIAS_HOLD_ENABLED: ${{ inputs.blue_green_alias_hold_enabled }}
           PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
           PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
@@ -262,7 +272,8 @@ jobs:
             --proof-mutation-controls-enabled "$PROOF_MUTATION_CONTROLS_ENABLED" \
             --proof-policy-consumers-staged "$PROOF_POLICY_CONSUMERS_STAGED" \
             --proof-policy-selected-color "$PROOF_POLICY_SELECTED_COLOR" \
-            --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR"
+            --proof-policy-prepared-color "$PROOF_POLICY_PREPARED_COLOR" \
+            --blue-green-alias-hold-enabled "$BLUE_GREEN_ALIAS_HOLD_ENABLED"
 
   plan:
     name: Build immutable sandbox Control update plan
@@ -311,6 +322,7 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          BLUE_GREEN_ALIAS_HOLD_ENABLED: ${{ inputs.blue_green_alias_hold_enabled }}
           PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
           PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
@@ -332,6 +344,10 @@ jobs:
             proof_mutation_flags=(
               --proof-mutation-controls-enabled
             )
+          fi
+          blue_green_flags=()
+          if [[ "$BLUE_GREEN_ALIAS_HOLD_ENABLED" == 'true' ]]; then
+            blue_green_flags=(--blue-green-alias-hold-enabled)
           fi
           proof_policy_consumer_stage_flags=()
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
@@ -355,7 +371,8 @@ jobs:
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
             "${proof_policy_consumer_stage_flags[@]}" \
-            "${proof_policy_rollout_flags[@]}"
+            "${proof_policy_rollout_flags[@]}" \
+            "${blue_green_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh
@@ -629,6 +646,7 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          BLUE_GREEN_ALIAS_HOLD_ENABLED: ${{ inputs.blue_green_alias_hold_enabled }}
           PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
           PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
@@ -650,6 +668,10 @@ jobs:
             proof_mutation_flags=(
               --proof-mutation-controls-enabled
             )
+          fi
+          blue_green_flags=()
+          if [[ "$BLUE_GREEN_ALIAS_HOLD_ENABLED" == 'true' ]]; then
+            blue_green_flags=(--blue-green-alias-hold-enabled)
           fi
           proof_policy_consumer_stage_flags=()
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
@@ -673,7 +695,8 @@ jobs:
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
             "${proof_policy_consumer_stage_flags[@]}" \
-            "${proof_policy_rollout_flags[@]}"
+            "${proof_policy_rollout_flags[@]}" \
+            "${blue_green_flags[@]}"
           cmp "$RUNNER_TEMP/control-plan-artifact/authority-runtime.generated.tfvars.json" \
             "$RUNNER_TEMP/authority-runtime.generated.tfvars.json" || {
             echo '::error::Verified Authority runtime input differs from the reviewed plan input.'
@@ -1026,6 +1049,7 @@ jobs:
           HUB_WORKER_ENABLED: ${{ inputs.hub_worker_enabled }}
           PROOF_MUTATION_CONTROLS_ENABLED: ${{ inputs.proof_mutation_controls_enabled }}
           PROOF_POLICY_CONSUMERS_STAGED: ${{ inputs.proof_policy_consumers_staged }}
+          BLUE_GREEN_ALIAS_HOLD_ENABLED: ${{ inputs.blue_green_alias_hold_enabled }}
           PROOF_POLICY_SELECTED_COLOR: ${{ inputs.proof_policy_selected_color }}
           PROOF_POLICY_PREPARED_COLOR: ${{ inputs.proof_policy_prepared_color }}
         run: |
@@ -1047,6 +1071,10 @@ jobs:
             proof_mutation_flags=(
               --proof-mutation-controls-enabled
             )
+          fi
+          blue_green_flags=()
+          if [[ "$BLUE_GREEN_ALIAS_HOLD_ENABLED" == 'true' ]]; then
+            blue_green_flags=(--blue-green-alias-hold-enabled)
           fi
           proof_policy_consumer_stage_flags=()
           if [[ "$PROOF_POLICY_CONSUMERS_STAGED" == 'true' ]]; then
@@ -1070,7 +1098,8 @@ jobs:
             "${hub_worker_flag[@]}" \
             "${proof_mutation_flags[@]}" \
             "${proof_policy_consumer_stage_flags[@]}" \
-            "${proof_policy_rollout_flags[@]}"
+            "${proof_policy_rollout_flags[@]}" \
+            "${blue_green_flags[@]}"
 
       - name: Prove checkout credentials are absent before Terraform
         run: scripts/check-no-checkout-credentials.sh

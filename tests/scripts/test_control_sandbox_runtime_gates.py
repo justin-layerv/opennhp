@@ -35,6 +35,10 @@ LIVE = {
     "proof_policy_consumers_staged": True,
     "proof_policy_selected_color": "green",
     "proof_policy_prepared_color": "green",
+    # Dark: the blue/green alias hold is wired but not flipped. Turning it on is
+    # a live change (the selected colour stops following each republish), so it
+    # gets its own reviewed gate flip and attended plan.
+    "blue_green_alias_hold_enabled": False,
 }
 
 
@@ -292,6 +296,69 @@ class DependencyRules(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("requires the Authority runtime functions gate", result.stderr)
+
+    def test_blue_green_hold_requires_runtime_functions(self) -> None:
+        """validate() must mirror the generator's own dependency guard.
+
+        Without this the bad shape passes gate-load and only fails several steps
+        later inside generate, on the deploy leg rather than loudly up front.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run(
+                "flags",
+                gates=write_gates(
+                    Path(tmp),
+                    blue_green_alias_hold_enabled=True,
+                    enable_runtime_functions=False,
+                    # Silence the proof rules, which are checked first and would
+                    # otherwise mask the rule under test.
+                    proof_mutation_controls_enabled=False,
+                    proof_policy_consumers_staged=False,
+                    proof_policy_selected_color="none",
+                    proof_policy_prepared_color="none",
+                ),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("blue/green alias hold requires", result.stderr)
+
+    def test_check_rejects_a_disagreeing_blue_green_input(self) -> None:
+        """A dispatch that disagrees with the committed gate must be refused.
+
+        The gate was in BOOLEAN_GATES and TFVARS_KEYS but missing from
+        check_inputs' comparison dict, so a dispatch of true against a committed
+        false was silently accepted -- exactly what the dispatch input's own help
+        text promises the guard rejects.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            gates = write_gates(Path(tmp), blue_green_alias_hold_enabled=False)
+            result = run(
+                *check_args(blue_green_alias_hold_enabled="true"), gates=gates
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("blue_green_alias_hold_enabled", result.stderr)
+
+    def test_blue_green_flag_is_emitted_last(self) -> None:
+        """Flag ORDER is byte-compared against the reviewed plan input.
+
+        The gate is APPENDED to BOOLEAN_GATES rather than inserted, so enabling
+        it must leave every pre-existing flag in its existing relative position
+        and add exactly one token. (It lands at the end of the boolean flags,
+        before the colour flags, because emit_flags walks BOOLEAN_GATES then
+        COLOR_GATES -- so "last overall" is the wrong assertion.) Inserting
+        mid-list would fail the apply, not the review.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = run("flags", gates=write_gates(Path(tmp)))
+            enabled = run(
+                "flags",
+                gates=write_gates(Path(tmp), blue_green_alias_hold_enabled=True),
+            )
+        self.assertEqual(base.returncode, 0)
+        self.assertEqual(enabled.returncode, 0)
+        flag = "--blue-green-alias-hold-enabled"
+        enabled_tokens = enabled.stdout.split()
+        self.assertIn(flag, enabled_tokens)
+        self.assertEqual([t for t in enabled_tokens if t != flag], base.stdout.split())
 
     def test_staged_consumers_require_proof_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

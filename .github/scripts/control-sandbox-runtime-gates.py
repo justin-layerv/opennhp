@@ -43,6 +43,11 @@ BOOLEAN_GATES = (
     ("hub_worker_enabled", "--hub-worker-enabled"),
     ("proof_mutation_controls_enabled", "--proof-mutation-controls-enabled"),
     ("proof_policy_consumers_staged", "--proof-policy-consumers-staged"),
+    # Appended at the END deliberately: this tuple's order is the order both
+    # workflows emit flags in, and the generated tfvars is byte-compared
+    # against the reviewed plan input, so inserting mid-list would break the
+    # apply rather than the review.
+    ("blue_green_alias_hold_enabled", "--blue-green-alias-hold-enabled"),
 )
 
 COLOR_GATES = (
@@ -69,6 +74,7 @@ TFVARS_KEYS = {
     "proof_policy_consumers_staged": "authority_proof_policy_consumers_staged",
     "proof_policy_selected_color": "authority_proof_policy_selected_color",
     "proof_policy_prepared_color": "authority_proof_policy_prepared_color",
+    "blue_green_alias_hold_enabled": "authority_blue_green_alias_hold_enabled",
 }
 
 
@@ -123,6 +129,12 @@ def validate(gates: dict[str, object]) -> None:
     if gates["proof_policy_consumers_staged"] and not gates["proof_mutation_controls_enabled"]:
         raise GateError(
             "proof policy consumers require the attended-proof mutation control"
+        )
+    # Mirrors the generator's own guard so a bad gate file fails loudly at
+    # gate-load rather than several steps later inside generate.
+    if gates["blue_green_alias_hold_enabled"] and not gates["enable_runtime_functions"]:
+        raise GateError(
+            "the blue/green alias hold requires the Authority runtime functions gate"
         )
     selected = gates["proof_policy_selected_color"]
     prepared = gates["proof_policy_prepared_color"]
@@ -203,6 +215,7 @@ def check_inputs(gates: dict[str, object], args: argparse.Namespace) -> None:
         "proof_policy_consumers_staged": args.proof_policy_consumers_staged,
         "proof_policy_selected_color": args.proof_policy_selected_color,
         "proof_policy_prepared_color": args.proof_policy_prepared_color,
+        "blue_green_alias_hold_enabled": args.blue_green_alias_hold_enabled,
     }
     differences = []
     for name, value in supplied.items():
