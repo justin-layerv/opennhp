@@ -6,8 +6,12 @@ EPIPE, and `pipefail` promotes the writer's failure to the pipeline's status --
 so a pattern that IS present reports absent.
 
 It is invisible below the pipe buffer (64 KiB on Linux): the writer finishes
-before grep exits, so every small-input test passes. That is what makes it worth
-a fence rather than a code review note.
+before grep exits, so every small-input test passes. Between there and grep's
+initial read buffer (96 KiB) it is a coin flip -- one read can drain the whole
+pipe and let the writer finish -- which is why the field symptom comes and goes.
+Only past that buffer does grep reliably exit still owing the writer bytes. That
+progression, invisible then intermittent then certain, is what makes it worth a
+fence rather than a code review note.
 
 Observed 2026-08-02: `deploy-sandbox-cell1-infra` read the 69 KB cell1
 server-init.sh and reported
@@ -37,10 +41,18 @@ class NoPipefailGrepQTest(unittest.TestCase):
 
         Without this, a future reader has only an assertion that some shell
         idiom is banned, and no way to check whether it still matters.
+
+        The demonstration uses 1 MiB rather than the incident's 69 KB. 69 KB
+        fits inside grep's 96 KiB initial read, so a single read can empty the
+        pipe and let the writer finish -- the false negative reproduces only
+        some of the time (found in 42 of 60 runs on GNU grep 3.11 / Ubuntu
+        24.04), and this test went red on main on 2026-08-10 for exactly that
+        reason. Past that buffer grep always exits with bytes still unwritten,
+        which is the property being fenced; the size at which it starts is not.
         """
         script = r"""
         set -euo pipefail
-        big="$(python3 -c "print('FLAG=true'); print('x'*70000)")"
+        big="$(python3 -c "print('FLAG=true'); print('x'*(1024*1024))")"
         piped=found;      printf '%s' "$big" | grep -q '^FLAG=' 2>/dev/null || piped=MISSING
         herestring=found; grep -q '^FLAG=' <<<"$big" || herestring=MISSING
         echo "$piped $herestring"
@@ -48,11 +60,14 @@ class NoPipefailGrepQTest(unittest.TestCase):
         result = subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, timeout=60
         )
+        # Without this the split below raises a bare ValueError -- the one
+        # failure that says nothing about which of the two probes went wrong.
+        self.assertEqual(result.returncode, 0, result.stderr)
         piped, herestring = result.stdout.split()
         self.assertEqual(
             piped,
             "MISSING",
-            "the pipe no longer false-negatives on 70 KB; if the platform "
+            "the pipe no longer false-negatives on 1 MiB; if the platform "
             "changed, this fence can be reconsidered",
         )
         self.assertEqual(herestring, "found", "the herestring must find it")
