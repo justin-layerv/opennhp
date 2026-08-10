@@ -1933,6 +1933,25 @@ jobs:
       - name: Check terraform policy-condition denylist (#1316 regression fence)
         run: python3 ./.github/scripts/check-terraform-policy-conditions.py
 
+      - name: Check tfvars reach the module (#3811 regression fence)
+        # #3811 set a flag in an environment's terraform.tfvars, merged, and
+        # applied creating nothing: the environment root never declared the
+        # variable, so terraform ignored it with a warning and the module kept
+        # its default. Plan, merge, and apply were all green.
+        #
+        # This job is `if: github.event_name == 'pull_request'` and the
+        # workflow's pull_request trigger carries no paths filter, so the fence
+        # runs on EVERY PR to main — which is the point. A post-merge-only fence
+        # would reproduce #3811's own "too late" shape.
+        run: python3 ./.github/scripts/check-tfvars-reach-the-module.py
+
+      - name: Run tfvars reachability fixtures
+        # The checker's parser has real edge surface (column-zero matching,
+        # heredocs, nested map literals, comment stripping). Without committed
+        # fixtures, a later "simplification" could quietly disable the fence
+        # while it still reports OK.
+        run: ./tests/lints/tfvars-reachability/run-fixtures.sh
+
       - name: Check Connector control table schemas
         # The authority owns global copies of four established qURL identity
         # tables. Compare their exact keys, attributes, GSIs, and TTL shape to
