@@ -1756,6 +1756,46 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                     "Resource": sorted(resources),
                 }
             )
+    if spec.get("ticket_handle_write"):
+        statements.append(
+            {
+                "Sid": "AuthorityTicketHandleWrite",
+                "Effect": "Allow",
+                # The handle spec, NOT the replay action list. Sourcing it from
+                # the replay list reintroduced in the fixture exactly the
+                # coupling the Terraform split removes: widening replay would
+                # make this fixture emit the wider set for the handle write and
+                # surface as a confusing "ticket-handle write actions drifted"
+                # failure caused by an unrelated change.
+                "Action": sorted(spec["ticket_handle_write_actions"]),
+                "Resource": sorted(
+                    CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+                ),
+                "Condition": {
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": ["ASSIGNMENT_TICKET#*"],
+                    },
+                    "Null": {"dynamodb:LeadingKeys": "false"},
+                },
+            }
+        )
+    if spec.get("ticket_handle_read"):
+        statements.append(
+            {
+                "Sid": "AuthorityTicketHandleRead",
+                "Effect": "Allow",
+                "Action": ["dynamodb:GetItem"],
+                "Resource": sorted(
+                    CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+                ),
+                "Condition": {
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": ["ASSIGNMENT_TICKET#*"],
+                    },
+                    "Null": {"dynamodb:LeadingKeys": "false"},
+                },
+            }
+        )
     if spec.get("signs"):
         statements.append(
             {
@@ -13588,6 +13628,11 @@ class ComposedTransitionTest(unittest.TestCase):
                 "authority-proof-consumer-staging",
                 "authority-hub-exec-policy-update",
                 "hub-client-edge-port-migration",
+                # Publish tracking makes the resolved digest move on its own, so
+                # the foundation contract now lands alongside whatever else a
+                # Control PR changes. Without this lane every such plan falls
+                # through to the terminal reject.
+                "authority-image-uri-move",
             },
         )
 
@@ -14935,3 +14980,145 @@ class AuthorityImageSchemaTransitionTests(unittest.TestCase):
             CHECKER._check_authority_image_foundation_update(
                 _foundation_by_address(change)
             )
+
+
+class AuthorityImageUriMoveLaneTests(unittest.TestCase):
+    """The lane that lets a floating digest coexist with other changes."""
+
+    def _foundation(self, before: dict, after: dict) -> dict:
+        return _foundation_by_address(_authority_foundation_change(before, after))
+
+    def test_claims_a_pure_image_move(self) -> None:
+        before = _publish_tracking_runtime_input()
+        after = copy.deepcopy(before)
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}@sha256:" + "8" * 64
+        by_address = self._foundation(before, after)
+        claimed = CHECKER._claim_authority_image_uri_move(
+            set(by_address), {a: ["update"] for a in by_address}, by_address
+        )
+        self.assertEqual(
+            claimed, frozenset({CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS})
+        )
+
+    def test_claims_the_migration_and_image_move_together(self) -> None:
+        """The shape the live plan actually produced.
+
+        The recorded state can still predate the schema change, so the first
+        Control plan after it carries the pinned-to-publish migration AND an
+        image move in one foundation update. A claim that recognised only a
+        pure image move left that plan unadmittable -- which is exactly what
+        CI rejected.
+        """
+        before = _legacy_pre_key_runtime_input()
+        repository = before["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after = _migrated_publish_input(
+            before, image_uri=f"{repository}@sha256:" + "9" * 64
+        )
+        by_address = self._foundation(before, after)
+        claimed = CHECKER._claim_authority_image_uri_move(
+            set(by_address), {a: ["update"] for a in by_address}, by_address
+        )
+        self.assertEqual(
+            claimed, frozenset({CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS})
+        )
+
+    def test_rejects_when_something_else_moved(self) -> None:
+        """Claimed, then REFUSED with a specific error -- not silently unclaimed.
+
+        A claim that declined here sent the plan to the generic "unadmittable
+        shape" reject, which says nothing about what was wrong. The lane owns
+        this address; the validator is what enforces the rule.
+        """
+        before = _publish_tracking_runtime_input()
+        after = copy.deepcopy(before)
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}@sha256:" + "8" * 64
+        after["authority_runtime_contract"]["global"]["qat1_kid"] = "moved"
+        by_address = self._foundation(before, after)
+        self.assertIsNotNone(
+            CHECKER._claim_authority_image_uri_move(
+                set(by_address), {a: ["update"] for a in by_address}, by_address
+            )
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_uri_move(
+                frozenset(by_address), by_address, {}
+            )
+
+    def test_delegated_validation_covers_every_field_not_just_one(self) -> None:
+        """The lane claims structurally, so its safety IS the validator.
+
+        Review asked whether the delegation is airtight or rests on the single
+        field the earlier case happened to mutate. It is a byte-equality
+        reconstruction, so it covers all of them -- demonstrated rather than
+        asserted, across a nested global value, a top-level contract value, a
+        per-function value and an added key.
+        """
+        repository_change = lambda c: c["authority_runtime_contract"]["global"].update(
+            {"authority_repository_url": "123456789012.dkr.ecr.us-east-2.amazonaws.com/layerv/other"}
+        )
+        quota_change = lambda c: c["authority_runtime_contract"]["global"].update(
+            {"regional_lambda_concurrency_quota": 4242}
+        )
+        color_change = lambda c: c["authority_runtime_contract"].update(
+            {"selected_authority_color": "green"}
+        )
+        function_change = lambda c: next(
+            iter(c["authority_runtime_contract"]["functions"].values())
+        ).update({"steady_reserved_concurrency": 99})
+        added_key = lambda c: c["authority_runtime_contract"]["global"].update(
+            {"unexpected_new_key": "x"}
+        )
+
+        for name, mutate in (
+            ("repository url", repository_change),
+            ("concurrency quota", quota_change),
+            ("selected color", color_change),
+            ("per-function concurrency", function_change),
+            ("an added global key", added_key),
+        ):
+            with self.subTest(name):
+                before = _publish_tracking_runtime_input()
+                after = copy.deepcopy(before)
+                repository = after["authority_runtime_contract"]["global"][
+                    "authority_repository_url"
+                ]
+                after["authority_image_uri"] = f"{repository}@sha256:" + "a" * 64
+                mutate(after)
+                by_address = self._foundation(before, after)
+                # Claimed on the structural signal ...
+                self.assertIsNotNone(
+                    CHECKER._claim_authority_image_uri_move(
+                        set(by_address),
+                        {a: ["update"] for a in by_address},
+                        by_address,
+                    )
+                )
+                # ... and then refused by the validator, which is where the
+                # safety of this lane actually lives.
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._validate_authority_image_uri_move(
+                        frozenset(by_address), by_address, {}
+                    )
+
+    def test_does_not_claim_a_pinned_contract(self) -> None:
+        """A pinned digest cannot move on its own, so this lane must not apply."""
+        before = authority_runtime_input_fixture()
+        after = copy.deepcopy(before)
+        repository = after["authority_runtime_contract"]["global"][
+            "authority_repository_url"
+        ]
+        after["authority_image_uri"] = f"{repository}@sha256:" + "8" * 64
+        by_address = self._foundation(before, after)
+        self.assertIsNone(
+            CHECKER._claim_authority_image_uri_move(
+                set(by_address), {a: ["update"] for a in by_address}, by_address
+            )
+        )

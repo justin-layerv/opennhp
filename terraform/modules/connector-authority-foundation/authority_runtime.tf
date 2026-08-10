@@ -307,6 +307,20 @@ locals {
   # (repository/dynamodb/hub_request_replay_repo.go). A Put inside a transaction
   # is authorized by dynamodb:PutItem, not a Transact* action.
   authority_runtime_ddb_replay_write_actions = ["dynamodb:PutItem"]
+  # The assignment-ticket handle store's partition-key prefix. The issuer writes
+  # these rows and the verifiers resolve them; stated once so the write grant and
+  # the read grant cannot drift apart.
+  #
+  # It is deliberately NOT folded into the replay grant above. That grant means
+  # "may write its own replay tombstone" and should keep meaning exactly that;
+  # widening it would make a future reviewer read one prefix list and believe it
+  # covers both purposes.
+  authority_runtime_ticket_handle_leading_keys = ["ASSIGNMENT_TICKET#*"]
+  # Its own action list, deliberately not an alias of the replay one. The whole
+  # point of a separate Sid is that these are distinct purposes; sharing the
+  # action local would let the replay grant gaining an action silently widen
+  # the handle grant too, which is the coupling the split exists to prevent.
+  authority_runtime_ddb_ticket_handle_write_actions = ["dynamodb:PutItem"]
   # IssueCredentialRecovery additionally UPDATEs the device-credential head anchor
   # on the first grant (agent_credential_recovery_repo.go recoveryHeadTransactionItem),
   # so it needs UpdateItem beyond the replay/grant Puts. DeleteItem is unused by
@@ -381,6 +395,25 @@ locals {
         Condition = {
           "ForAllValues:StringLike" = {
             "dynamodb:LeadingKeys" = ["HUB_REQUEST#IssueAssignment#*"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      },
+      {
+        # The signed ticket no longer travels in the assignment reply; it is
+        # stored here under an unguessable handle and the reply carries the
+        # handle. Without this grant the issuer fails closed -- it refuses to
+        # publish a handle whose write it cannot prove -- so enrollment stops
+        # rather than degrading, which is how the gap was found in sandbox.
+        Sid      = "AuthorityTicketHandleWrite"
+        Effect   = "Allow"
+        Action   = local.authority_runtime_ddb_ticket_handle_write_actions
+        Resource = local.authority_runtime_table_resources.connector_authority
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = local.authority_runtime_ticket_handle_leading_keys
           }
           Null = {
             "dynamodb:LeadingKeys" = "false"
@@ -473,6 +506,24 @@ locals {
           Effect   = "Allow"
           Action   = local.authority_runtime_ddb_read_actions
           Resource = concat(local.authority_runtime_table_resources.api_keys, local.authority_runtime_table_resources.customers)
+        },
+        {
+          # This operation had no access to connector_authority at all, because
+          # before the handle it never needed any -- the client carried the
+          # signed ticket. GetItem only, and only the handle prefix: it resolves
+          # a ticket, it does not read placement, replay or recovery state.
+          Sid      = "AuthorityTicketHandleRead"
+          Effect   = "Allow"
+          Action   = ["dynamodb:GetItem"]
+          Resource = local.authority_runtime_table_resources.connector_authority
+          Condition = {
+            "ForAllValues:StringLike" = {
+              "dynamodb:LeadingKeys" = local.authority_runtime_ticket_handle_leading_keys
+            }
+            Null = {
+              "dynamodb:LeadingKeys" = "false"
+            }
+          }
         },
         local.authority_runtime_qat1_public_key_statement,
       ],

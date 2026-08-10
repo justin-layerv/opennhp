@@ -1721,6 +1721,12 @@ AUTHORITY_RUNTIME_OPERATION_IAM = {
         "write_sid": "AuthorityReplayWrite",
         "write_actions": AUTHORITY_RUNTIME_DYNAMODB_REPLAY_WRITE_ACTIONS,
         "signs": True,
+        # The signed assignment ticket is stored under a handle instead of
+        # being sent, so this operation alone creates ASSIGNMENT_TICKET# rows.
+        # A separate Sid, not a wider AuthorityReplayWrite: the replay grant
+        # must keep meaning exactly "its own replay tombstone".
+        "ticket_handle_write": True,
+        "ticket_handle_write_actions": ("dynamodb:PutItem",),
     },
     "refresh_assignment": {
         "read_tables": ("agent_keys", "connector_authority"),
@@ -1742,6 +1748,10 @@ AUTHORITY_RUNTIME_CELL_OPERATION_IAM = {
         "public_key": True,
         "otp_user": "issuer",
         "sends_email": True,
+        # Resolves the handle a client presents back to the signed ticket. It
+        # has no other business on connector_authority, so this is GetItem on
+        # the ASSIGNMENT_TICKET# prefix rather than a read-table entry.
+        "ticket_handle_read": True,
     },
     "activate_registration": {
         "read_tables": ("api_keys", "agent_keys", "connector_authority"),
@@ -6330,6 +6340,8 @@ def _check_authority_exec_role_policy(
     }
     if spec["signs"]:
         expected_sids.add("Qat1Sign")
+    if spec.get("ticket_handle_write"):
+        expected_sids.add("AuthorityTicketHandleWrite")
     if proof_policy_consumer:
         expected_sids.update({"ProofPolicyRead", "DenyProofPolicyWrite"})
     if set(by_sid) != expected_sids:
@@ -6393,6 +6405,35 @@ def _check_authority_exec_role_policy(
         AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
     ):
         raise ContractError(f"{fn} writes must be scoped to connector_authority only")
+    if spec.get("ticket_handle_write"):
+        # Asserted separately from the replay write above, with its own action
+        # set and prefix, so the two grants cannot converge by someone widening
+        # one of them. That separation is the reason there are two Sids at all.
+        handle_write = by_sid["AuthorityTicketHandleWrite"]
+        if _authority_string_set(
+            handle_write.get("Action"), fn, "ticket handle write Action"
+        ) != set(spec["ticket_handle_write_actions"]):
+            raise ContractError(
+                f"{fn} ticket-handle write actions drifted from the reviewed set"
+            )
+        if _authority_string_set(
+            handle_write.get("Resource"), fn, "ticket handle write Resource"
+        ) != set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]):
+            raise ContractError(
+                f"{fn} ticket-handle writes must be scoped to connector_authority only"
+            )
+        # The Null guard is load-bearing, not decoration: ForAllValues:* is
+        # vacuously true when a request carries no LeadingKeys at all, so
+        # without it an unkeyed request slips past the prefix scope entirely.
+        if handle_write.get("Condition") != {
+            "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": ["ASSIGNMENT_TICKET#*"],
+            },
+            "Null": {"dynamodb:LeadingKeys": "false"},
+        }:
+            raise ContractError(
+                f"{fn} ticket-handle write is not fenced to the ASSIGNMENT_TICKET# prefix"
+            )
     expected_write_keys = {
         "issue_assignment": ["HUB_REQUEST#IssueAssignment#*"],
         "refresh_assignment": ["HUB_REQUEST#RefreshAssignment#*"],
@@ -6767,12 +6808,17 @@ def _check_authority_cell_exec_role_policy(
         sid = stmt.get("Sid")
         if not isinstance(sid, str) or sid in by_sid:
             raise ContractError(f"{fn} execution statement Sid missing or duplicated")
+        # The handle read is LeadingKeys-scoped on purpose: it resolves a ticket
+        # and must not become a general read of connector_authority. Its
+        # Condition IS the scope, so it belongs on this list.
         if "Condition" in stmt and sid not in {
             "AuthorityDynamoDBDecrypt",
             "OTPSecretDecrypt",
+            "AuthorityTicketHandleRead",
         }:
             raise ContractError(
-                f"{fn} only DynamoDB/OTP decrypt statements may carry a Condition"
+                f"{fn} only DynamoDB/OTP decrypt and ticket-handle statements "
+                "may carry a Condition"
             )
         by_sid[sid] = stmt
 
@@ -6789,12 +6835,41 @@ def _check_authority_cell_exec_role_policy(
         expected_sids.update({"OTPSecretRead", "OTPSecretDecrypt", "OTPRedisConnect"})
     if spec["sends_email"]:
         expected_sids.add("OTPSendEmail")
+    if spec.get("ticket_handle_read"):
+        expected_sids.add("AuthorityTicketHandleRead")
     if set(by_sid) != expected_sids:
         raise ContractError(
             f"{fn} execution policy statement set drifted: "
             f"{sorted(by_sid)} != {sorted(expected_sids)}"
         )
 
+    if spec.get("ticket_handle_read"):
+        # Fenced symmetrically with the write grant. Asserting only the Sid and
+        # the allowed-Condition membership left the read's actual scope
+        # unchecked: its Action, Resource, prefix and Null guard could all be
+        # weakened and every gate would still pass. A GetItem always carries a
+        # key, so ForAllValues:* is not vacuous here -- but that is exactly the
+        # argument the write side declined to rely on, so neither does this.
+        handle_read = by_sid["AuthorityTicketHandleRead"]
+        if _authority_string_set(
+            handle_read.get("Action"), fn, "ticket handle read Action"
+        ) != {"dynamodb:GetItem"}:
+            raise ContractError(f"{fn} ticket-handle read must be GetItem only")
+        if _authority_string_set(
+            handle_read.get("Resource"), fn, "ticket handle read Resource"
+        ) != set(AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]):
+            raise ContractError(
+                f"{fn} ticket-handle read must be scoped to connector_authority only"
+            )
+        if handle_read.get("Condition") != {
+            "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": ["ASSIGNMENT_TICKET#*"],
+            },
+            "Null": {"dynamodb:LeadingKeys": "false"},
+        }:
+            raise ContractError(
+                f"{fn} ticket-handle read is not fenced to the ASSIGNMENT_TICKET# prefix"
+            )
     eni = by_sid["LambdaVpcEni"]
     if _authority_string_set(eni.get("Action"), fn, "ENI Action") != set(
         AUTHORITY_RUNTIME_ENI_ACTIONS
@@ -8967,7 +9042,60 @@ def _validate_provisioned_cell_general_assignable_update(claimed, by_address, pl
             )
 
 
+def _claim_authority_image_uri_move(
+    changed: set[str], actual_non_noop: dict[str, Any], by_address: dict[str, Any]
+) -> frozenset[str] | None:
+    """Claim a foundation contract whose ONLY input change is the image uri.
+
+    Publish tracking resolves the deployed digest from the publisher-owned
+    parameter at plan time, so this now moves on its own whenever qurl-service
+    publishes -- and therefore lands alongside whatever else a Control PR
+    happens to change. No composable lane existed because, while the digest was
+    pinned in the basis, it could only move as part of an enumerated image
+    migration; a floating digest makes that assumption false for every future
+    Control plan, not just the one that introduced it.
+
+    Deliberately narrow: if anything else in the contract moved, this is not the
+    lane and the enumerated migration paths still own it.
+    """
+    address = AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS
+    if address not in changed or (actual_non_noop.get(address) or ()) != ["update"]:
+        return None
+    change = (by_address.get(address) or {}).get("change") or {}
+    before = (change.get("before") or {}).get("input") or {}
+    after = (change.get("after") or {}).get("input") or {}
+    if not isinstance(before, dict) or not isinstance(after, dict) or not before or not after:
+        return None
+    if not _authority_image_tracks_publish(after.get("authority_runtime_contract")):
+        return None
+    # Claim on the structural signal only, and let the validator speak.
+    #
+    # Two earlier versions got this wrong in opposite directions. Restating the
+    # rule here missed the migration-plus-image-move shape. Asking the validator
+    # inside the claim then SWALLOWED its error, so a malformed foundation
+    # change fell through to the generic "unadmittable shape" reject and hid the
+    # actual reason -- three CI rounds of guessing, caused by the diagnostic
+    # being thrown away.
+    #
+    # A foundation contract updating while the contract tracks publishes IS this
+    # lane. If the change is malformed, the validator below must raise its own
+    # specific error rather than have the plan reported as unrecognised.
+    return frozenset({address})
+
+
+def _validate_authority_image_uri_move(
+    claimed: frozenset[str], by_address: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    """Reuse the full foundation validator; the claim only selects the lane."""
+    _check_authority_image_foundation_update(by_address)
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "authority-image-uri-move",
+        _claim_authority_image_uri_move,
+        _validate_authority_image_uri_move,
+    ),
     (
         "provisioned-cell-status-update",
         _claim_provisioned_cell_status_update,

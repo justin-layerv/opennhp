@@ -994,3 +994,82 @@ run "dark_runtime_plans_no_alarm_and_needs_no_destination" {
     error_message = "A dark runtime must plan no alarm at all, so the operator destination is only required once functions exist."
   }
 }
+
+# The handle store is only reachable if IAM says so, and nothing in this suite
+# checked that. The gap was real and shipped: the issuer's write grant is
+# LeadingKeys-scoped to HUB_REQUEST#IssueAssignment#*, so ASSIGNMENT_TICKET#*
+# was denied, and IssueRegistrationOTP had no access to that table at all. The
+# code failed closed and enrollment stopped -- found by invoking the deployed
+# function in sandbox, which is the only place effective IAM is observable.
+#
+# Keyed on operation rather than physical function name so every cell's copy is
+# covered, and length-checked so an empty selection cannot pass alltrue.
+run "authority_ticket_handle_grants_exist_and_are_scoped" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "AuthorityTicketHandleWrite" &&
+        # Exact, not contains: a superset is precisely the silent widening the
+        # separate Sid exists to prevent, and contains() waves it through.
+        statement.Action == ["dynamodb:PutItem"] &&
+        statement.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["ASSIGNMENT_TICKET#*"]
+      ]) if fn.operation == "issue_assignment"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "issue_assignment"]) == 1
+    error_message = "IssueAssignment cannot write the handle rows it must store; the issuer will fail closed."
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "AuthorityTicketHandleRead" &&
+        statement.Action == ["dynamodb:GetItem"] &&
+        statement.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["ASSIGNMENT_TICKET#*"] &&
+        # Pinned symmetrically with the write grant rather than relying on the
+        # fact that a GetItem always carries a key.
+        statement.Condition["Null"]["dynamodb:LeadingKeys"] == "false"
+      ]) if fn.operation == "issue_registration_otp"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "issue_registration_otp"]) > 0
+    error_message = "An IssueRegistrationOTP function cannot resolve an assignment ticket handle."
+  }
+
+  # ActivateRegistration already reads this table for its durable outcome, so it
+  # needs no new grant. Asserted so a future tightening of that read does not
+  # silently remove handle resolution from the activation path.
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "AuthorityReads" &&
+        contains(statement.Action, "dynamodb:GetItem") &&
+        anytrue([for arn in statement.Resource : strcontains(arn, "connector-authority")])
+      ]) if fn.operation == "activate_registration"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "activate_registration"]) > 0
+    error_message = "ActivateRegistration lost its connector-authority read and can no longer resolve a handle."
+  }
+
+  # The replay grant must keep meaning exactly "its own replay tombstone". If a
+  # future change widens it to cover handles instead of adding a grant, the two
+  # purposes become indistinguishable in review.
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "AuthorityReplayWrite" &&
+        statement.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["HUB_REQUEST#IssueAssignment#*"]
+      ]) if fn.operation == "issue_assignment"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "issue_assignment"]) == 1
+    error_message = "The replay write grant was widened instead of a separate handle grant being added."
+  }
+}
