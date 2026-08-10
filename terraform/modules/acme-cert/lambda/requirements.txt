@@ -41,7 +41,7 @@ pyOpenSSL==26.4.0
 # be listed for the --no-deps build (was previously only backfilled by build.sh's
 # non-fatal second pass).
 typing_extensions==4.16.0
-cffi>=2.1.0
+cffi>=2.1.1
 pycparser==2.23
 pyrfc3339==1.1
 pytz==2024.2
