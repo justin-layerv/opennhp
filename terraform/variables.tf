@@ -1065,6 +1065,12 @@ variable "agent_otp_registration_enabled" {
   default     = false
 }
 
+variable "agent_otp_ci_mailbox_enabled" {
+  description = "Creates the CI receive mailbox for the per-PR OTP gate (agent_otp_ci_mailbox.tf): a dedicated `ci-otp.<sender domain>` receiving subdomain with its own MX, an SES receipt rule storing raw mail to S3, an SQS arrival queue, and read access for the GitHub Actions role. NON-PROD ONLY — a precondition fails the plan when environment == \"prod\", because this routes OTP mail somewhere CI can read it. Also requires agent_otp_enabled = true (the subdomain derives from the OTP sender domain) and a region where SES email RECEIVING is available. Note this activates an SES receipt rule set, and an account has only one active set. Default false."
+  type        = bool
+  default     = false
+}
+
 variable "agent_otp_email_from" {
   description = "From address qurl-service stamps on OTP emails (QURL_AGENT_OTP_EMAIL_FROM), e.g. `noreply@notify.layerv.ai`. The root derives the SES sender domain from the part after `@` (agent_otp_ses.tf). Required (non-empty) when agent_otp_enabled = true; empty when the OTP path is dark. Do NOT set to an address whose domain is outside the Route53 zone this env manages (hosted_zone_id) — SES DKIM/MAIL-FROM records are written into that zone."
   type        = string
@@ -1256,6 +1262,12 @@ variable "qurl_github_repo" {
   description = "GitHub repository for QURL service (for ECR push permissions)"
   type        = string
   default     = "qurl-service"
+}
+
+variable "qurl_go_github_repo" {
+  description = "GitHub repository for the qURL Go SDK. Used only to build the OIDC trust subject for the per-PR OTP registration gate's mailbox-read role (agent_otp_ci_mailbox.tf) — repo:<github_org>/<this>:pull_request. Note this repo is PUBLIC; fork pull requests receive no OIDC token, so only in-repo branches can assume that role, and it grants nothing but reads of a CI-only OTP mailbox."
+  type        = string
+  default     = "qurl-go"
 }
 
 variable "qurl_reverse_tunnel_server_github_repo" {

@@ -698,6 +698,20 @@ agent_registration_relay_base_url = "https://relay.qurl.link.layerv.xyz"
 # agent_otp_ses.tf fails the plan if this is ever set in prod.
 agent_otp_ci_send_gate_enabled = true
 
+# Receive mailbox for the per-PR OTP gate: SES accepts mail for
+# otp-gate@ci-otp.notify.layerv.xyz (a dedicated subdomain with its own MX --
+# notify.layerv.xyz itself is untouched), stores it to S3, and notifies SQS so
+# CI can read the emailed code. Sandbox only; the fence in
+# agent_otp_ci_mailbox.tf fails the plan if this is ever set in prod.
+#
+# OWNERSHIP NOTE: enabling this makes THIS ROOT the owner of the sandbox
+# account's SES active receipt rule set, which is a per-region singleton. It
+# was empty when this landed. If any other inbound-mail configuration is ever
+# added to this account and region, the two applies will fight over that one
+# active set, each re-asserting its own on every run. Route new inbound mail
+# through additional rules in THIS set rather than a second set.
+agent_otp_ci_mailbox_enabled = true
+
 # ==============================================================================
 # QURL Link Redirect Page
 # Hosts the redirect page that extracts tokens and sends users to NHP Server
