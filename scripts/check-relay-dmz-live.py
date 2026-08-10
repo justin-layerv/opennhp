@@ -182,11 +182,19 @@ RELAY_HEALTH_PATH = "/health/live"
 # not a source fence. Matches EXPECTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDR in the
 # sibling plan checker and must move with it.
 #
-# This is deliberately NOT the proof runner's identity. The runner still owns
-# 3.141.109.76/32 and that EIP is still asserted, under the distinct name
-# PROOF_SOURCE_CIDR in .github/scripts/udp_proof_deployment_contract.py. Keep
-# the two names apart: one is who the proof runner is, the other is what the
-# edge admits.
+# This is deliberately NOT the proof runner's identity, and that distinction now
+# matters more than when it was written. Both halves of the old note are stale:
+# the runner was destroyed on 2026-08-10 and its EIP released, so 3.141.109.76
+# is back in the AWS public pool and may already belong to another account, and
+# udp_proof_deployment_contract.py -- which used to assert it -- was deleted
+# with the attended proof in #3799.
+#
+# The sibling plan checker still carries the address in
+# ACCEPTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDRS because its source-fence migration
+# and partial-retry paths model a plan that creates or destroys that exact rule.
+# That is a plan-shape identity, not a statement that the address is still ours.
+# Nothing may re-admit it to a live ingress rule without first allocating a new
+# EIP we own; see docs/runbooks/prod-rollout-ledger/2026-08-03-open-sandbox-udp-edges.md.
 SANDBOX_PUBLIC_UDP_INGRESS_CIDR = "0.0.0.0/0"
 # Main sandbox VPC, the source of the in-VPC AC keepalive rule
 # (module.compute's server_nhp_udp_vpc). ACs send NHP_KPL straight to their
