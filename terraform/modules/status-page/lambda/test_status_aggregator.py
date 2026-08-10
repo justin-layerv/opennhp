@@ -194,7 +194,216 @@ class TestAggregateTargetHealth:
         )
 
 
+def _dorny_to_regex(pattern):
+    """Compile a dorny/picomatch path glob the way dorny matches it.
+
+    `**` crosses `/`; a single `*` does not. fnmatch cannot express that
+    distinction — its `*` always crosses — which is why an earlier version of
+    this fence simply refused any pattern containing a lone `*`. That also
+    rejected ordinary shapes like `**/*.tf`, turning a routine filter addition
+    into a matcher rewrite, so translate properly instead.
+
+    `**/` matches zero or more directories, so `**/*.tf` matches `a.tf` as well
+    as `sub/a.tf`.
+    """
+    # picomatch treats `**` as a globstar only when it is a WHOLE path segment;
+    # `foo**bar` degrades to single-`*` semantics there. Rather than model that
+    # second meaning, refuse it — the contract this translator advertises is
+    # "reject what you cannot model", and silently compiling `foo**bar` to
+    # `foo.*bar` would cross `/` where picomatch would not.
+    for match in re.finditer(r"\*\*", pattern):
+        before, after = pattern[: match.start()], pattern[match.end() :]
+        if (before and not before.endswith("/")) or (after and not after.startswith("/")):
+            raise AssertionError(
+                f"`**` must be a whole path segment, got {pattern!r}; "
+                "teach _dorny_to_regex picomatch's mid-segment semantics first"
+            )
+
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("^" + "".join(out) + r"\Z")
+
+
+class TestGlobTranslation:
+    """The translator is load-bearing for the trigger-coverage fence below."""
+
+    def test_double_star_crosses_slash_and_single_star_does_not(self):
+        cases = [
+            ("terraform/modules/**/lambda/**", "terraform/modules/sp/lambda/x.py", True),
+            ("terraform/modules/**/lambda/**", "terraform/modules/monitoring/main.tf", False),
+            ("terraform/modules/monitoring/**", "terraform/modules/monitoring/main.tf", True),
+            ("terraform/main.tf", "terraform/main.tf", True),
+            ("terraform/main.tf", "terraform/modules/main.tf", False),
+            # The shapes the old invariant rejected outright.
+            ("**/*.tf", "a.tf", True),
+            ("**/*.tf", "deep/nested/a.tf", True),
+            ("**/*.tf", "a.py", False),
+            ("terraform/*.tf", "terraform/main.tf", True),
+            # A single `*` must NOT cross a separator; fnmatch got this wrong.
+            ("terraform/*.tf", "terraform/modules/main.tf", False),
+            ("terraform/*/main.tf", "terraform/modules/main.tf", True),
+            ("terraform/*/main.tf", "terraform/a/b/main.tf", False),
+        ]
+        for pattern, path, expected in cases:
+            assert bool(_dorny_to_regex(pattern).match(path)) is expected, (pattern, path)
+
+    def test_mid_segment_double_star_is_refused_not_guessed(self):
+        # picomatch would degrade these to single-`*`; compiling them as a
+        # globstar would cross `/` where it must not.
+        for pattern in ("foo**bar", "a/foo**", "a/**bar/c"):
+            with pytest.raises(AssertionError, match="whole path segment"):
+                _dorny_to_regex(pattern)
+        # Legitimate whole-segment forms keep working.
+        for pattern in ("**", "**/x", "a/**", "a/**/b", "a/**/b/**"):
+            _dorny_to_regex(pattern)
+
+    def test_metacharacters_in_the_literal_are_escaped(self):
+        assert _dorny_to_regex("a.b/c.tf").match("a.b/c.tf")
+        assert not _dorny_to_regex("a.b/c.tf").match("axb/c.tf")
+
+
 class TestAlarmSummary:
+    # Every repo path this suite reads from OUTSIDE its own
+    # terraform/modules/*/lambda/ tree. build-and-push.yml's `lambdas` paths
+    # filter decides whether "Test Lambdas" runs at all, so an input the filter
+    # does not watch means the guard reading it stays silent on the PR that
+    # breaks it and first fires on an unrelated Lambda PR days later — which is
+    # how #3732's uncategorized alarm surfaced on dependabot PR #3780. Add to
+    # this tuple whenever the suite grows a read outside lambda/.
+    SUITE_INPUTS_OUTSIDE_LAMBDA_DIR = (
+        ".github/scripts/check-status-page-public-surface.py",
+        ".gitignore",
+        "docs/runbooks/prod-rollout-ledger/2026-06-10-pr-2457-public-status-page.md",
+        "terraform/main.tf",
+        "terraform/modules/monitoring/main.tf",
+        "terraform/modules/status-page/README.md",
+        "terraform/modules/status-page/frontend/index.html",
+        "terraform/modules/status-page/main.tf",
+        "terraform/modules/status-page/variables.tf",
+    )
+    # Watching these would also need an `on.push.paths` entry in
+    # build-and-push.yml — check-paths-filter-coverage.py requires every inner
+    # filter pattern to have an ancestor there — and the only entry that covers
+    # them is a `docs/**` or `.gitignore` glob that would start a build and
+    # deploy on every prose edit. Both are assertion fixtures, not behavior the
+    # published status page depends on, so the trade is not worth it.
+    #
+    # That cost is per-path, not a blanket exemption: #3794 accepted it for
+    # `check-status-page-public-surface.py` because a single named file is a
+    # cheap `on.push.paths` entry, and it is watched now. Hence equality rather
+    # than subset below — this list has to shrink when that happens, and it
+    # failed loudly here until it did.
+    SUITE_INPUTS_KNOWINGLY_UNWATCHED = frozenset({
+        ".gitignore",
+        "docs/runbooks/prod-rollout-ledger/2026-06-10-pr-2457-public-status-page.md",
+    })
+
+    def test_lambdas_paths_filter_watches_this_suites_inputs(self):
+        repo_root = Path(__file__).resolve().parents[4]
+        workflow = (repo_root / ".github/workflows/build-and-push.yml").read_text()
+        # Positional, not structural: this hardcodes the filter block's exact
+        # indentation (12 spaces before `lambdas:`, 14 before each entry), so a
+        # reindent, a reflow, or a YAML anchor in that group breaks the match —
+        # `assert group` below turns that into a loud, explained failure rather
+        # than a silent skip. Parsing the YAML properly would need PyYAML,
+        # which the Test Lambdas env does not install. Two consequences worth
+        # knowing if this ever fires: re.M + first-match binds to the first
+        # 12-space `lambdas:` key in the file, and a differently-indented
+        # rewrite needs this pattern updated, not the filter reverted.
+        group = re.search(
+            r"^            lambdas:\n((?:              (?:#.*|- '[^']+')\n)+)",
+            workflow,
+            re.M,
+        )
+        assert group, "could not locate the `lambdas` filter group in build-and-push.yml"
+        patterns = re.findall(r"- '([^']+)'", group.group(1))
+        assert patterns
+
+        # Syntax this translator does not model. Brace expansion, negation and
+        # character classes all change which paths match, so guessing would
+        # produce a false green — the thing this fence exists to prevent.
+        unsupported = sorted(p for p in patterns if set(p) & set("{}!()[]+@"))
+        assert not unsupported, (
+            "unsupported glob syntax in the `lambdas` filter; teach "
+            f"_dorny_to_regex first: {unsupported}"
+        )
+
+        watched = {
+            path
+            for path in self.SUITE_INPUTS_OUTSIDE_LAMBDA_DIR
+            for pattern in patterns
+            if _dorny_to_regex(pattern).match(path)
+        }
+        unwatched = set(self.SUITE_INPUTS_OUTSIDE_LAMBDA_DIR) - watched
+
+        # Equality, not subset: a path that becomes watched must leave the
+        # allowlist, so the recorded exceptions can't quietly go stale.
+        assert unwatched == set(self.SUITE_INPUTS_KNOWINGLY_UNWATCHED), (
+            "build-and-push.yml's `lambdas` filter no longer matches this "
+            f"suite's declared inputs: newly unwatched="
+            f"{sorted(unwatched - self.SUITE_INPUTS_KNOWINGLY_UNWATCHED)}, "
+            f"stale allowlist entries="
+            f"{sorted(self.SUITE_INPUTS_KNOWINGLY_UNWATCHED - unwatched)}"
+        )
+
+    def test_declared_suite_inputs_are_read_by_this_suite(self):
+        source = Path(__file__).read_text()
+        # The declarations live in this file, so searching the whole source
+        # would match the tuple entry itself and pass vacuously. Cut the
+        # declaration block out first and look for a real read.
+        # Each constant is excised on its own rather than as one span between
+        # them: a single span assumes they stay adjacent, and anything inserted
+        # between would shrink what gets cut and quietly restore the vacuous
+        # match for whatever stayed inside.
+        body = source
+        for declaration in (
+            r"    SUITE_INPUTS_OUTSIDE_LAMBDA_DIR = \(.*?\n    \)\n",
+            r"    SUITE_INPUTS_KNOWINGLY_UNWATCHED = frozenset\(\{.*?\n    \}\)\n",
+        ):
+            body, count = re.subn(declaration, "", body, flags=re.S)
+            assert count == 1, f"declaration not excised ({declaration!r}); guard is vacuous"
+
+        for path in self.SUITE_INPUTS_OUTSIDE_LAMBDA_DIR:
+            # Anchor on the whole read expression, for both shapes. Module-local
+            # files are read through parents[1] so they appear as a tail rather
+            # than the full repo-relative path — and a bare `"main.tf"` or
+            # `"README.md"` also occurs in assertion text, so that substring
+            # alone would prove nothing.
+            #
+            # Note what this therefore tracks: the read's SYNTAX, on one line
+            # with this spacing — not the existence of the read. Hoisting a
+            # path into a local, or reflowing the expression, fails here even
+            # though the file is still read. That is the safe direction and it
+            # is intended: the declaration list is a claim about what this
+            # suite reads, and a refactor should re-confirm it rather than
+            # quietly inherit it. Update the needle, don't delete the entry.
+            tail = path.partition("terraform/modules/status-page/")[2]
+            needle = f'parents[1] / "{tail}"' if tail else f'/ "{path}"'
+            assert needle in body, (
+                f"{path} is declared as a suite input but nothing reads it "
+                f"(looked for {needle!r}); drop it from "
+                "SUITE_INPUTS_OUTSIDE_LAMBDA_DIR"
+            )
+        assert self.SUITE_INPUTS_KNOWINGLY_UNWATCHED <= set(
+            self.SUITE_INPUTS_OUTSIDE_LAMBDA_DIR
+        )
+
     def test_monitoring_cell_alarms_are_classified_or_explicitly_ignored(self):
         import status_aggregator as sa
 
@@ -245,6 +454,28 @@ class TestAlarmSummary:
 
         assert cell_alarm_suffixes
         assert not unclassified, f"categorize new monitoring alarm suffixes: {sorted(unclassified)}"
+
+        # Matching is substring-based, so these four differ only in prefix
+        # text — but the monitoring module is instantiated per env and per
+        # cell, so assert the real deployed shapes rather than a stand-in.
+        # Deliberately NOT an enumeration of deployed env x cell. That would be
+        # a list that goes stale in silence — add cell2 and this stays green
+        # while covering less, the opposite of the point. Matching is
+        # substring-based on the whole alarm name, so the property is
+        # prefix-independence: one real deployed shape, one arbitrary future
+        # cell, and a degenerate prefix together assert that no ignored suffix
+        # yields a component regardless of what precedes it.
+        for cell_prefix in (
+            "layerv-nhp-prod-cell0",
+            "layerv-nhp-sandbox-cell99",
+            "x",
+        ):
+            for suffix in sorted(ignored_non_status_suffixes):
+                name = f"{cell_prefix}{suffix}"
+                assert sa._component_for_alarm_name(
+                    name, cell_prefix, (cell_prefix,), ()
+                ) is None, name
+                assert sa._component_for_alarm_name(name) is None, name
 
     @patch("status_aggregator.cloudwatch")
     def test_prefix_ownership_maps_status_relevant_active_alarms(self, mock_cloudwatch):
