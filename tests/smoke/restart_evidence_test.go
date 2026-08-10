@@ -66,6 +66,20 @@ func TestRestartEvidenceCorpus(t *testing.T) {
 			if detail == "" {
 				t.Fatal("detail is empty — the operator-facing message is the other half of the fix")
 			}
+
+			// Optional per-case message assertions, shared with Part D of the
+			// shell runner. Without them the corpus pins verdicts only, so a
+			// message-only behaviour had to be asserted once per language.
+			for _, needle := range corpusNeedles(t, name, "detail-contains") {
+				if !strings.Contains(detail, needle) {
+					t.Errorf("detail is missing %q\ndetail: %s", needle, detail)
+				}
+			}
+			for _, needle := range corpusNeedles(t, name, "detail-excludes") {
+				if strings.Contains(detail, needle) {
+					t.Errorf("detail must not contain %q\ndetail: %s", needle, detail)
+				}
+			}
 		})
 	}
 
@@ -76,56 +90,61 @@ func TestRestartEvidenceCorpus(t *testing.T) {
 	}
 }
 
-// TestRestartEvidenceMessagesStateObservations pins the message contract: the
-// #1096 panic class is named only when a panic was actually observed. The
-// original bug was not just the wrong verdict, it was a failure message that
-// sent whoever read it hunting a panic that did not exist.
+// corpusNeedles reads an optional per-case assertion file (one substring per
+// line). Absent file means no assertion.
+func corpusNeedles(t *testing.T, caseName, file string) []string {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(corpusDir, caseName, file))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read %s/%s: %v", caseName, file, err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// TestRestartEvidenceMessagesStateObservations covers message behaviour the
+// shared corpus cannot: cases built from a restartEvidence struct rather than
+// a parsed report. The corpus owns the rest via detail-contains/-excludes.
 func TestRestartEvidenceMessagesStateObservations(t *testing.T) {
 	t.Parallel()
 
-	selfHealed := restartEvidence{
-		NRestarts: 1, ActiveState: "active", SubState: "running",
-		Exits: []string{"exited:0", "exited:125"},
-		DaemonErr: "Error response from daemon: failed to create task for container: " +
-			"failed to initialize logging driver: failed to create Cloudwatch log stream",
-	}
-	verdict, detail := classifyRestartEvidence(selfHealed)
-	if verdict != verdictInfraSelfHealed {
-		t.Fatalf("verdict = %q, want %q", verdict, verdictInfraSelfHealed)
-	}
-	if strings.Contains(detail, "#1096") {
-		t.Errorf("self-heal message must not assert the #1096 panic class: %s", detail)
-	}
-	for _, want := range []string{
-		"Go panic in journal: absent",
-		"docker failed to start the container (exit 125)",
-		"failed to create Cloudwatch log stream",
-	} {
-		if !strings.Contains(detail, want) {
-			t.Errorf("self-heal message is missing %q: %s", want, detail)
-		}
-	}
-
-	// A crash proven only by its exit status must report that status and
-	// must NOT borrow the panic wording.
-	_, detail = classifyRestartEvidence(restartEvidence{
-		NRestarts: 1, ActiveState: "active", SubState: "running",
-		Exits: []string{"exited:2"},
-	})
-	if strings.Contains(detail, "#1096") {
-		t.Errorf("a panic-less crash must not assert the #1096 panic class: %s", detail)
-	}
-	if !strings.Contains(detail, "exit exited:2") {
-		t.Errorf("a panic-less crash must report its exit status: %s", detail)
-	}
-
-	// ...while an observed panic still names it.
-	_, detail = classifyRestartEvidence(restartEvidence{
+	// Panic text is corroboration, not the verdict. With a non-125 exit the
+	// verdict is already app_crash; the panic only sharpens the wording.
+	verdict, withPanic := classifyRestartEvidence(restartEvidence{
 		NRestarts: 1, ActiveState: "active", SubState: "running",
 		Exits: []string{"exited:2"}, Panics: 3,
 	})
-	if !strings.Contains(detail, "#1096") {
-		t.Errorf("an observed panic must still name #1096: %s", detail)
+	if verdict != verdictAppCrash {
+		t.Fatalf("verdict = %q, want %q", verdict, verdictAppCrash)
+	}
+	if !strings.Contains(withPanic, "#1096") {
+		t.Errorf("an observed panic must name #1096: %s", withPanic)
+	}
+
+	verdict, withoutPanic := classifyRestartEvidence(restartEvidence{
+		NRestarts: 1, ActiveState: "active", SubState: "running",
+		Exits: []string{"exited:2"},
+	})
+	if verdict != verdictAppCrash {
+		t.Fatalf("verdict = %q, want %q — the exit status alone must carry it", verdict, verdictAppCrash)
+	}
+	if strings.Contains(withoutPanic, "#1096") {
+		t.Errorf("a panic-less crash must not assert the #1096 class: %s", withoutPanic)
+	}
+	if withPanic == withoutPanic {
+		t.Error("panic evidence should still change the wording")
+	}
+	if strings.Contains(withPanic, "line(s)") {
+		t.Errorf("panic presence must not be rendered as a line count: %s", withPanic)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 // outage.
 const nRestartsProbeBudget = 2 * time.Minute
 
-// TestServerDeployStability_NRestartsZero fences the crash-loop class of
+// TestServerDeployStability_NoApplicationCrash fences the crash-loop class of
 // bug fixed in PR #1096 (panic: send on closed channel in
 // RemoteTransaction.Run cleanup under HandleACOnline load).
 //
@@ -55,7 +55,7 @@ const nRestartsProbeBudget = 2 * time.Minute
 //     downtime during every deploy).
 //
 // Regression fence for PR #1096 (panic: send on closed channel).
-func TestServerDeployStability_NRestartsZero(t *testing.T) {
+func TestServerDeployStability_NoApplicationCrash(t *testing.T) {
 	// Prod burns SSM probes in for 30 days before enabling them
 	// (CLAUDE.md smoke-test rule 11). Until that clears, skip rather
 	// than fail-closed noisily — the sandbox run still fences the bug.
@@ -144,7 +144,7 @@ func TestServerDeployStability_NRestartsZero(t *testing.T) {
 }
 
 // TestParallelSubtestsDontInheritCanceledCtx is a regression fence for
-// the specific bug class that broke TestServerDeployStability_NRestartsZero
+// the specific bug class that broke TestServerDeployStability_NoApplicationCrash
 // (smoke run 24612063961 against main-post-#1112).
 //
 // The broken pattern: parent test builds a ctx with context.WithTimeout

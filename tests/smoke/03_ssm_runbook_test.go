@@ -168,13 +168,20 @@ func TestSSMRunbook_ShellCmdHasNoDoubleQuotes(t *testing.T) {
 // script is not found within 6 levels up, which means either the
 // working directory is unusual or the script has been renamed.
 func findVerifyASGScript() (string, error) {
+	return findRepoScript("verify-asg-instances-healthy.sh")
+}
+
+// findRepoScript resolves a .github/scripts/<name> path by walking up from the
+// working directory. Shared so probes/tests that need to read a repo script
+// use one idiom rather than each inventing its own relative path.
+func findRepoScript(name string) (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
 	dir := wd
 	for i := 0; i < 6; i++ {
-		candidate := filepath.Join(dir, ".github", "scripts", "verify-asg-instances-healthy.sh")
+		candidate := filepath.Join(dir, ".github", "scripts", name)
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate, nil
 		}
@@ -184,5 +191,5 @@ func findVerifyASGScript() (string, error) {
 		}
 		dir = parent
 	}
-	return "", errors.New("verify-asg-instances-healthy.sh not found within 6 parent directories")
+	return "", errors.New(name + " not found within 6 parent directories")
 }

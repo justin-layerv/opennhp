@@ -1,0 +1,6 @@
+NRESTARTS=1
+ACTIVESTATE=active
+SUBSTATE=running
+EXITS=exited:125 ,
+PANICS=0
+OOM=0

@@ -1,0 +1,3 @@
+docker failed to start the container (exit 125)
+Go panic in journal: absent
+failed to create Cloudwatch log stream

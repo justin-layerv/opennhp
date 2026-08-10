@@ -107,7 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           go test -tags=smoke -count=1 -v \
-            -run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError' \
+            -run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError|TestParallelSubtestsDontInheritCanceledCtx' \
             ./... | tee test-output.txt
           if grep -q 'no tests to run' test-output.txt; then
             echo "::error::The -run pattern matched no tests — this step passed without asserting anything."

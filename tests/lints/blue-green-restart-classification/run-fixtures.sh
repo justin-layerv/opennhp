@@ -723,6 +723,24 @@ fi
 # one over the same cases. A decision changed on one side and not the other
 # turns exactly one of the two red.
 # ============================================================================
+# read_needles FILE → one non-empty assertion substring per line, nothing if the
+# file is absent (assertions are optional per case).
+#
+# The `|| [ -n "$line" ]` and the trim are load-bearing: without them a file
+# saved WITHOUT a trailing newline loses its last line, and a padded needle is
+# grepped verbatim here while the Go driver trims — either way the two drivers
+# assert different sets, which is the cross-driver drift this corpus exists to
+# eliminate. Self-tested below.
+read_needles() {
+  local file="$1" line
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] && printf '%s\n' "$line"
+  done < "$file"
+}
+
 echo "  Part D — shared corpus (drift fence vs the Go classifier)"
 
 CORPUS="${REPO_ROOT}/tests/fixtures/nhp-server-restart-evidence"
@@ -744,11 +762,27 @@ for case_dir in "$CORPUS"/*/; do
   got_out=$("$CLASSIFIER" < "$case_dir/report" 2>&1)
   set -e
   got=$(sed -n 's/^verdict=//p' <<<"$got_out")
+  got_detail=$(sed -n 's/^detail=//p' <<<"$got_out")
 
-  if [ "$got" = "$want" ]; then
+  if [ "$got" != "$want" ]; then
+    fail "corpus: $case_name" "verdict '$got', corpus says '$want'" "$got_out"
+    continue
+  fi
+
+  problem=""
+  while IFS= read -r needle; do
+    grep -qF "$needle" <<<"$got_detail" || problem="detail is missing '$needle'"
+  done < <(read_needles "$case_dir/detail-contains")
+  if [ -z "$problem" ]; then
+    while IFS= read -r needle; do
+      grep -qF "$needle" <<<"$got_detail" && problem="detail must not contain '$needle'"
+    done < <(read_needles "$case_dir/detail-excludes")
+  fi
+
+  if [ -z "$problem" ]; then
     pass "corpus: $case_name → $got"
   else
-    fail "corpus: $case_name" "verdict '$got', corpus says '$want'" "$got_out"
+    fail "corpus: $case_name" "$problem" "$got_detail"
   fi
 done
 
@@ -859,6 +893,105 @@ if [ "$journal_cases" -ge 5 ]; then
 else
   fail "the shared journal corpus still has its cases" \
     "only $journal_cases case(s) in $JOURNAL_CORPUS — the shared collector corpus lost cases" ""
+fi
+
+# ============================================================================
+# Part F — cross-file lockstep: the offline smoke -run allow-list, the
+# self-heal budget default shared by the two classifiers, and the corpus needle
+# reader itself.
+# ============================================================================
+echo "  Part F — cross-file lockstep"
+
+ran=$((ran + 1))
+printf '  padded-needle  \n' > "$TMP/padded.txt"
+if [ "$(read_needles "$TMP/padded.txt")" = "padded-needle" ]; then
+  pass "corpus needle reader trims padding, as the Go driver does"
+else
+  fail "corpus needle reader trims padding, as the Go driver does" \
+    "the two drivers would grep different substrings" ""
+fi
+
+ran=$((ran + 1))
+printf 'first\nlast-without-trailing-newline' > "$TMP/needles.txt"
+if [ "$(read_needles "$TMP/needles.txt" | wc -l | tr -d ' ')" = "2" ]; then
+  pass "corpus needle reader keeps a last line with no trailing newline"
+else
+  fail "corpus needle reader keeps a last line with no trailing newline" \
+    "read_needles dropped it — shell and Go drivers would assert different sets" ""
+fi
+
+# The self-heal budget lives in two languages; the corpus pins it only at the
+# DEFAULT, so compare the defaults directly.
+ran=$((ran + 1))
+# shellcheck disable=SC2016  # the ${...} is literal text being matched in the
+# classifier's source, not an expansion for this shell to perform.
+shell_budget=$(sed -n 's/^MAX_SELF_HEALED_RESTARTS="${MAX_SELF_HEALED_RESTARTS:-\([0-9]*\)}"$/\1/p' "$CLASSIFIER")
+go_budget=$(sed -n 's/^const maxSelfHealedRestarts = \([0-9]*\)$/\1/p' "${REPO_ROOT}/tests/smoke/restart_evidence.go")
+if [ -z "$shell_budget" ] || [ -z "$go_budget" ]; then
+  fail "self-heal budget default matches between shell and Go" \
+    "could not extract both defaults (shell='$shell_budget' go='$go_budget') — extraction markers drifted, so this fence is asserting nothing" ""
+elif [ "$shell_budget" = "$go_budget" ]; then
+  pass "self-heal budget default matches between shell and Go ($shell_budget)"
+else
+  fail "self-heal budget default matches between shell and Go" \
+    "shell default $shell_budget, Go const $go_budget" ""
+fi
+
+# ...and nothing may set the env override, which would move the shell budget
+# while the Go const stayed put. Scoped to all of .github/ (the classifier's
+# invoker lives in .github/scripts/), excluding the classifier's own default.
+ran=$((ran + 1))
+override_hits=$(grep -rn 'MAX_SELF_HEALED_RESTARTS' "${REPO_ROOT}/.github" 2>/dev/null \
+  | grep -v 'classify-nhp-server-restart-evidence.sh' || true)
+if [ -n "$override_hits" ]; then
+  fail "nothing under .github mentions MAX_SELF_HEALED_RESTARTS" \
+    "something references the env override; if this is only a documentation mention, narrow this grep to an assignment form" \
+    "$override_hits"
+else
+  pass "nothing under .github mentions MAX_SELF_HEALED_RESTARTS"
+fi
+
+# The offline -run allow-list is duplicated in the workflow and the Makefile and
+# fenced by nothing else; and comparing the two copies cannot catch a test BOTH
+# omit, so the allow-list must also be shown to select every offline test.
+extract_run_pattern() {
+  sed -n "s/.*-run '\([^']*\)'.*/\1/p" "$1" | grep 'TestRestartEvidence' | head -1
+}
+wf_pattern=$(extract_run_pattern "${REPO_ROOT}/.github/workflows/nhp-smoke-pr.yml")
+
+ran=$((ran + 1))
+ssm_gated='skipIfNoSSMProbes|requireRemote|requireActive|describeInServiceInstances|getSSMParameter|requireServingASG|requireCWLogs'
+offline_files="tests/smoke/restart_evidence_test.go tests/smoke/06_server_deploy_stability_test.go"
+offline_missing=""
+for offline_file in $offline_files; do
+  [ -f "${REPO_ROOT}/${offline_file}" ] || offline_missing="$offline_missing $offline_file"
+done
+missed=""
+offline_count=0
+seen_any=0
+while IFS="$(printf '\t')" read -r test_name test_body; do
+  seen_any=1
+  printf '%s' "$test_body" | grep -qE "$ssm_gated" && continue
+  offline_count=$((offline_count + 1))
+  printf '%s' "$test_name" | grep -qE "$wf_pattern" || missed="$missed $test_name"
+done < <(awk '
+  /^func Test[A-Za-z0-9_]+\(/ { name=$2; sub(/\(.*/,"",name); body=""; inbody=1; next }
+  inbody && /^}/ { printf "%s\t%s\n", name, body; inbody=0; next }
+  inbody { body = body " " $0 }
+' "${REPO_ROOT}/tests/smoke/restart_evidence_test.go" \
+  "${REPO_ROOT}/tests/smoke/06_server_deploy_stability_test.go")
+
+if [ -n "$offline_missing" ]; then
+  fail "the offline allow-list selects every offline test" \
+    "scanned file(s) missing:$offline_missing — moved or renamed, so this fence silently stopped covering them" ""
+elif [ "$seen_any" -eq 0 ] || [ "$offline_count" -eq 0 ]; then
+  fail "the offline allow-list selects every offline test" \
+    "found no offline Test functions — the awk extraction drifted, so this fence is asserting nothing" ""
+elif [ -n "$missed" ]; then
+  fail "the offline allow-list selects every offline test" \
+    "the -run pattern does not select:$missed — they compile at PR time but never execute" "pattern: $wf_pattern"
+else
+  pass "the offline allow-list selects every offline test ($offline_count)"
 fi
 
 echo ""

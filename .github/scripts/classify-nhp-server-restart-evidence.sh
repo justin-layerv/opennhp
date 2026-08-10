@@ -68,13 +68,16 @@
 #   infra_selfhealed  Every restart is an exit-125 container-start failure,
 #                     the unit is running now, and the count is within
 #                     MAX_SELF_HEALED_RESTARTS.                        (pass)
-#   app_crash         A Go panic, an OOM kill, or a non-125 abnormal exit of
-#                     the server process itself.                       (fail)
+#   app_crash         A non-125 abnormal exit of the server process itself, or
+#                     an OOM kill.                                     (fail)
 #   infra_unstable    All-125 container-start failures, but the unit has not
 #                     converged or has flapped past the budget. Not an
 #                     application defect, but not self-healed either.  (fail)
 #   indeterminate     The report is malformed, or restarts outnumber the
 #                     failures that would explain them. Fail closed.   (fail)
+#
+# Note what does NOT appear above: a panic-marker branch. Panic text is
+# corroboration, never the verdict — see the block above the OOM check.
 #
 # MAX_SELF_HEALED_RESTARTS (env, default 2) bounds how much container-start
 # flapping still counts as "self-healed". A transient CloudWatch Logs or
@@ -88,9 +91,22 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+# KEEP THIS ASSIGNMENT ON ONE LINE in this exact form: Part E of
+# tests/lints/blue-green-restart-classification/run-fixtures.sh extracts the
+# default with an anchored sed to compare it against Go's maxSelfHealedRestarts.
+# Reformatting does not silently disable the fence (it fails loudly with
+# "asserting nothing") but will turn CI red unexpectedly.
 MAX_SELF_HEALED_RESTARTS="${MAX_SELF_HEALED_RESTARTS:-2}"
-if ! [[ "$MAX_SELF_HEALED_RESTARTS" =~ ^[0-9]+$ ]]; then
-  echo "usage: MAX_SELF_HEALED_RESTARTS must be a non-negative integer; got '$MAX_SELF_HEALED_RESTARTS'" >&2
+# Bounded to 9 digits like the journal-derived counters below, for the same
+# reason: an all-digit value that overflows bash's signed 64-bit arithmetic
+# wraps rather than erroring, and a wrapped budget makes `nrestarts > MAX`
+# answer arbitrarily. The override is operator-controlled and Part E of
+# tests/lints/blue-green-restart-classification/run-fixtures.sh fences that no
+# workflow sets it at all, so this is defence in depth rather than a reachable
+# path — but it costs nothing and keeps one validation rule in this script
+# instead of two.
+if ! [[ "$MAX_SELF_HEALED_RESTARTS" =~ ^[0-9]{1,9}$ ]]; then
+  echo "usage: MAX_SELF_HEALED_RESTARTS must be a non-negative integer of at most 9 digits; got '$MAX_SELF_HEALED_RESTARTS'" >&2
   exit 2
 fi
 
@@ -139,15 +155,26 @@ emit() {
   esac
 }
 
+# ORDER IS LOAD-BEARING: this presence loop must stay AHEAD of the numeric loop
+# below. A present-but-empty counter (`PANICS=`) has to report "missing PANICS",
+# which is what the Go side reports for the same input — reversing the two would
+# report "non-numeric" here and diverge the drivers on an identical report.
+# Fenced, not just documented: swapping the loops turns several corpus cases red.
 for required in "$nrestarts:NRESTARTS" "$activestate:ACTIVESTATE" "$substate:SUBSTATE" "$panics:PANICS" "$oom:OOM"; do
   if [[ -z "${required%%:*}" ]]; then
     emit indeterminate "evidence report is missing ${required#*:} — cannot classify the restart"
   fi
 done
 
+# Bounded to 9 digits, not just ^[0-9]+$. An all-digit value that overflows
+# bash's signed 64-bit arithmetic wraps rather than erroring, and a wrapped
+# NRestarts sailed through the accounting and budget comparisons to
+# infra_selfhealed — the gate PASSING on a corrupted counter. Go's parseCounter
+# applies the same bound, so both now reject it identically. A real NRestarts
+# never approaches 9 digits.
 for numeric in "NRestarts:$nrestarts" "panic-line count:$panics" "OOM-line count:$oom"; do
-  if ! [[ "${numeric#*:}" =~ ^[0-9]+$ ]]; then
-    emit indeterminate "evidence report carries a non-numeric ${numeric%%:*} ('${numeric#*:}') — cannot classify the restart"
+  if ! [[ "${numeric#*:}" =~ ^[0-9]{1,9}$ ]]; then
+    emit indeterminate "evidence report carries a non-numeric or implausibly large ${numeric%%:*} (\"${numeric#*:}\") — cannot classify the restart"
   fi
 done
 
@@ -166,6 +193,12 @@ exit_entries=()
 IFS=',' read -r -a exit_entries <<<"$exits" || true
 for entry in ${exit_entries[@]+"${exit_entries[@]}"}; do
   [[ -z "$entry" ]] && continue
+  # An entry without a colon is malformed and is dropped rather than guessed
+  # at — the same thing the Go classifier in tests/smoke/restart_evidence.go
+  # does, so the two cannot diverge on it. Dropping is safe because a dropped
+  # entry explains no restart, so the accounting check below still fails it
+  # closed as indeterminate.
+  [[ "$entry" != *:* ]] && continue
   [[ "${entry##*:}" == "0" ]] && continue
   nonzero_exits+=("$entry")
 done
@@ -179,7 +212,7 @@ fi
 if [[ "$panics" == "0" ]]; then
   observed+="; Go panic in journal: absent"
 else
-  observed+="; Go panic in journal: PRESENT ($panics line(s))"
+  observed+="; Go panic in journal: PRESENT"
 fi
 if [[ "$oom" == "0" ]]; then
   observed+="; OOM kill: absent"
@@ -188,22 +221,34 @@ else
 fi
 observed+="; unit now: $activestate/$substate"
 
-if [[ "$panics" != "0" ]]; then
-  emit app_crash "$observed — the server process panicked during this deploy. This is the regression class fixed by PR #1096 (panic: send on closed channel). Investigate journalctl -u nhp-server on this instance before re-deploying."
-fi
-
+# Panic evidence is CORROBORATION, not its own decision branch. The verdict is
+# carried by the exit status — a panicking process exits 2, so the non-125
+# branch below catches a real panic whether or not its stack trace reached the
+# journal. Pre-empting that with `panics != 0` made the panic grep decisive,
+# which is how an application log line beginning at column 0 with `panic: `
+# could turn an unrelated container-start self-heal into a claimed #1096
+# regression. Kept as message material and as the two fail-closed cases below,
+# which is exactly as far as this signal can carry.
+#
+# OOM stays decisive, unlike panic text, because it is systemd's own
+# unit-scoped statement that it killed the process — not a string that
+# application output can forge.
 if [[ "$oom" != "0" ]]; then
   emit app_crash "$observed — the server process was killed by the OOM killer during this deploy. Check the instance's memory headroom and the server's allocation profile before re-deploying."
 fi
 
 # Any abnormal exit that is not docker's own 125 means the container's
 # entrypoint ran and the server process itself died.
+investigate="Investigate journalctl -u nhp-server on this instance before re-deploying."
+
 container_start_failures=0
 for entry in ${nonzero_exits[@]+"${nonzero_exits[@]}"}; do
   if [[ "$entry" == "exited:125" ]]; then
     container_start_failures=$((container_start_failures + 1))
+  elif [[ "$panics" != "0" ]]; then
+    emit app_crash "$observed — exit $entry with a Go panic in the journal: the server process panicked during this deploy. This is the regression class fixed by PR #1096 (panic: send on closed channel). $investigate"
   else
-    emit app_crash "$observed — exit $entry is the server process terminating abnormally, not a container-start failure (docker reports its own failures as exit 125). Investigate journalctl -u nhp-server on this instance before re-deploying."
+    emit app_crash "$observed — exit $entry is the server process terminating abnormally, not a container-start failure (docker reports its own failures as exit 125). $investigate"
   fi
 done
 
@@ -211,8 +256,20 @@ if [[ -n "$daemonerr" ]]; then
   observed+="; last docker daemon error: $daemonerr"
 fi
 
+# Restarts nothing accounts for. When a panic marker is also present this is
+# the likely shape of a real panic whose exit line never reached the scanned
+# journal (journald rate-limiting drops systemd's follow-up lines during a
+# multi-thousand-line goroutine dump), so say so rather than reporting a bare
+# accounting gap.
+# The two emits below are sequential rather than if/else on purpose: emit
+# always exits (0 or 1), so the first one that fires ends the process. If emit
+# is ever refactored to RETURN, this block must become an if/else — the Go
+# mirror is naturally safe because it returns.
 if [[ "$container_start_failures" -lt "$nrestarts" ]]; then
-  emit indeterminate "$observed — only $container_start_failures of $nrestarts restart(s) are explained by a container-start failure; the remainder has no recorded cause. Investigate journalctl -u nhp-server on this instance before re-deploying."
+  if [[ "$panics" != "0" ]]; then
+    emit indeterminate "$observed — only $container_start_failures of $nrestarts restart(s) are explained by a container-start failure, and a Go panic marker is present without a matching exit line. Most likely a real panic whose exit line was dropped from the journal. $investigate"
+  fi
+  emit indeterminate "$observed — only $container_start_failures of $nrestarts restart(s) are explained by a container-start failure; the remainder has no recorded cause. $investigate"
 fi
 
 if [[ "$activestate" != "active" || "$substate" != "running" ]]; then
@@ -223,4 +280,21 @@ if [[ "$nrestarts" -gt "$MAX_SELF_HEALED_RESTARTS" ]]; then
   emit infra_unstable "$observed — every restart is a docker container-start failure (exit 125) and the unit is running now, but $nrestarts restarts exceeds the self-heal budget of $MAX_SELF_HEALED_RESTARTS. Treat this as an infrastructure fault (container runtime, log driver, or registry), not an nhp-server defect."
 fi
 
-emit infra_selfhealed "$observed — docker failed to start the container (exit 125), so no nhp-server code ran; systemd's Restart=always policy recovered it and the unit is healthy. Not an application crash."
+selfhealed_detail="$observed — docker failed to start the container (exit 125), so no nhp-server code ran; systemd's Restart=always policy recovered it and the unit is healthy. Not an application crash."
+
+# A panic marker here caused NONE of the restarts: every one is accounted for
+# by an exit 125, which a panicking process cannot produce (a real panic exits
+# 2, and would have been caught either as a non-125 abnormal exit or as an
+# unexplained restart above). So it is a recovered panic or an application log
+# line beginning at column 0 with a panic marker.
+#
+# Surfaced loudly, but NOT made the verdict. Failing here would make panic text
+# decisive exactly where the exit-status accounting is complete and says the
+# deploy is fine — the same disproportionate response, and the same four-hour
+# lock, that this classifier exists to remove, just triggered by a log-line
+# shape instead of a bare counter.
+if [[ "$panics" != "0" ]]; then
+  selfhealed_detail+=" NOTE: a Go panic marker appears in this boot's journal but caused none of the restarts — most likely a recovered panic or a log line beginning with a panic marker. Worth a look; not a reason to block the deploy."
+fi
+
+emit infra_selfhealed "$selfhealed_detail"

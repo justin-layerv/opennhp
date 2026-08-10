@@ -31,6 +31,42 @@ One directory per case:
 Verdict tokens: `clean`, `infra_selfhealed` (both pass the gate), `app_crash`,
 `infra_unstable`, `indeterminate` (all fail it).
 
+A case may also carry optional `detail-contains` / `detail-excludes` files (one
+substring per line) asserting the operator-facing message. Both drivers honour
+them, so message behaviour — the `#1096` wording especially — is a shared
+invariant rather than two per-language copies.
+
+## What this fence does and does not cover
+
+It pins the **decision table** — report in, verdict out. It does **not** pin
+evidence *collection*, because the cases are pre-baked reports: nothing here
+executes either probe. The two collect differently and cannot be made
+identical:
+
+| | shell gate | Go smoke suite |
+|---|---|---|
+| shape | one piped script, `sed`/`grep` over the journal | one `journalctl --grep` per signal |
+| window | `-n 20000` raw journal lines, then filter | `-n 400` **matching** lines for exits and daemon errors; `-n 1` for the panic/fatal/goroutine and OOM probes, whose results are booleans |
+
+Note the windows are not comparable in the direction you might expect.
+`journalctl` applies `--grep` first and `-n` bounds the *result*, so
+`-n 400 --grep=Main process exited` keeps the last 400 **exit lines** — a much
+wider reach than 400 raw lines, and in practice wider than the shell's 20,000
+raw-line window. The Go side is split per signal only because
+`--grep='^(panic|fatal error)'` needs a `|`, which `ssm_probe.go`'s
+`rejectPatterns` bars.
+
+What that means in practice: a collection-level regression (a `sed` capture
+that stops matching, a `--grep` pattern that drifts) is invisible here. Those
+are fenced separately — Part C of the fixture runner extracts the shell probe
+verbatim and runs it against real journal text, and
+`TestParseSystemdExitLines` / `TestLastMeaningfulDaemonError` cover the Go
+parsers. The two probes' *marker sets* are fenced automatically by
+`TestRestartEvidencePanicMarkersMatchDeployGate`, which derives the expected
+patterns from `panicMarkerProbes` and compares them against the shell gate's
+alternation (arm counts included), so neither side can gain or lose a marker
+alone.
+
 ## Adding a case
 
 Add the directory, then run both suites. A case that only one side satisfies is

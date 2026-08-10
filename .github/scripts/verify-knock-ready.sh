@@ -27,6 +27,9 @@
 # NRestarts=0 at launch means any non-zero reading is this deploy's
 # window and the probe is semantically correct.
 #
+# Exit status: 0 all healthy, 1 a gate failed, 2 a usage or ENVIRONMENT error
+# (bad check-nrestarts argument, or a missing jq — see the preflight below).
+#
 # Uses SSM RunShellScript to curl each instance's /health/knock-ready
 # endpoint. Captures stderr from AWS CLI calls to surface real errors
 # (not swallow them with 2>/dev/null).
@@ -52,6 +55,20 @@ set -euo pipefail
 # Resolved from BASH_SOURCE, not $PWD: the workflow invokes this by repo-root
 # relative path, but the fixtures run it from elsewhere.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# jq parses every SSM response here and builds the evidence probe's parameters.
+# It has always been required (the pre-existing readiness probe parses .Status
+# and .StandardOutputContent with it); state that up front so a runner without
+# it fails with this line instead of a confusing mid-probe parse error.
+#
+# Only jq is checked, not every dependency: aws/mktemp/tr fail loudly and
+# obviously by name, whereas a missing jq surfaced as an empty parse deep
+# inside a probe. This is a targeted fix for that one ambiguous failure, not a
+# claim that the script is dependency-complete.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "::error::verify-knock-ready.sh requires jq (used to build SSM parameters and parse every command invocation)"
+  exit 2
+fi
 
 ASG_NAME="${1:?Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes> [check-nrestarts]}"
 LABEL="${2:?}"
@@ -216,6 +233,12 @@ check_one() {
 # fleet (see verify_no_crashes). `-n` bounds the scan on an instance that has
 # been up longer than expected.
 #
+# The `|| true` after each `grep -c` is not only guarding grep's exit-1
+# "no match": a grep runtime error (exit 2) is swallowed the same way, leaving
+# the field EMPTY rather than 0. That is deliberate and fails closed — an empty
+# counter is non-numeric to the classifier, which returns indeterminate instead
+# of silently reading a failed scan as "no panics".
+#
 # Every field is reduced to one line on the instance so the report stays a
 # small key=value document; DAEMONERR is additionally bounded and stripped of
 # the characters that would break the report's line framing.
@@ -261,7 +284,33 @@ _restart_evidence_probe_once() {
   # would mangle.
   params=$(jq -nc --arg c "$RESTART_EVIDENCE_SCRIPT" '{commands:[$c]}')
 
-  if ! output=$(_ssm_run "$instance_id" "$params" 2); then
+  # poll_sleep=4, not the readiness probe's 3, because this is the HEAVIER
+  # command — it reads the boot journal and runs four passes over it, where the
+  # readiness probe is one loopback curl. A window that expires before a
+  # slow-but-successful probe returns would read as probe_failed and fail the
+  # deploy closed, which is the same false-red this script exists to stop.
+  #
+  # The observable window is 4 x poll_sleep = 16 s, NOT 5 x. _ssm_run sleeps
+  # once up front and then checks at the TOP of each of four iterations, so
+  # statuses are seen at t=4/8/12/16; the fourth iteration's trailing sleep is
+  # dead time no check follows. (That loop shape predates this probe and is
+  # shared with the readiness path, so it is left alone rather than reshaped
+  # here.)
+  #
+  # 16 s is the whole execution budget, NOT 30 s: send-command's
+  # --timeout-seconds bounds DELIVERY to the instance, not how long the command
+  # may run, so a probe whose on-instance work exceeds the poll window reads as
+  # probe_failed on both the attempt and the retry — failing the deploy closed,
+  # the very false-red this file exists to stop.
+  #
+  # Measured on a live sandbox server instance (up 1h33m): the whole boot
+  # journal was 29 lines / 2,280 bytes and the full probe took 53 ms — roughly
+  # a 300x margin. `-n 20000` is nowhere near binding on a freshly-refreshed
+  # fleet, which is the only fleet this probe runs against. If that margin ever
+  # erodes, the fix is to bound the on-instance journalctl scan, not to raise
+  # the poll count: more polls widen the window for a probe that is already
+  # too slow, while a tighter scan makes it fast again.
+  if ! output=$(_ssm_run "$instance_id" "$params" 4); then
     echo "probe_failed: $output"
     return
   fi

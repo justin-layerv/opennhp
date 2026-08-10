@@ -758,7 +758,7 @@ smoke-build: ## Compile + vet the smoke suite and check tier filter coverage (no
 	@# `go test -run` exits 0 when its pattern matches nothing, so the grep is
 	@# what stops a renamed test from turning this into a green no-op.
 	cd tests/smoke && NHP_ENVIRONMENT=local go test -tags=smoke -count=1 -v \
-		-run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError' ./... \
+		-run 'TestRestartEvidence|TestParseSystemdExitLines|TestLastMeaningfulDaemonError|TestParseUnitState|TestParallelSubtestsDontInheritCanceledCtx' ./... \
 		| tee /tmp/nhp-smoke-restart-evidence.log
 	@if grep -q 'no tests to run' /tmp/nhp-smoke-restart-evidence.log; then \
 		echo "$(COLOUR_RED)[OpenNHP] The -run pattern matched no tests — nothing was asserted.$(END_COLOUR)"; \

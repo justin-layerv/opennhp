@@ -252,7 +252,7 @@ func classifyRestartEvidence(ev restartEvidence) (restartVerdict, string) {
 	if ev.Panics == 0 {
 		observed += "; Go panic in journal: absent"
 	} else {
-		observed += fmt.Sprintf("; Go panic in journal: PRESENT (%d line(s))", ev.Panics)
+		observed += "; Go panic in journal: PRESENT"
 	}
 	if ev.OOM == 0 {
 		observed += "; OOM kill: absent"
@@ -261,36 +261,60 @@ func classifyRestartEvidence(ev restartEvidence) (restartVerdict, string) {
 	}
 	observed += fmt.Sprintf("; unit now: %s/%s", ev.ActiveState, ev.SubState)
 
-	if ev.Panics != 0 {
-		return verdictAppCrash, observed + " — the server process panicked during this deploy. " +
-			"This is the regression class fixed by PR #1096 (panic: send on closed channel). " +
-			"Investigate journalctl -u nhp-server on this instance before re-deploying."
-	}
+	// Panic evidence is CORROBORATION, not its own decision branch. The verdict
+	// is carried by the exit status — a panicking process exits 2, so the
+	// non-125 branch below catches a real panic whether or not its stack trace
+	// reached the journal. Pre-empting that with `Panics != 0` made the panic
+	// grep decisive, which is how an application log line beginning at column 0
+	// with `panic: ` could turn an unrelated container-start self-heal into a
+	// claimed #1096 regression.
+	//
+	// OOM stays decisive, unlike panic text, because it is systemd's own
+	// unit-scoped statement that it killed the process — not a string that
+	// application output can forge.
 	if ev.OOM != 0 {
 		return verdictAppCrash, observed + " — the server process was killed by the OOM killer during this deploy. " +
 			"Check the instance's memory headroom and the server's allocation profile before re-deploying."
 	}
 
+	const investigate = "Investigate journalctl -u nhp-server on this instance before re-deploying."
+
 	containerStartFailures := 0
 	for _, e := range nonzero {
-		if e != "exited:125" {
-			return verdictAppCrash, observed + fmt.Sprintf(
-				" — exit %s is the server process terminating abnormally, not a container-start "+
-					"failure (docker reports its own failures as exit 125). Investigate "+
-					"journalctl -u nhp-server on this instance before re-deploying.", e)
+		if e == "exited:125" {
+			containerStartFailures++
+			continue
 		}
-		containerStartFailures++
+		if ev.Panics != 0 {
+			return verdictAppCrash, observed + fmt.Sprintf(
+				" — exit %s with a Go panic in the journal: the server process panicked during "+
+					"this deploy. This is the regression class fixed by PR #1096 (panic: send on "+
+					"closed channel). %s", e, investigate)
+		}
+		return verdictAppCrash, observed + fmt.Sprintf(
+			" — exit %s is the server process terminating abnormally, not a container-start "+
+				"failure (docker reports its own failures as exit 125). %s", e, investigate)
 	}
 
 	if ev.DaemonErr != "" {
 		observed += "; last docker daemon error: " + ev.DaemonErr
 	}
 
+	// Restarts nothing accounts for. With a panic marker also present this is
+	// the likely shape of a real panic whose exit line never reached the
+	// scanned journal, so say so rather than reporting a bare accounting gap.
 	if containerStartFailures < ev.NRestarts {
+		if ev.Panics != 0 {
+			return verdictIndeterminate, observed + fmt.Sprintf(
+				" — only %d of %d restart(s) are explained by a container-start failure, and a "+
+					"Go panic marker is present without a matching exit line. Most likely a real "+
+					"panic whose exit line was dropped from the journal. %s",
+				containerStartFailures, ev.NRestarts, investigate)
+		}
 		return verdictIndeterminate, observed + fmt.Sprintf(
 			" — only %d of %d restart(s) are explained by a container-start failure; the "+
-				"remainder has no recorded cause. Investigate journalctl -u nhp-server on this "+
-				"instance before re-deploying.", containerStartFailures, ev.NRestarts)
+				"remainder has no recorded cause. %s",
+			containerStartFailures, ev.NRestarts, investigate)
 	}
 
 	if ev.ActiveState != "active" || ev.SubState != "running" {
@@ -306,9 +330,57 @@ func classifyRestartEvidence(ev restartEvidence) (restartVerdict, string) {
 				"nhp-server defect.", ev.NRestarts, maxSelfHealedRestarts)
 	}
 
-	return verdictInfraSelfHealed, observed + " — docker failed to start the container (exit 125), " +
+	detail := observed + " — docker failed to start the container (exit 125), " +
 		"so no nhp-server code ran; systemd's Restart=always policy recovered it and the unit is " +
 		"healthy. Not an application crash."
+
+	// A panic marker here caused NONE of the restarts: every one is accounted
+	// for by an exit 125, which a panicking process cannot produce. So it is a
+	// recovered panic, or a log line beginning at column 0 with a panic marker.
+	// Surfaced loudly, but NOT made the verdict — failing here would make panic
+	// text decisive exactly where the exit-status accounting is complete and
+	// says the deploy is fine.
+	if ev.Panics != 0 {
+		detail += " NOTE: a Go panic marker appears in this boot's journal but caused none of " +
+			"the restarts — most likely a recovered panic or a log line beginning with a panic " +
+			"marker. Worth a look; not a reason to block the deploy."
+	}
+
+	return verdictInfraSelfHealed, detail
+}
+
+// maxCounterDigits bounds a counter to what the shell classifier's
+// `^[0-9]{1,9}$` guard accepts. The bound is load-bearing on BOTH sides: an
+// all-digit value that overflows bash's signed 64-bit arithmetic WRAPS rather
+// than erroring, and a wrapped NRestarts passed the accounting and budget
+// comparisons all the way to infra_selfhealed — the gate going green on a
+// corrupted counter.
+const maxCounterDigits = 9
+
+// parseCounter accepts exactly what the shell's `^[0-9]{1,9}$` accepts, on the
+// UNTRIMMED value. Stricter than strconv.Atoi, which takes a sign and which —
+// with a TrimSpace — let " 1", "+1" and "-1" through here while the shell
+// rejected all three. On "-1" that difference was not cosmetic: Go reached
+// infra_selfhealed and PASSED the gate where the shell failed closed.
+func parseCounter(value string) (int, bool) {
+	if value == "" || len(value) > maxCounterDigits {
+		return 0, false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	// Cannot fail: at most 9 digits fits int on every supported platform.
+	n, _ := strconv.Atoi(value)
+	return n, true
+}
+
+// counterMalformed is the single wording for a rejected counter, so a reworded
+// message cannot land on some counters and not others.
+func counterMalformed(label, value string) string {
+	return fmt.Sprintf("evidence report carries a non-numeric or implausibly large %s (\"%s\")",
+		label, value)
 }
 
 // parseRestartEvidenceReport reads the key=value report emitted by the deploy
@@ -323,12 +395,20 @@ func parseRestartEvidenceReport(report string) restartEvidence {
 		if !ok {
 			continue
 		}
+		// An empty value is indistinguishable from an absent key to the shell
+		// classifier, which initialises every field to "" and tests -z. Treat it
+		// the same here, or `PANICS=` yields "missing PANICS" there and
+		// "non-numeric" here for one identical report. DAEMONERR is optional and
+		// legitimately empty, and is not in the required set below.
+		if value == "" {
+			continue
+		}
 		seen[key] = true
 		switch key {
 		case "NRESTARTS":
-			n, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				ev.malformed = fmt.Sprintf("evidence report carries a non-numeric NRestarts (%q)", value)
+			n, ok := parseCounter(value)
+			if !ok {
+				ev.malformed = counterMalformed("NRestarts", value)
 				return ev
 			}
 			ev.NRestarts = n
@@ -339,16 +419,16 @@ func parseRestartEvidenceReport(report string) restartEvidence {
 		case "EXITS":
 			ev.Exits = splitExits(value)
 		case "PANICS":
-			n, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				ev.malformed = fmt.Sprintf("evidence report carries a non-numeric panic-line count (%q)", value)
+			n, ok := parseCounter(value)
+			if !ok {
+				ev.malformed = counterMalformed("panic-line count", value)
 				return ev
 			}
 			ev.Panics = n
 		case "OOM":
-			n, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				ev.malformed = fmt.Sprintf("evidence report carries a non-numeric OOM-line count (%q)", value)
+			n, ok := parseCounter(value)
+			if !ok {
+				ev.malformed = counterMalformed("OOM-line count", value)
 				return ev
 			}
 			ev.OOM = n
@@ -369,8 +449,12 @@ func parseRestartEvidenceReport(report string) restartEvidence {
 // splitExits parses "exited:125,exited:0," into its entries.
 func splitExits(raw string) []string {
 	var out []string
+	// Deliberately does NOT trim: the shell compares each entry exactly with
+	// `[[ "$entry" == "exited:125" ]]`, so trimming here made `exited:125 ,` a
+	// container-start failure (pass) in Go and an abnormal exit (fail) in the
+	// shell — a verdict-level divergence with Go on the permissive side.
 	for _, e := range strings.Split(raw, ",") {
-		if e = strings.TrimSpace(e); e != "" {
+		if e != "" {
 			out = append(out, e)
 		}
 	}

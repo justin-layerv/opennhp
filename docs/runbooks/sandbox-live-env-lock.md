@@ -187,9 +187,35 @@ reaching for this runbook's Release section:
 
 | Verdict | Means | First move |
 |---|---|---|
-| `app_crash` | Panic, OOM kill, or a non-125 abnormal exit | Real regression — `journalctl -u nhp-server` on the named instance |
+| `app_crash` | A non-125 abnormal exit of the server process, or an OOM kill | Real regression — `journalctl -u nhp-server` on the named instance |
 | `infra_unstable` | All container-start failures, but not converged or past the self-heal budget | Container runtime, log driver, or registry fault — not an nhp-server defect |
 | `indeterminate` | Restarts with no recorded cause, or an unreadable report | Read the raw journal; the gate deliberately refuses to guess |
+
+A panic marker in the journal is **corroboration, never the verdict**. A
+panicking process exits 2, so the exit status alone catches a real
+#1096-class crash — which matters because container output reaches CloudWatch,
+not necessarily the journal. Letting the panic grep decide instead would mean
+an application log line beginning at column 0 with `panic: ` could turn an
+unrelated container-start self-heal into a claimed regression, which is the
+original misdiagnosis pointed the other way. So the gate names #1096 only
+alongside an abnormal exit, and reports a panic marker it cannot reconcile as
+`indeterminate`.
+
+That wording is load-bearing, so it is asserted rather than merely written: the
+shared corpus at `tests/fixtures/nhp-server-restart-evidence/` carries
+`detail-contains`/`detail-excludes` files per case (both drivers honour them),
+and `TestRestartEvidenceMessagesStateObservations` in
+`tests/smoke/restart_evidence_test.go` pins the cases built from a struct
+rather than a parsed report. If you change what this section says, one of those
+will tell you.
+
+A panic marker that caused *no* restart — every restart already accounted for
+by an exit 125 — passes with a `::warning::` rather than failing. Getting there
+means the exit-status accounting is complete and says docker was at fault, so
+the marker is a recovered panic or a log line beginning at column 0 with panic
+text. Failing on it would make panic text decisive exactly where the evidence
+says the deploy is fine, re-creating the same disproportionate block (and the
+same four-hour lock) from a log-line shape instead of a bare counter.
 
 This broader boundary was added after NHP run `29658670289` overlapped
 qurl-service exact-image smoke run `29658663594`. The smoke acquired the old
