@@ -35,7 +35,7 @@ dnspython==2.8.0
 #
 # pyOpenSSL is still an acme dependency, but with acme>=3 nothing on our cert
 # path calls its removed X509Req/load_certificate_request APIs (see acme note).
-pyOpenSSL==26.3.0
+pyOpenSSL==26.4.0
 # typing_extensions is imported by pyOpenSSL 26.x (OpenSSL/SSL.py). acme.client
 # -> crypto_util -> OpenSSL pulls it in on the handler's import path, so it MUST
 # be listed for the --no-deps build (was previously only backfilled by build.sh's
