@@ -9112,7 +9112,138 @@ def _validate_authority_proof_controller_orphan_forget(
         )
 
 
+AUTHORITY_FUNCTION_ADDRESS_PREFIX = 'module.control.aws_lambda_function.authority["'
+AUTHORITY_ALIAS_ADDRESS_PREFIX = 'module.control.aws_lambda_alias.authority["'
+
+
+def _authority_contract_target_image(by_address: dict[str, Any]) -> str | None:
+    """The image URI the foundation contract binds for this plan, or None."""
+    item = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS)
+    if not isinstance(item, dict):
+        return None
+    after = item.get("change", {}).get("after")
+    if not isinstance(after, dict):
+        return None
+    payload = after.get("input")
+    if not isinstance(payload, dict):
+        return None
+    target = payload.get("authority_image_uri")
+    return target if isinstance(target, str) and "@sha256:" in target else None
+
+
+def _claim_authority_image_roll(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """Claim a routine Authority image roll, structurally rather than by digest.
+
+    Every merge to main can publish a new Authority image, so a lane that pins
+    a literal FROM->TO digest pair (AUTHORITY_IMAGE_UPDATE_{FROM,TO}_URI) can
+    only ever admit one migration. It stops matching the moment the next image
+    lands, and re-pinning it by hand cannot keep up with a stream of merges --
+    main moves again before the re-pin merges. That is how sandbox Control
+    wedged.
+
+    The invariant that actually matters is not "someone typed this digest", it
+    is **uniform convergence**: every Authority function lands on the single
+    image the foundation contract binds for this plan, and no function is left
+    behind on a previous one. A mixed-digest fleet is the real hazard, and a
+    literal pin does not detect it. This checks the property directly, so it
+    holds for every future roll without an edit.
+
+    Two assumptions this rests on, stated so they are not rediscovered:
+
+    1. **Digest provenance lives elsewhere, on a required path.** This lane
+       constrains only that the fleet converges on whatever `authority_image_uri`
+       the foundation contract binds; it does not judge WHICH digest that is
+       (`"@sha256:" in target` is a well-formedness check, not a provenance one).
+       That is deliberate -- the digest is not operator-supplied, because the
+       generated tfvars derive it from the measurement-basis manifest under
+       `--mode sandbox-exact-main --expected-checkout-commit`, and the apply job
+       regenerates and byte-compares them against the reviewed plan input under
+       `set -euo pipefail`. If that comparison ever becomes skippable, this lane
+       degrades to "any uniformly-asserted digest is admitted", so treat it as
+       load-bearing for this check rather than as workflow hygiene.
+    2. **Terraform emits a `resource_changes` entry for every function**, even
+       untouched ones. "No function is left behind" is only as strong as that:
+       it silently weakens to "no *listed* function is left behind" if a plan
+       ever omits an untouched resource. `_plan_resource_changes` preserving
+       no-ops is pinned by test, but that pins the helper, not Terraform.
+    """
+    functions = {a for a in changed if a.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX)}
+    aliases = {a for a in changed if a.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX)}
+    if not functions:
+        return frozenset()
+    # An image roll is update-only. A create, delete or replace is a different
+    # transition with different ordering, and never composes through this lane.
+    if any(actual_non_noop.get(address) != ["update"] for address in functions | aliases):
+        return frozenset()
+    target = _authority_contract_target_image(by_address)
+    if target is None:
+        return frozenset()
+    # Uniform convergence, across EVERY Authority function in the plan -- not
+    # merely the changed ones. A function sitting no-op on a stale digest means
+    # the fleet is being split, which is exactly what this must refuse.
+    for address, item in by_address.items():
+        if not address.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX):
+            continue
+        after = item.get("change", {}).get("after")
+        if not isinstance(after, dict) or after.get("image_uri") != target:
+            return frozenset()
+    claimed = functions | aliases
+    if AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS in changed:
+        claimed.add(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS)
+    return frozenset(claimed)
+
+
+def _validate_authority_image_roll(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    """Re-prove uniform convergence independently of the claim."""
+    target = _authority_contract_target_image(by_address)
+    if target is None:
+        raise ContractError(
+            "an Authority image roll requires the foundation contract to bind "
+            "an image digest"
+        )
+    functions = {a for a in claimed if a.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX)}
+    if not functions:
+        raise ContractError("an Authority image roll must move at least one function")
+    for address, item in by_address.items():
+        if not address.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX):
+            continue
+        after = item.get("change", {}).get("after")
+        if not isinstance(after, dict):
+            raise ContractError(f"{address} planned values are malformed")
+        if after.get("image_uri") != target:
+            raise ContractError(
+                "every Authority function must converge on the contract image; "
+                f"{address} does not"
+            )
+    for address in claimed:
+        actions = by_address.get(address, {}).get("change", {}).get("actions")
+        if actions != ["update"]:
+            raise ContractError(
+                f"an Authority image roll is update-only; {address} is {actions!r}"
+            )
+        if address.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX):
+            function_name = address[len(AUTHORITY_ALIAS_ADDRESS_PREFIX):].split(":", 1)[0]
+            owner = f'{AUTHORITY_FUNCTION_ADDRESS_PREFIX}{function_name}"]'
+            if owner not in by_address:
+                raise ContractError(
+                    f"{address} names no Authority function in this plan"
+                )
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "authority-image-roll",
+        _claim_authority_image_roll,
+        _validate_authority_image_roll,
+    ),
     (
         "authority-image-uri-move",
         _claim_authority_image_uri_move,
@@ -9167,6 +9298,33 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
 #
 # It is an explicit one-address allowlist, not a general relaxation: every other
 # address must still be claimed by exactly one transition.
+_COMPOSED_PLAN_MODE_PREFIX = "composed-"
+_COMPOSED_PLAN_MODE_SEPARATOR = "-with-"
+
+
+def _plan_mode_parts(plan_mode: str) -> set[str]:
+    """The atomic transition names inside a (possibly composed) plan mode.
+
+    `_compose_admitted_transitions` renders "composed-<a>-with-<b>", so a caller
+    gating on a transition name must not compare the composed string literally:
+    a reviewed transition would silently lose its allowance merely by landing
+    alongside another one.
+
+    Splitting the display string is sound only while no atomic mode name
+    contains the separator. Nothing in the type system enforces that, so
+    test_no_registered_lane_name_contains_the_composition_separator pins it. If
+    a future lane needs "-with-" in its name, thread the parts through the
+    composer's return value rather than widening this.
+    """
+    if not plan_mode.startswith(_COMPOSED_PLAN_MODE_PREFIX):
+        return {plan_mode}
+    return set(
+        plan_mode[len(_COMPOSED_PLAN_MODE_PREFIX):].split(
+            _COMPOSED_PLAN_MODE_SEPARATOR
+        )
+    )
+
+
 _COMPOSABLE_SHARED_ADDRESSES = frozenset(
     {"module.control.terraform_data.foundation_contract"}
 )
@@ -9229,7 +9387,9 @@ def _compose_admitted_transitions(
         return None
     for _, claimed, validate_fn in claims:
         validate_fn(claimed, by_address, plan)
-    return "composed-" + "-with-".join(sorted(name for name, _, _ in claims))
+    return _COMPOSED_PLAN_MODE_PREFIX + _COMPOSED_PLAN_MODE_SEPARATOR.join(
+        sorted(name for name, _, _ in claims)
+    )
 
 
 def _check_hub_worker_image_update(by_address: dict[str, Any]) -> None:
@@ -13453,7 +13613,17 @@ def check_plan(
             "publisher role normalization cannot be combined with a resource transition"
         )
     if normalization_drift_kind == "authority-digest":
-        if plan_mode not in (
+        # A composed plan_mode is "composed-<a>-with-<b>"; admit it when one of
+        # its parts is admitted here, so a reviewed transition does not lose its
+        # allowance merely by landing alongside another reviewed one.
+        #
+        # The OR is safe because admission here is not the check. Each part is
+        # independently claimed and validated, and the drift itself goes through
+        # _check_digest_normalization(item, by_address, spec=...), whose
+        # signature takes no plan_mode at all -- so it cannot be relaxed by what
+        # a mode is composed with. Composition widens WHICH plans may carry the
+        # drift; it can never weaken what the drift must look like.
+        if not _plan_mode_parts(plan_mode) & set((
             "no-op",
             "redis-split-transition",
             # The detached legacy OTP Redis user delete, for the same reason the
@@ -13486,7 +13656,11 @@ def check_plan(
             "authority-proof-disable",
             "authority-proof-consumers-enable",
             "authority-proof-consumers-disable",
-        ):
+            # The routine, structurally-validated image roll. Publisher writes
+            # to the digest parameter are exactly what precedes a roll, so this
+            # is the transition most likely to carry the drift.
+            "authority-image-roll",
+        )):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "
                 "Redis split, the legacy OTP Redis user delete, contract "

@@ -13670,6 +13670,195 @@ class ComposedTransitionTest(unittest.TestCase):
             frozenset({"module.control.terraform_data.foundation_contract"}),
         )
 
+    def image_roll_fixture(self) -> dict:
+        """The live sandbox Authority image roll, reduced to its shape."""
+        target = (
+            "767397897469.dkr.ecr.us-east-2.amazonaws.com/"
+            "layerv/qurl-connector-authority@sha256:" + "a" * 64
+        )
+        by = {}
+        for fn in ("layerv-nhp-sandbox-ca-ia", "layerv-nhp-sandbox-ca-ra"):
+            by[f'module.control.aws_lambda_function.authority["{fn}"]'] = {
+                "change": {"actions": ["update"], "after": {"image_uri": target}}
+            }
+            by[f'module.control.aws_lambda_alias.authority["{fn}:green"]'] = {
+                "change": {"actions": ["update"], "after": {}}
+            }
+        by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS] = {
+            "change": {
+                "actions": ["update"],
+                "after": {"input": {"authority_image_uri": target}},
+            }
+        }
+        return by
+
+    def test_image_roll_claims_functions_aliases_and_contract(self) -> None:
+        by = self.image_roll_fixture()
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_image_roll(changed, actions, by)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_image_roll(claimed, by, {})
+
+    def test_image_roll_refuses_a_split_fleet(self) -> None:
+        """A function left on a stale digest is the real hazard."""
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"]'][
+            "change"
+        ]["after"]["image_uri"] = "stale"
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_image_roll(changed, actions, by), frozenset()
+        )
+
+    def test_image_roll_refuses_a_no_op_function_on_a_stale_digest(self) -> None:
+        """Convergence is checked across every function, not just changed ones."""
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"]'] = {
+            "change": {"actions": ["no-op"], "after": {"image_uri": "stale"}}
+        }
+        changed = {a for a in by if by[a]["change"]["actions"] != ["no-op"]}
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_image_roll(changed, actions, by), frozenset()
+        )
+
+    def test_image_roll_is_update_only(self) -> None:
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_alias.authority["layerv-nhp-sandbox-ca-ia:green"]'][
+            "change"
+        ]["actions"] = ["delete"]
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_image_roll(changed, actions, by), frozenset()
+        )
+
+    def test_image_roll_requires_a_contract_bound_digest(self) -> None:
+        by = self.image_roll_fixture()
+        del by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_image_roll(changed, actions, by), frozenset()
+        )
+
+    def test_plan_resource_changes_keeps_no_op_entries(self) -> None:
+        """by_address must see no-op resources, or the split-fleet check is blind.
+
+        _claim/_validate_authority_image_roll prove convergence by walking every
+        Authority function in by_address, including ones planned no-op. That is
+        the whole point: a function stranded on the previous digest is the
+        hazard. by_address is built from _plan_resource_changes, so if that ever
+        started filtering no-ops the stranded function would simply be absent
+        and the split fleet would be ADMITTED. Pinned here against the real
+        function rather than a synthetic map, because a hand-built fixture
+        passes regardless of what the production path does.
+        """
+        plan = {
+            "resource_changes": [
+                {"address": "quiet", "change": {"actions": ["no-op"]}},
+                {"address": "moving", "change": {"actions": ["update"]}},
+            ]
+        }
+        changes = CHECKER._plan_resource_changes(plan, [], None)
+        self.assertEqual(
+            {item["address"] for item in changes}, {"quiet", "moving"}
+        )
+
+    def test_image_roll_validator_requires_a_contract_bound_digest(self) -> None:
+        by = self.image_roll_fixture()
+        claimed = frozenset(by)
+        del by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(claimed, by, {})
+
+    def test_image_roll_validator_refuses_a_non_convergent_function(self) -> None:
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"]'][
+            "change"
+        ]["after"]["image_uri"] = "stale"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(frozenset(by), by, {})
+
+    def test_image_roll_validator_refuses_a_stale_no_op_function(self) -> None:
+        by = self.image_roll_fixture()
+        claimed = frozenset(by)
+        by['module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"]'] = {
+            "change": {"actions": ["no-op"], "after": {"image_uri": "stale"}}
+        }
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(claimed, by, {})
+
+    def test_image_roll_validator_refuses_malformed_planned_values(self) -> None:
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"]'][
+            "change"
+        ]["after"] = None
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(frozenset(by), by, {})
+
+    def test_image_roll_validator_is_update_only(self) -> None:
+        by = self.image_roll_fixture()
+        by['module.control.aws_lambda_alias.authority["layerv-nhp-sandbox-ca-ia:green"]'][
+            "change"
+        ]["actions"] = ["delete"]
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(frozenset(by), by, {})
+
+    def test_image_roll_validator_refuses_an_alias_with_no_owner(self) -> None:
+        by = self.image_roll_fixture()
+        orphan = 'module.control.aws_lambda_alias.authority["layerv-nhp-sandbox-ca-ghost:green"]'
+        by[orphan] = {"change": {"actions": ["update"], "after": {}}}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(frozenset(by), by, {})
+
+    def test_image_roll_validator_requires_at_least_one_function(self) -> None:
+        by = self.image_roll_fixture()
+        aliases = frozenset(
+            a
+            for a in by
+            if a.startswith(CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX)
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_image_roll(aliases, by, {})
+
+    def test_plan_mode_parts_splits_a_composed_mode(self) -> None:
+        self.assertEqual(
+            CHECKER._plan_mode_parts("composed-authority-image-roll-with-hub-worker-image-update"),
+            {"authority-image-roll", "hub-worker-image-update"},
+        )
+
+    def test_plan_mode_parts_passes_an_atomic_mode_through(self) -> None:
+        for mode in ("no-op", "authority-image-roll", "authority-proof-disable"):
+            with self.subTest(mode=mode):
+                self.assertEqual(CHECKER._plan_mode_parts(mode), {mode})
+
+    def test_plan_mode_parts_round_trips_the_composer_rendering(self) -> None:
+        """The parser and the renderer must agree on the separator."""
+        names = sorted({name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS})[:3]
+        rendered = CHECKER._COMPOSED_PLAN_MODE_PREFIX + (
+            CHECKER._COMPOSED_PLAN_MODE_SEPARATOR.join(names)
+        )
+        self.assertEqual(CHECKER._plan_mode_parts(rendered), set(names))
+
+    def test_no_registered_lane_name_contains_the_composition_separator(self) -> None:
+        """_plan_mode_parts splits on "-with-", so no lane name may contain it.
+
+        A lane named with the separator inside it would be mis-split into
+        phantom parts, and a phantom part could collide with an allowlisted
+        name -- silently granting an allowance nobody reviewed.
+        """
+        for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS:
+            with self.subTest(lane=name):
+                self.assertNotIn(CHECKER._COMPOSED_PLAN_MODE_SEPARATOR, name)
+                # The prefix strip is the other half of the parse: a lane named
+                # "composed-..." would have its own name mangled into parts.
+                self.assertFalse(
+                    name.startswith(CHECKER._COMPOSED_PLAN_MODE_PREFIX)
+                )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
@@ -13687,6 +13876,12 @@ class ComposedTransitionTest(unittest.TestCase):
                 # Control PR changes. Without this lane every such plan falls
                 # through to the terminal reject.
                 "authority-image-uri-move",
+                # The routine Authority image roll. Validated structurally --
+                # every function must converge on the digest the foundation
+                # contract binds -- because a literal FROM->TO digest pin can
+                # only ever admit one migration and cannot keep up with a
+                # stream of merges to main.
+                "authority-image-roll",
             },
         )
 
