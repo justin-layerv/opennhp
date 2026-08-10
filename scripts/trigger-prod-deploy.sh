@@ -8,12 +8,90 @@
 #   ./scripts/trigger-prod-deploy.sh --dry-run   # Show summary + command only (no prompt)
 #   ./scripts/trigger-prod-deploy.sh --json      # Machine-readable JSON output (no prompt)
 #
+# --json contract: stdout carries exactly one JSON document on EVERY exit, so
+# `... --json | jq` never has to tell a blocked run apart from a crash. `.ok` is
+# the discriminator:
+#
+#   ok:true  + status:"promotable"        -> the full state/components/command document
+#   ok:true  + status:"nothing_to_deploy" -> clean exit, no promotion to make (exit 0)
+#   ok:false + error:"<kind>"             -> blocked, always exit non-zero. Kinds:
+#                unknown_argument, preflight_failed, ssm_read_failed,
+#                no_sandbox_commit, invalid_sandbox_commit, invalid_prod_commit,
+#                image_tag_mismatch, invalid_image_tag, deployment_checks_failed,
+#                unexpected_error
+#
+# Error documents carry `message` (the operator-facing sentence) and `detail`
+# (the specifics: which parameter, which check, which AWS error). The same text
+# also goes to stderr, coloured, as it does in every other mode.
+#
 # Prerequisites:
 #   - AWS CLI with profiles: layerv (sandbox), layerv-prod (prod)
 #   - GitHub CLI authenticated (gh auth login)
 #   - Git repository with full history (not shallow)
 
 set -Eeuo pipefail
+
+# =============================================================================
+# Machine-readable outcome reporting
+# =============================================================================
+#
+# --json is a documented machine interface (CLAUDE.md, Common Commands), and
+# every gate below used to honour it only on the way to success: a blocked run
+# printed coloured text and exited 1, leaving a consumer with a non-zero status
+# and either empty stdout or raw ANSI escapes where the document should have
+# been. Both are indistinguishable from the script crashing, which is the one
+# thing a machine interface must not be ambiguous about.
+#
+# Human-readable output is unchanged — it goes to stderr, which a terminal
+# renders alongside stdout, so interactive and --dry-run runs look the same as
+# before. The document is purely additive on stdout.
+#
+# Defined this early because argument validation is itself an exit path that has
+# to honour --json. $MODE is set by the block below and only read at call time.
+JSON_EMITTED=0
+
+# json_escape — escape one string for use as a JSON double-quoted value.
+#
+# Deliberately does not shell out to jq: preflight Check 5 fails *because* jq is
+# missing, and that failure has to be reportable in --json mode too.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    # Any other C0 control character has no shorthand escape and is illegal raw
+    # inside a JSON string. Drop it rather than emit a document jq would reject:
+    # "always parseable" is this function's whole contract, and a stray 0x01 in
+    # an AWS error message is not worth breaking it for.
+    printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037'
+}
+
+# json_doc — emit one outcome document on stdout, in --json mode only.
+#
+# Callers keep their own `exit`, so this can only add output; no fail-closed path
+# can be turned into a success here by accident.
+json_doc() {
+    [[ "$MODE" == "json" ]] || return 0
+    local ok="$1" key="$2" kind="$3" message="$4"
+    shift 4
+    local details="" entry
+    for entry in "$@"; do
+        details="${details:+${details},}\"$(json_escape "$entry")\""
+    done
+    printf '{"ok":%s,"%s":"%s","message":"%s","detail":[%s]}\n' \
+        "$ok" "$key" "$(json_escape "$kind")" "$(json_escape "$message")" "$details"
+    JSON_EMITTED=1
+}
+
+# json_fail <kind> <message> [detail...] — a blocked run; always paired with a
+# non-zero exit.
+json_fail() { json_doc false error "$@"; }
+
+# json_ok <status> <message> [detail...] — a clean exit that produces no
+# promotion command, which still owes the caller a document.
+json_ok() { json_doc true status "$@"; }
 
 # =============================================================================
 # Arguments
@@ -49,8 +127,15 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            echo "Unknown argument: $arg"
-            echo "Run with --help for usage."
+            # The mode isn't resolved yet — a bad argument can precede --json —
+            # so decide how to report from the whole argument list, not from how
+            # far this loop happens to have got.
+            for other in "$@"; do
+                if [[ "$other" == "--json" ]]; then MODE="json"; fi
+            done
+            echo "Unknown argument: $arg" >&2
+            echo "Run with --help for usage." >&2
+            json_fail unknown_argument "Unknown argument: ${arg}. Run with --help for usage." "$arg"
             exit 1
             ;;
     esac
@@ -72,6 +157,11 @@ RESOLVE_ACTIVE_TAG="$SCRIPT_DIR/../.github/scripts/resolve-active-image-tag.sh"
 # Script state
 PREFLIGHT_FAILED=0
 declare -a WARNINGS=()
+# Every fail() message, in order, so the --json error documents can carry the
+# specific checks that tripped rather than just "checks failed". fail() is the
+# only thing that sets PREFLIGHT_FAILED, so whenever a gate below fires on that
+# flag this array is non-empty.
+declare -a FAILURES=()
 # Parameters whose read errored rather than returning a value. A non-empty
 # list means the state below is incomplete and must not be acted on.
 declare -a SSM_READ_FAILED=()
@@ -111,7 +201,7 @@ NC='\033[0m'
 # JSON document, or `... --json | jq` fails to parse. On a terminal both streams
 # still render, so interactive and --dry-run output is unchanged.
 pass() { echo -e "  ${GREEN}[PASS]${NC} $1" >&2; }
-fail() { echo -e "  ${RED}[FAIL]${NC} $1" >&2; PREFLIGHT_FAILED=1; }
+fail() { echo -e "  ${RED}[FAIL]${NC} $1" >&2; PREFLIGHT_FAILED=1; FAILURES+=("$1"); }
 warn() { echo -e "  ${YELLOW}[WARN]${NC} $1" >&2; }
 info() { echo -e "         $1" >&2; }
 header() { echo -e "\n  ${BOLD}${CYAN}$1${NC}" >&2; echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 ${#1}))${NC}" >&2; }
@@ -122,7 +212,27 @@ header() { echo -e "\n  ${BOLD}${CYAN}$1${NC}" >&2; echo -e "  ${CYAN}$(printf '
 # into the parameter value would fail the downstream SHA check as "corrupted" —
 # the exact misdiagnosis this code exists to prevent.
 SSM_ERR_FILE="$(mktemp)"
-trap 'rm -f "$SSM_ERR_FILE"' EXIT
+
+# on_exit — drop the scratch file, and backstop --json's one-document-per-exit
+# contract.
+#
+# Every gate emits its own document, but `set -Eeuo pipefail` can also end the
+# run at an unguarded command, and in --json mode that would exit non-zero with
+# empty stdout — the exact hole this reporting exists to close. Emit one generic
+# document in that case; the failing command's own output is already on stderr.
+# Output-only, so the shell still exits with the status it was already exiting
+# with (verified on bash 3.2 and 5: an EXIT trap that returns normally does not
+# change it).
+on_exit() {
+    local status=$?
+    rm -f "$SSM_ERR_FILE"
+    if [ "$status" -ne 0 ] && [ "$JSON_EMITTED" -eq 0 ]; then
+        json_fail unexpected_error \
+            "The deployment helper exited unexpectedly (status ${status}); see stderr for the failing command." \
+            "exit status: ${status}"
+    fi
+}
+trap on_exit EXIT
 
 # read_ssm — read one SSM parameter, distinguishing "absent" from "unreadable".
 #
@@ -365,8 +475,9 @@ fi
 
 # Hard exit if basic preflight checks failed
 if [[ "$PREFLIGHT_FAILED" -ne 0 ]]; then
-    echo ""
-    echo -e "  ${RED}Preflight failed. Fix the above issues and retry.${NC}"
+    echo "" >&2
+    echo -e "  ${RED}Preflight failed. Fix the above issues and retry.${NC}" >&2
+    json_fail preflight_failed "Preflight failed. Fix the above issues and retry." "${FAILURES[@]}"
     exit 1
 fi
 
@@ -455,29 +566,44 @@ if [ ${#SSM_READ_FAILED[@]} -gt 0 ]; then
     done
     echo "" >&2
     echo -e "  ${RED}Not a corrupted parameter — the read itself failed. Retry; if it persists, check credentials and SSM availability.${NC}" >&2
+    # The document's kind carries the same distinction the prose does: a consumer
+    # branching on error=="ssm_read_failed" is looking at an incomplete read, not
+    # at bad state, and `detail` names each parameter and the AWS error it hit.
+    json_fail ssm_read_failed \
+        "Could not read ${#SSM_READ_FAILED[@]} deployment parameter(s); deployment state is incomplete." \
+        "${SSM_READ_FAILED[@]}"
     exit 1
 fi
 
 # Hard block: no sandbox commit means nothing to deploy
 if [[ -z "$SANDBOX_COMMIT" ]]; then
     fail "No sandbox commit found. Deploy to sandbox first, or check SSM parameter: ${SSM_SANDBOX_COMMIT}"
-    echo ""
-    echo -e "  ${RED}Cannot proceed without a sandbox deployment.${NC}"
+    echo "" >&2
+    echo -e "  ${RED}Cannot proceed without a sandbox deployment.${NC}" >&2
+    json_fail no_sandbox_commit \
+        "No sandbox commit found. Deploy to sandbox first, or check SSM parameter: ${SSM_SANDBOX_COMMIT}" \
+        "${SSM_SANDBOX_COMMIT}: (not set)"
     exit 1
 fi
 
 # Validate commit SHA format (security: prevent injection via compromised SSM)
 if [[ ! "$SANDBOX_COMMIT" =~ ^[a-f0-9]{7,40}$ ]]; then
     fail "Sandbox commit '${SANDBOX_COMMIT}' is not a valid git SHA. SSM parameter may be corrupted."
-    echo ""
-    echo -e "  ${RED}Cannot proceed with invalid commit SHA.${NC}"
+    echo "" >&2
+    echo -e "  ${RED}Cannot proceed with invalid commit SHA.${NC}" >&2
+    json_fail invalid_sandbox_commit \
+        "Sandbox commit '${SANDBOX_COMMIT}' is not a valid git SHA. SSM parameter may be corrupted." \
+        "${SSM_SANDBOX_COMMIT}: ${SANDBOX_COMMIT}"
     exit 1
 fi
 
 if [[ "$PROD_COMMIT" != "(not set)" && ! "$PROD_COMMIT" =~ ^[a-f0-9]{7,40}$ ]]; then
     fail "Prod commit '${PROD_COMMIT}' is not a valid git SHA. SSM parameter may be corrupted."
-    echo ""
-    echo -e "  ${RED}Cannot proceed with invalid commit SHA.${NC}"
+    echo "" >&2
+    echo -e "  ${RED}Cannot proceed with invalid commit SHA.${NC}" >&2
+    json_fail invalid_prod_commit \
+        "Prod commit '${PROD_COMMIT}' is not a valid git SHA. SSM parameter may be corrupted." \
+        "${SSM_PROD_COMMIT}: ${PROD_COMMIT}"
     exit 1
 fi
 
@@ -486,6 +612,12 @@ if [[ "$SANDBOX_COMMIT" == "$PROD_COMMIT" && -n "$SANDBOX_COMMIT" \
     && "$SANDBOX_SERVER_TAG" == "$PROD_SERVER_TAG" \
     && "$SANDBOX_AC_TAG" == "$PROD_AC_TAG" ]]; then
     info "Sandbox and prod at same commit (${SANDBOX_COMMIT:0:7}) with matching image tags. Nothing to deploy."
+    # Exits 0 with no promotion command, so there is no summary document to
+    # build — but --json still owes stdout a parseable answer, and "nothing to
+    # deploy" is an answer, not an absence of one.
+    json_ok nothing_to_deploy \
+        "Sandbox and prod at same commit (${SANDBOX_COMMIT:0:7}) with matching image tags. Nothing to deploy." \
+        "commit: ${SANDBOX_COMMIT}" "server tag: ${SANDBOX_SERVER_TAG}" "ac tag: ${SANDBOX_AC_TAG}"
     exit 0
 fi
 
@@ -542,7 +674,10 @@ header "SANDBOX HEALTH"
 if [[ "$SANDBOX_SERVER_TAG" != "(not set)" && "$SANDBOX_AC_TAG" != "(not set)" \
     && "$SANDBOX_SERVER_TAG" != "$SANDBOX_AC_TAG" ]]; then
     fail "Server tag (${SANDBOX_SERVER_TAG:0:7}) != AC tag (${SANDBOX_AC_TAG:0:7}). Cannot use single image_tag for both."
-    echo -e "  ${RED}Fix: re-deploy sandbox to bring server/AC tags back in sync.${NC}"
+    echo -e "  ${RED}Fix: re-deploy sandbox to bring server/AC tags back in sync.${NC}" >&2
+    json_fail image_tag_mismatch \
+        "Server tag (${SANDBOX_SERVER_TAG:0:7}) != AC tag (${SANDBOX_AC_TAG:0:7}). Cannot use single image_tag for both. Fix: re-deploy sandbox to bring server/AC tags back in sync." \
+        "sandbox server tag: ${SANDBOX_SERVER_TAG}" "sandbox ac tag: ${SANDBOX_AC_TAG}"
     exit 1
 fi
 
@@ -554,6 +689,9 @@ PROMOTION_TAG="$SANDBOX_SERVER_TAG"
 # Validate image tag format (same SHA check as deployed-commit)
 if [[ ! "$PROMOTION_TAG" =~ ^[a-f0-9]{7,40}$ ]]; then
     fail "Server image tag '${PROMOTION_TAG}' is not a valid git SHA. SSM parameter may be corrupted."
+    json_fail invalid_image_tag \
+        "Server image tag '${PROMOTION_TAG}' is not a valid git SHA. SSM parameter may be corrupted." \
+        "sandbox server tag: ${PROMOTION_TAG}"
     exit 1
 fi
 
@@ -671,8 +809,12 @@ fi
 
 # Hard exit if any deployment state or health checks failed
 if [[ "$PREFLIGHT_FAILED" -ne 0 ]]; then
-    echo ""
-    echo -e "  ${RED}Deployment checks failed. Fix the above issues and retry.${NC}"
+    echo "" >&2
+    echo -e "  ${RED}Deployment checks failed. Fix the above issues and retry.${NC}" >&2
+    # Preflight exited above on its own gate, so everything collected here is a
+    # Section 3/4 check: the deployment lock, sandbox state, an in-flight
+    # promotion, CI status, soak time, or a missing ECR image.
+    json_fail deployment_checks_failed "Deployment checks failed. Fix the above issues and retry." "${FAILURES[@]}"
     exit 1
 fi
 
@@ -1012,6 +1154,8 @@ if [[ "$MODE" == "json" ]]; then
         --argjson warnings "$WARNINGS_JSON" \
         --argjson changelog "$CHANGELOG_JSON" \
         '{
+          ok: true,
+          status: "promotable",
           preflight: { all_passed: $preflight_passed },
           first_deploy: $first_deploy,
           sandbox: {
@@ -1054,6 +1198,11 @@ if [[ "$MODE" == "json" ]]; then
           },
           warnings: $warnings
         }'
+
+    # Tells the EXIT backstop that stdout already carries its document. (Nothing
+    # after this can fail before exit 0, but leaving the flag unset would make
+    # the invariant depend on that staying true.)
+    JSON_EMITTED=1
 
     audit_log "JSON" "components=${COMPONENT_LIST}"
     exit 0
