@@ -1,0 +1,8 @@
+Started nhp-server.service.
+panic: send on closed channel
+
+goroutine 137 [running]:
+github.com/layervai/nhp/endpoints/server.(*UdpServer).sendMessageToPeer(...)
+nhp-server.service: Main process exited, code=exited, status=2/INVALIDARGUMENT
+nhp-server.service: Scheduled restart job, restart counter is at 1.
+Started nhp-server.service.

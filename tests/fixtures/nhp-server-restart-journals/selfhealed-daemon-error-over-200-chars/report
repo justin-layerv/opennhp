@@ -1,0 +1,7 @@
+NRESTARTS=1
+ACTIVESTATE=active
+SUBSTATE=running
+EXITS=exited:125,
+PANICS=0
+OOM=0
+DAEMONERR=Error response from daemon: failed to create task for container: failed to initialize logging driver: failed to create Cloudwatch log stream: RequestError: send request failed caused by: Post https://

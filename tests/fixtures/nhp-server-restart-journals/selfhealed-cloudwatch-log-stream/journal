@@ -1,0 +1,12 @@
+Stopping nhp-server.service...
+✅ Server stopped gracefully
+nhp-server.service: Deactivated successfully.
+Stopped nhp-server.service.
+Started nhp-server.service.
+Error response from daemon: No such container: nhp-server
+docker: Error response from daemon: failed to create task for container: failed to initialize logging driver: failed to create Cloudwatch log stream.
+nhp-server.service: Main process exited, code=exited, status=125/n/a
+nhp-server.service: Failed with result 'exit-code'.
+nhp-server.service: Scheduled restart job, restart counter is at 1.
+Error response from daemon: No such container: nhp-server
+Started nhp-server.service.

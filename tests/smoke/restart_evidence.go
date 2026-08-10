@@ -5,6 +5,7 @@ package smoke
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -65,6 +66,24 @@ import (
 // piping to grep would trip rejectPatterns, and shipping the whole journal
 // back would risk SSM's 24,000-character output truncation silently dropping
 // the very lines the verdict depends on.
+//
+// EVERY --grep pattern is single-quoted. SSM runs these through a shell, so an
+// unquoted pattern containing a space is word-split: `--grep=Main process
+// exited` arrives as `--grep=Main` plus two positional args, journalctl rejects
+// `process` as a match (matches must be FIELD=VALUE), and the probe errors —
+// which this fence reports as "cannot confirm whether this was an application
+// crash" on every instance that actually restarted. Single quotes also protect
+// `[0-9]` from glob expansion. Fenced by
+// TestRestartEvidenceProbeArgsSurviveTheShell.
+//
+// The -n bound means something different here than in the deploy gate's probe.
+// With --grep, journalctl applies --lines to the MATCHING entries, so 400 is
+// "the last 400 exit lines". The gate's on-instance script greps within the
+// last 20000 RAW journal lines instead. The two agree whenever the evidence
+// sits inside both windows, which on a freshly-deployed instance it does; they
+// could differ on an instance chatty enough to push an early restart past
+// 20000 lines, where this side is the more complete of the two. Do not
+// "align" these numbers — they are not the same quantity.
 const (
 	// cmdSystemdActiveStateNhpServer and cmdSystemdSubStateNhpServer prove
 	// the unit actually converged. "Self-healed" has to mean healed.
@@ -74,18 +93,51 @@ const (
 	// cmdJournalNhpServerExits returns systemd's own "Main process exited,
 	// code=<c>, status=<n>/..." lines — the exit statuses that separate a
 	// container-start failure (125) from the server process dying.
-	cmdJournalNhpServerExits = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep=Main process exited"
+	cmdJournalNhpServerExits = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='Main process exited'"
 
-	// cmdJournalNhpServerPanics counts Go panic headers. Corroboration for
-	// the message, not the safety property (see the file header).
-	cmdJournalNhpServerPanics = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep=^panic:"
+	// The three Go panic/fatal markers, counted as LINES and summed into
+	// restartEvidence.Panics. Corroboration for the message, not the safety
+	// property (see the file header).
+	//
+	// Three probes rather than one alternation because the reject-list bars
+	// `|` from a probe string outright. They must stay in lockstep with the
+	// single `grep -cE "^(panic: |fatal error: |goroutine [0-9]+
+	// \[running\]:)"` in the deploy gate's on-instance script: PANICS is what
+	// selects the "#1096 panic class" wording, so a marker matched on one
+	// side only means the two callers diagnose the same crash differently.
+	// A `fatal error:` (concurrent map write, out of memory) is a runtime
+	// abort with no `panic:` line at all, and one panic emits both its
+	// `panic:` header and a `goroutine N [running]:` line — the gate counts
+	// both, so summing three probes reproduces its count exactly.
+	// Fenced by the shared journal corpus.
+	//
+	// One residual the corpus cannot see: journalctl's --grep is smart-case,
+	// so an all-lowercase pattern matches case-INSENSITIVELY. These three
+	// patterns are all lowercase, while the gate's `grep -cE` is
+	// case-sensitive — so a MESSAGE beginning `Panic: ` would be counted here
+	// and not there. The other three probes below contain uppercase, which
+	// keeps journalctl case-sensitive and leaves them aligned. The Go runtime
+	// only ever emits these markers lowercase, so no real crash diverges, and
+	// neither fence can reach it: the corpus replays canonical text, and Go's
+	// regexp stand-in for --grep is case-sensitive either way. Left as a
+	// documented residual rather than papered over with a (?i) that would
+	// make the emulation lie about the gate.
+	cmdJournalNhpServerPanics        = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='^panic: '"
+	cmdJournalNhpServerFatalErrors   = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='^fatal error: '"
+	cmdJournalNhpServerGoroutineDump = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='^goroutine [0-9]+ \\[running\\]:'"
 
 	// cmdJournalNhpServerOOM matches systemd's own unit-scoped OOM message.
 	// The kernel's "Out of memory: Killed process" line is NOT visible here:
 	// kernel records carry no _SYSTEMD_UNIT, so `journalctl -u` excludes
 	// them. A container OOM also surfaces as exit 137 (128+SIGKILL), which
 	// the exit-status branch already fails on.
-	cmdJournalNhpServerOOM = "journalctl -u nhp-server -b --no-pager -o cat -n 50 --grep=killed by the OOM killer"
+	//
+	// -n was 50 where every other probe used 400; harmonized deliberately, so
+	// the shared bound documented above is one number rather than a special
+	// case a reader has to explain. Strictly a wider window on a line that is
+	// rare to begin with, so it cannot lose evidence — but it is a behaviour
+	// change, not a consequence of the quoting fix.
+	cmdJournalNhpServerOOM = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='killed by the OOM killer'"
 
 	// cmdJournalNhpServerDaemonErrors returns docker daemon refusals so the
 	// failure message can name the actual cause. Filtered in Go, not here:
@@ -94,7 +146,31 @@ const (
 	// daemon error after a failed start that systemd then retried
 	// successfully. Reporting it would name the harmless line and hide the
 	// real one.
-	cmdJournalNhpServerDaemonErrors = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep=Error response from daemon:"
+	cmdJournalNhpServerDaemonErrors = "journalctl -u nhp-server -b --no-pager -o cat -n 400 --grep='Error response from daemon:'"
+)
+
+// panicMarkerProbes are the three probes whose line counts SUM into
+// restartEvidence.Panics, reproducing the gate's single alternation.
+//
+// One list, not a loop body repeated per caller: the production collector and
+// the journal-corpus fence both range over this, so adding a fourth marker is
+// one edit. Hand-copying the subset is the seam journalEvidenceProbes was
+// introduced to close, and a marker added to production but not to the fence
+// would only be caught if some fixture happened to exercise it alone.
+var panicMarkerProbes = []string{
+	cmdJournalNhpServerPanics,
+	cmdJournalNhpServerFatalErrors,
+	cmdJournalNhpServerGoroutineDump,
+}
+
+// journalEvidenceProbes is every journal probe the collector issues, in the
+// order it issues them. Named so the shell-safety fence and the corpus fence
+// enumerate exactly what production sends rather than a hand-copied list that
+// can fall behind.
+var journalEvidenceProbes = slices.Concat(
+	[]string{cmdJournalNhpServerExits},
+	panicMarkerProbes,
+	[]string{cmdJournalNhpServerOOM, cmdJournalNhpServerDaemonErrors},
 )
 
 // maxSelfHealedRestarts bounds how much container-start flapping still counts
@@ -339,6 +415,33 @@ func parseSystemdExitLines(journal string) []string {
 // ExecStartPre emits on every clean start (including the successful retry
 // after a failed one, which is why "last line wins" alone reports the wrong
 // thing).
+//
+// Equivalent to the gate's
+//
+//	grep -oE "Error response from daemon: .*" | grep -v "No such container" |
+//	  tail -n 1 | tr -d "\r" | cut -c1-200 | tr -d "\n"
+//
+// for canonical docker output — which always emits `Error response from
+// daemon: <msg>`, with "No such container" appearing only AS the message body —
+// and the journal corpus pins that. It is NOT equivalent for constructed input,
+// in at least three ways, all verified:
+//
+//   - Filter scope. The shell re-extracts marker-to-EOL and filters that
+//     substring; this tests the whole line. On `No such container … : Error
+//     response from daemon: <real error>` the shell keeps the real error and
+//     this drops the line.
+//   - Required separator. The shell regex requires the colon-space; the marker
+//     here does not. On `…daemon:<msg>` with no space this reports the message
+//     and the shell reports nothing.
+//   - Trailing whitespace. `grep -o` preserves it; TrimSpace here removes it.
+//
+// Deliberately not chased into exact equivalence. DAEMONERR only sharpens the
+// operator message — no branch of classifyRestartEvidence reads it — so a
+// divergence on input docker cannot produce costs nothing, while matching a
+// grep pipeline byte-for-byte in Go means also reproducing `grep -o`'s
+// multiple-matches-per-line and `cut -c`'s locale-dependent character
+// counting. That is a larger surface than the thing it would protect. The
+// corpus is what guarantees agreement on journals that actually occur.
 func lastMeaningfulDaemonError(journal string) string {
 	const marker = "Error response from daemon:"
 	found := ""
@@ -370,8 +473,9 @@ func countNonEmptyLines(out string) int {
 
 // probeServerRestartEvidence collects everything needed to classify a
 // non-zero NRestarts counter. Callers MUST have already established that the
-// counter is non-zero (via probeServerNRestarts) — this issues five extra SSM
-// round-trips and there is nothing to explain on a healthy instance.
+// counter is non-zero (via probeServerNRestarts) — this issues eight extra SSM
+// round-trips (ActiveState, SubState, exits, three panic markers, OOM, daemon
+// errors) and there is nothing to explain on a healthy instance.
 //
 // Fails closed: any probe error is returned, and the caller treats an error as
 // "cannot confirm the deploy was clean".
@@ -396,11 +500,17 @@ func probeServerRestartEvidence(ctx context.Context, instanceID string, nRestart
 	}
 	ev.Exits = parseSystemdExitLines(exitLines)
 
-	panicLines, err := sendShellScript(ctx, instanceID, cmdJournalNhpServerPanics)
-	if err != nil {
-		return ev, fmt.Errorf("probe journal panic lines: %w", err)
+	// Summed, not one probe: see panicMarkerProbes. The gate's single
+	// alternation counts all three marker kinds as panic lines, and PANICS
+	// only ever selects wording, so partial coverage here would make the two
+	// callers describe the same crash differently.
+	for _, cmd := range panicMarkerProbes {
+		lines, err := sendShellScript(ctx, instanceID, cmd)
+		if err != nil {
+			return ev, fmt.Errorf("probe journal panic lines: %w", err)
+		}
+		ev.Panics += countNonEmptyLines(lines)
 	}
-	ev.Panics = countNonEmptyLines(panicLines)
 
 	oomLines, err := sendShellScript(ctx, instanceID, cmdJournalNhpServerOOM)
 	if err != nil {

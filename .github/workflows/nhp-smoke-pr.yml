@@ -28,6 +28,14 @@ on:
       # gate. A corpus-only edit changes what this suite must agree with, so it
       # has to re-run the drift fence even though no Go file moved.
       - "tests/fixtures/nhp-server-restart-evidence/**"
+      # The journal corpus one level earlier, pinning the two COLLECTORS against
+      # each other rather than the two decision tables.
+      - "tests/fixtures/nhp-server-restart-journals/**"
+      # The gate's on-instance collector itself. It is the thing this suite's
+      # --grep probes and parsers have to agree with, so a change there has to
+      # re-run TestRestartEvidenceJournalCorpus — the direction that actually
+      # needs catching, since a smoke-side edit already trips these paths.
+      - ".github/scripts/verify-knock-ready.sh"
       - "scripts/run-smoke.sh"
       - "scripts/smoke-local-stack.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"

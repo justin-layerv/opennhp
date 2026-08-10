@@ -1,0 +1,6 @@
+Started nhp-server.service.
+nhp-server.service: A process of this unit has been killed by the OOM killer.
+nhp-server.service: Main process exited, code=killed, status=9/KILL
+nhp-server.service: Failed with result 'oom-kill'.
+nhp-server.service: Scheduled restart job, restart counter is at 1.
+Started nhp-server.service.

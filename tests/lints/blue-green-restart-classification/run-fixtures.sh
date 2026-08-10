@@ -760,6 +760,107 @@ else
     "only $corpus_cases case(s) in $CORPUS — the shared decision table lost cases" ""
 fi
 
+# ============================================================================
+# Part E — the shared COLLECTOR corpus.
+#
+# Part D pins the two decision tables against each other, but it starts from a
+# report that already exists. There are two COLLECTORS as well — this side's
+# piped on-instance script, and the --grep probes plus Go parsers in
+# tests/smoke/restart_evidence.go — and two collectors reading the same journal
+# can build different reports. A verdict is only as good as the lines it was
+# built from, so agreeing on the decision while disagreeing on the evidence
+# reproduces the original outage with matching verdicts.
+#
+# It has already happened twice: the Go side matched only `^panic:` where this
+# script matches `fatal error:` and `goroutine N [running]:` too, and this
+# script's `tr "\n" " "` left a trailing space on DAEMONERR that the Go side
+# trimmed.
+#
+# So each case in tests/fixtures/nhp-server-restart-journals/ holds journal text
+# plus unit state, and the one report both collectors must produce from it. This
+# part drives the on-instance script over them; TestRestartEvidenceJournalCorpus
+# drives the Go collector over the same journals.
+# ============================================================================
+echo "  Part E — shared journal corpus (drift fence vs the Go collector)"
+
+JOURNAL_CORPUS="${REPO_ROOT}/tests/fixtures/nhp-server-restart-journals"
+journal_cases=0
+
+for case_dir in "$JOURNAL_CORPUS"/*/; do
+  [ -d "$case_dir" ] || continue
+  case_name="$(basename "$case_dir")"
+  journal_cases=$((journal_cases + 1))
+  ran=$((ran + 1))
+
+  if [ ! -f "$case_dir/journal" ] || [ ! -f "$case_dir/unit" ] || [ ! -f "$case_dir/report" ]; then
+    fail "journal corpus: $case_name" "case is missing journal, unit or report" ""
+    continue
+  fi
+
+  # Daemon-error lines must be ASCII, and this checks it rather than trusting
+  # the README to be obeyed.
+  #
+  # `cut -c1-200` in the on-instance script counts CHARACTERS under a UTF-8
+  # locale (BSD/macOS) and BYTES under GNU coreutils, while the Go collector
+  # slices 200 bytes. A multi-byte daemon error at or over that boundary
+  # therefore passes on Linux CI and fails a macOS `make lint-workflows`, as a
+  # byte-diff on a report that looks correct. Caught ahead of that comparison so
+  # the message names the cause.
+  #
+  # Scoped to the daemon-error line because that is the only text `cut -c`
+  # touches: EXITS goes through a line-wise sed, and PANICS/OOM through
+  # `grep -c` on ASCII patterns, none of which is locale-sensitive. Journals may
+  # therefore keep real non-ASCII elsewhere — the unit's own stop handler logs
+  # "✅ Server stopped gracefully", and a fixture that dropped it to satisfy a
+  # blanket ASCII rule would be less faithful for no gain.
+  #
+  # LC_ALL=C makes the bracket expression byte-wise: every byte of a multi-byte
+  # sequence is >= 0x80, so it is neither [:print:] nor [:space:].
+  case_daemon_lines=$(grep -o 'Error response from daemon:.*' "$case_dir/journal" || true)
+  if printf '%s' "$case_daemon_lines" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+    fail "journal corpus: $case_name" \
+      "the daemon-error line carries non-ASCII bytes; keep it ASCII — cut -c is character-based under a UTF-8 locale and byte-based under GNU coreutils, so this case would pass on Linux CI and fail on macOS. See the corpus README." \
+      "$case_daemon_lines"
+    continue
+  fi
+
+  # `unit` holds the three values systemctl would report, in the same
+  # key=value shape as the report so both sides read it identically.
+  case_nrestarts=$(sed -n 's/^NRESTARTS=//p' "$case_dir/unit")
+  case_activestate=$(sed -n 's/^ACTIVESTATE=//p' "$case_dir/unit")
+  case_substate=$(sed -n 's/^SUBSTATE=//p' "$case_dir/unit")
+
+  set +e
+  got_report=$(env FIXTURE_JOURNAL="$case_dir/journal" \
+    FIXTURE_NRESTARTS="$case_nrestarts" \
+    FIXTURE_ACTIVESTATE="$case_activestate" \
+    FIXTURE_SUBSTATE="$case_substate" \
+    PATH="$SHIM_DIR:$PATH" bash -c "$PROBE" 2>&1)
+  set -e
+
+  # Compared byte for byte against the committed report, trailing newline
+  # aside. A normalising comparison here would have hidden the DAEMONERR
+  # trailing space that this fence was written to catch — and THIS is the only
+  # side that can see a regression in the script, because it is the only side
+  # that runs it. The Go counterpart's inputs are the committed report and its
+  # own collector's output, so nothing this script does can change its result.
+  if [ "$got_report" = "$(cat "$case_dir/report")" ]; then
+    pass "journal corpus: $case_name"
+  else
+    fail "journal corpus: $case_name" \
+      "the on-instance script no longer produces this case's report" \
+      "$(diff <(cat "$case_dir/report") <(printf '%s\n' "$got_report") || true)"
+  fi
+done
+
+ran=$((ran + 1))
+if [ "$journal_cases" -ge 5 ]; then
+  pass "the shared journal corpus still has its cases ($journal_cases)"
+else
+  fail "the shared journal corpus still has its cases" \
+    "only $journal_cases case(s) in $JOURNAL_CORPUS — the shared collector corpus lost cases" ""
+fi
+
 echo ""
 # A suite that asserted nothing would otherwise report success.
 if [ "$ran" -lt 25 ]; then

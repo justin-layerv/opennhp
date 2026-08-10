@@ -246,7 +246,7 @@ j=$(journalctl -u $u -b -n 20000 --no-pager -o cat 2>/dev/null || true)
 printf "EXITS=%s\n" "$(printf "%s\n" "$j" | sed -n "s/.*Main process exited, code=\([a-z]*\), status=\([0-9]*\).*/\1:\2/p" | tr "\n" ",")"
 printf "PANICS=%s\n" "$(printf "%s\n" "$j" | grep -cE "^(panic: |fatal error: |goroutine [0-9]+ \[running\]:)" || true)"
 printf "OOM=%s\n" "$(printf "%s\n" "$j" | grep -c "killed by the OOM killer" || true)"
-printf "DAEMONERR=%s\n" "$(printf "%s\n" "$j" | grep -oE "Error response from daemon: .*" | grep -v "No such container" | tail -n 1 | tr -d "\r" | tr "\n" " " | cut -c1-200)"'
+printf "DAEMONERR=%s\n" "$(printf "%s\n" "$j" | grep -oE "Error response from daemon: .*" | grep -v "No such container" | tail -n 1 | tr -d "\r" | cut -c1-200 | tr -d "\n")"'
 
 # _restart_evidence_probe_once INSTANCE_ID → one evidence probe attempt.
 # Echoes the multi-line evidence report on success, or a single

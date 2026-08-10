@@ -235,6 +235,10 @@ on:
       # ...and the corpus it shares with tests/smoke's Go classifier, so a
       # corpus-only edit re-runs this side of the drift fence too.
       - "tests/fixtures/nhp-server-restart-evidence/**"
+      # Same again one level earlier: the journal corpus both COLLECTORS must
+      # build the same report from (Part E here, TestRestartEvidenceJournalCorpus
+      # in tests/smoke).
+      - "tests/fixtures/nhp-server-restart-journals/**"
       - ".github/actions/verify-image-attestation/**"
       # The watchdog script itself rides .github/scripts/** above.
       - "tests/lints/attestation-verify-watchdog/**"

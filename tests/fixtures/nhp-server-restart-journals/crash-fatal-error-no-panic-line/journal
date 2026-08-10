@@ -1,0 +1,8 @@
+Started nhp-server.service.
+fatal error: concurrent map writes
+
+goroutine 42 [running]:
+runtime.throw({0x9b1a2c?, 0x0?})
+nhp-server.service: Main process exited, code=exited, status=2/INVALIDARGUMENT
+nhp-server.service: Scheduled restart job, restart counter is at 1.
+Started nhp-server.service.
