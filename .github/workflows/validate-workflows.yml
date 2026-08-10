@@ -388,7 +388,17 @@ jobs:
           bash tests/lints/golangci-config-schema/run-fixtures.sh
           python3 scripts/check-golangci-config-schema.py
 
-
+      # FIRST of the tests.scripts.* steps, deliberately. #3799 deleted seven
+      # modules but left the step running them; #3801 removed that step after
+      # main went red. A stale reference does not merely fail its own step —
+      # unittest's loader turns the missing module into a failing test, the
+      # step exits 1, and every LATER step in this job is skipped. So a fence
+      # placed after another tests.scripts.* step could be preempted by the
+      # very ModuleNotFoundError it exists to explain. It needs nothing but the
+      # checkout and PyYAML above, so it goes here; the test asserts this
+      # ordering so a future insertion cannot quietly undo it.
+      - name: Fence workflow references to tests/scripts modules
+        run: python3 -m unittest -v tests.scripts.test_workflow_python_modules_exist
 
       # Both Claude entry points must use the same proven action SHA and explicit
       # model. Automatic review must remain a default-branch-trusted
