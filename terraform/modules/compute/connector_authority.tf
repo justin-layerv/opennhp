@@ -40,7 +40,15 @@ resource "terraform_data" "connector_authority_cell_contract" {
     precondition {
       condition = (
         contains(["sandbox", "prod"], var.connector_authority_cell_config.environment) &&
-        var.connector_authority_cell_config.environment == var.environment &&
+        # Compare against the PROTOCOL environment, not the infrastructure
+        # namespace. var.environment is the namespace ("sandbox",
+        # "sandbox-cell1", ...); the Connector Authority is Control-global and
+        # keyed by the protocol environment ("sandbox"/"prod"). On cell1 those
+        # differ by design -- protocol_environment's own description says a
+        # secondary cell "sets sandbox while retaining a distinct infrastructure
+        # namespace" -- so `== var.environment` fails every sandbox-cell1 apply
+        # with "sandbox" != "sandbox-cell1" and blocks the whole deploy.
+        var.connector_authority_cell_config.environment == local.protocol_environment &&
         lookup(
           local.connector_authority_account_by_environment,
           var.connector_authority_cell_config.environment,
