@@ -209,6 +209,13 @@ class TestAlarmSummary:
         ignored_non_status_suffixes = {
             "-art-replay-gate-drop",
             "-auth-failures",
+            # A cell instance served a Connector registration while its
+            # Authority handler was still dark (un-activated env, or mid
+            # activation rollout). That is an internal activation-rollout
+            # tripwire on a control-plane path with no public status
+            # component, not evidence that the public NHP server is
+            # unavailable — the knock edge keeps serving throughout.
+            "-connector-registration-handler-absent",
             "-internal-auth-signer-unavailable",
             # qURL reverse-tunnel token binding is an internal rollout/security
             # tripwire, not evidence that the public NHP server is unavailable.

@@ -202,6 +202,22 @@ jobs:
             lambdas:
               - 'terraform/modules/**/lambda/**'
               - 'terraform/lambda/**'
+              # Not Lambda code, but Lambda test *inputs*. These suites are
+              # largely Terraform-contract fences: they parse HCL outside their
+              # own lambda/ dir and fail when it drifts from the Python. Cover
+              # what they read, or a PR touching only that HCL skips the whole
+              # job and lands the drift red on main, where it surfaces later on
+              # an unrelated Lambda PR (#3732 → #3779). Each is module- rather
+              # than file-scoped so moving a resource to a sibling .tf can't
+              # silently reopen the gap.
+              #   monitoring          -> status-page cell-alarm classification
+              #   status-page         -> its own main/variables/README/frontend
+              #   custom-domain-cert  -> its renewal-metric alarm contract
+              - 'terraform/modules/monitoring/**'
+              - 'terraform/modules/status-page/**'
+              - 'terraform/modules/custom-domain-cert/**'
+              # Root qurl_link probe URL, asserted by the status-page suite.
+              - 'terraform/main.tf'
             packer:
               - 'packer/**'
             packer_server:
