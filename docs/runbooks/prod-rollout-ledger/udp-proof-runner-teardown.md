@@ -77,8 +77,14 @@ closed, so prod is code-only with no resource change.
 
 **Steps 1–3 are unreachable — see the next section before attempting them.**
 
-- [ ] Remove the orphaned `authority_proof_controller_invoke` policy (blocks the
-      apply, and blocks steps 1–3 from ever being restorable).
+- [ ] Restore the `layerv-nhp-sandbox-udp-proof-controller` IAM role, and decide
+      which root owns it now. This clears the **Terraform** wedge (the apply);
+      it does not restore a caller for steps 1–3. See "the orphan is not
+      independently removable" below. Do **not** try to delete the orphaned
+      policy instead; the module forbids it.
+- [ ] Reinstate a caller for the controller, or widen its trust policy — it is
+      GitHub-OIDC-only and its workflow was revoked (#3806). Required before
+      steps 1–3, not before the apply unblock above.
 - [ ] Decide the ordering for retiring the rollout selector now that it is known
       to replace the Hub task definition (measured below), then execute it.
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
@@ -108,9 +114,13 @@ destroying the runner root left it in Control's graph pointing at nothing.
 
 This is a latent **apply** failure, not a guard failure: any plan that changes
 the proof alias set re-renders the policy and calls `PutRolePolicy` on a role
-that is gone. It is a no-op today only because the alias set has not moved. This
-must be cleared before anything else, and it is also why steps 1–3 cannot simply
-be "restored" — the identity they need was deleted out from under Control.
+that is gone. It is a no-op today only because the alias set has not moved.
+
+This must be resolved before anything else — **by restoring the role, not by
+deleting the policy**; see "the orphan is not independently removable" below for
+why the module forbids the latter. It is also why the sanctioned steps 1–3
+cannot simply be "restored": the identity they need was deleted out from under
+Control.
 
 ### Blocker 2 — retiring the selector is not a small change
 
@@ -134,14 +144,66 @@ Hub task-definition replacement is a live Hub redeploy riding along with a
 "gate flip", which is what #3809's review caught. Decide deliberately whether to
 accept that or decompose it; do not let it arrive unattended.
 
-### Both blockers need a fence lane first
+### The orphan is not independently removable — measured, then refused
+
+The obvious next move is to drop the orphaned policy on its own. **It does not
+work, and the module says so.** `authority_proof_mutation_fence_valid`
+(`authority_runtime_contract.tf`) requires, whenever
+`authority_proof_mutation_controls_enabled` is true, exactly one controller role
+ARN equal to the deterministic `layerv-nhp-<env>-udp-proof-controller` ARN. Its
+own comment states the intent: *the only admitted controller identity is the
+deterministic role whose selected-alias policy Control owns in this same plan.*
+
+Control owning that policy and the capability being enabled are welded together
+on purpose. So the policy cannot leave while the capability is on, and turning
+the capability off is the `authority-proof-disable` transition — step 4, which
+requires all six aliases to already be no-ops, which requires steps 1–3, which
+require the controller. That is the whole deadlock, and its cause is that an IAM
+role Control depends on was deleted by a different root.
+
+Two measured notes for whoever picks this up:
+
+- `terraform plan -refresh-only` against live state does cleanly detect
+  `authority_proof_controller_invoke[0]` as *deleted outside Terraform*, and it
+  is the **only** drift in the root. But **do not run a refresh-only apply on its
+  own**: the module still declares the resource, so once state forgets it every
+  subsequent plan wants to create it against a role that does not exist, turning
+  a latent apply failure into a guaranteed one.
+- Because the capability must stay enabled until step 4, the cheapest correct
+  unblock is to **restore the IAM role** rather than to fight the contract.
+  Nothing needs to assume it for Control's plan to become applyable again — the
+  contract only requires the role to exist so Control can own a policy on it.
+  Its definition is recoverable from history at
+  `be7f2b5bd^:terraform/modules/udp-proof-runner/iam.tf`
+  (`aws_iam_role.controller`). Decide deliberately which root should own it now,
+  given the runner root that used to is gone.
+
+  **Restoring the role does not restore the ability to run steps 1–3.** That
+  role's trust policy admits only `sts:AssumeRoleWithWebIdentity` federated to
+  the GitHub OIDC provider and conditioned on
+  `repo:<repo>:environment:<environment>` — there is no AWS principal in it, so
+  no operator or CLI session can assume it, and the workflow that did was
+  removed with its App credentials revoked in #3806. Treat these as two separate
+  wedges: restoring the role clears the **Terraform** one (the apply), while
+  invoking the controller additionally needs a caller that no longer exists.
+  Anyone planning steps 1–3 must budget for reinstating one, or for widening
+  that trust policy deliberately.
+
+### The remaining blocker still needs a fence lane
 
 `scripts/check-connector-authority-foundation.sh` admits no proof-related delete
-in any lane, and both blockers require deletes. The guard that rejects today's
-state also blocks its own remediation — the same class as
+in any lane, and retiring the selector requires four. The guard that rejects
+today's state also blocks its own remediation — the same class as
 `2026-08-06-unlock-prod-control-root.md`. The lane must be justified by the
 corrected live-first ordering; an allowance shaped to admit a **code-first**
 teardown stays forbidden, which is why #3809 was closed.
+
+Note the pattern before reaching for that lane. This fence has now refused three
+separate proposals — #3810's gate flip, #3809's code-first teardown, and an
+attempt to drop the orphaned invoke policy on its own — and on all three it was
+right, the last one enforced by the module contract rather than the fence. Treat
+a fourth refusal as evidence the sequence is still wrong, not as a fourth
+allowance to write.
 
 ## Two traps for whoever does this
 
