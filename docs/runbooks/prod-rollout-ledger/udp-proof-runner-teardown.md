@@ -75,10 +75,73 @@ the `authority_proof_policy_*` plumbing in
 branch in `build-and-push.yml`. Prod's six variables are validation-locked
 closed, so prod is code-only with no resource change.
 
-- [ ] Run the governed alias-controller rollback (steps 1–3 above).
+**Steps 1–3 are unreachable — see the next section before attempting them.**
+
+- [ ] Remove the orphaned `authority_proof_controller_invoke` policy (blocks the
+      apply, and blocks steps 1–3 from ever being restorable).
+- [ ] Decide the ordering for retiring the rollout selector now that it is known
+      to replace the Hub task definition (measured below), then execute it.
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
       (step 5).
 - [ ] Delete the code once live state is dark.
+
+## Measured 2026-08-10 — two blockers, both verified against live sandbox
+
+The ordering above assumes a live governed alias controller. There is not one,
+and there has not been since this root was destroyed.
+`docs/design/AUTHORITY_PROOF_MUTATION_CONTROLS.md` § Rollback ordering now
+carries the correction; the evidence:
+
+| Probe | Result |
+|---|---|
+| `iam get-role layerv-nhp-sandbox-udp-proof-controller` | `NoSuchEntity` |
+| `lambda get-policy` on ca-pm (function, and `green` alias) | `ResourceNotFoundException` |
+
+So steps 1–3 have no caller and no permission. **Do not attempt them.**
+
+### Blocker 1 — orphaned invoke policy (undocumented until now)
+
+`aws_iam_role_policy.authority_proof_controller_invoke[0]` still manages an
+inline policy on that deleted role. Its `count` keys off
+`authority_proof_mutation_controls_enabled`, not off the role existing, so
+destroying the runner root left it in Control's graph pointing at nothing.
+
+This is a latent **apply** failure, not a guard failure: any plan that changes
+the proof alias set re-renders the policy and calls `PutRolePolicy` on a role
+that is gone. It is a no-op today only because the alias set has not moved. This
+must be cleared before anything else, and it is also why steps 1–3 cannot simply
+be "restored" — the identity they need was deleted out from under Control.
+
+### Blocker 2 — retiring the selector is not a small change
+
+Measured with a local read-only plan against live state (serial 95) at
+`consumers_staged=false, selected=none, prepared=none`:
+**`1 to add, 16 to change, 5 to destroy`.**
+
+Dropping the colours moves `authority_proof_policy_effective_color` green → blue,
+which repoints the proof alias everywhere it is referenced:
+
+- `aws_ecs_task_definition.hub[0]` **replaced** and `aws_ecs_service.hub[0]`
+  redeployed (the Hub public config embeds the proof alias ARN)
+- `aws_iam_role_policy.hub_task[0]`, `aws_vpc_endpoint.interface["lambda"]`, and
+  the `authority_proof_mutation_alias_arn` output all change
+- both ca-pm aliases move; 5 `authority_exec` policies update
+- the 4 `authority_proof_standby` pools are deleted
+
+IA/RA/ICR aliases stay exact no-ops, and every surviving warm pool keeps its
+value (`steady == rollout_active == rollout_standby == 2` in the basis). But a
+Hub task-definition replacement is a live Hub redeploy riding along with a
+"gate flip", which is what #3809's review caught. Decide deliberately whether to
+accept that or decompose it; do not let it arrive unattended.
+
+### Both blockers need a fence lane first
+
+`scripts/check-connector-authority-foundation.sh` admits no proof-related delete
+in any lane, and both blockers require deletes. The guard that rejects today's
+state also blocks its own remediation — the same class as
+`2026-08-06-unlock-prod-control-root.md`. The lane must be justified by the
+corrected live-first ordering; an allowance shaped to admit a **code-first**
+teardown stays forbidden, which is why #3809 was closed.
 
 ## Two traps for whoever does this
 

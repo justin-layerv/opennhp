@@ -346,6 +346,18 @@ simulated green result.
 
 ## Rollback ordering
 
+> [!IMPORTANT]
+> **The ordering below is unreachable as written since #3804.** It assumes a
+> live governed alias controller. The `udp-proof-runner` root that owned the
+> controller identity was destroyed and its state object deleted before this
+> rollback ever ran, so steps 1-3 have no caller. Measured 2026-08-10:
+> `layerv-nhp-sandbox-udp-proof-controller` returns `NoSuchEntity`, and ca-pm
+> carries no resource-based policy on the function or on its `green` alias — so
+> nothing can invoke the controller and nothing would be permitted to if it
+> could. See `docs/runbooks/prod-rollout-ledger/udp-proof-runner-teardown.md`
+> for the measured plan and the remaining blockers. Do not follow steps 1-3
+> until that entry says they are reachable again.
+
 Rollback uses the governed alias controller plus two exact Control saved plans.
 First return IA/RA/ICR to the prior warm versions, then disable the
 consumer-staging gate while both aliases remain unchanged. Publish and warm the
@@ -361,3 +373,43 @@ proof alias output. IA/RA/ICR and all six aliases remain exact no-ops in this
 final plan. Verify the
 Control state/live lanes without the proof slice and require a refresh-enabled
 dark no-op before considering rollback complete.
+
+### Why it became unreachable: the cross-root ownership seam
+
+`aws_iam_role_policy.authority_proof_controller_invoke` is the seam. Control
+manages an inline policy on a role it does not own — the resource comment says
+so directly: *the role itself is pre-created by the udp-proof-runner root*. Its
+`count` keys off `authority_proof_mutation_controls_enabled`, **not** off the
+role existing, so destroying the runner root did not remove it from Control's
+graph. The grant's own design note ("rollback removes this grant before deleting
+the alias") describes an ordering the runner-root teardown bypassed.
+
+Consequences, both measured rather than reasoned:
+
+- The orphan is a latent **apply** failure, not just a guard failure. Any
+  Control plan that changes the proof alias set re-renders this policy and calls
+  `PutRolePolicy` against the deleted role. It is a no-op today only because the
+  alias set has not moved. A refresh-enabled lane finds the policy absent and
+  plans a create, which fails the same way.
+- Retiring the rollout selector is **not** a small IAM-only change. A local
+  read-only plan of `consumers_staged=false, selected=none, prepared=none`
+  against live state (serial 95) is `1 to add, 16 to change, 5 to destroy`.
+  Dropping the colours moves `authority_proof_policy_effective_color` from green
+  to blue, which repoints the proof alias everywhere it is referenced: the Hub
+  public config, so `aws_ecs_task_definition.hub[0]` is **replaced** and
+  `aws_ecs_service.hub[0]` redeployed; the Hub task role; the lambda interface
+  endpoint policy; and the proof alias output. Both ca-pm aliases move.
+  IA/RA/ICR aliases stay exact no-ops, as does every surviving warm pool
+  (`steady == rollout_active == rollout_standby == 2` in the measurement basis).
+
+Two consequences for whoever resumes this. First, any correct sequence must
+delete resources — the orphaned invoke policy, and the four
+`authority_proof_standby` pools — and
+`scripts/check-connector-authority-foundation.sh` admits no proof-related delete
+in any lane, so the fence must gain an exact-shape allowance before any of this
+can pass. That is the same guard-deadlock class as
+`docs/runbooks/prod-rollout-ledger/2026-08-06-unlock-prod-control-root.md`: the
+guard that rejects the broken state also blocks its own remediation. Second, the
+allowance must be justified by *this* corrected ordering. An allowance added to
+admit a code-first teardown — deleting the Terraform and then destroying what it
+managed — remains forbidden, because it inverts the live-first rule above.
