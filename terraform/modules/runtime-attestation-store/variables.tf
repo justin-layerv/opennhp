@@ -20,9 +20,11 @@ variable "name_prefix" {
 
 variable "bucket_name" {
   description = <<-EOT
-    Exact runtime-attestation bucket name. The deployment-manifest producer
-    only accepts a `layerv-nhp-sandbox-*` bucket ARN, so this name is part of
-    the published contract, not a cosmetic label.
+    Exact runtime-attestation bucket name. The `layerv-nhp-sandbox-*` shape is
+    enforced below rather than being a cosmetic label: the bucket's self-binding
+    policy and every attested node's write grant are scoped to this exact name,
+    so a rename is a boundary change. It was also the shape the retired
+    UDP-proof manifest producer required.
   EOT
   type        = string
   default     = "layerv-nhp-sandbox-runtime-attestations"

@@ -1,19 +1,20 @@
 # runtime-attestation-store
 
-Immutable per-node runtime evidence for the sandbox UDP-proof deployment
-manifest.
+Immutable per-node runtime evidence for the attested sandbox cell0, cell1 and
+qRTS fleets.
 
 Launch-template, SSM tag, AMI, or ECR lookups cannot prove what each current
 in-service instance is actually running: NHP servers run a Docker container, and
 `qurl-reverse-tunnel-server` pulls an ECR image only to extract a host binary and
 then removes the container. This module provisions the evidence channel that
-closes that gap, and publishes the two parameters the read-only producer
-(`.github/scripts/collect_udp_proof_deployment_evidence.py`) requires:
+closes that gap.
 
-| Parameter | Contents |
-| --- | --- |
-| `/sandbox/nhp/udp-proof/runtime-attestation-bucket-arn` | Exact bucket ARN |
-| `/sandbox/nhp/udp-proof/runtime-attestation-collector-contract` | Canonical collector, unit, repair-document, and bucket-policy digests |
+It was built for the attended UDP proof's deployment-manifest producer, and
+published two parameters under `/sandbox/nhp/udp-proof/` for it to read. That
+producer was deleted with the proof in #3799, so the parameters were retired —
+they were published for nobody. The contract they carried remains available as
+the `collector_contract` output; a future consumer should take it from there and
+re-derive its own encoding constraints rather than restoring the parameters.
 
 ## Why not SSM custom Inventory
 
@@ -112,14 +113,15 @@ during any rolling replacement.
 
 ## Canonical JSON
 
-The collector contract and the bucket policy are compared byte for byte against
-the producer's canonical encoder (sorted keys, `,`/`:` separators, ASCII).
-Terraform's `jsonencode` matches it exactly except that Go escapes `<`, `>`, and
-`&`; preconditions in `storage.tf` and `parameters.tf` fail closed if any such
-character ever enters either document.
+The bucket policy is canonically encoded (sorted keys, `,`/`:` separators,
+ASCII); a precondition in `storage.tf` fails closed if a `<`, `>`, or `&` ever
+enters it, since Go and Terraform escape those differently. The collector
+contract carried the same constraint while it was published to SSM for the
+UDP-proof producer; that bound retired with the parameters in #3815's follow-up,
+because nothing reads the contract over a wire any more.
 
 ## After applying
 
-Feed `bucket_arn` and `kms_key_arn` into the `sandbox-udp-proof-runner` root's
-`runtime_attestation_bucket_arn` / `runtime_attestation_kms_key_arn` so the
-producer role gains its read-only S3/KMS grants.
+Nothing downstream to wire. The store's only consumer was the UDP-proof
+deployment-manifest producer, deleted in #3799; the collector and its repair
+association attest the live cell0, cell1 and qRTS fleets on their own.

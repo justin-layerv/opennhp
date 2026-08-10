@@ -251,24 +251,23 @@ run "storage_boundary_contract" {
   }
 
   # ---------------------------------------------------------------------------
-  # The two parameters the producer reads, and the exact contract schema it
-  # accepts (.github/scripts/collect_udp_proof_deployment_evidence.py).
+  # The collector contract schema.
+  #
+  # This used to be asserted through the two SSM parameters the UDP-proof
+  # deployment-manifest producer read. That producer was deleted in #3799 and
+  # the parameters retired, so these now assert the `collector_contract` output
+  # directly — the contract is still the binding between the repair document and
+  # the exact committed bytes it installs, which is worth keeping regardless of
+  # who reads it.
+  #
+  # The producer's canonical-JSON and 4096-byte encoding assertions are gone with
+  # it: they constrained a wire format nothing consumes now. A future consumer
+  # should re-derive its own bounds rather than reinstating these.
   # ---------------------------------------------------------------------------
 
   assert {
     condition = (
-      aws_ssm_parameter.runtime_attestation_bucket_arn.name == "/sandbox/nhp/udp-proof/runtime-attestation-bucket-arn" &&
-      aws_ssm_parameter.runtime_attestation_bucket_arn.type == "String" &&
-      aws_ssm_parameter.runtime_attestation_bucket_arn.value == "arn:aws:s3:::layerv-nhp-sandbox-runtime-attestations" &&
-      aws_ssm_parameter.runtime_attestation_collector_contract.name == "/sandbox/nhp/udp-proof/runtime-attestation-collector-contract" &&
-      aws_ssm_parameter.runtime_attestation_collector_contract.type == "String"
-    )
-    error_message = "Both producer-read parameters must exist at their exact paths as public String values."
-  }
-
-  assert {
-    condition = (
-      keys(jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value)) == [
+      keys(output.collector_contract) == [
         "bucket_policy_sha256",
         "collector_sha256",
         "repair_document_name",
@@ -278,32 +277,22 @@ run "storage_boundary_contract" {
         "service_unit_sha256",
         "timer_unit_sha256",
       ] &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).schema_version == 1 &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).repair_document_name == "layerv-nhp-sandbox-runtime-attestation-repair" &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).repair_document_version == aws_ssm_document.repair.document_version
+      output.collector_contract.schema_version == 1 &&
+      output.collector_contract.repair_document_name == "layerv-nhp-sandbox-runtime-attestation-repair" &&
+      output.collector_contract.repair_document_version == aws_ssm_document.repair.document_version
     )
-    error_message = "The collector contract must carry exactly the eight fields the producer's exact-key reader accepts."
+    error_message = "The collector contract must carry exactly its eight declared fields."
   }
 
   assert {
     condition = (
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).collector_sha256 == filesha256("${path.module}/assets/collect-runtime-attestation.py") &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).service_unit_sha256 == filesha256("${path.module}/assets/layerv-runtime-attestation.service") &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).timer_unit_sha256 == filesha256("${path.module}/assets/layerv-runtime-attestation.timer") &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).repair_document_sha256 == sha256(aws_ssm_document.repair.content) &&
-      jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value).bucket_policy_sha256 == sha256(aws_s3_bucket_policy.attestations.policy)
+      output.collector_contract.collector_sha256 == filesha256("${path.module}/assets/collect-runtime-attestation.py") &&
+      output.collector_contract.service_unit_sha256 == filesha256("${path.module}/assets/layerv-runtime-attestation.service") &&
+      output.collector_contract.timer_unit_sha256 == filesha256("${path.module}/assets/layerv-runtime-attestation.timer") &&
+      output.collector_contract.repair_document_sha256 == sha256(aws_ssm_document.repair.content) &&
+      output.collector_contract.bucket_policy_sha256 == sha256(aws_s3_bucket_policy.attestations.policy)
     )
-    error_message = "Every published digest must bind the exact committed bytes it claims to describe."
-  }
-
-  # The producer parses this value with its canonical-JSON reader, which rejects
-  # any non-canonical encoding outright.
-  assert {
-    condition = (
-      aws_ssm_parameter.runtime_attestation_collector_contract.value == jsonencode(jsondecode(aws_ssm_parameter.runtime_attestation_collector_contract.value)) &&
-      length(aws_ssm_parameter.runtime_attestation_collector_contract.value) <= 4096
-    )
-    error_message = "The collector contract must be canonical JSON within the producer's 4096-byte bound."
+    error_message = "Every contract digest must bind the exact committed bytes it claims to describe."
   }
 
   # The installer must refuse to write anything whose digest differs from the

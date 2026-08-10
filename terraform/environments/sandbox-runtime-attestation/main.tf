@@ -1,21 +1,18 @@
 # -----------------------------------------------------------------------------
 # Sandbox runtime-attestation store — the immutable per-node runtime evidence
-# channel for the UDP-proof deployment manifest.
+# channel for the attested cell0, cell1 and qRTS fleets.
 #
 # Launch-template, SSM tag, AMI, or ECR lookups cannot prove what each current
 # in-service instance is running: NHP servers run a Docker container, and
 # qurl-reverse-tunnel-server pulls an ECR image only to extract a host binary
 # and then removes the container. This root provisions the evidence channel
-# that closes that gap, and publishes the two parameters the read-only producer
-# reads:
+# that closes that gap.
 #
-#   /sandbox/nhp/udp-proof/runtime-attestation-bucket-arn
-#   /sandbox/nhp/udp-proof/runtime-attestation-collector-contract
-#
-# After applying, feed `bucket_arn` and `kms_key_arn` into the
-# sandbox-udp-proof-runner root's runtime_attestation_bucket_arn /
-# runtime_attestation_kms_key_arn so the producer role gains its read-only
-# S3/KMS grants.
+# It was built for the attended UDP proof's deployment-manifest producer and
+# used to publish two parameters under /sandbox/nhp/udp-proof/ for it. That
+# producer was deleted with the proof in #3799 and the parameters were retired;
+# the store itself is unaffected, because the collector and its repair
+# association attest the live fleets regardless of who reads the evidence.
 # -----------------------------------------------------------------------------
 
 locals {

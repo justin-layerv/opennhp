@@ -1,5 +1,5 @@
 output "bucket_arn" {
-  description = "Exact runtime-attestation bucket ARN — the sandbox-udp-proof-runner root's runtime_attestation_bucket_arn."
+  description = "Exact runtime-attestation bucket ARN."
   value       = aws_s3_bucket.attestations.arn
 }
 
@@ -9,7 +9,7 @@ output "bucket_name" {
 }
 
 output "kms_key_arn" {
-  description = "Exact CMK ARN for attestation objects — the sandbox-udp-proof-runner root's runtime_attestation_kms_key_arn."
+  description = "Exact CMK ARN for attestation objects."
   value       = aws_kms_key.attestations.arn
 }
 
@@ -34,16 +34,6 @@ output "repair_association_ids" {
 }
 
 output "collector_contract" {
-  description = "The canonical collector contract published to SSM."
+  description = "The canonical collector contract: digests of the collector, its units, the repair document, and the bucket policy."
   value       = local.collector_contract
-}
-
-output "bucket_arn_parameter_name" {
-  description = "SSM parameter holding the exact attestation bucket ARN."
-  value       = aws_ssm_parameter.runtime_attestation_bucket_arn.name
-}
-
-output "collector_contract_parameter_name" {
-  description = "SSM parameter holding the canonical collector contract."
-  value       = aws_ssm_parameter.runtime_attestation_collector_contract.name
 }
