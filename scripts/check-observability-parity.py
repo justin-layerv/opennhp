@@ -677,10 +677,6 @@ def require_alarm_registry(
 #   servers + their alarms live in other roots this lint already checks, so there
 #   is no server observability surface to enforce parity on here. Removing the
 #   record root should drop this entry too.
-#   /28 VPC, one JIT runner at a time, a broker + sweeper) for the attended UDP
-#   proof. It instantiates no compute/AC/relay/security and no `module "nhp"`;
-#   the servers it exercises (cell0/cell1) + their alarms live in roots this lint
-#   already checks. Removing the runner root should drop this entry too.
 #
 #   sandbox-runtime-attestation: a sandbox-only root composing
 #   modules/runtime-attestation-store — the immutable per-node runtime evidence
