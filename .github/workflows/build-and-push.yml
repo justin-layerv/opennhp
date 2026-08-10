@@ -1952,6 +1952,17 @@ jobs:
         # while it still reports OK.
         run: ./tests/lints/tfvars-reachability/run-fixtures.sh
 
+      - name: Check IAM description charset (#3827 regression fence)
+        # An em dash in an IAM role description broke the sandbox deploy on
+        # main. terraform plan accepts such a description cleanly and only
+        # CreateRole rejects it, so this class cannot fail in review -- it
+        # merges green and breaks the apply. This job is PR-only, which is
+        # where the check needs to be.
+        run: python3 ./.github/scripts/check-iam-description-charset.py
+
+      - name: Run IAM description charset fixtures
+        run: ./tests/lints/iam-description-charset/run-fixtures.sh
+
       - name: Check Connector control table schemas
         # The authority owns global copies of four established qURL identity
         # tables. Compare their exact keys, attributes, GSIs, and TTL shape to
