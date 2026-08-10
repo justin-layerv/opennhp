@@ -13517,8 +13517,6 @@ class HubWorkerImageUpdateLaneTest(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class ComposedTransitionTest(unittest.TestCase):
@@ -15122,3 +15120,7 @@ class AuthorityImageUriMoveLaneTests(unittest.TestCase):
                 set(by_address), {a: ["update"] for a in by_address}, by_address
             )
         )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
