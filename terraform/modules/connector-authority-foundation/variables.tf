@@ -467,3 +467,26 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "authority_blue_green_alias_hold_enabled" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Blue/green alias semantics for the Authority runtime. Dark by default.
+
+    Today every alias tracks the newest published function version, so a new
+    image moves BOTH colours at once: there is no standby to warm and no
+    rollback target that differs from live. That is what leaves an image roll
+    moving 22 aliases, and it is why a "cutover" is not expressible.
+
+    When true, the SELECTED colour holds its current live version and only the
+    STANDBY colour advances to the newly published one. Cutting over then means
+    changing authority_runtime_contract.selected_authority_color -- one reviewed
+    value -- instead of aliases moving implicitly on republish.
+
+    The gate exists because the hold reads live alias versions through a data
+    source, which cannot resolve before the aliases exist. Keeping it false on
+    a first apply keeps the create path free of that lookup; enable it only once
+    the aliases are live.
+  EOT
+}

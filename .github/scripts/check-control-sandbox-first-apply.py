@@ -1478,6 +1478,14 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws_lambda_alias",
         "aws",
     ),
+    # Live alias versions for the blue/green hold. Declared unconditionally in
+    # the module, so it is in the configuration map even while the gate is dark
+    # and its for_each resolves empty.
+    "module.control.data.aws_lambda_alias.authority_live": (
+        "data",
+        "aws_lambda_alias",
+        "aws",
+    ),
     "module.control.aws_lambda_function.authority": (
         "managed",
         "aws_lambda_function",

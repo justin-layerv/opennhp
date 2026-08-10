@@ -246,3 +246,9 @@ variable "authority_proof_mutation_controller_role_arns" {
   type        = list(string)
   default     = []
 }
+
+variable "authority_blue_green_alias_hold_enabled" {
+  type        = bool
+  default     = false
+  description = "Blue/green alias semantics for the Authority runtime: the selected colour holds its live version and only standby advances. Dark by default."
+}

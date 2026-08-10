@@ -1144,6 +1144,18 @@ resource "aws_lambda_function" "authority" {
   })
 }
 
+# Live alias versions for the blue/green hold. Empty while the gate is dark, so
+# a first apply never asks AWS for an alias it has not created yet.
+data "aws_lambda_alias" "authority_live" {
+  for_each = (
+    var.authority_blue_green_alias_hold_enabled &&
+    local.authority_runtime_functions_deploy
+  ) ? local.authority_runtime_aliases : {}
+
+  function_name = each.value.function_name
+  name          = each.value.color
+}
+
 data "aws_lambda_alias" "authority_proof_policy_live" {
   for_each = var.authority_proof_mutation_controls_enabled ? {
     for key, alias in local.authority_runtime_aliases :
@@ -1161,16 +1173,31 @@ resource "aws_lambda_alias" "authority" {
   name          = each.value.color
   description   = "Closed ${each.value.color} deployment qualifier"
   function_name = aws_lambda_function.authority[each.value.function_name].function_name
+  # Blue/green hold takes precedence when enabled: the selected colour keeps the
+  # version live traffic is already on, and only standby advances. The proof
+  # branch below is the older, narrower form of the same idea, scoped to the
+  # IA/RA/ICR + ca-pm rollout; it is retired with the proof surface, after which
+  # this expression has a single owner.
   function_version = (
-    var.authority_proof_mutation_controls_enabled &&
-    contains(keys(local.authority_proof_policy_pinned_functions), each.value.function_name)
+    var.authority_blue_green_alias_hold_enabled &&
+    local.authority_runtime_functions_deploy &&
+    !var.authority_proof_mutation_controls_enabled
     ? (
-      local.authority_proof_policy_rollout_active &&
-      each.value.color == var.authority_proof_policy_prepared_color
-      ? aws_lambda_function.authority[each.value.function_name].version
-      : data.aws_lambda_alias.authority_proof_policy_live[each.key].function_version
+      each.value.color == local.authority_runtime_selected_color
+      ? data.aws_lambda_alias.authority_live[each.key].function_version
+      : aws_lambda_function.authority[each.value.function_name].version
     )
-    : aws_lambda_function.authority[each.value.function_name].version
+    : (
+      var.authority_proof_mutation_controls_enabled &&
+      contains(keys(local.authority_proof_policy_pinned_functions), each.value.function_name)
+      ? (
+        local.authority_proof_policy_rollout_active &&
+        each.value.color == var.authority_proof_policy_prepared_color
+        ? aws_lambda_function.authority[each.value.function_name].version
+        : data.aws_lambda_alias.authority_proof_policy_live[each.key].function_version
+      )
+      : aws_lambda_function.authority[each.value.function_name].version
+    )
   )
 }
 
