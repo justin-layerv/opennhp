@@ -421,8 +421,13 @@ resource "terraform_data" "agent_otp_ci_send_gate_fence" {
 resource "aws_iam_role" "qurl_otp_email_gate" {
   count = local.agent_otp_ci_send_gate_permitted ? 1 : 0
 
-  name        = "${local.name_prefix}-qurl-otp-email-gate"
-  description = "Per-PR live OTP email gate for ${var.github_org}/${var.qurl_github_repo} — ses:SendEmail to the mailbox simulator only"
+  name = "${local.name_prefix}-qurl-otp-email-gate"
+  # ASCII ONLY. IAM validates role descriptions against a charset that
+  # excludes the em dash (U+2014) this line used to carry. Terraform plans
+  # such a description cleanly and CreateRole then fails at apply with a
+  # ValidationError, so the break lands on main rather than in review.
+  # Keep punctuation in this string to plain ASCII.
+  description = "Per-PR live OTP email gate for ${var.github_org}/${var.qurl_github_repo} - ses:SendEmail to the mailbox simulator only"
 
   # No environment: binding, deliberately. The `sandbox` GitHub environment's
   # deployment-branch policy rejects PR merge refs (that rejection is what
