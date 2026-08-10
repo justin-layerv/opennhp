@@ -1,67 +1,52 @@
-# 2026-07-26 · PR #3453 · Source-fence sandbox UDP edges
+# 2026-07-26 · PR #3453 · Retire the one-time UDP source-fence migration allowance
 
 > **Access policy superseded on 2026-08-03** by
 > [`2026-08-03-open-sandbox-udp-edges.md`](2026-08-03-open-sandbox-udp-edges.md)
 > and [qurl-go ADR 0001](https://github.com/layervai/qurl-go/blob/main/docs/decisions/0001-sandbox-nhp-access.md).
-> The sandbox Hub, cell0, and cell1 edges now admit `0.0.0.0/0` on UDP 443 so
-> developers inside and outside the company can use sandbox. The
+> The sandbox Hub, cell0 and cell1 edges now admit `0.0.0.0/0` on UDP 443. The
 > SG-attached-NLB topology this rollout installed is retained and still
-> enforced; only *who* is admitted changed. The post-rollout item below that
-> requires "timeout from an unrelated public source" no longer applies.
+> enforced; only *who* is admitted changed.
 
 - **Owner:** sandbox UDP rollout coordinator
 - **Source:** [NHP PR #3453](https://github.com/layervai/nhp/pull/3453)
 
-Replace the three sandbox SG-less public UDP NLBs with SG-attached,
-source-fenced edges. Hub and cell1 remain proof-runner-only; cell0 additionally
-admits the exact managed AC EIP pool required for registration. Production
-remains unchanged and dark.
+The rollout itself is done and was verified against live AWS on 2026-08-10:
+`layerv-nhp-sandbox-edge`, `layerv-nhp-sandbox-cell1-edge` and
+`layerv-nhp-sandbox-hub-edge` all exist with exactly one security group
+attached, so the SG-less-NLB replacement converged. Its rollout runbook was
+deleted with this rewrite; git history is the record. One task survives.
 
-Cell0's NLB replacement is already converged. Its corrective remainder is the
-seven exact managed-AC EIP `/32` ingress creates required for AC registration;
-the reviewed gate must show every original replacement participant as a no-op
-and no NLB or listener replacement.
+- [ ] Post-rollout: land the bounded cleanup that removes the remaining one-time
+      source-fence migration allowance from
+      `.github/scripts/check-relay-dmz-plan.py`. The migration it exists for is
+      complete, but the allowance still widens a security fence for a transition
+      that can no longer happen.
 
-- [ ] Pre-rollout: after the unrelated Control Authority/catalog transitions
-      converge, produce complete Terraform 1.14.3 saved plans for sandbox main,
-      Control, sandbox cell1, and sandbox Hub DNS. Cell1's `10.102.0.0/16` to
-      `10.104.0.0/16` relocation (#3459) is already applied, so cell1 takes an
-      ordinary standalone source-fence plan in the VPC it already occupies —
-      there is no combined relocation-plus-fence graph and no relocation checker
-      in this rollout.
-      Require every trusted checker to accept only the reviewed envelopes and
-      confirm the proof runner still owns exactly `3.141.109.76/32`. Pause the
-      cell0 blue/green lane and prove the managed active-color parameter,
-      Terraform state, and live public listener all identify the exact green
-      UDP target group before sealing the cell0 plan.
-      Confirm the cell0 AC EIP pool contains exactly seven unique managed
-      addresses (three blue, three green, and the rolling-refresh spare).
-- [ ] Rollout: follow
-      [`sandbox-udp-source-fence-replacement.md`](../sandbox-udp-source-fence-replacement.md)
-      from the merged commit, applying only its reviewed cell0, Control, cell1,
-      and DNS saved plans. Accept only the documented brief sandbox listener
-      handoffs; stop on any unreviewed plan participant. If an apply is
-      interrupted, discard its stale saved plan and apply only a fresh
-      refresh-enabled Terraform 1.14.3 plan that the trusted checker accepts as
-      the exact remaining subset with exact target no-ops or the bounded
-      deposed-NLB/listener continuation. Never recover with `-target`, state
-      edits/imports, or a widened checker.
-- [ ] Post-rollout: read back exactly one security group on every public UDP
-      NLB, NLB-SG-only target ingress, healthy targets, successful UDP lifecycle
-      from the proof runner, and timeout from an unrelated public source.
-      Confirm cell0 ingress is exactly the proof-runner `/32` plus all seven
-      managed AC EIP `/32`s, while Hub and cell1 retain proof-runner-only
-      ingress. Record
-      that cell0 remains green-to-green across replacement, then resume normal
-      blue/green ownership. Record
-      a refresh-enabled no-op for every applied root using the permanent
-      `--require-udp-source-fenced-topology` contract, then land the bounded
-      cleanup that removes the remaining pre-apply one-time replacement
-      allowance.
-- [ ] Production exclusion: before merge, verify the production plans contain
-      no UDP-edge replacement or activation. Record that any future production
-      activation requires a separate reviewed edge/source policy, saved-plan
-      sequence, negative probe, and rollback contract.
-- [ ] Rollback: stop proof traffic and use a forward replacement. Repoint DNS
-      only to a previously verified source-fenced edge; never restore the
-      SG-less NLB or reopen UDP 62206 to `0.0.0.0/0`.
+      Attempted on 2026-08-10 and backed out, so the next attempt starts
+      informed. The allowance is not one constant — it is
+      `EXPECTED_SANDBOX_PROOF_SOURCE_CIDR`, its use in
+      `ACCEPTED_SANDBOX_PUBLIC_UDP_INGRESS_CIDRS`, the one-time source-fence
+      replacement tolerance (grep `the one-time UDP source-fence migration
+      REPLACES`), and the partial-retry phase logic. Grep the symbols rather
+      than trusting line numbers; the file is ~5k lines and moves.
+      Simply dropping the address from the accepted set fails **13 tests** in
+      `tests/scripts/test_check_relay_dmz_plan.py`, including
+      `test_fenced_topology_is_still_admitted`,
+      `test_source_fence_migration_preserves_live_green_target` and
+      `test_source_fence_partial_retry_accepts_only_exact_target_complement`
+      (one of whose phases is literally `proof-runner UDP ingress creation`).
+
+      The checker deliberately models a migration state machine in which that
+      exact ingress rule is created and destroyed. The real change is to
+      separate **an address a migration plan may mention** from **a source the
+      edge may admit**, and to retire the whole fenced-topology branch now that
+      no root can select it — all three roots are validation-pinned to `null` or
+      exactly `["0.0.0.0/0"]`. That is a reviewed refactor of the fence, not a
+      constant deletion.
+
+      This also closes a live hazard: the address the allowance still accepts,
+      `3.141.109.76/32`, was the UDP proof runner's EIP and was released when
+      that runner was destroyed. See
+      [`2026-08-03-open-sandbox-udp-edges.md`](2026-08-03-open-sandbox-udp-edges.md).
+
+Delete this entry once that allowance is gone.

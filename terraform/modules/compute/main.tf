@@ -1764,8 +1764,9 @@ resource "aws_lb" "server" {
     # would fail with DuplicateLoadBalancerName. Every cell now reaches the fence
     # through exactly that name-changing transition -- cell1's
     # `10.102.0.0/16` -> `10.104.0.0/16` relocation is already applied, so no
-    # cell combines a VPC move with the fence (see
-    # docs/runbooks/sandbox-udp-source-fence-replacement.md). Any FUTURE VPC move
+    # cell combines a VPC move with the fence. (The rollout runbook that used to
+    # be cited here was deleted once every cell converged; recover it from git
+    # history for this path if ever needed.) Any FUTURE VPC move
     # of an already-fenced cell fires replace_triggered_by below WITHOUT changing
     # the name, so it must carry an explicit name change in its reviewed saved
     # plan.
