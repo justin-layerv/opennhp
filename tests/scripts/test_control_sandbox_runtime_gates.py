@@ -25,15 +25,20 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github" / "scripts" / "control-sandbox-runtime-gates.py"
 COMMITTED = ROOT / ".github" / "control-sandbox-runtime-gates.json"
 
-# The live sandbox shape as of the 2026-08-07 apply. Held here as a literal so a
-# gate flip has to be a deliberate edit in two places, not a one-character slip.
+# The live sandbox shape. Held here as a literal so a gate flip has to be a
+# deliberate edit in two places, not a one-character slip.
+#
+# Bound to the 2026-08-07 apply EXCEPT the two proof colours: those are the
+# target of the catch-up cutover, not a confirmed-live reading. They become live
+# when that applies; until then this file and live AWS disagree on them by
+# design, because editing the gate file IS the rollout step.
 LIVE = {
     "enable_runtime_functions": True,
     "hub_edge_enabled": True,
     "hub_worker_enabled": True,
     "proof_mutation_controls_enabled": True,
     "proof_policy_consumers_staged": True,
-    "proof_policy_selected_color": "blue",
+    "proof_policy_selected_color": "green",
     "proof_policy_prepared_color": "blue",
     # Still dark. The gate flip is NOT in this PR: closing the rollout window
     # before the catch-up cutover would drop live Hub traffic onto the frozen
@@ -134,7 +139,7 @@ class FlagEmission(unittest.TestCase):
                 "--proof-mutation-controls-enabled",
                 "--proof-policy-consumers-staged",
                 "--proof-policy-selected-color",
-                "blue",
+                "green",
                 "--proof-policy-prepared-color",
                 "blue",
             ],
@@ -377,7 +382,7 @@ class TfvarsReceipt(unittest.TestCase):
         "hub_worker_enabled": True,
         "authority_proof_mutation_controls_enabled": True,
         "authority_proof_policy_consumers_staged": True,
-        "authority_proof_policy_selected_color": "blue",
+        "authority_proof_policy_selected_color": "green",
         "authority_proof_policy_prepared_color": "blue",
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
@@ -411,8 +416,8 @@ class TfvarsReceipt(unittest.TestCase):
         self.assertIn("hub_worker_enabled", result.stderr)
 
     def test_flipped_color_fails(self) -> None:
-        # "green" is the flip now that the committed selector is blue.
-        tfvars = dict(self.LIVE_TFVARS, authority_proof_policy_selected_color="green")
+        # "blue" is the flip: the committed selector is green during prepare.
+        tfvars = dict(self.LIVE_TFVARS, authority_proof_policy_selected_color="blue")
         with tempfile.TemporaryDirectory() as tmp:
             result = self.verify(tmp, tfvars)
         self.assertEqual(result.returncode, 1)
@@ -476,14 +481,15 @@ class DispatchBinding(unittest.TestCase):
         self.assertIn("hub_edge_enabled", result.stderr)
 
     def test_a_flipped_color_fails(self) -> None:
-        result = run(*check_args(proof_policy_selected_color="green"))
+        # "blue" is the flip: the committed selector is green during prepare.
+        result = run(*check_args(proof_policy_selected_color="blue"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("proof_policy_selected_color", result.stderr)
 
     def test_every_difference_is_named_not_just_the_first(self) -> None:
         # An operator re-dispatching should learn all of it in one round trip.
         result = run(
-            *check_args(hub_edge_enabled=False, proof_policy_prepared_color="blue")
+            *check_args(hub_edge_enabled=False, proof_policy_prepared_color="green")
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("hub_edge_enabled", result.stderr)
@@ -510,7 +516,7 @@ class DispatchBinding(unittest.TestCase):
         for expected in (
             "-f enable_runtime_functions=true",
             "-f hub_edge_enabled=true",
-            "-f proof_policy_selected_color=blue",
+            "-f proof_policy_selected_color=green",
             "-f proof_policy_prepared_color=blue",
         ):
             self.assertIn(expected, result.stderr)
