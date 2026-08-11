@@ -14294,6 +14294,99 @@ class ComposedTransitionTest(unittest.TestCase):
             frozenset(),
         )
 
+    def steady_pc_completion_by(self, qualifier="green", alloc=1, fn="ca-pm"):
+        return {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "actions": ["no-op"],
+                    "after": {
+                        "input": {
+                            "authority_runtime_contract": {
+                                "selected_authority_color": "green"
+                            }
+                        }
+                    },
+                }
+            },
+            CHECKER.AUTHORITY_STEADY_PC_PREFIX
+            + f'"layerv-nhp-sandbox-{fn}"]': {
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "qualifier": qualifier,
+                        "provisioned_concurrent_executions": alloc,
+                    },
+                }
+            },
+        }
+
+    def test_steady_pc_completion_admits_the_selected_colour(self) -> None:
+        """The real validator runs: pm at 1 on green, a runtime fn at 2."""
+        for fn, alloc in (("ca-pm", 1), ("ca-ar-cell0", 2)):
+            with self.subTest(fn=fn):
+                by = self.steady_pc_completion_by(alloc=alloc, fn=fn)
+                changed = {
+                    a for a, v in by.items()
+                    if v["change"]["actions"] != ["no-op"]
+                }
+                CHECKER._check_authority_steady_pc_completion(changed, by)
+
+    def test_steady_pc_completion_refuses_the_standby_colour(self) -> None:
+        by = self.steady_pc_completion_by(qualifier="blue")
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_authority_steady_pc_completion(changed, by)
+
+    def test_steady_pc_completion_pins_the_exact_allocation(self) -> None:
+        """0/2/3 for pm and 1/3 for a runtime fn are all refused."""
+        for fn, bad in (("ca-pm", 0), ("ca-pm", 2), ("ca-pm", 3),
+                        ("ca-ar-cell0", 1), ("ca-ar-cell0", 3)):
+            with self.subTest(fn=fn, alloc=bad):
+                by = self.steady_pc_completion_by(alloc=bad, fn=fn)
+                changed = {
+                    a for a, v in by.items()
+                    if v["change"]["actions"] != ["no-op"]
+                }
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._check_authority_steady_pc_completion(changed, by)
+
+    def hub_projection_item(self) -> dict:
+        def role(policy):
+            return {
+                "inline_policy": [{"name": "hub-task", "policy": policy}],
+                "arn": "arn:aws:iam::767397897469:role/hub-task",
+            }
+        import json as _json
+        before = role(_json.dumps(
+            CHECKER._expected_hub_task_inline_policy(rollout=True, selected="blue")
+        ))
+        after = role(_json.dumps(
+            CHECKER._expected_hub_task_inline_policy(rollout=False, selected="green")
+        ))
+        return {
+            "address": CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+            "change": {"actions": ["update"], "before": before, "after": after},
+        }
+
+    def test_hub_projection_drift_is_the_reviewed_kind(self) -> None:
+        item = self.hub_projection_item()
+        by = {item["address"]: {"change": {"actions": ["no-op"]}}}
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift([item], by, refresh_only=False),
+            "hub-task-selected-projection",
+        )
+
+    def test_hub_projection_drift_refuses_an_arbitrary_role_edit(self) -> None:
+        import json as _json
+        item = self.hub_projection_item()
+        doc = _json.loads(item["change"]["after"]["inline_policy"][0]["policy"])
+        doc["Statement"].append({"Action": "s3:*", "Effect": "Allow", "Resource": "*"})
+        item["change"]["after"]["inline_policy"][0]["policy"] = _json.dumps(doc)
+        by = {item["address"]: {"change": {"actions": ["no-op"]}}}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_state_normalization_drift([item], by, refresh_only=False)
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(

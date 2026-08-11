@@ -9503,6 +9503,42 @@ def _authority_proof_window_closes_to_null(by_address: dict[str, Any]) -> bool:
     )
 
 
+def _check_authority_steady_pc_completion(
+    changed: set[str], by_address: dict[str, Any]
+) -> None:
+    """Validate a partial-apply completion: steady-PC creates, selected colour.
+
+    Every create must land on the contract's selected colour with exactly the
+    generator's steady allocation for that function (1 for the attended-proof
+    pm/pcr pair, 2 for the eleven runtime functions). A create on the standby
+    colour, or any other allocation, raises.
+    """
+    selected = _selected_authority_color_from_contract(
+        (
+            by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {})
+            .get("change", {})
+            .get("after")
+            or {}
+        ).get("input")
+    )
+    for address in sorted(changed):
+        after = by_address.get(address, {}).get("change", {}).get("after")
+        if not isinstance(after, dict) or after.get("qualifier") != selected:
+            raise ContractError(
+                f"{address} must create capacity on the selected colour "
+                f"({selected!r})"
+            )
+        function_name = address.rsplit('["', 1)[1][:-2]
+        expected_allocation = (
+            1 if function_name in AUTHORITY_PROOF_FUNCTIONS else 2
+        )
+        if after.get("provisioned_concurrent_executions") != expected_allocation:
+            raise ContractError(
+                f"{address} allocation must be the generator's steady value "
+                f"({expected_allocation})"
+            )
+
+
 def _claim_authority_proof_rollout_retirement(
     changed: set[str],
     actual_non_noop: dict[str, Any],
@@ -10505,14 +10541,16 @@ def _check_authority_proof_concurrency_recovery_drift(
             )
 
 
-def _expected_hub_task_inline_policy(*, rollout: bool) -> dict[str, Any]:
+def _expected_hub_task_inline_policy(
+    *, rollout: bool, selected: str = "blue"
+) -> dict[str, Any]:
     return {
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Action": "lambda:InvokeFunction",
                 "Effect": "Allow",
-                "Resource": sorted(_hub_authority_alias_arns(rollout)),
+                "Resource": sorted(_hub_authority_alias_arns(rollout, selected)),
                 "Sid": "AuthorityInvoke",
             },
             {
@@ -10834,6 +10872,47 @@ def _require_normalization_plan_mode(
         )
 
 
+def _check_hub_task_selected_projection_drift(item: dict[str, Any]) -> None:
+    """The switch pointer moved; the provider re-reads hub_task's inline_policy.
+
+    State carries the old selected colour's policy doc, live the new one, and
+    the planned change is a no-op (the policy resource itself already applied).
+    Exact on both sides -- old-selected doc to new-selected doc, everything
+    else identical -- so an arbitrary role edit still fails closed.
+    """
+    change = item.get("change")
+    before = change.get("before") if isinstance(change, dict) else None
+    after = change.get("after") if isinstance(change, dict) else None
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise _unexpected_drift_error([item])
+    if {k: v for k, v in before.items() if k != "inline_policy"} != {
+        k: v for k, v in after.items() if k != "inline_policy"
+    }:
+        raise _unexpected_drift_error([item])
+
+    def _doc(side: dict[str, Any]) -> Any:
+        inline = side.get("inline_policy")
+        if not isinstance(inline, list) or len(inline) != 1:
+            raise _unexpected_drift_error([item])
+        if inline[0].get("name") != "hub-task":
+            raise _unexpected_drift_error([item])
+        return _decode_exact_json(
+            inline[0].get("policy"),
+            "policy",
+            AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+        )
+    # The state doc predates the window close, so it carries the ROLLOUT
+    # projection (both colours); live carries the new selected colour alone.
+    # rollout=True returns BOTH colours and ignores `selected`; passed
+    # explicitly so a future change to the rollout projection cannot quietly
+    # break this equality.
+    if (_doc(before), _doc(after)) != (
+        _expected_hub_task_inline_policy(rollout=True, selected="blue"),
+        _expected_hub_task_inline_policy(rollout=False, selected="green"),
+    ):
+        raise _unexpected_drift_error([item])
+
+
 def _check_state_normalization_drift(
     drift: list[dict[str, Any]],
     by_address: dict[str, dict[str, Any]],
@@ -10888,6 +10967,15 @@ def _check_state_normalization_drift(
         return AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
     if not all(isinstance(address, str) for address in addresses):
         raise _unexpected_drift_error(drift)
+    if (
+        len(drift) == 1
+        and addresses[0] == AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+        and drift[0].get("change", {}).get("actions") == ["update"]
+        and by_address.get(addresses[0], {}).get("change", {}).get("actions")
+        == ["no-op"]
+    ):
+        _check_hub_task_selected_projection_drift(drift[0])
+        return "hub-task-selected-projection"
     if addresses and all(
         (
             address.startswith("module.control.aws_lambda_alias.authority[")
@@ -14023,6 +14111,27 @@ def check_plan(
         _validate_authority_hub_exec_policy_update(
             _exec_policy_only, by_address, plan
         )
+    elif (
+        changed
+        and changed
+        <= {
+            f"{AUTHORITY_STEADY_PC_PREFIX}\"{fn}\"]"
+            for fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+        }
+        and all(actual_non_noop.get(a) == ["create"] for a in changed)
+        and not deposed_by_address
+    ):
+        # Completing a partially-applied PC re-home: the 2026-08-11 pointer
+        # apply lowered ca-pm's reserved concurrency before its old pool was
+        # gone, so the steady create transiently exceeded the budget and the
+        # apply stopped with everything else converged. The residual plan is
+        # pure capacity CREATES on the selected colour -- availability-positive
+        # and grant-free -- so it is admitted exactly: every address in the
+        # steady set, create-only, and each qualifier must equal the contract's
+        # selected colour (a create on the standby colour is a different
+        # operation and falls through to the terminal reject).
+        plan_mode = "authority-steady-pc-completion"
+        _check_authority_steady_pc_completion(changed, by_address)
     elif (
         _retirement_only := _claim_authority_proof_rollout_retirement(
             changed, actual_non_noop, by_address
