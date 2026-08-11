@@ -14217,6 +14217,21 @@ class ComposedTransitionTest(unittest.TestCase):
                         {"authority_runtime_contract": contract}
                     )
 
+    def test_blue_green_hold_data_slice_membership(self) -> None:
+        """26 instances: 13 runtime functions x both colours, keyed fn:colour."""
+        slice_ = CHECKER.AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES
+        self.assertEqual(len(slice_), 26)
+        self.assertEqual(
+            len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF), 13
+        )
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF:
+            for color in ("blue", "green"):
+                self.assertIn(
+                    "module.control.data.aws_lambda_alias."
+                    f'authority_live["{fn}:{color}"]',
+                    slice_,
+                )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(

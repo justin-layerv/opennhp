@@ -881,6 +881,14 @@ AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES = frozenset(
     for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
     for color in ("blue", "green")
 )
+# The blue/green hold reads every runtime alias's live version so the selected
+# colour can keep serving it; all 13 functions x both colours, present in state
+# exactly while the hold gate is on.
+AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES = frozenset(
+    f'module.control.data.aws_lambda_alias.authority_live["{_fn}:{_color}"]'
+    for _fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+    for _color in ("blue", "green")
+)
 AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES = frozenset(
     f'module.control.data.aws_lambda_alias.authority_proof_policy_live["{AUTHORITY_PROOF_FUNCTION_NAME}:{color}"]'
     for color in ("blue", "green")
@@ -14253,6 +14261,7 @@ def check_state_list(path: Path) -> dict[str, int]:
     proof_rollout_data_extra = set(
         AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES
     )
+    blue_green_data_extra = set(AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES)
     proof_rollout_extra = set(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     hub_edge_extra = set(HUB_EDGE_RESOURCES)
     # The worker slice contributes both managed resources AND its two count-gated
@@ -14267,6 +14276,12 @@ def check_state_list(path: Path) -> dict[str, int]:
     proof_alias_reads_present = bool(addresses & proof_consumer_data_extra)
     proof_rollout_alias_reads_present = bool(addresses & proof_rollout_data_extra)
     proof_rollout_present = bool(addresses & proof_rollout_extra)
+    blue_green_hold_present = bool(addresses & blue_green_data_extra)
+    if blue_green_hold_present and not bool(addresses & runtime_extra):
+        raise ContractError(
+            "the blue/green hold's live-alias reads require the Authority "
+            "runtime slice"
+        )
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
     if proof_present and not runtime_present:
@@ -14303,6 +14318,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         | (proof_rollout_extra if proof_rollout_present else set())
         | (proof_consumer_data_extra if proof_present else set())
         | (proof_rollout_data_extra if proof_rollout_present else set())
+        | (blue_green_data_extra if blue_green_hold_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -14323,6 +14339,11 @@ def check_state_list(path: Path) -> dict[str, int]:
             + (
                 len(AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES)
                 if proof_rollout_present
+                else 0
+            )
+            + (
+                len(AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES)
+                if blue_green_hold_present
                 else 0
             )
             + (len(HUB_WORKER_DATA_RESOURCES) if hub_worker_present else 0)
