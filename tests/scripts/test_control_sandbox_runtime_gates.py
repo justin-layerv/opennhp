@@ -39,7 +39,7 @@ LIVE = {
     "proof_mutation_controls_enabled": True,
     "proof_policy_consumers_staged": True,
     "proof_policy_selected_color": "green",
-    "proof_policy_prepared_color": "blue",
+    "proof_policy_prepared_color": "green",
     # Still dark. The gate flip is NOT in this PR: closing the rollout window
     # before the catch-up cutover would drop live Hub traffic onto the frozen
     # standby alias. The lanes land first; the flip follows with the cutover.
@@ -141,7 +141,7 @@ class FlagEmission(unittest.TestCase):
                 "--proof-policy-selected-color",
                 "green",
                 "--proof-policy-prepared-color",
-                "blue",
+                "green",
             ],
         )
 
@@ -383,7 +383,7 @@ class TfvarsReceipt(unittest.TestCase):
         "authority_proof_mutation_controls_enabled": True,
         "authority_proof_policy_consumers_staged": True,
         "authority_proof_policy_selected_color": "green",
-        "authority_proof_policy_prepared_color": "blue",
+        "authority_proof_policy_prepared_color": "green",
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
         "authority_proof_mutation_owner_id": "someone",
@@ -517,7 +517,7 @@ class DispatchBinding(unittest.TestCase):
             "-f enable_runtime_functions=true",
             "-f hub_edge_enabled=true",
             "-f proof_policy_selected_color=green",
-            "-f proof_policy_prepared_color=blue",
+            "-f proof_policy_prepared_color=green",
         ):
             self.assertIn(expected, result.stderr)
 
