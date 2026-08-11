@@ -3713,10 +3713,6 @@ jobs:
           # a shape nobody chose, so bind the emitted keys back to the file.
           .github/scripts/control-sandbox-runtime-gates.py verify-tfvars \
             --tfvars "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
-          # Publish the colours through the SAME validated reader, so the gate
-          # file has exactly one parser in this job; a jq read below would be a
-          # second one, free to drift from the Python rules.
-          .github/scripts/control-sandbox-runtime-gates.py env >>"$GITHUB_ENV"
 
       - name: Prove checkout credentials are absent before Terraform
         if: steps.freshness.outputs.fresh == 'true'
@@ -3823,31 +3819,56 @@ jobs:
             "$RUNNER_TEMP/control-live-before-apply" \
             pre-apply
 
-      - name: Require exact warm pools before a proof selector apply
+      - name: Refuse an unattended proof rollout apply
         if: steps.plan.outputs.control_status == 'applied'
+        working-directory: ${{ env.CONTROL_ROOT }}
         run: |
           set -euo pipefail
-          # Both colours come from the validated reader via $GITHUB_ENV in the
-          # generate step; this job has one parser of the gate file, not two.
-          selected="${CONTROL_SELECTED_COLOR:?gate colours were not published}"
-          prepared="${CONTROL_PREPARED_COLOR:?gate colours were not published}"
-          if [[ "$selected" == 'none' || "$selected" != "$prepared" ]]; then
-            echo "Not a proof selector apply (selected=$selected prepared=$prepared); skipping."
-            exit 0
-          fi
-          # FAIL CLOSED. The attended proof and its authority-evidence
-          # verifier are gone, so the readiness precondition this branch
-          # depended on no longer exists. The colour comparison above is NOT a
-          # substitute: it checks that selected == prepared, while readiness
-          # verified authority evidence (warm pools actually present). Letting
-          # the branch proceed with the precondition stubbed would apply infra
-          # with its safety gate silently removed.
+          # FAIL CLOSED on a proof rollout apply. The attended proof and its
+          # authority-evidence readiness verifier are gone, so the precondition
+          # such an apply depended on no longer exists; refuse it rather than
+          # run it unguarded.
           #
-          # The proof_policy_* dispatch inputs are retained for a later
-          # governed pass, so this branch stays REACHABLE until then. Refuse it
-          # rather than run it unguarded.
-          echo "::error::proof selector apply is no longer supported: the attended proof and its authority-evidence readiness check were removed. Dispatch with proof_policy_selected_color=none, or land the governed change that removes the proof_policy_* inputs."
-          exit 1
+          # This keys off what the PLAN DOES, not off the committed gate
+          # colours. The previous form compared selected == prepared and failed
+          # whenever they matched -- but equal colours are the STEADY state, the
+          # shape live sandbox has been in since the rollout converged. A
+          # selector apply is the selector MOVING, which equal colours are
+          # precisely the absence of. So that test fired on every ordinary
+          # Control apply -- infra, CI, anything -- and froze sandbox Control at
+          # whatever state it last converged to. It only looked dormant because
+          # the step is guarded on control_status == 'applied' and Control
+          # happened to have nothing to apply.
+          #
+          # plan_mode comes from the same contract summary the plan step already
+          # wrote, so this job keeps one plan parser. That step ("Plan and check
+          # the Control root") runs with working-directory: $CONTROL_ROOT and
+          # tees the file there, which is why this step sets the same directory
+          # and reads it relatively. A missing or unreadable summary fails closed
+          # here under `set -euo pipefail`, which is the intended posture.
+          #
+          # The refused literals below are bound to the producer's vocabulary by
+          # test_the_deploy_gate_refuses_the_real_rollout_plan_modes; they are a
+          # fail-CLOSED check only while they match what the checker emits.
+          mode="$(jq -er '.plan_mode' plan-contract-summary.json)"
+          # Composed transitions render as "composed-<a>-with-<b>"; a rollout
+          # riding along with another reviewed transition is still a rollout.
+          case "$mode" in
+            composed-*) parts="${mode#composed-}"; parts="${parts//-with-/ }" ;;
+            *) parts="$mode" ;;
+          esac
+          # Disable globbing before the unquoted split: word-splitting is what
+          # we want, pathname expansion is not.
+          set -f
+          for part in $parts; do
+            case "$part" in
+              authority-proof-rollout-selector|authority-proof-rollout-prepare)
+                echo "::error::proof rollout apply (${part}) is no longer supported unattended: the attended proof and its authority-evidence readiness check were removed. Dispatch control-sandbox-update.yml and read the plan, or land the governed change that retires the proof_policy_* surface."
+                exit 1
+                ;;
+            esac
+          done
+          echo "Not a proof rollout apply (plan_mode=${mode}); proceeding."
 
       - name: Apply the checked plan without GitHub credentials
         id: apply

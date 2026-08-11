@@ -171,59 +171,22 @@ class FlagEmission(unittest.TestCase):
 
 
 class EnvEmission(unittest.TestCase):
-    """`env` exists so the gate file has ONE parser inside the deploy job."""
+    """The retired `env` subcommand."""
 
-    def test_emits_both_colors_as_github_env_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            result = run("env", gates=write_gates(Path(tmp)))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout.split(),
-            ["CONTROL_SELECTED_COLOR=green", "CONTROL_PREPARED_COLOR=green"],
-        )
+    def test_the_env_command_is_retired(self) -> None:
+        """`env` published the two proof colours; its only consumer is gone.
 
-    def test_dark_rollout_emits_none_rather_than_an_empty_value(self) -> None:
-        # The consuming step uses ${VAR:?} and then compares against 'none'; an
-        # empty value would trip the :? guard and fail a legitimately dark run.
-        with tempfile.TemporaryDirectory() as tmp:
-            gates = write_gates(
-                Path(tmp),
-                proof_policy_selected_color="none",
-                proof_policy_prepared_color="none",
-            )
-            result = run("env", gates=gates)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout.split(),
-            ["CONTROL_SELECTED_COLOR=none", "CONTROL_PREPARED_COLOR=none"],
-        )
-
-    def test_emitted_names_are_the_names_the_workflow_reads(self) -> None:
-        # The seam the fence family does not cover: `env` derives these names
-        # with removeprefix().upper(), and build-and-push.yml reads them as
-        # literals. Assert the equality across the seam rather than pinning
-        # either side alone — a rename on the Python side would otherwise leave
-        # the workflow's ${VAR:?} to discover it during a live deploy.
-        workflow = (
-            ROOT / ".github" / "workflows" / "build-and-push.yml"
-        ).read_text(encoding="utf-8")
+        The deploy gate that read CONTROL_SELECTED_COLOR/CONTROL_PREPARED_COLOR
+        now keys off the plan's own plan_mode instead, so this command emitted
+        names nothing consumed -- and the cross-seam test that used to live here
+        had no subject left. A publisher with no reader is exactly how a rename
+        goes unnoticed until a live deploy, so retire it rather than keep it
+        warm.
+        """
         result = run("env")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        names = [line.split("=", 1)[0] for line in result.stdout.splitlines() if line]
-        self.assertTrue(names, "env emitted nothing to cross-check")
-        for name in names:
-            self.assertIn(
-                f"${{{name}:?",
-                workflow,
-                f"{name} is emitted but build-and-push.yml does not consume it",
-            )
-
-    def test_invalid_gate_file_emits_nothing(self) -> None:
-        # Must fail rather than emit partial env lines a later step would trust.
-        with tempfile.TemporaryDirectory() as tmp:
-            result = run("env", gates=write_gates(Path(tmp), hub_edge_enabled="false"))
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout.strip(), "")
+        # argparse rejects the removed choice: exit 2, naming it.
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice: 'env'", result.stderr)
 
 
 class FileDegradation(unittest.TestCase):

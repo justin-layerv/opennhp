@@ -257,7 +257,7 @@ def check_inputs(gates: dict[str, object], args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("flags", "check", "verify-tfvars", "env"))
+    parser.add_argument("command", choices=("flags", "check", "verify-tfvars"))
     parser.add_argument("--gates", type=Path, default=DEFAULT_GATES)
     parser.add_argument("--tfvars", type=Path)
     for name, _ in BOOLEAN_GATES + COLOR_GATES:
@@ -269,14 +269,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "flags":
             for flag in emit_flags(gates):
                 print(flag)
-        elif args.command == "env":
-            # $GITHUB_ENV lines for the later workflow steps that need a gate
-            # value, so this file keeps exactly one parser. Colors only: those
-            # are the sole values a downstream step reads today, and emitting
-            # the booleans too would invite shell-side truthiness bugs on
-            # strings that are always non-empty.
-            for name, _ in COLOR_GATES:
-                print(f"CONTROL_{name.removeprefix('proof_policy_').upper()}={gates[name]}")
         elif args.command == "verify-tfvars":
             if args.tfvars is None:
                 raise GateError("verify-tfvars requires --tfvars")

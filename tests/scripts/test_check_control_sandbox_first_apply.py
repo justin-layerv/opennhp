@@ -13843,6 +13843,52 @@ class ComposedTransitionTest(unittest.TestCase):
         )
         self.assertEqual(CHECKER._plan_mode_parts(rendered), set(names))
 
+    def test_the_deploy_gate_refuses_the_real_rollout_plan_modes(self) -> None:
+        """Bind build-and-push.yml's refusal literals to the producer vocabulary.
+
+        The unattended deploy gate refuses a proof rollout apply by matching
+        plan_mode strings out of plan-contract-summary.json. Its safety is
+        entirely in those literals: if the checker ever renames a rollout mode,
+        or joins composed modes with a different token, the `case` arms stop
+        matching, the loop falls through, and the step prints "Not a proof
+        rollout apply ... proceeding." The fail-CLOSED refusal silently becomes
+        fail-OPEN, which is the one outcome that step exists to prevent.
+
+        That is the same producer/consumer drift the retired CONTROL_* `env`
+        publisher had, so it gets the same treatment: assert the equality across
+        the seam rather than pinning either side alone.
+        """
+        workflow = (
+            ROOT / ".github" / "workflows" / "build-and-push.yml"
+        ).read_text(encoding="utf-8")
+        checker = (
+            ROOT / ".github" / "scripts" / "check-control-sandbox-first-apply.py"
+        ).read_text(encoding="utf-8")
+
+        refused = ("authority-proof-rollout-selector", "authority-proof-rollout-prepare")
+        for mode in refused:
+            with self.subTest(mode=mode):
+                # The consumer still names it...
+                self.assertIn(mode, workflow, f"{mode} is not refused by the deploy gate")
+                # ...and the producer can still emit it.
+                self.assertIn(
+                    f'plan_mode = "{mode}"',
+                    checker,
+                    f"{mode} is refused by the deploy gate but no longer produced",
+                )
+
+        # The composed-mode split must agree with how the composer renders.
+        self.assertIn(
+            f'parts="${{mode#{CHECKER._COMPOSED_PLAN_MODE_PREFIX}}}"',
+            workflow,
+            "the deploy gate strips a different composed prefix than the composer writes",
+        )
+        self.assertIn(
+            f'parts="${{parts//{CHECKER._COMPOSED_PLAN_MODE_SEPARATOR}/ }}"',
+            workflow,
+            "the deploy gate splits on a different separator than the composer writes",
+        )
+
     def test_no_registered_lane_name_contains_the_composition_separator(self) -> None:
         """_plan_mode_parts splits on "-with-", so no lane name may contain it.
 
