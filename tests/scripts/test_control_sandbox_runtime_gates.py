@@ -35,9 +35,9 @@ LIVE = {
     "proof_policy_consumers_staged": True,
     "proof_policy_selected_color": "green",
     "proof_policy_prepared_color": "green",
-    # Dark: the blue/green alias hold is wired but not flipped. Turning it on is
-    # a live change (the selected colour stops following each republish), so it
-    # gets its own reviewed gate flip and attended plan.
+    # Still dark. The gate flip is NOT in this PR: closing the rollout window
+    # before the catch-up cutover would drop live Hub traffic onto the frozen
+    # standby alias. The lanes land first; the flip follows with the cutover.
     "blue_green_alias_hold_enabled": False,
 }
 
@@ -153,6 +153,7 @@ class FlagEmission(unittest.TestCase):
                 proof_policy_consumers_staged=False,
                 proof_policy_selected_color="none",
                 proof_policy_prepared_color="none",
+                blue_green_alias_hold_enabled=False,
             )
             result = run("flags", gates=gates)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -336,14 +337,26 @@ class DependencyRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = run(
                 "flags",
-                gates=write_gates(Path(tmp), proof_policy_prepared_color="none"),
+                gates=write_gates(
+                    Path(tmp),
+                    proof_policy_selected_color="green",
+                    proof_policy_prepared_color="none",
+                ),
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("must be supplied together", result.stderr)
 
     def test_rollout_colors_require_the_live_hub_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            result = run("flags", gates=write_gates(Path(tmp), hub_worker_enabled=False))
+            result = run(
+                "flags",
+                gates=write_gates(
+                    Path(tmp),
+                    hub_worker_enabled=False,
+                    proof_policy_selected_color="green",
+                    proof_policy_prepared_color="green",
+                ),
+            )
         self.assertEqual(result.returncode, 1)
         self.assertIn("live Hub worker", result.stderr)
 

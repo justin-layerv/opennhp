@@ -102,6 +102,13 @@ running them would not buy anything.
 - [ ] Amend `AUTHORITY_PROOF_MUTATION_CONTROLS.md`: its six-aliases-no-op rule,
       which the measured disable plan does not meet; and its description of the
       slice as ca-pm only, which has been two functions since ca-pcr landed.
+- [x] Close the rollout window (live-first). The gate flip to
+      `proof_policy_*_color: none` plus `blue_green_alias_hold_enabled: true`
+      produces the retirement plan; both fences admit it as
+      `authority-proof-rollout-retirement`. Landing this darkens live state.
+      Measured against serial 100: 1 add, 9 change, 5 destroy -- the four
+      standby pools and the Hub task definition. With the blue/green hold live,
+      IA/RA/ICR aliases do not move at all.
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
       (step 5). This subsumes retiring the rollout selector — measured below,
       it is not a separate step.

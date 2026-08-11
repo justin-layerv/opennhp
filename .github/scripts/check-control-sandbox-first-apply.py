@@ -1945,6 +1945,11 @@ _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES = frozenset(
         # less exact merely because prepare or selector owns the config change.
         "authority-proof-rollout-prepare",
         "authority-proof-rollout-selector",
+        # Closing the rollout window touches the same runtime slice the rollout
+        # itself did, so the same provider re-projection rides along. The drift
+        # half stays fully validated by the exec-identity subset test and
+        # _check_planned_security, which run outside this dispatch.
+        "authority-proof-rollout-retirement",
     }
 )
 
@@ -5343,8 +5348,18 @@ def _check_planned_security(
         elif runtime_mode and address == AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS:
             _check_authority_email_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
+            # While the rollout window is CLOSING, the standby pools still
+            # exist pre-apply so proof_rollout_mode is true -- but the policy
+            # correctly narrows back to the selected colour alone. Judge it on
+            # the window's after-state, not on inventory that is being deleted
+            # in this very plan.
             _check_hub_lambda_endpoint_policy(
-                after, address, rollout=proof_rollout_mode
+                after,
+                address,
+                rollout=(
+                    proof_rollout_mode
+                    and not _authority_proof_window_closes_to_null(by_address)
+                ),
             )
         elif (
             hub_worker_mode
@@ -8474,6 +8489,15 @@ def _claim_hub_worker_image_update(
     revision this same plan creates -- the identical pairing the proof-rollout
     lane already uses.
     """
+    # Stand down while the proof rollout window is closing. The Hub task
+    # definition is replaced then because hub-init's environment carries the
+    # ca-pm alias ARN and that alias moves -- which this lane correctly refuses,
+    # since it admits an image change and nothing else.
+    # authority-proof-rollout-retirement owns that replacement and proves the
+    # environment delta is exactly the proof alias ARN.
+    if _authority_proof_retirement_closes_the_window(by_address):
+        return frozenset()
+
     address = HUB_WORKER_TASK_DEFINITION_ADDRESS
     if address not in changed:
         return None
@@ -9026,6 +9050,14 @@ def _claim_authority_image_uri_move(
     Deliberately narrow: if anything else in the contract moved, this is not the
     lane and the enumerated migration paths still own it.
     """
+    # Stand down while the proof rollout window is closing. The contract change
+    # is then not an image-URI move at all -- it also drops both selector
+    # colours -- and this lane's validator would correctly call that an
+    # unrelated field. authority-proof-rollout-retirement owns that shape, and
+    # foundation_contract is a shared address so it still composes.
+    if _authority_proof_retirement_closes_the_window(by_address):
+        return frozenset()
+
     address = AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS
     if address not in changed or (actual_non_noop.get(address) or ()) != ["update"]:
         return None
@@ -9246,7 +9278,271 @@ def _validate_authority_image_roll(
                 )
 
 
+AUTHORITY_PROOF_STANDBY_PREFIX = (
+    "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby["
+)
+# The Hub task definition and its service are NOT here: hub-worker-image-update
+# already owns that pair, and two claims on one address fail composition's
+# disjointness. Ceding them keeps this lane composable with the roll that
+# always accompanies it.
+AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION = (
+    "module.control.aws_ecs_task_definition.hub[0]"
+)
+AUTHORITY_PROOF_RETIREMENT_UPDATES = frozenset(
+    {
+        "module.control.aws_ecs_service.hub[0]",
+        "module.control.aws_iam_role_policy.hub_task[0]",
+        'module.control.aws_vpc_endpoint.interface["lambda"]',
+        AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
+    }
+)
+
+
+def _authority_proof_retirement_closes_the_window(by_address: dict[str, Any]) -> bool:
+    """True when the contract MOVES the proof selector colours.
+
+    Two shapes qualify and they are the same operation in two steps:
+
+    * set -> different colour: the catch-up cutover. The standby colour has been
+      frozen for the length of the rollout, so it must be advanced and the Hub
+      moved onto it before the window can close -- otherwise closing the window
+      drops live Hub traffic onto a stale alias.
+    * set -> null: closing the window itself.
+
+    Both repoint the Hub's Authority alias ARNs by colour, which is why both
+    need this lane rather than hub-worker-image-update.
+    """
+    item = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS)
+    if not isinstance(item, dict):
+        return False
+    change = item.get("change")
+    if not isinstance(change, dict):
+        return False
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    b_in, a_in = before.get("input"), after.get("input")
+    if not isinstance(b_in, dict) or not isinstance(a_in, dict):
+        return False
+    before_colors = (
+        b_in.get("authority_proof_policy_selected_color"),
+        b_in.get("authority_proof_policy_prepared_color"),
+    )
+    after_colors = (
+        a_in.get("authority_proof_policy_selected_color"),
+        a_in.get("authority_proof_policy_prepared_color"),
+    )
+    if before_colors == after_colors:
+        return False
+    # The window must already be OPEN. Without this, null -> (green, green) --
+    # opening the window -- also matched, which is not a shape this lane or its
+    # stand-down callers should recognise. It was masked downstream (an opening
+    # plan CREATES pools, and the claim requires deletes), but the same
+    # predicate gates the stand-downs in _claim_hub_worker_image_update and
+    # _claim_authority_image_uri_move, where nothing would have caught it.
+    if None in before_colors:
+        return False
+    # Closing (-> null, null) or moving to a complete new pair. A half-set pair
+    # is not a shape this lane recognises.
+    return after_colors == (None, None) or None not in after_colors
+
+
+def _check_hub_task_definition_proof_alias_only(by_address: dict[str, Any]) -> None:
+    """Prove the Hub replacement is EXACTLY an Authority alias colour move.
+
+    Admitting a bare "hub-init environment changed" here would be the widening
+    the rest of this lane avoids, so pin the delta: every container, and every
+    environment entry inside them, must be identical except values mentioning
+    the ca-pm function, which may differ only in their alias colour suffix.
+    """
+    change = by_address.get(AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION, {}).get("change")
+    if not isinstance(change, dict):
+        raise ContractError("the Hub task definition replacement must be planned")
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError("the Hub task definition planned values are malformed")
+
+    def strip_defaults(node: Any) -> Any:
+        """Drop provider-normalised empties so only real deltas survive.
+
+        The provider omits empty collections and nulls on one side of the
+        replacement and renders them on the other (environment: [],
+        portMappings: [], systemControls: [], volumesFrom: []). Comparing raw
+        text would show those as differences and mask the one field that
+        actually matters.
+        """
+        if isinstance(node, dict):
+            cleaned = {
+                key: strip_defaults(value)
+                for key, value in node.items()
+                # hostPort is derived from containerPort by the provider and is
+                # rendered on one side of the replacement only.
+                if key != "hostPort" and value not in (None, [], {}, "")
+            }
+            return {k: v for k, v in cleaned.items() if v not in (None, [], {}, "")}
+        if isinstance(node, list):
+            return [strip_defaults(item) for item in node]
+        return node
+
+    def normalise(raw: Any) -> str:
+        parsed = raw
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except ValueError:
+                pass
+        # Recurse into JSON embedded in environment values (the Hub public
+        # config is a JSON string inside a container env var), so the alias ARN
+        # is masked wherever it lives.
+        text = json.dumps(strip_defaults(parsed), sort_keys=True)
+        # Mask the deployment colour on any Authority alias ARN. The mask is
+        # per-ARN and does not cross-check that every ARN moved the SAME way, so
+        # two aliases moving in opposite directions would pass here. The
+        # surrounding zero-spill guards are what constrain that: the claim cedes
+        # all alias movement to authority-image-roll, which proves uniform
+        # convergence across the whole fleet. The colour is
+        # what this operation legitimately moves; everything else in the Hub's
+        # container definitions must be byte-identical, which is what keeps this
+        # from becoming a bare "hub-init environment changed" admission.
+        return re.sub(
+            r"(function:[A-Za-z0-9_-]+):(?:blue|green)\b", r"\1:<color>", text
+        )
+
+    if normalise(before.get("container_definitions")) != normalise(
+        after.get("container_definitions")
+    ):
+        raise ContractError(
+            "the Hub task definition replacement must change only the proof "
+            "alias colour in its container definitions"
+        )
+
+
+def _authority_proof_window_closes_to_null(by_address: dict[str, Any]) -> bool:
+    """True only for the CLOSING half of the transition (colours -> null).
+
+    Distinct from _authority_proof_retirement_closes_the_window, which also
+    matches the catch-up cutover. The endpoint policy spans both colours for as
+    long as the window is open -- including during the cutover, when the pair is
+    blue/blue -- and narrows to the selected colour only once it shuts. Using
+    the broader predicate here narrowed it a step too early.
+    """
+    item = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS)
+    if not isinstance(item, dict):
+        return False
+    after = item.get("change", {}).get("after")
+    if not isinstance(after, dict):
+        return False
+    payload = after.get("input")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("authority_proof_policy_selected_color") is None
+        and payload.get("authority_proof_policy_prepared_color") is None
+    )
+
+
+def _claim_authority_proof_rollout_retirement(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """Claim closing the attended-proof rollout window.
+
+    Dropping the selector colours ends the rollout. That deletes the four
+    standby warm pools the window created, moves the ca-pm alias the Hub
+    resolves, and so replaces the Hub task definition (immutable) and redeploys
+    its service. IA/RA/ICR aliases must NOT move: with the blue/green hold live
+    the selected colour holds its version, and any movement there would mean the
+    consumer path is being retargeted by what is supposed to be a teardown.
+
+    This is the live-first half of the retirement -- live state goes dark here,
+    the Terraform removal follows separately. That ordering is the whole reason
+    it is admissible; a code-first teardown stays forbidden (#3809).
+    """
+    if not _authority_proof_retirement_closes_the_window(by_address):
+        return frozenset()
+    # Pools are deleted only when the window CLOSES. The catch-up cutover keeps
+    # the window open, so an empty set here is a valid shape -- what defines the
+    # lane is the colour transition, not the pools.
+    pools = {a for a in changed if a.startswith(AUTHORITY_PROOF_STANDBY_PREFIX)}
+    if any(actual_non_noop.get(a) != ["delete"] for a in pools):
+        return frozenset()
+    # Function and alias movement belongs to authority-image-roll, which owns
+    # the uniform-convergence proof for them. Closing the window always
+    # republishes the proof functions (they lose their proof-policy env), so
+    # that lane fires here too and the two compose. Claiming them in both would
+    # overlap, and overlapping claims fail composition's disjointness -- the
+    # retirement would then only ever match alone, which is not how it lands:
+    # main publishes a new image on merge, so a roll rides along.
+    if not _claim_authority_image_roll(changed, actual_non_noop, by_address) and any(
+        a.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX)
+        or a.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX)
+        for a in changed
+    ):
+        return frozenset()
+    updates = changed & AUTHORITY_PROOF_RETIREMENT_UPDATES
+    if any(actual_non_noop.get(a) != ["update"] for a in updates):
+        return frozenset()
+    # NOT checked here: that the claim covers all of `changed`. Exactness is the
+    # composer's job (it requires the union of claims to equal `changed`), and
+    # the standalone lane re-checks it. Enforcing it inside the claim would stop
+    # the retirement composing with an Authority image roll -- and a roll
+    # legitimately lands alongside it, since main publishes a new image on merge.
+    replaces = changed & {AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION}
+    if any(
+        actual_non_noop.get(a) not in (["delete", "create"], ["create", "delete"])
+        for a in replaces
+    ):
+        return frozenset()
+    return frozenset(pools | updates | replaces)
+
+
+def _validate_authority_proof_rollout_retirement(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    """Re-prove the retirement independently of the claim."""
+    if not _authority_proof_retirement_closes_the_window(by_address):
+        raise ContractError(
+            "a proof rollout retirement must close the selector window "
+            "(both colours to null)"
+        )
+    pools = {a for a in claimed if a.startswith(AUTHORITY_PROOF_STANDBY_PREFIX)}
+    if AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION in claimed:
+        _check_hub_task_definition_proof_alias_only(by_address)
+    if not claimed:
+        raise ContractError(
+            "a proof selector transition must claim at least one address"
+        )
+    for address in claimed:
+        actions = by_address.get(address, {}).get("change", {}).get("actions")
+        if address in pools:
+            if actions != ["delete"]:
+                raise ContractError(
+                    f"{address} must be a plain delete; got {actions!r}"
+                )
+            continue
+        if address == AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION:
+            # Immutable by construction, so a colour move can only present as a
+            # replacement; its content is proved above.
+            if actions not in (["delete", "create"], ["create", "delete"]):
+                raise ContractError(
+                    f"{address} must be a replacement; got {actions!r}"
+                )
+            continue
+        if actions != ["update"]:
+            raise ContractError(
+                f"{address} must be an in-place update; got {actions!r}"
+            )
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "authority-proof-rollout-retirement",
+        _claim_authority_proof_rollout_retirement,
+        _validate_authority_proof_rollout_retirement,
+    ),
     (
         "authority-image-roll",
         _claim_authority_image_roll,
@@ -10360,7 +10656,12 @@ def _require_slice_and_digest_plan_mode(
     """
     if normalization_drift_kind not in _RUNTIME_SLICE_NORMALIZATION_KINDS:
         return
-    if plan_mode in _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
+    # Composed modes are admitted when a part is: the re-projection belongs to
+    # whichever reviewed transition touched the slice, and composition does not
+    # make that transition less reviewed. Same reasoning as the authority-digest
+    # allowlist; the drift half stays validated by the exec-identity subset test
+    # and _check_planned_security regardless.
+    if _plan_mode_parts(plan_mode) & _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES:
         return
     if (
         normalization_drift_kind == _SLICE_AND_AUTHORITY_DIGEST_NORMALIZATION_KIND
@@ -13062,9 +13363,21 @@ def check_plan(
         AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
         *AUTHORITY_IMAGE_UPDATE_RECOVERY_REPLACES,
     }
+    # This lane admits ONE reviewed migration. It must therefore claim only that
+    # migration -- claiming any image-shaped plan and then failing on the pinned
+    # digests turns every later image roll into a hard stop, which is exactly
+    # what it did once sandbox moved past 65421e -> e147b2. Ordinary rolls now
+    # fall through to authority-image-roll, which proves uniform convergence
+    # structurally instead of by literal digest.
+    try:
+        _plan_image_uris = _authority_image_plan_uris(by_address)
+    except ContractError:
+        _plan_image_uris = None
     authority_image_update_transition = (
         runtime_mode
         and bool(changed)
+        and _plan_image_uris
+        == (AUTHORITY_IMAGE_UPDATE_FROM_URI, AUTHORITY_IMAGE_UPDATE_TO_URI)
         and changed.issubset(authority_image_update_scope)
         and all(
             actual_non_noop.get(address) == ["delete", "create"]
@@ -13572,6 +13885,18 @@ def check_plan(
         plan_mode = "authority-hub-exec-policy-update"
         _validate_authority_hub_exec_policy_update(
             _exec_policy_only, by_address, plan
+        )
+    elif (
+        _retirement_only := _claim_authority_proof_rollout_retirement(
+            changed, actual_non_noop, by_address
+        )
+    ) and set(_retirement_only) == changed and not deposed_by_address:
+        # Closing the attended-proof rollout window on its own. Composition
+        # needs two or more claims by design, so this shape would otherwise
+        # fall through to the terminal reject.
+        plan_mode = "authority-proof-rollout-retirement"
+        _validate_authority_proof_rollout_retirement(
+            _retirement_only, by_address, plan
         )
     elif (
         _composed_plan_mode := _compose_admitted_transitions(

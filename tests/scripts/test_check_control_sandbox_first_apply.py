@@ -13905,6 +13905,242 @@ class ComposedTransitionTest(unittest.TestCase):
                     name.startswith(CHECKER._COMPOSED_PLAN_MODE_PREFIX)
                 )
 
+    def retirement_fixture(self) -> dict:
+        """Closing the rollout window, reduced to its shape."""
+        pool = (
+            CHECKER.AUTHORITY_PROOF_STANDBY_PREFIX
+            + '"layerv-nhp-sandbox-ca-ia"]'
+        )
+        return {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "actions": ["update"],
+                    "before": {
+                        "input": {
+                            "authority_proof_policy_selected_color": "green",
+                            "authority_proof_policy_prepared_color": "green",
+                        }
+                    },
+                    "after": {
+                        "input": {
+                            "authority_proof_policy_selected_color": None,
+                            "authority_proof_policy_prepared_color": None,
+                        }
+                    },
+                }
+            },
+            pool: {"change": {"actions": ["delete"]}},
+            CHECKER.AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION: {
+                "change": {
+                    "actions": ["delete", "create"],
+                    # Identical but for the alias colour, and carrying a
+                    # provider-normalised empty on one side only -- both of
+                    # which the content proof must see through.
+                    "before": {
+                        "container_definitions": json.dumps(
+                            [
+                                {
+                                    "name": "hub-init",
+                                    "environment": [
+                                        {
+                                            "name": "NHP_HUB_PUBLIC_CONFIG_JSON",
+                                            "value": json.dumps(
+                                                {
+                                                    "issue_assignment_alias_arn": (
+                                                        "arn:aws:lambda:us-east-2:"
+                                                        "767397897469:function:"
+                                                        "layerv-nhp-sandbox-ca-ia:green"
+                                                    )
+                                                }
+                                            ),
+                                        }
+                                    ],
+                                    "portMappings": [],
+                                }
+                            ]
+                        )
+                    },
+                    "after": {
+                        "container_definitions": json.dumps(
+                            [
+                                {
+                                    "name": "hub-init",
+                                    "environment": [
+                                        {
+                                            "name": "NHP_HUB_PUBLIC_CONFIG_JSON",
+                                            "value": json.dumps(
+                                                {
+                                                    "issue_assignment_alias_arn": (
+                                                        "arn:aws:lambda:us-east-2:"
+                                                        "767397897469:function:"
+                                                        "layerv-nhp-sandbox-ca-ia:blue"
+                                                    )
+                                                }
+                                            ),
+                                        }
+                                    ],
+                                }
+                            ]
+                        )
+                    },
+                }
+            },
+        }
+
+    def test_retirement_claims_pools_contract_and_task_definition(self) -> None:
+        by = self.retirement_fixture()
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_proof_rollout_retirement(claimed, by, {})
+
+    def test_retirement_requires_the_window_to_close(self) -> None:
+        """Colours must go set -> null; anything else is not a retirement."""
+        by = self.retirement_fixture()
+        by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]["change"]["after"][
+            "input"
+        ]["authority_proof_policy_selected_color"] = "green"
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by),
+            frozenset(),
+        )
+
+    def test_retirement_defers_alias_moves_to_the_image_roll(self) -> None:
+        """Alias/function movement is authority-image-roll's to prove.
+
+        Claiming it in both would overlap, and overlapping claims fail
+        composition's disjointness -- so this lane stands down entirely when an
+        alias moves without a roll to own it.
+        """
+        by = self.retirement_fixture()
+        by[
+            CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX + 'layerv-nhp-sandbox-ca-ia:green"]'
+        ] = {"change": {"actions": ["update"]}}
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by),
+            frozenset(),
+        )
+
+    def test_retirement_requires_plain_pool_deletes(self) -> None:
+        by = self.retirement_fixture()
+        pool = CHECKER.AUTHORITY_PROOF_STANDBY_PREFIX + '"layerv-nhp-sandbox-ca-ia"]'
+        by[pool]["change"]["actions"] = ["delete", "create"]
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by),
+            frozenset(),
+        )
+
+    def test_retirement_refuses_a_non_colour_hub_delta(self) -> None:
+        """Admitting a bare "hub-init environment changed" would be the widening
+        this lane exists to avoid, so any delta beyond the alias colour fails.
+        """
+        by = self.retirement_fixture()
+        change = by[CHECKER.AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION]["change"]
+        containers = json.loads(change["after"]["container_definitions"])
+        containers[0]["environment"].append({"name": "SNUCK_IN", "value": "1"})
+        change["after"]["container_definitions"] = json.dumps(containers)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_proof_rollout_retirement(
+                frozenset(by), by, {}
+            )
+
+    def test_retirement_composes_with_an_image_roll(self) -> None:
+        """The shape this lane is actually built for.
+
+        Main publishes a new Authority image on merge, so a roll rides along
+        with the retirement rather than the retirement landing alone. The whole
+        disjointness design -- ceding functions/aliases to authority-image-roll,
+        sharing foundation_contract, standing down when an alias moves with no
+        roll to own it -- exists for this path, so assert it directly instead of
+        inferring it from the standalone case.
+        """
+        roll = self.image_roll_fixture()
+        by = self.retirement_fixture()
+        target = roll[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]["change"][
+            "after"
+        ]["input"]["authority_image_uri"]
+        by.update(
+            {a: v for a, v in roll.items()
+             if a != CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS}
+        )
+        # One contract entry carrying BOTH halves: the image the fleet converges
+        # on, and the colour transition that closes the window.
+        by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS] = {
+            "change": {
+                "actions": ["update"],
+                "before": {
+                    "input": {
+                        "authority_image_uri": target,
+                        "authority_proof_policy_selected_color": "green",
+                        "authority_proof_policy_prepared_color": "green",
+                    }
+                },
+                "after": {
+                    "input": {
+                        "authority_image_uri": target,
+                        "authority_proof_policy_selected_color": None,
+                        "authority_proof_policy_prepared_color": None,
+                    }
+                },
+            }
+        }
+        changed = {a for a in by if by[a]["change"]["actions"] != ["no-op"]}
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+
+        retirement = CHECKER._claim_authority_proof_rollout_retirement(
+            changed, actions, by
+        )
+        roll_claim = CHECKER._claim_authority_image_roll(changed, actions, by)
+        self.assertTrue(retirement, "retirement must claim alongside a roll")
+        self.assertTrue(roll_claim, "the roll must still claim its own addresses")
+
+        # Disjoint except for the deliberately shared contract address, and
+        # between them they must account for every changed address.
+        overlap = set(retirement) & set(roll_claim)
+        self.assertEqual(overlap - CHECKER._COMPOSABLE_SHARED_ADDRESSES, set())
+        self.assertEqual(set(retirement) | set(roll_claim), changed)
+
+    def test_image_roll_claims_the_shared_contract_address(self) -> None:
+        """Both lanes claim foundation_contract; that is why it is shared.
+
+        If it ever stopped being in _COMPOSABLE_SHARED_ADDRESSES, the overlap
+        would fail composition's disjointness and the retirement-plus-roll plan
+        would be rejected -- the normal merge shape. Pin the dependency.
+        """
+        by = self.image_roll_fixture()
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_image_roll(changed, actions, by)
+        self.assertIn(CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, claimed)
+        self.assertIn(
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
+            CHECKER._COMPOSABLE_SHARED_ADDRESSES,
+        )
+
+    def test_opening_the_window_is_not_a_selector_transition(self) -> None:
+        """null -> set is opening, and must not match the transition predicate.
+
+        The same predicate gates the stand-downs in hub-worker-image-update and
+        authority-image-uri-move, so a false match there would silently disarm
+        two unrelated lanes during a window-opening plan.
+        """
+        by = self.retirement_fixture()
+        contract = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]["change"]
+        contract["before"]["input"]["authority_proof_policy_selected_color"] = None
+        contract["before"]["input"]["authority_proof_policy_prepared_color"] = None
+        contract["after"]["input"]["authority_proof_policy_selected_color"] = "green"
+        contract["after"]["input"]["authority_proof_policy_prepared_color"] = "green"
+        self.assertFalse(
+            CHECKER._authority_proof_retirement_closes_the_window(by)
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
@@ -13928,6 +14164,10 @@ class ComposedTransitionTest(unittest.TestCase):
                 # only ever admit one migration and cannot keep up with a
                 # stream of merges to main.
                 "authority-image-roll",
+                # Closing the attended-proof rollout window: the live-first half
+                # of the retirement, where live state goes dark before the
+                # Terraform removal follows.
+                "authority-proof-rollout-retirement",
             },
         )
 

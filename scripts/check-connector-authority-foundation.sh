@@ -159,6 +159,51 @@ if [[ -n "$plan_json" ]]; then
   # non-image field plus the exact sandbox account/region/repository/digest.
   # This shell fence deliberately delegates the deep shape instead of growing a
   # second jq implementation that can drift from the complete Control checker.
+  # The governed proof-rollout retirement. Dropping the selector colours ends the
+  # rollout window, so the four standby warm pools it created are deleted and the
+  # Hub's ca-pm alias target moves -- an immutable ECS task definition, hence a
+  # replacement. Live state goes dark FIRST, through this gate flip; the code
+  # removal follows separately. That ordering is what makes this admissible where
+  # a code-first teardown is not (see AUTHORITY_PROOF_MUTATION_CONTROLS.md
+  # "Rollback ordering" and PR #3809, closed for inverting it).
+  #
+  # Bounded two ways so nothing can borrow the lane: the plan's COMPLETE
+  # destructive set must equal exactly these five addresses, and the contract
+  # must prove the selector colours are going from set to null. A plan that
+  # destroys anything else, or that is not the retirement, fails the equality
+  # and falls through to the refusal below.
+  authority_proof_rollout_retirement_allowed=false
+  if jq -e '
+    def destructive:
+      .change.actions != ["no-op"]
+      and .change.actions != ["read"]
+      and (.change.actions | index("delete"));
+    ([(.resource_changes[]?, .resource_drift[]?) | select(destructive) | .address]
+      | unique) as $destroyed
+    | (($destroyed == ["module.control.aws_ecs_task_definition.hub[0]"])
+    or ($destroyed == [
+        "module.control.aws_ecs_task_definition.hub[0]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-icr\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-pm\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]"
+      ]))
+    and (
+      [ .resource_changes[]?
+        | select(.address == "module.control.terraform_data.foundation_contract")
+        | select(.change.before.input.authority_proof_policy_selected_color != null)
+        | select(
+            .change.before.input.authority_proof_policy_selected_color
+            != .change.after.input.authority_proof_policy_selected_color
+            or .change.before.input.authority_proof_policy_prepared_color
+              != .change.after.input.authority_proof_policy_prepared_color
+          )
+      ] | length
+    ) == 1
+  ' "$plan_json" >/dev/null; then
+    authority_proof_rollout_retirement_allowed=true
+  fi
+
   hub_worker_image_update_allowed=false
   if jq -e '
     [
@@ -173,7 +218,12 @@ if [[ -n "$plan_json" ]]; then
         == "module.control.aws_ecs_task_definition.hub[0]"
       and $destructive[0].change.actions == ["delete", "create"]
   ' "$plan_json" >/dev/null; then
-    if ! python3 "$control_plan_checker" \
+    # A proof selector transition also replaces the task definition, because the
+    # Hub's Authority alias ARNs move by colour. That is not an image update and
+    # must not be judged as one; authority-proof-rollout-retirement owns it and
+    # proves the container definitions differ only in that colour.
+    if [[ "$authority_proof_rollout_retirement_allowed" != true ]] \
+      && ! python3 "$control_plan_checker" \
       hub-worker-image-update "$plan_json" >/dev/null; then
       echo "ERROR: Hub worker task-definition replacement failed its exact image-only contract" >&2
       exit 1
@@ -329,7 +379,9 @@ if [[ -n "$plan_json" ]]; then
     --argjson hub_worker_image_update_allowed \
       "$hub_worker_image_update_allowed" \
     --argjson authority_proof_prepare_recovery_allowed \
-      "$authority_proof_prepare_recovery_allowed" '
+      "$authority_proof_prepare_recovery_allowed" \
+    --argjson authority_proof_rollout_retirement_allowed \
+      "$authority_proof_rollout_retirement_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -402,6 +454,20 @@ if [[ -n "$plan_json" ]]; then
               == "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]"
           )
           and .type == "aws_lambda_provisioned_concurrency_config"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete", "create"]
+        ) or (
+          $authority_proof_rollout_retirement_allowed
+          and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby["))
+          and .type == "aws_lambda_provisioned_concurrency_config"
+          and .mode == "managed"
+          and (.deposed // null) == null
+          and .change.actions == ["delete"]
+        ) or (
+          $authority_proof_rollout_retirement_allowed
+          and .address == "module.control.aws_ecs_task_definition.hub[0]"
+          and .type == "aws_ecs_task_definition"
           and .mode == "managed"
           and (.deposed // null) == null
           and .change.actions == ["delete", "create"]
