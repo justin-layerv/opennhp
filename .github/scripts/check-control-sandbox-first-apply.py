@@ -11341,6 +11341,34 @@ def _refresh_sensitive_contract(
     raise ContractError(f"refresh drift is not approved for normalization: {address}")
 
 
+# authority_image_uri tracks the PUBLISHED image digest by design (#3761): the
+# digest is read from an SSM parameter the publisher updates out of band, so a
+# refresh legitimately observes a newer image than the captured state. Before
+# #3761 the digest was pinned in the reviewed basis and every root output was
+# stable across a refresh, which is the assumption this normalizer was written
+# under.
+#
+# Permit exactly that movement and nothing else: the SAME repository, differing
+# only in the digest. A repository change, a tag-form URI, or a malformed digest
+# is still a hard failure, and every other output must still match byte for
+# byte.
+_DIGEST_TRACKING_OUTPUT = "authority_image_uri"
+_ECR_DIGEST_URI = re.compile(r"^(?P<repo>[^@\s]+)@sha256:(?P<digest>[0-9a-f]{64})$")
+
+
+def _is_published_digest_move(planned: Any, state: Any) -> bool:
+    """Report whether two output entries differ only by a same-repo image digest."""
+    planned_value = planned.get("value") if isinstance(planned, dict) else None
+    state_value = state.get("value") if isinstance(state, dict) else None
+    if not isinstance(planned_value, str) or not isinstance(state_value, str):
+        return False
+    planned_uri = _ECR_DIGEST_URI.match(planned_value)
+    state_uri = _ECR_DIGEST_URI.match(state_value)
+    if planned_uri is None or state_uri is None:
+        return False
+    return planned_uri.group("repo") == state_uri.group("repo")
+
+
 def _check_refresh_only_outputs(
     plan: dict[str, Any], prior_state: dict[str, Any]
 ) -> None:
@@ -11389,15 +11417,23 @@ def _check_refresh_only_outputs(
         # Terraform 1.14.3 collapses non-sensitive scalar and complex root
         # outputs to the literal false; the version-pinned fixture covers both
         # object and tuple values so a representation change fails closed.
-        if (
-            not _is_exact_nonsensitive_output_entry(planned_output)
-            or not _is_exact_nonsensitive_output_entry(state_output)
-            or not _json_equal(planned_output, state_output)
-        ):
+        if not _is_exact_nonsensitive_output_entry(
+            planned_output
+        ) or not _is_exact_nonsensitive_output_entry(state_output):
             raise ContractError(
-                f"refresh-only Terraform {TF_VERSION} outputs do not match captured state; "
+                f"refresh-only Terraform {TF_VERSION} output entry {output_name} is malformed; "
                 f"{_refresh_only_value_shape(planned_values)}"
             )
+        if _json_equal(planned_output, state_output):
+            continue
+        if output_name == _DIGEST_TRACKING_OUTPUT and _is_published_digest_move(
+            planned_output, state_output
+        ):
+            continue
+        raise ContractError(
+            f"refresh-only Terraform {TF_VERSION} output {output_name} does not match "
+            f"captured state; {_refresh_only_value_shape(planned_values)}"
+        )
     for output_name in set(AUTHORITY_PROOF_ALIAS_OUTPUTS.values()) - set(
         state_outputs
     ):

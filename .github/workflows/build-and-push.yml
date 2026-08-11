@@ -1765,6 +1765,7 @@ jobs:
             tests/scripts/check-control-global-routing_test.sh \
             tests/scripts/check-control-vpc-cidr-overlap_test.sh
           python3 tests/scripts/test_check_control_sandbox_first_apply.py
+          python3 tests/scripts/test_refresh_only_digest_move.py
           python3 tests/scripts/test_generate_connector_authority_runtime_contract.py
           tests/scripts/check-connector-authority-foundation_test.sh
           tests/scripts/check-control-global-routing_test.sh
