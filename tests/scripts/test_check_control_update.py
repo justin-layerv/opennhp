@@ -900,7 +900,7 @@ class WorkflowContractTests(unittest.TestCase):
             "control-state-before-apply/state.json",
             "live-refresh-contract-summary.json",
             "live-refresh-drift-summary.raw.json",
-            "publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*",
+            "publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-alias-refresh:*|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*",
             "publisher-role|hub-publisher-role|redis-passwords)",
         ):
             self.assertIn(marker, live_refresh_step)

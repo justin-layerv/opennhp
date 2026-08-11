@@ -783,7 +783,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-alias-refresh:*|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -816,6 +816,18 @@ jobs:
               exit 0
               ;;
           esac
+          if [[ "$normalization_kind" == 'authority-alias-refresh' ]]; then
+            # State catch-up from a failed apply's partial success: live already
+            # holds these alias/function values, the plan proposes no change to
+            # them (the classifier requires every drifted address to be planned
+            # no-op), and the qurl-service publisher rolls new versions
+            # externally on every main push. Re-observing an externally rolling
+            # value between plan and apply "is not a staleness guard, it is a
+            # coin flip" -- the immediately-before-apply state {serial, sha256}
+            # binding in the next step is the real guard, exactly as for the
+            # digest kinds.
+            exit 0
+          fi
           if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' \
              || "$normalization_kind" == 'authority-runtime-slice-with-authority-digest' ]]; then
             # The runtime-slice completion's benign drift is a deterministic

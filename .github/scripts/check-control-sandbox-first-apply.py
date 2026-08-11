@@ -4230,8 +4230,40 @@ def _check_authority_proof_rollout_prepare_recovery(
             )
 
 
-def _hub_authority_alias_arns(rollout: bool) -> set[str]:
-    colors = ("blue", "green") if rollout else ("blue",)
+def _selected_authority_color_from_contract(payload: Any) -> str:
+    """The blue/green switch pointer, read from a foundation-contract input.
+
+    "blue" only when the CONTRACT ITSELF is absent (rollout-era shapes and
+    pre-contract states keep their historical meaning). A contract that is
+    present but missing or mis-spelling `selected_authority_color` raises
+    instead of degrading: a silent "blue" here would wedge every plan at
+    exactly the moment the pointer moves to green -- the scenario this helper
+    exists to unblock -- and a schema drift should surface as itself, not as a
+    phantom colour disagreement.
+    """
+    if not isinstance(payload, dict):
+        return "blue"
+    contract = payload.get("authority_runtime_contract")
+    if not isinstance(contract, dict):
+        return "blue"
+    color = contract.get("selected_authority_color")
+    if color not in ("blue", "green"):
+        raise ContractError(
+            "authority_runtime_contract carries no valid "
+            f"selected_authority_color; got {color!r}"
+        )
+    return color
+
+
+def _hub_authority_alias_arns(rollout: bool, selected: str = "blue") -> set[str]:
+    """The alias ARNs the Hub may invoke.
+
+    During a rollout both colours are reachable. Outside one, exactly the
+    SELECTED colour is -- and that is the contract's selected_authority_color,
+    not a constant: the selector is the blue/green switch pointer, so pinning
+    "blue" here would wedge every plan the moment the pointer moves.
+    """
+    colors = ("blue", "green") if rollout else (selected,)
     return {
         f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{function_name}:{color}"
         for function_name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
@@ -5353,6 +5385,16 @@ def _check_planned_security(
             # correctly narrows back to the selected colour alone. Judge it on
             # the window's after-state, not on inventory that is being deleted
             # in this very plan.
+            _contract_after = (
+                by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {})
+                .get("change", {})
+                .get("after")
+            )
+            _contract_payload = (
+                _contract_after.get("input")
+                if isinstance(_contract_after, dict)
+                else None
+            )
             _check_hub_lambda_endpoint_policy(
                 after,
                 address,
@@ -5360,6 +5402,7 @@ def _check_planned_security(
                     proof_rollout_mode
                     and not _authority_proof_window_closes_to_null(by_address)
                 ),
+                selected=_selected_authority_color_from_contract(_contract_payload),
             )
         elif (
             hub_worker_mode
@@ -5967,7 +6010,11 @@ def _endpoint_allow_statements(
 
 
 def _check_hub_lambda_endpoint_policy(
-    after: dict[str, Any], address: str, *, rollout: bool = False
+    after: dict[str, Any],
+    address: str,
+    *,
+    rollout: bool = False,
+    selected: str = "blue",
 ) -> None:
     # The opened lambda interface endpoint admits ONLY the Hub worker task role,
     # invoking ONLY the 3 selected-color authority aliases. Same Principal "*" +
@@ -5986,7 +6033,7 @@ def _check_hub_lambda_endpoint_policy(
         raise ContractError(f"{address} action must be exactly lambda:InvokeFunction")
     if _authority_string_set(
         stmt.get("Resource"), address, "Resource"
-    ) != _hub_authority_alias_arns(rollout):
+    ) != _hub_authority_alias_arns(rollout, selected):
         raise ContractError(
             f"{address} resources must be exactly the bounded Authority alias set"
         )
@@ -10762,6 +10809,8 @@ def _check_state_normalization_drift(
     # From here down ``drift`` is the substantive remainder, and every existing
     # reviewed-kind matcher below sees exactly that. Rejection diagnostics
     # therefore name only the entries that actually carry a signal.
+    # Derived positionally from ``drift``: every zip() below pairs each address
+    # with its own drift item by construction.
     addresses = tuple(item.get("address") for item in drift)
     if (
         all(isinstance(address, str) for address in addresses)
@@ -10779,6 +10828,34 @@ def _check_state_normalization_drift(
         return AUTHORITY_PROOF_CONCURRENCY_RECOVERY_NORMALIZATION_KIND
     if not all(isinstance(address, str) for address in addresses):
         raise _unexpected_drift_error(drift)
+    if addresses and all(
+        (
+            address.startswith("module.control.aws_lambda_alias.authority[")
+            or address.startswith("module.control.aws_lambda_function.authority[")
+        )
+        and item.get("change", {}).get("actions") == ["update"]
+        and by_address.get(address, {}).get("change", {}).get("actions")
+        == ["no-op"]
+        for address, item in zip(addresses, drift)
+    ):
+        # A failed Authority apply leaves state behind live on exactly the
+        # aliases/functions whose AWS calls succeeded before the error (the
+        # 2026-08-11 prepare apply died on ResourceConflictException after the
+        # ca-pm publish went through). The refresh reconciles state to live, and
+        # requiring every drifted address to be planned NO-OP is what confines
+        # this to pure state catch-up: a drifted address with a pending change
+        # still fails closed to the terminal rejection below.
+        #
+        # Deliberately a GENERAL kind, not a one-shot heal: any future failed
+        # Authority apply leaves this same residue, and the confinement (all
+        # no-op, plus the immediately-before-apply state binding) is what makes
+        # it safe -- not the specific 2026-08-11 event. Also deliberately does
+        # NOT require refresh_only, unlike redis-passwords: this catch-up
+        # legitimately rides ordinary deploy plans, and gating it to
+        # refresh-only dispatches would leave every routine deploy wedged
+        # behind an attended refresh. Skipping plan-mode gating is safe for the
+        # same reason it is safe to skip here (see the check_plan comment).
+        return "authority-alias-refresh"
     if addresses == _REDIS_PASSWORD_NORMALIZATION_ADDRESSES:
         if not refresh_only:
             raise ContractError(
@@ -14048,6 +14125,10 @@ def check_plan(
             )
     if normalization_drift_kind == "authority-and-hub-digest":
         _require_normalization_plan_mode(normalization_drift_kind, plan_mode, plan)
+    # "authority-alias-refresh" is deliberately NOT plan-mode-gated: the
+    # classifier only returns it when every drifted address is planned no-op,
+    # so the drift cannot smuggle a change into any plan mode -- it is pure
+    # state catch-up from a failed apply's partial success.
     if normalization_drift_kind == "redis-passwords" and plan_mode != "no-op":
         raise ContractError(
             "Redis password projection normalization cannot be combined with "
@@ -15127,7 +15208,12 @@ def check_state(state: Any) -> dict[str, Any]:
             _check_authority_email_endpoint_policy(item, address)
         elif hub_worker_present and service == "lambda":
             _check_hub_lambda_endpoint_policy(
-                item, address, rollout=proof_rollout_present
+                item,
+                address,
+                rollout=proof_rollout_present,
+                selected=_selected_authority_color_from_contract(
+                    foundation.get("input")
+                ),
             )
         elif hub_worker_present and not runtime_present and service == "secretsmanager":
             _check_hub_secretsmanager_endpoint_policy(item, address)

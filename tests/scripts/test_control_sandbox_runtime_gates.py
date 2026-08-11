@@ -40,10 +40,9 @@ LIVE = {
     "proof_policy_consumers_staged": True,
     "proof_policy_selected_color": "green",
     "proof_policy_prepared_color": "green",
-    # Still dark. The gate flip is NOT in this PR: closing the rollout window
-    # before the catch-up cutover would drop live Hub traffic onto the frozen
-    # standby alias. The lanes land first; the flip follows with the cutover.
-    "blue_green_alias_hold_enabled": False,
+    # Live: the rollout window is closed and the hold keeps the selected
+    # colour on the version it serves; standby tracks each new publish.
+    "blue_green_alias_hold_enabled": True,
 }
 
 
@@ -138,6 +137,9 @@ class FlagEmission(unittest.TestCase):
                 "--hub-worker-enabled",
                 "--proof-mutation-controls-enabled",
                 "--proof-policy-consumers-staged",
+                # Booleans emit before colours: emit_flags walks BOOLEAN_GATES
+                # (where the hold is appended last) and then COLOR_GATES.
+                "--blue-green-alias-hold-enabled",
                 "--proof-policy-selected-color",
                 "green",
                 "--proof-policy-prepared-color",
@@ -317,11 +319,11 @@ class DependencyRules(unittest.TestCase):
         mid-list would fail the apply, not the review.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            base = run("flags", gates=write_gates(Path(tmp)))
-            enabled = run(
+            base = run(
                 "flags",
-                gates=write_gates(Path(tmp), blue_green_alias_hold_enabled=True),
+                gates=write_gates(Path(tmp), blue_green_alias_hold_enabled=False),
             )
+            enabled = run("flags", gates=write_gates(Path(tmp)))
         self.assertEqual(base.returncode, 0)
         self.assertEqual(enabled.returncode, 0)
         flag = "--blue-green-alias-hold-enabled"
@@ -384,6 +386,7 @@ class TfvarsReceipt(unittest.TestCase):
         "authority_proof_policy_consumers_staged": True,
         "authority_proof_policy_selected_color": "green",
         "authority_proof_policy_prepared_color": "green",
+        "authority_blue_green_alias_hold_enabled": True,
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
         "authority_proof_mutation_owner_id": "someone",
@@ -518,6 +521,7 @@ class DispatchBinding(unittest.TestCase):
             "-f hub_edge_enabled=true",
             "-f proof_policy_selected_color=green",
             "-f proof_policy_prepared_color=green",
+            "-f blue_green_alias_hold_enabled=true",
         ):
             self.assertIn(expected, result.stderr)
 

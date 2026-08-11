@@ -14141,6 +14141,82 @@ class ComposedTransitionTest(unittest.TestCase):
             CHECKER._authority_proof_retirement_closes_the_window(by)
         )
 
+    def alias_refresh_drift(self, planned: str = "no-op") -> tuple[list, dict]:
+        address = (
+            'module.control.aws_lambda_alias.authority["layerv-nhp-sandbox-ca-ia:blue"]'
+        )
+        drift = [{"address": address, "change": {"actions": ["update"]}}]
+        by = {address: {"change": {"actions": [planned]}}}
+        return drift, by
+
+    def test_absorbed_alias_refresh_drift_is_a_reviewed_kind(self) -> None:
+        """A failed apply's partial success reconciles as pure state catch-up."""
+        drift, by = self.alias_refresh_drift()
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False),
+            "authority-alias-refresh",
+        )
+
+    def test_alias_refresh_drift_with_a_pending_change_is_not_catch_up(self) -> None:
+        """The no-op requirement is the confinement.
+
+        A drifted alias with a pending change must NOT classify as the
+        catch-up kind -- it falls through to the slice-normalization kind,
+        whose downstream gate binds it to reviewed slice transitions (and the
+        terminal rejection otherwise, as the end-to-end negative proves).
+        """
+        drift, by = self.alias_refresh_drift(planned="update")
+        self.assertNotEqual(
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False),
+            "authority-alias-refresh",
+        )
+
+    def test_function_drift_is_also_catch_up(self) -> None:
+        address = (
+            'module.control.aws_lambda_function.authority["layerv-nhp-sandbox-ca-pm"]'
+        )
+        drift = [{"address": address, "change": {"actions": ["update"]}}]
+        by = {address: {"change": {"actions": ["no-op"]}}}
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False),
+            "authority-alias-refresh",
+        )
+
+    def test_mixed_drift_with_a_foreign_address_is_not_catch_up(self) -> None:
+        """One non-Authority address in the set defeats the whole kind."""
+        drift, by = self.alias_refresh_drift()
+        foreign = "module.control.aws_vpc.control"
+        drift.append({"address": foreign, "change": {"actions": ["update"]}})
+        by[foreign] = {"change": {"actions": ["no-op"]}}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False)
+
+    def test_switch_pointer_reads_the_contract(self) -> None:
+        for color in ("blue", "green"):
+            with self.subTest(color=color):
+                self.assertEqual(
+                    CHECKER._selected_authority_color_from_contract(
+                        {"authority_runtime_contract": {"selected_authority_color": color}}
+                    ),
+                    color,
+                )
+
+    def test_switch_pointer_defaults_blue_only_without_a_contract(self) -> None:
+        for payload in (None, {}, {"authority_runtime_contract": None}):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    CHECKER._selected_authority_color_from_contract(payload), "blue"
+                )
+
+    def test_switch_pointer_raises_on_a_contract_missing_the_colour(self) -> None:
+        """Schema drift must surface as itself, not as a phantom blue."""
+        for contract in ({}, {"selected_authority_color": "purple"}):
+            with self.subTest(contract=contract):
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER._selected_authority_color_from_contract(
+                        {"authority_runtime_contract": contract}
+                    )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
