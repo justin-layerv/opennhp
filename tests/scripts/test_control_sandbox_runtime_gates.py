@@ -33,8 +33,8 @@ LIVE = {
     "hub_worker_enabled": True,
     "proof_mutation_controls_enabled": True,
     "proof_policy_consumers_staged": True,
-    "proof_policy_selected_color": "green",
-    "proof_policy_prepared_color": "green",
+    "proof_policy_selected_color": "blue",
+    "proof_policy_prepared_color": "blue",
     # Still dark. The gate flip is NOT in this PR: closing the rollout window
     # before the catch-up cutover would drop live Hub traffic onto the frozen
     # standby alias. The lanes land first; the flip follows with the cutover.
@@ -134,9 +134,9 @@ class FlagEmission(unittest.TestCase):
                 "--proof-mutation-controls-enabled",
                 "--proof-policy-consumers-staged",
                 "--proof-policy-selected-color",
-                "green",
+                "blue",
                 "--proof-policy-prepared-color",
-                "green",
+                "blue",
             ],
         )
 
@@ -377,8 +377,8 @@ class TfvarsReceipt(unittest.TestCase):
         "hub_worker_enabled": True,
         "authority_proof_mutation_controls_enabled": True,
         "authority_proof_policy_consumers_staged": True,
-        "authority_proof_policy_selected_color": "green",
-        "authority_proof_policy_prepared_color": "green",
+        "authority_proof_policy_selected_color": "blue",
+        "authority_proof_policy_prepared_color": "blue",
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
         "authority_proof_mutation_owner_id": "someone",
@@ -411,7 +411,8 @@ class TfvarsReceipt(unittest.TestCase):
         self.assertIn("hub_worker_enabled", result.stderr)
 
     def test_flipped_color_fails(self) -> None:
-        tfvars = dict(self.LIVE_TFVARS, authority_proof_policy_selected_color="blue")
+        # "green" is the flip now that the committed selector is blue.
+        tfvars = dict(self.LIVE_TFVARS, authority_proof_policy_selected_color="green")
         with tempfile.TemporaryDirectory() as tmp:
             result = self.verify(tmp, tfvars)
         self.assertEqual(result.returncode, 1)
@@ -475,7 +476,7 @@ class DispatchBinding(unittest.TestCase):
         self.assertIn("hub_edge_enabled", result.stderr)
 
     def test_a_flipped_color_fails(self) -> None:
-        result = run(*check_args(proof_policy_selected_color="blue"))
+        result = run(*check_args(proof_policy_selected_color="green"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("proof_policy_selected_color", result.stderr)
 
@@ -509,8 +510,8 @@ class DispatchBinding(unittest.TestCase):
         for expected in (
             "-f enable_runtime_functions=true",
             "-f hub_edge_enabled=true",
-            "-f proof_policy_selected_color=green",
-            "-f proof_policy_prepared_color=green",
+            "-f proof_policy_selected_color=blue",
+            "-f proof_policy_prepared_color=blue",
         ):
             self.assertIn(expected, result.stderr)
 
