@@ -59,6 +59,13 @@ false positives, so the check never blocks a valid change -- but a clean run
 here is not proof that no IAM description anywhere carries a rejected
 character. The parser also assumes `terraform fmt` layout: nested blocks
 indented, and the resource closing brace at column zero.
+
+Two more shapes in the same false-negative family: `str.splitlines()` also
+breaks on U+2028/U+2029/U+0085/form-feed, so a description literal containing
+one is split across "lines" and slips past the assignment pattern; and the
+greedy capture can pull a trailing comment into the scanned value when the
+comment itself contains a quote, which errs toward over-strictness rather than
+under.
 """
 
 from __future__ import annotations
@@ -100,7 +107,12 @@ def scan(tf_file: Path, base: Path) -> int:
     failures = 0
     inside: str | None = None
     heredoc: str | None = None
-    for lineno, line in enumerate(tf_file.read_text(encoding="utf-8").splitlines(), 1):
+    # errors="replace" rather than letting a non-UTF-8 byte raise: a traceback
+    # would fail the run without the ::error:: framing every other message uses.
+    # It also improves detection -- a mangled byte becomes U+FFFD, which the
+    # disallowed-charset regex catches and reports properly.
+    body = tf_file.read_text(encoding="utf-8", errors="replace")
+    for lineno, line in enumerate(body.splitlines(), 1):
         if heredoc is not None:
             if line.strip() == heredoc:
                 heredoc = None
