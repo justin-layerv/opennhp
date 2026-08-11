@@ -38,8 +38,8 @@ LIVE = {
     "hub_worker_enabled": True,
     "proof_mutation_controls_enabled": True,
     "proof_policy_consumers_staged": True,
-    "proof_policy_selected_color": "green",
-    "proof_policy_prepared_color": "green",
+    "proof_policy_selected_color": "none",
+    "proof_policy_prepared_color": "none",
     # Live: the rollout window is closed and the hold keeps the selected
     # colour on the version it serves; standby tracks each new publish.
     "blue_green_alias_hold_enabled": True,
@@ -139,11 +139,8 @@ class FlagEmission(unittest.TestCase):
                 "--proof-policy-consumers-staged",
                 # Booleans emit before colours: emit_flags walks BOOLEAN_GATES
                 # (where the hold is appended last) and then COLOR_GATES.
+                # The rollout window is closed: no colour flags are emitted.
                 "--blue-green-alias-hold-enabled",
-                "--proof-policy-selected-color",
-                "green",
-                "--proof-policy-prepared-color",
-                "green",
             ],
         )
 
@@ -384,8 +381,7 @@ class TfvarsReceipt(unittest.TestCase):
         "hub_worker_enabled": True,
         "authority_proof_mutation_controls_enabled": True,
         "authority_proof_policy_consumers_staged": True,
-        "authority_proof_policy_selected_color": "green",
-        "authority_proof_policy_prepared_color": "green",
+        # Window closed: the generator emits no colour keys.
         "authority_blue_green_alias_hold_enabled": True,
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
@@ -519,8 +515,8 @@ class DispatchBinding(unittest.TestCase):
         for expected in (
             "-f enable_runtime_functions=true",
             "-f hub_edge_enabled=true",
-            "-f proof_policy_selected_color=green",
-            "-f proof_policy_prepared_color=green",
+            "-f proof_policy_selected_color=none",
+            "-f proof_policy_prepared_color=none",
             "-f blue_green_alias_hold_enabled=true",
         ):
             self.assertIn(expected, result.stderr)

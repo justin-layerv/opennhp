@@ -109,6 +109,16 @@ running them would not buy anything.
       Measured against serial 100: 1 add, 9 change, 5 destroy -- the four
       standby pools and the Hub task definition. With the blue/green hold live,
       IA/RA/ICR aliases do not move at all.
+- [x] Close the rollout window and align the switch pointer (nhp #3846): the
+      selector colours go to `none` and the contract's
+      `selected_authority_color` moves to green -- where live Hub traffic
+      already points -- in one measured apply (13 add / 8 change / 17 destroy,
+      Hub task definition no-op, zero drift). The four standby pools delete and
+      steady provisioned concurrency re-homes blue => green with a brief
+      (~2-4 min) sandbox warm-capacity gap, accepted by the owner. Admitted as
+      `authority-proof-rollout-retirement` composed with the image roll; the
+      strict `authority-proof-disable` transition remains for the later
+      full-dark step (proof gate off, ca-pm/ca-pcr removed).
 - [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
       (step 5). This subsumes retiring the rollout selector — measured below,
       it is not a separate step.

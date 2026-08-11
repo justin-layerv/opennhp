@@ -181,6 +181,24 @@ if [[ -n "$plan_json" ]]; then
     ([(.resource_changes[]?, .resource_drift[]?) | select(destructive) | .address]
       | unique) as $destroyed
     | (($destroyed == ["module.control.aws_ecs_task_definition.hub[0]"])
+    or (
+      # The pointer-align + window-close shape: the four standby pools go, and
+      # the steady provisioned concurrency re-homes from the old selected
+      # colour to the new one (delete+create; qualifier is the identity). The
+      # equality below still pins the COMPLETE destructive set, so anything
+      # else riding along collapses the allowance.
+      ($destroyed - [
+        (.resource_changes[]? | select(
+          (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
+          and .change.actions == ["delete", "create"]
+        ) | .address)
+      ]) == [
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-icr\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-pm\"]",
+        "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ra\"]"
+      ]
+    )
     or ($destroyed == [
         "module.control.aws_ecs_task_definition.hub[0]",
         "module.control.aws_lambda_provisioned_concurrency_config.authority_proof_standby[\"layerv-nhp-sandbox-ca-ia\"]",
@@ -438,6 +456,10 @@ if [[ -n "$plan_json" ]]; then
               == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pm\"]"
             or .address
               == "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-pcr\"]"
+            or (
+              $authority_proof_rollout_retirement_allowed
+              and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
+            )
           )
           and .type == "aws_lambda_provisioned_concurrency_config"
           and .mode == "managed"

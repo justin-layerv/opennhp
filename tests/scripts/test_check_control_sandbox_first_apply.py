@@ -14232,6 +14232,68 @@ class ComposedTransitionTest(unittest.TestCase):
                     slice_,
                 )
 
+    def rehome_fixture(self) -> dict:
+        """A window-close carrying one steady-PC re-home blue -> green."""
+        by = self.retirement_fixture()
+        contract = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]["change"]
+        contract["before"]["input"]["authority_runtime_contract"] = {
+            "selected_authority_color": "blue"
+        }
+        contract["after"]["input"]["authority_runtime_contract"] = {
+            "selected_authority_color": "green"
+        }
+        by[
+            CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]'
+        ] = {
+            "change": {
+                "actions": ["delete", "create"],
+                "before": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+                "after": {"qualifier": "green", "provisioned_concurrent_executions": 2},
+            }
+        }
+        return by
+
+    def test_rehome_rides_the_window_close(self) -> None:
+        by = self.rehome_fixture()
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_proof_rollout_retirement(claimed, by, {})
+
+    def test_rehome_must_follow_the_selector_direction(self) -> None:
+        """green -> blue while the selector moves blue -> green is refused."""
+        by = self.rehome_fixture()
+        pc = by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]']
+        pc["change"]["before"]["qualifier"] = "green"
+        pc["change"]["after"]["qualifier"] = "blue"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_proof_rollout_retirement(
+                frozenset(by), by, {}
+            )
+
+    def test_rehome_must_keep_its_allocation(self) -> None:
+        by = self.rehome_fixture()
+        by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]'][
+            "change"
+        ]["after"]["provisioned_concurrent_executions"] = 99
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_proof_rollout_retirement(
+                frozenset(by), by, {}
+            )
+
+    def test_rehome_is_delete_before_create_only(self) -> None:
+        """Parity with the shell fence is exact, not incidental."""
+        by = self.rehome_fixture()
+        pc_addr = CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]'
+        by[pc_addr]["change"]["actions"] = ["create", "delete"]
+        changed = set(by)
+        actions = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_proof_rollout_retirement(changed, actions, by),
+            frozenset(),
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(

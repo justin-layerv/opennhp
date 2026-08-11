@@ -8367,20 +8367,24 @@ def _check_authority_proof_steady_output(
             before=selected_alias,
             after=selected_alias,
         )
-        if function_name == AUTHORITY_PROOF_FUNCTION_NAME:
-            prefix = (
-                f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
-                f"{function_name}:"
-            )
-            other_alias = (
-                f"{prefix}{'green' if selected_color == 'blue' else 'blue'}"
-            )
-            valid = valid or _is_exact_output_change(
-                change,
-                actions=["update"],
-                before=other_alias,
-                after=selected_alias,
-            )
+        # Both proof outputs may move other-colour -> selected: the rollout's
+        # pm flip did, and the switch pointer moving does it for every proof
+        # function at once. The exactness (before is precisely the other
+        # colour, after precisely the selected alias) is what keeps this from
+        # admitting an arbitrary retarget.
+        prefix = (
+            f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:"
+            f"{function_name}:"
+        )
+        other_alias = (
+            f"{prefix}{'green' if selected_color == 'blue' else 'blue'}"
+        )
+        valid = valid or _is_exact_output_change(
+            change,
+            actions=["update"],
+            before=other_alias,
+            after=selected_alias,
+        )
         if not valid:
             raise ContractError(
                 f"attended-proof output {output_name} action is invalid"
@@ -9340,6 +9344,9 @@ AUTHORITY_PROOF_STANDBY_PREFIX = (
 # already owns that pair, and two claims on one address fail composition's
 # disjointness. Ceding them keeps this lane composable with the roll that
 # always accompanies it.
+AUTHORITY_STEADY_PC_PREFIX = (
+    "module.control.aws_lambda_provisioned_concurrency_config.authority["
+)
 AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION = (
     "module.control.aws_ecs_task_definition.hub[0]"
 )
@@ -9522,6 +9529,21 @@ def _claim_authority_proof_rollout_retirement(
     pools = {a for a in changed if a.startswith(AUTHORITY_PROOF_STANDBY_PREFIX)}
     if any(actual_non_noop.get(a) != ["delete"] for a in pools):
         return frozenset()
+    # Closing the window may also re-home the steady provisioned concurrency
+    # when the switch pointer moves in the same contract change: the PC
+    # qualifier is its identity, so a colour move can only present as
+    # delete+create. Claimed here (not by the image roll -- PC is capacity, not
+    # code) and content-proved by the validator.
+    pc_rehomes = {
+        a
+        for a in changed
+        if a.startswith(AUTHORITY_STEADY_PC_PREFIX)
+    }
+    # Delete-before-create ONLY, matching the shell fence exactly: PC
+    # replacement is delete-before-create by provider default, and the two
+    # guards agreeing across languages is a stated invariant, not an accident.
+    if any(actual_non_noop.get(a) != ["delete", "create"] for a in pc_rehomes):
+        return frozenset()
     # Function and alias movement belongs to authority-image-roll, which owns
     # the uniform-convergence proof for them. Closing the window always
     # republishes the proof functions (they lose their proof-policy env), so
@@ -9549,7 +9571,7 @@ def _claim_authority_proof_rollout_retirement(
         for a in replaces
     ):
         return frozenset()
-    return frozenset(pools | updates | replaces)
+    return frozenset(pools | updates | replaces | pc_rehomes)
 
 
 def _validate_authority_proof_rollout_retirement(
@@ -9576,6 +9598,36 @@ def _validate_authority_proof_rollout_retirement(
             if actions != ["delete"]:
                 raise ContractError(
                     f"{address} must be a plain delete; got {actions!r}"
+                )
+            continue
+        if address.startswith(AUTHORITY_STEADY_PC_PREFIX):
+            change = by_address.get(address, {}).get("change", {})
+            before, after = change.get("before"), change.get("after")
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                raise ContractError(f"{address} planned values are malformed")
+            b_q, a_q = before.get("qualifier"), after.get("qualifier")
+            # Direction is pinned to the selector transition itself: every
+            # re-home must move old-selected -> new-selected. A mixed or
+            # reversed re-home would land warm capacity on the wrong colour.
+            contract_change = by_address.get(
+                AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}
+            ).get("change", {})
+            old_selected = _selected_authority_color_from_contract(
+                (contract_change.get("before") or {}).get("input")
+            )
+            new_selected = _selected_authority_color_from_contract(
+                (contract_change.get("after") or {}).get("input")
+            )
+            if b_q != old_selected or a_q != new_selected or b_q == a_q:
+                raise ContractError(
+                    f"{address} must re-home {old_selected!r} -> "
+                    f"{new_selected!r} with the selector; got {b_q!r} -> {a_q!r}"
+                )
+            if before.get("provisioned_concurrent_executions") != after.get(
+                "provisioned_concurrent_executions"
+            ):
+                raise ContractError(
+                    f"{address} must keep its allocation while re-homing"
                 )
             continue
         if address == AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION:
