@@ -3924,6 +3924,223 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+      # The blue/green auto-promote: when a publish has advanced the standby
+      # colour past the serving one, flip the SSM pointer and run the SAME
+      # fenced plan/check/apply cycle again — the plan the new pointer produces
+      # is the reviewed authority-selector-flip shape (create-before-destroy
+      # warm pools, task-definition after READY, service drained before the old
+      # pool releases). This is the compute module's per-deploy promotion,
+      # applied to the Authority runtime.
+      #
+      # Skips itself when: the base cycle did not end healthy, the pointer or
+      # any alias READ fails (transience -- the next deploy retries), versions
+      # are not uniformly newer on standby (a mid-roll fleet), or there is
+      # simply nothing new. A pointer VALUE outside blue/green is the one hard
+      # error: that is state corruption, not transience. A promote apply that
+      # fails leaves the pointer ahead of the fleet with the serving colour
+      # intact (create-first fails safe); the next deploy replans the same flip
+      # and completes it — fix-forward, no pointer revert.
+      - name: Detect a promotable standby colour
+        id: promote-detect
+        if: >-
+          success() &&
+          steps.freshness.outputs.fresh == 'true' &&
+          (steps.plan.outputs.control_status == 'converged' || steps.verify.outcome == 'success')
+        run: |
+          set -euo pipefail
+          pointer_name="/sandbox/nhp/control/authority/active-color"
+          if ! serving="$(aws ssm get-parameter --name "$pointer_name" \
+            --query Parameter.Value --output text)"; then
+            echo "::warning::Pointer read failed; skipping promotion this run (the next deploy retries)."
+            echo "promote=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$serving" in
+            blue) standby=green ;;
+            green) standby=blue ;;
+            *)
+              echo "::error::Authority active-color pointer is ${serving@Q}, not a colour; refusing to promote."
+              exit 1
+              ;;
+          esac
+          # The contract's own function list — no third hardcoded fleet copy.
+          mapfile -t functions < <(jq -er \
+            '.authority_runtime_contract.functions | keys[]' \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json")
+          if [[ "${#functions[@]}" -eq 0 ]]; then
+            # The contract always carries the full function graph, and the
+            # base plan already consumed this same file -- an empty parse here
+            # is a broken read (jq failures inside <(...) do not propagate),
+            # not an empty fleet. Refuse to guess, matching the readback.
+            echo "::error::No contract functions parsed from the generated tfvars; refusing to guess."
+            exit 1
+          fi
+          promote=true
+          for fn in "${functions[@]}"; do
+            # Both colour aliases exist unconditionally with the runtime, so a
+            # failed read here is transience (throttle, eventual consistency),
+            # not absence -- soft-skip and let the next deploy retry, rather
+            # than redding the whole deploy for a promotion it can defer.
+            if ! serving_version="$(aws lambda get-alias --function-name "$fn" \
+              --name "$serving" --query FunctionVersion --output text)"; then
+              echo "::warning::${fn} ${serving} alias read failed; skipping promotion this run."
+              promote=false
+              break
+            fi
+            if ! standby_version="$(aws lambda get-alias --function-name "$fn" \
+              --name "$standby" --query FunctionVersion --output text)"; then
+              echo "::warning::${fn} ${standby} alias read failed; skipping promotion this run."
+              promote=false
+              break
+            fi
+            if ! [[ "$serving_version" =~ ^[0-9]+$ && "$standby_version" =~ ^[0-9]+$ ]]; then
+              echo "::warning::${fn} alias versions are not numeric (${serving_version}/${standby_version}); skipping promotion."
+              promote=false
+              break
+            fi
+            # Strictly newer on EVERY function. After a flip the old colour
+            # is older, so this cannot ping-pong; a mid-roll fleet (some
+            # advanced, some not) skips and the next deploy retries.
+            if [[ "$standby_version" -le "$serving_version" ]]; then
+              promote=false
+              break
+            fi
+          done
+          {
+            echo "promote=$promote"
+            echo "serving=$serving"
+            echo "standby=$standby"
+          } >>"$GITHUB_OUTPUT"
+          echo "serving=${serving} standby=${standby} promote=${promote}"
+
+      - name: Point the Authority at the standby colour
+        id: promote-pointer
+        if: steps.promote-detect.outputs.promote == 'true'
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter \
+            --name /sandbox/nhp/control/authority/active-color \
+            --value "${{ steps.promote-detect.outputs.standby }}" \
+            --type String --overwrite
+          echo "Pointer -> ${{ steps.promote-detect.outputs.standby }}"
+
+      - name: Plan and check the promotion
+        id: promote-plan
+        if: steps.promote-pointer.outcome == 'success'
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          scripts_root="$(git rev-parse --show-toplevel)"
+          "$scripts_root"/scripts/capture-control-update-state.sh sandbox \
+            "$RUNNER_TEMP/control-promote-state-before-plan"
+          terraform show -json \
+            "$RUNNER_TEMP/control-promote-state-before-plan/state.tfstate" \
+            >"$RUNNER_TEMP/control-promote-state-before-plan/state.json"
+          plan_exit=0
+          terraform plan -detailed-exitcode \
+            -var-file="$RUNNER_TEMP/authority-runtime.generated.tfvars.json" \
+            -input=false -lock-timeout=5m -no-color -out=tfplan-promote \
+            | tee tfplan-promote.txt || plan_exit="${PIPESTATUS[0]}"
+          if [[ "$plan_exit" != 0 && "$plan_exit" != 2 ]]; then
+            echo '::error::Promotion plan failed.'
+            exit 1
+          fi
+          terraform show -json tfplan-promote >tfplan-promote.json
+          # The same two fences the base cycle ran, on the flip plan. The
+          # contract checker must classify it; the terminal reject fails here.
+          "$scripts_root"/.github/scripts/check-control-sandbox-first-apply.py plan \
+            tfplan-promote.json \
+            "$RUNNER_TEMP/control-promote-state-before-plan/state.json" \
+            | tee promote-plan-contract-summary.json
+          "$scripts_root"/scripts/check-connector-authority-foundation.sh tfplan-promote.json
+          mode="$(jq -er '.plan_mode' promote-plan-contract-summary.json)"
+          echo "promotion plan_mode=${mode}"
+          # A pointer flip that plans as anything but the reviewed selector
+          # flip (alone or composed) is not the promotion this step wrote; a
+          # no-op means the pointer moved but nothing followed, which is
+          # equally not a flip. Fail loud rather than applying a surprise.
+          # The composed vocabulary this pattern matches is pinned by
+          # test_composed_plan_mode_vocabulary_is_pinned in
+          # tests/scripts/test_check_control_sandbox_first_apply.py.
+          case "$mode" in
+            authority-selector-flip|composed-*authority-selector-flip*) ;;
+            *)
+              echo "::error::Promotion planned as ${mode}, not the selector flip; refusing to apply it."
+              exit 1
+              ;;
+          esac
+
+      - name: Apply the checked promotion without GitHub credentials
+        id: promote-apply
+        if: steps.promote-plan.outcome == 'success'
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          scripts_root="$(git rev-parse --show-toplevel)"
+          "$scripts_root"/scripts/check-no-checkout-credentials.sh
+          "$scripts_root"/scripts/capture-control-update-state.sh sandbox \
+            "$RUNNER_TEMP/control-promote-state-immediately-before-apply"
+          cmp "$RUNNER_TEMP/control-promote-state-before-plan/state-summary.json" \
+            "$RUNNER_TEMP/control-promote-state-immediately-before-apply/state-summary.json" || {
+            echo '::error::Sandbox Control state moved between the promotion plan and apply; this run does not apply it.'
+            exit 1
+          }
+          terraform apply -input=false -lock-timeout=5m -no-color tfplan-promote
+
+      - name: Verify the promotion and read back the fleet
+        id: promote-verify
+        if: steps.promote-apply.outcome == 'success'
+        run: |
+          set -euo pipefail
+          scripts/verify-control-sandbox-first-apply.sh \
+            "$CONTROL_ROOT" \
+            "$RUNNER_TEMP/control-promote-verification" \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json"
+          # Empirical readback: the pointer, and every provisioned pool READY
+          # on the promoted colour.
+          standby="${{ steps.promote-detect.outputs.standby }}"
+          pointer="$(aws ssm get-parameter \
+            --name /sandbox/nhp/control/authority/active-color \
+            --query Parameter.Value --output text)"
+          [[ "$pointer" == "$standby" ]] || {
+            echo "::error::Pointer readback is ${pointer}, expected ${standby}."
+            exit 1
+          }
+          mapfile -t functions < <(jq -er \
+            '.authority_runtime_contract.functions | keys[]' \
+            "$RUNNER_TEMP/authority-runtime.generated.tfvars.json")
+          [[ "${#functions[@]}" -gt 0 ]] || {
+            echo "::error::No contract functions in the readback; refusing a vacuous pass."
+            exit 1
+          }
+          failures=0
+          for fn in "${functions[@]}"; do
+            # get- rather than list-: the singular read is the call Terraform
+            # itself makes for this resource, so the apply role provably holds
+            # it; a pool on the wrong colour surfaces as its NotFound.
+            status="$(aws lambda get-provisioned-concurrency-config \
+              --function-name "$fn" --qualifier "$standby" \
+              --query Status --output text)" || status="ABSENT"
+            if [[ "$status" != "READY" ]]; then
+              echo "::error::${fn} provisioned pool on ${standby} is ${status}, not READY."
+              failures=$((failures + 1))
+            fi
+          done
+          [[ "$failures" -eq 0 ]]
+          echo "Promotion verified: pointer=${pointer}, ${#functions[@]} pools READY on ${standby}."
+
+      - name: Upload sanitized promotion evidence
+        if: steps.promote-verify.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-sandbox-auto-promote-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/control-promote-verification/verification-summary.json
+            ${{ runner.temp }}/control-promote-verification/post-apply-plan-summary.json
+            ${{ runner.temp }}/control-promote-verification/state-list-summary.json
+          retention-days: 14
+          if-no-files-found: error
+
       # Fires for BOTH post-apply incidents: a failed apply (estate possibly
       # partial) and a successful apply whose proof then failed. The second one
       # needs a snapshot just as much — the operator is being told to go re-run
@@ -3931,7 +4148,11 @@ jobs:
       # skipped in that case because its implicit success() is already false.
       - name: Capture recovery state identity
         id: partial-state
-        if: failure() && (steps.apply.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: >-
+          failure() && (steps.apply.outcome == 'failure' ||
+          steps.verify.outcome == 'failure' ||
+          steps.promote-apply.outcome == 'failure' ||
+          steps.promote-verify.outcome == 'failure')
         continue-on-error: true
         run: scripts/capture-control-update-state.sh sandbox "$RUNNER_TEMP/control-recovery-state"
 
@@ -3951,6 +4172,10 @@ jobs:
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
           APPLY_OUTCOME: ${{ steps.apply.outcome }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PROMOTED: ${{ steps.promote-detect.outputs.promote }}
+          PROMOTE_DETECT_OUTCOME: ${{ steps.promote-detect.outcome }}
+          PROMOTE_APPLY_OUTCOME: ${{ steps.promote-apply.outcome }}
+          PROMOTE_VERIFY_OUTCOME: ${{ steps.promote-verify.outcome }}
           # The catch-all. Naming intermediate steps means remembering to add each
           # new one, and forgetting is silent: the state re-bind, boundary proof
           # and warm-pool gate all fail with apply merely SKIPPED.
@@ -3963,7 +4188,45 @@ jobs:
           # no state falls through to silence. Order matters once — the
           # applied-and-verified arm precedes the generic job-failed arm, so a
           # failed evidence upload after a good apply still reports honestly.
-          if [[ "$APPLY_OUTCOME" == 'failure' ]]; then
+          if [[ "$PROMOTE_APPLY_OUTCOME" == 'failure' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control auto-promotion apply failed
+
+          > The pointer was written but the flip did not apply. The serving colour
+          > keeps its warm pool and its traffic (the flip provisions the new colour
+          > FIRST, so a failed create halts with live state untouched). Do NOT revert
+          > the pointer: the next deploy replans the same selector flip and completes
+          > it — or read the promote step's log if a fence refused the shape, and fix
+          > forward.
+          EOF
+          elif [[ "$PROMOTE_APPLY_OUTCOME" == 'success' && "$PROMOTE_VERIFY_OUTCOME" != 'success' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control auto-promoted but the post-promotion proof failed
+
+          > The selector flip APPLIED — the promoted colour is serving — but the
+          > post-apply convergence proof or the pointer/pool readback did not pass.
+          > Dispatch `control-sandbox-update.yml` with `operation=verify` from current
+          > main to re-run the read-only proof against live state before the next
+          > automatic run plans against it.
+          EOF
+          elif [[ "$PROMOTE_DETECT_OUTCOME" == 'failure' ]]; then
+            cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          ## Sandbox Control applied, but promotion detection failed
+
+          > The base cycle is healthy, but the promotion detector errored — a
+          > corrupted pointer value is the deliberate hard case. Nothing was
+          > promoted; live traffic is unchanged. Read the detect step's log and fix
+          > the pointer parameter before the next deploy.
+          EOF
+          elif [[ "$PROMOTED" == 'true' && "$PROMOTE_VERIFY_OUTCOME" == 'success' ]]; then
+            {
+              echo '## Sandbox Control: auto-promoted'
+              echo
+              echo 'A newer standby build was detected (whether or not the base cycle'
+              echo 'had its own changes); the pointer flipped and the selector-flip'
+              echo 'plan applied and verified — the new colour serves.'
+            } >>"$GITHUB_STEP_SUMMARY"
+          elif [[ "$APPLY_OUTCOME" == 'failure' ]]; then
             cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
           ## Sandbox Control apply failed
 

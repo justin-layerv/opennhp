@@ -15192,6 +15192,18 @@ class ComposedTransitionTest(unittest.TestCase):
             "hub-task-selected-projection",
         )
 
+    def test_composed_plan_mode_vocabulary_is_pinned(self) -> None:
+        """The auto-promote deploy step greps the composed label format
+        (build-and-push.yml: `composed-*authority-selector-flip*`); a silent
+        rename here would make it reject a legitimate flip with the pointer
+        already written. Pin the vocabulary so a rename breaks HERE first."""
+        self.assertEqual(CHECKER._COMPOSED_PLAN_MODE_PREFIX, "composed-")
+        self.assertEqual(CHECKER._COMPOSED_PLAN_MODE_SEPARATOR, "-with-")
+        self.assertIn(
+            ("authority-selector-flip"),
+            {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS},
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
