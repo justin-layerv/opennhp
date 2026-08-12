@@ -3,6 +3,7 @@
 package smoke
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -559,5 +560,33 @@ func TestLastMeaningfulDaemonError(t *testing.T) {
 	// A journal with only the benign noise yields nothing worth showing.
 	if got := lastMeaningfulDaemonError("Error response from daemon: No such container: nhp-server"); got != "" {
 		t.Fatalf("expected no reportable daemon error, got %q", got)
+	}
+}
+
+// TestSendJournalGrepMapsNoMatchesToEmpty pins the transport mapping through
+// the REAL predicate: journalctl --grep exits 1 when no entries match, SSM
+// reports Failed/1/empty-stderr, and that is the innocent outcome for every
+// panic/OOM probe. Everything else -- higher exit codes, stderr content,
+// Cancelled/TimedOut even with ResponseCode 1 -- must propagate.
+func TestSendJournalGrepMapsNoMatchesToEmpty(t *testing.T) {
+	if !isJournalNoMatch(&ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1}) {
+		t.Fatalf("the no-matches shape must map to an empty result")
+	}
+	for name, e := range map[string]error{
+		"real exit 2":           &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 2},
+		"stderr present":        &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1, Stderr: "boom"},
+		"timed out with code 1": &ssmCommandFailed{CommandID: "c", Status: "TimedOut", ResponseCode: 1},
+		"cancelled with code 1": &ssmCommandFailed{CommandID: "c", Status: "Cancelled", ResponseCode: 1},
+		"untyped error":         errors.New("network"),
+	} {
+		if isJournalNoMatch(e) {
+			t.Fatalf("%s must propagate, not map to empty", name)
+		}
+	}
+	// Error() keeps the exact historical wording other diagnostics grep for.
+	want := `ssm command c status=Failed stderr=""`
+	got := (&ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1}).Error()
+	if got != want {
+		t.Fatalf("Error() wording drifted: %q != %q", got, want)
 	}
 }

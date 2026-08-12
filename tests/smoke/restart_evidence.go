@@ -4,6 +4,7 @@ package smoke
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -563,6 +564,43 @@ func countNonEmptyLines(out string) int {
 //
 // Fails closed: any probe error is returned, and the caller treats an error as
 // "cannot confirm the deploy was clean".
+// isJournalNoMatch reports whether err is EXACTLY journalctl's no-matches
+// shape: a Failed invocation whose command exited 1 with nothing on stderr.
+// Status is checked because sendShellScript returns the typed error for
+// Cancelled and TimedOut too; those must propagate even if they ever carried
+// ResponseCode 1 (SSM normally reports -1 there, but the guard should not
+// rest on that).
+func isJournalNoMatch(err error) bool {
+	var failed *ssmCommandFailed
+	return errors.As(err, &failed) &&
+		failed.Status == "Failed" &&
+		failed.ResponseCode == 1 &&
+		failed.Stderr == ""
+}
+
+// sendJournalGrep issues a journalctl --grep probe and maps its documented
+// no-matches outcome to an empty result: journalctl exits 1 when no entries
+// match the pattern, which SSM reports as a Failed invocation. That is the
+// INNOCENT outcome for every probe below -- a restarted unit with no panic,
+// no fatal error, no OOM line -- and treating it as a probe failure made the
+// evidence collector fail closed on precisely the restarts it exists to
+// clear (measured live on i-0209b63d922e839b0: a docker exit-125 blip failed
+// the deploy-stability smoke twice because '^panic: ' matched nothing).
+// Exit codes above 1, and every other failure shape, still propagate.
+func sendJournalGrep(ctx context.Context, instanceID, cmd string) (string, error) {
+	out, err := sendShellScript(ctx, instanceID, cmd)
+	if err != nil {
+		if isJournalNoMatch(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return out, nil
+}
+
+// probeServerRestartEvidence collects everything needed to classify a
+// non-zero NRestarts counter; see the doc block above sendJournalGrep for why
+// the journal probes tolerate the no-matches exit.
 func probeServerRestartEvidence(ctx context.Context, instanceID string, nRestarts int) (restartEvidence, error) {
 	ev := restartEvidence{NRestarts: nRestarts}
 
@@ -578,7 +616,7 @@ func probeServerRestartEvidence(ctx context.Context, instanceID string, nRestart
 	}
 	ev.SubState = strings.TrimSpace(subState)
 
-	exitLines, err := sendShellScript(ctx, instanceID, cmdJournalNhpServerExits)
+	exitLines, err := sendJournalGrep(ctx, instanceID, cmdJournalNhpServerExits)
 	if err != nil {
 		return ev, fmt.Errorf("probe journal exit lines: %w", err)
 	}
@@ -589,14 +627,14 @@ func probeServerRestartEvidence(ctx context.Context, instanceID string, nRestart
 	// only ever selects wording, so partial coverage here would make the two
 	// callers describe the same crash differently.
 	for _, cmd := range panicMarkerProbes {
-		lines, err := sendShellScript(ctx, instanceID, cmd)
+		lines, err := sendJournalGrep(ctx, instanceID, cmd)
 		if err != nil {
 			return ev, fmt.Errorf("probe journal panic lines: %w", err)
 		}
 		ev.Panics += countNonEmptyLines(lines)
 	}
 
-	oomLines, err := sendShellScript(ctx, instanceID, cmdJournalNhpServerOOM)
+	oomLines, err := sendJournalGrep(ctx, instanceID, cmdJournalNhpServerOOM)
 	if err != nil {
 		return ev, fmt.Errorf("probe journal OOM lines: %w", err)
 	}
@@ -604,7 +642,7 @@ func probeServerRestartEvidence(ctx context.Context, instanceID string, nRestart
 
 	// Best-effort: the daemon error only sharpens the message, so a failure
 	// here must not turn an otherwise-classifiable restart into a red deploy.
-	if daemonLines, derr := sendShellScript(ctx, instanceID, cmdJournalNhpServerDaemonErrors); derr == nil {
+	if daemonLines, derr := sendJournalGrep(ctx, instanceID, cmdJournalNhpServerDaemonErrors); derr == nil {
 		ev.DaemonErr = lastMeaningfulDaemonError(daemonLines)
 	}
 

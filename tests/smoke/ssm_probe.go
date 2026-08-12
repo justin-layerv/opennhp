@@ -318,6 +318,22 @@ const ssmFailedErrorFmt = "ssm command %s status=%s stderr=%q"
 //   - Sends AWS-RunShellScript with --timeout-seconds 30 (API minimum).
 //   - Polls get-command-invocation until a terminal status; max wait ~45s.
 //   - Returns stdout on Success, an error containing stderr otherwise.
+//
+// ssmCommandFailed carries the invocation's exit code so callers can
+// distinguish a command's meaningful non-zero exit (journalctl --grep with no
+// matching entries exits 1) from a real probe failure. Error() preserves the
+// exact wording sendShellScript always produced.
+type ssmCommandFailed struct {
+	CommandID    string
+	Status       string
+	ResponseCode int32
+	Stderr       string
+}
+
+func (e *ssmCommandFailed) Error() string {
+	return fmt.Sprintf(ssmFailedErrorFmt, e.CommandID, e.Status, e.Stderr)
+}
+
 func sendShellScript(ctx context.Context, instanceID, cmd string) (string, error) {
 	for _, pat := range rejectPatterns {
 		if pat.MatchString(cmd) {
@@ -379,8 +395,12 @@ func sendShellScript(ctx context.Context, instanceID, cmd string) (string, error
 		case ssmtypes.CommandInvocationStatusFailed,
 			ssmtypes.CommandInvocationStatusCancelled,
 			ssmtypes.CommandInvocationStatusTimedOut:
-			return "", fmt.Errorf(ssmFailedErrorFmt,
-				cmdID, getResp.Status, aws.ToString(getResp.StandardErrorContent))
+			return "", &ssmCommandFailed{
+				CommandID:    cmdID,
+				Status:       string(getResp.Status),
+				ResponseCode: getResp.ResponseCode,
+				Stderr:       aws.ToString(getResp.StandardErrorContent),
+			}
 		}
 
 		if time.Now().After(deadline) {
