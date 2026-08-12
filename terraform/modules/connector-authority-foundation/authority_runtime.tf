@@ -1274,7 +1274,22 @@ resource "aws_lambda_alias" "authority" {
     ? (
       each.value.color == local.authority_runtime_selected_color
       ? data.aws_lambda_alias.authority_live[each.key].function_version
-      : aws_lambda_function.authority[each.value.function_name].version
+      # STANDBY: advance to the newest published version -- UNLESS that is the
+      # very version the selected colour is serving, in which case hold in
+      # place. That exception is what makes a selector flip physically
+      # applicable: during a flip the newly-standby colour still carries its
+      # provisioned pool until the deposed destroy runs LAST (create-before-
+      # destroy), and Lambda refuses to retarget a pooled alias onto a version
+      # another pooled alias already serves ("Alias can't be used for
+      # Provisioned Concurrency configuration on an already Provisioned
+      # version" -- measured live, run 31644720148). The standby then advances
+      # on the next publish, unpooled, exactly as the hold intends.
+      : (
+        aws_lambda_function.authority[each.value.function_name].version
+        == data.aws_lambda_alias.authority_live["${each.value.function_name}:${local.authority_runtime_selected_color}"].function_version
+        ? data.aws_lambda_alias.authority_live[each.key].function_version
+        : aws_lambda_function.authority[each.value.function_name].version
+      )
     )
     : (
       var.authority_proof_mutation_controls_enabled &&

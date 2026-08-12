@@ -4194,10 +4194,13 @@ jobs:
 
           > The pointer was written but the flip did not apply. The serving colour
           > keeps its warm pool and its traffic (the flip provisions the new colour
-          > FIRST, so a failed create halts with live state untouched). Do NOT revert
-          > the pointer: the next deploy replans the same selector flip and completes
-          > it — or read the promote step's log if a fence refused the shape, and fix
-          > forward.
+          > FIRST, so a failed create halts with live state untouched). Default to
+          > fix-forward: the next deploy replans the same selector flip and completes
+          > it. If the SAME flip plan fails repeatedly — the wedge class where the
+          > plan itself cannot succeed (run 31644720148's pooled-standby retarget,
+          > since designed out by the alias hold's flip exception) — writing the
+          > pointer back to the serving colour is the reviewed unwind: the checker
+          > admits it as the degenerate selector flip with zero pool moves.
           EOF
           elif [[ "$PROMOTE_APPLY_OUTCOME" == 'success' && "$PROMOTE_VERIFY_OUTCOME" != 'success' ]]; then
             cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"

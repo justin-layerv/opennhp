@@ -10083,15 +10083,40 @@ def _claim_authority_selector_flip(
     # itself a hazardous state, and this claim is the last gate before a live
     # traffic move, so it refuses the shape outright rather than admitting
     # whatever subset happened to plan.
+    #
+    # The one other admissible shape is the DEGENERATE flip: zero re-homes
+    # because every pool already sits on the NEW selected colour. That is the
+    # pointer-unwind recovery (run 31644720148: the pooled standby aliases
+    # advanced onto the served version, the pool creates 409'd, and pointing
+    # back at the colour that already holds every pool is the only plan that
+    # converges without moving capacity). Proved from the plan itself: every
+    # steady pool is a no-op whose qualifier is the new selected colour.
     expected_pc = {
         f'{AUTHORITY_STEADY_PC_PREFIX}"{fn}"]'
         for fn in AUTHORITY_RUNTIME_FUNCTIONS
     }
     if pc != expected_pc:
-        return frozenset()
+        if pc:
+            return frozenset()
+        _, new_selected = _authority_selector_flip_colors(by_address)
+        for address in expected_pc:
+            change = by_address.get(address, {}).get("change", {})
+            if change.get("actions") != ["no-op"]:
+                return frozenset()
+            after = change.get("after")
+            if (
+                not isinstance(after, dict)
+                or after.get("qualifier") != new_selected
+            ):
+                return frozenset()
     claimed = pc | {AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS}
     for address, actions in (
-        (AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION, (["delete", "create"], ["create", "delete"])),
+        # Pure ["create"] is the lost-state resurrect: a failed flip apply can
+        # depose the task definition from STATE while the live revision keeps
+        # serving (revisions are append-only); the recovery registers a fresh
+        # revision with the same colour-consistent content. The validator pins
+        # that content to the new selected colour either way.
+        (AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION, (["delete", "create"], ["create", "delete"], ["create"])),
         ("module.control.aws_ecs_service.hub[0]", (["update"],)),
         ("module.control.aws_iam_role_policy.hub_task[0]", (["update"],)),
         ('module.control.aws_vpc_endpoint.interface["lambda"]', (["update"],)),
@@ -10132,7 +10157,39 @@ def _validate_authority_selector_flip(
                     f"{address} must keep its allocation while re-homing"
                 )
     if AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION in claimed:
-        _check_hub_task_definition_proof_alias_only(by_address)
+        td_change = by_address.get(
+            AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION, {}
+        ).get("change", {})
+        if td_change.get("actions") == ["create"]:
+            # No before to diff against: pin the created content directly --
+            # every Authority alias ARN in the container environment must be
+            # the NEW selected colour, so the resurrected revision cannot
+            # smuggle a colour the flip did not choose. This is deliberately
+            # NARROWER than the update path's masked full diff: with no
+            # before, only the colour pin is checkable, and the rest of the
+            # content is module-rendered, not operator-supplied. The regex
+            # covers the one place a colour appears (alias-qualified function
+            # ARNs); a colour in any other textual position has no consumer.
+            container_definitions = (td_change.get("after") or {}).get(
+                "container_definitions"
+            )
+            container_json = (
+                container_definitions
+                if isinstance(container_definitions, str)
+                else json.dumps(container_definitions)
+            )
+            foreign = set(
+                re.findall(
+                    r"function:[A-Za-z0-9_-]+:(blue|green)\b", container_json
+                )
+            ) - {new_selected}
+            if foreign:
+                raise ContractError(
+                    "the resurrected Hub task definition must carry only the "
+                    f"new selected colour; found {sorted(foreign)}"
+                )
+        else:
+            _check_hub_task_definition_proof_alias_only(by_address)
     # The three riding updates must themselves be colour moves, not arbitrary
     # in-place edits admitted on action shape alone: after masking the alias
     # colour, before and after must be identical.
@@ -11826,6 +11883,35 @@ def _check_state_normalization_drift(
         == ["no-op"]
     ):
         _check_hub_task_selected_projection_drift(drift[0])
+        return "hub-task-selected-projection"
+    if (
+        len(drift) == 2
+        and set(addresses)
+        == {
+            AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+            AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+        }
+        and all(
+            item.get("change", {}).get("actions") == ["update"]
+            and by_address.get(item.get("address"), {})
+            .get("change", {})
+            .get("actions")
+            == ["no-op"]
+            for item in drift
+        )
+    ):
+        # The hub_task projection re-read together with the pointer's benign
+        # value re-read (the pipeline writes the pointer; state keeps the
+        # seed). Each half keeps its own validation: the projection by its
+        # dedicated checker, the pointer by the same confinement the
+        # alias-refresh kind gives it (planned no-op; the value itself only
+        # enters the plan through the postcondition-gated data source). A
+        # selector flip's plan carries exactly this pair, so the pair keeps
+        # the single kind's name and gating.
+        by_drift_address = {item.get("address"): item for item in drift}
+        _check_hub_task_selected_projection_drift(
+            by_drift_address[AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS]
+        )
         return "hub-task-selected-projection"
     if addresses and all(
         (
@@ -15080,6 +15166,20 @@ def check_plan(
         _validate_authority_proof_rollout_retirement(
             _retirement_only, by_address, plan
         )
+    elif (
+        _flip_only := _claim_authority_selector_flip(
+            changed, actual_non_noop, by_address
+        )
+    ) and set(_flip_only) == changed and not deposed_by_address:
+        # A selector flip landing on its own -- including the degenerate
+        # pointer-unwind recovery, where every pool already sits on the new
+        # selected colour and only the contract, task definition, service and
+        # colour-bearing policies move. Composition needs two or more claims
+        # by design, so this shape would otherwise fall to the terminal
+        # reject; the ordinary promotion still lands composed with the
+        # standby-alias advance.
+        plan_mode = "authority-selector-flip"
+        _validate_authority_selector_flip(_flip_only, by_address, plan)
     elif (
         _envelope_widen_only := _claim_authority_reserved_envelope_widen(
             changed, actual_non_noop, by_address

@@ -14543,6 +14543,130 @@ class ComposedTransitionTest(unittest.TestCase):
         self.assertEqual(set(claimed), changed)
         CHECKER._validate_authority_selector_flip(claimed, by, {})
 
+    def degenerate_flip_by(self) -> dict:
+        """The pointer-unwind recovery (run 31644720148): the contract flips
+        back to the colour every pool already sits on; zero re-homes, the
+        task definition resurrects from lost state as a pure create."""
+        import copy as _copy
+        by = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "actions": ["update"],
+                    "before": {"input": {"authority_runtime_contract": {"selected_authority_color": "green"}}},
+                    "after": {"input": {"authority_runtime_contract": {"selected_authority_color": "blue"}}},
+                }
+            },
+            CHECKER.AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION: {
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {"container_definitions": json.dumps([
+                        {"environment": [{"name": "X", "value":
+                            "arn:aws:lambda:us-east-2:1:function:layerv-nhp-sandbox-ca-ia:blue"}]}
+                    ])},
+                }
+            },
+        }
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + f'"{fn}"]'] = {
+                "change": {
+                    "actions": ["no-op"],
+                    "before": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+                    "after": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+                }
+            }
+        return by
+
+    def test_pointer_and_projection_drift_pair_classifies(self) -> None:
+        """A flip plan carries exactly this drift pair (run 31644720148's
+        recovery): the hub_task projection re-read plus the pointer's benign
+        value re-read, each planned no-op."""
+        import json as _j
+        def role(sel):
+            return {"inline_policy": [{"name": "hub-task", "policy": _j.dumps(
+                CHECKER._expected_hub_task_inline_policy(rollout=False, selected=sel))}]}
+        drift = [
+            {
+                "address": CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+                "change": {"actions": ["update"], "before": role("green"), "after": role("blue")},
+            },
+            {
+                "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+                "change": {"actions": ["update"], "before": {"value": "green"}, "after": {"value": "blue"}},
+            },
+        ]
+        by = {
+            item["address"]: {"change": {"actions": ["no-op"]}} for item in drift
+        }
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False),
+            "hub-task-selected-projection",
+        )
+
+    def test_drift_pair_with_a_pending_pointer_change_stays_strict(self) -> None:
+        """The pair is only the benign re-read when BOTH halves are planned
+        no-op; a pointer with a pending change must fall to the strict path."""
+        import json as _j
+        def role(sel):
+            return {"inline_policy": [{"name": "hub-task", "policy": _j.dumps(
+                CHECKER._expected_hub_task_inline_policy(rollout=False, selected=sel))}]}
+        drift = [
+            {
+                "address": CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+                "change": {"actions": ["update"], "before": role("green"), "after": role("blue")},
+            },
+            {
+                "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+                "change": {"actions": ["update"], "before": {"value": "green"}, "after": {"value": "blue"}},
+            },
+        ]
+        by = {
+            CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS: {"change": {"actions": ["no-op"]}},
+            CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS: {"change": {"actions": ["update"]}},
+        }
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_state_normalization_drift(drift, by, refresh_only=False)
+
+    def test_degenerate_flip_claims_and_validates(self) -> None:
+        by = self.degenerate_flip_by()
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_selector_flip(changed, acts, by)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_selector_flip(claimed, by, {})
+
+    def test_degenerate_flip_refuses_a_pool_on_the_old_colour(self) -> None:
+        """Zero re-homes is only admissible when EVERY pool already sits on
+        the new selected colour; one still on the old colour is the mid-flip
+        hazard and must refuse."""
+        by = self.degenerate_flip_by()
+        by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ra"]'][
+            "change"
+        ]["after"]["qualifier"] = "green"
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_flip(changed, acts, by), frozenset()
+        )
+
+    def test_resurrected_task_definition_pins_the_new_colour(self) -> None:
+        """A pure-create task definition (lost state) cannot smuggle the old
+        colour into the container environment."""
+        by = self.degenerate_flip_by()
+        by[CHECKER.AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION]["change"][
+            "after"
+        ]["container_definitions"] = json.dumps([
+            {"environment": [{"name": "X", "value":
+                "arn:aws:lambda:us-east-2:1:function:layerv-nhp-sandbox-ca-ia:green"}]}
+        ])
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_selector_flip(changed, acts, by)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "resurrected Hub task definition"
+        ):
+            CHECKER._validate_authority_selector_flip(claimed, by, {})
+
     def test_selector_flip_refuses_a_partial_fleet(self) -> None:
         """Some pools flipped and some not is itself the hazardous state."""
         by = self.flip_by()
