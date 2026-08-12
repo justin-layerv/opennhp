@@ -572,10 +572,21 @@ func countNonEmptyLines(out string) int {
 // rest on that).
 func isJournalNoMatch(err error) bool {
 	var failed *ssmCommandFailed
-	return errors.As(err, &failed) &&
-		failed.Status == "Failed" &&
-		failed.ResponseCode == 1 &&
-		failed.Stderr == ""
+	if !errors.As(err, &failed) ||
+		failed.Status != "Failed" ||
+		failed.ResponseCode != 1 {
+		return false
+	}
+	// SSM's shell wrapper synthesizes this exact stderr for a non-zero exit
+	// whose command wrote nothing to stderr -- measured live on the dispatched
+	// smoke run (i-0209b63d922e839b0): journalctl --grep with no matches
+	// surfaces as Failed / code 1 / this string, never as an empty stderr. A
+	// command that produced its OWN stderr still propagates.
+	switch strings.TrimSpace(failed.Stderr) {
+	case "", "failed to run commands: exit status 1":
+		return true
+	}
+	return false
 }
 
 // sendJournalGrep issues a journalctl --grep probe and maps its documented

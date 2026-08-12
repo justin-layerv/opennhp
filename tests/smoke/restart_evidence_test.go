@@ -572,12 +572,23 @@ func TestSendJournalGrepMapsNoMatchesToEmpty(t *testing.T) {
 	if !isJournalNoMatch(&ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1}) {
 		t.Fatalf("the no-matches shape must map to an empty result")
 	}
+	// The live shape, measured on the dispatched smoke run: SSM's shell
+	// wrapper synthesizes this stderr for a silent exit 1.
+	if !isJournalNoMatch(&ssmCommandFailed{
+		CommandID: "c", Status: "Failed", ResponseCode: 1,
+		Stderr: "failed to run commands: exit status 1",
+	}) {
+		t.Fatalf("SSM's synthesized exit-1 stderr must map to an empty result")
+	}
 	for name, e := range map[string]error{
-		"real exit 2":           &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 2},
-		"stderr present":        &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1, Stderr: "boom"},
-		"timed out with code 1": &ssmCommandFailed{CommandID: "c", Status: "TimedOut", ResponseCode: 1},
-		"cancelled with code 1": &ssmCommandFailed{CommandID: "c", Status: "Cancelled", ResponseCode: 1},
-		"untyped error":         errors.New("network"),
+		"real exit 2":    &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 2},
+		"stderr present": &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1, Stderr: "boom"},
+		// The append form, measured live: a command's OWN stderr keeps the
+		// synthesized suffix and must still propagate.
+		"own stderr plus suffix": &ssmCommandFailed{CommandID: "c", Status: "Failed", ResponseCode: 1, Stderr: "my-own-error\nfailed to run commands: exit status 1"},
+		"timed out with code 1":  &ssmCommandFailed{CommandID: "c", Status: "TimedOut", ResponseCode: 1},
+		"cancelled with code 1":  &ssmCommandFailed{CommandID: "c", Status: "Cancelled", ResponseCode: 1},
+		"untyped error":          errors.New("network"),
 	} {
 		if isJournalNoMatch(e) {
 			t.Fatalf("%s must propagate, not map to empty", name)

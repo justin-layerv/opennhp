@@ -633,9 +633,11 @@ func parseQurlAPIURLValue(line string) (string, error) {
 //
 //   - exit 2 (env file missing): stderr carries "No such file or
 //     directory". Render as "nhp-server env file missing".
-//   - exit 1 (line missing): SSM returns Failed with empty stderr,
-//     surfacing here as `status=Failed stderr=""`. Render as
-//     "QURL_API_URL line missing".
+//   - exit 1 (line missing): SSM's shell wrapper reports a silent exit 1
+//     as stderr="failed to run commands: exit status 1" (measured live on
+//     i-0209b63d922e839b0; it APPENDS to a command's own stderr, so a real
+//     error keeps its message and falls through). The empty-stderr match is
+//     kept for older agent behaviour. Render as "QURL_API_URL line missing".
 //
 // All other shapes pass through untouched. Pulled out as a pure
 // function so the dispatch contract is unit-testable in
@@ -666,7 +668,8 @@ func classifyQurlAPIURLError(err error) error {
 	switch {
 	case strings.Contains(msg, "No such file or directory"):
 		return fmt.Errorf("nhp-server env file missing at %s — qurl-plugin not provisioned or user_data dropped the env-file write: %w", nhpServerEnvFilePath, err)
-	case strings.Contains(msg, `status=Failed stderr=""`):
+	case strings.Contains(msg, `status=Failed stderr=""`),
+		strings.Contains(msg, `status=Failed stderr="failed to run commands: exit status 1"`):
 		return fmt.Errorf("QURL_API_URL line missing in %s — qurl_config.enabled=false in tfvars, or user_data template regressed the qurl block: %w", nhpServerEnvFilePath, err)
 	}
 	return err
