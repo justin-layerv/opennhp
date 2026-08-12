@@ -9,7 +9,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-ar-cell1": {
         "max_caller_in_flight": 2,
@@ -19,7 +19,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-ccr-cell0": {
         "max_caller_in_flight": 2,
@@ -29,7 +29,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-ccr-cell1": {
         "max_caller_in_flight": 2,
@@ -39,7 +39,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-cr-cell0": {
         "max_caller_in_flight": 2,
@@ -49,7 +49,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-cr-cell1": {
         "max_caller_in_flight": 2,
@@ -59,7 +59,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-ia": {
         "max_caller_in_flight": 2,
@@ -69,7 +69,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-icr": {
         "max_caller_in_flight": 2,
@@ -79,7 +79,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-iro-cell0": {
         "max_caller_in_flight": 2,
@@ -89,7 +89,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-iro-cell1": {
         "max_caller_in_flight": 2,
@@ -99,7 +99,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       },
       "layerv-nhp-sandbox-ca-ra": {
         "max_caller_in_flight": 2,
@@ -109,7 +109,7 @@
         "rollout_reserved_concurrency": 4,
         "rollout_standby_provisioned_concurrency": 2,
         "steady_provisioned_concurrency": 2,
-        "steady_reserved_concurrency": 2
+        "steady_reserved_concurrency": 4
       }
     },
     "global": {

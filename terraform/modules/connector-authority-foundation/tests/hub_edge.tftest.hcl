@@ -185,7 +185,7 @@ variables {
     functions = {
       "layerv-nhp-sandbox-ca-ia" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -203,7 +203,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-ra" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -221,7 +221,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-icr" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4

@@ -396,6 +396,15 @@ resource "aws_ecs_task_definition" "hub" {
   execution_role_arn       = aws_iam_role.hub_execution[0].arn
   task_role_arn            = aws_iam_role.hub_task[0].arn
 
+  # Blue/green flip ordering: this task definition's container env carries the
+  # Authority alias ARNs by colour, so its replacement IS the traffic switch.
+  # Depending on the provisioned-concurrency resource (create-before-destroy)
+  # sequences a selector flip as: new colour's pool READY -> task definition
+  # replaced -> service rolls -> old colour's pool destroyed. The switch never
+  # runs ahead of warm capacity, and a failed provisioning (init runs during
+  # the allocation) halts the apply with traffic untouched on the old colour.
+  depends_on = [aws_lambda_provisioned_concurrency_config.authority]
+
   runtime_platform {
     cpu_architecture        = "X86_64"
     operating_system_family = "LINUX"
@@ -548,6 +557,22 @@ resource "aws_ecs_service" "hub" {
     enable   = true
     rollback = true
   }
+
+  # Blue/green flip ordering, second half. The task-definition dependency on
+  # the provisioned-concurrency resource makes the switch wait for the new
+  # colour's warm pool; this makes the OLD pool's destroy wait for the drain.
+  # Without it, Terraform proceeds as soon as ECS accepts the update, and
+  # still-draining Hub tasks hold the old colour's alias ARNs -- whose invokes
+  # would fail closed once that pool is destroyed, because the handler rejects
+  # non-provisioned initialization by design. Steady-state means the new tasks
+  # are serving and the old ones are gone before the deposed pool is released;
+  # paired with the circuit breaker above, a failed rollout surfaces as an
+  # apply error after ECS rolls back rather than as a silent half-switch.
+  # Operationally: every service-touching apply now blocks on the ECS rollout,
+  # bounded by the provider's default 20m update timeout (no timeouts block on
+  # purpose); a stuck-but-not-failing deployment holds the Control apply until
+  # that fires, well inside the deploy job's own limit.
+  wait_for_steady_state = true
 
   lifecycle {
     ignore_changes = [desired_count]

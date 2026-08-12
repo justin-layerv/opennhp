@@ -191,7 +191,7 @@ variables {
     functions = {
       "layerv-nhp-sandbox-ca-ia" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -209,7 +209,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-ra" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -227,7 +227,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-icr" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -529,7 +529,7 @@ run "ready_requires_and_accepts_exact_two_cell_graph" {
               run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.functions["layerv-nhp-sandbox-ca-ia"],
               {
                 steady_provisioned_concurrency          = 3
-                steady_reserved_concurrency             = 3
+                steady_reserved_concurrency             = 6
                 rollout_active_provisioned_concurrency  = 3
                 rollout_standby_provisioned_concurrency = 3
                 rollout_reserved_concurrency            = 6
@@ -938,7 +938,7 @@ run "rejects_partial_cell_operation_group" {
           {
             "layerv-nhp-sandbox-ca-iro-cell0" = {
               steady_provisioned_concurrency          = 3
-              steady_reserved_concurrency             = 3
+              steady_reserved_concurrency             = 6
               rollout_active_provisioned_concurrency  = 3
               rollout_standby_provisioned_concurrency = 3
               rollout_reserved_concurrency            = 6
@@ -1243,7 +1243,7 @@ run "rejects_request_rate_above_rollout_standby_allocation_ceiling" {
               run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.functions["layerv-nhp-sandbox-ca-ia"],
               {
                 steady_provisioned_concurrency          = 3
-                steady_reserved_concurrency             = 3
+                steady_reserved_concurrency             = 6
                 rollout_active_provisioned_concurrency  = 3
                 rollout_standby_provisioned_concurrency = 2
                 rollout_reserved_concurrency            = 5

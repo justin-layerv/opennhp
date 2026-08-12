@@ -9380,6 +9380,14 @@ def _claim_authority_image_roll(
        ever omits an untouched resource. `_plan_resource_changes` preserving
        no-ops is pinned by test, but that pins the helper, not Terraform.
     """
+    # The reserved-envelope widen owns the whole function fleet when the
+    # contract's steady algebra is the thing moving: its validator re-proves
+    # uniform image convergence via the full runtime-inventory check, so an
+    # image publish riding that plan stays covered. Two claims on one address
+    # would fail composition's disjointness.
+    if _authority_reserved_envelope_widen_functions(by_address) is not None:
+        return frozenset()
+
     # A consumer-staging transition owns its own republishes: the function
     # change is the proof env coming or going, not an image move, and its
     # validator checks that exactly. Two claims on one address would fail
@@ -10109,6 +10117,196 @@ def _validate_authority_selector_flip(
         )
 
 
+AUTHORITY_EXHAUSTION_ALARM_TEMPLATE = (
+    'module.control.aws_cloudwatch_metric_alarm.authority_runtime'
+    '["{fn}:concurrency_exhaustion"]'
+)
+
+
+def _hub_service_steady_state_wait_only(by_address: dict[str, Any]) -> bool:
+    """True when the Hub service update is exactly wait_for_steady_state
+    turning on: every other known field identical before and after."""
+    change = by_address.get(HUB_WORKER_SERVICE_ADDRESS, {}).get("change", {})
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    if before.get("wait_for_steady_state") not in (None, False):
+        return False
+    if after.get("wait_for_steady_state") is not True:
+        return False
+    return {
+        k: v for k, v in before.items() if k != "wait_for_steady_state"
+    } == {k: v for k, v in after.items() if k != "wait_for_steady_state"}
+
+
+def _authority_reserved_envelope_widen_functions(
+    by_address: dict[str, Any],
+) -> set[str] | None:
+    """The contract functions when its change is exactly the steady reserved
+    envelope widening: every function's steady_reserved_concurrency moves from
+    provisioned to 2 x provisioned, nothing else in any function spec moves,
+    nothing else in the contract moves, and the rest of the foundation input is
+    identical except that the pinned image URI may advance in the same plan (a
+    routine publish riding the widen; the validator re-proves uniform image
+    convergence for the whole fleet either way).
+
+    Evidence stamps are expected to move WITH the widen, not despite it: the
+    generator writes the checkout commit and the manifest hash into every
+    basis_evidence block (and provisioned_cells_evidence), and the widen edits
+    the manifest, so those self-referential stamps change by construction.
+    Their content is not taken on trust here -- the runtime binding check
+    validates every evidence object's repository, commit, path, hash shape and
+    cross-object uniformity on a required path for every plan."""
+    change = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}).get(
+        "change", {}
+    )
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    input_before = before.get("input")
+    input_after = after.get("input")
+    if not isinstance(input_before, dict) or not isinstance(input_after, dict):
+        return None
+    contract_before = input_before.get("authority_runtime_contract")
+    contract_after = input_after.get("authority_runtime_contract")
+    if not isinstance(contract_before, dict) or not isinstance(contract_after, dict):
+        return None
+    functions_before = contract_before.get("functions")
+    functions_after = contract_after.get("functions")
+    if (
+        not isinstance(functions_before, dict)
+        or not isinstance(functions_after, dict)
+        or set(functions_before) != set(functions_after)
+        or not functions_after
+    ):
+        return None
+    moving_spec_keys = ("steady_reserved_concurrency", "basis_evidence")
+    for fn, spec_before in functions_before.items():
+        spec_after = functions_after.get(fn)
+        if not isinstance(spec_before, dict) or not isinstance(spec_after, dict):
+            return None
+        stripped_before = {
+            k: v for k, v in spec_before.items() if k not in moving_spec_keys
+        }
+        stripped_after = {
+            k: v for k, v in spec_after.items() if k not in moving_spec_keys
+        }
+        if stripped_before != stripped_after:
+            return None
+        provisioned = spec_after.get("steady_provisioned_concurrency")
+        if not isinstance(provisioned, int) or isinstance(provisioned, bool):
+            return None
+        if spec_before.get("steady_reserved_concurrency") != provisioned:
+            return None
+        if spec_after.get("steady_reserved_concurrency") != 2 * provisioned:
+            return None
+    global_before = contract_before.get("global")
+    global_after = contract_after.get("global")
+    if not isinstance(global_before, dict) or not isinstance(global_after, dict):
+        return None
+    if {k: v for k, v in global_before.items() if k != "basis_evidence"} != {
+        k: v for k, v in global_after.items() if k != "basis_evidence"
+    }:
+        return None
+    moving_contract_keys = ("functions", "global", "provisioned_cells_evidence")
+    if {**contract_before, **{k: None for k in moving_contract_keys}} != {
+        **contract_after,
+        **{k: None for k in moving_contract_keys},
+    }:
+        return None
+    rest_before = {
+        k: v
+        for k, v in input_before.items()
+        if k not in ("authority_runtime_contract", "authority_image_uri")
+    }
+    rest_after = {
+        k: v
+        for k, v in input_after.items()
+        if k not in ("authority_runtime_contract", "authority_image_uri")
+    }
+    if rest_before != rest_after:
+        return None
+    return set(functions_after)
+
+
+def _claim_authority_reserved_envelope_widen(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """The one-time steady-algebra migration: reserved goes provisioned -> 2x.
+
+    Claims the contract, every runtime function's in-place update (the only
+    field moving is reserved_concurrent_executions -- unless a routine image
+    publish rides along, in which case image_uri moves with it and the
+    validator's full-config check still pins the whole after-state), and every
+    concurrency-exhaustion alarm update (its threshold is derived from the
+    reserved envelope). All-or-nothing: a partial fleet -- some functions
+    widened, some not -- cannot satisfy the contract's steady algebra and is
+    refused outright rather than admitted as whatever subset planned. PC
+    configs and aliases do not move here; a standby alias catch-up riding the
+    same plan belongs to authority-standby-alias-advance and composes.
+    """
+    fns = _authority_reserved_envelope_widen_functions(by_address)
+    if fns is None:
+        return frozenset()
+    expected_functions = {
+        f'{AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]' for fn in fns
+    }
+    expected_alarms = {
+        AUTHORITY_EXHAUSTION_ALARM_TEMPLATE.format(fn=fn) for fn in fns
+    }
+    if not expected_functions <= changed or not expected_alarms <= changed:
+        return frozenset()
+    claimed = expected_functions | expected_alarms
+    if any(actual_non_noop.get(a) != ["update"] for a in claimed):
+        return frozenset()
+    # The same PR that widens the envelope turns on the Hub service's
+    # steady-state wait (the drain half of warm-before-switch), so that
+    # service update rides the widen apply exactly once. Claimed only when
+    # its delta is exactly that flag; the validator content-proves it.
+    if HUB_WORKER_SERVICE_ADDRESS in changed:
+        if actual_non_noop.get(HUB_WORKER_SERVICE_ADDRESS) != ["update"]:
+            return frozenset()
+        if not _hub_service_steady_state_wait_only(by_address):
+            return frozenset()
+        claimed = claimed | {HUB_WORKER_SERVICE_ADDRESS}
+    return frozenset(claimed | {AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS})
+
+
+def _validate_authority_reserved_envelope_widen(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    fns = _authority_reserved_envelope_widen_functions(by_address)
+    if fns is None:
+        raise ContractError(
+            "the reserved-envelope widen must move exactly the contract's "
+            "steady reserved algebra"
+        )
+    foundation_after = (
+        by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {})
+        .get("change", {})
+        .get("after")
+    )
+    if not isinstance(foundation_after, dict):
+        raise ContractError("the widened foundation contract is malformed")
+    if HUB_WORKER_SERVICE_ADDRESS in claimed and not (
+        _hub_service_steady_state_wait_only(by_address)
+    ):
+        raise ContractError(
+            "the Hub service update riding the widen must be exactly "
+            "wait_for_steady_state turning on"
+        )
+    # The full runtime-inventory check re-proves the entire after-state against
+    # the widened contract: every function's reserved envelope AND image URI,
+    # every exhaustion-alarm threshold, and every PC allocation/qualifier. The
+    # claim already pinned the contract delta to the reserved algebra alone, so
+    # nothing can ride the widen that this pass would not see.
+    _check_authority_runtime_resources(by_address, foundation_after)
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
     (
         "authority-proof-rollout-retirement",
@@ -10139,6 +10337,11 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-selector-flip",
         _claim_authority_selector_flip,
         _validate_authority_selector_flip,
+    ),
+    (
+        "authority-reserved-envelope-widen",
+        _claim_authority_reserved_envelope_widen,
+        _validate_authority_reserved_envelope_widen,
     ),
     (
         "authority-steady-pc-completion",
@@ -14634,6 +14837,26 @@ def check_plan(
             actual_non_noop.get(a) in (["create"], ["delete", "create"])
             for a in changed
         )
+        # delete,create recoveries only arise from a fleet-wide stuck flip, so
+        # they are all-or-nothing: a PARTIAL delete-first set is the mid-flip
+        # hazard itself and falls through to the terminal reject. This matches
+        # the shell fence's exactly-the-11 witness (review #3855). Pure-create
+        # residuals stay subset-tolerant -- the 2026-08-11 shape was a single
+        # function's pending allocation.
+        and (
+            not any(
+                actual_non_noop.get(a) == ["delete", "create"] for a in changed
+            )
+            or {
+                a
+                for a in changed
+                if actual_non_noop.get(a) == ["delete", "create"]
+            }
+            == {
+                f'{AUTHORITY_STEADY_PC_PREFIX}"{fn}"]'
+                for fn in AUTHORITY_RUNTIME_FUNCTIONS
+            }
+        )
         and not deposed_by_address
     ):
         # Completing a partially-applied PC re-home. Two shapes:
@@ -14666,6 +14889,18 @@ def check_plan(
         plan_mode = "authority-proof-rollout-retirement"
         _validate_authority_proof_rollout_retirement(
             _retirement_only, by_address, plan
+        )
+    elif (
+        _envelope_widen_only := _claim_authority_reserved_envelope_widen(
+            changed, actual_non_noop, by_address
+        )
+    ) and set(_envelope_widen_only) == changed and not deposed_by_address:
+        # The one-time steady-algebra migration (reserved -> 2x provisioned)
+        # landing on its own. Composition needs two or more claims by design,
+        # so this shape would otherwise fall through to the terminal reject.
+        plan_mode = "authority-reserved-envelope-widen"
+        _validate_authority_reserved_envelope_widen(
+            _envelope_widen_only, by_address, plan
         )
     elif (
         _composed_plan_mode := _compose_admitted_transitions(

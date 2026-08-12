@@ -210,7 +210,7 @@ variables {
     functions = {
       "layerv-nhp-sandbox-ca-ia" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -228,7 +228,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-ra" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -246,7 +246,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-icr" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -439,6 +439,7 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
     # and the first-apply checker.)
     condition = (
       aws_ecs_service.hub[0].desired_count == 2 &&
+      aws_ecs_service.hub[0].wait_for_steady_state == true &&
       aws_ecs_service.hub[0].launch_type == "FARGATE" &&
       one(aws_ecs_service.hub[0].load_balancer).container_name == "hub" &&
       one(aws_ecs_service.hub[0].load_balancer).container_port == 62206

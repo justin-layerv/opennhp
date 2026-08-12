@@ -265,7 +265,7 @@ variables {
     functions = {
       "layerv-nhp-sandbox-ca-ia" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -283,7 +283,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-ra" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -301,7 +301,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-icr" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -319,7 +319,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-pm" = {
         steady_provisioned_concurrency          = 1
-        steady_reserved_concurrency             = 1
+        steady_reserved_concurrency             = 2
         rollout_active_provisioned_concurrency  = 1
         rollout_standby_provisioned_concurrency = 1
         rollout_reserved_concurrency            = 2
@@ -337,7 +337,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-pcr" = {
         steady_provisioned_concurrency          = 1
-        steady_reserved_concurrency             = 1
+        steady_reserved_concurrency             = 2
         rollout_active_provisioned_concurrency  = 1
         rollout_standby_provisioned_concurrency = 1
         rollout_reserved_concurrency            = 2
@@ -601,7 +601,7 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
       functions = {
         "layerv-nhp-sandbox-ca-ia" = {
           steady_provisioned_concurrency          = 2
-          steady_reserved_concurrency             = 2
+          steady_reserved_concurrency             = 4
           rollout_active_provisioned_concurrency  = 2
           rollout_standby_provisioned_concurrency = 2
           rollout_reserved_concurrency            = 4
@@ -619,7 +619,7 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
         }
         "layerv-nhp-sandbox-ca-ra" = {
           steady_provisioned_concurrency          = 2
-          steady_reserved_concurrency             = 2
+          steady_reserved_concurrency             = 4
           rollout_active_provisioned_concurrency  = 2
           rollout_standby_provisioned_concurrency = 2
           rollout_reserved_concurrency            = 4
@@ -637,7 +637,7 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
         }
         "layerv-nhp-sandbox-ca-icr" = {
           steady_provisioned_concurrency          = 2
-          steady_reserved_concurrency             = 2
+          steady_reserved_concurrency             = 4
           rollout_active_provisioned_concurrency  = 2
           rollout_standby_provisioned_concurrency = 2
           rollout_reserved_concurrency            = 4
@@ -655,7 +655,7 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
         }
         "layerv-nhp-sandbox-ca-pm" = {
           steady_provisioned_concurrency          = 1
-          steady_reserved_concurrency             = 1
+          steady_reserved_concurrency             = 2
           rollout_active_provisioned_concurrency  = 1
           rollout_standby_provisioned_concurrency = 1
           rollout_reserved_concurrency            = 2
@@ -673,7 +673,7 @@ run "rejects_proof_controller_capacity_above_one_attended_call" {
         }
         "layerv-nhp-sandbox-ca-pcr" = {
           steady_provisioned_concurrency          = 1
-          steady_reserved_concurrency             = 1
+          steady_reserved_concurrency             = 2
           rollout_active_provisioned_concurrency  = 1
           rollout_standby_provisioned_concurrency = 1
           rollout_reserved_concurrency            = 2

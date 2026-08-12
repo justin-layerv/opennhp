@@ -848,4 +848,47 @@ chmod +x "${fake_bin}/grep"
 expect_failure 'Terraform scan failed with status 2' env \
   PATH="${fake_bin}:${PATH}" NHP_REPO_ROOT="$fixture_root" "$checker"
 
+# Mechanical lockstep guard (review #3855): the shell fence's hardcoded
+# steady-PC completion witness must name exactly the Python checker's
+# AUTHORITY_RUNTIME_FUNCTIONS. A function add/remove that touches only one
+# side fails here instead of silently desynchronizing the two gates.
+python3 - "$repo_root" <<'LOCKSTEP'
+import importlib.util
+import re
+import sys
+
+repo_root = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "checker", f"{repo_root}/.github/scripts/check-control-sandbox-first-apply.py"
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+python_expected = sorted(module.AUTHORITY_RUNTIME_FUNCTIONS)
+
+shell_source = open(
+    f"{repo_root}/scripts/check-connector-authority-foundation.sh"
+).read()
+# The completion witness's argjson array, anchored on its variable name and
+# closed at the array's end -- not on indentation, so an unrelated argjson
+# added elsewhere cannot silently become the compared block.
+match = re.search(r"--argjson expected '\[(.*?)\]'", shell_source, re.DOTALL)
+if match is None:
+    sys.exit("FAIL: completion witness --argjson expected array not found")
+shell_expected = sorted(
+    set(
+        re.findall(
+            r"provisioned_concurrency_config\.authority\[\\\"([a-z0-9-]+)\\\"\]",
+            match.group(1),
+        )
+    )
+)
+if shell_expected != python_expected:
+    sys.exit(
+        "FAIL: shell completion witness and Python AUTHORITY_RUNTIME_FUNCTIONS "
+        f"disagree:\n  shell:  {shell_expected}\n  python: {python_expected}"
+    )
+if len(shell_expected) != 11:
+    sys.exit(f"FAIL: expected 11 witnessed functions, extracted {len(shell_expected)}")
+LOCKSTEP
+
 echo "Connector Authority foundation checker fixtures passed"

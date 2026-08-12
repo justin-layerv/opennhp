@@ -533,7 +533,15 @@ locals {
     alltrue([
       for function_name, function in local.authority_contract_functions :
       function.steady_provisioned_concurrency >= 1 &&
-      function.steady_reserved_concurrency == function.steady_provisioned_concurrency &&
+      # The steady reserved envelope covers BOTH colours' warm pools at once,
+      # exactly like the rollout invariant below covers active + standby. A
+      # blue/green selector flip provisions the new colour before the old one
+      # releases (create-before-destroy on the provisioned-concurrency
+      # resource), and Lambda refuses any alias allocation that would exceed
+      # the function's reserved concurrency -- measured on the 2026-08-12
+      # cutover. reserved == provisioned would make every flip delete-first
+      # and serve a cold window mid-switch.
+      function.steady_reserved_concurrency == 2 * function.steady_provisioned_concurrency &&
       function.rollout_active_provisioned_concurrency >= 1 &&
       function.rollout_standby_provisioned_concurrency >= 1 &&
       function.rollout_reserved_concurrency == (

@@ -1223,16 +1223,19 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
   qualifier     = aws_lambda_alias.authority["${each.key}:${local.authority_runtime_selected_color}"].name
 
   # A selector flip re-homes this capacity to the other colour; the qualifier
-  # is the PC's identity, so the move is a replacement. It is deliberately
-  # DELETE-BEFORE-CREATE (Terraform's default): steady_reserved_concurrency
-  # equals steady_provisioned_concurrency, so the old colour's live pool
-  # consumes the entire reserved budget. Create-before-destroy would try to
-  # provision the new colour while the old still holds that budget and Lambda
-  # refuses it ("Requested Provisioned Concurrency should not be greater than
-  # the reservedConcurrentExecution") -- measured on the 2026-08-12 cutover.
-  # Delete-first frees the reservation, then provisions the new colour; the
-  # brief unprovisioned window is on-demand (blue serves, just cold) rather
-  # than an outage. The alias itself never stops resolving.
+  # is the PC's identity, so the move is a replacement. It is
+  # CREATE-BEFORE-DESTROY: the steady reserved envelope is 2x the provisioned
+  # allocation (enforced by the contract's steady algebra), so both colours'
+  # pools fit inside it and Lambda accepts the new colour's allocation while
+  # the old one is still live. The provider waits for the new pool to reach
+  # READY -- and provisioning RUNS the handler's init, so a broken build fails
+  # the create and the apply halts with the old colour's pool untouched. The
+  # Hub task definition depends on this resource, so under replace ordering
+  # the traffic switch happens strictly after the new pool is READY and the
+  # old pool is destroyed strictly after the switch: warm-before-switch with
+  # no cold window. (Delete-first was the forced order while reserved ==
+  # provisioned; Lambda's budget refusal was measured on the 2026-08-12
+  # cutover.)
   provisioned_concurrent_executions = (
     local.authority_proof_policy_rollout_active &&
     contains(local.authority_proof_policy_rollout_function_names, each.key)
@@ -1252,6 +1255,9 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
     aws_security_group.authority_lambda,
   ]
 
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # The first attended proof intentionally keeps the reviewed blue basis pool at

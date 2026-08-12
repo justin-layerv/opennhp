@@ -14618,6 +14618,334 @@ class ComposedTransitionTest(unittest.TestCase):
         changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
         CHECKER._check_authority_steady_pc_completion(changed, by)
 
+    def widen_plan(self) -> dict:
+        """The steady inventory mutated into the one-time envelope widen: the
+        contract's steady reserved algebra moves provisioned -> 2x, every
+        function's reserved_concurrent_executions follows, and every
+        concurrency-exhaustion alarm threshold follows (it derives from the
+        reserved envelope)."""
+        plan = authority_runtime_steady_fixture()
+        plan["applyable"] = True
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        foundation = changes[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        foundation["actions"] = ["update"]
+        after_payload = copy.deepcopy(foundation["after"]["input"])
+        for spec in after_payload["authority_runtime_contract"][
+            "functions"
+        ].values():
+            spec["steady_reserved_concurrency"] = (
+                2 * spec["steady_provisioned_concurrency"]
+            )
+        foundation["after"] = {
+            "input": after_payload,
+            "output": copy.deepcopy(after_payload),
+        }
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            change = changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]']
+            change["actions"] = ["update"]
+            change["after"] = {
+                **copy.deepcopy(change["before"]),
+                "reserved_concurrent_executions": 4,
+            }
+            alarm = changes[
+                CHECKER.AUTHORITY_EXHAUSTION_ALARM_TEMPLATE.format(fn=fn)
+            ]
+            alarm["actions"] = ["update"]
+            alarm["after"] = {**copy.deepcopy(alarm["before"]), "threshold": 4}
+        return plan
+
+    def test_reserved_envelope_widen_classifies_end_to_end(self) -> None:
+        summary = CHECKER.check_plan(self.widen_plan())
+        self.assertEqual(summary["plan_mode"], "authority-reserved-envelope-widen")
+
+    def test_reserved_envelope_widen_absorbs_a_riding_image_publish(self) -> None:
+        """A routine publish landing in the same plan stays admitted.
+
+        Under publish tracking (the live sandbox source), the resolved digest
+        moves in the payload's image URI alone -- the contract itself is
+        byte-identical -- so the delta helper still recognizes the widen, and
+        the validator's full-inventory pass re-proves the uniform convergence
+        the image-roll lane (stood down to keep claims disjoint) would have.
+        """
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        foundation = changes[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        for side in ("before", "after"):
+            for view in ("input", "output"):
+                global_contract = foundation[side][view][
+                    "authority_runtime_contract"
+                ]["global"]
+                global_contract["authority_image_source"] = "publish_parameter"
+                global_contract.pop("authority_image_digest", None)
+        old_uri = foundation["after"]["input"]["authority_image_uri"]
+        new_uri = old_uri.split("@sha256:")[0] + "@sha256:" + 64 * "f"
+        self.assertNotEqual(new_uri, old_uri)
+        for view in ("input", "output"):
+            foundation["after"][view]["authority_image_uri"] = new_uri
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            change = changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]']
+            change["after"]["image_uri"] = new_uri
+        summary = CHECKER.check_plan(plan)
+        self.assertEqual(summary["plan_mode"], "authority-reserved-envelope-widen")
+
+    def test_reserved_envelope_widen_rejects_a_split_fleet_image_ride(self) -> None:
+        """A non-uniform image ride is rejected INSIDE this lane: the claim
+        excludes the image URI from its own comparison, so the split-fleet
+        refusal rests on the delegated full-inventory pass pinning every
+        function to the contract's URI (review #3855 round 4)."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        foundation = changes[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        for side in ("before", "after"):
+            for view in ("input", "output"):
+                global_contract = foundation[side][view][
+                    "authority_runtime_contract"
+                ]["global"]
+                global_contract["authority_image_source"] = "publish_parameter"
+                global_contract.pop("authority_image_digest", None)
+        old_uri = foundation["after"]["input"]["authority_image_uri"]
+        new_uri = old_uri.split("@sha256:")[0] + "@sha256:" + 64 * "f"
+        for view in ("input", "output"):
+            foundation["after"][view]["authority_image_uri"] = new_uri
+        stale = sorted(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)[0]
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            if fn == stale:
+                continue
+            changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]'][
+                "after"
+            ]["image_uri"] = new_uri
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "contract-pinned repository@digest"
+        ):
+            CHECKER.check_plan(plan)
+
+    def test_reserved_envelope_widen_refuses_a_partial_fleet(self) -> None:
+        """One function left on the old algebra fails the contract delta."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        foundation = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        foundation["change"]["after"]["input"]["authority_runtime_contract"][
+            "functions"
+        ]["layerv-nhp-sandbox-ca-ra"]["steady_reserved_concurrency"] = 2
+        self.assertIsNone(
+            CHECKER._authority_reserved_envelope_widen_functions(by)
+        )
+
+    def test_reserved_envelope_widen_refuses_a_wrong_multiple(self) -> None:
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        foundation = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        for spec in foundation["change"]["after"]["input"][
+            "authority_runtime_contract"
+        ]["functions"].values():
+            spec["steady_reserved_concurrency"] = 5
+        self.assertIsNone(
+            CHECKER._authority_reserved_envelope_widen_functions(by)
+        )
+
+    def test_reserved_envelope_widen_refuses_a_riding_contract_edit(self) -> None:
+        """Any other spec field moving with the widen is not this lane."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        foundation = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        foundation["change"]["after"]["input"]["authority_runtime_contract"][
+            "functions"
+        ]["layerv-nhp-sandbox-ca-ia"]["max_caller_requests_per_second"] = 6
+        self.assertIsNone(
+            CHECKER._authority_reserved_envelope_widen_functions(by)
+        )
+
+    def test_reserved_envelope_widen_refuses_a_riding_global_edit(self) -> None:
+        """Evidence stamps may move with the widen; anything else in the
+        contract's global block may not."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        foundation = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        foundation["change"]["after"]["input"]["authority_runtime_contract"][
+            "global"
+        ]["caller_capacity"]["hub_workers"]["max_replicas"] = 99
+        self.assertIsNone(
+            CHECKER._authority_reserved_envelope_widen_functions(by)
+        )
+
+    def test_reserved_envelope_widen_tolerates_fresh_evidence_stamps(self) -> None:
+        """The generator stamps the checkout commit + manifest hash into every
+        evidence block, and the widen edits the manifest -- so a real widen
+        plan always carries fresh stamps. The delta must admit them."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        foundation = by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        contract = foundation["change"]["after"]["input"][
+            "authority_runtime_contract"
+        ]
+        fresh = {
+            "repository": "layervai/nhp",
+            "source_commit": "c" * 40,
+            "path": (
+                "docs/evidence/connector-authority/v1/"
+                "sandbox-measurement-basis.json"
+            ),
+            "sha256": "d" * 64,
+            "schema_version": 1,
+        }
+        contract["global"]["basis_evidence"] = dict(fresh)
+        contract["provisioned_cells_evidence"] = dict(fresh)
+        for spec in contract["functions"].values():
+            spec["basis_evidence"] = dict(fresh)
+        self.assertEqual(
+            CHECKER._authority_reserved_envelope_widen_functions(by),
+            set(contract["functions"]),
+        )
+
+    def test_reserved_envelope_widen_rejects_an_alarm_threshold_tamper(self) -> None:
+        """The claim admits the shape; the full-inventory validator pins the
+        threshold to the widened envelope exactly."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        changes[
+            CHECKER.AUTHORITY_EXHAUSTION_ALARM_TEMPLATE.format(
+                fn="layerv-nhp-sandbox-ca-ia"
+            )
+        ]["after"]["threshold"] = 3
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "threshold must be exactly"
+        ):
+            CHECKER.check_plan(plan)
+
+    def test_reserved_envelope_widen_rejects_a_function_field_smuggle(self) -> None:
+        """A function update carrying more than the envelope (and a uniform
+        image move) is caught by the full-inventory after-state check."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        changes[
+            f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}layerv-nhp-sandbox-ca-ia"]'
+        ]["after"]["description"] = "not the reviewed description"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(plan)
+
+    def _append_hub_service_wait_flip(self, plan: dict, extra: dict) -> None:
+        """The runtime fixture carries no Hub worker slice, so append the
+        service update the real widen plan carries (wait_for_steady_state
+        turning on) with any extra after-field tamper the test wants."""
+        before = {
+            "name": "layerv-nhp-sandbox-hub",
+            "launch_type": "FARGATE",
+            "desired_count": 2,
+            "task_definition": "arn:aws:ecs:us-east-2:767397897469:task-definition/layerv-nhp-sandbox-control-hub:5",
+            "wait_for_steady_state": False,
+        }
+        plan["resource_changes"].append(
+            {
+                "address": CHECKER.HUB_WORKER_SERVICE_ADDRESS,
+                "mode": "managed",
+                "type": "aws_ecs_service",
+                "change": {
+                    "actions": ["update"],
+                    "before": copy.deepcopy(before),
+                    "after": {
+                        **copy.deepcopy(before),
+                        "wait_for_steady_state": True,
+                        **extra,
+                    },
+                    "after_unknown": {},
+                },
+            }
+        )
+
+    def test_reserved_envelope_widen_admits_the_steady_state_wait_flip(self) -> None:
+        """The service's wait_for_steady_state enablement rides the widen
+        apply exactly once (the drain half of warm-before-switch).
+
+        Claim-level rather than check_plan: the runtime fixture carries no Hub
+        worker inventory, and appending a lone service trips the slice
+        coexistence rule. The end-to-end admission is proven against the real
+        live-state plan (which carries the full Hub inventory) in the PR.
+        """
+        plan = self.widen_plan()
+        self._append_hub_service_wait_flip(plan, {})
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_reserved_envelope_widen(
+            changed, acts, by
+        )
+        self.assertIn(CHECKER.HUB_WORKER_SERVICE_ADDRESS, claimed)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_reserved_envelope_widen(claimed, by, plan)
+
+    def test_reserved_envelope_widen_refuses_a_wider_service_edit(self) -> None:
+        """A service update carrying anything beyond the wait flag is not
+        claimable by the widen, so the plan cannot be fully claimed."""
+        plan = self.widen_plan()
+        self._append_hub_service_wait_flip(plan, {"desired_count": 9})
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_reserved_envelope_widen(changed, acts, by),
+            frozenset(),
+        )
+
+    def completion_recovery_plan(self, function_count: int) -> dict:
+        """The steady inventory with the first function_count steady pools
+        re-homing delete,create to the selected colour."""
+        plan = authority_runtime_steady_fixture()
+        plan["applyable"] = True
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        for fn in sorted(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)[:function_count]:
+            change = changes[CHECKER.AUTHORITY_STEADY_PC_PREFIX + f'"{fn}"]']
+            change["actions"] = ["delete", "create"]
+            change["before"] = {
+                **copy.deepcopy(change["after"]),
+                "qualifier": "green",
+            }
+        return plan
+
+    def test_full_delete_create_completion_classifies_end_to_end(self) -> None:
+        summary = CHECKER.check_plan(
+            self.completion_recovery_plan(len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS))
+        )
+        self.assertEqual(summary["plan_mode"], "authority-steady-pc-completion")
+
+    def test_partial_delete_create_completion_falls_to_the_terminal_reject(
+        self,
+    ) -> None:
+        """A partial delete-first re-home set IS the mid-flip hazard; only the
+        complete 11-function recovery classifies (review #3855, aligning the
+        Python elif with the shell fence's exactly-the-11 witness)."""
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "must be an exact no-op"
+        ):
+            CHECKER.check_plan(self.completion_recovery_plan(3))
+
+    def test_image_roll_stands_down_for_the_widen(self) -> None:
+        """Two claims on one function address would fail composition."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, item in by.items() if item["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_image_roll(changed, acts, by), frozenset()
+        )
+
     def test_flip_projection_drift_admits_either_direction(self) -> None:
         """hub_task projection drift is accepted for a green->blue flip too."""
         import json as _json
@@ -14676,6 +15004,11 @@ class ComposedTransitionTest(unittest.TestCase):
                 # follows create-before-destroy, and the Hub repoints by
                 # colour with the delta content-proved.
                 "authority-selector-flip",
+                # The one-time steady-algebra migration behind warm flips:
+                # every function's reserved envelope widens to 2x provisioned
+                # so both colours' pools fit inside it, with the exhaustion
+                # alarm thresholds following.
+                "authority-reserved-envelope-widen",
             },
         )
 

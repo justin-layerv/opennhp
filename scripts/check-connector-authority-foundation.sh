@@ -124,8 +124,8 @@ if [[ -n "$plan_json" ]]; then
   # The blue/green selector flip: the contract's selected_authority_color
   # moves between the two valid colours and nothing else in the contract
   # changes shape. The flip re-homes steady provisioned concurrency to the new
-  # colour (delete-before-create since #3854 -- the old colour releases its
-  # reserved budget first) and replaces
+  # colour (create-before-destroy -- the reserved envelope is 2x provisioned,
+  # so the new colour warms while the old is still live) and replaces
   # the Hub task definition (its container env carries the alias ARNs by
   # colour). Any delete outside those two shapes defeats the flag.
   # Steady-PC completion recovery: a partial cutover left the fleet with the
@@ -157,6 +157,13 @@ if [[ -n "$plan_json" ]]; then
       | .address
     ] | sort) as $destroyed
     | $destroyed == ($expected | sort)
+    # Delete-first ONLY: a selector flip re-homes the same 11 addresses
+    # create-before-destroy, and this flag must stay false there so the two
+    # recovery shapes cannot be misread as simultaneously live (review #3855).
+    and ([
+      (.resource_changes[]?, .resource_drift[]?)
+      | select((.address | IN($expected[])) and .change.actions != ["delete", "create"])
+    ] | length) == 0
   ' "$plan_json" >/dev/null; then
     authority_steady_pc_completion_allowed=true
   fi
@@ -590,10 +597,18 @@ if [[ -n "$plan_json" ]]; then
           and (
             .change.actions == ["delete", "create"]
             or (
-              # Both the flip and the completion recovery re-home delete-first
-              # (#3854 reverted create-before-destroy): the old colour releases
-              # its reserved budget before the new colour provisions.
-              ($authority_selector_flip_allowed or $authority_steady_pc_completion_allowed)
+              # The selector flip re-homes create-before-destroy: the steady
+              # reserved envelope is 2x provisioned, so the new colour warms
+              # to READY while the old pool is still live, and the fleet
+              # never serves an unwarmed window mid-switch.
+              $authority_selector_flip_allowed
+              and .change.actions == ["create", "delete"]
+            )
+            or (
+              # The historical completion recovery (#3854) re-homed the stuck
+              # pools delete-first, freeing the reserved budget the old colour
+              # still held under the reserved == provisioned algebra.
+              $authority_steady_pc_completion_allowed
               and .change.actions == ["delete", "create"]
             )
           )

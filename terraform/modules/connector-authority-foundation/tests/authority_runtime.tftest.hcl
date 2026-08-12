@@ -263,7 +263,7 @@ variables {
     functions = merge({
       "layerv-nhp-sandbox-ca-ia" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -281,7 +281,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-ra" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -299,7 +299,7 @@ variables {
       }
       "layerv-nhp-sandbox-ca-icr" = {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -327,7 +327,7 @@ variables {
         "layerv-nhp-sandbox-ca-ccr-cell1",
         ]) : function_name => {
         steady_provisioned_concurrency          = 2
-        steady_reserved_concurrency             = 2
+        steady_reserved_concurrency             = 4
         rollout_active_provisioned_concurrency  = 2
         rollout_standby_provisioned_concurrency = 2
         rollout_reserved_concurrency            = 4
@@ -406,11 +406,11 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
 
   assert {
     condition = (
-      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"].reserved_concurrent_executions == 2 &&
-      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"].reserved_concurrent_executions == 2 &&
-      aws_lambda_function.authority["layerv-nhp-sandbox-ca-icr"].reserved_concurrent_executions == 2 &&
-      aws_lambda_function.authority["layerv-nhp-sandbox-ca-iro-cell0"].reserved_concurrent_executions == 2 &&
-      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ccr-cell1"].reserved_concurrent_executions == 2 &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"].reserved_concurrent_executions == 4 &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ra"].reserved_concurrent_executions == 4 &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-icr"].reserved_concurrent_executions == 4 &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-iro-cell0"].reserved_concurrent_executions == 4 &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-ccr-cell1"].reserved_concurrent_executions == 4 &&
       aws_lambda_function.authority["layerv-nhp-sandbox-ca-ia"].package_type == "Image" &&
       alltrue([
         for pc in values(aws_lambda_provisioned_concurrency_config.authority) :

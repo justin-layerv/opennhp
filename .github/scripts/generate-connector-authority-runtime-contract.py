@@ -450,7 +450,10 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         expected_rps = caller["max_replicas"] * (
             rate["burst"] + rate["refill_per_second"]
         )
-        if values["steady_reserved_concurrency"] != values["steady_provisioned_concurrency"]:
+        # Both colours' warm pools must fit inside the reserved envelope so a
+        # blue/green flip can provision the new colour before the old releases
+        # (mirrors the rollout algebra below: active + standby).
+        if values["steady_reserved_concurrency"] != 2 * values["steady_provisioned_concurrency"]:
             fail(f"{function_name} steady concurrency algebra differs")
         if values["rollout_reserved_concurrency"] != (
             values["rollout_active_provisioned_concurrency"]
