@@ -11853,6 +11853,29 @@ def _check_state_normalization_drift(
     _, drift = _partition_first_projection_drift(drift)
     if not drift:
         return "first-projection"
+    # The blue/green switch pointer's value re-read is peeled next, for the
+    # same reason first projections are: it carries no signal to constrain.
+    # The deploy pipeline writes the parameter on every promotion, Terraform
+    # ignores the value (state keeps the seed forever), and the value only
+    # enters the plan through the postcondition-gated data source -- so the
+    # re-read is a permanent companion of every post-promotion plan, in any
+    # combination with any other reviewed drift. Peeling is confined to the
+    # benign shape: the pointer's PLAN must be a no-op; a pointer with a
+    # pending change stays on the strict path below.
+    pointer_reads = [
+        item
+        for item in drift
+        if item.get("address") == AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS
+        and item.get("change", {}).get("actions") == ["update"]
+        and by_address.get(AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS, {})
+        .get("change", {})
+        .get("actions")
+        == ["no-op"]
+    ]
+    if pointer_reads:
+        drift = [item for item in drift if item not in pointer_reads]
+        if not drift:
+            return "authority-alias-refresh"
     # From here down ``drift`` is the substantive remainder, and every existing
     # reviewed-kind matcher below sees exactly that. Rejection diagnostics
     # therefore name only the entries that actually carry a signal.
@@ -11889,30 +11912,34 @@ def _check_state_normalization_drift(
         and set(addresses)
         == {
             AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
-            AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+            _AUTHORITY_DIGEST_ADDRESS,
         }
-        and all(
-            item.get("change", {}).get("actions") == ["update"]
-            and by_address.get(item.get("address"), {})
+    ):
+        # The hub_task projection together with the publisher-rolled digest:
+        # exactly what a publish landing beside a selector flip refreshes.
+        # Mirrors the enablement pair -- each half runs its OWN unweakened
+        # single-drift validator, and the matched set admits nothing else.
+        by_drift_address = {item.get("address"): item for item in drift}
+        projection = by_drift_address[
+            AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+        ]
+        if (
+            projection.get("change", {}).get("actions") != ["update"]
+            or by_address.get(
+                AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS, {}
+            )
             .get("change", {})
             .get("actions")
-            == ["no-op"]
-            for item in drift
+            != ["no-op"]
+        ):
+            raise _unexpected_drift_error(drift)
+        _check_hub_task_selected_projection_drift(projection)
+        _check_digest_normalization(
+            by_drift_address[_AUTHORITY_DIGEST_ADDRESS],
+            by_address,
+            spec=_AUTHORITY_DIGEST_SPEC,
         )
-    ):
-        # The hub_task projection re-read together with the pointer's benign
-        # value re-read (the pipeline writes the pointer; state keeps the
-        # seed). Each half keeps its own validation: the projection by its
-        # dedicated checker, the pointer by the same confinement the
-        # alias-refresh kind gives it (planned no-op; the value itself only
-        # enters the plan through the postcondition-gated data source). A
-        # selector flip's plan carries exactly this pair, so the pair keeps
-        # the single kind's name and gating.
-        by_drift_address = {item.get("address"): item for item in drift}
-        _check_hub_task_selected_projection_drift(
-            by_drift_address[AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS]
-        )
-        return "hub-task-selected-projection"
+        return "hub-task-selected-projection-with-authority-digest"
     if addresses and all(
         (
             address.startswith("module.control.aws_lambda_alias.authority[")
@@ -15275,7 +15302,10 @@ def check_plan(
         raise ContractError(
             "publisher role normalization cannot be combined with a resource transition"
         )
-    if normalization_drift_kind == "authority-digest":
+    if normalization_drift_kind in (
+        "authority-digest",
+        "hub-task-selected-projection-with-authority-digest",
+    ):
         # A composed plan_mode is "composed-<a>-with-<b>"; admit it when one of
         # its parts is admitted here, so a reviewed transition does not lose its
         # allowance merely by landing alongside another reviewed one.
@@ -15328,6 +15358,10 @@ def check_plan(
             # can accompany it; the full-inventory validator re-proves uniform
             # convergence on the refreshed digest.
             "authority-reserved-envelope-widen",
+            # A publish landing beside a selector flip (the auto-promote's
+            # ordinary weather): the digest rolls, the flip plan carries the
+            # refresh, and the flip's own lane validates every planned change.
+            "authority-selector-flip",
         )):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "

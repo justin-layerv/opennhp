@@ -14627,6 +14627,50 @@ class ComposedTransitionTest(unittest.TestCase):
         with self.assertRaises(CHECKER.ContractError):
             CHECKER._check_state_normalization_drift(drift, by, refresh_only=False)
 
+    def test_pointer_peel_survives_any_drift_combination(self) -> None:
+        """The triple from run 31648474705: projection + pointer + digest.
+        The pointer peels (planned no-op), and the remaining pair classifies
+        with each half's own validator."""
+        def role(sel):
+            return {"inline_policy": [{"name": "hub-task", "policy": json.dumps(
+                CHECKER._expected_hub_task_inline_policy(rollout=False, selected=sel))}]}
+        digest_before = "sha256:" + "1" * 64
+        digest_after = "sha256:" + "2" * 64
+        drift = [
+            {
+                "address": CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+                "change": {"actions": ["update"], "before": role("green"), "after": role("blue")},
+            },
+            {
+                "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+                "change": {"actions": ["update"], "before": {"value": "green"}, "after": {"value": "blue"}},
+            },
+            {
+                "address": "module.control.aws_ssm_parameter.authority_image_digest",
+                "change": {"actions": ["update"], "before": {
+                    "name": "/sandbox/nhp/control/connector-authority/image-digest",
+                    "type": "String", "value": digest_before,
+                }, "after": {
+                    "name": "/sandbox/nhp/control/connector-authority/image-digest",
+                    "type": "String", "value": digest_after,
+                }},
+            },
+        ]
+        # A shape-exact digest item, borrowed from the enablement fixture the
+        # digest validator already accepts.
+        binding = authority_contract_transition_fixture()
+        digest_item = next(
+            item
+            for item in binding["resource_drift"]
+            if item["address"]
+            == "module.control.aws_ssm_parameter.authority_image_digest"
+        )
+        drift[2] = digest_item
+        by = {item["address"]: {"change": {"actions": ["no-op"],
+            "after": item["change"]["after"]}} for item in drift}
+        kind = CHECKER._check_state_normalization_drift(drift, by, refresh_only=False)
+        self.assertEqual(kind, "hub-task-selected-projection-with-authority-digest")
+
     def test_degenerate_flip_claims_and_validates(self) -> None:
         by = self.degenerate_flip_by()
         changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}

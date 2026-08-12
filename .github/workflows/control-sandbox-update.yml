@@ -783,7 +783,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-alias-refresh:*|hub-task-selected-projection:1|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|authority-and-hub-digest:2|redis-passwords:2|authority-enablement-normalization:2|authority-runtime-slice-normalization:*|authority-alias-refresh:*|hub-task-selected-projection:1|hub-task-selected-projection-with-authority-digest:2|authority-runtime-slice-with-authority-digest:*|authority-proof-concurrency-recovery:*|authority-proof-rollout-prepare-recovery:*|provider-reprojection:*|provider-reprojection-with-authority-digest:*)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -817,7 +817,8 @@ jobs:
               ;;
           esac
           if [[ "$normalization_kind" == 'authority-alias-refresh' \
-             || "$normalization_kind" == 'hub-task-selected-projection' ]]; then
+             || "$normalization_kind" == 'hub-task-selected-projection' \
+             || "$normalization_kind" == 'hub-task-selected-projection-with-authority-digest' ]]; then
             # State catch-up from a failed apply's partial success: live already
             # holds these alias/function values, the plan proposes no change to
             # them (the classifier requires every drifted address to be planned
@@ -826,7 +827,9 @@ jobs:
             # value between plan and apply "is not a staleness guard, it is a
             # coin flip" -- the immediately-before-apply state {serial, sha256}
             # binding in the next step is the real guard, exactly as for the
-            # digest kinds.
+            # digest kinds. The -with-authority-digest pair adds the digest
+            # half, which is the canonically externally-rolling value the coin
+            # flip argument was written for.
             exit 0
           fi
           if [[ "$normalization_kind" == 'authority-runtime-slice-normalization' \
