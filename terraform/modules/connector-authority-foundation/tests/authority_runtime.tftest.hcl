@@ -1068,3 +1068,159 @@ run "authority_ticket_handle_grants_exist_and_are_scoped" {
     error_message = "The replay write grant was widened instead of a separate handle grant being added."
   }
 }
+
+run "pointer_parameter_is_seeded_with_the_contract_colour" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  assert {
+    condition = (
+      length(aws_ssm_parameter.authority_active_color) == 1 &&
+      aws_ssm_parameter.authority_active_color[0].name == "/sandbox/nhp/control/authority/active-color" &&
+      aws_ssm_parameter.authority_active_color[0].type == "String" &&
+      aws_ssm_parameter.authority_active_color[0].value == "blue" &&
+      length(data.aws_ssm_parameter.authority_active_color) == 0
+    )
+    error_message = "The switch pointer must be created with the runtime, seeded with the contract's selected colour, and never read while the pointer gate is dark."
+  }
+}
+
+run "ssm_pointer_steers_every_colour_bearing_rendering" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_blue_green_alias_hold_enabled = true
+    authority_selector_ssm_pointer_enabled  = true
+  }
+
+  # The live pointer disagrees with the committed contract (green vs blue):
+  # the module must follow the POINTER everywhere a colour is rendered, and
+  # must record the effective colour in the foundation contract so the flip
+  # presents as the reviewed contract before/after.
+  override_data {
+    target          = data.aws_ssm_parameter.authority_active_color[0]
+    override_during = plan
+    values = {
+      value = "green"
+    }
+  }
+
+  assert {
+    condition     = local.authority_runtime_selected_color == "green"
+    error_message = "With the pointer gate on, the effective selector must be the SSM value."
+  }
+
+  assert {
+    condition     = local.authority_proof_policy_standby_color == "blue"
+    error_message = "The standby colour must be the pointer value's complement."
+  }
+
+  assert {
+    condition = alltrue([
+      for pc in values(aws_lambda_provisioned_concurrency_config.authority) :
+      pc.qualifier == "green"
+    ])
+    error_message = "The PC qualifiers must follow the pointer."
+  }
+
+  # The recorded contract selector (terraform_data.foundation_contract.input)
+  # is deliberately NOT asserted here: the test harness defers terraform_data
+  # planned input to unknown, though real plan JSON carries it known -- the
+  # b1 live plan and the checker'"'"'s flip-lane fixtures pin that recording.
+
+  assert {
+    condition = (
+      alltrue([
+        for operation, arn in local.authority_selected_alias_targets.hub :
+        endswith(arn, ":green")
+      ]) &&
+      alltrue([
+        for cell_id, operations in local.authority_selected_alias_targets.cells :
+        alltrue([for operation, arn in operations : endswith(arn, ":green")])
+      ])
+    )
+    error_message = "Every Hub/cell alias target must follow the pointer."
+  }
+}
+
+run "corrupted_pointer_value_fails_the_plan_closed" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_blue_green_alias_hold_enabled = true
+    authority_selector_ssm_pointer_enabled  = true
+  }
+
+  override_data {
+    target          = data.aws_ssm_parameter.authority_active_color[0]
+    override_during = plan
+    values = {
+      value = "purple"
+    }
+  }
+
+  expect_failures = [data.aws_ssm_parameter.authority_active_color]
+}
+
+run "pointer_gate_without_the_hold_fails_closed" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_blue_green_alias_hold_enabled = false
+    authority_selector_ssm_pointer_enabled  = true
+  }
+
+  # A valid pointer value, so the read postcondition passes and the guard
+  # under test -- pointer requires the hold -- is the failure that fires.
+  override_data {
+    target          = data.aws_ssm_parameter.authority_active_color[0]
+    override_during = plan
+    values = {
+      value = "blue"
+    }
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "agreeing_pointer_is_the_steady_state" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled     = true
+    authority_blue_green_alias_hold_enabled = true
+    authority_selector_ssm_pointer_enabled  = true
+  }
+
+  # The expected state right after the pointer gate flips: the SSM value
+  # agrees with the committed contract, so the effective selector -- and
+  # every rendering behind it -- is unchanged from the contract-driven world.
+  override_data {
+    target          = data.aws_ssm_parameter.authority_active_color[0]
+    override_during = plan
+    values = {
+      value = "blue"
+    }
+  }
+
+  assert {
+    condition = (
+      local.authority_runtime_selected_color == "blue" &&
+      alltrue([
+        for pc in values(aws_lambda_provisioned_concurrency_config.authority) :
+        pc.qualifier == "blue"
+      ]) &&
+      alltrue([
+        for operation, arn in local.authority_selected_alias_targets.hub :
+        endswith(arn, ":blue")
+      ])
+    )
+    error_message = "An agreeing pointer must reproduce the contract-driven rendering exactly."
+  }
+}

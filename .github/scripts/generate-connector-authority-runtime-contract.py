@@ -524,6 +524,7 @@ def generated_input(
     proof_policy_selected_color: str | None = None,
     proof_policy_prepared_color: str | None = None,
     blue_green_alias_hold_enabled: bool = False,
+    selector_ssm_pointer_enabled: bool = False,
 ) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     if proof_mutation_controls_enabled:
@@ -612,6 +613,15 @@ def generated_input(
                 "functions to be enabled"
             )
         payload["authority_blue_green_alias_hold_enabled"] = True
+    # Seventh, the SSM switch pointer: the module reads the serving colour
+    # from its parameter instead of the committed contract. Staged after the
+    # parameter exists; a pointer without the hold has nothing to switch.
+    if selector_ssm_pointer_enabled:
+        if not blue_green_alias_hold_enabled:
+            fail(
+                "the SSM selector pointer requires the blue/green alias hold"
+            )
+        payload["authority_selector_ssm_pointer_enabled"] = True
     rollout_colors = (proof_policy_selected_color, proof_policy_prepared_color)
     if any(color is not None for color in rollout_colors):
         if not all(color in {"blue", "green"} for color in rollout_colors):
@@ -716,6 +726,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--selector-ssm-pointer-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Read the blue/green switch pointer from its SSM parameter instead "
+            "of the committed contract. Requires --blue-green-alias-hold-enabled."
+        ),
+    )
+    parser.add_argument(
         "--proof-policy-selected-color",
         choices=("blue", "green"),
         help=(
@@ -750,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
                 hub_worker_enabled=args.hub_worker_enabled,
                 proof_mutation_controls_enabled=args.proof_mutation_controls_enabled,
                 blue_green_alias_hold_enabled=args.blue_green_alias_hold_enabled,
+                selector_ssm_pointer_enabled=args.selector_ssm_pointer_enabled,
                 proof_policy_consumers_staged=args.proof_policy_consumers_staged,
                 proof_policy_selected_color=args.proof_policy_selected_color,
                 proof_policy_prepared_color=args.proof_policy_prepared_color,

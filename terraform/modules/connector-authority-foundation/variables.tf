@@ -468,6 +468,23 @@ variable "tags" {
   default     = {}
 }
 
+variable "authority_selector_ssm_pointer_enabled" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Reads the Authority blue/green switch pointer from its SSM parameter
+    instead of the committed contract. Dark by default.
+
+    Staged AFTER the parameter exists (the alias-hold pattern): the first
+    apply creates aws_ssm_parameter.authority_active_color seeded with the
+    contract's selected colour; only then may this gate flip, at which point
+    the deploy pipeline owns the pointer and a cutover is an SSM write plus
+    the resulting reviewed selector-flip plan -- the compute module's
+    active-color idiom, applied to the Authority runtime. Requires the
+    blue/green alias hold: a pointer without the hold has nothing to switch.
+  EOT
+}
+
 variable "authority_blue_green_alias_hold_enabled" {
   type        = bool
   default     = false

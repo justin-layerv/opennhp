@@ -48,6 +48,7 @@ BOOLEAN_GATES = (
     # against the reviewed plan input, so inserting mid-list would break the
     # apply rather than the review.
     ("blue_green_alias_hold_enabled", "--blue-green-alias-hold-enabled"),
+    ("selector_ssm_pointer_enabled", "--selector-ssm-pointer-enabled"),
 )
 
 COLOR_GATES = (
@@ -75,6 +76,7 @@ TFVARS_KEYS = {
     "proof_policy_selected_color": "authority_proof_policy_selected_color",
     "proof_policy_prepared_color": "authority_proof_policy_prepared_color",
     "blue_green_alias_hold_enabled": "authority_blue_green_alias_hold_enabled",
+    "selector_ssm_pointer_enabled": "authority_selector_ssm_pointer_enabled",
 }
 
 
@@ -135,6 +137,14 @@ def validate(gates: dict[str, object]) -> None:
     if gates["blue_green_alias_hold_enabled"] and not gates["enable_runtime_functions"]:
         raise GateError(
             "the blue/green alias hold requires the Authority runtime functions gate"
+        )
+    # Mirrors the module precondition: a pointer without the hold has nothing
+    # to switch, and without the runtime there is no parameter to read.
+    if gates["selector_ssm_pointer_enabled"] and not (
+        gates["blue_green_alias_hold_enabled"] and gates["enable_runtime_functions"]
+    ):
+        raise GateError(
+            "the SSM selector pointer requires the blue/green alias hold and the runtime gate"
         )
     selected = gates["proof_policy_selected_color"]
     prepared = gates["proof_policy_prepared_color"]
@@ -216,6 +226,7 @@ def check_inputs(gates: dict[str, object], args: argparse.Namespace) -> None:
         "proof_policy_selected_color": args.proof_policy_selected_color,
         "proof_policy_prepared_color": args.proof_policy_prepared_color,
         "blue_green_alias_hold_enabled": args.blue_green_alias_hold_enabled,
+        "selector_ssm_pointer_enabled": args.selector_ssm_pointer_enabled,
     }
     differences = []
     for name, value in supplied.items():

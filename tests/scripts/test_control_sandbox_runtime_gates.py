@@ -43,6 +43,9 @@ LIVE = {
     # Live: the rollout window is closed and the hold keeps the selected
     # colour on the version it serves; standby tracks each new publish.
     "blue_green_alias_hold_enabled": True,
+    # Dark until the pointer parameter exists; flipping it is the staged
+    # second apply of the SSM switch-pointer rollout.
+    "selector_ssm_pointer_enabled": False,
 }
 
 
@@ -323,6 +326,47 @@ class DependencyRules(unittest.TestCase):
         enabled_tokens = enabled.stdout.split()
         self.assertIn(flag, enabled_tokens)
         self.assertEqual([t for t in enabled_tokens if t != flag], base.stdout.split())
+
+    def test_selector_pointer_requires_the_hold(self) -> None:
+        """The pointer gate mirrors the module precondition: no hold, nothing
+        to switch. validate() must refuse at gate-load."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run(
+                "flags",
+                gates=write_gates(
+                    Path(tmp),
+                    selector_ssm_pointer_enabled=True,
+                    blue_green_alias_hold_enabled=False,
+                ),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("SSM selector pointer requires", result.stderr)
+
+    def test_selector_pointer_flag_appends_without_reordering(self) -> None:
+        """Same byte-compare rule as the hold flag: appended, never inserted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = run("flags", gates=write_gates(Path(tmp)))
+            enabled = run(
+                "flags",
+                gates=write_gates(Path(tmp), selector_ssm_pointer_enabled=True),
+            )
+        self.assertEqual(base.returncode, 0)
+        self.assertEqual(enabled.returncode, 0)
+        flag = "--selector-ssm-pointer-enabled"
+        enabled_tokens = enabled.stdout.split()
+        self.assertIn(flag, enabled_tokens)
+        self.assertEqual(
+            [t for t in enabled_tokens if t != flag], base.stdout.split()
+        )
+
+    def test_check_rejects_a_disagreeing_selector_pointer_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gates = write_gates(Path(tmp))
+            result = run(
+                *check_args(selector_ssm_pointer_enabled="true"), gates=gates
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("selector_ssm_pointer_enabled", result.stderr)
 
     def test_staged_consumers_require_proof_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

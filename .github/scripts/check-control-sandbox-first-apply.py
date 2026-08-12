@@ -642,6 +642,12 @@ for _fn in AUTHORITY_RUNTIME_FUNCTIONS:
         f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
     ] = "aws_cloudwatch_metric_alarm"
 AUTHORITY_RUNTIME_RESOURCES[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS] = "aws_security_group"
+# The blue/green switch pointer parameter counts in with the runtime (its
+# count gates on the same deploy local); the gated live READ is a data source
+# and inventories separately.
+AUTHORITY_RUNTIME_RESOURCES[
+    "module.control.aws_ssm_parameter.authority_active_color[0]"
+] = "aws_ssm_parameter"
 AUTHORITY_RUNTIME_RESOURCES[
     "module.control.aws_vpc_security_group_egress_rule.authority_interface_endpoints[0]"
 ] = "aws_vpc_security_group_egress_rule"
@@ -1494,6 +1500,19 @@ AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
         "aws_lambda_alias",
         "aws",
     ),
+    # The blue/green switch pointer (repo active-color idiom) and its gated
+    # live read. Both declared unconditionally; the parameter counts in with
+    # the runtime and the read stays empty until the pointer gate flips.
+    "module.control.aws_ssm_parameter.authority_active_color": (
+        "managed",
+        "aws_ssm_parameter",
+        "aws",
+    ),
+    "module.control.data.aws_ssm_parameter.authority_active_color": (
+        "data",
+        "aws_ssm_parameter",
+        "aws",
+    ),
     "module.control.aws_lambda_function.authority": (
         "managed",
         "aws_lambda_function",
@@ -2168,6 +2187,26 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
             "aws_ecr_repository.authority.name",
             "aws_ecr_repository.authority",
         ],
+    },
+    # The blue/green switch pointer. The READ feeds the module's effective
+    # selector -- alias targets, PC qualifiers, the Hub environment -- so its
+    # name must stay the known local (never an attacker-influencable value)
+    # and its gate must stay the reviewed pointer flag. The parameter's own
+    # value is the committed contract's colour at create and CI-owned after.
+    "module.control.aws_ssm_parameter.authority_active_color": {
+        ("count",): ["local.authority_runtime_functions_deploy"],
+        ("name",): ["local.authority_active_color_parameter_name"],
+        ("value",): [
+            "var.authority_runtime_contract.selected_authority_color",
+            "var.authority_runtime_contract",
+        ],
+    },
+    "module.control.data.aws_ssm_parameter.authority_active_color": {
+        ("count",): [
+            "var.authority_selector_ssm_pointer_enabled",
+            "local.authority_runtime_functions_deploy",
+        ],
+        ("name",): ["local.authority_active_color_parameter_name"],
     },
     "module.control.aws_vpc.control": {
         ("cidr_block",): ["var.vpc_cidr"],
@@ -10122,6 +10161,87 @@ AUTHORITY_EXHAUSTION_ALARM_TEMPLATE = (
     '["{fn}:concurrency_exhaustion"]'
 )
 
+AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS = (
+    "module.control.aws_ssm_parameter.authority_active_color[0]"
+)
+AUTHORITY_ACTIVE_COLOR_PARAMETER_NAME = "/sandbox/nhp/control/authority/active-color"
+
+
+def _claim_authority_selector_pointer_create(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """One-time creation of the blue/green switch pointer parameter.
+
+    The parameter is the repo-idiom active-color pointer (CI owns every value
+    after creation; Terraform ignores value drift), seeded with exactly the
+    bound contract's selected colour -- so the moment it is born it agrees
+    with the selector every colour-bearing rendering already uses. Anything
+    else -- another name, a non-String type, a seed that disagrees with the
+    contract -- is not this transition.
+
+    COMPOSITION-ONLY by design: standing alone, the create is a runtime-slice
+    resource appearing with the contract already bound, which the legacy
+    expansion branch classifies and _require_create_shapes validates (the
+    config-reference contract pins the seed to the contract's colour). This
+    claim exists for the create riding another lane -- a publish's standby
+    alias advance in the same push -- where the exact-set expansion shape
+    cannot fire and composition's union would otherwise leave it unclaimed.
+    """
+    address = AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS
+    if address not in changed or actual_non_noop.get(address) != ["create"]:
+        return frozenset()
+    after = (by_address.get(address, {}).get("change", {}) or {}).get("after")
+    if not isinstance(after, dict):
+        return frozenset()
+    payload = (
+        (
+            by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}).get(
+                "change", {}
+            )
+            or {}
+        ).get("after")
+        or {}
+    ).get("input") or {}
+    try:
+        selected = _selected_authority_color_from_contract(payload)
+    except ContractError:
+        return frozenset()
+    if (
+        after.get("name") != AUTHORITY_ACTIVE_COLOR_PARAMETER_NAME
+        or after.get("type") != "String"
+        or after.get("value") != selected
+        or after.get("tier") not in (None, "Standard")
+    ):
+        return frozenset()
+    return frozenset({address})
+
+
+def _validate_authority_selector_pointer_create(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    address = AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS
+    if set(claimed) != {address}:
+        raise ContractError(
+            "the pointer-create claim owns exactly the active-color parameter"
+        )
+    changed = {address}
+    if not _claim_authority_selector_pointer_create(
+        changed,
+        {address: (by_address.get(address, {}).get("change", {}) or {}).get(
+            "actions"
+        )},
+        by_address,
+    ):
+        raise ContractError(
+            "the active-color parameter create must be the reviewed pointer "
+            "seed: the exact name, String type, and the bound contract's "
+            "selected colour"
+        )
+
 
 def _hub_service_steady_state_wait_only(by_address: dict[str, Any]) -> bool:
     """True when the Hub service update is exactly wait_for_steady_state
@@ -10396,6 +10516,11 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-reserved-envelope-widen",
         _claim_authority_reserved_envelope_widen,
         _validate_authority_reserved_envelope_widen,
+    ),
+    (
+        "authority-selector-pointer-create",
+        _claim_authority_selector_pointer_create,
+        _validate_authority_selector_pointer_create,
     ),
     (
         "authority-steady-pc-completion",

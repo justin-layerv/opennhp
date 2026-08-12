@@ -36,7 +36,30 @@ locals {
     if contains(local.authority_actual_function_names, function_name)
   } : {}
 
-  authority_runtime_selected_color = local.authority_runtime_functions_deploy ? var.authority_runtime_contract.selected_authority_color : null
+  # The effective selector: the live SSM pointer once the pointer gate is on
+  # (repo blue/green idiom -- CI owns movement, Terraform owns structure, the
+  # same shape as modules/compute's active-color parameter), otherwise the
+  # committed contract's value. The contract's selected_authority_color
+  # becomes the pointer's INITIAL value only; every colour-bearing rendering
+  # (alias targets, PC qualifier, Hub env, hold direction) derives from this
+  # local, and the foundation contract records it, so a pointer move presents
+  # as the reviewed authority-selector-flip plan shape.
+  authority_runtime_effective_selected_color = (
+    local.authority_runtime_contract_enabled
+    ? (
+      var.authority_selector_ssm_pointer_enabled && local.authority_runtime_functions_deploy
+      # nonsensitive(): the provider marks every SSM parameter value sensitive,
+      # but this one is a public colour name -- leaving the taint would cascade
+      # through alias targets and the Hub environment into module outputs and
+      # fail the plan ("Output refers to sensitive values"). The precondition
+      # on the foundation contract still pins it to exactly blue/green.
+      ? nonsensitive(data.aws_ssm_parameter.authority_active_color[0].value)
+      : var.authority_runtime_contract.selected_authority_color
+    )
+    : null
+  )
+
+  authority_runtime_selected_color = local.authority_runtime_functions_deploy ? local.authority_runtime_effective_selected_color : null
 
   authority_proof_policy_consumer_functions = {
     for function_name, fn in local.authority_runtime_functions :
@@ -57,12 +80,15 @@ locals {
     ? var.authority_proof_policy_selected_color
     : (
       local.authority_runtime_contract_enabled
-      ? var.authority_runtime_contract.selected_authority_color
+      ? local.authority_runtime_effective_selected_color
       : "blue"
     )
   )
   authority_proof_policy_standby_color = (
-    try(var.authority_runtime_contract.selected_authority_color == "blue", true)
+    (
+      local.authority_runtime_effective_selected_color == null ||
+      local.authority_runtime_effective_selected_color == "blue"
+    )
     ? "green"
     : "blue"
   )
@@ -1142,6 +1168,60 @@ resource "aws_lambda_function" "authority" {
     Name      = each.key
     Operation = each.value.operation
   })
+}
+
+# The blue/green switch pointer (repo idiom: modules/compute's active-color).
+# Terraform owns the parameter and its INITIAL value (the committed contract's
+# selected colour); the deploy pipeline owns every later value, which is why
+# Terraform ignores value drift. The pointer gate below decides whether the
+# module READS it; until then the committed contract remains the selector and
+# this parameter is a passive record.
+resource "aws_ssm_parameter" "authority_active_color" {
+  count = local.authority_runtime_functions_deploy ? 1 : 0
+
+  name        = local.authority_active_color_parameter_name
+  description = "Serving Authority colour (blue/green switch pointer); CI-owned after creation"
+  type        = "String"
+  value       = var.authority_runtime_contract.selected_authority_color
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-authority-active-color"
+    Component = "connector-authority"
+    Purpose   = "Authority blue/green switch pointer"
+  })
+
+  lifecycle {
+    # The deploy pipeline flips this on promotion; an apply must never revert
+    # a cutover that happened after the last plan.
+    ignore_changes = [value]
+  }
+}
+
+# The live pointer read. Gated separately from the parameter's creation so the
+# first apply that creates the parameter cannot also depend on reading it (a
+# same-config read-after-create would defer every colour-bearing rendering to
+# apply time). The gate flips only after the parameter exists -- the staged
+# two-apply pattern the alias hold used. The foundation contract precondition
+# rejects any read value outside blue/green, so a corrupted pointer fails the
+# plan closed instead of rendering a nonsense colour.
+data "aws_ssm_parameter" "authority_active_color" {
+  count = (
+    var.authority_selector_ssm_pointer_enabled && local.authority_runtime_functions_deploy
+  ) ? 1 : 0
+
+  name = local.authority_active_color_parameter_name
+
+  lifecycle {
+    postcondition {
+      # Validated AT THE READ, before any colour-bearing expression renders:
+      # a corrupted pointer would otherwise surface as a raw invalid-index on
+      # the alias map instead of an actionable message. The foundation
+      # contract precondition re-checks the effective colour as defense in
+      # depth.
+      condition     = contains(["blue", "green"], self.value)
+      error_message = "The Authority active-color pointer must be exactly blue or green; fix the SSM parameter value."
+    }
+  }
 }
 
 # Live alias versions for the blue/green hold. Empty while the gate is dark, so

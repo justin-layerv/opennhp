@@ -2218,6 +2218,23 @@ def _runtime_resource_changes() -> list[dict]:
     image_uri = payload["authority_image_uri"]
     functions = payload["authority_runtime_contract"]["functions"]
     changes: list[dict] = _authority_alarm_changes(functions)
+    changes.append(
+        {
+            "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+            "mode": "managed",
+            "type": "aws_ssm_parameter",
+            "change": _runtime_create(
+                {
+                    "name": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_NAME,
+                    "type": "String",
+                    "value": payload["authority_runtime_contract"][
+                        "selected_authority_color"
+                    ],
+                    "tier": "Standard",
+                }
+            ),
+        }
+    )
     for fn, spec in functions.items():
         changes.append(
             {
@@ -15093,6 +15110,72 @@ class ComposedTransitionTest(unittest.TestCase):
             CHECKER._claim_authority_image_roll(changed, acts, by), frozenset()
         )
 
+    def pointer_create_plan(self) -> dict:
+        """The steady inventory with the switch-pointer parameter appearing:
+        the B1 shape (module change merged, gate dark, one create)."""
+        plan = authority_runtime_steady_fixture()
+        plan["applyable"] = True
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        change = changes[CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS]
+        change["actions"] = ["create"]
+        change["before"] = None
+        return plan
+
+    def test_pointer_create_classifies_as_the_legacy_expansion(self) -> None:
+        """Standing alone, the pointer create is a runtime resource appearing
+        with the contract already bound -- the expansion branch owns it, and
+        the config-reference contract pins its seed to the contract colour."""
+        summary = CHECKER.check_plan(self.pointer_create_plan())
+        self.assertEqual(
+            summary["plan_mode"], "authority-runtime-legacy-expansion"
+        )
+
+    def test_pointer_create_claim_admits_the_exact_seed(self) -> None:
+        plan = self.pointer_create_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_pointer_create(changed, acts, by),
+            frozenset({CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS}),
+        )
+
+    def test_pointer_create_claim_refuses_a_disagreeing_seed(self) -> None:
+        """A seed that disagrees with the bound contract's selected colour is
+        not the reviewed transition."""
+        plan = self.pointer_create_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        by[CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS]["change"]["after"][
+            "value"
+        ] = "green"
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_pointer_create(changed, acts, by),
+            frozenset(),
+        )
+
+    def test_pointer_create_claim_refuses_a_foreign_name(self) -> None:
+        plan = self.pointer_create_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        by[CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS]["change"]["after"][
+            "name"
+        ] = "/sandbox/nhp/somewhere/else"
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_pointer_create(changed, acts, by),
+            frozenset(),
+        )
+
     def test_flip_projection_drift_admits_either_direction(self) -> None:
         """hub_task projection drift is accepted for a green->blue flip too."""
         import json as _json
@@ -15156,6 +15239,11 @@ class ComposedTransitionTest(unittest.TestCase):
                 # so both colours' pools fit inside it, with the exhaustion
                 # alarm thresholds following.
                 "authority-reserved-envelope-widen",
+                # The switch-pointer parameter's one-time creation as a
+                # composable rider (standing alone, the legacy-expansion
+                # branch classifies it): a publish's standby alias advance in
+                # the same push would otherwise leave the create unclaimed.
+                "authority-selector-pointer-create",
             },
         )
 

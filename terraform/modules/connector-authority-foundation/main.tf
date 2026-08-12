@@ -16,6 +16,7 @@ locals {
   authority_image_digest_parameter_name = "/${var.environment}/nhp/control/connector-authority/image-digest"
   hub_ecr_repository_name               = "layerv/nhp-hub"
   hub_image_digest_parameter_name       = "/${var.environment}/nhp/control/hub/image-digest"
+  authority_active_color_parameter_name = "/${var.environment}/nhp/control/authority/active-color"
   hub_public_key_parameter_name         = "/${var.environment}/nhp/control/hub/identity/public-key"
 
   common_tags = merge(var.tags, {
@@ -38,8 +39,16 @@ resource "terraform_data" "foundation_contract" {
     jsondecode(
       local.authority_runtime_contract_enabled
       ? jsonencode({
-        authority_image_uri        = local.authority_runtime_image_uri
-        authority_runtime_contract = var.authority_runtime_contract
+        authority_image_uri = local.authority_runtime_image_uri
+        # The contract is recorded with the EFFECTIVE selector (the live SSM
+        # pointer once the pointer gate is on) so a pointer move presents as
+        # this resource's reviewed before/after -- the same flip shape the
+        # plan checker already validates -- rather than as an invisible
+        # data-source read. With the gate off this merge is the identity.
+        authority_runtime_contract = merge(
+          var.authority_runtime_contract,
+          { selected_authority_color = local.authority_runtime_effective_selected_color },
+        )
       })
       : "{}"
     ),
@@ -56,6 +65,25 @@ resource "terraform_data" "foundation_contract" {
     precondition {
       condition     = data.aws_caller_identity.current.account_id == var.aws_account_id
       error_message = "Connector Authority foundation is targeting the wrong AWS account."
+    }
+
+    precondition {
+      condition = (
+        !var.authority_selector_ssm_pointer_enabled ||
+        (var.authority_blue_green_alias_hold_enabled && local.authority_runtime_functions_deploy)
+      )
+      error_message = "The SSM selector pointer requires the blue/green alias hold and a deployed Authority runtime."
+    }
+
+    precondition {
+      # A corrupted pointer value (anything but the two closed colours) must
+      # fail the plan, not render a nonsense colour into alias targets, PC
+      # qualifiers, and the Hub environment.
+      condition = (
+        !local.authority_runtime_contract_enabled ||
+        contains(["blue", "green"], local.authority_runtime_effective_selected_color)
+      )
+      error_message = "The effective Authority selector (SSM pointer included) must be exactly blue or green."
     }
 
     precondition {

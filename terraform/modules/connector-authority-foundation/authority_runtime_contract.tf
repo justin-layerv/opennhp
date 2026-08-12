@@ -687,7 +687,11 @@ locals {
       var.authority_proof_mutation_controls_enabled &&
       var.authority_runtime_functions_enabled &&
       var.hub_worker_enabled &&
-      var.authority_runtime_contract.selected_authority_color == "blue" &&
+      # The EFFECTIVE selector (review #3857): every other colour-bearing
+      # rendering derives from it, and a fence reading the committed value
+      # here could silently disagree with a live pointer. Identical while the
+      # pointer gate is dark.
+      local.authority_runtime_effective_selected_color == "blue" &&
       length(local.authority_proof_policy_consumer_functions) == 3 &&
       length(local.authority_proof_policy_rollout_functions) == 4 &&
       alltrue([
@@ -735,7 +739,7 @@ locals {
       for cell_id, expected_names in local.authority_expected_cell_names :
       cell_id => {
         for function_name in expected_names :
-        local.authority_expected_functions[function_name].operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${var.authority_runtime_contract.selected_authority_color}"
+        local.authority_expected_functions[function_name].operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${local.authority_runtime_effective_selected_color}"
         if contains(local.authority_actual_function_names, function_name)
       }
     }
@@ -745,7 +749,7 @@ locals {
     # even though it lives in the same derivation.
     proof = {
       for function_name, spec in local.authority_expected_proof_functions :
-      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${spec.operation == "mutate_proof_agent" ? local.authority_proof_policy_effective_color : var.authority_runtime_contract.selected_authority_color}"
+      spec.operation => "arn:${local.authority_contract_global.aws_partition}:lambda:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:function:${function_name}:${spec.operation == "mutate_proof_agent" ? local.authority_proof_policy_effective_color : local.authority_runtime_effective_selected_color}"
       if contains(local.authority_actual_function_names, function_name)
     }
   }

@@ -247,6 +247,12 @@ variable "authority_proof_mutation_controller_role_arns" {
   default     = []
 }
 
+variable "authority_selector_ssm_pointer_enabled" {
+  description = "Read the Authority blue/green switch pointer from SSM instead of the committed contract. Staged after the pointer parameter exists; requires the alias hold."
+  type        = bool
+  default     = false
+}
+
 variable "authority_blue_green_alias_hold_enabled" {
   type        = bool
   default     = false
