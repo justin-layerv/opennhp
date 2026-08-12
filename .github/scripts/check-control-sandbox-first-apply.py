@@ -11831,6 +11831,17 @@ def _check_state_normalization_drift(
         (
             address.startswith("module.control.aws_lambda_alias.authority[")
             or address.startswith("module.control.aws_lambda_function.authority[")
+            # The blue/green switch pointer. The deploy pipeline WRITES this
+            # parameter on every promotion and Terraform ignores its value, so
+            # its drift is inherent and -- because state keeps the seed value
+            # forever -- PERMANENT after the first promotion. It shares this
+            # kind's exact confinement (planned no-op, nothing pending), and
+            # admitting the re-read grants nothing: this clause deliberately
+            # does NOT validate the drifted value itself -- the value only
+            # enters the plan through the gated data source, whose
+            # postcondition pins it to exactly blue/green, so a nonsense
+            # pointer is admitted here and the PLAN then fails closed there.
+            or address == AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS
         )
         and item.get("change", {}).get("actions") == ["update"]
         and by_address.get(address, {}).get("change", {}).get("actions")

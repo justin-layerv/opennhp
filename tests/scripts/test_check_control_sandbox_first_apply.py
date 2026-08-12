@@ -15176,6 +15176,55 @@ class ComposedTransitionTest(unittest.TestCase):
             frozenset(),
         )
 
+    def test_pointer_value_drift_is_the_permanent_refresh_kind(self) -> None:
+        """The deploy pipeline writes the pointer on every promotion and state
+        keeps the seed forever, so this drift rides every subsequent plan --
+        including the promotion's own flip plan (run 31641110788 was refused
+        exactly here) and every steady no-op after it. It classifies with the
+        alias-refresh kind, which is deliberately not plan-mode-gated."""
+        item = {
+            "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+            "change": {
+                "actions": ["update"],
+                "before": {"value": "blue"},
+                "after": {"value": "green"},
+            },
+        }
+        by = {
+            CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS: {
+                "change": {"actions": ["no-op"]}
+            }
+        }
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift(
+                [item], by, refresh_only=False
+            ),
+            "authority-alias-refresh",
+        )
+
+    def test_pointer_drift_with_a_pending_change_stays_strict(self) -> None:
+        """A drifted pointer whose plan is NOT a no-op is not the benign
+        re-read; it must fall through to the stricter matchers."""
+        item = {
+            "address": CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS,
+            "change": {
+                "actions": ["update"],
+                "before": {"value": "blue"},
+                "after": {"value": "green"},
+            },
+        }
+        by = {
+            CHECKER.AUTHORITY_ACTIVE_COLOR_PARAMETER_ADDRESS: {
+                "change": {"actions": ["update"]}
+            }
+        }
+        self.assertNotEqual(
+            CHECKER._check_state_normalization_drift(
+                [item], by, refresh_only=False
+            ),
+            "authority-alias-refresh",
+        )
+
     def test_flip_projection_drift_admits_either_direction(self) -> None:
         """hub_task projection drift is accepted for a green->blue flip too."""
         import json as _json
