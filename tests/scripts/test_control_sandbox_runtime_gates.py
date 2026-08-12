@@ -37,7 +37,7 @@ LIVE = {
     "hub_edge_enabled": True,
     "hub_worker_enabled": True,
     "proof_mutation_controls_enabled": True,
-    "proof_policy_consumers_staged": True,
+    "proof_policy_consumers_staged": False,
     "proof_policy_selected_color": "none",
     "proof_policy_prepared_color": "none",
     # Live: the rollout window is closed and the hold keeps the selected
@@ -136,10 +136,8 @@ class FlagEmission(unittest.TestCase):
                 "--hub-edge-enabled",
                 "--hub-worker-enabled",
                 "--proof-mutation-controls-enabled",
-                "--proof-policy-consumers-staged",
-                # Booleans emit before colours: emit_flags walks BOOLEAN_GATES
-                # (where the hold is appended last) and then COLOR_GATES.
-                # The rollout window is closed: no colour flags are emitted.
+                # Consumer staging retired and the window closed: neither the
+                # staging flag nor the colour flags are emitted.
                 "--blue-green-alias-hold-enabled",
             ],
         )
@@ -332,7 +330,12 @@ class DependencyRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = run(
                 "flags",
-                gates=write_gates(Path(tmp), proof_mutation_controls_enabled=False),
+                gates=write_gates(
+                    Path(tmp),
+                    # LIVE is dark on both; state the divergent pair explicitly.
+                    proof_policy_consumers_staged=True,
+                    proof_mutation_controls_enabled=False,
+                ),
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("attended-proof mutation control", result.stderr)
@@ -379,9 +382,9 @@ class TfvarsReceipt(unittest.TestCase):
         "authority_runtime_functions_enabled": True,
         "hub_edge_enabled": True,
         "hub_worker_enabled": True,
+
         "authority_proof_mutation_controls_enabled": True,
-        "authority_proof_policy_consumers_staged": True,
-        # Window closed: the generator emits no colour keys.
+        # Consumer staging retired; window closed: neither key is emitted.
         "authority_blue_green_alias_hold_enabled": True,
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},

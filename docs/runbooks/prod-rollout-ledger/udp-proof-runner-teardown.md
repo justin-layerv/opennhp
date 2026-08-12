@@ -119,7 +119,14 @@ running them would not buy anything.
       `authority-proof-rollout-retirement` composed with the image roll; the
       strict `authority-proof-disable` transition remains for the later
       full-dark step (proof gate off, ca-pm/ca-pcr removed).
-- [ ] Dispatch the strict `authority-proof-disable` plan (step 4) and verify
+- [x] Teardown step 1 (nhp #3848): consumer staging off. IA/RA/ICR republish
+      without the proof env, exec policies drop the PROOF read, ca-pm's pending
+      steady capacity restores, and no alias moves (consumers stay pinned while
+      the gate is on). Measured 1 add / 7 change / 0 destroy at serial 112.
+- [ ] Teardown step 2: flip `proof_mutation_controls_enabled` off -- the strict
+      `authority-proof-disable` shape (ca-pm/ca-pcr graphs deleted; the
+      foundation fence's new disable flag admits exactly that pair and nothing
+      else). Then verify state/live lanes and the refresh-enabled dark no-op
       (step 5). This subsumes retiring the rollout selector — measured below,
       it is not a separate step.
 - [ ] Delete the code once live state is dark.

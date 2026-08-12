@@ -8134,13 +8134,20 @@ def _authority_proof_consumer_transition_addresses(
     if (
         enabled.get("authority_proof_policy_consumers_staged") is not True
         or disabled.get("authority_proof_policy_consumers_staged") not in (None, False)
-        or not _require_authority_runtime_binding(
-            {"input": enabled}, proof_enabled=True
-        )
-        or not _require_authority_runtime_binding(
-            {"input": disabled}, proof_enabled=True
-        )
     ):
+        return None
+    # A RECOGNIZER, not a validator: a plan whose graph does not bind as a
+    # consumer transition (e.g. the full proof teardown, whose after-graph has
+    # no proof functions at all) is simply not this transition. Raising here
+    # would veto every later branch in check_plan's chain.
+    try:
+        if not _require_authority_runtime_binding(
+            {"input": enabled}, proof_enabled=True
+        ) or not _require_authority_runtime_binding(
+            {"input": disabled}, proof_enabled=True
+        ):
+            return None
+    except ContractError:
         return None
     stripped = copy.deepcopy(enabled)
     stripped.pop("authority_proof_policy_consumers_staged", None)
@@ -8781,6 +8788,13 @@ def _claim_authority_hub_exec_policy_update(
     and pinning only the hub subset made every later plan unadmittable while the
     shape was identical.
     """
+    # The consumer-staging rollback owns its exec-policy updates; two claims on
+    # one address would fail composition's disjointness.
+    if _authority_proof_consumer_transition_addresses(
+        by_address, enabling=False
+    ) is not None:
+        return frozenset()
+
     staged = _claim_authority_proof_consumer_staging(changed, actual_non_noop, by_address)
     claimed = {
         address
@@ -8948,6 +8962,13 @@ def _claim_authority_proof_consumer_staging(
     set that resolver proves belongs to a staging (or rollback) move -- never a
     hand-rolled address guess.
     """
+    # The rollback direction owns this shape when it matches; two claims on the
+    # consumer addresses would fail composition's disjointness.
+    if _authority_proof_consumer_transition_addresses(
+        by_address, enabling=False
+    ) is not None:
+        return frozenset()
+
     for enabling in (True, False):
         try:
             addresses = _authority_proof_consumer_transition_addresses(
@@ -9109,6 +9130,16 @@ def _claim_authority_image_uri_move(
     Deliberately narrow: if anything else in the contract moved, this is not the
     lane and the enumerated migration paths still own it.
     """
+    # A consumer-staging transition owns the contract change (the staging key
+    # coming or going is precisely what it validates); this lane's validator
+    # would read that same key move as an unrelated field.
+    if _authority_proof_consumer_transition_addresses(
+        by_address, enabling=False
+    ) is not None or _authority_proof_consumer_transition_addresses(
+        by_address, enabling=True
+    ) is not None:
+        return frozenset()
+
     # Stand down while the proof rollout window is closing. The contract change
     # is then not an image-URI move at all -- it also drops both selector
     # colours -- and this lane's validator would correctly call that an
@@ -9270,6 +9301,17 @@ def _claim_authority_image_roll(
        ever omits an untouched resource. `_plan_resource_changes` preserving
        no-ops is pinned by test, but that pins the helper, not Terraform.
     """
+    # A consumer-staging transition owns its own republishes: the function
+    # change is the proof env coming or going, not an image move, and its
+    # validator checks that exactly. Two claims on one address would fail
+    # composition's disjointness.
+    if _authority_proof_consumer_transition_addresses(
+        by_address, enabling=False
+    ) is not None or _authority_proof_consumer_transition_addresses(
+        by_address, enabling=True
+    ) is not None:
+        return frozenset()
+
     functions = {a for a in changed if a.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX)}
     aliases = {a for a in changed if a.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX)}
     if not functions:
@@ -9680,6 +9722,67 @@ def _validate_authority_proof_rollout_retirement(
             )
 
 
+def _claim_authority_proof_consumer_disable(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """Claim the consumer-staging rollback so it can compose.
+
+    The elif chain's exclusive form still exists for the standalone plan; this
+    claim admits the same exact shape when something else (today: the pending
+    steady-PC completion create) legitimately rides along.
+    """
+    addresses = _authority_proof_consumer_transition_addresses(
+        by_address, enabling=False
+    )
+    if addresses is None:
+        return frozenset()
+    claimed = set(addresses) & changed
+    if claimed != set(addresses):
+        return frozenset()
+    if any(actual_non_noop.get(a) != ["update"] for a in claimed):
+        return frozenset()
+    return frozenset(claimed)
+
+
+def _validate_authority_proof_consumer_disable(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    _check_authority_proof_consumer_transition(by_address, enabling=False)
+
+
+def _claim_authority_steady_pc_completion(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """The elif lane's shape as a composable claim (creates only)."""
+    creates = {
+        a
+        for a in changed
+        if a.startswith(AUTHORITY_STEADY_PC_PREFIX)
+        and actual_non_noop.get(a) == ["create"]
+    }
+    if not creates:
+        return frozenset()
+    try:
+        _check_authority_steady_pc_completion(creates, by_address)
+    except ContractError:
+        return frozenset()
+    return frozenset(creates)
+
+
+def _validate_authority_steady_pc_completion_claim(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    _check_authority_steady_pc_completion(set(claimed), by_address)
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
     (
         "authority-proof-rollout-retirement",
@@ -9690,6 +9793,16 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-image-roll",
         _claim_authority_image_roll,
         _validate_authority_image_roll,
+    ),
+    (
+        "authority-proof-consumers-disable",
+        _claim_authority_proof_consumer_disable,
+        _validate_authority_proof_consumer_disable,
+    ),
+    (
+        "authority-steady-pc-completion",
+        _claim_authority_steady_pc_completion,
+        _validate_authority_steady_pc_completion_claim,
     ),
     (
         "authority-image-uri-move",
@@ -13023,9 +13136,19 @@ def check_plan(
     # exact type/delete validation, while deriving proof_mode from the target
     # state so the rollback can be checked against the dark security contract.
     proof_inventory_mode = bool(actual_inventory & proof_extra)
-    proof_mode = proof_inventory_mode and any(
-        isinstance(by_address[address].get("change", {}).get("after"), dict)
-        for address in actual_inventory & proof_extra
+    # Keyed on the defining resource, not on any(after) across the whole proof
+    # slice: with consumers staged, AUTHORITY_PROOF_RESOURCES includes the
+    # IA/RA/ICR function addresses, which survive a proof teardown as updates
+    # and would keep proof_mode true while the pair itself is being deleted.
+    proof_mode = proof_inventory_mode and isinstance(
+        by_address.get(
+            f'module.control.aws_lambda_function.authority'
+            f'["{AUTHORITY_PROOF_FUNCTION_NAME}"]',
+            {},
+        )
+        .get("change", {})
+        .get("after"),
+        dict,
     )
     proof_rollout_mode = bool(actual_inventory & proof_rollout_extra)
     hub_edge_mode = bool(actual_inventory & hub_edge_extra)
@@ -13052,6 +13175,28 @@ def check_plan(
     # is the planned action -- any other action on the address (a create, or a
     # real delete) falls straight back to the mismatch below. See
     # _claim_authority_proof_controller_orphan_forget.
+    # ca-pm's steady PC never provisioned (its create kept exceeding the
+    # lowered reserved budget), so a teardown of the proof pair legitimately
+    # finds the address absent from state. Tolerated ONLY while the pm function
+    # itself is planned delete -- any other plan still requires the exact
+    # inventory.
+    _pm_pc_address = (
+        'module.control.aws_lambda_provisioned_concurrency_config.authority'
+        '["layerv-nhp-sandbox-ca-pm"]'
+    )
+    _pm_function_delete = (
+        by_address.get(
+            'module.control.aws_lambda_function.authority'
+            '["layerv-nhp-sandbox-ca-pm"]',
+            {},
+        )
+        .get("change", {})
+        .get("actions")
+        == ["delete"]
+    )
+    if _pm_function_delete and _pm_pc_address not in actual_inventory:
+        proof_extra = set(proof_extra) - {_pm_pc_address}
+
     _orphan_change = by_address.get(AUTHORITY_PROOF_CONTROLLER_POLICY_ADDRESS)
     _orphan_forget_pending = (
         isinstance(_orphan_change, dict)
@@ -13092,6 +13237,11 @@ def check_plan(
         expected_resources.update(AUTHORITY_RUNTIME_RESOURCES)
     if proof_inventory_mode:
         expected_resources.update(AUTHORITY_PROOF_RESOURCES)
+        if _pm_function_delete and _pm_pc_address not in by_address:
+            # Same predicate as the inventory tolerance above by construction:
+            # actual_inventory is literally set(by_address), so the two blocks
+            # can never diverge on membership.
+            expected_resources.pop(_pm_pc_address, None)
     if proof_rollout_mode:
         expected_resources.update(AUTHORITY_PROOF_ROLLOUT_RESOURCES)
     if hub_edge_mode:

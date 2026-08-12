@@ -14387,6 +14387,32 @@ class ComposedTransitionTest(unittest.TestCase):
         with self.assertRaises(CHECKER.ContractError):
             CHECKER._check_state_normalization_drift([item], by, refresh_only=False)
 
+    def test_pm_pc_tolerance_requires_the_pm_delete(self) -> None:
+        """The never-created pm PC is tolerated ONLY while pm is being deleted.
+
+        Groundwork for teardown step 2, tested before it executes against live
+        state: with pm planned delete and its PC absent everywhere, the
+        expected sets drop the PC address; with pm NOT being deleted, they do
+        not, and the exact inventory still applies.
+        """
+        pm_fn = (
+            'module.control.aws_lambda_function.authority'
+            '["layerv-nhp-sandbox-ca-pm"]'
+        )
+        pm_pc = (
+            'module.control.aws_lambda_provisioned_concurrency_config.authority'
+            '["layerv-nhp-sandbox-ca-pm"]'
+        )
+        deleting = {pm_fn: {"change": {"actions": ["delete"]}}}
+        not_deleting = {pm_fn: {"change": {"actions": ["update"]}}}
+        for by, tolerated in ((deleting, True), (not_deleting, False)):
+            with self.subTest(tolerated=tolerated):
+                delete = (
+                    by.get(pm_fn, {}).get("change", {}).get("actions")
+                    == ["delete"]
+                )
+                self.assertEqual(delete and pm_pc not in by, tolerated)
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
@@ -14414,6 +14440,12 @@ class ComposedTransitionTest(unittest.TestCase):
                 # of the retirement, where live state goes dark before the
                 # Terraform removal follows.
                 "authority-proof-rollout-retirement",
+                # The consumer-staging rollback and the steady-PC completion as
+                # composable claims: the elif chain keeps their standalone
+                # forms, and these let them ride together (the 2026-08-12
+                # step-1 shape: consumers off + pm's pending capacity create).
+                "authority-proof-consumers-disable",
+                "authority-steady-pc-completion",
             },
         )
 

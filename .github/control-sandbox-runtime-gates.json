@@ -36,7 +36,7 @@
   "hub_edge_enabled": true,
   "hub_worker_enabled": true,
   "proof_mutation_controls_enabled": true,
-  "proof_policy_consumers_staged": true,
+  "proof_policy_consumers_staged": false,
   "proof_policy_selected_color": "none",
   "proof_policy_prepared_color": "none",
   "blue_green_alias_hold_enabled": true

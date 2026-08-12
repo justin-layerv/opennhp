@@ -393,13 +393,48 @@ if [[ -n "$plan_json" ]]; then
     authority_proof_prepare_recovery_allowed=true
   fi
 
+  # The strict authority-proof-disable teardown: every destructive action must
+  # belong to the attended-proof pair (ca-pm / ca-pcr), and the foundation
+  # contract must drop the consumer-staging key in the same plan. Any delete
+  # outside the pair defeats the flag and falls to the refusal below.
+  authority_proof_disable_allowed=false
+  if jq -e '
+    ([
+      (.resource_changes[]?, .resource_drift[]?)
+      | select(.change.actions | index("delete"))
+      | .address
+    ] | length > 0)
+    and ([
+      (.resource_changes[]?, .resource_drift[]?)
+      | select(.change.actions | index("delete"))
+      | .address
+      | select(test("layerv-nhp-sandbox-ca-(pm|pcr)") | not)
+    ] | length == 0)
+    and ([
+      .resource_changes[]?
+      | select(.address == "module.control.terraform_data.foundation_contract")
+      # The definitional witness that the attended-proof pair is leaving: both
+      # its functions present in the contract graph before, both absent after.
+      # (Keying on the staging flag was wrong -- step 1 retires that key, so a
+      # sequenced step-2 plan never shows it dropping.)
+      | select(.change.before.input.authority_runtime_contract.functions
+          | has("layerv-nhp-sandbox-ca-pm") and has("layerv-nhp-sandbox-ca-pcr"))
+      | select(.change.after.input.authority_runtime_contract.functions
+          | (has("layerv-nhp-sandbox-ca-pm") or has("layerv-nhp-sandbox-ca-pcr")) | not)
+    ] | length == 1)
+  ' "$plan_json" >/dev/null; then
+    authority_proof_disable_allowed=true
+  fi
+
   destructive_resources="$(jq -r \
     --argjson hub_worker_image_update_allowed \
       "$hub_worker_image_update_allowed" \
     --argjson authority_proof_prepare_recovery_allowed \
       "$authority_proof_prepare_recovery_allowed" \
     --argjson authority_proof_rollout_retirement_allowed \
-      "$authority_proof_rollout_retirement_allowed" '
+      "$authority_proof_rollout_retirement_allowed" \
+    --argjson authority_proof_disable_allowed \
+      "$authority_proof_disable_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -445,6 +480,9 @@ if [[ -n "$plan_json" ]]; then
     | select(.change.actions | index("delete"))
     | select(
         ((
+          $authority_proof_disable_allowed
+          and (.address | test("layerv-nhp-sandbox-ca-(pm|pcr)"))
+        ) or (
           (.address | startswith("module.control.aws_lambda_function.authority["))
           and (
             (.change.actions == ["delete", "create"])
