@@ -14790,6 +14790,14 @@ def check_state_list(path: Path) -> dict[str, int]:
     catalog_present = bool(addresses & catalog_extra)
     runtime_present = bool(addresses & runtime_extra)
     proof_present = bool(addresses & proof_extra)
+    if not proof_present:
+        # The hold reads whatever aliases the graph HAS: with the attended-
+        # proof pair retired, its four data instances are gone with it.
+        blue_green_data_extra -= {
+            f'module.control.data.aws_lambda_alias.authority_live["{_fn}:{_color}"]'
+            for _fn in AUTHORITY_PROOF_FUNCTIONS
+            for _color in ("blue", "green")
+        }
     proof_alias_reads_present = bool(addresses & proof_consumer_data_extra)
     proof_rollout_alias_reads_present = bool(addresses & proof_rollout_data_extra)
     proof_rollout_present = bool(addresses & proof_rollout_extra)

@@ -14471,6 +14471,27 @@ class ComposedTransitionTest(unittest.TestCase):
             frozenset(),
         )
 
+    def test_retired_pair_slice_subtraction_matches_the_population_format(self) -> None:
+        """The 26 -> 22 arithmetic, format-locked (review on #3850).
+
+        The subtraction is a silent no-op if its f-string ever drifts from how
+        the slice constant is populated, so pin byte-for-byte membership: the
+        pair's four instances are IN the constant, the remainder is 22, and the
+        proof set is exactly the retired pair.
+        """
+        self.assertEqual(sorted(CHECKER.AUTHORITY_PROOF_FUNCTIONS), [
+            "layerv-nhp-sandbox-ca-pcr", "layerv-nhp-sandbox-ca-pm",
+        ])
+        pair_instances = {
+            f'module.control.data.aws_lambda_alias.authority_live["{fn}:{color}"]'
+            for fn in CHECKER.AUTHORITY_PROOF_FUNCTIONS
+            for color in ("blue", "green")
+        }
+        slice_ = CHECKER.AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES
+        self.assertEqual(len(pair_instances), 4)
+        self.assertTrue(pair_instances <= slice_)
+        self.assertEqual(len(slice_ - pair_instances), 22)
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
