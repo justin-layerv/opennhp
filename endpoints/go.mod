@@ -29,7 +29,7 @@ require (
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pion/webrtc/v4 v4.2.18
-	github.com/sigstore/cosign/v2 v2.6.3
+	github.com/sigstore/cosign/v2 v2.6.5
 	github.com/spf13/viper v1.21.0
 	github.com/urfave/cli/v2 v2.27.7
 	go.etcd.io/etcd/client/v3 v3.7.1
