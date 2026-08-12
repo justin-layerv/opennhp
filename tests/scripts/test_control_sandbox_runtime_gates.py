@@ -43,9 +43,9 @@ LIVE = {
     # Live: the rollout window is closed and the hold keeps the selected
     # colour on the version it serves; standby tracks each new publish.
     "blue_green_alias_hold_enabled": True,
-    # Dark until the pointer parameter exists; flipping it is the staged
-    # second apply of the SSM switch-pointer rollout.
-    "selector_ssm_pointer_enabled": False,
+    # Live since the staged second apply: the pointer parameter exists
+    # (seeded blue by #3857's apply) and the module reads it.
+    "selector_ssm_pointer_enabled": True,
 }
 
 
@@ -140,6 +140,7 @@ class FlagEmission(unittest.TestCase):
                 "--hub-worker-enabled",
                 # The proof surface is fully retired: no proof flags at all.
                 "--blue-green-alias-hold-enabled",
+                "--selector-ssm-pointer-enabled",
             ],
         )
 
@@ -157,6 +158,7 @@ class FlagEmission(unittest.TestCase):
                 proof_policy_selected_color="none",
                 proof_policy_prepared_color="none",
                 blue_green_alias_hold_enabled=False,
+                selector_ssm_pointer_enabled=False,
             )
             result = run("flags", gates=gates)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -297,9 +299,17 @@ class DependencyRules(unittest.TestCase):
         text promises the guard rejects.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            gates = write_gates(Path(tmp), blue_green_alias_hold_enabled=False)
+            gates = write_gates(
+                Path(tmp),
+                blue_green_alias_hold_enabled=False,
+                selector_ssm_pointer_enabled=False,
+            )
             result = run(
-                *check_args(blue_green_alias_hold_enabled="true"), gates=gates
+                *check_args(
+                    blue_green_alias_hold_enabled="true",
+                    selector_ssm_pointer_enabled="false",
+                ),
+                gates=gates,
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("blue_green_alias_hold_enabled", result.stderr)
@@ -317,9 +327,18 @@ class DependencyRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = run(
                 "flags",
-                gates=write_gates(Path(tmp), blue_green_alias_hold_enabled=False),
+                gates=write_gates(
+                    Path(tmp),
+                    blue_green_alias_hold_enabled=False,
+                    # Silence the pointer rule (pointer requires the hold),
+                    # which would otherwise mask the ordering under test.
+                    selector_ssm_pointer_enabled=False,
+                ),
             )
-            enabled = run("flags", gates=write_gates(Path(tmp)))
+            enabled = run(
+                "flags",
+                gates=write_gates(Path(tmp), selector_ssm_pointer_enabled=False),
+            )
         self.assertEqual(base.returncode, 0)
         self.assertEqual(enabled.returncode, 0)
         flag = "--blue-green-alias-hold-enabled"
@@ -345,11 +364,11 @@ class DependencyRules(unittest.TestCase):
     def test_selector_pointer_flag_appends_without_reordering(self) -> None:
         """Same byte-compare rule as the hold flag: appended, never inserted."""
         with tempfile.TemporaryDirectory() as tmp:
-            base = run("flags", gates=write_gates(Path(tmp)))
-            enabled = run(
+            base = run(
                 "flags",
-                gates=write_gates(Path(tmp), selector_ssm_pointer_enabled=True),
+                gates=write_gates(Path(tmp), selector_ssm_pointer_enabled=False),
             )
+            enabled = run("flags", gates=write_gates(Path(tmp)))
         self.assertEqual(base.returncode, 0)
         self.assertEqual(enabled.returncode, 0)
         flag = "--selector-ssm-pointer-enabled"
@@ -363,7 +382,7 @@ class DependencyRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gates = write_gates(Path(tmp))
             result = run(
-                *check_args(selector_ssm_pointer_enabled="true"), gates=gates
+                *check_args(selector_ssm_pointer_enabled="false"), gates=gates
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("selector_ssm_pointer_enabled", result.stderr)
@@ -427,6 +446,7 @@ class TfvarsReceipt(unittest.TestCase):
 
         # Proof surface fully retired: no proof keys are emitted.
         "authority_blue_green_alias_hold_enabled": True,
+        "authority_selector_ssm_pointer_enabled": True,
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},
         "authority_proof_mutation_owner_id": "someone",

@@ -40,5 +40,5 @@
   "proof_policy_selected_color": "none",
   "proof_policy_prepared_color": "none",
   "blue_green_alias_hold_enabled": true,
-  "selector_ssm_pointer_enabled": false
+  "selector_ssm_pointer_enabled": true
 }
