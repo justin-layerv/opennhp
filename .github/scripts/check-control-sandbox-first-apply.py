@@ -1958,6 +1958,10 @@ _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES = frozenset(
         # half stays fully validated by the exec-identity subset test and
         # _check_planned_security, which run outside this dispatch.
         "authority-proof-rollout-retirement",
+        # The teardown and the consumer rollback republish slice functions, so
+        # the same re-projection accompanies them; identical validation story.
+        "authority-proof-disable",
+        "authority-proof-consumers-disable",
     }
 )
 
@@ -8249,7 +8253,14 @@ def _check_authority_proof_disable_transition(
             "principals"
         )
 
+    _pm_pc_absent = AUTHORITY_PM_STEADY_PC_ADDRESS
     for address in AUTHORITY_PROOF_RESOURCES:
+        if address == _pm_pc_absent and address not in by_address:
+            # ca-pm's steady PC was never successfully provisioned (its create
+            # kept exceeding the lowered reserved budget), so the teardown has
+            # nothing to delete at this address. Absence is the exact expected
+            # shape here, not a gap.
+            continue
         item = by_address[address]
         change = item.get("change")
         if (
@@ -8274,6 +8285,8 @@ def _check_authority_proof_disable_transition(
         set(AUTHORITY_PROOF_RESOURCES)
         | set(AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES)
     ):
+        if address == _pm_pc_absent and address not in before_view:
+            continue
         change = before_view[address]["change"]
         before = change.get("before")
         if not isinstance(before, dict):
@@ -8283,6 +8296,35 @@ def _check_authority_proof_disable_transition(
         change["actions"] = ["no-op"]
         change["after"] = copy.deepcopy(before)
         change["after_unknown"] = {}
+    _before_selected = _selected_authority_color_from_contract(
+        (before_foundation or {}).get("input")
+    )
+    if _pm_pc_absent not in before_view:
+        # Synthesize the capacity entry the enabled graph SHOULD have carried.
+        # The steady create never provisioned, so the before-state validation
+        # -- which proves the graph being deleted was the reviewed one -- gets
+        # the reviewed values (selected colour, the generator's steady 1)
+        # rather than a hole. Every other property of the pair is still proved
+        # from real state.
+        before_view[_pm_pc_absent] = {
+            "address": _pm_pc_absent,
+            "mode": "managed",
+            "type": "aws_lambda_provisioned_concurrency_config",
+            "change": {
+                "actions": ["no-op"],
+                "before": {
+                    "function_name": "layerv-nhp-sandbox-ca-pm",
+                    "qualifier": _before_selected,
+                    "provisioned_concurrent_executions": 1,
+                },
+                "after": {
+                    "function_name": "layerv-nhp-sandbox-ca-pm",
+                    "qualifier": _before_selected,
+                    "provisioned_concurrent_executions": 1,
+                },
+                "after_unknown": {},
+            },
+        }
     _check_authority_runtime_resources(
         before_view,
         before_view[foundation_address]["change"]["after"],
@@ -8298,19 +8340,42 @@ def _check_authority_proof_disable_transition(
         )
         for function_name, output_name in AUTHORITY_PROOF_ALIAS_OUTPUTS.items()
     }
+    # The teardown nulls the proof outputs. Two exact presentations, by which
+    # half owns the change: `delete` once the root output declarations are
+    # removed (the code-removal PR), or `update` to null while the live-first
+    # gate flip runs with the declarations still present -- the module returns
+    # null with the gate off, and the root output keeps existing until the code
+    # goes. Both sides are pinned either way.
+    def _proof_output_nulled(output_name: str, selected_alias: str) -> bool:
+        return _is_exact_output_change(
+            output_changes[output_name],
+            actions=["delete"],
+            before=selected_alias,
+            after=None,
+        ) or _is_exact_output_change(
+            output_changes[output_name],
+            actions=["update"],
+            before=selected_alias,
+            after=None,
+        )
+
+    # Two presentations, one per teardown half: DELETE once the root output
+    # declarations are removed (planned outputs then omit the pair), UPDATE to
+    # null while the declarations remain (planned outputs still carry them).
+    _outputs_expected_after = (
+        EXPECTED_CONTROL_OUTPUTS - set(AUTHORITY_PROOF_ALIAS_OUTPUTS.values())
+        if not isinstance(planned_outputs, dict)
+        or set(planned_outputs)
+        != EXPECTED_CONTROL_OUTPUTS
+        else EXPECTED_CONTROL_OUTPUTS
+    )
     if (
         not isinstance(output_changes, dict)
         or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
         or not isinstance(planned_outputs, dict)
-        or set(planned_outputs)
-        != EXPECTED_CONTROL_OUTPUTS - set(AUTHORITY_PROOF_ALIAS_OUTPUTS.values())
+        or set(planned_outputs) != _outputs_expected_after
         or any(
-            not _is_exact_output_change(
-                output_changes[output_name],
-                actions=["delete"],
-                before=selected_alias,
-                after=None,
-            )
+            not _proof_output_nulled(output_name, selected_alias)
             for output_name, selected_alias in selected_aliases.items()
         )
     ):
@@ -9130,6 +9195,12 @@ def _claim_authority_image_uri_move(
     Deliberately narrow: if anything else in the contract moved, this is not the
     lane and the enumerated migration paths still own it.
     """
+    # The proof teardown owns the contract change when the pair is leaving the
+    # function graph; this lane's validator would read that as an unrelated
+    # field.
+    if _claim_authority_proof_disable(changed, actual_non_noop, by_address):
+        return frozenset()
+
     # A consumer-staging transition owns the contract change (the staging key
     # coming or going is precisely what it validates); this lane's validator
     # would read that same key move as an unrelated field.
@@ -9386,6 +9457,10 @@ AUTHORITY_PROOF_STANDBY_PREFIX = (
 # already owns that pair, and two claims on one address fail composition's
 # disjointness. Ceding them keeps this lane composable with the roll that
 # always accompanies it.
+AUTHORITY_PM_STEADY_PC_ADDRESS = (
+    'module.control.aws_lambda_provisioned_concurrency_config.authority'
+    '["layerv-nhp-sandbox-ca-pm"]'
+)
 AUTHORITY_STEADY_PC_PREFIX = (
     "module.control.aws_lambda_provisioned_concurrency_config.authority["
 )
@@ -9783,6 +9858,127 @@ def _validate_authority_steady_pc_completion_claim(
     _check_authority_steady_pc_completion(set(claimed), by_address)
 
 
+def _claim_authority_proof_disable(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """The strict proof teardown as a composable claim.
+
+    The exclusive elif form requires the teardown to be the WHOLE plan, which
+    the sequenced reality is not: step 1's consumer republishes ride along
+    whenever its apply was interrupted, and ca-pm's steady PC -- which its
+    create kept failing to provision -- is legitimately absent from both state
+    and plan. This claims exactly the proof graph deletes (minus that tolerated
+    absence) plus the teardown's update addresses, and leaves the riders to
+    their own lanes.
+    """
+    pm_pc = AUTHORITY_PM_STEADY_PC_ADDRESS
+    expected_deletes = set(AUTHORITY_PROOF_RESOURCES)
+    if pm_pc not in by_address:
+        expected_deletes.discard(pm_pc)
+    if not expected_deletes <= changed:
+        return frozenset()
+    if any(actual_non_noop.get(a) != ["delete"] for a in expected_deletes):
+        return frozenset()
+    updates = set(AUTHORITY_PROOF_ENABLE_UPDATE_ADDRESSES) & changed
+    if any(actual_non_noop.get(a) != ["update"] for a in updates):
+        return frozenset()
+    return frozenset(expected_deletes | updates)
+
+
+def _validate_authority_proof_disable_claim(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    _check_authority_proof_disable_transition(plan, by_address)
+
+
+def _claim_authority_standby_alias_advance(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """The blue/green hold's steady-state signature: standby catches up.
+
+    Every claimed alias is the NON-selected colour moving by plain update while
+    every selected-colour alias stays no-op. This is what each publish leaves
+    for the standby once its function update has applied -- and permanently the
+    routine shape of the hold, so it composes with whatever else a push
+    carries.
+    """
+    _contract_change = by_address.get(
+        AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}
+    ).get("change", {})
+    _contract_payload = (
+        (_contract_change.get("after") or {}).get("input")
+        or (_contract_change.get("before") or {}).get("input")
+    )
+    try:
+        selected = _selected_authority_color_from_contract(_contract_payload)
+    except ContractError:
+        selected = None
+    if selected not in ("blue", "green") or _contract_payload is None:
+        # Cannot prove which colour is serving -- do not claim. Composition's
+        # union requirement then forces another lane (or the terminal reject)
+        # to account for the alias, instead of this lane guessing and the
+        # retarget guard below silently never firing.
+        return frozenset()
+    standby = "green" if selected == "blue" else "blue"
+    # Alias-only by definition: when functions move too, the image roll owns
+    # the whole fleet's aliases and proves uniform convergence; claiming them
+    # here as well would fail composition's disjointness.
+    if any(
+        a.startswith(AUTHORITY_FUNCTION_ADDRESS_PREFIX)
+        and actual_non_noop.get(a) == ["update"]
+        for a in changed
+    ):
+        return frozenset()
+    # Self-scoped to standby-colour UPDATES: alias deletes belong to whatever
+    # teardown owns them (composition's union/disjointness accounts for them),
+    # and a selected-colour update is refused below rather than skipped.
+    aliases = {
+        a
+        for a in changed
+        if a.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX)
+        and a.endswith(f':{standby}"]')
+        and actual_non_noop.get(a) == ["update"]
+    }
+    if not aliases:
+        return frozenset()
+    # No selected-colour alias may be RETARGETED -- an update there means the
+    # serving pointer is moving, which is never a catch-up. A selected-colour
+    # DELETE is a teardown lane's to own and to justify (composition's
+    # union/disjointness still forces some claim to account for it).
+    for address in by_address:
+        if address.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX) and address.endswith(
+            f':{selected}"]'
+        ):
+            if by_address[address].get("change", {}).get("actions") == ["update"]:
+                return frozenset()
+    return frozenset(aliases)
+
+
+def _validate_authority_standby_alias_advance(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    if not _claim_authority_standby_alias_advance(
+        set(claimed),
+        {
+            a: by_address.get(a, {}).get("change", {}).get("actions")
+            for a in claimed
+        },
+        by_address,
+    ):
+        raise ContractError(
+            "standby alias advance re-validation failed: a selected-colour "
+            "alias moved or a claimed alias is not the standby colour"
+        )
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
     (
         "authority-proof-rollout-retirement",
@@ -9798,6 +9994,16 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-proof-consumers-disable",
         _claim_authority_proof_consumer_disable,
         _validate_authority_proof_consumer_disable,
+    ),
+    (
+        "authority-proof-disable",
+        _claim_authority_proof_disable,
+        _validate_authority_proof_disable_claim,
+    ),
+    (
+        "authority-standby-alias-advance",
+        _claim_authority_standby_alias_advance,
+        _validate_authority_standby_alias_advance,
     ),
     (
         "authority-steady-pc-completion",

@@ -14413,6 +14413,64 @@ class ComposedTransitionTest(unittest.TestCase):
                 )
                 self.assertEqual(delete and pm_pc not in by, tolerated)
 
+    def standby_advance_by(self, contract=True, selected="green"):
+        by = {}
+        if contract:
+            by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS] = {
+                "change": {
+                    "actions": ["no-op"],
+                    "after": {
+                        "input": {
+                            "authority_runtime_contract": {
+                                "selected_authority_color": selected
+                            }
+                        }
+                    },
+                }
+            }
+        by[
+            CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX
+            + 'layerv-nhp-sandbox-ca-ar-cell0:blue"]'
+        ] = {"change": {"actions": ["update"]}}
+        return by
+
+    def test_standby_advance_claims_the_catch_up(self) -> None:
+        by = self.standby_advance_by()
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            set(CHECKER._claim_authority_standby_alias_advance(changed, acts, by)),
+            changed,
+        )
+
+    def test_standby_advance_fails_closed_without_a_contract(self) -> None:
+        """Cannot prove which colour is serving -> do not claim (review #1).
+
+        With no contract entry the old code defaulted the serving colour and
+        the retarget guard could never fire; a serving-alias retarget would
+        have been claimed as a benign catch-up.
+        """
+        by = self.standby_advance_by(contract=False)
+        changed = set(by)
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_standby_alias_advance(changed, acts, by),
+            frozenset(),
+        )
+
+    def test_standby_advance_refuses_a_serving_retarget(self) -> None:
+        by = self.standby_advance_by()
+        by[
+            CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX
+            + 'layerv-nhp-sandbox-ca-ar-cell0:green"]'
+        ] = {"change": {"actions": ["update"]}}
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_standby_alias_advance(changed, acts, by),
+            frozenset(),
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
@@ -14446,6 +14504,11 @@ class ComposedTransitionTest(unittest.TestCase):
                 # step-1 shape: consumers off + pm's pending capacity create).
                 "authority-proof-consumers-disable",
                 "authority-steady-pc-completion",
+                # Step 2 of the teardown as a composable claim, and the hold's
+                # permanent steady-state lane: standby aliases catching up to
+                # the newest published version while selected holds.
+                "authority-proof-disable",
+                "authority-standby-alias-advance",
             },
         )
 

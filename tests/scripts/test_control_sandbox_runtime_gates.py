@@ -36,7 +36,7 @@ LIVE = {
     "enable_runtime_functions": True,
     "hub_edge_enabled": True,
     "hub_worker_enabled": True,
-    "proof_mutation_controls_enabled": True,
+    "proof_mutation_controls_enabled": False,
     "proof_policy_consumers_staged": False,
     "proof_policy_selected_color": "none",
     "proof_policy_prepared_color": "none",
@@ -135,9 +135,7 @@ class FlagEmission(unittest.TestCase):
                 "--runtime-functions-enabled",
                 "--hub-edge-enabled",
                 "--hub-worker-enabled",
-                "--proof-mutation-controls-enabled",
-                # Consumer staging retired and the window closed: neither the
-                # staging flag nor the colour flags are emitted.
+                # The proof surface is fully retired: no proof flags at all.
                 "--blue-green-alias-hold-enabled",
             ],
         )
@@ -383,8 +381,7 @@ class TfvarsReceipt(unittest.TestCase):
         "hub_edge_enabled": True,
         "hub_worker_enabled": True,
 
-        "authority_proof_mutation_controls_enabled": True,
-        # Consumer staging retired; window closed: neither key is emitted.
+        # Proof surface fully retired: no proof keys are emitted.
         "authority_blue_green_alias_hold_enabled": True,
         # A real tfvars also carries manifest-derived keys; they must be ignored.
         "authority_runtime_contract": {"schema_version": 1},

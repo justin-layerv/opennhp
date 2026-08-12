@@ -123,11 +123,16 @@ running them would not buy anything.
       without the proof env, exec policies drop the PROOF read, ca-pm's pending
       steady capacity restores, and no alias moves (consumers stay pinned while
       the gate is on). Measured 1 add / 7 change / 0 destroy at serial 112.
-- [ ] Teardown step 2: flip `proof_mutation_controls_enabled` off -- the strict
-      `authority-proof-disable` shape (ca-pm/ca-pcr graphs deleted; the
-      foundation fence's new disable flag admits exactly that pair and nothing
-      else). Then verify state/live lanes and the refresh-enabled dark no-op
-      (step 5). This subsumes retiring the rollout selector — measured below,
+- [x] Teardown step 2 (nhp #this): `proof_mutation_controls_enabled` off. The
+      real live plan (serial 113) deletes exactly the ca-pm/ca-pcr graphs (31
+      destroys), nulls both proof outputs, drops the pair from the DynamoDB
+      endpoint principals, and the freed IA/RA/ICR standby aliases catch up
+      under the hold while the serving green aliases stay no-ops. Admitted as
+      composed-authority-proof-disable-with-authority-standby-alias-advance;
+      foundation fence clean via the pair-leaving-the-graph witness.
+- [ ] Verify the refresh-enabled dark no-op after the apply, then delete the
+      proof code (root outputs, module plumbing, checker proof lanes) and this
+      ledger entry. This subsumes retiring the rollout selector — measured below,
       it is not a separate step.
 - [ ] Delete the code once live state is dark.
 
