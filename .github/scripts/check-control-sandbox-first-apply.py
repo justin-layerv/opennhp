@@ -8620,6 +8620,10 @@ def _claim_hub_worker_image_update(
     revision this same plan creates -- the identical pairing the proof-rollout
     lane already uses.
     """
+    # A selector flip owns this shape: the Hub replacement is the alias-colour move, not an image change.
+    if _authority_selector_flip_colors(by_address) is not None:
+        return frozenset()
+
     # Stand down while the proof rollout window is closing. The Hub task
     # definition is replaced then because hub-init's environment carries the
     # ca-pm alias ARN and that alias moves -- which this lane correctly refuses,
@@ -9195,6 +9199,10 @@ def _claim_authority_image_uri_move(
     Deliberately narrow: if anything else in the contract moved, this is not the
     lane and the enumerated migration paths still own it.
     """
+    # A selector flip owns this shape: the contract change is the switch pointer moving, not an image-URI move.
+    if _authority_selector_flip_colors(by_address) is not None:
+        return frozenset()
+
     # The proof teardown owns the contract change when the pair is leaving the
     # function graph; this lane's validator would read that as an unrelated
     # field.
@@ -9741,6 +9749,7 @@ def _validate_authority_proof_rollout_retirement(
     pools = {a for a in claimed if a.startswith(AUTHORITY_PROOF_STANDBY_PREFIX)}
     if AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION in claimed:
         _check_hub_task_definition_proof_alias_only(by_address)
+
     if not claimed:
         raise ContractError(
             "a proof selector transition must claim at least one address"
@@ -9979,6 +9988,127 @@ def _validate_authority_standby_alias_advance(
         )
 
 
+def _authority_selector_flip_colors(by_address: dict[str, Any]) -> tuple[str, str] | None:
+    """(old, new) when the contract's switch pointer moves between the colours."""
+    change = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}).get(
+        "change", {}
+    )
+    before, after = change.get("before"), change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    b = ((before.get("input") or {}).get("authority_runtime_contract") or {}).get(
+        "selected_authority_color"
+    )
+    a = ((after.get("input") or {}).get("authority_runtime_contract") or {}).get(
+        "selected_authority_color"
+    )
+    if b in ("blue", "green") and a in ("blue", "green") and b != a:
+        return b, a
+    return None
+
+
+def _claim_authority_selector_flip(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """The blue/green cutover: one reviewed pointer moves, capacity follows.
+
+    Claims the contract, the 13 steady-PC re-homes (create-before-destroy, so
+    the new colour warms before the old releases), the Hub task definition
+    replacement (its container env carries the alias ARNs by colour; the
+    content proof pins the delta to exactly that colour), the Hub service
+    redeploy, the hub_task policy and the lambda endpoint policy. The
+    newly-standby colour's alias catch-ups belong to
+    authority-standby-alias-advance, and alias no-ops need no claim -- the
+    hold keeps the newly-selected colour on the version it already serves.
+    """
+    if _authority_selector_flip_colors(by_address) is None:
+        return frozenset()
+    pc = {
+        a
+        for a in changed
+        if a.startswith(AUTHORITY_STEADY_PC_PREFIX)
+        and actual_non_noop.get(a) == ["create", "delete"]
+    }
+    # Completeness: the WHOLE fleet re-homes together, or nothing does. A
+    # partial flip -- some pools on the new colour, some on the old -- is
+    # itself a hazardous state, and this claim is the last gate before a live
+    # traffic move, so it refuses the shape outright rather than admitting
+    # whatever subset happened to plan.
+    expected_pc = {
+        f'{AUTHORITY_STEADY_PC_PREFIX}"{fn}"]'
+        for fn in AUTHORITY_RUNTIME_FUNCTIONS
+    }
+    if pc != expected_pc:
+        return frozenset()
+    claimed = pc | {AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS}
+    for address, actions in (
+        (AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION, (["delete", "create"], ["create", "delete"])),
+        ("module.control.aws_ecs_service.hub[0]", (["update"],)),
+        ("module.control.aws_iam_role_policy.hub_task[0]", (["update"],)),
+        ('module.control.aws_vpc_endpoint.interface["lambda"]', (["update"],)),
+    ):
+        if address in changed:
+            if actual_non_noop.get(address) not in list(actions):
+                return frozenset()
+            claimed.add(address)
+    return frozenset(claimed)
+
+
+def _validate_authority_selector_flip(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    colors = _authority_selector_flip_colors(by_address)
+    if colors is None:
+        raise ContractError("a selector flip must move the contract's pointer")
+    old_selected, new_selected = colors
+    for address in claimed:
+        if address.startswith(AUTHORITY_STEADY_PC_PREFIX):
+            change = by_address.get(address, {}).get("change", {})
+            before, after = change.get("before"), change.get("after")
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                raise ContractError(f"{address} planned values are malformed")
+            if (
+                before.get("qualifier") != old_selected
+                or after.get("qualifier") != new_selected
+            ):
+                raise ContractError(
+                    f"{address} must re-home {old_selected!r} -> {new_selected!r}"
+                )
+            if before.get("provisioned_concurrent_executions") != after.get(
+                "provisioned_concurrent_executions"
+            ):
+                raise ContractError(
+                    f"{address} must keep its allocation while re-homing"
+                )
+    if AUTHORITY_PROOF_RETIREMENT_TASK_DEFINITION in claimed:
+        _check_hub_task_definition_proof_alias_only(by_address)
+    # The three riding updates must themselves be colour moves, not arbitrary
+    # in-place edits admitted on action shape alone: after masking the alias
+    # colour, before and after must be identical.
+    def _colour_only_update(address: str, field: str) -> None:
+        change = by_address.get(address, {}).get("change", {})
+        before, after = change.get("before"), change.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ContractError(f"{address} planned values are malformed")
+        mask = re.compile(r"(function:[A-Za-z0-9_-]+):(?:blue|green)\b")
+        b = mask.sub(r"\1:<color>", json.dumps(before.get(field), sort_keys=True))
+        a = mask.sub(r"\1:<color>", json.dumps(after.get(field), sort_keys=True))
+        if b != a:
+            raise ContractError(
+                f"{address} must change only the alias colour in {field}"
+            )
+    if "module.control.aws_iam_role_policy.hub_task[0]" in claimed:
+        _colour_only_update("module.control.aws_iam_role_policy.hub_task[0]", "policy")
+    if 'module.control.aws_vpc_endpoint.interface["lambda"]' in claimed:
+        _colour_only_update(
+            'module.control.aws_vpc_endpoint.interface["lambda"]', "policy"
+        )
+
+
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
     (
         "authority-proof-rollout-retirement",
@@ -10004,6 +10134,11 @@ _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
         "authority-standby-alias-advance",
         _claim_authority_standby_alias_advance,
         _validate_authority_standby_alias_advance,
+    ),
+    (
+        "authority-selector-flip",
+        _claim_authority_selector_flip,
+        _validate_authority_selector_flip,
     ),
     (
         "authority-steady-pc-completion",

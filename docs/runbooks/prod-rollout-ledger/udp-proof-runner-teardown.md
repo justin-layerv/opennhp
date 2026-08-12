@@ -130,6 +130,14 @@ running them would not buy anything.
       under the hold while the serving green aliases stay no-ops. Admitted as
       composed-authority-proof-disable-with-authority-standby-alias-advance;
       foundation fence clean via the pair-leaving-the-graph witness.
+- [x] Blue/green cutover (nhp #this): the switch pointer moves green -> blue in
+      the measurement basis. Measured at serial 115: 12 add / 15 change / 12
+      destroy -- the 13 steady pools re-home create-before-destroy (the new
+      colour warms before the old releases; zero unwarmed window), the Hub task
+      definition replaces with the delta content-proved to be exactly the alias
+      colour, and the newly-standby green aliases catch up under the hold.
+      Admitted as composed-authority-selector-flip-with-authority-standby-
+      alias-advance; fence clean via the selector-flip witness.
 - [ ] Verify the refresh-enabled dark no-op after the apply, then delete the
       proof code (root outputs, module plumbing, checker proof lanes) and this
       ledger entry. This subsumes retiring the rollout selector — measured below,

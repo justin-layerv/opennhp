@@ -182,6 +182,20 @@ if [[ -n "$plan_json" ]]; then
       | unique) as $destroyed
     | (($destroyed == ["module.control.aws_ecs_task_definition.hub[0]"])
     or (
+      # The selector flip: the Hub task definition replaces (its container env
+      # carries the alias ARNs by colour) and the 13 steady pools re-home. The
+      # subtraction still pins the COMPLETE destructive set.
+      $authority_selector_flip_allowed
+      and (
+        ($destroyed - [
+          (.resource_changes[]? | select(
+            (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
+            and .change.actions == ["create", "delete"]
+          ) | .address)
+        ]) == ["module.control.aws_ecs_task_definition.hub[0]"]
+      )
+    )
+    or (
       # The pointer-align + window-close shape: the four standby pools go, and
       # the steady provisioned concurrency re-homes from the old selected
       # colour to the new one (delete+create; qualifier is the identity). The
@@ -222,6 +236,25 @@ if [[ -n "$plan_json" ]]; then
     authority_proof_rollout_retirement_allowed=true
   fi
 
+  # The blue/green selector flip: the contract's selected_authority_color
+  # moves between the two valid colours and nothing else in the contract
+  # changes shape. The flip re-homes steady provisioned concurrency to the new
+  # colour (create-before-destroy, so the new colour warms first) and replaces
+  # the Hub task definition (its container env carries the alias ARNs by
+  # colour). Any delete outside those two shapes defeats the flag.
+  authority_selector_flip_allowed=false
+  if jq -e '
+    ([
+      .resource_changes[]?
+      | select(.address == "module.control.terraform_data.foundation_contract")
+      | select((.change.before.input.authority_runtime_contract.selected_authority_color) as $b
+          | (.change.after.input.authority_runtime_contract.selected_authority_color) as $a
+          | ($b == "blue" or $b == "green") and ($a == "blue" or $a == "green") and $b != $a)
+    ] | length == 1)
+  ' "$plan_json" >/dev/null; then
+    authority_selector_flip_allowed=true
+  fi
+
   hub_worker_image_update_allowed=false
   if jq -e '
     [
@@ -240,7 +273,8 @@ if [[ -n "$plan_json" ]]; then
     # Hub's Authority alias ARNs move by colour. That is not an image update and
     # must not be judged as one; authority-proof-rollout-retirement owns it and
     # proves the container definitions differ only in that colour.
-    if [[ "$authority_proof_rollout_retirement_allowed" != true ]] \
+    if [[ "$authority_proof_rollout_retirement_allowed" != true \
+       && "$authority_selector_flip_allowed" != true ]] \
       && ! python3 "$control_plan_checker" \
       hub-worker-image-update "$plan_json" >/dev/null; then
       echo "ERROR: Hub worker task-definition replacement failed its exact image-only contract" >&2
@@ -434,7 +468,9 @@ if [[ -n "$plan_json" ]]; then
     --argjson authority_proof_rollout_retirement_allowed \
       "$authority_proof_rollout_retirement_allowed" \
     --argjson authority_proof_disable_allowed \
-      "$authority_proof_disable_allowed" '
+      "$authority_proof_disable_allowed" \
+    --argjson authority_selector_flip_allowed \
+      "$authority_selector_flip_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -498,11 +534,25 @@ if [[ -n "$plan_json" ]]; then
               $authority_proof_rollout_retirement_allowed
               and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
             )
+            or (
+              # The selector flip re-homes every steady pool to the new colour.
+              $authority_selector_flip_allowed
+              and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
+            )
           )
           and .type == "aws_lambda_provisioned_concurrency_config"
           and .mode == "managed"
           and (.deposed // null) == null
-          and .change.actions == ["delete", "create"]
+          and (
+            .change.actions == ["delete", "create"]
+            or (
+              # Create-before-destroy: the flip provisions the new colour
+              # before the old colour releases, so the fleet never serves an
+              # unwarmed window mid-switch.
+              $authority_selector_flip_allowed
+              and .change.actions == ["create", "delete"]
+            )
+          )
         ) or (
           $authority_proof_prepare_recovery_allowed
           and (
@@ -525,7 +575,7 @@ if [[ -n "$plan_json" ]]; then
           and (.deposed // null) == null
           and .change.actions == ["delete"]
         ) or (
-          $authority_proof_rollout_retirement_allowed
+          ($authority_proof_rollout_retirement_allowed or $authority_selector_flip_allowed)
           and .address == "module.control.aws_ecs_task_definition.hub[0]"
           and .type == "aws_ecs_task_definition"
           and .mode == "managed"

@@ -14492,6 +14492,101 @@ class ComposedTransitionTest(unittest.TestCase):
         self.assertTrue(pair_instances <= slice_)
         self.assertEqual(len(slice_ - pair_instances), 22)
 
+    def flip_by(self) -> dict:
+        import copy as _copy
+        target_pc = {
+            "change": {
+                "actions": ["create", "delete"],
+                "before": {"qualifier": "green", "provisioned_concurrent_executions": 2},
+                "after": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+            }
+        }
+        by = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "actions": ["update"],
+                    "before": {"input": {"authority_runtime_contract": {"selected_authority_color": "green"}}},
+                    "after": {"input": {"authority_runtime_contract": {"selected_authority_color": "blue"}}},
+                }
+            },
+        }
+        # Completeness: the claim requires the WHOLE fleet, so the fixture
+        # carries every runtime function's steady pool.
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + f'"{fn}"]'] = _copy.deepcopy(
+                target_pc
+            )
+        return by
+
+    def test_selector_flip_claims_and_validates(self) -> None:
+        by = self.flip_by()
+        changed = set(by)
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        claimed = CHECKER._claim_authority_selector_flip(changed, acts, by)
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_authority_selector_flip(claimed, by, {})
+
+    def test_selector_flip_refuses_a_partial_fleet(self) -> None:
+        """Some pools flipped and some not is itself the hazardous state."""
+        by = self.flip_by()
+        del by[
+            CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ra"]'
+        ]
+        changed = set(by)
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_flip(changed, acts, by), frozenset()
+        )
+
+    def test_selector_flip_refuses_allocation_tamper(self) -> None:
+        by = self.flip_by()
+        by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]'][
+            "change"
+        ]["after"]["provisioned_concurrent_executions"] = 99
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_selector_flip(frozenset(by), by, {})
+
+    def test_selector_flip_refuses_a_non_colour_policy_edit(self) -> None:
+        """A riding hub_task update must be a colour move, nothing else."""
+        import json as _json
+        by = self.flip_by()
+        addr = "module.control.aws_iam_role_policy.hub_task[0]"
+        by[addr] = {
+            "change": {
+                "actions": ["update"],
+                "before": {"policy": _json.dumps({"Resource": [
+                    "arn:aws:lambda:us-east-2:1:function:layerv-nhp-sandbox-ca-ia:green"
+                ]})},
+                "after": {"policy": _json.dumps({"Resource": [
+                    "arn:aws:lambda:us-east-2:1:function:layerv-nhp-sandbox-ca-ia:blue",
+                    "s3:*",
+                ]})},
+            }
+        }
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_selector_flip(
+                frozenset(by), by, {}
+            )
+
+    def test_selector_flip_pins_rehome_direction(self) -> None:
+        by = self.flip_by()
+        pc = by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]']
+        pc["change"]["before"]["qualifier"] = "blue"
+        pc["change"]["after"]["qualifier"] = "green"
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._validate_authority_selector_flip(frozenset(by), by, {})
+
+    def test_selector_flip_requires_the_pointer_to_move(self) -> None:
+        by = self.flip_by()
+        by[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]["change"]["after"][
+            "input"
+        ]["authority_runtime_contract"]["selected_authority_color"] = "green"
+        changed = set(by)
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_selector_flip(changed, acts, by), frozenset()
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
@@ -14530,6 +14625,10 @@ class ComposedTransitionTest(unittest.TestCase):
                 # the newest published version while selected holds.
                 "authority-proof-disable",
                 "authority-standby-alias-advance",
+                # The blue/green cutover: one reviewed pointer moves, capacity
+                # follows create-before-destroy, and the Hub repoints by
+                # colour with the delta content-proved.
+                "authority-selector-flip",
             },
         )
 

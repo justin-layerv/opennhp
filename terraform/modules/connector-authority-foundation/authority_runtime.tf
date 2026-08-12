@@ -1221,6 +1221,17 @@ resource "aws_lambda_provisioned_concurrency_config" "authority" {
 
   function_name = aws_lambda_function.authority[each.key].function_name
   qualifier     = aws_lambda_alias.authority["${each.key}:${local.authority_runtime_selected_color}"].name
+
+  # Warm-before-switch. A selector flip re-homes this capacity to the other
+  # colour, and the qualifier is the PC's identity, so the move is a
+  # replacement. Create-before-destroy provisions the NEW colour's capacity
+  # while the old colour keeps serving warm -- possible because the hold keeps
+  # the two colours on distinct versions, and Lambda only refuses two
+  # provisioned aliases on the SAME version. Without this the replacement is
+  # delete-first and the fleet serves a multi-minute unwarmed window mid-flip.
+  lifecycle {
+    create_before_destroy = true
+  }
   provisioned_concurrent_executions = (
     local.authority_proof_policy_rollout_active &&
     contains(local.authority_proof_policy_rollout_function_names, each.key)
