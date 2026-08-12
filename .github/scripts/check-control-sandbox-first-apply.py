@@ -11355,15 +11355,30 @@ def _check_hub_task_selected_projection_drift(item: dict[str, Any]) -> None:
             "policy",
             AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
         )
-    # The state doc predates the window close, so it carries the ROLLOUT
-    # projection (both colours); live carries the new selected colour alone.
-    # rollout=True returns BOTH colours and ignores `selected`; passed
-    # explicitly so a future change to the rollout projection cannot quietly
-    # break this equality.
-    if (_doc(before), _doc(after)) != (
+    # Two exact projections are admitted, by which operation left the drift:
+    #
+    # * window close: state carries the ROLLOUT projection (both colours), live
+    #   the new selected colour alone.
+    # * selector flip: state carries the OLD selected colour (the flip's
+    #   hub_task update applied to blue, so state green predates it), live the
+    #   new selected colour. Either flip direction.
+    #
+    # rollout=True returns both colours and ignores `selected`; passed
+    # explicitly so a future change to that projection cannot quietly break the
+    # first equality.
+    pair = (_doc(before), _doc(after))
+    close_projection = (
         _expected_hub_task_inline_policy(rollout=True, selected="blue"),
         _expected_hub_task_inline_policy(rollout=False, selected="green"),
-    ):
+    )
+    flip_projections = [
+        (
+            _expected_hub_task_inline_policy(rollout=False, selected=old),
+            _expected_hub_task_inline_policy(rollout=False, selected=new),
+        )
+        for old, new in (("green", "blue"), ("blue", "green"))
+    ]
+    if pair != close_projection and pair not in flip_projections:
         raise _unexpected_drift_error([item])
 
 
@@ -14605,22 +14620,39 @@ def check_plan(
     elif (
         changed
         and changed
+        # Subset of the WITH_PROOF set (13). Post-teardown only the 11 runtime
+        # functions exist, so a real recovery is those 11 -- which the shell
+        # fence hardcodes exactly. The 13-superset here also still admits the
+        # historical single-ca-pm completion from before the teardown. Keep the
+        # shell's 11-list and this set in lockstep: both are the same runtime
+        # functions, the shell simply excludes the deleted proof pair.
         <= {
             f"{AUTHORITY_STEADY_PC_PREFIX}\"{fn}\"]"
             for fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
         }
-        and all(actual_non_noop.get(a) == ["create"] for a in changed)
+        and all(
+            actual_non_noop.get(a) in (["create"], ["delete", "create"])
+            for a in changed
+        )
         and not deposed_by_address
     ):
-        # Completing a partially-applied PC re-home: the 2026-08-11 pointer
-        # apply lowered ca-pm's reserved concurrency before its old pool was
-        # gone, so the steady create transiently exceeded the budget and the
-        # apply stopped with everything else converged. The residual plan is
-        # pure capacity CREATES on the selected colour -- availability-positive
-        # and grant-free -- so it is admitted exactly: every address in the
-        # steady set, create-only, and each qualifier must equal the contract's
-        # selected colour (a create on the standby colour is a different
-        # operation and falls through to the terminal reject).
+        # Completing a partially-applied PC re-home. Two shapes:
+        #
+        # * pure CREATE on the selected colour: the 2026-08-11 residual, where
+        #   ca-pm's create had transiently exceeded its lowered reserved budget
+        #   while everything else converged.
+        # * delete,create re-home to the selected colour: the 2026-08-12 cutover
+        #   recovery. The flip's create-before-destroy tried to provision the
+        #   new colour while the old still held the full reserved budget and
+        #   Lambda refused it; the Hub and contract had already committed to the
+        #   new colour, so the fleet is mid-flip. Delete-first frees the
+        #   reservation and completes the re-home to the SAME selected colour
+        #   the contract already carries.
+        #
+        # Both are availability-positive and grant-free, and
+        # _check_authority_steady_pc_completion pins every qualifier to the
+        # contract's selected colour with the reviewed allocation, so a re-home
+        # to the standby colour still falls through to the terminal reject.
         plan_mode = "authority-steady-pc-completion"
         _check_authority_steady_pc_completion(changed, by_address)
     elif (

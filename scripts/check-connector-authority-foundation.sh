@@ -121,6 +121,59 @@ if [[ -n "$plan_json" ]]; then
     exit 1
   fi
 
+  # The blue/green selector flip: the contract's selected_authority_color
+  # moves between the two valid colours and nothing else in the contract
+  # changes shape. The flip re-homes steady provisioned concurrency to the new
+  # colour (delete-before-create since #3854 -- the old colour releases its
+  # reserved budget first) and replaces
+  # the Hub task definition (its container env carries the alias ARNs by
+  # colour). Any delete outside those two shapes defeats the flag.
+  # Steady-PC completion recovery: a partial cutover left the fleet with the
+  # Hub and contract on the new colour but the steady pools stuck on the old.
+  # The recovery re-homes exactly those pools (delete,create) and NOTHING else
+  # is destructive -- no task-def replacement, no contract change. Admitted only
+  # when every destructive action is such a re-home.
+  # The 11 runtime-function steady pools (proof pm/pcr excluded -- they are
+  # gone after the teardown). The recovery re-homes the COMPLETE set together;
+  # a partial set is itself a hazard and a lone re-home (e.g. an unknown
+  # function) must still fall through to the refusal.
+  authority_steady_pc_completion_allowed=false
+  if jq -e --argjson expected '[
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ar-cell0\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ar-cell1\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ccr-cell0\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ccr-cell1\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-cr-cell0\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-cr-cell1\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ia\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-icr\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-iro-cell0\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-iro-cell1\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ra\"]"
+    ]' '
+    ([
+      (.resource_changes[]?, .resource_drift[]?)
+      | select((.change.actions | index("delete")) and .change.actions != ["no-op"])
+      | .address
+    ] | sort) as $destroyed
+    | $destroyed == ($expected | sort)
+  ' "$plan_json" >/dev/null; then
+    authority_steady_pc_completion_allowed=true
+  fi
+
+  authority_selector_flip_allowed=false
+  if jq -e '
+    ([
+      .resource_changes[]?
+      | select(.address == "module.control.terraform_data.foundation_contract")
+      | select((.change.before.input.authority_runtime_contract.selected_authority_color) as $b
+          | (.change.after.input.authority_runtime_contract.selected_authority_color) as $a
+          | ($b == "blue" or $b == "green") and ($a == "blue" or $a == "green") and $b != $a)
+    ] | length == 1)
+  ' "$plan_json" >/dev/null; then
+    authority_selector_flip_allowed=true
+  fi
+
   # Four exact replacement classes are intentional:
   #
   # * a tainted Connector Authority FUNCTION replan recreates a function left
@@ -232,28 +285,12 @@ if [[ -n "$plan_json" ]]; then
           )
       ] | length
     ) == 1
-  ' "$plan_json" >/dev/null; then
+  ' --argjson authority_selector_flip_allowed \
+    "$authority_selector_flip_allowed" \
+    "$plan_json" >/dev/null; then
     authority_proof_rollout_retirement_allowed=true
   fi
 
-  # The blue/green selector flip: the contract's selected_authority_color
-  # moves between the two valid colours and nothing else in the contract
-  # changes shape. The flip re-homes steady provisioned concurrency to the new
-  # colour (create-before-destroy, so the new colour warms first) and replaces
-  # the Hub task definition (its container env carries the alias ARNs by
-  # colour). Any delete outside those two shapes defeats the flag.
-  authority_selector_flip_allowed=false
-  if jq -e '
-    ([
-      .resource_changes[]?
-      | select(.address == "module.control.terraform_data.foundation_contract")
-      | select((.change.before.input.authority_runtime_contract.selected_authority_color) as $b
-          | (.change.after.input.authority_runtime_contract.selected_authority_color) as $a
-          | ($b == "blue" or $b == "green") and ($a == "blue" or $a == "green") and $b != $a)
-    ] | length == 1)
-  ' "$plan_json" >/dev/null; then
-    authority_selector_flip_allowed=true
-  fi
 
   hub_worker_image_update_allowed=false
   if jq -e '
@@ -470,7 +507,9 @@ if [[ -n "$plan_json" ]]; then
     --argjson authority_proof_disable_allowed \
       "$authority_proof_disable_allowed" \
     --argjson authority_selector_flip_allowed \
-      "$authority_selector_flip_allowed" '
+      "$authority_selector_flip_allowed" \
+    --argjson authority_steady_pc_completion_allowed \
+      "$authority_steady_pc_completion_allowed" '
     # The exact generation-1 function-SG before-state, shared by the replacement
     # and its deposed continuation so both admissions cannot drift apart. Kept
     # field-for-field in lockstep with _is_exact_legacy_authority_sg_before in
@@ -539,6 +578,11 @@ if [[ -n "$plan_json" ]]; then
               $authority_selector_flip_allowed
               and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
             )
+            or (
+              # The completion recovery re-homes the stuck steady pools.
+              $authority_steady_pc_completion_allowed
+              and (.address | startswith("module.control.aws_lambda_provisioned_concurrency_config.authority[\""))
+            )
           )
           and .type == "aws_lambda_provisioned_concurrency_config"
           and .mode == "managed"
@@ -546,11 +590,11 @@ if [[ -n "$plan_json" ]]; then
           and (
             .change.actions == ["delete", "create"]
             or (
-              # Create-before-destroy: the flip provisions the new colour
-              # before the old colour releases, so the fleet never serves an
-              # unwarmed window mid-switch.
-              $authority_selector_flip_allowed
-              and .change.actions == ["create", "delete"]
+              # Both the flip and the completion recovery re-home delete-first
+              # (#3854 reverted create-before-destroy): the old colour releases
+              # its reserved budget before the new colour provisions.
+              ($authority_selector_flip_allowed or $authority_steady_pc_completion_allowed)
+              and .change.actions == ["delete", "create"]
             )
           )
         ) or (

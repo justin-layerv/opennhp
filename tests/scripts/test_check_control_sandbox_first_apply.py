@@ -14587,6 +14587,53 @@ class ComposedTransitionTest(unittest.TestCase):
             CHECKER._claim_authority_selector_flip(changed, acts, by), frozenset()
         )
 
+    def test_steady_pc_completion_admits_delete_create_rehome(self) -> None:
+        """The 2026-08-12 cutover recovery: stuck pools re-home delete-first."""
+        by = {
+            CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS: {
+                "change": {
+                    "actions": ["no-op"],
+                    "after": {"input": {"authority_runtime_contract": {
+                        "selected_authority_color": "blue"}}},
+                }
+            },
+            CHECKER.AUTHORITY_STEADY_PC_PREFIX + '"layerv-nhp-sandbox-ca-ia"]': {
+                "change": {
+                    "actions": ["delete", "create"],
+                    "before": {"qualifier": "green", "provisioned_concurrent_executions": 2},
+                    "after": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+                }
+            },
+        }
+        # End-to-end through check_plan (not just the validator): the full
+        # runtime fleet re-homing delete,create classifies as the completion.
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            by[CHECKER.AUTHORITY_STEADY_PC_PREFIX + f'"{fn}"]'] = {
+                "change": {
+                    "actions": ["delete", "create"],
+                    "before": {"qualifier": "green", "provisioned_concurrent_executions": 2},
+                    "after": {"qualifier": "blue", "provisioned_concurrent_executions": 2},
+                }
+            }
+        changed = {a for a, v in by.items() if v["change"]["actions"] != ["no-op"]}
+        CHECKER._check_authority_steady_pc_completion(changed, by)
+
+    def test_flip_projection_drift_admits_either_direction(self) -> None:
+        """hub_task projection drift is accepted for a green->blue flip too."""
+        import json as _json
+        def role(sel):
+            return {"inline_policy": [{"name": "hub-task", "policy": _json.dumps(
+                CHECKER._expected_hub_task_inline_policy(rollout=False, selected=sel))}]}
+        item = {
+            "address": CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
+            "change": {"actions": ["update"], "before": role("green"), "after": role("blue")},
+        }
+        by = {item["address"]: {"change": {"actions": ["no-op"]}}}
+        self.assertEqual(
+            CHECKER._check_state_normalization_drift([item], by, refresh_only=False),
+            "hub-task-selected-projection",
+        )
+
     def test_the_real_registry_carries_the_expected_lanes(self) -> None:
         names = {name for name, _, _ in CHECKER._COMPOSABLE_TRANSITIONS}
         self.assertEqual(
