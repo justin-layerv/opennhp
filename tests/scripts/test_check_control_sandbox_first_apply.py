@@ -14689,8 +14689,154 @@ class ComposedTransitionTest(unittest.TestCase):
         for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
             change = changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]']
             change["after"]["image_uri"] = new_uri
+        self._advance_standby_aliases(changes)
         summary = CHECKER.check_plan(plan)
         self.assertEqual(summary["plan_mode"], "authority-reserved-envelope-widen")
+
+    def _advance_standby_aliases(self, changes: dict) -> None:
+        """The republish's organic companion: every standby (green — the
+        fixture's contract selects blue) alias advances to the new version,
+        deferred to apply."""
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            alias = changes[
+                f'{CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX}{fn}:green"]'
+            ]
+            alias["actions"] = ["update"]
+            alias["after"] = {
+                **copy.deepcopy(alias["before"]),
+                "function_version": None,
+            }
+            alias["after_unknown"] = {"function_version": True}
+
+    def test_reserved_envelope_widen_refuses_an_alias_ride_without_a_publish(
+        self,
+    ) -> None:
+        """Standby aliases moving with NO image move is not the organic
+        republish shape -- the claim leaves them unclaimed and the plan
+        cannot be fully accounted for."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        self._advance_standby_aliases(changes)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_plan(plan)
+
+    def test_reserved_envelope_widen_refuses_a_partial_standby_ride(self) -> None:
+        """Image moved but only SOME standby aliases advancing is not the
+        organic republish (which republishes every function): refused."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        foundation = changes[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        for side in ("before", "after"):
+            for view in ("input", "output"):
+                global_contract = foundation[side][view][
+                    "authority_runtime_contract"
+                ]["global"]
+                global_contract["authority_image_source"] = "publish_parameter"
+                global_contract.pop("authority_image_digest", None)
+        old_uri = foundation["after"]["input"]["authority_image_uri"]
+        new_uri = old_uri.split("@sha256:")[0] + "@sha256:" + 64 * "f"
+        for view in ("input", "output"):
+            foundation["after"][view]["authority_image_uri"] = new_uri
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]'][
+                "after"
+            ]["image_uri"] = new_uri
+        self._advance_standby_aliases(changes)
+        stale = sorted(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)[0]
+        alias = changes[
+            f'{CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX}{stale}:green"]'
+        ]
+        alias["actions"] = ["no-op"]
+        alias["after"] = copy.deepcopy(alias["before"])
+        alias["after_unknown"] = {}
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_reserved_envelope_widen(changed, acts, by),
+            frozenset(),
+        )
+
+    def test_reserved_envelope_widen_refuses_a_standby_alias_replace(self) -> None:
+        """A standby alias REPLACING (rather than updating in place) is not
+        the hold's advance shape: refused."""
+        plan = self.widen_plan()
+        changes = {
+            item["address"]: item["change"] for item in plan["resource_changes"]
+        }
+        foundation = changes[CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS]
+        for side in ("before", "after"):
+            for view in ("input", "output"):
+                global_contract = foundation[side][view][
+                    "authority_runtime_contract"
+                ]["global"]
+                global_contract["authority_image_source"] = "publish_parameter"
+                global_contract.pop("authority_image_digest", None)
+        old_uri = foundation["after"]["input"]["authority_image_uri"]
+        new_uri = old_uri.split("@sha256:")[0] + "@sha256:" + 64 * "f"
+        for view in ("input", "output"):
+            foundation["after"][view]["authority_image_uri"] = new_uri
+        for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS:
+            changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]'][
+                "after"
+            ]["image_uri"] = new_uri
+        self._advance_standby_aliases(changes)
+        changes[
+            f'{CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX}'
+            f'{sorted(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)[0]}:green"]'
+        ]["actions"] = ["delete", "create"]
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_reserved_envelope_widen(changed, acts, by),
+            frozenset(),
+        )
+
+    def test_reserved_envelope_widen_validator_rejects_a_doctored_claim(self) -> None:
+        """The validator's standby-only recheck is defense-in-depth against a
+        future claim bug: drive it directly with a claimed set that smuggles a
+        selected-colour alias (review #3856)."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        doctored = frozenset(
+            {
+                CHECKER.AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS,
+                f'{CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX}'
+                'layerv-nhp-sandbox-ca-ia:blue"]',
+            }
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "is not the standby colour"
+        ):
+            CHECKER._validate_authority_reserved_envelope_widen(
+                doctored, by, plan
+            )
+
+    def test_reserved_envelope_widen_refuses_a_serving_alias_retarget(self) -> None:
+        """A selected-colour alias update is a traffic move; the widen claim
+        refuses outright rather than leaving it to composition."""
+        plan = self.widen_plan()
+        by = {item["address"]: item for item in plan["resource_changes"]}
+        by[
+            f'{CHECKER.AUTHORITY_ALIAS_ADDRESS_PREFIX}layerv-nhp-sandbox-ca-ia:blue"]'
+        ]["change"]["actions"] = ["update"]
+        changed = {
+            a for a, i in by.items() if i["change"]["actions"] != ["no-op"]
+        }
+        acts = {a: by[a]["change"]["actions"] for a in changed}
+        self.assertEqual(
+            CHECKER._claim_authority_reserved_envelope_widen(changed, acts, by),
+            frozenset(),
+        )
 
     def test_reserved_envelope_widen_rejects_a_split_fleet_image_ride(self) -> None:
         """A non-uniform image ride is rejected INSIDE this lane: the claim
@@ -14720,6 +14866,7 @@ class ComposedTransitionTest(unittest.TestCase):
             changes[f'{CHECKER.AUTHORITY_FUNCTION_ADDRESS_PREFIX}{fn}"]'][
                 "after"
             ]["image_uri"] = new_uri
+        self._advance_standby_aliases(changes)
         with self.assertRaisesRegex(
             CHECKER.ContractError, "contract-pinned repository@digest"
         ):

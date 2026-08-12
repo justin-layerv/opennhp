@@ -10271,6 +10271,44 @@ def _claim_authority_reserved_envelope_widen(
         if not _hub_service_steady_state_wait_only(by_address):
             return frozenset()
         claimed = claimed | {HUB_WORKER_SERVICE_ADDRESS}
+    # A publish riding the widen republishes every function, so the standby
+    # colour's aliases advance in the same plan -- the alias movement the
+    # image-roll lane would have owned had it not stood down for the widen
+    # (and authority-standby-alias-advance stands down whenever functions
+    # move). Own it here, with the image-roll lane's own rules: the ride is
+    # uniform (all standby aliases or none), and NO selected-colour alias may
+    # move -- the hold keeps the serving colour on its live version, and a
+    # selected retarget is a traffic move this lane must never admit.
+    change = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {}).get(
+        "change", {}
+    )
+    input_before = (change.get("before") or {}).get("input") or {}
+    input_after = (change.get("after") or {}).get("input") or {}
+    image_moved = input_before.get("authority_image_uri") != input_after.get(
+        "authority_image_uri"
+    )
+    try:
+        selected = _selected_authority_color_from_contract(input_after)
+    except ContractError:
+        return frozenset()
+    standby = "green" if selected == "blue" else "blue"
+    if any(
+        a.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX)
+        and a.endswith(f':{selected}"]')
+        for a in changed
+    ):
+        return frozenset()
+    if image_moved:
+        expected_aliases = {
+            f'{AUTHORITY_ALIAS_ADDRESS_PREFIX}{fn}:{standby}"]' for fn in fns
+        }
+        if not expected_aliases <= changed:
+            return frozenset()
+        if any(
+            actual_non_noop.get(a) != ["update"] for a in expected_aliases
+        ):
+            return frozenset()
+        claimed = claimed | expected_aliases
     return frozenset(claimed | {AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS})
 
 
@@ -10299,6 +10337,22 @@ def _validate_authority_reserved_envelope_widen(
             "the Hub service update riding the widen must be exactly "
             "wait_for_steady_state turning on"
         )
+    # Alias movement riding the widen must be the hold's shape: only the
+    # standby colour advances (to the version the riding publish creates);
+    # the serving colour's aliases hold. The claim gates this too, but the
+    # validator re-derives it from the plan rather than trusting the claim.
+    selected = _selected_authority_color_from_contract(
+        foundation_after.get("input")
+    )
+    standby = "green" if selected == "blue" else "blue"
+    for address in claimed:
+        if address.startswith(AUTHORITY_ALIAS_ADDRESS_PREFIX) and not (
+            address.endswith(f':{standby}"]')
+        ):
+            raise ContractError(
+                f"{address} is not the standby colour; the widen admits no "
+                "serving-alias movement"
+            )
     # The full runtime-inventory check re-proves the entire after-state against
     # the widened contract: every function's reserved envelope AND image URI,
     # every exhaustion-alarm threshold, and every PC allocation/qualifier. The
@@ -15033,6 +15087,11 @@ def check_plan(
             # to the digest parameter are exactly what precedes a roll, so this
             # is the transition most likely to carry the drift.
             "authority-image-roll",
+            # The one-time envelope widen absorbs a riding publish (image-roll
+            # stands down for it), so the same publisher-written digest drift
+            # can accompany it; the full-inventory validator re-proves uniform
+            # convergence on the refreshed digest.
+            "authority-reserved-envelope-widen",
         )):
             raise ContractError(
                 "authority digest normalization may accompany only a reviewed "
