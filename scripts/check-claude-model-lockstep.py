@@ -38,7 +38,7 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 WORKFLOW_DIR = Path(".github/workflows")
 ACTION_REPOSITORY = "anthropics/claude-code-action"
-PROVEN_ACTION_REF = "be7b93b1907a4abad570368f3c74b6fe3807510b"
+PROVEN_ACTION_REF = "c038e4dcdedfbbca18dfb17df35a17e40ded4ddc"
 PROVEN_MODELS = frozenset({"claude-opus-4-8"})
 
 
@@ -277,7 +277,11 @@ def check(repo_root: Path) -> str:
         )
         raise ContractError(
             f"Claude workflow action refs must use proven SHA "
-            f"{PROVEN_ACTION_REF}: {detail}"
+            f"{PROVEN_ACTION_REF}: {detail}; the pin is a tamper fence, so a "
+            "bump must re-prove the guarded action properties and update this "
+            "constant plus tests/scripts/test_check_claude_model_lockstep.py "
+            'in the same PR — see "Updating the Claude workflow contract" in '
+            ".github/workflows/README.md"
         )
 
     return model

@@ -156,6 +156,23 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    ignore:
+      # anthropics/claude-code-action is a tamper-fenced pin: both Claude
+      # workflows depend on undocumented internals of the action tree, so the
+      # SHA only moves after a human re-proves those properties (see
+      # "Updating the Claude workflow contract" in .github/workflows/README.md).
+      # v1.0.187 added replaceCheckoutCredentials() and calls it from the
+      # use_commit_signing:true branch that previously did nothing. It runs
+      # `git remote set-url origin` at a github.com URL, overwriting the
+      # local-origin shim both workflows install, and — since neither sets
+      # allowed_non_write_users — embeds the token in .git/config inside the
+      # tree Claude runs in. That breaks two invariants the workflows assert.
+      # Held until the action can leave `origin` alone under API signing (or
+      # the shim is redesigned to survive it); then bump and drop this ignore.
+      # Security updates are exempt from ignore, so an action CVE still
+      # surfaces a PR.
+      - dependency-name: "anthropics/claude-code-action"
+        versions: [">=1.0.187"]
 
   # Docker
   # Scoped to /docker, so an ubuntu base-image digest bump here CANNOT touch

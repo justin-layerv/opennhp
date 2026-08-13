@@ -210,7 +210,7 @@ jobs:
             exit 1
           fi
 
-          # v1.0.183 preserves PR-authored startup-sensitive paths under
+          # v1.0.186 preserves PR-authored startup-sensitive paths under
           # .claude-pr/ with dereferencing enabled before restoring the base
           # copies. A symlink such as .claude/settings.json ->
           # /proc/self/environ would therefore materialize this secrets-bearing
@@ -311,9 +311,9 @@ jobs:
       - name: Run Claude Code
         id: claude
         if: success()
-        # v1.0.183 keeps interactive commands on the same fail-closed runner as
+        # v1.0.186 keeps interactive commands on the same fail-closed runner as
         # automatic review and avoids the v1.0.140/141 issue-comment crash.
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        uses: anthropics/claude-code-action@c038e4dcdedfbbca18dfb17df35a17e40ded4ddc # v1.0.186
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Omit github_token so the action uses its OIDC/GitHub App token path.

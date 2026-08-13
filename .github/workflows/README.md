@@ -379,6 +379,38 @@ action or model upgrade must make all of these changes in one PR:
    `tests/scripts/test_check_claude_model_lockstep.py`.
 5. Run `make lint-workflows`.
 
+The pinned SHA is hardcoded in three places on purpose. It is a tamper fence,
+not a cache: the pin may only move when a human has re-proved the properties
+below against the candidate tree, so it must not be derived from the workflow
+files the bump edits. Dependabot can therefore never green its own
+`claude-code-action` PR — every bump needs the paired edit above, and a red
+`validate-workflows` on such a PR is the fence working, not a flake.
+
+The properties that must be re-proved on each bump, because the workflows
+depend on them rather than on the action's documented interface:
+
+- `base-action/src/run-claude-sdk.ts` — a terminal SDK result with
+  `subtype: success` and `is_error: true` fails the step.
+- `src/github/operations/restore-config.ts` — the dereferencing `.claude-pr/`
+  snapshot, and its `SENSITIVE_PATHS` list still matching the `sensitive_paths`
+  array the interactive preflight fences.
+- `src/github/operations/git-config.ts` — with `use_commit_signing: true`, the
+  action installs no Git credentials and leaves `origin` alone.
+
+**Held at v1.0.186: do not bump to v1.0.187 or later without redesigning the
+local-origin shim.** v1.0.187 added `replaceCheckoutCredentials()` and calls it
+from the `use_commit_signing: true` branch of both `src/modes/tag/index.ts` and
+`src/modes/agent/index.ts` — the branch that previously did nothing. It runs
+`git remote set-url origin` against a `github.com` URL, so it overwrites the
+local-origin shim both workflows install and points Git back at a credentialed
+remote. Because neither workflow sets `allowed_non_write_users`, it takes the
+`else` path and embeds the token directly in `.git/config`
+(`https://x-access-token:<token>@github.com/...`) inside the tree Claude runs
+in. That contradicts two invariants asserted above — the shim exposing only the
+validated head and base refs, and API signing not installing Git credentials —
+so a bump past v1.0.186 is a guard design change, not a version edit.
+`.github/dependabot.yml` holds the pin at `<1.0.187` with the same rationale.
+
 Keep each `claude_args` value on one single-quoted line and set the model only
 through `--model`. Alternate scalar forms, embedded single quotes, native
 `model:` inputs, and one-sided or unproven pins require an explicit guard design
@@ -390,7 +422,7 @@ workflow token input and use the action's OIDC/GitHub App token with commit
 signing for accepted edits;
 checkout credentials remain disabled. Before the pinned action performs that
 checkout, the workflow rejects symlinks, gitlinks, and other non-regular leaves
-under v1.0.183's startup-sensitive preservation paths; otherwise the action's
+under v1.0.186's startup-sensitive preservation paths; otherwise the action's
 dereferencing `.claude-pr/` snapshot could materialize an out-of-tree secret.
 Both workflows replace the GitHub remote
 with a local-origin shim that exposes only the validated head and base refs
@@ -404,7 +436,7 @@ Automatic review must retain its default-branch-trusted
 `pull_request_target` event, PR-author bot exclusion, same-repository head and
 base, ready-candidate guard, `opened`/`synchronize`/`reopened`/
 `ready_for_review` triggers, and per-PR cancellation. It uses the narrowly
-scoped workflow token with API signing so v1.0.183 does not install Git
+scoped workflow token with API signing so v1.0.186 does not install Git
 credentials. Its model receives only the enumerated read/comment GitHub MCP
 tools; local file, shell, network, delegation, and GitHub file-write tools stay
 denied. The interactive tag-mode entry point excludes only the exact
