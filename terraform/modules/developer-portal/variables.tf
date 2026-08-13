@@ -234,3 +234,46 @@ variable "ci_bypass_secret_name" {
   type        = string
   default     = null
 }
+
+# ==============================================================================
+# Fixed-Resource Demo (the /qurl LiveDemo's "hidden app")
+# ==============================================================================
+# The demo publishes one constant protected-resource URL whose hostname is
+# deliberately dark (no DNS record), so the playground's create path can never
+# resolve or SSRF-validate it. When these are set, a create request for exactly
+# playground_demo_target_url instead mints a fresh link for the pre-provisioned
+# resource. All three must be set together (enforced by a precondition on the
+# Lambda); empty (the default) leaves the demo path disabled.
+
+variable "playground_demo_target_url" {
+  description = "Exact protected-resource URL the LiveDemo publishes (e.g. https://hidden-app.layerv.ai). Coupled contract: must match the website LiveDemo's published constant byte-for-byte (same case, no trailing slash) — a drifted value silently falls back to the client's simulated links. Empty disables the demo mint path."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.playground_demo_target_url == "" || can(regex("^https://[a-z0-9.-]+(:[0-9]+)?$", var.playground_demo_target_url))
+    error_message = "playground_demo_target_url must be https:// with a bare host (no path) — the Lambda matches it by exact string equality."
+  }
+}
+
+variable "playground_demo_resource_id" {
+  description = "qurl-service resource id of the pre-provisioned resource serving the demo page. Must be owned by the account the playground M2M credentials authenticate as, or mint_link fails."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.playground_demo_resource_id == "" || can(regex("^[a-zA-Z0-9_-]{1,64}$", var.playground_demo_resource_id))
+    error_message = "playground_demo_resource_id must match the Lambda's QURL id pattern (^[a-zA-Z0-9_-]{1,64}$)."
+  }
+}
+
+variable "playground_demo_qurl_site" {
+  description = "qurl_site URL returned verbatim to the LiveDemo for the demo resource (e.g. https://r_abc.qurl.site)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.playground_demo_qurl_site == "" || can(regex("^https://[A-Za-z0-9._-]+(:[0-9]+)?$", var.playground_demo_qurl_site))
+    error_message = "playground_demo_qurl_site must be https:// with a bare host (no path) — it is returned verbatim to the demo client."
+  }
+}

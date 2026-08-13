@@ -2247,6 +2247,39 @@ variable "developer_portal_connector_base_url" {
   }
 }
 
+variable "developer_portal_demo_target_url" {
+  description = "Exact protected-resource URL the /qurl LiveDemo publishes (e.g. https://hidden-app.layerv.ai). When set with the other developer_portal_demo_* variables, playground creates for exactly this URL mint links for the pre-provisioned demo resource instead of creating a URL resource. Coupled contract: must match the website LiveDemo's published constant byte-for-byte. Empty disables the demo mint path."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.developer_portal_demo_target_url == "" || can(regex("^https://[a-z0-9.-]+(:[0-9]+)?$", var.developer_portal_demo_target_url))
+    error_message = "developer_portal_demo_target_url must be https:// with a bare host (no path) — the Lambda matches it by exact string equality."
+  }
+}
+
+variable "developer_portal_demo_resource_id" {
+  description = "qurl-service resource id of the pre-provisioned resource serving the LiveDemo hidden page. Must be owned by the account the playground M2M credentials authenticate as."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.developer_portal_demo_resource_id == "" || can(regex("^[a-zA-Z0-9_-]{1,64}$", var.developer_portal_demo_resource_id))
+    error_message = "developer_portal_demo_resource_id must match the Lambda's QURL id pattern (^[a-zA-Z0-9_-]{1,64}$)."
+  }
+}
+
+variable "developer_portal_demo_qurl_site" {
+  description = "qurl_site URL returned verbatim to the LiveDemo for the demo resource (e.g. https://r_abc.qurl.site)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.developer_portal_demo_qurl_site == "" || can(regex("^https://[A-Za-z0-9._-]+(:[0-9]+)?$", var.developer_portal_demo_qurl_site))
+    error_message = "developer_portal_demo_qurl_site must be https:// with a bare host (no path) — it is returned verbatim to the demo client."
+  }
+}
+
 # ==================== Shared Dashboard CORS ====================
 
 variable "dashboard_allowed_origins" {

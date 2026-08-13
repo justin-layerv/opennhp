@@ -32,6 +32,16 @@ resource "aws_lambda_function" "playground" {
       condition     = var.playground_upload_timeout_seconds + var.playground_mint_timeout_seconds <= 25
       error_message = "playground_upload_timeout_seconds + playground_mint_timeout_seconds must be <= 25 (leaves 5s headroom inside API Gateway's 30s integration timeout for base64 decode + rate-limit writes + cold-start M2M + transport)."
     }
+    precondition {
+      condition = (
+        (var.playground_demo_target_url == "") ==
+        (var.playground_demo_resource_id == "")
+        ) && (
+        (var.playground_demo_target_url == "") ==
+        (var.playground_demo_qurl_site == "")
+      )
+      error_message = "playground_demo_target_url, playground_demo_resource_id, and playground_demo_qurl_site must be set together (all or none) — a partial config silently disables the demo mint path."
+    }
   }
 
   filename         = data.archive_file.playground.output_path
@@ -84,6 +94,14 @@ resource "aws_lambda_function" "playground" {
       },
       var.ci_bypass_secret_name != null ? {
         CI_BYPASS_SECRET_NAME = var.ci_bypass_secret_name
+      } : {},
+      # Fixed-resource demo: rendered only when configured so the dark
+      # default leaves no empty env vars behind. All-or-none is enforced
+      # by the lifecycle precondition above.
+      var.playground_demo_target_url != "" ? {
+        PLAYGROUND_DEMO_TARGET_URL  = var.playground_demo_target_url
+        PLAYGROUND_DEMO_RESOURCE_ID = var.playground_demo_resource_id
+        PLAYGROUND_DEMO_QURL_SITE   = var.playground_demo_qurl_site
       } : {}
     )
   }
@@ -207,6 +225,41 @@ resource "aws_iam_role_policy" "playground" {
 # ==============================================================================
 # CloudWatch Alarm (optional)
 # ==============================================================================
+
+# Demo-mint failure visibility. handle_demo_mint passes upstream errors
+# through and the LiveDemo client silently falls back to simulated links, so
+# this log-literal filter + alarm is the ONLY operator signal that the live
+# demo is degraded (deleted demo resource, rotated M2M credentials, upstream
+# outage). The pattern matches the Lambda's exact logger.warning literal;
+# while the demo is unconfigured (dark) the filter simply never matches.
+resource "aws_cloudwatch_log_metric_filter" "playground_demo_mint_failures" {
+  name           = "${var.name_prefix}-playground-demo-mint-failures"
+  log_group_name = aws_cloudwatch_log_group.playground.name
+  pattern        = "{ $.message = \"Demo mint upstream failure\" }"
+
+  metric_transformation {
+    name      = "PlaygroundDemoMintFailures"
+    namespace = "LayerV/DeveloperPortal"
+    value     = "1"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "playground_demo_mint_failures" {
+  count               = local.has_sns ? 1 : 0
+  alarm_name          = "${var.name_prefix}-playground-demo-mint-failures"
+  alarm_description   = "The LiveDemo fixed-resource mint is failing upstream — users are silently getting simulated links. Check the demo resource, playground M2M credentials, and qurl-service health."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "PlaygroundDemoMintFailures"
+  namespace           = "LayerV/DeveloperPortal"
+  period              = 900
+  statistic           = "Sum"
+  threshold           = 2
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+}
 
 resource "aws_cloudwatch_metric_alarm" "playground_errors" {
   count               = local.has_sns ? 1 : 0

@@ -920,6 +920,332 @@ class TestCreateHandler:
 
 
 # ---------------------------------------------------------------------------
+# Fixed-Resource Demo Tests
+# ---------------------------------------------------------------------------
+
+DEMO_TARGET = 'https://hidden-app.example'
+DEMO_RESOURCE_ID = 'r_demo1234567'
+DEMO_QURL_SITE = 'https://r_demo1234567.qurl.site'
+
+
+def _enable_demo(pp):
+    """Configure the fixed-resource demo on a freshly imported module."""
+    pp.PLAYGROUND_DEMO_TARGET_URL = DEMO_TARGET
+    pp.PLAYGROUND_DEMO_RESOURCE_ID = DEMO_RESOURCE_ID
+    pp.PLAYGROUND_DEMO_QURL_SITE = DEMO_QURL_SITE
+
+
+def _demo_mint_upstream(qurl_link='https://qurl.link/#at_demo', qurl_id='q_minted1',
+                        expires_at='2026-07-14T12:00:00Z'):
+    """A successful upstream mint_link response body."""
+    return {'data': {'qurl_link': qurl_link, 'qurl_id': qurl_id,
+                     'expires_at': expires_at, 'type': 'tunnel'}}
+
+
+class TestDemoFixedResource:
+    """Tests for the fixed-resource demo mint path."""
+
+    def _demo_event(self, create_event, **overrides):
+        body = {'target_url': DEMO_TARGET, 'expires_in': '15m', 'one_time_use': True}
+        body.update(overrides)
+        create_event['body'] = json.dumps(body)
+        return create_event
+
+    def test_demo_mint_happy_path(self, mock_dynamodb, mock_proxy, create_event):
+        """A create for exactly the demo URL mints from the fixed resource."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            mock_proxy.assert_called_once_with(
+                'POST', f'/v1/qurls/{DEMO_RESOURCE_ID}/mint_link',
+                body={'expires_in': '15m', 'one_time_use': True})
+            assert response['statusCode'] == 201
+            data = json.loads(response['body'])['data']
+            assert data == {
+                'resource_id': DEMO_RESOURCE_ID,
+                'qurl_id': 'q_minted1',
+                'qurl_link': 'https://qurl.link/#at_demo',
+                'qurl_site': DEMO_QURL_SITE,
+                'expires_at': '2026-07-14T12:00:00Z',
+            }
+
+    def test_demo_mint_caps_ttl(self, mock_dynamodb, mock_proxy, create_event):
+        """The playground TTL cap applies to demo mints too."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            pp.lambda_handler(self._demo_event(create_event, expires_in='2h'), None)
+
+            assert mock_proxy.call_args[1]['body']['expires_in'] == '30m'
+
+    def test_demo_mint_defaults_ttl_when_absent(self, mock_dynamodb, mock_proxy, create_event):
+        """Missing expires_in falls back to the playground max."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            create_event['body'] = json.dumps({'target_url': DEMO_TARGET})
+            pp.lambda_handler(create_event, None)
+
+            assert mock_proxy.call_args[1]['body'] == {'expires_in': '30m'}
+
+    def test_demo_mint_rejects_non_bool_one_time_use(self, mock_dynamodb, mock_proxy, create_event):
+        """one_time_use is validated exactly like the create path."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+
+            response = pp.lambda_handler(
+                self._demo_event(create_event, one_time_use='yes'), None)
+
+            assert response['statusCode'] == 400
+            assert 'one_time_use' in json.loads(response['body'])['error']
+            mock_proxy.assert_not_called()
+
+    def test_demo_mint_passes_upstream_error_through(self, mock_dynamodb, mock_proxy, create_event):
+        """Upstream mint errors pass through so the client can fall back."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (404, {'error': {'detail': 'Resource not found'}})
+
+            response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            assert response['statusCode'] == 404
+            assert json.loads(response['body']) == {'error': {'detail': 'Resource not found'}}
+
+    def test_demo_mint_2xx_without_link_is_502(self, mock_dynamodb, mock_proxy, create_event):
+        """A malformed upstream success cannot produce a linkless demo response."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, {'data': {'qurl_id': 'q_minted1'}})
+
+            response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            assert response['statusCode'] == 502
+
+    def test_demo_mint_rate_limited(self, mock_dynamodb, mock_proxy, create_event):
+        """Rate limits are enforced before the demo mint."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            pp.check_rate_limits = MagicMock(return_value='Too many requests. Please try again later.')
+
+            response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            assert response['statusCode'] == 429
+            mock_proxy.assert_not_called()
+
+    def test_demo_target_normalizes_trailing_slash_and_case(self, mock_dynamodb, mock_proxy, create_event):
+        """The two likely drift footguns — trailing slash and case — still match."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            for variant in (DEMO_TARGET + '/', DEMO_TARGET.upper()):
+                mock_proxy.reset_mock()
+                pp.lambda_handler(self._demo_event(create_event, target_url=variant), None)
+                assert mock_proxy.call_args[0][:2] == (
+                    'POST', f'/v1/qurls/{DEMO_RESOURCE_ID}/mint_link'
+                ), variant
+
+    def test_demo_mint_failure_logs_operator_signal(self, mock_dynamodb, mock_proxy, create_event, caplog):
+        """Upstream failures emit the exact literal the metric filter alarms on."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (404, {'error': {'code': 'resource_not_found',
+                                                       'detail': 'Resource not found'}})
+
+            with caplog.at_level('WARNING'):
+                pp.lambda_handler(self._demo_event(create_event), None)
+
+            records = [r for r in caplog.records if r.message == 'Demo mint upstream failure']
+            assert len(records) == 1
+            assert records[0].resource_id == DEMO_RESOURCE_ID
+            assert records[0].status == 404
+            assert records[0].error_code == 'resource_not_found'
+
+    def test_demo_requires_exact_target_match(self, mock_dynamodb, mock_proxy, create_event):
+        """A non-demo target stays on the normal create path."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+
+            create_event['body'] = json.dumps({
+                'target_url': 'https://example.com',
+                'expires_in': '15m'
+            })
+            pp.lambda_handler(create_event, None)
+
+            assert mock_proxy.call_args[0][:2] == ('POST', '/v1/qurls')
+
+    def test_demo_url_with_path_is_not_demo(self, mock_dynamodb, mock_proxy, create_event):
+        """Only the exact demo URL triggers the mint path — not sub-paths."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+
+            with patch('socket.getaddrinfo', side_effect=socket.gaierror):
+                response = pp.lambda_handler(
+                    self._demo_event(create_event, target_url=DEMO_TARGET + '/admin'), None)
+
+            assert response['statusCode'] == 400
+            assert 'resolve' in json.loads(response['body'])['error']
+            mock_proxy.assert_not_called()
+
+    def test_demo_disabled_by_default(self, mock_dynamodb, mock_proxy, create_event):
+        """Without config, the demo URL hits normal validation (and fails DNS)."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+
+            with patch('socket.getaddrinfo', side_effect=socket.gaierror):
+                response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            assert response['statusCode'] == 400
+            assert 'resolve' in json.loads(response['body'])['error']
+            mock_proxy.assert_not_called()
+
+    def test_demo_partially_configured_stays_disabled(self, mock_dynamodb, mock_proxy, create_event):
+        """A half-set config (e.g. missing qurl_site) never mints."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            pp.PLAYGROUND_DEMO_TARGET_URL = DEMO_TARGET
+            pp.PLAYGROUND_DEMO_RESOURCE_ID = DEMO_RESOURCE_ID
+
+            with patch('socket.getaddrinfo', side_effect=socket.gaierror):
+                response = pp.lambda_handler(self._demo_event(create_event), None)
+
+            assert response['statusCode'] == 400
+            mock_proxy.assert_not_called()
+
+    def test_delete_demo_resource_forbidden(self, mock_dynamodb, mock_proxy, delete_event):
+        """The public demo resource id must not be revocable anonymously."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+
+            delete_event['rawPath'] = f'/playground/qurl/{DEMO_RESOURCE_ID}'
+            delete_event['pathParameters'] = {'id': DEMO_RESOURCE_ID}
+            response = pp.lambda_handler(delete_event, None)
+
+            assert response['statusCode'] == 403
+            assert 'cannot be revoked' in json.loads(response['body'])['error']
+            mock_proxy.assert_not_called()
+
+    def test_delete_other_id_still_proxied(self, mock_dynamodb, mock_proxy, delete_event):
+        """Non-demo deletes keep working when the demo is configured."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (204, {})
+
+            response = pp.lambda_handler(delete_event, None)
+
+            assert response['statusCode'] == 200
+            mock_proxy.assert_called_once_with('DELETE', '/v1/qurls/r_test123')
+
+    def _direct_mint_event(self, qurl_id, body):
+        return {
+            'requestContext': {'http': {'method': 'POST', 'sourceIp': '203.0.113.1'}},
+            'rawPath': f'/playground/qurl/{qurl_id}/mint',
+            'headers': {'origin': 'https://layerv.ai'},
+            'pathParameters': {'id': qurl_id},
+            'body': json.dumps(body),
+        }
+
+    def test_direct_mint_of_demo_id_is_clamped(self, mock_dynamodb, mock_proxy):
+        """The public demo id cannot mint uncapped or absolute-expiry links via /mint."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            event = self._direct_mint_event(DEMO_RESOURCE_ID, {
+                'expires_in': '30d',
+                'expires_at': '2027-01-01T00:00:00Z',
+                'max_sessions': 0,
+                'session_duration': '24h',
+                'one_time_use': False,
+            })
+            pp.lambda_handler(event, None)
+
+            mock_proxy.assert_called_once_with(
+                'POST', f'/v1/qurls/{DEMO_RESOURCE_ID}/mint_link',
+                body={'expires_in': '30m', 'one_time_use': False})
+
+    def test_direct_mint_of_demo_id_validates_one_time_use(self, mock_dynamodb, mock_proxy):
+        """Demo-id mints via /mint validate one_time_use like the demo path."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+
+            event = self._direct_mint_event(DEMO_RESOURCE_ID, {'one_time_use': 'yes'})
+            response = pp.lambda_handler(event, None)
+
+            assert response['statusCode'] == 400
+            mock_proxy.assert_not_called()
+
+    def test_direct_mint_of_other_id_stays_raw_passthrough(self, mock_dynamodb, mock_proxy):
+        """Non-demo ids keep the existing raw mint passthrough."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+            _enable_demo(pp)
+            mock_proxy.return_value = (201, _demo_mint_upstream())
+
+            body = {'expires_in': '7d', 'label': 'for a friend'}
+            pp.lambda_handler(self._direct_mint_event('r_other123', body), None)
+
+            mock_proxy.assert_called_once_with(
+                'POST', '/v1/qurls/r_other123/mint_link', body=body)
+
+
+# ---------------------------------------------------------------------------
 # CORS Tests
 # ---------------------------------------------------------------------------
 

@@ -99,6 +99,17 @@ MAX_TTL_DURATION = '30m'
 # control; removing would require flagging a future cap implementation.
 MAX_ACTIVE_QURLS_PER_IP = 10  # max active QURLs per IP per hour (unused — see note above)
 
+# Fixed-resource demo (the /qurl LiveDemo's "hidden app"). The demo publishes
+# one constant protected-resource URL whose hostname is deliberately dark (no
+# DNS record — invisibility is the point), so the normal create path can never
+# resolve or SSRF-validate it. When all three values are set, a create request
+# for EXACTLY that URL instead mints a fresh link for the pre-provisioned
+# connector resource that serves the hidden page. Any value empty (the
+# default) disables the demo path entirely.
+PLAYGROUND_DEMO_TARGET_URL = os.environ.get('PLAYGROUND_DEMO_TARGET_URL', '')
+PLAYGROUND_DEMO_RESOURCE_ID = os.environ.get('PLAYGROUND_DEMO_RESOURCE_ID', '')
+PLAYGROUND_DEMO_QURL_SITE = os.environ.get('PLAYGROUND_DEMO_QURL_SITE', '')
+
 # File upload constraints (POST /playground/upload).
 # Cap below Lambda's 6 MB sync payload limit so a base64-encoded multipart
 # body still fits with envelope overhead. Tune via env if Lambda is moved
@@ -230,8 +241,15 @@ def handle_create_qurl(event):
         if rate_error:
             return cors_response(event, 429, {'error': rate_error})
 
-    # Validate target URL (must be HTTPS, no private/internal IPs)
     target_url = body.get('target_url', '')
+
+    # Fixed-resource demo: a dark hostname can never pass validate_target_url,
+    # so a create for exactly the demo URL mints from the pre-provisioned
+    # resource instead (rate limits above still applied).
+    if _is_demo_target(target_url):
+        return handle_demo_mint(event, body)
+
+    # Validate target URL (must be HTTPS, no private/internal IPs)
     valid, error_msg = validate_target_url(target_url)
     if not valid:
         return cors_response(event, 400, {'error': error_msg})
@@ -282,8 +300,111 @@ def handle_create_qurl(event):
     return cors_response(event, status, response_body)
 
 
+def _is_demo_target(target_url):
+    """
+    True when the fixed-resource demo is configured and target_url is its URL.
+
+    The comparison is a deliberate coupled contract with the website LiveDemo
+    constant (layervai/website PR #630's PROTECTED_RESOURCE_URL). Trailing
+    slashes and letter case are normalized away — the two most likely drift
+    footguns — but nothing else is: any other variant silently falls through
+    to validate_target_url and the client's simulated-link fallback. The
+    config side is regex-pinned to a bare lowercase-scheme https host.
+    """
+    if not (PLAYGROUND_DEMO_TARGET_URL and PLAYGROUND_DEMO_RESOURCE_ID and PLAYGROUND_DEMO_QURL_SITE):
+        return False
+    if not isinstance(target_url, str):
+        return False
+    return target_url.rstrip('/').lower() == PLAYGROUND_DEMO_TARGET_URL.rstrip('/').lower()
+
+
+def _demo_mint_body(body):
+    """
+    Clamp a caller body to the demo mint contract: capped TTL, validated
+    one_time_use, and nothing else. The demo resource's id is public, so
+    caller-controlled expiry (`expires_in` beyond the cap, or the absolute
+    `expires_at` escape hatch) and session/policy parameters must never
+    reach the upstream mint for it.
+
+    Returns (mint_body, None) on success or (None, error_body) for a 400.
+    """
+    if not isinstance(body, dict):
+        body = {}
+    mint_body = {'expires_in': cap_ttl(body.get('expires_in', MAX_TTL_DURATION))}
+    if 'one_time_use' in body:
+        if not isinstance(body['one_time_use'], bool):
+            return None, {'error': 'one_time_use must be a boolean'}
+        mint_body['one_time_use'] = body['one_time_use']
+    return mint_body, None
+
+
+def handle_demo_mint(event, body):
+    """
+    Mint a link for the pre-provisioned fixed demo resource.
+
+    Reuses the create request/response contract so the demo client needs no
+    special casing: TTL is capped like create, one_time_use is validated like
+    create, and the response carries the same envelope. Create-only options
+    (description, max_sessions, access_policy) are ignored — mint_link is a
+    different upstream contract and the demo resource's policy is not
+    caller-controlled.
+    """
+    mint_body, error_body = _demo_mint_body(body)
+    if error_body is not None:
+        return cors_response(event, 400, error_body)
+
+    status, upstream = proxy_to_qurl_api(
+        'POST', f'/v1/qurls/{PLAYGROUND_DEMO_RESOURCE_ID}/mint_link', body=mint_body)
+    if not 200 <= status < 300:
+        # Pass upstream errors through untouched; the demo client falls back
+        # to a simulated link on any failure — which means this branch firing
+        # persistently is INVISIBLE to end users (they just get fake links).
+        # Log loudly: the exact message literal feeds the
+        # PlaygroundDemoMintFailures metric filter + alarm in playground.tf.
+        error_code = None
+        if isinstance(upstream, dict) and isinstance(upstream.get('error'), dict):
+            error_code = upstream['error'].get('code')
+        logger.warning("Demo mint upstream failure", extra={
+            "resource_id": PLAYGROUND_DEMO_RESOURCE_ID,
+            "status": status,
+            "error_code": error_code,
+        })
+        return cors_response(event, status, upstream)
+
+    data = upstream.get('data') if isinstance(upstream, dict) else None
+    qurl_link = data.get('qurl_link') if isinstance(data, dict) else None
+    if not qurl_link:
+        logger.error("Demo mint returned 2xx without qurl_link",
+                     extra={"status": status,
+                            "keys": sorted(data.keys()) if isinstance(data, dict) else None})
+        return cors_response(event, 502, {'error': {'detail': 'Upstream request failed'}})
+
+    source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
+    logger.info("Playground demo mint", extra={
+        "resource_id": PLAYGROUND_DEMO_RESOURCE_ID,
+        "qurl_id": data.get('qurl_id'),
+        "source_ip": source_ip,
+    })
+
+    return cors_response(event, status, {'data': {
+        'resource_id': PLAYGROUND_DEMO_RESOURCE_ID,
+        'qurl_id': data.get('qurl_id'),
+        'qurl_link': qurl_link,
+        'qurl_site': PLAYGROUND_DEMO_QURL_SITE,
+        'expires_at': data.get('expires_at'),
+    }})
+
+
 def handle_get_qurl(event, qurl_id):
-    """Get QURL status by ID."""
+    """
+    Get QURL status by ID.
+
+    Deliberately NOT guarded for the public demo resource id (unlike DELETE,
+    and unlike the mint clamp): this is read-only, rate-limited, and the demo
+    resource's identity and site are already public by design — its upstream
+    status reveals nothing sensitive, while a guard would special-case the
+    one id for no concrete risk reduction.
+    """
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
     if not _is_ci_bypass(event):
@@ -303,6 +424,15 @@ def handle_delete_qurl(event, qurl_id):
         rate_error = check_rate_limits(source_ip)
         if rate_error:
             return cors_response(event, 429, {'error': rate_error})
+
+    # The fixed demo resource's id is public (every demo response includes
+    # it), so the shared long-lived resource must not be revocable through
+    # the anonymous playground. Other ids stay deletable as before — their
+    # creators are the only ones who learn them. Unlike _is_demo_target,
+    # this deliberately keys on the id alone (not the all-or-none trio):
+    # protecting the resource must survive any out-of-band env drift.
+    if PLAYGROUND_DEMO_RESOURCE_ID and qurl_id == PLAYGROUND_DEMO_RESOURCE_ID:
+        return cors_response(event, 403, {'error': 'The demo resource cannot be revoked'})
 
     status, response_body = proxy_to_qurl_api('DELETE', f'/v1/qurls/{qurl_id}')
     # Upstream returns 204 No Content on success; normalize to 200 with a body
@@ -328,6 +458,25 @@ def handle_mint_link(event, qurl_id):
     except (json.JSONDecodeError, TypeError):
         body = {}
 
+    # The fixed demo resource's id is public (every demo response includes
+    # it), and this raw passthrough would otherwise let anonymous callers
+    # mint links to the hidden app with an uncapped TTL (via expires_in OR
+    # the absolute expires_at) and arbitrary session/policy parameters.
+    # Clamp demo-id mints to the same contract as handle_demo_mint. Other
+    # ids DELIBERATELY keep the raw passthrough: they are unguessable
+    # (r_ + random) and known only to their creators, so the playground
+    # 30m cap is not enforced on this route for them today — whether it
+    # should be is tracked separately (see the issue referenced in the
+    # PR that added this clamp).
+    if PLAYGROUND_DEMO_RESOURCE_ID and qurl_id == PLAYGROUND_DEMO_RESOURCE_ID:
+        body, error_body = _demo_mint_body(body)
+        if error_body is not None:
+            return cors_response(event, 400, error_body)
+
+    # Response stays raw passthrough even for the demo id — the clamp above
+    # hardens the REQUEST only. handle_demo_mint's 502-normalization of a
+    # linkless 2xx is deliberately not mirrored here: this route's contract
+    # is the true upstream response, and it is not the LiveDemo client path.
     status, response_body = proxy_to_qurl_api('POST', f'/v1/qurls/{qurl_id}/mint_link', body=body)
     return cors_response(event, status, response_body)
 

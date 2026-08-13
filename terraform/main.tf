@@ -3571,6 +3571,13 @@ module "developer_portal" {
   # own default for unit-testing only; the root insists on an
   # explicit env-level value.
   connector_base_url = var.developer_portal_connector_base_url
+
+  # Fixed-resource demo (the /qurl LiveDemo's "hidden app"). Dark until an
+  # environment sets all three in its tfvars — see the module variables for
+  # the all-or-none contract.
+  playground_demo_target_url  = var.developer_portal_demo_target_url
+  playground_demo_resource_id = var.developer_portal_demo_resource_id
+  playground_demo_qurl_site   = var.developer_portal_demo_qurl_site
 }
 
 # ==================== Billing ====================
