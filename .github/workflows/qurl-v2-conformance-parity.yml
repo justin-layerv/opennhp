@@ -63,7 +63,7 @@ jobs:
     # Node 22 matches the js-agent toolchain pin (js-agent.yml). setup-node warms
     # the npm cache even though the parity script runs `npm ci` itself.
     - name: Set up Node
-      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22'
         cache: npm
