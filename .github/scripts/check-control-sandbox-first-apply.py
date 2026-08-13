@@ -15538,6 +15538,18 @@ def check_state_list(path: Path) -> dict[str, int]:
             "the blue/green hold's live-alias reads require the Authority "
             "runtime slice"
         )
+    # The switch pointer's live read persists in state once the pointer gate
+    # is on. It is meaningless without the hold (the module precondition
+    # enforces the same dependency at plan time).
+    pointer_read_address = (
+        "module.control.data.aws_ssm_parameter.authority_active_color[0]"
+    )
+    pointer_read_present = pointer_read_address in addresses
+    if pointer_read_present and not blue_green_hold_present:
+        raise ContractError(
+            "the selector pointer read requires the blue/green hold's "
+            "live-alias reads"
+        )
     hub_edge_present = bool(addresses & hub_edge_extra)
     hub_worker_present = bool(addresses & hub_worker_managed)
     if proof_present and not runtime_present:
@@ -15575,6 +15587,7 @@ def check_state_list(path: Path) -> dict[str, int]:
         | (proof_consumer_data_extra if proof_present else set())
         | (proof_rollout_data_extra if proof_rollout_present else set())
         | (blue_green_data_extra if blue_green_hold_present else set())
+        | ({pointer_read_address} if pointer_read_present else set())
         | (hub_edge_extra if hub_edge_present else set())
         | (hub_worker_extra if hub_worker_present else set())
     )
@@ -15602,6 +15615,7 @@ def check_state_list(path: Path) -> dict[str, int]:
                 if blue_green_hold_present
                 else 0
             )
+            + (1 if pointer_read_present else 0)
             + (len(HUB_WORKER_DATA_RESOURCES) if hub_worker_present else 0)
         ),
         "managed_resource_count": (
