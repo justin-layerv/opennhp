@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.4
 	github.com/aws/aws-sdk-go-v2/config v1.32.35
 	github.com/aws/aws-sdk-go-v2/service/iam v1.54.5
-	github.com/aws/aws-sdk-go-v2/service/lambda v1.101.1
+	github.com/aws/aws-sdk-go-v2/service/lambda v1.101.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.1
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.4
 	github.com/pelletier/go-toml/v2 v2.4.2
