@@ -192,19 +192,18 @@ The SSM reads are strict by design. A transient AWS/SSM failure in either the
 pre-build drift job or the post-switch `Update Deployment Tracking` gate should
 fail the run red and be rerun after AWS recovers, not guessed clean. If the
 post-switch gate fails after a healthy rollout, leave `deployed-commit` stale so
-the next scheduled deploy re-proves the live configured tags before recording
-the SHA.
+the next deploy (main push or sandbox dispatch) re-proves the live configured
+tags before recording the SHA.
 
 If an active image tag points at a commit GitHub can no longer fetch, the drift
 gate also fails closed into a forced app build/roll until the live tags converge
 and deployment tracking can be stamped honestly again.
 
 Only pushes matching `build-and-push.yml`'s `on.push.paths` start this gate, so
-a docs-only `main` push does not heal pre-existing drift by itself. The scheduled
-deploy path and an explicit sandbox `workflow_dispatch` do run the same drift
-gate and can heal drift by building/rolling the target tree when the app is
-healthy. On-call triage lives in
-`docs/runbooks/sandbox-app-image-drift.md`.
+a docs-only `main` push does not heal pre-existing drift by itself. An explicit
+sandbox `workflow_dispatch` runs the same drift gate and can heal drift by
+building/rolling the target tree when the app is healthy. On-call triage lives
+in `docs/runbooks/sandbox-app-image-drift.md`.
 
 Keep the GitHub `sandbox` environment free of required reviewers/protection
 rules while `sandbox-app-image-drift` is on the main-push path, or revisit this

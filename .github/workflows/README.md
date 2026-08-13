@@ -345,15 +345,11 @@ gh workflow run promote-to-prod.yml --ref main \
 
 ### `blue-green-deploy.yml` — Blue/Green Deploy (Sandbox)
 
-Switches NLB listener between blue and green ASGs for zero-downtime deployments. Used by `scheduled-release.yml` for sandbox deploys.
+Switches NLB listener between blue and green ASGs for zero-downtime deployments. Dispatched by `build-and-push.yml` sandbox deploys.
 
 ### `canary-deploy.yml` — Canary Deploy (Production)
 
-Step Functions-based gradual rollout with automatic rollback. Used by `scheduled-release.yml` for production deploys.
-
-### `scheduled-release.yml` — Scheduled Release Pipeline
-
-Automated pipeline (weekdays 7am UTC): check for pending changes → deploy to sandbox (blue/green) → soak period → promote to prod (canary) → tag release.
+Step Functions-based gradual rollout with automatic rollback. Used by `promote-to-prod.yml` for production deploys.
 
 ## Support Workflows
 

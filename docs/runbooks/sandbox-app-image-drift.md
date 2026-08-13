@@ -10,9 +10,9 @@ is not actually live.
 
 The gate runs on workflow-triggering `main` pushes and explicit sandbox deploy
 dispatches. Pushes that do not match `build-and-push.yml`'s `on.push.paths`, such
-as docs-only pushes, do not start the workflow by themselves. The scheduled
-deploy path and a manual sandbox workflow dispatch still re-run this gate and can
-heal drift when the target app tree is healthy.
+as docs-only pushes, do not start the workflow by themselves. A manual sandbox
+workflow dispatch re-runs this gate and can heal drift when the target app tree
+is healthy.
 
 ## Expected Fail-Closed Cases
 

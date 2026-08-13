@@ -587,7 +587,6 @@ jobs:
             .github/scripts/deploy-relay.sh \
             .github/scripts/dispatch-and-poll-blue-green.sh \
             .github/scripts/dispatch-and-poll-canary.sh \
-            .github/scripts/ensure-sandbox-deployed.sh \
             .github/scripts/emit-deployment-window-metric.sh \
             .github/scripts/verify-asg-instances-healthy.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
@@ -596,7 +595,6 @@ jobs:
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
-            tests/scripts/ensure-sandbox-deployed_test.sh \
             tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/verify-asg-instances-healthy_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
@@ -605,7 +603,6 @@ jobs:
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
-          bash tests/scripts/ensure-sandbox-deployed_test.sh
           bash tests/scripts/emit-deployment-window-metric_test.sh
           bash tests/scripts/verify-asg-instances-healthy_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh
@@ -656,16 +653,6 @@ jobs:
           shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh .github/scripts/check-internal-relay-migration-active-color.sh tests/scripts/check-internal-relay-migration-active-color_test.sh
           bash tests/scripts/blue-green-switch_test.sh
           bash tests/scripts/check-internal-relay-migration-active-color_test.sh
-
-      # The scheduled-release soak runs AFTER switch-traffic, so it must watch
-      # the color that is actually serving. Fence that it resolves the fleet via
-      # active-color -> <color>-asg-name, never the color-blind
-      # /<env>/nhp/server/asg-name, and that an unknown color or a missing
-      # per-color parameter fails closed rather than soaking the idle fleet.
-      - name: Test soak period active-color fleet resolution
-        run: |
-          shellcheck .github/scripts/soak-period.sh tests/scripts/soak-period_test.sh
-          bash tests/scripts/soak-period_test.sh
 
       - name: Test blue/green active-tag assertions
         run: |

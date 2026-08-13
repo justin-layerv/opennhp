@@ -77,7 +77,7 @@ fi
 # failure mode.
 #
 # `--limit 50` is a bigger window than the default to survive a burst
-# of dispatches (Dependabot batches, scheduled-release fan-out, etc.)
+# of dispatches (Dependabot batches, back-to-back manual deploys, etc.)
 # pushing the target run past the first page before the finder polls.
 # 50 covers >2x the busiest historical CI pattern with negligible
 # extra API cost.

@@ -533,10 +533,9 @@ lint-workflows:
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
 	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
-	@shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh .github/scripts/dispatch-and-poll-blue-green.sh .github/scripts/dispatch-and-poll-canary.sh .github/scripts/ensure-sandbox-deployed.sh .github/scripts/emit-deployment-window-metric.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh tests/scripts/ensure-sandbox-deployed_test.sh tests/scripts/emit-deployment-window-metric_test.sh
+	@shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh .github/scripts/dispatch-and-poll-blue-green.sh .github/scripts/dispatch-and-poll-canary.sh .github/scripts/emit-deployment-window-metric.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh tests/scripts/emit-deployment-window-metric_test.sh
 	@bash tests/scripts/wait-for-instance-refresh_test.sh
 	@bash tests/scripts/deploy-relay_test.sh
-	@bash tests/scripts/ensure-sandbox-deployed_test.sh
 	@bash tests/scripts/emit-deployment-window-metric_test.sh
 	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/resolve-active-image-tag_test.sh

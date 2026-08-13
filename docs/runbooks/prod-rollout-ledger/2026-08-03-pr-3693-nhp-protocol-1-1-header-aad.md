@@ -33,8 +33,9 @@ window as short as possible and to know exactly who is in it.
       versions are actually knocking the fleet. If any customer is on <= v0.2.0,
       they go dark at cutover — decide deliberately whether to notify them first.
 - [ ] Pre-rollout: the fleet is a long way behind main (last standalone prod
-      canary was 2026-06-01; the daily scheduled-release pipeline has been
-      cancelled or stuck pending for two weeks). Get prod current on main and
+      canary was 2026-06-01; the scheduled-release pipeline was retired
+      in PR #3864 — prod ships only via `trigger-prod-deploy.sh`). Get prod
+      current on main and
       verify **before** adding a breaking protocol change, or 1.1 ships buried in
       a very large combined delta and any failure is unattributable.
 - [ ] Rollout: deploy the server, relay and AC fleet, then publish the

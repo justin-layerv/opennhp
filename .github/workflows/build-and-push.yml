@@ -2740,9 +2740,7 @@ jobs:
   # Idempotency: deploy-sandbox-infra runs TF apply on every push to main, but
   # only a qurl change bumps the revision. The roll is gated on
   # running-task-def != latest-task-def, so the common no-qurl-change deploy is
-  # a fast no-op rather than a redundant rolling restart. (The scheduled-release
-  # path, ensure-sandbox-deployed.sh, does not run terraform apply and so
-  # cannot create qurl revisions — it does not share this gap.)
+  # a fast no-op rather than a redundant rolling restart.
   deploy-sandbox-qurl:
     name: Deploy Sandbox - QURL Service
     needs: [deploy-sandbox-infra]
@@ -3131,8 +3129,7 @@ jobs:
   # This ensures every CI deploy alternates between blue and green ASGs,
   # includes the knock-readiness gate, and uses instant NLB listener
   # switching instead of rolling replacement. The actual dispatch + poll
-  # logic lives in .github/scripts/dispatch-and-poll-blue-green.sh so it
-  # is shared with ensure-sandbox-deployed.sh (scheduled-release path).
+  # logic lives in .github/scripts/dispatch-and-poll-blue-green.sh.
   deploy-sandbox-blue-green:
     name: Deploy Sandbox - Blue/Green
     needs: [setup, app-image-build-required, build, deploy-sandbox-infra]

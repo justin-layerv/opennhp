@@ -241,7 +241,7 @@ The reconciler is gated by the `QURL_SCHEMA_RECONCILER_ENABLED` env var on the q
 
 - **Lifecycle interaction:** `aws_ecs_service.qurl` has `lifecycle { ignore_changes = [desired_count, task_definition] }` (the `task_definition` element is the relevant one here). A `terraform apply` during the override does NOT immediately revert the running task — it just registers a new task-definition revision with the module default (`"true"`). The kill switch silently drops on the **next service deploy** that picks up the latest revision. So the failure window is "any service deploy following a terraform-apply during the override," not the terraform-apply itself.
 - **What to pause (sandbox):** `build-and-push.yml` (auto-applies on every push to `main`) plus the `qurl-service` repo's own `build-and-deploy.yml` (auto-deploys on every qurl-service push to `main`).
-- **What to pause (prod):** `scheduled-release.yml` (cron, weekdays 07:00 UTC) plus `promote-to-prod.yml` (manual `trigger-prod-deploy.sh` runs).
+- **What to pause (prod):** `promote-to-prod.yml` (manual `trigger-prod-deploy.sh` runs; prod promotion has no scheduled path).
 - **Multi-cell:** these workflows apply across all cells in their environment, not per-cell, so disabling them halts drift-revert for every cell — that's expected for the override window. Today only `cell0` exists in each env, so this is operationally fine; revisit when the fleet expands beyond cell0 ([nhp#1697](https://github.com/layervai/nhp/issues/1697)).
 - **Out-of-band paths:** a laptop-driven `terraform apply` or a `trigger-prod-deploy.sh` run with `run_terraform=true` will do the same — coordinate on Slack before either.
 
