@@ -15504,6 +15504,81 @@ class ComposedTransitionTest(unittest.TestCase):
             "hub-task-selected-projection",
         )
 
+    def test_hub_task_overlap_projection_admits_either_selected_predecessor(
+        self,
+    ) -> None:
+        """The permanent six-alias policy re-projects after its first apply."""
+        import json as _json
+
+        def role(*, rollout, selected="blue"):
+            return {
+                "inline_policy": [
+                    {
+                        "name": "hub-task",
+                        "policy": _json.dumps(
+                            CHECKER._expected_hub_task_inline_policy(
+                                rollout=rollout, selected=selected
+                            )
+                        ),
+                    }
+                ]
+            }
+
+        address = CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+        by = {address: {"change": {"actions": ["no-op"]}}}
+        for selected in ("blue", "green"):
+            with self.subTest(selected=selected):
+                item = {
+                    "address": address,
+                    "change": {
+                        "actions": ["update"],
+                        "before": role(rollout=False, selected=selected),
+                        "after": role(rollout=True),
+                    },
+                }
+                self.assertEqual(
+                    CHECKER._check_state_normalization_drift(
+                        [item], by, refresh_only=False
+                    ),
+                    "hub-task-selected-projection",
+                )
+
+    def test_hub_task_overlap_projection_rejects_an_unreviewed_policy(
+        self,
+    ) -> None:
+        """An expansion is not a wildcard for arbitrary inline-policy drift."""
+        import copy as _copy
+        import json as _json
+
+        def role(policy):
+            return {
+                "inline_policy": [
+                    {"name": "hub-task", "policy": _json.dumps(policy)}
+                ]
+            }
+
+        before = CHECKER._expected_hub_task_inline_policy(
+            rollout=False, selected="blue"
+        )
+        after = _copy.deepcopy(
+            CHECKER._expected_hub_task_inline_policy(rollout=True)
+        )
+        after["Statement"][0]["Resource"].append("*")
+        address = CHECKER.AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS
+        item = {
+            "address": address,
+            "change": {
+                "actions": ["update"],
+                "before": role(before),
+                "after": role(after),
+            },
+        }
+        by = {address: {"change": {"actions": ["no-op"]}}}
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_state_normalization_drift(
+                [item], by, refresh_only=False
+            )
+
     def test_composed_plan_mode_vocabulary_is_pinned(self) -> None:
         """The auto-promote deploy step greps the composed label format
         (build-and-push.yml: `composed-*authority-selector-flip*`); a silent

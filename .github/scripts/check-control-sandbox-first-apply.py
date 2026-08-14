@@ -11752,13 +11752,14 @@ def _require_normalization_plan_mode(
         )
 
 
-def _check_hub_task_selected_projection_drift(item: dict[str, Any]) -> None:
-    """The switch pointer moved; the provider re-reads hub_task's inline_policy.
+def _check_hub_task_inline_policy_projection_drift(item: dict[str, Any]) -> None:
+    """The provider re-reads hub_task's separately managed inline policy.
 
-    State carries the old selected colour's policy doc, live the new one, and
-    the planned change is a no-op (the policy resource itself already applied).
-    Exact on both sides -- old-selected doc to new-selected doc, everything
-    else identical -- so an arbitrary role edit still fails closed.
+    State can carry the old selected colour's policy doc while live has either
+    the newly selected colour or the permanent blue/green overlap policy. The
+    planned role change is a no-op because aws_iam_role_policy owns the document.
+    Exact on both sides, with every other role attribute identical, so an
+    arbitrary role or policy edit still fails closed.
     """
     change = item.get("change")
     before = change.get("before") if isinstance(change, dict) else None
@@ -11781,13 +11782,18 @@ def _check_hub_task_selected_projection_drift(item: dict[str, Any]) -> None:
             "policy",
             AUTHORITY_PROOF_PREPARE_RECOVERY_HUB_ROLE_ADDRESS,
         )
-    # Two exact projections are admitted, by which operation left the drift:
+    # Three exact projection families are admitted, by which operation left the
+    # drift:
     #
     # * window close: state carries the ROLLOUT projection (both colours), live
     #   the new selected colour alone.
     # * selector flip: state carries the OLD selected colour (the flip's
     #   hub_task update applied to blue, so state green predates it), live the
     #   new selected colour. Either flip direction.
+    # * permanent overlap migration: the separately managed policy has already
+    #   applied the new six-alias steady policy, while the role's deprecated
+    #   Optional+Computed inline_policy projection still carries the prior
+    #   selected-only document. Either selected colour may be the predecessor.
     #
     # rollout=True returns both colours and ignores `selected`; passed
     # explicitly so a future change to that projection cannot quietly break the
@@ -11804,7 +11810,21 @@ def _check_hub_task_selected_projection_drift(item: dict[str, Any]) -> None:
         )
         for old, new in (("green", "blue"), ("blue", "green"))
     ]
-    if pair != close_projection and pair not in flip_projections:
+    overlap_projection = _expected_hub_task_inline_policy(
+        rollout=True, selected="blue"
+    )
+    overlap_expansions = [
+        (
+            _expected_hub_task_inline_policy(rollout=False, selected=old),
+            overlap_projection,
+        )
+        for old in ("blue", "green")
+    ]
+    if (
+        pair != close_projection
+        and pair not in flip_projections
+        and pair not in overlap_expansions
+    ):
         raise _unexpected_drift_error([item])
 
 
@@ -11892,7 +11912,7 @@ def _check_state_normalization_drift(
         and by_address.get(addresses[0], {}).get("change", {}).get("actions")
         == ["no-op"]
     ):
-        _check_hub_task_selected_projection_drift(drift[0])
+        _check_hub_task_inline_policy_projection_drift(drift[0])
         return "hub-task-selected-projection"
     if (
         len(drift) == 2
@@ -11920,7 +11940,7 @@ def _check_state_normalization_drift(
             != ["no-op"]
         ):
             raise _unexpected_drift_error(drift)
-        _check_hub_task_selected_projection_drift(projection)
+        _check_hub_task_inline_policy_projection_drift(projection)
         _check_digest_normalization(
             by_drift_address[_AUTHORITY_DIGEST_ADDRESS],
             by_address,
