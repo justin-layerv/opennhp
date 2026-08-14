@@ -115,14 +115,6 @@ locals {
       if fn.operation == "mutate_proof_agent"
     } : {},
   )
-  authority_proof_policy_rollout_alias_arns = local.authority_proof_policy_rollout_active ? {
-    for function_name, fn in local.authority_proof_policy_rollout_functions :
-    function_name => {
-      for color in local.authority_runtime_alias_colors :
-      color => "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${function_name}:${color}"
-    }
-  } : {}
-
   # Both closed deployment qualifiers are published up front. For this initial
   # dark bootstrap they intentionally target the same first published version;
   # only the selected color receives steady provisioned concurrency below.

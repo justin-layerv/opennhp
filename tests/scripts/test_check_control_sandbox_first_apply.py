@@ -11747,6 +11747,101 @@ class HubS3EndpointPolicyTests(unittest.TestCase):
             )
 
 
+class HubAuthorityAliasOverlapPolicyTests(unittest.TestCase):
+    def test_exact_two_resource_update_is_the_only_admitted_shape(self) -> None:
+        exact = {
+            CHECKER.HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS: ["update"],
+            CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS: ["update"],
+        }
+        self.assertTrue(
+            CHECKER._is_exact_hub_authority_alias_overlap_policy_update(
+                hub_worker_mode=True,
+                changed=set(exact),
+                actual_non_noop=exact,
+                deposed_by_address={},
+            )
+        )
+
+        for label, worker_mode, actions, deposed in (
+            ("worker dark", False, exact, {}),
+            (
+                "extra resource",
+                True,
+                {**exact, "module.control.aws_iam_role_policy.rogue": ["update"]},
+                {},
+            ),
+            (
+                "destructive action",
+                True,
+                {**exact, CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS: ["delete"]},
+                {},
+            ),
+            ("deposed object", True, exact, {"rogue": [{}]}),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(
+                    CHECKER._is_exact_hub_authority_alias_overlap_policy_update(
+                        hub_worker_mode=worker_mode,
+                        changed=set(actions),
+                        actual_non_noop=actions,
+                        deposed_by_address=deposed,
+                    )
+                )
+
+    def test_steady_policies_require_both_closed_aliases(self) -> None:
+        aliases = sorted(CHECKER._hub_authority_alias_arns(True, "blue"))
+        endpoint = {
+            "policy": json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "HubWorkersInvokeAuthority",
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "lambda:InvokeFunction",
+                            "Resource": aliases,
+                            "Condition": {
+                                "StringEquals": {
+                                    "aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]
+                                }
+                            },
+                        }
+                    ],
+                }
+            )
+        }
+        task_policy = {
+            "name": "hub-task",
+            "role": f"{CHECKER.CONTROL_PREFIX}-hub-task",
+            "policy": json.dumps(
+                CHECKER._expected_hub_task_inline_policy(
+                    rollout=True, selected="blue"
+                )
+            ),
+        }
+
+        CHECKER._check_hub_lambda_endpoint_policy(
+            endpoint,
+            CHECKER.HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
+            rollout=True,
+        )
+        CHECKER._check_hub_task_policy(
+            task_policy, CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS
+        )
+
+        selected_only = copy.deepcopy(task_policy)
+        selected_only["policy"] = json.dumps(
+            CHECKER._expected_hub_task_inline_policy(
+                rollout=False, selected="blue"
+            )
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_task_policy(
+                selected_only, CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS
+            )
+
+
 class LiveContractTests(unittest.TestCase):
     def test_exact_live_boundary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

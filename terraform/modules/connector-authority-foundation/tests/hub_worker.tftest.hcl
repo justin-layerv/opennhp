@@ -465,21 +465,29 @@ run "hub_worker_on_plans_the_worker_and_opens_the_lambda_endpoint" {
 
   assert {
     # The lambda endpoint Resource and the task role's AuthorityInvoke Resource
-    # are BOTH exactly the three sorted :blue alias ARNs.
+    # are BOTH exactly the six closed blue/green alias ARNs. ECS drains old Hub
+    # tasks after starting replacements, so both task revisions must remain
+    # authorized throughout a selector flip.
     condition = (
       toset(jsondecode(aws_vpc_endpoint.interface["lambda"].policy).Statement[0].Resource) == toset([
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:green",
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:green",
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:green",
       ]) &&
       toset({ for s in jsondecode(aws_iam_role_policy.hub_task[0].policy).Statement : s.Sid => s }["AuthorityInvoke"].Resource) == toset([
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:green",
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:green",
         "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:blue",
+        "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:green",
       ]) &&
       { for s in jsondecode(aws_iam_role_policy.hub_task[0].policy).Statement : s.Sid => s }["PublishHubMetrics"].Condition.StringEquals["cloudwatch:namespace"] == "LayerV/NHP"
     )
-    error_message = "The lambda endpoint and the task role's AuthorityInvoke must both scope to exactly the three sorted :blue alias ARNs; PublishHubMetrics must pin the LayerV/NHP namespace."
+    error_message = "The lambda endpoint and task role must authorize exactly both closed aliases for the three Hub operations during ECS rollout overlap; PublishHubMetrics must pin the LayerV/NHP namespace."
   }
 
   assert {

@@ -1080,6 +1080,18 @@ run "proof_rollout_promotes_green_without_moving_recovery_selector" {
     )
     error_message = "Promotion may move only the provisioned proof-mutation selector; recovery remains on the contract-selected provisioned alias."
   }
+
+  assert {
+    condition = toset(local.hub_authority_alias_arns) == toset([
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:blue",
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ia:green",
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:blue",
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-icr:green",
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:blue",
+      "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ra:green",
+    ])
+    error_message = "Promoting the Hub selector to green must keep exactly the six valid closed blue/green aliases; it must never append a second color qualifier."
+  }
 }
 
 run "proof_selector_rejects_a_stale_pm_alias_after_consumers_are_ready" {

@@ -30,20 +30,23 @@ locals {
   hub_task_role_arn      = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${local.name_prefix}-hub-task"
   hub_execution_role_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${local.name_prefix}-hub-exec"
 
-  # The 3 Authority alias ARNs the worker invokes, sorted+deduplicated for the
-  # task IAM policy and the Lambda endpoint policy. Available because the runtime
-  # is a hard dependency of this slice (the main.tf precondition guarantees
-  # authority_selected_alias_targets is non-null before the worker deploys); the
-  # guard keeps this a plain empty list while the worker is dark so nothing
-  # dereferences the nullable contract map.
-  hub_authority_alias_arns = local.hub_worker_deploy ? (
-    local.authority_proof_policy_rollout_active
-    ? sort(flatten([
-      for function_name in keys(local.authority_proof_policy_consumer_functions) :
-      values(local.authority_proof_policy_rollout_alias_arns[function_name])
-    ]))
-    : sort(values(local.authority_selected_alias_targets.hub))
-  ) : []
+  # The 3 Hub-facing Authority functions' closed blue AND green alias ARNs,
+  # sorted for the task IAM policy and Lambda endpoint policy. ECS deployment
+  # overlap intentionally keeps the previous Hub task revision serving while
+  # replacements start. The old revision still invokes the previously selected
+  # alias, so narrowing these policies to only the new selector causes transient
+  # authenticated assignment failures until the old targets drain.
+  #
+  # Both aliases remain closed qualified targets and neither is reachable by a
+  # Hub task unless that task's immutable runtime config names it. The selector
+  # therefore continues to own traffic while the policy merely makes rolling
+  # replacement safe. The guard keeps this empty while the worker is dark.
+  hub_authority_alias_arns = local.hub_worker_deploy ? sort(flatten([
+    for selected_alias_arn in values(local.authority_selected_alias_targets.hub) : [
+      for color in local.authority_runtime_alias_colors :
+      "${trimsuffix(trimsuffix(selected_alias_arn, ":blue"), ":green")}:${color}"
+    ]
+  ])) : []
 
   # The publisher-owned digest pin resolves the immutable image the worker runs.
   # UNPUBLISHED (or any non-sha256 value) is rejected by the task-definition
@@ -228,11 +231,14 @@ resource "aws_iam_role" "hub_task" {
   })
 }
 
-# Least-privilege runtime identity: InvokeFunction on ONLY the three sorted
-# :color alias ARNs (the network path is separately gated by the Lambda endpoint
-# policy, scoped to this same role), and PutMetricData constrained to the
-# LayerV/NHP namespace. No secret/KMS/data grants: the container never reads the
-# secret directly (the execution role/agent does) and holds no data-plane reach.
+# Least-privilege runtime identity: InvokeFunction on ONLY the six closed
+# blue/green alias ARNs for the three Hub-facing operations (the network path is
+# separately gated by the Lambda endpoint policy, scoped to this same role), and
+# PutMetricData constrained to the LayerV/NHP namespace. A task still invokes
+# only the alias named in its immutable runtime config; keeping both qualifiers
+# authorized lets ECS drain the previous task revision safely. No secret/KMS/data
+# grants: the container never reads the secret directly (the execution
+# role/agent does) and holds no data-plane reach.
 resource "aws_iam_role_policy" "hub_task" {
   count = local.hub_worker_count
 

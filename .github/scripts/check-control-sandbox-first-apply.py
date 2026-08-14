@@ -1368,6 +1368,7 @@ HUB_WORKER_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
 # not change; their policy/ingress does). Used by the plan_mode transition and
 # the partial-retry normalization lane.
 HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS = 'module.control.aws_vpc_endpoint.interface["lambda"]'
+HUB_WORKER_TASK_POLICY_ADDRESS = "module.control.aws_iam_role_policy.hub_task[0]"
 HUB_WORKER_SECRETSMANAGER_ENDPOINT_ADDRESS = (
     'module.control.aws_vpc_endpoint.interface["secretsmanager"]'
 )
@@ -5431,29 +5432,14 @@ def _check_planned_security(
         elif runtime_mode and address == AUTHORITY_RUNTIME_EMAIL_ENDPOINT_ADDRESS:
             _check_authority_email_endpoint_policy(after, address)
         elif hub_worker_mode and address == HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS:
-            # While the rollout window is CLOSING, the standby pools still
-            # exist pre-apply so proof_rollout_mode is true -- but the policy
-            # correctly narrows back to the selected colour alone. Judge it on
-            # the window's after-state, not on inventory that is being deleted
-            # in this very plan.
-            _contract_after = (
-                by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS, {})
-                .get("change", {})
-                .get("after")
-            )
-            _contract_payload = (
-                _contract_after.get("input")
-                if isinstance(_contract_after, dict)
-                else None
-            )
+            # ECS may keep the previous Hub task revision serving after a
+            # selector flip. Both closed deployment aliases must therefore stay
+            # reachable throughout ordinary task replacement, independently of
+            # whether the attended-proof rollout window is open.
             _check_hub_lambda_endpoint_policy(
                 after,
                 address,
-                rollout=(
-                    proof_rollout_mode
-                    and not _authority_proof_window_closes_to_null(by_address)
-                ),
-                selected=_selected_authority_color_from_contract(_contract_payload),
+                rollout=True,
             )
         elif (
             hub_worker_mode
@@ -5475,6 +5461,8 @@ def _check_planned_security(
     # resources do not exist (the inventory admission gates that); when live their
     # policies are validated here exactly like the runtime dependency endpoints.
     if hub_worker_mode:
+        hub_task_policy, _ = values(HUB_WORKER_TASK_POLICY_ADDRESS)
+        _check_hub_task_policy(hub_task_policy, HUB_WORKER_TASK_POLICY_ADDRESS)
         _check_hub_identity_resources(by_address, refresh_disabled=refresh_disabled)
         for address, service, endpoint_type in (
             ("module.control.aws_vpc_endpoint.hub_ecr_api[0]", "ecr.api", "Interface"),
@@ -9651,30 +9639,6 @@ def _check_hub_task_definition_proof_alias_only(by_address: dict[str, Any]) -> N
         )
 
 
-def _authority_proof_window_closes_to_null(by_address: dict[str, Any]) -> bool:
-    """True only for the CLOSING half of the transition (colours -> null).
-
-    Distinct from _authority_proof_retirement_closes_the_window, which also
-    matches the catch-up cutover. The endpoint policy spans both colours for as
-    long as the window is open -- including during the cutover, when the pair is
-    blue/blue -- and narrows to the selected colour only once it shuts. Using
-    the broader predicate here narrowed it a step too early.
-    """
-    item = by_address.get(AUTHORITY_IMAGE_UPDATE_FOUNDATION_ADDRESS)
-    if not isinstance(item, dict):
-        return False
-    after = item.get("change", {}).get("after")
-    if not isinstance(after, dict):
-        return False
-    payload = after.get("input")
-    if not isinstance(payload, dict):
-        return False
-    return (
-        payload.get("authority_proof_policy_selected_color") is None
-        and payload.get("authority_proof_policy_prepared_color") is None
-    )
-
-
 def _check_authority_steady_pc_completion(
     changed: set[str], by_address: dict[str, Any]
 ) -> None:
@@ -11457,6 +11421,29 @@ def _expected_hub_task_inline_policy(
             },
         ],
     }
+
+
+def _check_hub_task_policy(after: dict[str, Any], address: str) -> None:
+    """Pin the steady Hub task policy to both closed Authority aliases.
+
+    A task revision still invokes only the alias named in its immutable runtime
+    configuration. Authorizing both closed qualifiers here keeps the previous
+    revision functional while ECS drains it; it does not select traffic.
+    """
+    _require_fields(
+        after,
+        {
+            "name": "hub-task",
+            "role": f"{CONTROL_PREFIX}-hub-task",
+        },
+        address,
+    )
+    _require_json_field(
+        after,
+        "policy",
+        _expected_hub_task_inline_policy(rollout=True),
+        address,
+    )
 
 
 def _check_authority_proof_prepare_recovery_drift(
@@ -13886,6 +13873,31 @@ def _hub_identity_transition_pending(
     return exact, creates, updates
 
 
+def _is_exact_hub_authority_alias_overlap_policy_update(
+    *,
+    hub_worker_mode: bool,
+    changed: set[str],
+    actual_non_noop: dict[str, list[str]],
+    deposed_by_address: dict[str, list[dict[str, Any]]],
+) -> bool:
+    """Admit only the two policy updates that make ECS overlap safe.
+
+    Their after-state is independently pinned by _check_planned_security: the
+    Lambda endpoint and task role must both name exactly the six closed
+    blue/green aliases. This predicate owns only the bounded plan envelope.
+    """
+    addresses = {
+        HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
+        HUB_WORKER_TASK_POLICY_ADDRESS,
+    }
+    return (
+        hub_worker_mode
+        and not deposed_by_address
+        and changed == addresses
+        and all(actual_non_noop.get(address) == ["update"] for address in addresses)
+    )
+
+
 def check_plan(
     plan: Any, prior_state: Any = None, *, refresh_disabled: bool = False
 ) -> dict[str, str | int]:
@@ -14771,6 +14783,14 @@ def check_plan(
         and changed == {HUB_WORKER_S3_ENDPOINT_ADDRESS}
         and actual_non_noop.get(HUB_WORKER_S3_ENDPOINT_ADDRESS) == ["update"]
     )
+    hub_authority_alias_overlap_policy_update = (
+        _is_exact_hub_authority_alias_overlap_policy_update(
+            hub_worker_mode=hub_worker_mode,
+            changed=changed,
+            actual_non_noop=actual_non_noop,
+            deposed_by_address=deposed_by_address,
+        )
+    )
 
     # The legacy-user cleanup is delete-only against every transition EXCEPT the
     # Hub UDP source-fence replacement, which was already pending and unapplied
@@ -15102,6 +15122,10 @@ def check_plan(
         # A single in-place policy update on the already-created hub_s3 gateway
         # endpoint -- no create shape to assert. The corrected after-state is
         # validated by _check_hub_s3_endpoint_policy in _check_planned_security.
+    elif hub_authority_alias_overlap_policy_update:
+        plan_mode = "hub-authority-alias-overlap-policy"
+        # Exact two-resource update only. _check_planned_security pins both
+        # policies to the six closed blue/green aliases before the plan returns.
     elif (
         changed == {AUTHORITY_PROOF_EXEC_POLICY_ADDRESS}
         and actual_non_noop.get(AUTHORITY_PROOF_EXEC_POLICY_ADDRESS) == ["update"]
@@ -15240,7 +15264,8 @@ def check_plan(
             "Hub public edge slice, the exact Hub Fargate worker slice, or the "
             "exact proof-mutation DynamoDB decrypt grant, the "
             "exact Hub S3 endpoint-policy correction, the exact Hub worker "
-            "image update, Hub PrivateLink "
+            "image update, the exact Hub Authority alias-overlap policy update, "
+            "Hub PrivateLink "
             "inbound-rule enforcement, the exact Hub client-edge port "
             "migration, or Hub UDP source-fence "
             "replacement; "
