@@ -6,9 +6,9 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 SCRIPT="$REPO_ROOT/scripts/check-go-version-drift.sh"
-GO_LINUX_AMD64_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
-GO_LINUX_ARM64_SHA256=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49
-GO_LINUX_ARMV6L_SHA256=6dae9edab81c13bccf962dec15f1fd2ec26c14a6821b4d2c92dab4130c289d7a
+GO_LINUX_AMD64_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
+GO_LINUX_ARM64_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e
+GO_LINUX_ARMV6L_SHA256=e1379a2fe77bd30fa29833074388247e7c65416e09279f746f20de2d5cf4dfea
 
 pass=0
 fail=0
@@ -27,7 +27,7 @@ report_fail() {
 
 write_good_fixture() {
   local dir="$1"
-  local version=1.26.5
+  local version=1.26.6
   mkdir -p \
     "$dir/scripts" \
     "$dir/.github/workflows" \
@@ -143,7 +143,7 @@ test_workflow_drift_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak "s/GO_VERSION: '1.26.5'/GO_VERSION: '1.26.6'/" "$tmp/.github/workflows/codeql.yml"
+  sed -i.bak "s/GO_VERSION: '1.26.6'/GO_VERSION: '1.26.7'/" "$tmp/.github/workflows/codeql.yml"
   assert_failure "$name" "$tmp" ".github/workflows/codeql.yml env.GO_VERSION"
 }
 
@@ -156,7 +156,7 @@ test_unlisted_workflow_go_version_fails() {
   cat > "$tmp/.github/workflows/new-go-workflow.yml" <<EOF
 name: new-go-workflow
 env:
-  GO_VERSION: '1.26.5'
+  GO_VERSION: '1.26.6'
 EOF
   assert_failure "$name" "$tmp" ".github/workflows/new-go-workflow.yml: contains GO_VERSION but is not listed in workflow_files"
 }
@@ -174,7 +174,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.5'
+          go-version: '1.26.6'
 EOF
   assert_failure "$name" "$tmp" ".github/workflows/codeql.yml: setup-go go-version must reference env.GO_VERSION or go-version-file, not a numeric literal"
 }
@@ -229,7 +229,7 @@ runs:
   steps:
     - uses: actions/setup-go@v6
       with:
-        go-version: '1.26.5'
+        go-version: '1.26.6'
 EOF
   assert_failure "$name" "$tmp" ".github/actions/go-action/action.yml: setup-go go-version must reference env.GO_VERSION or go-version-file, not a numeric literal"
 }
@@ -248,7 +248,7 @@ jobs:
     steps:
       - name: local env
         env:
-          GO_VERSION: '1.26.5'
+          GO_VERSION: '1.26.6'
         run: go version
 EOF
   assert_success "$name" "$tmp"
@@ -266,7 +266,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      GO_VERSION: '1.26.5'
+      GO_VERSION: '1.26.6'
     steps:
       - run: go version
 EOF
@@ -289,7 +289,7 @@ test_duplicate_go_directive_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  printf '\ngo 1.26.5\n' >> "$tmp/tests/local/go.mod"
+  printf '\ngo 1.26.6\n' >> "$tmp/tests/local/go.mod"
   assert_failure "$name" "$tmp" "tests/local/go.mod: expected exactly one go directive, found 2"
 }
 
@@ -299,8 +299,8 @@ test_two_part_go_directive_drift_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak 's/go 1.26.5/go 1.27/' "$tmp/endpoints/go.mod"
-  assert_failure "$name" "$tmp" "endpoints/go.mod: expected Go 1.26.5, got 1.27"
+  sed -i.bak 's/go 1.26.6/go 1.27/' "$tmp/endpoints/go.mod"
+  assert_failure "$name" "$tmp" "endpoints/go.mod: expected Go 1.26.6, got 1.27"
 }
 
 test_source_go_directive_requires_patch() {
@@ -309,7 +309,7 @@ test_source_go_directive_requires_patch() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak 's/go 1.26.5/go 1.26/' "$tmp/nhp/go.mod"
+  sed -i.bak 's/go 1.26.6/go 1.26/' "$tmp/nhp/go.mod"
   assert_failure "$name" "$tmp" "source Go version must include a patch release"
 }
 
@@ -319,8 +319,8 @@ test_go_directive_comments_and_whitespace_pass() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak 's/go 1.26.5/go 1.26.5   \/\/ CI lockstep/' "$tmp/endpoints/go.mod"
-  printf '\ntoolchain go1.26.5   // CI lockstep\n' >> "$tmp/tests/local/go.mod"
+  sed -i.bak 's/go 1.26.6/go 1.26.6   \/\/ CI lockstep/' "$tmp/endpoints/go.mod"
+  printf '\ntoolchain go1.26.6   // CI lockstep\n' >> "$tmp/tests/local/go.mod"
   assert_success "$name" "$tmp"
 }
 
@@ -330,8 +330,8 @@ test_toolchain_directive_drift_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  printf '\ntoolchain go1.26.6\n' >> "$tmp/nhp/go.mod"
-  assert_failure "$name" "$tmp" "nhp/go.mod toolchain directive: expected Go 1.26.5, got 1.26.6"
+  printf '\ntoolchain go1.26.7\n' >> "$tmp/nhp/go.mod"
+  assert_failure "$name" "$tmp" "nhp/go.mod toolchain directive: expected Go 1.26.6, got 1.26.7"
 }
 
 test_unpinned_test_image_fails() {
@@ -340,7 +340,7 @@ test_unpinned_test_image_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak "s|GO_TEST_IMAGE: 'golang:1.26.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'|GO_TEST_IMAGE: 'golang:1.26.5-bookworm'|" "$tmp/.github/workflows/build-and-push.yml"
+  sed -i.bak "s|GO_TEST_IMAGE: 'golang:1.26.6-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'|GO_TEST_IMAGE: 'golang:1.26.6-bookworm'|" "$tmp/.github/workflows/build-and-push.yml"
   assert_failure "$name" "$tmp" "GO_TEST_IMAGE: must be tag+digest pinned" "expected exactly one digest-pinned GO_TEST_IMAGE"
 }
 
@@ -350,7 +350,7 @@ test_docker_from_drift_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak "s/golang:1.26.5-bookworm/golang:1.26.6-bookworm/" "$tmp/docker/Dockerfile.server"
+  sed -i.bak "s/golang:1.26.6-bookworm/golang:1.26.7-bookworm/" "$tmp/docker/Dockerfile.server"
   assert_failure "$name" "$tmp" "docker/Dockerfile.server golang FROM"
 }
 
@@ -380,7 +380,7 @@ test_docker_from_variant_fails_with_variant_error() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak "s/golang:1.26.5-bookworm/golang:1.26.5-alpine/" "$tmp/docker/Dockerfile.ac"
+  sed -i.bak "s/golang:1.26.6-bookworm/golang:1.26.6-alpine/" "$tmp/docker/Dockerfile.ac"
   assert_failure "$name" "$tmp" "docker/Dockerfile.ac golang FROM: must use repo-standard golang:<version>-bookworm@sha256:<64-hex>"
 }
 
@@ -391,7 +391,7 @@ test_duplicate_dockerfile_golang_from_passes() {
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
   cat >> "$tmp/docker/Dockerfile.server" <<EOF
-FROM golang:1.26.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS second-builder
+FROM golang:1.26.6-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS second-builder
 EOF
   assert_success "$name" "$tmp"
 }
@@ -403,7 +403,7 @@ test_second_dockerfile_golang_from_digest_drift_fails() {
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
   cat >> "$tmp/docker/Dockerfile.server" <<EOF
-FROM golang:1.26.5-bookworm@sha256:9999999999999999999999999999999999999999999999999999999999999999 AS second-builder
+FROM golang:1.26.6-bookworm@sha256:9999999999999999999999999999999999999999999999999999999999999999 AS second-builder
 EOF
   assert_failure "$name" "$tmp" "docker/Dockerfile.server golang FROM stage 2: expected Go image"
 }
@@ -428,7 +428,7 @@ test_nested_dockerfile_golang_from_fails() {
   write_good_fixture "$tmp"
   mkdir -p "$tmp/docker/nested"
   cat > "$tmp/docker/nested/Dockerfile" <<EOF
-FROM golang:1.26.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
+FROM golang:1.26.6-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
   assert_failure "$name" "$tmp" "docker/nested/Dockerfile: contains a golang FROM but is not listed in golang_from_files"
 }
@@ -440,7 +440,7 @@ test_unlisted_dockerfile_golang_from_fails() {
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
   cat > "$tmp/docker/Dockerfile.extra" <<EOF
-FROM golang:1.26.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
+FROM golang:1.26.6-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
   assert_failure "$name" "$tmp" "docker/Dockerfile.extra: contains a golang FROM but is not listed in golang_from_files"
 }
@@ -456,7 +456,7 @@ test_unlisted_smoke_dockerfile_golang_from_fails() {
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
   cat > "$tmp/tests/smoke/local-stack/Dockerfile.extra" <<EOF
-FROM golang:1.26.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
+FROM golang:1.26.6-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
   assert_failure "$name" "$tmp" "tests/smoke/local-stack/Dockerfile.extra: contains a golang FROM but is not listed in golang_from_files"
 }
@@ -477,7 +477,7 @@ test_dev_dockerfile_quoted_args_pass() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak "s/ARG GO_VERSION=1.26.5/ARG GO_VERSION='1.26.5'/" "$tmp/docker/Dockerfile.app"
+  sed -i.bak "s/ARG GO_VERSION=1.26.6/ARG GO_VERSION='1.26.6'/" "$tmp/docker/Dockerfile.app"
   sed -i.bak "s/ARG GO_LINUX_ARM64_SHA256=$GO_LINUX_ARM64_SHA256/ARG GO_LINUX_ARM64_SHA256=\"$GO_LINUX_ARM64_SHA256\"/" "$tmp/docker/Dockerfile.app"
   assert_success "$name" "$tmp"
 }
@@ -501,7 +501,7 @@ test_dev_dockerfile_stale_matching_checksums_fail() {
   for dockerfile in Dockerfile.app Dockerfile.base; do
     sed -i.bak "s/ARG GO_LINUX_ARM64_SHA256=$GO_LINUX_ARM64_SHA256/ARG GO_LINUX_ARM64_SHA256=9999999999999999999999999999999999999999999999999999999999999999/" "$tmp/docker/$dockerfile"
   done
-  assert_failure "$name" "$tmp" "expected GO_LINUX_ARM64_SHA256 checksum $GO_LINUX_ARM64_SHA256 for Go 1.26.5"
+  assert_failure "$name" "$tmp" "expected GO_LINUX_ARM64_SHA256 checksum $GO_LINUX_ARM64_SHA256 for Go 1.26.6"
 }
 
 test_checksum_table_version_drift_fails() {
@@ -510,8 +510,8 @@ test_checksum_table_version_drift_fails() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   write_good_fixture "$tmp"
-  sed -i.bak 's/go 1.26.5/go 1.26.6/' "$tmp/nhp/go.mod"
-  assert_failure "$name" "$tmp" "Go tarball checksum table: expected checksums for Go 1.26.6, table is for Go 1.26.5"
+  sed -i.bak 's/go 1.26.6/go 1.26.7/' "$tmp/nhp/go.mod"
+  assert_failure "$name" "$tmp" "Go tarball checksum table: expected checksums for Go 1.26.7, table is for Go 1.26.6"
 }
 
 echo "Running check-go-version-drift_test.sh"

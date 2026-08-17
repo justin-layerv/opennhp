@@ -1,6 +1,6 @@
 module github.com/OpenNHP/opennhp/endpoints
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0

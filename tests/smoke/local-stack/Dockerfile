@@ -18,7 +18,7 @@
 # (#2800) and check-go-version-drift.sh the golang one, so a one-sided bump
 # (e.g. a dependabot "bump ubuntu … in /docker" PR that can't reach this file)
 # fails CI until this digest is bumped too.
-FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS builder
+FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS builder
 
 WORKDIR /src
 
