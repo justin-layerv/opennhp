@@ -1664,6 +1664,34 @@ def runtime_scoped_endpoint_policies(
     return dynamodb, kms, secrets, email
 
 
+def hub_lambda_endpoint_policy(
+    *, rollout: bool = True, selected: str = "blue"
+) -> dict[str, str]:
+    return {
+        "policy": json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "HubWorkersInvokeAuthority",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": sorted(
+                            CHECKER._hub_authority_alias_arns(rollout, selected)
+                        ),
+                        "Condition": {
+                            "StringEquals": {
+                                "aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+    }
+
+
 def runtime_exec_policy(fn: str, operation: str) -> str:
     """Build the per-operation execution (identity) policy the checker expects.
 
@@ -10583,6 +10611,78 @@ class StateContractTests(unittest.TestCase):
             len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
         )
 
+    def test_closed_proof_window_admits_permanent_hub_alias_overlap(self) -> None:
+        state = state_fixture_runtime()
+        resources = state["values"]["root_module"]["resources"]
+        by_address = {item["address"]: item["values"] for item in resources}
+        self.assertFalse(
+            set(by_address) & set(CHECKER.AUTHORITY_PROOF_ROLLOUT_RESOURCES)
+        )
+        hub_edge_address = "module.control.aws_subnet.hub_public[0]"
+        hub_worker_address = "module.control.aws_security_group.hub_worker[0]"
+        hub_worker_sg_id = "sg-a11a5"
+        resources.extend(
+            [
+                {
+                    "address": hub_edge_address,
+                    "mode": "managed",
+                    "type": "aws_subnet",
+                    "values": {"id": "subnet-hub"},
+                },
+                {
+                    "address": hub_worker_address,
+                    "mode": "managed",
+                    "type": "aws_security_group",
+                    "values": {"id": hub_worker_sg_id},
+                },
+            ]
+        )
+        hub_ingress = runtime_interface_ingress_rule()
+        hub_ingress.update(
+            {
+                "description": "HTTPS from Hub worker ENIs",
+                "security_groups": [hub_worker_sg_id],
+            }
+        )
+        by_address[CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS]["ingress"].append(
+            hub_ingress
+        )
+        by_address[CHECKER.HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS]["policy"] = (
+            hub_lambda_endpoint_policy()["policy"]
+        )
+
+        class ReachedHubEndpointPolicy(Exception):
+            pass
+
+        check_endpoint_policy = CHECKER._check_hub_lambda_endpoint_policy
+
+        def check_endpoint_policy_and_stop(after: dict, address: str) -> None:
+            check_endpoint_policy(after, address)
+            raise ReachedHubEndpointPolicy
+
+        # Narrow the optional Hub inventories to isolate check_state's policy
+        # routing. The full Hub inventory and each resource contract are covered
+        # separately; this regression must prove that a closed proof-rollout
+        # window still routes the live six-alias endpoint policy to the steady
+        # validator without deriving a selected-color-only expectation.
+        with (
+            mock.patch.object(
+                CHECKER, "HUB_EDGE_RESOURCES", {hub_edge_address: "aws_subnet"}
+            ),
+            mock.patch.object(
+                CHECKER,
+                "HUB_WORKER_RESOURCES",
+                {hub_worker_address: "aws_security_group"},
+            ),
+            mock.patch.object(
+                CHECKER,
+                "_check_hub_lambda_endpoint_policy",
+                check_endpoint_policy_and_stop,
+            ),
+            self.assertRaises(ReachedHubEndpointPolicy),
+        ):
+            CHECKER.check_state(state)
+
     def test_runtime_state_rejects_still_dark_dependency_endpoint(self) -> None:
         state = state_fixture_runtime()
         resources = state["values"]["root_module"]["resources"]
@@ -11789,28 +11889,7 @@ class HubAuthorityAliasOverlapPolicyTests(unittest.TestCase):
                 )
 
     def test_steady_policies_require_both_closed_aliases(self) -> None:
-        aliases = sorted(CHECKER._hub_authority_alias_arns(True, "blue"))
-        endpoint = {
-            "policy": json.dumps(
-                {
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Sid": "HubWorkersInvokeAuthority",
-                            "Effect": "Allow",
-                            "Principal": "*",
-                            "Action": "lambda:InvokeFunction",
-                            "Resource": aliases,
-                            "Condition": {
-                                "StringEquals": {
-                                    "aws:PrincipalArn": [CHECKER.HUB_TASK_ROLE_ARN]
-                                }
-                            },
-                        }
-                    ],
-                }
-            )
-        }
+        endpoint = hub_lambda_endpoint_policy()
         task_policy = {
             "name": "hub-task",
             "role": f"{CHECKER.CONTROL_PREFIX}-hub-task",
@@ -11824,7 +11903,6 @@ class HubAuthorityAliasOverlapPolicyTests(unittest.TestCase):
         CHECKER._check_hub_lambda_endpoint_policy(
             endpoint,
             CHECKER.HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
-            rollout=True,
         )
         CHECKER._check_hub_task_policy(
             task_policy, CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS
@@ -11839,6 +11917,13 @@ class HubAuthorityAliasOverlapPolicyTests(unittest.TestCase):
         with self.assertRaises(CHECKER.ContractError):
             CHECKER._check_hub_task_policy(
                 selected_only, CHECKER.HUB_WORKER_TASK_POLICY_ADDRESS
+            )
+
+        selected_only_endpoint = hub_lambda_endpoint_policy(rollout=False)
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER._check_hub_lambda_endpoint_policy(
+                selected_only_endpoint,
+                CHECKER.HUB_WORKER_LAMBDA_ENDPOINT_ADDRESS,
             )
 
 

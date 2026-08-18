@@ -5439,7 +5439,6 @@ def _check_planned_security(
             _check_hub_lambda_endpoint_policy(
                 after,
                 address,
-                rollout=True,
             )
         elif (
             hub_worker_mode
@@ -6051,14 +6050,14 @@ def _endpoint_allow_statements(
 def _check_hub_lambda_endpoint_policy(
     after: dict[str, Any],
     address: str,
-    *,
-    rollout: bool = False,
-    selected: str = "blue",
 ) -> None:
     # The opened lambda interface endpoint admits ONLY the Hub worker task role,
-    # invoking ONLY the 3 selected-color authority aliases. Same Principal "*" +
-    # aws:PrincipalArn shape as the runtime dependency endpoints -- a role-ARN
-    # Principal would silently deny the worker's assumed-role session.
+    # invoking ONLY both closed aliases for the 3 Hub-facing Authority functions.
+    # Both colors stay reachable while ECS drains the previous task revision;
+    # immutable task configuration still selects the one alias each revision
+    # invokes. Same Principal "*" + aws:PrincipalArn shape as the runtime
+    # dependency endpoints -- a role-ARN Principal would silently deny the
+    # worker's assumed-role session.
     stmt = _authority_single_allow_statement(
         after, address, "HubWorkersInvokeAuthority"
     )
@@ -6072,7 +6071,7 @@ def _check_hub_lambda_endpoint_policy(
         raise ContractError(f"{address} action must be exactly lambda:InvokeFunction")
     if _authority_string_set(
         stmt.get("Resource"), address, "Resource"
-    ) != _hub_authority_alias_arns(rollout, selected):
+    ) != _hub_authority_alias_arns(rollout=True):
         raise ContractError(
             f"{address} resources must be exactly the bounded Authority alias set"
         )
@@ -16546,10 +16545,6 @@ def check_state(state: Any) -> dict[str, Any]:
             _check_hub_lambda_endpoint_policy(
                 item,
                 address,
-                rollout=proof_rollout_present,
-                selected=_selected_authority_color_from_contract(
-                    foundation.get("input")
-                ),
             )
         elif hub_worker_present and not runtime_present and service == "secretsmanager":
             _check_hub_secretsmanager_endpoint_policy(item, address)
