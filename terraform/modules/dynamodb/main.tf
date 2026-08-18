@@ -739,6 +739,16 @@ resource "aws_dynamodb_table" "qurl_resources" {
     kms_key_arn = var.kms_key_arn
   }
 
+  # Enforce the `ttl` attribute qurl-service has always written under the
+  # assumption it was active (qurl-service#846): expires_at + 7d retention
+  # on revoked short-lived rows, 10-year safety backstop otherwise. CRID
+  # retirement sentinels are separate no-TTL items, so TTL deletes leave
+  # the retired-404 registry intact.
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-${var.cell_id}-qurl-resources"
     Cell      = var.cell_id
