@@ -65,6 +65,12 @@ enable_egress_eips = true
 terraform_state_bucket = "layerv-terraform-state-235500187906"
 terraform_lock_table   = "terraform-state-lock"
 
+# Keep the assigned-cell registration handoff dark until production Control's
+# runtime and alias outputs are applied and verified. Activation requires a
+# reviewed source-lock removal plus this tfvars flip, followed by a production
+# server canary/ASG rollout.
+connector_authority_cell_from_control_enabled = false
+
 # Lambda layer bucket (cryptography layer for key generation)
 lambda_layer_bucket = "layerv-terraform-state-235500187906"
 

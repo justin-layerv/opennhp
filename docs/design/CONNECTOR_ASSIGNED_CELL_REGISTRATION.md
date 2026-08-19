@@ -121,6 +121,15 @@ publish the Hub UDP endpoint plus public identity through the signed bootstrap
 artifact; the Hub image publisher must not gain that role. Native Connector
 traffic remains UDP-only throughout.
 
+For the qURL CLI, the signed bootstrap artifact is the official binary release.
+The production rollout reads the public SSM value, commits the SHA-256 of its
+decoded 32-byte key in qurl-integrations, and sets the matching public repository
+variable. That repository's release workflow verifies the value with the CLI's
+runtime X25519 decoder before injecting it into GoReleaser, and its signed
+checksum manifest binds the resulting binary. The release job receives no NHP
+production role, and the cell server key is never an acceptable substitute for
+this independent Hub identity.
+
 ## Provisioned-cell service topology
 
 A provisioned cell is the NHP-server cluster and its cell-local qurl-service

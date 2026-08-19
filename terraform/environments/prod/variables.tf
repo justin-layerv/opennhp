@@ -26,7 +26,7 @@ variable "cell_id" {
 }
 
 variable "connector_authority_cell_config" {
-  description = "Prod Connector Authority cell caller graph. Must remain null until the prod runtime/cell catalog is provisioned and proven."
+  description = "Production cell0 Connector Authority caller graph. Source-locked null until the governed Control-derived activation."
   type = object({
     environment                            = string
     aws_account_id                         = string
@@ -45,7 +45,18 @@ variable "connector_authority_cell_config" {
 
   validation {
     condition     = var.connector_authority_cell_config == null
-    error_message = "Prod Connector Authority cell calls remain dark until the governed prod activation."
+    error_message = "Prod Connector Authority cell calls remain dark until the governed Control-derived activation."
+  }
+}
+
+variable "connector_authority_cell_from_control_enabled" {
+  description = "Read the production Control state and derive cell0's selected Connector Authority aliases. Defaults false because the Control state does not exist before its governed rollout."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.connector_authority_cell_from_control_enabled
+    error_message = "The production Control-state handoff remains source-locked until the Control state and runtime alias outputs exist."
   }
 }
 

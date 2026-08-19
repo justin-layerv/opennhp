@@ -62,10 +62,11 @@ def terraform_variable_block(path: Path, variable_name: str) -> str:
 
 
 class CellActivationDefaultTests(unittest.TestCase):
-    def test_auto_deployed_sandbox_cell_roots_stay_dark_by_default(self) -> None:
+    def test_auto_deployed_cell_roots_stay_dark_by_default(self) -> None:
         for relative_path in (
             "terraform/environments/sandbox/variables.tf",
             "terraform/environments/sandbox-cell1/variables.tf",
+            "terraform/environments/prod/variables.tf",
         ):
             with self.subTest(root=relative_path):
                 block = terraform_variable_block(
@@ -96,6 +97,7 @@ class CellActivationDefaultTests(unittest.TestCase):
         for relative_path in (
             "terraform/environments/sandbox/main.tf",
             "terraform/environments/sandbox-cell1/main.tf",
+            "terraform/environments/prod/main.tf",
         ):
             with self.subTest(root=relative_path):
                 text = (ROOT / relative_path).read_text(encoding="utf-8")
@@ -133,6 +135,7 @@ class CellActivationDefaultTests(unittest.TestCase):
         for relative_path in (
             "terraform/environments/sandbox/main.tf",
             "terraform/environments/sandbox-cell1/main.tf",
+            "terraform/environments/prod/main.tf",
         ):
             with self.subTest(root=relative_path):
                 root_dir = (ROOT / relative_path).parent
@@ -146,7 +149,7 @@ class CellActivationDefaultTests(unittest.TestCase):
                 self.assertRegex(
                     body,
                     r"try\(\s*\n?\s*data\.terraform_remote_state\.control"
-                    r"\.outputs\.authority_cell_alias_targets",
+                    r"(?:\[0\])?\.outputs\.authority_cell_alias_targets",
                 )
                 # Cell-agnostic on purpose: each derived root names its local
                 # after its own cell (control_cell1_alias_targets in the cell1
@@ -156,6 +159,47 @@ class CellActivationDefaultTests(unittest.TestCase):
                     body,
                     r"control_cell[0-9]+_alias_targets == null \? null",
                 )
+
+    def test_prod_control_state_handoff_is_explicit_and_dark_by_default(self) -> None:
+        root = ROOT / "terraform/environments/prod"
+        variables = terraform_variable_block(
+            root / "variables.tf", "connector_authority_cell_from_control_enabled"
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^\s*default\s*=\s*(.+?)\s*$", variables),
+            ["false"],
+        )
+        self.assertIn(
+            "condition     = !var.connector_authority_cell_from_control_enabled",
+            variables,
+        )
+
+        config = terraform_variable_block(
+            root / "variables.tf", "connector_authority_cell_config"
+        )
+        self.assertIn(
+            "condition     = var.connector_authority_cell_config == null", config
+        )
+
+        source = (root / "connector_authority_cell.tf").read_text(encoding="utf-8")
+        self.assertIn(
+            'count   = var.connector_authority_cell_from_control_enabled ? 1 : 0',
+            source,
+        )
+        self.assertIn('bucket = "layerv-terraform-state-235500187906"', source)
+        self.assertIn('key    = "nhp/prod/control/terraform.tfstate"', source)
+        self.assertIn(
+            "var.connector_authority_cell_from_control_enabled ? try(", source
+        )
+        main = (root / "main.tf").read_text(encoding="utf-8")
+        self.assertIn(
+            "connector_authority_cell_config = local.connector_authority_cell_config",
+            main,
+        )
+        tfvars = (root / "terraform.tfvars").read_text(encoding="utf-8")
+        self.assertIn(
+            "connector_authority_cell_from_control_enabled = false", tfvars
+        )
 
 
 class ManifestValidationTests(unittest.TestCase):
