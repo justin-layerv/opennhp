@@ -460,8 +460,8 @@ jobs:
 
       # Go dependency security fence: Dockerfile.ac.aws rebuilds the current
       # Traefik patch from checksum-pinned source with explicit grpc-go and
-      # x/text floors. Keep both literals non-overridable and prove the produced
-      # binary is inspected.
+      # x/mod/x/text floors. Keep every literal non-overridable and prove the
+      # produced binary is inspected.
       - name: Test + check AC Traefik dependency security floors
         run: |
           shellcheck scripts/check-traefik-grpc-pin.sh tests/scripts/check-traefik-grpc-pin_test.sh

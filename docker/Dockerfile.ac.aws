@@ -74,7 +74,10 @@ RUN make init acd ebpf-objects
 # collision allowing cross-namespace backend hijacking) via upstream #13580, and
 # ships grpc-go v1.82.1 and golang.org/x/text v0.40.0 in its own go.mod — so it
 # also supersedes the x/text v0.39.0 override this stage previously applied for
-# CVE-2026-56852.
+# CVE-2026-56852. It still pins golang.org/x/mod v0.37.0, however, so this stage
+# raises x/mod to v0.40.0 for CVE-2026-56864 and CVE-2026-56865. Go MVS also
+# raises x/crypto, x/net, x/text, and x/tools to the compatible versions selected
+# by that fixed release.
 #
 # The Gateway API provider is Kubernetes-only and the AC runs Traefik with the
 # file provider alone, so CVE-2026-71327 was not reachable here. It is patched
@@ -86,11 +89,9 @@ RUN make init acd ebpf-objects
 # the source authority, and Go's module checksums protect both explicit security
 # floors.
 #
-# v3.6.25 ships grpc v1.82.1 and x/text v0.40.0 in its own go.mod, so the
-# `go get` override this stage used to carry is gone: pinning x/text@v0.39.0
-# against it would now DOWNGRADE the dependency. The two version assertions
-# below are kept and re-pointed at upstream's versions, which turns them from a
-# check on our own override into a check that upstream has not regressed.
+# v3.6.25 ships grpc v1.82.1 in its own go.mod. The grpc version assertion below
+# therefore checks that upstream has not regressed, while the x/mod and x/text
+# assertions fence the security override and its MVS-selected dependency graph.
 #
 # That also satisfies the condition this stage was built to wait for (an
 # upstream 3.6.x embedding x/text >= v0.39.0), so the stage itself can now be
@@ -113,6 +114,13 @@ RUN curl -fsSL --retry 3 --retry-delay 5 \
     && git tag v3.6.25 4b18b24b0b002dcc80e0640c6088a87d813de29a \
     && test "$(git rev-parse HEAD)" = 4b18b24b0b002dcc80e0640c6088a87d813de29a \
     && go mod verify \
+    && go get golang.org/x/mod@v0.40.0 \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/crypto)" = v0.55.0 \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/mod)" = v0.40.0 \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/net)" = v0.58.0 \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/text)" = v0.41.0 \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/tools)" = v0.49.0 \
+    && go mod verify \
     && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
         -trimpath \
         -buildvcs=true \
@@ -131,7 +139,16 @@ RUN curl -fsSL --retry 3 --retry-delay 5 \
     && awk -v want=v1.82.1 \
         '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == want { found = 1 } END { exit !found }' \
         /tmp/traefik-build-info.txt \
+    && awk -v want=v0.55.0 \
+        '$1 == "dep" && $2 == "golang.org/x/crypto" && $3 == want { found = 1 } END { exit !found }' \
+        /tmp/traefik-build-info.txt \
     && awk -v want=v0.40.0 \
+        '$1 == "dep" && $2 == "golang.org/x/mod" && $3 == want { found = 1 } END { exit !found }' \
+        /tmp/traefik-build-info.txt \
+    && awk -v want=v0.58.0 \
+        '$1 == "dep" && $2 == "golang.org/x/net" && $3 == want { found = 1 } END { exit !found }' \
+        /tmp/traefik-build-info.txt \
+    && awk -v want=v0.41.0 \
         '$1 == "dep" && $2 == "golang.org/x/text" && $3 == want { found = 1 } END { exit !found }' \
         /tmp/traefik-build-info.txt \
     && awk \
@@ -210,14 +227,15 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Install the checksum-pinned Traefik source rebuild from the stage above.
-# 3.6.24 is built with Go 1.26.5, which fixes CVE-2026-39822 (os.Root escape
+# 3.6.25 is built with Go 1.26.6, which fixes CVE-2026-39822 (os.Root escape
 # via a trailing-slash symlink), and fixes CVE-2026-48020 (StripPrefix
 # route-level auth bypass),
 # CVE-2026-35051 (ForwardAuth X-Forwarded-Prefix spoofing),
 # CVE-2026-39858 (forwarded alias spoofing pre-auth bypass), and
 # CVE-2026-40912 (StripPrefixRegex Path/RawPath desync auth bypass).
-# Also bundles go-jose v4.1.4, go-acme/lego v5.2.2, grpc v1.82.1,
-# x/text v0.39.0, and otel v1.44.0.
+# Also bundles go-jose v4.1.4, go-acme/lego v5.3.1, grpc v1.82.1,
+# x/crypto v0.55.0, x/mod v0.40.0, x/net v0.58.0, x/text v0.41.0,
+# and otel v1.44.0.
 COPY --from=traefik-builder /usr/local/bin/traefik /usr/local/bin/traefik
 
 # Copy built AC binary and scripts.
