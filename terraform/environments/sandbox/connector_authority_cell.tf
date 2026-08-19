@@ -19,10 +19,12 @@
 #
 # The alias ARNs are READ FROM CONTROL, never pinned here. Control colors every
 # cell operation with authority_runtime_contract.selected_authority_color, so
-# reading its output means a reviewed color flip carries automatically. A literal
-# color here would be a second source of truth and would strand the cells on a
-# retired alias the day the selector moves -- the same stale-literal failure mode
-# as the pre-1.1 Hub pin.
+# a Control-first deploy followed by this root's apply and blue/green refresh
+# carries a reviewed color flip into every running server. This is materialized
+# configuration, not a dynamic runtime read; the workflow and its live
+# convergence gate enforce that order. A literal color here would be a second
+# source of truth and would strand the cells on a retired alias the day the
+# selector moves -- the same stale-literal failure mode as the pre-1.1 Hub pin.
 data "terraform_remote_state" "control" {
   backend = "s3"
 

@@ -550,6 +550,10 @@ lint-workflows:
 	@bash tests/scripts/wait-for-instance-refresh_test.sh
 	@bash tests/scripts/deploy-relay_test.sh
 	@bash tests/scripts/emit-deployment-window-metric_test.sh
+	@shellcheck .github/scripts/verify-asg-instances-healthy.sh .github/scripts/verify-authority-cell-alias-convergence.sh tests/scripts/verify-asg-instances-healthy_test.sh tests/scripts/verify-authority-cell-alias-convergence_test.sh
+	@bash tests/scripts/verify-asg-instances-healthy_test.sh
+	@bash tests/scripts/verify-authority-cell-alias-convergence_test.sh
+	@python3 tests/scripts/test_authority_consumer_cutover_workflow.py
 	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/resolve-active-image-tag_test.sh
 	@shellcheck .github/scripts/plan-blue-green-dispatch.sh tests/scripts/plan-blue-green-dispatch_test.sh

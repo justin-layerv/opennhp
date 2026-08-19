@@ -2208,12 +2208,13 @@ jobs:
   # DEPLOY SANDBOX - Split into parallel jobs for faster deploys
   # ============================================================================
   # Job dependency graph:
-  #   deploy-sandbox-infra → deploy-sandbox-blue-green → deploy-sandbox-validate
+  #   Control → cell0 infra ┬→ cell0 blue/green ─┐
+  #                         └→ cell1 infra ───────┴→ cell1 blue/green → Validate
   # ============================================================================
 
   deploy-sandbox-infra:
     name: Deploy Sandbox - Infrastructure
-    needs: [changes, setup, sandbox-environment-guard, sandbox-app-image-drift, app-image-build-required, test, test-lambdas, build, terraform-plan]
+    needs: [changes, setup, sandbox-environment-guard, sandbox-app-image-drift, app-image-build-required, test, test-lambdas, build, terraform-plan, deploy-sandbox-control]
     if: |
       always() &&
       (needs.sandbox-environment-guard.result == 'success' || needs.sandbox-environment-guard.result == 'skipped') &&
@@ -2224,6 +2225,7 @@ jobs:
       (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
       needs.build.result == 'success' &&
       needs.terraform-plan.result == 'success' &&
+      needs.deploy-sandbox-control.result == 'success' &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
@@ -3410,13 +3412,13 @@ jobs:
 
   deploy-sandbox-cell1-blue-green:
     name: Deploy Sandbox cell1 - Blue/Green
-    # Only deploy-sandbox-blue-green is listed: it already needs setup, build
-    # and deploy-sandbox-infra, so gating on its success gates transitively on
-    # all of them, and its server_tag output is the only value used here.
-    needs: [deploy-sandbox-blue-green]
+    # The image tag comes from cell0, but the refresh must also wait for
+    # cell1's Terraform apply to publish the selected Authority alias graph.
+    needs: [deploy-sandbox-blue-green, deploy-sandbox-cell1-infra]
     if: |
       always() &&
       needs.deploy-sandbox-blue-green.result == 'success' &&
+      needs.deploy-sandbox-cell1-infra.result == 'success' &&
       needs.deploy-sandbox-blue-green.outputs.server_tag != ''
     runs-on: ubuntu-latest
     environment: sandbox
@@ -3552,27 +3554,29 @@ jobs:
   #      guard is the state {serial, sha256} re-proved immediately before apply.
   #      Every source-owned CONTENT check still runs.
   #
-  # Shares the deploy-sandbox-infra writer lock so Control and cell0 can never
-  # apply concurrently; that makes this leg preemptable, which notify reports as
-  # a superseded run rather than a failure.
+  # Runs before cell0/cell1 Terraform so their rendered caller aliases consume
+  # the settled selector. The shared writer lock remains defense in depth.
   # ============================================================================
   deploy-sandbox-control:
     name: Deploy Sandbox - Control
-    # Same minimal shape as deploy-sandbox-qurl: this job consumes no setup
-    # outputs, and infra already orders after setup.
-    needs: [deploy-sandbox-infra]
+    needs: [changes, setup, sandbox-environment-guard, sandbox-app-image-drift, app-image-build-required, test, test-lambdas, build, terraform-plan]
     # Runs on every sandbox deploy, not only when terraform/control changed: the
     # Authority image digest is republished out of band, so "main did not touch
-    # the Control root" does not mean it is converged. A SKIPPED infra leg still
-    # lets Control converge; a FAILED one does not, since stacking a Control
-    # apply on a half-applied cell0 estate turns one bad push into two.
+    # the Control root" does not mean it is converged. Cell applies consume this
+    # job's settled selector and therefore cannot run before it.
     #
     # Accepted consequence: an infra-skipped push applies Control without
     # validate/smoke. Smoke never routes through the Hub, and the in-job
     # post-apply proofs are what cover a Control apply. See the README.
     if: |
       always() &&
-      (needs.deploy-sandbox-infra.result == 'success' || needs.deploy-sandbox-infra.result == 'skipped') &&
+      (needs.sandbox-environment-guard.result == 'success' || needs.sandbox-environment-guard.result == 'skipped') &&
+      (needs.sandbox-app-image-drift.result == 'success' || needs.sandbox-app-image-drift.result == 'skipped') &&
+      needs.app-image-build-required.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
+      needs.build.result == 'success' &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
@@ -4345,24 +4349,18 @@ jobs:
     # now ORDERS after deploy-sandbox-relay, but only the relay smoke and
     # deployment tracking gate on relay success. That keeps unrelated
     # integration/E2E/CSP validation visible when the relay leg is already red.
-    # deploy-sandbox-control is in needs for the same reason deploy-sandbox-qurl
-    # is: ORDER validation after it, so smoke observes a settled Control plane
-    # rather than racing an in-flight Hub/Authority apply — and so the Slack
-    # pipeline's `… → Control → Validate → Smoke` describes the real dependency
-    # rather than only the render order.
-    #
-    # Same order-but-don't-gate rule as qURL, for the same reason: a FAILED
-    # Control apply leaves a partially applied Control plane, and suppressing
-    # every other smoke assertion (server, AC, qURL — none of which route
-    # through the Hub) because of it trades one loud signal for no signal. The
-    # Control failure is already loud: red in Slack and in notify's
-    # DEPLOY_FAILED loop. Only 'cancelled' — indeterminate, run being torn
-    # down — skips validation.
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl, deploy-sandbox-relay, deploy-sandbox-control]
+    # deploy-sandbox-control is also named explicitly even though it is an
+    # ancestor of both cell refreshes. The cell0 infra job gates on Control
+    # success, both blue/green legs gate on their matching Terraform applies,
+    # and this job gates on both refreshes before proving the live alias graph.
+    # Keeping Control in `needs` preserves its explicit Slack/result context and
+    # makes cancellation fail closed rather than allowing a mixed-time readback.
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-cell1-blue-green, deploy-sandbox-qurl, deploy-sandbox-relay, deploy-sandbox-control]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
       needs.deploy-sandbox-blue-green.result == 'success' &&
+      needs.deploy-sandbox-cell1-blue-green.result == 'success' &&
       needs.deploy-sandbox-qurl.result != 'cancelled' &&
       needs.deploy-sandbox-control.result != 'cancelled'
     runs-on: ubuntu-latest
@@ -4389,6 +4387,14 @@ jobs:
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify active cell Authority alias convergence
+        # Two sequential four-minute ASG probes plus AWS readback overhead.
+        # Leave enough headroom for the helper to emit its own actionable error.
+        timeout-minutes: 12
+        run: |
+          ./.github/scripts/verify-authority-cell-alias-convergence.sh \
+            sandbox 767397897469 "$AWS_REGION"
 
       - name: Post-Deployment Validation
         timeout-minutes: 6

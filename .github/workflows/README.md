@@ -63,15 +63,22 @@ documents normal deployment and verification.
 `build-and-push.yml` applies the isolated sandbox Control root
 (`terraform/control/environments/sandbox` — the Connector Authority foundation,
 the `ca-*` runtime functions, and the Hub edge + Fargate worker) on every
-sandbox deploy, ordered after `deploy-sandbox-infra` and holding the same
-`deploy-sandbox-infra` writer lock, because Control and cell0 must never apply
-concurrently. It plans with `-detailed-exitcode`, reports `converged` and stops
-when there is nothing to do, and otherwise applies in-run. `Control` renders in
-the Slack pipeline between Relay and Validate, distinguishing an apply from a
-no-op convergence, from a leg superseded by a newer push. Validation orders
-after it so smoke sees a settled Control plane, but does not gate on its
-success — a failed Control apply must not suppress the server/AC/qURL smoke
-assertions that never touch the Hub.
+sandbox deploy. Control runs first and holds the same `deploy-sandbox-infra`
+writer lock, because Control and cell0 must never apply concurrently. After its
+selector is settled, the cell0 and cell1 Terraform roots read that exact output
+and publish it into their S3 bootstrap objects; each blue/green leg then refreshes
+the affected server fleet before validation. This order is load-bearing: the
+alias ARNs are materialized at Terraform/apply and instance boot, not read
+dynamically by an already-running server. It plans with `-detailed-exitcode`,
+reports `converged` and stops when there is nothing to do, and otherwise applies
+in-run. `Control` renders in the Slack pipeline before Validate, distinguishing
+an apply from a no-op convergence, from a leg superseded by a newer push.
+
+Validation gates on both cell refreshes and then fails closed unless every
+Authority operation has the selected color in all three materialization layers:
+the Control pointer, each cell's S3 bootstrap object, and every InService active
+server's host env file plus running container. A stale consumer therefore blocks
+the pipeline before SDK enrollment gates can be asked to trust the cutover.
 
 Turning all seven gates dark is a teardown of the Hub and the Authority
 runtime, not a deploy. The reader accepts that shape (it is the documented
@@ -91,12 +98,11 @@ the Terraform that needs it. `scripts/check-control-leg-surfaced.sh` fences the
 wiring, the shared writer lock, and the gate-file sourcing.
 
 On an infra-skipped push (a gate-file or docs-only change) Control applies and
-`deploy-sandbox-validate` does not run, because validate still requires infra
-success. That is deliberate: smoke exercises server, AC, and qURL, none of which
-route through the Hub or the Authority runtime, so widening validate would add
-pipeline time on every docs push while asserting nothing about what changed. The
-in-job post-apply refresh-enabled no-op and live dark-boundary proof are what
-cover a Control apply.
+`deploy-sandbox-validate` does not run, because validate still requires both cell
+infra/refresh paths. That is deliberate: the Control job's in-job post-apply
+refresh-enabled no-op and live dark-boundary proof cover Control itself. Any run
+that materializes cell infrastructure must complete both refreshes and the live
+consumer-convergence gate.
 
 **Keep this workflow's rationale short.** `build-and-push.yml` sits near a size
 ceiling that GitHub does not surface as a normal error: a file that grows past

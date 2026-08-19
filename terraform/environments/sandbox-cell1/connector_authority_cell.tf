@@ -29,8 +29,10 @@
 #
 # The alias ARNs are READ FROM CONTROL, never pinned here, for the reason that
 # file gives: Control colors every cell operation with
-# authority_runtime_contract.selected_authority_color, so a reviewed color flip
-# carries automatically. Control already publishes the cell1 targets
+# authority_runtime_contract.selected_authority_color. The Control-first deploy,
+# this root's apply, and its blue/green refresh carry a reviewed color flip into
+# every running cell1 server; the value is materialized rather than dynamically
+# read at runtime. Control already publishes the cell1 targets
 # (authority_selected_alias_targets.cells["cell1"]); only this root was not
 # reading them.
 data "terraform_remote_state" "control" {

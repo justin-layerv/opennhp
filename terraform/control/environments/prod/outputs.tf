@@ -152,9 +152,10 @@ output "authority_cell_alias_targets" {
     complete_credential_recovery), or null while the runtime is dark.
 
     Single source of truth for the cell servers' NHP_CONNECTOR_REGISTRATION_* wiring.
-    The sandbox root reads this through terraform_remote_state rather than pinning a
-    literal alias color, so a reviewed authority-color selector flip carries to the
-    cells automatically instead of silently stranding them on a retired alias.
+    The cell roots read this through terraform_remote_state rather than
+    pinning a literal alias color. Deployment orchestration must settle Control
+    before applying those roots and refreshing their fleets because the aliases are
+    materialized into server configuration rather than read dynamically at runtime.
 
     Derived from authority_selected_alias_targets.cells, which colors every cell
     operation with var.authority_runtime_contract.selected_authority_color. Do NOT

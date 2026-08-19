@@ -55,6 +55,7 @@ case "$1 $2" in
   "autoscaling describe-auto-scaling-groups")
     case "$scenario" in
       success) printf 'i-ok\n' ;;
+      empty) printf '\n' ;;
       *) printf 'i-fail\n' ;;
     esac
     ;;
@@ -223,6 +224,10 @@ assert_rc "successful health probe exits zero" 0
 assert_contains "successful health probe logs ok instance" "i-ok: ok"
 assert_contains "successful health probe logs completion" "All 1 instance(s) passed health check"
 assert_count "successful health probe skips failure details" "health command stdout" 0
+
+run_case empty-asg empty bash "$SCRIPT" layerv-nhp-sandbox-ac AC-Standby 1 'curl -sfS -o /dev/null http://127.0.0.1:8080/ping'
+assert_rc "ASG with no InService instances fails closed" 1
+assert_contains "empty ASG failure names the missing runtime" "No InService instances found"
 
 run_case failed-health-probe failed-static bash "$SCRIPT" layerv-nhp-sandbox-ac AC-Standby 1 'curl -sfS -o /dev/null http://127.0.0.1:8080/ping'
 assert_rc "failed health probe exits non-zero" 1

@@ -604,6 +604,7 @@ jobs:
             .github/scripts/dispatch-and-poll-canary.sh \
             .github/scripts/emit-deployment-window-metric.sh \
             .github/scripts/verify-asg-instances-healthy.sh \
+            .github/scripts/verify-authority-cell-alias-convergence.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
             .github/scripts/check-relay-deposed-sg-clear.sh \
             scripts/rotate-relay-identity.sh \
@@ -612,6 +613,7 @@ jobs:
             tests/scripts/deploy-relay_test.sh \
             tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/verify-asg-instances-healthy_test.sh \
+            tests/scripts/verify-authority-cell-alias-convergence_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
             tests/scripts/check-relay-deposed-sg-clear_test.sh \
             tests/scripts/rotate-relay-identity_test.sh
@@ -620,6 +622,8 @@ jobs:
           bash tests/scripts/deploy-relay_test.sh
           bash tests/scripts/emit-deployment-window-metric_test.sh
           bash tests/scripts/verify-asg-instances-healthy_test.sh
+          bash tests/scripts/verify-authority-cell-alias-convergence_test.sh
+          python3 tests/scripts/test_authority_consumer_cutover_workflow.py
           bash tests/scripts/recover-relay-deposed-sg_test.sh
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
           bash tests/scripts/rotate-relay-identity_test.sh
