@@ -176,25 +176,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # that don't exercise ACME).
 ENV AWS_REGION=""
 
-# Swap archive.ubuntu.com for Canonical's Azure mirror before installing.
-# GitHub Actions runners are Azure-hosted, so azure.archive.ubuntu.com is
-# geo-local and far faster + more reliable than the general archive that
-# serves every CI system on the planet. Three consecutive CI failures on
-# 2026-04-17 (runs 24548987311, 24549340621, 24550346283) were caused by
-# archive.ubuntu.com either refusing connections or crawling at 3 KB/s —
-# the retries/timeout in PR #1083 helped but couldn't recover from that.
-#
-# azure.archive.ubuntu.com serves both the main archive and security
-# updates so one substitution covers every source.list entry.
+# Prefer the official archive/security sources frozen in the pinned Ubuntu
+# base, but recover from an outage through Canonical's Azure-local mirror. The
+# shared helper owns update + install, repairs a partial dpkg transaction on
+# fallback, and fails closed if either source shape or both attempts fail.
 #
 # All runtime apt packages in one layer:
 #   ca-certificates, iptables, ipset, curl, file, supervisor — base
 #   gettext-base — provides envsubst used by the entrypoint script below
-RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
-        { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+RUN --mount=type=bind,source=docker/ubuntu-apt-install-with-fallback.sh,target=/usr/local/sbin/ubuntu-apt-install-with-fallback,ro \
+    /usr/local/sbin/ubuntu-apt-install-with-fallback \
     ca-certificates \
     iptables \
     ipset \

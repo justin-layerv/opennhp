@@ -109,12 +109,17 @@ relay_go_dependency_paths() {
   ' <<< "$imports" | sort -u
 }
 
-relay_dockerfile_shared_docker_copies() {
-  awk '
-    /^[[:space:]]*COPY[[:space:]]+/ && $0 ~ /(^|[[:space:]])docker\// {
-      print
-    }
-  ' "$REPO_ROOT/docker/Dockerfile.relay"
+relay_dockerfile_shared_docker_inputs() {
+  {
+    awk '
+      /^[[:space:]]*COPY[[:space:]]+/ && $0 ~ /(^|[[:space:]])docker\// {
+        for (i = 2; i < NF; i++) {
+          if ($i ~ /^docker\//) print $i
+        }
+      }
+    ' "$REPO_ROOT/docker/Dockerfile.relay"
+    sed -nE 's|.*source=(docker/[^,[:space:]]+).*|\1|p' "$REPO_ROOT/docker/Dockerfile.relay"
+  } | sort -u
 }
 
 tmpdir=$(mktemp -d)
@@ -126,10 +131,11 @@ git -C "$tmpdir" init -q
 git -C "$tmpdir" config user.email test@example.com
 git -C "$tmpdir" config user.name "Test User"
 
-mkdir -p "$tmpdir/endpoints/server" "$tmpdir/endpoints/relay" "$tmpdir/terraform"
+mkdir -p "$tmpdir/endpoints/server" "$tmpdir/endpoints/relay" "$tmpdir/terraform" "$tmpdir/docker"
 printf 'old\n' > "$tmpdir/endpoints/server/forward.go"
 printf 'old\n' > "$tmpdir/endpoints/relay/relay.go"
 printf 'old\n' > "$tmpdir/terraform/main.tf"
+printf 'old\n' > "$tmpdir/docker/ubuntu-apt-install-with-fallback.sh"
 printf 'old\n' > "$tmpdir/.trivyignore"
 git -C "$tmpdir" add .
 git -C "$tmpdir" commit -q -m base
@@ -149,6 +155,11 @@ printf 'relay\n' > "$tmpdir/endpoints/relay/relay.go"
 git -C "$tmpdir" add .
 git -C "$tmpdir" commit -q -m relay-change
 relay=$(git -C "$tmpdir" rev-parse HEAD)
+
+printf 'mirror helper\n' > "$tmpdir/docker/ubuntu-apt-install-with-fallback.sh"
+git -C "$tmpdir" add .
+git -C "$tmpdir" commit -q -m mirror-helper-change
+mirror_helper=$(git -C "$tmpdir" rev-parse HEAD)
 
 printf 'ignore\n' > "$tmpdir/.trivyignore"
 git -C "$tmpdir" add .
@@ -259,8 +270,8 @@ server_ac_paths=$(extract_script_array SERVER_AC_IMAGE_PATHS)
 relay_paths=$(extract_script_array RELAY_IMAGE_PATHS)
 relay_deps=$(relay_go_dependency_paths)
 relay_deps_rc=$?
-relay_required_inputs=$'endpoints/go.mod\nendpoints/go.sum\ndocker/Dockerfile.relay\nMakefile\n.trivyignore'
-relay_shared_docker_copies=$(relay_dockerfile_shared_docker_copies)
+relay_required_inputs=$'endpoints/go.mod\nendpoints/go.sum\ndocker/Dockerfile.relay\ndocker/ubuntu-apt-install-with-fallback.sh\nMakefile\n.trivyignore'
+relay_shared_docker_inputs=$(relay_dockerfile_shared_docker_inputs)
 
 assert_non_empty "workflow app filter extraction is non-empty" "$workflow_app_filter"
 assert_non_empty "server/ac image path extraction is non-empty" "$server_ac_paths"
@@ -275,7 +286,8 @@ else
   report_fail "relay go dependency extraction is non-empty" "go list failed"
 fi
 assert_lines_contain_all "relay image paths include Dockerfile and build inputs" "$relay_paths" "$relay_required_inputs"
-assert_empty "relay Dockerfile does not copy untracked docker/ shared inputs" "$relay_shared_docker_copies"
+assert_non_empty "relay Dockerfile shared docker/ input extraction is non-empty" "$relay_shared_docker_inputs"
+assert_lines_contain_all "relay image paths cover shared docker/ inputs" "$relay_paths" "$relay_shared_docker_inputs"
 
 run_case "same app tree after infra-only commit does not require image" \
   false "$infra" "server=$base" "ac=$base"
@@ -310,6 +322,9 @@ run_case "relay ignores server-only endpoint changes" \
 
 run_case "relay source change requires relay image" \
   true "$relay" "relay=$base"
+
+run_case "relay mirror helper change requires relay image" \
+  true "$mirror_helper" "relay=$relay"
 
 run_case ".trivyignore change requires image" \
   true "$trivyignore" "server=$relay" "ac=$relay" "relay=$relay"

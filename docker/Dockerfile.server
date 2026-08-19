@@ -48,16 +48,12 @@ RUN make init serverd
 FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Swap to Canonical's Azure mirror — GitHub Actions runners are in Azure,
-# so azure.archive.ubuntu.com is geo-local and more reliable than the
-# general archive.ubuntu.com. See Dockerfile.ac.aws for the CI-failure
-# history (2026-04-17 outage affecting runs 24548987311 / 24549340621 /
-# 24550346283) that motivated this swap.
-RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
-        { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+# Prefer the official archive/security sources frozen in the pinned Ubuntu
+# base, but recover from an outage through Canonical's Azure-local mirror. The
+# shared helper owns update + install, repairs a partial dpkg transaction on
+# fallback, and fails closed if either source shape or both attempts fail.
+RUN --mount=type=bind,source=docker/ubuntu-apt-install-with-fallback.sh,target=/usr/local/sbin/ubuntu-apt-install-with-fallback,ro \
+    /usr/local/sbin/ubuntu-apt-install-with-fallback \
     ca-certificates \
     iptables \
     ipset \

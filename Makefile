@@ -256,7 +256,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation lint-prod-deploy-relay-activation
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-errorcode-to-error-callers lint-run-fuzz lint-ac-apt-guard lint-ubuntu-apt-mirror-fallback lint-cis-metric-filter-patterns lint-dispatch-concurrency-isolation lint-prod-deploy-relay-activation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -385,6 +385,16 @@ lint-ac-apt-guard:
 	@./tests/lints/ac-apt-guard/run-fixtures.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] AC boot-time apt guard passed!$(END_COLOUR)"
 
+# Keep every application-image matrix runtime on one bounded package-index
+# strategy: pinned official sources first, Azure-local fallback, then fail.
+.PHONY: lint-ubuntu-apt-mirror-fallback
+lint-ubuntu-apt-mirror-fallback:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking Ubuntu apt mirror fallback...$(END_COLOUR)"
+	@shellcheck docker/ubuntu-apt-install-with-fallback.sh scripts/check-ubuntu-apt-mirror-fallback.sh tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+	@./tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+	@./scripts/check-ubuntu-apt-mirror-fallback.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] Ubuntu apt mirror fallback passed!$(END_COLOUR)"
+
 # Freeze the CIS v1.4.0 CloudWatch metric-filter patterns in
 # terraform/modules/security/cloudtrail_metric_filters.tf against the golden
 # in tests/lints/cis-metric-filter-patterns/golden.json (#1140 / PR #2344).
@@ -493,6 +503,9 @@ lint-workflows:
 	@shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
 	@bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
 	@bash scripts/check-ubuntu-base-digest-drift.sh
+	@shellcheck docker/ubuntu-apt-install-with-fallback.sh scripts/check-ubuntu-apt-mirror-fallback.sh tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+	@bash tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+	@bash scripts/check-ubuntu-apt-mirror-fallback.sh
 	@shellcheck scripts/check-lambda-boto-pin-lockstep.sh tests/scripts/check-lambda-boto-pin-lockstep_test.sh
 	@bash tests/scripts/check-lambda-boto-pin-lockstep_test.sh
 	@bash scripts/check-lambda-boto-pin-lockstep.sh

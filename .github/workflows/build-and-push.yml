@@ -1904,6 +1904,9 @@ jobs:
         # cover them explicitly here so a typo lands at PR time, not later.
         run: |
           shellcheck ./tests/lints/ac-apt-guard/run-fixtures.sh
+          shellcheck ./docker/ubuntu-apt-install-with-fallback.sh
+          shellcheck ./scripts/check-ubuntu-apt-mirror-fallback.sh
+          shellcheck ./tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
           shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
           shellcheck ./tests/lints/terraform-tag-charset/run-fixtures.sh
           shellcheck ./tests/lints/asg-capacity-deficit-alarms/run-fixtures.sh
@@ -1914,6 +1917,14 @@ jobs:
         # terraform/modules/ac/main.tf. Runs unconditionally so regex drift
         # cannot hide until the next AC boot-path incident.
         run: ./tests/lints/ac-apt-guard/run-fixtures.sh
+
+      - name: Test and check Ubuntu apt mirror fallback
+        # This is the same path the image jobs consume later in this workflow.
+        # Run behavioral + wiring fixtures before a mirror outage can make the
+        # image failure itself the first signal that fallback drifted.
+        run: |
+          ./tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+          ./scripts/check-ubuntu-apt-mirror-fallback.sh
 
       - name: Run terraform-prod-drift fixture suite
         # Regression fences for #1316 (resource-policy Condition denylist)

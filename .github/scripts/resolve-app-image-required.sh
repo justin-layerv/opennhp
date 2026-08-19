@@ -49,6 +49,7 @@ RELAY_IMAGE_PATHS=(
   endpoints/metrics
   endpoints/relay
   docker/Dockerfile.relay
+  docker/ubuntu-apt-install-with-fallback.sh
   Makefile
   .trivyignore
 )

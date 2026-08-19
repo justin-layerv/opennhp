@@ -38,6 +38,11 @@ on:
       # edit; watch the lint itself so an edit to it re-fires. Paired fixture
       # test rides tests/scripts/** below.
       - "scripts/check-ubuntu-base-digest-drift.sh"
+      # Every application-image matrix runtime must use the same bounded
+      # official-source -> Azure apt fallback. Watch the helper explicitly;
+      # Dockerfiles and the fixture directory are covered below.
+      - "scripts/check-ubuntu-apt-mirror-fallback.sh"
+      - "docker/ubuntu-apt-install-with-fallback.sh"
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
@@ -226,6 +231,7 @@ on:
       # run in the job below.
       - "tests/lints/packer-failure-surfaced/**"
       - "tests/lints/ebpf-load-path-lockstep/**"
+      - "tests/lints/ubuntu-apt-mirror-fallback/**"
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
       # Blue/green post-switch restart classification. Both scripts it drives
@@ -494,6 +500,15 @@ jobs:
           shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
           bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
           bash scripts/check-ubuntu-base-digest-drift.sh
+
+      # APT may report a partial-index fetch as success unless Error-Mode=any
+      # is set. Prove the official-source primary, Azure-local fallback,
+      # bounded dual failure, and shared wiring across all runtime images.
+      - name: Test + check Ubuntu apt mirror fallback
+        run: |
+          shellcheck docker/ubuntu-apt-install-with-fallback.sh scripts/check-ubuntu-apt-mirror-fallback.sh tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+          bash tests/lints/ubuntu-apt-mirror-fallback/run-fixtures.sh
+          bash scripts/check-ubuntu-apt-mirror-fallback.sh
 
       # Lambda boto3/botocore pin lockstep (#3320/#3323): build-and-push.yml's
       # "Test Lambdas" job installs every terraform/modules/*/lambda test

@@ -33,11 +33,11 @@ RUN test -n "$NHP_BUILD_COMMIT_ID" && test -n "$NHP_BUILD_COMMIT_TIME" && \
 FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
-        { echo "ERROR: ubuntu.sources mirror substitution failed"; exit 1; } && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+# Use the pinned official sources first with one bounded Azure-local recovery
+# path for mirror outages. The helper owns update + install, repairs partial
+# dpkg state on fallback, and fails if neither source completes the package set.
+RUN --mount=type=bind,source=docker/ubuntu-apt-install-with-fallback.sh,target=/usr/local/sbin/ubuntu-apt-install-with-fallback,ro \
+    /usr/local/sbin/ubuntu-apt-install-with-fallback \
     ca-certificates \
     libssl3t64 \
     openssl-provider-legacy \
