@@ -14,5 +14,5 @@
 
 -r requirements.txt
 pytest==9.1.1
-boto3==1.43.67
-botocore==1.43.67
+boto3==1.43.71
+botocore==1.43.71

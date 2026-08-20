@@ -8,8 +8,8 @@ pytest==9.1.1
 # Kept in lockstep with custom-domain-cert/lambda/requirements-test.txt: CI
 # installs both cert-lambda test requirement sets into one env, so divergent
 # boto3/botocore pins here would only ever be shadowed (last-write-wins).
-boto3==1.43.67
-botocore==1.43.67
+boto3==1.43.71
+botocore==1.43.71
 
 # The Lambda dependencies (for running tests)
 -r requirements.txt
