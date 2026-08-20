@@ -255,6 +255,16 @@ variable "nhp_internal_auth_secret_arn" {
   }
 }
 
+variable "feedback_slack_webhook_secret_arn" {
+  description = "Secrets Manager ARN for the qURL Desktop feedback Slack incoming webhook"
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$", var.feedback_slack_webhook_secret_arn))
+    error_message = "feedback_slack_webhook_secret_arn must be a valid Secrets Manager ARN."
+  }
+}
+
 # ==================== KMS ====================
 
 variable "logs_kms_key_arn" {

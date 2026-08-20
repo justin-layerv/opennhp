@@ -326,6 +326,7 @@ locals {
       var.jwt_secret_arn,
       var.internal_service_token_arn,
       var.nhp_internal_auth_secret_arn,
+      var.feedback_slack_webhook_secret_arn,
     ],
     # Grafana Cloud secret when the ADOT sidecar is enabled.
     var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : [],
@@ -626,6 +627,8 @@ locals {
     { name = "QURL_AC_ID", valueFrom = aws_ssm_parameter.default_ac_id.arn },
     # Shared HMAC secret — signer side of the /nhp/internal/knock contract with nhp-server.
     { name = "NHP_INTERNAL_AUTH_SECRET", valueFrom = var.nhp_internal_auth_secret_arn },
+    # Dedicated launch-time credential for authenticated qURL Desktop feedback.
+    { name = "QURL_FEEDBACK_SLACK_WEBHOOK_URL", valueFrom = var.feedback_slack_webhook_secret_arn },
   ]
 }
 

@@ -84,6 +84,7 @@ variables {
   jwt_secret_arn                         = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-jwt-AbCdEf"
   internal_service_token_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-internal-AbCdEf"
   nhp_internal_auth_secret_arn           = "arn:aws:secretsmanager:us-east-2:767397897469:secret:nhp-internal-AbCdEf"
+  feedback_slack_webhook_secret_arn      = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-feedback-AbCdEf"
   secrets_kms_key_arn                    = "arn:aws:kms:us-east-2:767397897469:key/11111111-1111-1111-1111-111111111111"
   logs_kms_key_arn                       = "arn:aws:kms:us-east-2:767397897469:key/22222222-2222-2222-2222-222222222222"
   cookie_domain                          = ".qurl.site.layerv.xyz"

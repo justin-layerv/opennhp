@@ -538,6 +538,45 @@ resource "terraform_data" "qurl_service_secret_seed" {
   }
 }
 
+# Keep feedback delivery dark until an operator installs the dedicated Slack
+# incoming webhook directly in Secrets Manager. Terraform owns only the
+# sentinel value used on first creation, never the production credential.
+resource "aws_secretsmanager_secret" "qurl_feedback_slack_webhook" {
+  count = local.qurl_service_deployable ? 1 : 0
+
+  name                    = "${local.name_prefix}-qurl-feedback-slack-webhook"
+  description             = "Slack incoming webhook for authenticated qURL Desktop feedback"
+  recovery_window_in_days = 0
+  kms_key_id              = module.kms.secrets_key_arn
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-qurl-feedback-slack-webhook"
+    Component = "qurl-service"
+    Purpose   = "Desktop feedback delivery"
+  })
+}
+
+resource "terraform_data" "qurl_feedback_slack_webhook_seed" {
+  count            = local.qurl_service_deployable ? 1 : 0
+  triggers_replace = [aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].arn]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      printf '%s' 'DISABLED' |
+        aws secretsmanager put-secret-value \
+          --region "${data.aws_region.current.region}" \
+          --secret-id "${aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].id}" \
+          --secret-string file:///dev/stdin >/dev/null
+    EOT
+  }
+}
+
+# Deliberately omit a secret-version data source/check: once an operator
+# installs the webhook, reading secret_string would copy the credential into
+# Terraform state. A failed local-exec instead taints this seed for retry.
+
 module "qurl_service" {
   count  = local.qurl_service_deployable ? 1 : 0
   source = "../../modules/qurl-service"
@@ -608,11 +647,12 @@ module "qurl_service" {
   auth0_jwks_cache_ttl_seconds     = 3600
   auth0_jwks_fetch_timeout_seconds = 10
 
-  secrets_kms_key_arn          = module.kms.secrets_key_arn
-  logs_kms_key_arn             = module.kms.logs_key_arn
-  jwt_secret_arn               = aws_secretsmanager_secret.qurl_service["jwt"].arn
-  internal_service_token_arn   = aws_secretsmanager_secret.qurl_service["internal-token"].arn
-  nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
+  secrets_kms_key_arn               = module.kms.secrets_key_arn
+  logs_kms_key_arn                  = module.kms.logs_key_arn
+  jwt_secret_arn                    = aws_secretsmanager_secret.qurl_service["jwt"].arn
+  internal_service_token_arn        = aws_secretsmanager_secret.qurl_service["internal-token"].arn
+  nhp_internal_auth_secret_arn      = aws_secretsmanager_secret.nhp_internal_auth.arn
+  feedback_slack_webhook_secret_arn = aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].arn
 
   nhp_server_internal_url      = "http://${module.compute.cloudmap_service_dns}:8888"
   nhp_server_security_group_id = module.compute.security_group_id
@@ -674,6 +714,7 @@ module "qurl_service" {
     terraform_data.qurl_service_runtime_image,
     terraform_data.qurl_service_secret_seed,
     terraform_data.nhp_internal_auth_seed,
+    terraform_data.qurl_feedback_slack_webhook_seed,
   ]
 }
 

@@ -736,6 +736,46 @@ resource "terraform_data" "nhp_internal_auth_seed" {
   }
 }
 
+# Dedicated delivery credential for authenticated qURL Desktop feedback. The
+# initial sentinel keeps delivery dark until the rollout coordinator writes the
+# Slack incoming webhook directly to Secrets Manager; Terraform never owns the
+# real credential value.
+resource "aws_secretsmanager_secret" "qurl_feedback_slack_webhook" {
+  count = var.deploy_qurl_service ? 1 : 0
+
+  name                    = "${local.name_prefix}-qurl-feedback-slack-webhook"
+  description             = "Slack incoming webhook for authenticated qURL Desktop feedback"
+  recovery_window_in_days = var.environment == "prod" ? 30 : 0
+  kms_key_id              = module.kms.secrets_key_arn
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-qurl-feedback-slack-webhook"
+    Component = "qurl-service"
+    Purpose   = "Desktop feedback delivery"
+  })
+}
+
+resource "terraform_data" "qurl_feedback_slack_webhook_seed" {
+  count            = var.deploy_qurl_service ? 1 : 0
+  triggers_replace = [aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].arn]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      printf '%s' 'DISABLED' |
+        aws secretsmanager put-secret-value \
+          --region "${data.aws_region.current.region}" \
+          --secret-id "${aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].id}" \
+          --secret-string file:///dev/stdin >/dev/null
+    EOT
+  }
+}
+
+# Deliberately omit a secret-version data source/check: once an operator
+# installs the webhook, reading secret_string would copy the credential into
+# Terraform state. A failed local-exec instead taints this seed for retry.
+
 # Early diagnostic: confirm the secret has a populated version. If the seed's
 # local-exec failed on first apply, this fires a warning at every subsequent
 # plan/apply until `terraform apply -replace=terraform_data.nhp_internal_auth_seed`
@@ -2868,9 +2908,10 @@ module "qurl_service" {
   auth0_jwks_fetch_timeout_seconds = var.qurl_auth0_jwks_fetch_timeout_seconds
 
   # Secrets
-  secrets_kms_key_arn        = module.kms.secrets_key_arn
-  jwt_secret_arn             = var.qurl_jwt_secret_arn
-  internal_service_token_arn = var.qurl_internal_service_token_arn
+  secrets_kms_key_arn               = module.kms.secrets_key_arn
+  jwt_secret_arn                    = var.qurl_jwt_secret_arn
+  internal_service_token_arn        = var.qurl_internal_service_token_arn
+  feedback_slack_webhook_secret_arn = aws_secretsmanager_secret.qurl_feedback_slack_webhook[0].arn
 
   # Shared HMAC secret for signing outbound /nhp/internal/knock requests.
   # Must match the value nhp-server reads on the verifier side.
@@ -3125,6 +3166,8 @@ module "qurl_service" {
   # depends_on:
   #  - terraform_data.nhp_internal_auth_seed: ensure the HMAC secret is seeded
   #    before the ECS task pulls it via valueFrom.
+  #  - terraform_data.qurl_feedback_slack_webhook_seed: ensure feedback starts
+  #    with the explicit disabled sentinel before ECS resolves the secret.
   #  - module.bootstrap_alb: ensure the bootstrap-ALB listener exists before
   #    aws_ecs_service.qurl runs RegisterTargets against the bootstrap-ALB TG
   #    (the cross-module ref on bootstrap_alb_target_group_arn implicitly
@@ -3164,6 +3207,7 @@ module "qurl_service" {
 
   depends_on = [
     terraform_data.nhp_internal_auth_seed,
+    terraform_data.qurl_feedback_slack_webhook_seed,
     module.bootstrap_alb,
   ]
 }

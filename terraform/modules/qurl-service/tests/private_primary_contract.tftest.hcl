@@ -74,6 +74,7 @@ variables {
   jwt_secret_arn                         = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-jwt-AbCdEf"
   internal_service_token_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-internal-AbCdEf"
   nhp_internal_auth_secret_arn           = "arn:aws:secretsmanager:us-east-2:767397897469:secret:nhp-internal-AbCdEf"
+  feedback_slack_webhook_secret_arn      = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-feedback-AbCdEf"
   secrets_kms_key_arn                    = "arn:aws:kms:us-east-2:767397897469:key/11111111-1111-1111-1111-111111111111"
   logs_kms_key_arn                       = "arn:aws:kms:us-east-2:767397897469:key/22222222-2222-2222-2222-222222222222"
   cookie_domain                          = ".qurl.site.layerv.xyz"
@@ -302,9 +303,30 @@ run "private_primary_is_internal_and_digest_pinned" {
         "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-jwt-AbCdEf",
         "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-internal-AbCdEf",
         "arn:aws:secretsmanager:us-east-2:767397897469:secret:nhp-internal-AbCdEf",
+        "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-feedback-AbCdEf",
       ])
     )
     error_message = "Private execution boundary must pin the exact ECR repository and permit KMS decrypt only through Secrets Manager for the exact runtime secret ARNs."
+  }
+
+  assert {
+    condition = (
+      length([
+        for item in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].secrets : item
+        if item.name == "QURL_FEEDBACK_SLACK_WEBHOOK_URL"
+        && item.valueFrom == var.feedback_slack_webhook_secret_arn
+      ]) == 1
+      && contains(
+        { for statement in jsondecode(aws_iam_policy.execution_private_boundary[0].policy).Statement : statement.Sid => statement }["ReadExactRuntimeSecrets"].Resource,
+        var.feedback_slack_webhook_secret_arn,
+      )
+      && length([
+        for statement in jsondecode(aws_iam_role_policy.execution_secrets.policy).Statement : statement
+        if contains(statement.Action, "secretsmanager:GetSecretValue")
+        && contains(statement.Resource, var.feedback_slack_webhook_secret_arn)
+      ]) == 1
+    )
+    error_message = "The task must resolve the dedicated feedback webhook exactly once, and both execution-role policies must grant its launch-time secret read."
   }
 }
 

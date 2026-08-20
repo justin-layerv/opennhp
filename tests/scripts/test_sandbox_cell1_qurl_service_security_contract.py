@@ -13,30 +13,37 @@ SOURCE_TEXT = SOURCE.read_text(encoding="utf-8")
 NORMALIZED = " ".join(SOURCE_TEXT.split())
 
 
-class SandboxCell1QurlServiceSecurityContractTest(unittest.TestCase):
-    def test_generated_secret_uses_stdin_not_process_argv(self) -> None:
-        source = SOURCE_TEXT
-        match = re.search(
-            r'resource "terraform_data" "qurl_service_secret_seed" \{'
-            r"(?P<body>.*?)"
-            r'\n\}\n\nmodule "qurl_service"',
-            source,
-            flags=re.DOTALL,
-        )
-        self.assertIsNotNone(match, "qurl_service_secret_seed resource is missing")
-        body = match.group("body")
+def terraform_data_body(name: str) -> str:
+    match = re.search(
+        rf'resource "terraform_data" "{re.escape(name)}" \{{'
+        r"(?P<body>.*?)"
+        r"\n\}",
+        SOURCE_TEXT,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"{name} resource is missing")
+    return match.group("body")
 
-        self.assertIn('printf \'%s\' "$value" |', body)
-        self.assertEqual(
-            re.findall(r"--secret-string\s+(\S+)", body),
-            ["file:///dev/stdin"],
-            "Secret seeding must make AWS CLI read the generated value from stdin",
-        )
-        self.assertNotRegex(
-            body,
-            r"--secret-string\s+[\"']?\$value",
-            "Generated secret material must not be interpolated into AWS CLI argv",
-        )
+
+class SandboxCell1QurlServiceSecurityContractTest(unittest.TestCase):
+    def test_secret_seeds_use_stdin_not_process_argv(self) -> None:
+        generated_body = terraform_data_body("qurl_service_secret_seed")
+        feedback_body = terraform_data_body("qurl_feedback_slack_webhook_seed")
+
+        self.assertIn('printf \'%s\' "$value" |', generated_body)
+        self.assertIn("printf '%s' 'DISABLED' |", feedback_body)
+        for body in (generated_body, feedback_body):
+            self.assertEqual(
+                re.findall(r"--secret-string\s+(\S+)", body),
+                ["file:///dev/stdin"],
+                "Each secret seed must make AWS CLI read its value from stdin",
+            )
+            self.assertNotRegex(
+                body,
+                r"--secret-string\s+[\"']?\$",
+                "Secret material must not be interpolated into AWS CLI argv",
+            )
 
     def test_publisher_reads_only_the_cell1_service(self) -> None:
         source = SOURCE_TEXT
