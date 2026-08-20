@@ -1132,6 +1132,38 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("observability parity surfaces are wired", result.stdout)
 
+    def test_exempt_source_locked_prod_hub_dns_root_without_module_nhp_passes(
+        self,
+    ) -> None:
+        # prod-hub-dns owns only the explicit production Hub alias. Control owns
+        # the worker/NLB and their alarms, and this root's source lock prevents
+        # even the NLB lookup until a later reviewed activation.
+        self.assertIn(
+            "prod-hub-dns", CHECKER.OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            write(
+                root / "terraform" / "environments" / "prod-hub-dns" / "main.tf",
+                """
+                data "aws_lb" "hub" {
+                  count = var.hub_dns_enabled ? 1 : 0
+                  name  = "layerv-nhp-prod-hub-edge"
+                }
+
+                resource "aws_route53_record" "hub" {
+                  count = var.hub_dns_enabled ? 1 : 0
+                  name  = "hub.nhp.layerv.ai"
+                }
+                """,
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("observability parity surfaces are wired", result.stdout)
+
     def test_exempt_runtime_attestation_root_without_module_nhp_passes(self) -> None:
         # sandbox-runtime-attestation composes modules/runtime-attestation-store
         # (the immutable per-node runtime evidence channel) and instantiates no

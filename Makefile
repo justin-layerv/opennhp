@@ -569,6 +569,7 @@ lint-workflows:
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@python3 tests/scripts/test_qurl_agent_transact_iam.py
+	@python3 tests/scripts/test_prod_hub_dns.py
 	@python3 tests/scripts/test_sandbox_cell1_qurl_service_security_contract.py
 	@shellcheck scripts/capture-control-update-state.sh scripts/check-control-aws-identity.sh scripts/check-control-global-routing.sh scripts/check-control-vpc-cidr-overlap.sh scripts/check-sandbox-cell1-vpc-relocation-preflight.sh scripts/check-live-main-ref.sh scripts/check-no-checkout-credentials.sh scripts/ensure-control-otp-pepper.sh scripts/verify-control-otp-pepper.sh scripts/verify-control-sandbox-first-apply.sh scripts/verify-control-sandbox-live-boundary.sh tests/fixtures/control-vpc-cidr-overlap/aws tests/fixtures/sandbox-cell1-vpc-relocation/aws tests/scripts/check-control-global-routing_test.sh tests/scripts/check-sandbox-cell1-vpc-relocation-preflight_test.sh
 	@python3 tests/scripts/test_check_control_sandbox_first_apply.py

@@ -59,6 +59,8 @@ run_case "prod markdown is docs-only despite prod glob" false false false \
 	$'M\tterraform/environments/prod/README.md'
 run_case "prod terraform is prod-only" true true false \
 	$'M\tterraform/environments/prod/main.tf'
+run_case "prod Hub DNS terraform is prod-only" true true false \
+	$'M\tterraform/environments/prod-hub-dns/main.tf'
 run_case "staged prod IAM root is prod-only" true true false \
 	$'M\tterraform/staged/qurl-agent-transact-iam/main.tf'
 run_case "staged prod IAM README is docs-only" false false false \

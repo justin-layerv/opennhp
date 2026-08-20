@@ -66,6 +66,7 @@ on:
       - "scripts/check-control-aws-identity.sh"
       - "scripts/check-live-main-ref.sh"
       - "scripts/check-no-checkout-credentials.sh"
+      - "scripts/check-prod-hub-dns-plan.py"
       - "scripts/ensure-control-otp-pepper.sh"
       - "scripts/verify-control-otp-pepper.sh"
       - "scripts/verify-control-sandbox-first-apply.sh"
@@ -298,6 +299,7 @@ on:
       - "terraform/modules/qurl-reverse-tunnel-server/user_data.sh.tpl"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
+      - "terraform/environments/prod-hub-dns/**"
       - "terraform/environments/sandbox/**"
       - "terraform/modules/ac/variables.tf"
       - "terraform/variables.tf"
@@ -701,6 +703,9 @@ jobs:
 
       - name: Test staged qURL agent transaction IAM boundary
         run: python3 tests/scripts/test_qurl_agent_transact_iam.py
+
+      - name: Test source-locked production Hub DNS boundary
+        run: python3 tests/scripts/test_prod_hub_dns.py
 
       - name: Test sandbox Control foundation boundary
         run: |

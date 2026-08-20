@@ -10,6 +10,7 @@
       ".github/workflows/build-and-push.yml",
       ".github/workflows/control-prod-update.yml",
       ".github/workflows/control-sandbox-update.yml",
+      ".github/workflows/prod-hub-dns-update.yml",
       ".github/workflows/promote-to-prod.yml",
       ".github/workflows/qurl-agent-transact-iam.yml",
       ".github/workflows/recover-sandbox-terraform-read.yml",

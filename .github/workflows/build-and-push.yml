@@ -1752,6 +1752,20 @@ jobs:
           python3 tests/scripts/test_qurl_agent_transact_iam.py
           tests/scripts/classify-terraform-plan-pr-changes_test.sh
 
+      - name: Terraform production Hub DNS init and validate (source-locked)
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/environments/prod-hub-dns
+        run: |
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -backend=false -lockfile=readonly
+          terraform validate
+
+      - name: Test source-locked production Hub DNS contract
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        run: |
+          terraform -chdir=terraform/environments/prod-hub-dns test
+          python3 tests/scripts/test_prod_hub_dns.py
+
       - name: Test dark Connector Authority foundation
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         run: |

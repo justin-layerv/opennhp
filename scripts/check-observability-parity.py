@@ -678,6 +678,10 @@ def require_alarm_registry(
 #   is no server observability surface to enforce parity on here. Removing the
 #   record root should drop this entry too.
 #
+#   prod-hub-dns: a source-locked DNS-only root for the explicit production
+#   Hub A-alias. It owns no data-plane compute or alarms; Control owns the Hub
+#   worker/NLB and their observability. Its lock prevents even the NLB lookup
+#   until a later reviewed activation.
 #   sandbox-runtime-attestation: a sandbox-only root composing
 #   modules/runtime-attestation-store — the immutable per-node runtime evidence
 #   channel (one KMS-encrypted, versioned, public-blocked S3 bucket, its
@@ -690,6 +694,7 @@ def require_alarm_registry(
 #   this entry too.
 OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS: frozenset[str] = frozenset(
     {
+        "prod-hub-dns",
         "sandbox-cell1",
         "sandbox-hub-dns",
         "sandbox-runtime-attestation",

@@ -53,6 +53,13 @@ while IFS=$'\t' read -r status file _rest; do
 			terraform_changed=true
 			prod_env_changed=true
 			;;
+		# Standalone production-only DNS root. It reads the production Hub NLB
+		# and writes the management-account layerv.ai zone; never gate it on an
+		# unrelated sandbox plan.
+		terraform/environments/prod-hub-dns/*)
+			terraform_changed=true
+			prod_env_changed=true
+			;;
 		# This temporary root is production-only and has its own state and
 		# post-merge saved-plan workflow. Never gate it on the unrelated
 		# sandbox legacy-root plan.
