@@ -130,13 +130,11 @@ case "$TIER" in
     # allow-list: the coverage checker validates these tokens are real but does
     # NOT require every test to appear here.
     #
-    # ResolveV2 (TestResolveV2_SDKRejectsBadLinks) is the exception that does
-    # NOT touch the local stack: it is a fully offline qurl-go SDK tripwire
-    # (no AWS, no network, no minting). It rides the local tier so the
-    # PR-pre-flight lane (nhp-smoke-pr.yml) actually EXECUTES it — a bad qurl-go
-    # bump that loosens the v2 parser/signature check then reds on the PR that
-    # bumps it, not only post-merge against deployed binaries.
-    RUN_FILTER='^Test(HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing|ResolveV2)_'
+    # ResolveV2 (the offline qurl-go rejection tripwire) and
+    # QurlLinkFrontend (whose remote checks skip while its committed-template
+    # qv2t1 render fences execute) do NOT touch the local stack. They ride this
+    # tier so PR pre-flight executes both reader boundaries before deployment.
+    RUN_FILTER='^Test(HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing|ResolveV2|QurlLinkFrontend)_'
     ;;
   all)
     RUN_FILTER=''

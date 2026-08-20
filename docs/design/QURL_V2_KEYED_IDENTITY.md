@@ -162,15 +162,40 @@ session-limit reasons.
 
 ## qURL v2 Artifact
 
-Format:
+Canonical cryptographic artifact:
 
 ```text
-https://qurl.link/#qv2.<base64url(claims_json)>.<base64url(secret_json)>.<base64url(issuer_sig)>
+qv2.<base64url(claims_json)>.<base64url(secret_json)>.<base64url(issuer_sig)>
 ```
 
 The fragment is three dot-separated base64url parts: the signed `claims`, the
 unsigned `secret`, and the issuer signature. This mirrors the NHP Server Contract,
 which takes `qurl_claims_b64` and `qurl_issuer_sig_b64` as separate blobs.
+
+Public share transport:
+
+```text
+https://qurl.link/#qv2t1.<claims_count>.<secret_count>.<sig_count>.<claims_chunks...>.<secret_chunks...>.<sig_chunks...>
+```
+
+`qv2t1` is a transport wrapper, not a new cryptographic artifact version. It
+splits every canonical base64url field into dot-delimited chunks of at most 240
+characters so messaging clients such as iMessage detect the complete URL as one
+link. Every non-final chunk is exactly 240 characters. Counts are canonical
+positive decimal integers, capped at 26 claims chunks, 3 secret chunks, and 1
+signature chunk, derived from the canonical qv2 encoded-part caps of 6144, 512,
+and 128 characters. Readers reject empty/oversized chunks, characters outside
+the base64url alphabet, leading-zero counts, count/layout mismatches, unknown
+transport versions, and total transport sizes above the derived bound before
+reconstructing the exact `qv2.<claims>.<secret>.<sig>` bytes. The transport
+decoder deliberately does not base64-decode its chunks: impossible lengths,
+non-canonical trailing bits, schema errors, and invalid signatures remain the
+unchanged strict inner parser and verifier's responsibility.
+
+The public reader boundary accepts only `qv2t1`; legacy `#qv2.` public links are
+not supported because qURL v2 has not entered production. The reconstructed
+inner artifact is passed to the existing strict parser unchanged, and issuer
+verification remains over the exact reconstructed claims string.
 
 The JSON is plaintext. It is not a secret container. The private key in the
 fragment is protected by browser fragment semantics only: it is not sent in the
@@ -466,22 +491,26 @@ both succeeded.
 
 The browser and headless clients use the same qURL semantics.
 
-1. Parse `#qv2.<payload>`.
-2. Verify the issuer signature locally - REQUIRED for the first-party JS/headless
+1. Strictly decode the framing of `#qv2t1.<counts>.<chunks...>` to the exact
+   inner `qv2.<claims>.<secret>.<sig>` artifact, rejecting legacy/unknown
+   transports. This step validates only bounded framing and the base64url
+   alphabet; it does not create a second inner decoder.
+2. Parse and canonicality-check the inner artifact with the strict qv2 parser.
+3. Verify the issuer signature locally - REQUIRED for the first-party JS/headless
    client, not merely recommended. The client acts on `relay_url` and
-   `cell_public_key_b64` (steps 3-4 and 7) to choose where to POST and what to
+   `cell_public_key_b64` (steps 4-5 and 8) to choose where to POST and what to
    encrypt to, all before any server sees the knock; server-side admission cannot
    protect against client misdirection. A tampered `relay_url`/cell key on an
    unverifying client yields DoS and claims disclosure (bounded: the private key
    never leaves the `secret` block and is not recoverable from the Noise
    handshake). Ship the issuer trust anchor (per `kid`) to the first-party client.
    Server-side verification remains authoritative for admission.
-3. Compute `serverId = fingerprint(cell_public_key_b64)`.
-4. Build an NHP knock using `qurl_user_private_key_b64` as the agent static
+4. Compute `serverId = fingerprint(cell_public_key_b64)`.
+5. Build an NHP knock using `qurl_user_private_key_b64` as the agent static
    private key and `cell_public_key_b64` as the server static public key.
-5. Set the NHP knock resource identity to the protected-resource public key.
-6. Put the signed qURL claims in encrypted knock user data.
-7. POST the opaque NHP packet to `relay_url + "/relay/" + serverId`.
+6. Set the NHP knock resource identity to the protected-resource public key.
+7. Put the signed qURL claims in encrypted knock user data.
+8. POST the opaque NHP packet to `relay_url + "/relay/" + serverId`.
 
 The relay sees only:
 
@@ -1242,7 +1271,7 @@ Phase 2: qURL user keys without token removal.
 
 Phase 3: qURL v2 no-token bootstrap.
 
-- Add signed `qv2.` fragments.
+- Add signed canonical `qv2.` artifacts carried publicly as `qv2t1` transports.
 - Add JS/headless parser and NHP knock construction from qURL private key.
 - Add NHP qURL v2 admission endpoints.
 - Add qurl-service v2 prepare/commit/authorize.

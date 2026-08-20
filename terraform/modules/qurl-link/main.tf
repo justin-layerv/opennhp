@@ -29,8 +29,8 @@ locals {
     server_static_pub_b64 = var.server_public_key_b64
     # qURL v2 issuer trust material. jsonencode a map -> JS object literal (kid ->
     # SPKI-DER-base64url) and a list -> JS array of host[:port]. Empty {}/[] when
-    # qv2 is off, so the rendered verifier keeps qv1-only behavior and a #qv2. link
-    # fails closed. The map/list are already validated by the module variables.
+    # qv2 is off, so the rendered verifier keeps qv1-only behavior and a #qv2t1.
+    # link fails closed. The map/list are already validated by the module variables.
     qurl_v2_issuer_trust_store_json = jsonencode(var.qurl_v2_issuer_trust_store)
     qurl_v2_relay_allowlist_json    = jsonencode(var.qurl_v2_relay_allowlist)
   })

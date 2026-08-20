@@ -49,7 +49,8 @@ describe("production bundle", () => {
     // the name to the list below. The qURL v2 entries are the construct/call/catch
     // surface the qurl.link page needs: knockQurlV2 (call), TrustStore +
     // RelayAllowlist (construct), and the error classes it branches on
-    // (FragmentError, SignatureError, RelayUrlError, UnknownKidError, plus the
+    // (QurlV2TransportError, FragmentError, SignatureError, RelayUrlError,
+    // UnknownKidError, plus the
     // parse-level StrictParseError/KeyLengthError/Base64UrlError that knockQurlV2
     // can surface from a malformed fragment).
     expect([...output.exports].sort()).toEqual([
@@ -57,6 +58,7 @@ describe("production bundle", () => {
       "FragmentError",
       "KeyLengthError",
       "PUBKEY_FINGERPRINT_LEN",
+      "QurlV2TransportError",
       "RelayAllowlist",
       "RelayError",
       "RelayUrlError",

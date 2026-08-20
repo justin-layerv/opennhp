@@ -59,7 +59,7 @@ variable "qurl_v2_issuer_trust_store" {
     form the browser TrustStore.fromSpkiDerB64 decodes, NOT standard base64). The
     root caller converts the KMS GetPublicKey standard-base64 DER to base64url so
     both the NHP server trust store and this portal verify against the same bytes.
-    Empty map keeps the page qv1-only: a #qv2. fragment then fails closed with a
+    Empty map keeps the page qv1-only: a #qv2t1. fragment then fails closed with a
     "not configured" error and the at_/qv1. paths are unaffected.
   EOT
   type        = map(string)
@@ -82,7 +82,7 @@ variable "qurl_v2_relay_allowlist" {
     Host[:port] allowlist for a qURL v2 signed relay_url, rendered into the
     verifier as the RelayAllowlist. Bare host matches any port; host:port matches
     that exact authority (an explicit :443 will not match an https URL — use the
-    bare host). Empty list keeps the page qv1-only (a #qv2. fragment fails closed).
+    bare host). Empty list keeps the page qv1-only (a #qv2t1. fragment fails closed).
     Mirror of the issuer's relay_url allowlist (root var.qurl_v2_relay_allowlist).
   EOT
   type        = list(string)

@@ -14,6 +14,15 @@ vectors it is fenced against (`nhp/utils/crypto_fingerprint_test.go`,
 `nhp/core/kdf_test.go`), rather than in a separate repo where the two could
 silently drift.
 
+The qURL v2 public reader accepts the share-safe
+`#qv2t1.<counts>.<chunks...>` transport only. `src/qurl/transport.ts` bounds and
+validates that wrapper, reconstructs the exact inner
+`qv2.<claims>.<secret>.<sig>` artifact, and hands it to the unchanged strict
+parser/signature verifier. The 240-character canonical chunks prevent one long
+dot-delimited component from being cut out of a link by messaging-client URL
+detectors. Legacy `#qv2.` public transport is intentionally rejected because v2
+has not entered production.
+
 ## Status / PR sequence
 
 Ported incrementally, each step its own PR:

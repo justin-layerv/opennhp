@@ -119,7 +119,7 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 			// additionally asserts issuerTrustStore is non-empty there.
 			"issuerTrustStore:",
 			"relayAllowlist:",
-			"fragment.startsWith('qv2.')",
+			"fragment.startsWith('qv2')",
 			"handleQurlV2Fragment",
 			"agent.TrustStore.fromSpkiDerB64(QURL_LINK_CONFIG.issuerTrustStore)",
 			"new agent.RelayAllowlist(QURL_LINK_CONFIG.relayAllowlist)",
@@ -462,6 +462,66 @@ func TestQurlLinkFrontend_QurlV2ConfigRendersPopulated(t *testing.T) {
 	assertQurlV2ConfigState(t, "rendered", gotTrust, gotRelay, env, enabled)
 }
 
+// TestQurlLinkFrontend_QurlV2ShareTransportRoutingRenders is the executable
+// source-level seam for the share-safe qv2t1 transport. The JS-agent unit tests
+// own the decoder grammar; this test proves the page routes the whole raw
+// fragment into that one decoder, enters verifier mode before loading the agent,
+// clears every qv2-looking credential from history, and does not log caught
+// credential-derived parser errors. It performs no network I/O and is included in
+// the local smoke tier.
+func TestQurlLinkFrontend_QurlV2ShareTransportRoutingRenders(t *testing.T) {
+	raw, err := os.ReadFile(qurlLinkTemplatePath(t))
+	if err != nil {
+		t.Fatalf("read qurl-link template: %v", err)
+	}
+	scripts := inlineExecutableScripts(string(raw))
+	if len(scripts) != 2 {
+		t.Fatalf("qurl-link template has %d executable inline scripts, want preload + verifier", len(scripts))
+	}
+
+	preload := scripts[0]
+	for _, want := range []string{
+		"hash.startsWith('qv2')",
+		"document.documentElement.classList.add('verifying')",
+	} {
+		if !strings.Contains(preload, want) {
+			t.Fatalf("qurl.link preload is missing qv2t1 verifier-state wiring %q.", want)
+		}
+	}
+
+	verifier := inlineVerifierScript(t, string(raw))
+	for _, want := range []string{
+		"fragment.startsWith('qv2')",
+		"document.body.classList.add('verifying')",
+		"clearSensitiveFragment(fragment)",
+		"handleQurlV2Fragment(fragment)",
+		"fragment.startsWith('qv2') || fragment.startsWith('qv1.')",
+		"agent.knockQurlV2(fragment,",
+		"catch {",
+		"showError('qURL v2 verification failed')",
+	} {
+		if !strings.Contains(verifier, want) {
+			t.Fatalf("qurl.link verifier is missing qv2t1 transport wiring %q.", want)
+		}
+	}
+
+	addVerifyingAt := strings.Index(verifier, "document.body.classList.add('verifying')")
+	clearAt := strings.Index(verifier, "clearSensitiveFragment(fragment)")
+	handleAt := strings.Index(verifier, "handleQurlV2Fragment(fragment)")
+	if addVerifyingAt < 0 || clearAt < addVerifyingAt || handleAt < clearAt {
+		t.Fatalf("qurl.link qv2 route ordering is not verifying -> history clear -> handler: verifying=%d clear=%d handler=%d", addVerifyingAt, clearAt, handleAt)
+	}
+
+	for _, forbidden := range []string{
+		"fragment.startsWith('qv2.')",
+		"console.error('qURL v2 verification failed:', error)",
+	} {
+		if strings.Contains(verifier, forbidden) {
+			t.Fatalf("qurl.link verifier retains forbidden legacy/secret-logging wiring %q.", forbidden)
+		}
+	}
+}
+
 // assertQurlV2VerifierWiring checks the qv2 config keys + dispatch branch are
 // present in a verifier script, regardless of qv2 enablement. Shared by the
 // deployed-bytes and rendered-template fences.
@@ -470,7 +530,7 @@ func assertQurlV2VerifierWiring(t *testing.T, script string) {
 	for _, want := range []string{
 		"issuerTrustStore:",
 		"relayAllowlist:",
-		"fragment.startsWith('qv2.')",
+		"fragment.startsWith('qv2')",
 		"handleQurlV2Fragment",
 		"agent.knockQurlV2(fragment,",
 	} {

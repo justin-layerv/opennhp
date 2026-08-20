@@ -22,7 +22,10 @@
   <script>
     (function() {
       var hash = window.location.hash.substring(1);
-      if (hash.startsWith('at_') || hash.startsWith('qv2.')) {
+      // Enter verifier mode before styles, the external agent module, or the
+      // full inline controller load. All qv2-looking fragments route to the
+      // strict qv2t1 decoder later, so legacy/unknown transports fail visibly.
+      if (hash.startsWith('at_') || hash.startsWith('qv2')) {
         document.documentElement.classList.add('verifying');
       }
     })();
@@ -1316,8 +1319,8 @@
         // issuer kid -> SPKI-DER-base64url (the exact form TrustStore.fromSpkiDerB64
         // expects — base64URL, not standard base64). relayAllowlist is the host[:port]
         // set a signed relay_url may target. Both are empty ({}/[]) until qv2 is
-        // enabled; when empty, a #qv2. fragment fails closed (no trust anchor) and the
-        // qv1 at_/qv1. paths are unaffected.
+        // enabled; when empty, a #qv2t1. fragment fails closed (no trust anchor) and
+        // the qv1 at_/qv1. paths are unaffected.
         issuerTrustStore: ${qurl_v2_issuer_trust_store_json},
         relayAllowlist: ${qurl_v2_relay_allowlist_json}
       };
@@ -1336,17 +1339,20 @@
         }
       });
 
-      clearSensitiveFragment(fragment);
-
-      // qURL v2 (keyed-identity) fragments are a distinct, fully async flow:
-      // parse+verify the issuer signature, validate relay_url, knock through the
-      // relay via the bundle's knockQurlV2, then redirect. It is handled here,
-      // BEFORE the qv1 parser, and short-circuits so the qv1 at_/qv1. code path
-      // below is never entered for a qv2 link (and is byte-for-byte unchanged).
-      if (fragment.startsWith('qv2.')) {
+      // qURL v2 (keyed-identity) transports are a distinct, fully async flow.
+      // Route every qv2-looking value through the bundle's strict qv2t1 decoder:
+      // valid transport unwraps and verifies, while legacy/unknown/malformed
+      // transport fails closed on the branded verifier instead of falling through
+      // to the public landing page. The page only classifies and clears the
+      // fragment; transport grammar lives exclusively in the agent bundle.
+      if (fragment.startsWith('qv2')) {
+        document.body.classList.add('verifying');
+        clearSensitiveFragment(fragment);
         handleQurlV2Fragment(fragment);
         return;
       }
+
+      clearSensitiveFragment(fragment);
 
       const bootstrap = parseQurlBootstrapFragment(fragment);
 
@@ -1539,15 +1545,13 @@
 %{ endif ~}
 
       // qURL v2 (keyed-identity) flow. Distinct from the qv1 at_/qv1. bootstrap:
-      // the fragment IS the credential (signed claims + unsigned secret + issuer
-      // signature), verified client-side against a shipped issuer trust store before
-      // any relay is contacted. Always defined so a #qv2. link gets a real
-      // error page instead of silently rendering the landing page; fails closed when
-      // qv2 is not provisioned (empty issuerTrustStore / relayAllowlist). Never
-      // touches the qv1 code path.
+      // the fragment IS the credential (the qv2t1 share transport around signed
+      // claims + unsigned secret + issuer signature), verified client-side against
+      // a shipped issuer trust store before any relay is contacted. Always defined
+      // so qv2-looking links get a real error page instead of silently rendering the
+      // landing page; fails closed when qv2 is not provisioned (empty
+      // issuerTrustStore / relayAllowlist). Never touches the qv1 code path.
       async function handleQurlV2Fragment(fragment) {
-        document.body.classList.add('verifying');
-
         var hostname = window.location.hostname.toLowerCase();
         if (!QURL_LINK_CONFIG.allowedHosts.includes(hostname)) {
           showError('Invalid host: ' + hostname);
@@ -1575,11 +1579,11 @@
           var trustStore = await agent.TrustStore.fromSpkiDerB64(QURL_LINK_CONFIG.issuerTrustStore);
           var relayAllowlist = new agent.RelayAllowlist(QURL_LINK_CONFIG.relayAllowlist);
 
-          // knockQurlV2 parses+verifies the issuer signature, validates relay_url
-          // against the allowlist, asserts the PoP linkage, then knocks through the
-          // relay (relay_url + server static + entropy are all derived internally
-          // from the verified claims and the browser CSPRNG). aspId mirrors the qv1
-          // default while v2 rides the same static qURL package.
+          // knockQurlV2 strictly unwraps qv2t1, parses+verifies the issuer signature,
+          // validates relay_url against the allowlist, asserts the PoP linkage, then
+          // knocks through the relay (relay_url + server static + entropy are all
+          // derived internally from the verified claims and the browser CSPRNG).
+          // aspId mirrors the qv1 default while v2 rides the same static qURL package.
           var result = await agent.knockQurlV2(fragment, {
             trustStore: trustStore,
             relayAllowlist: relayAllowlist,
@@ -1605,17 +1609,13 @@
             return;
           }
           showError('Relay returned no redirect');
-        } catch (error) {
-          // knockQurlV2 throws the exported error bases on a verification, relay_url,
-          // PoP, key-decoding, or transport fault (FragmentError / StrictParseError /
-          // KeyLengthError / Base64UrlError / UnknownKidError / SignatureError /
-          // RelayUrlError, plus any transport/crypto fault). All map to the same
-          // branded invalid-access page; the detail goes to the operator console only,
-          // never the DOM, and MUST NOT carry the fragment.
+        } catch {
+          // knockQurlV2 throws on a transport, verification, relay_url, PoP,
+          // key-decoding, or relay/crypto fault. All map to the same branded
+          // invalid-access page. Do not print the caught error: parser errors may
+          // describe credential-derived input, and browser consoles are commonly
+          // captured in bug reports or screen shares.
           showError('qURL v2 verification failed');
-          if (typeof console !== 'undefined' && console.error) {
-            console.error('qURL v2 verification failed:', error);
-          }
         }
       }
 
@@ -1679,9 +1679,10 @@
       }
 
       function isSensitiveQurlFragment(fragment) {
-        // qv2. carries the per-qURL private key + signed claims, so it is cleared
-        // from history the same as the qv1. bundle and the at_ token.
-        return !!fragment && (fragment.startsWith('qv2.') || fragment.startsWith('qv1.') || fragment.startsWith('at_'));
+        // qv2t1 carries the per-qURL private key + signed claims. Clear every
+        // qv2-looking value, including malformed/unknown/legacy transport, before
+        // the decoder reports an error; none should remain in browser history.
+        return !!fragment && (fragment.startsWith('qv2') || fragment.startsWith('qv1.') || fragment.startsWith('at_'));
       }
 
       function isX25519KeyB64(value) {

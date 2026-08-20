@@ -29,6 +29,7 @@ import type { Fragment } from "./fragment.js";
 import { parseAndVerifyFragment } from "./fragment.js";
 import { validateRelayUrl, type RelayAllowlist } from "./relay-url.js";
 import type { TrustStore } from "./truststore.js";
+import { decodeQurlV2Transport } from "./transport.js";
 
 /** UserData key carrying the EXACT base64url signed claims (Part 1, verbatim). */
 export const QURL_V2_CLAIMS_USER_DATA_KEY = "qurl_claims_b64";
@@ -130,18 +131,21 @@ export interface QurlV2KnockOptions {
 }
 
 /**
- * Performs a full qURL v2 bootstrap knock from a raw `#qv2.…` fragment:
+ * Performs a full qURL v2 bootstrap knock from a `qv2t1.…` transport body
+ * extracted from the public URL fragment:
  *
- *   1. parse the fragment and VERIFY the issuer signature (mandatory — this must
- *      succeed before any value from the claims is acted on);
- *   2. validate `relay_url` (HTTPS + allowlist; userinfo rejected) — only now,
+ *   1. decode the bounded share transport to the exact inner
+ *      `qv2.<claims>.<secret>.<sig>` fragment;
+ *   2. parse the canonical fragment and VERIFY the issuer signature (mandatory —
+ *      this must succeed before any value from the claims is acted on);
+ *   3. validate `relay_url` (HTTPS + allowlist; userinfo rejected) — only now,
  *      after verification;
- *   3. assert the proof-of-possession linkage (secret priv ↔ signed user pubkey);
- *   4. decode the per-qURL private key (agent static) and cell public key
+ *   4. assert the proof-of-possession linkage (secret priv ↔ signed user pubkey);
+ *   5. decode the per-qURL private key (agent static) and cell public key
  *      (server static);
- *   5. build the v2 knock body (signed claims + signature in UserData, resId =
+ *   6. build the v2 knock body (signed claims + signature in UserData, resId =
  *      resource public key);
- *   6. knock through the relay via the existing path — `serverId =
+ *   7. knock through the relay via the existing path — `serverId =
  *      pubKeyFingerprint(cellPub)` and the POST to `relay_url + "/relay/" +
  *      serverId` are handled by {@link knock} / `relayPost`.
  *
@@ -164,16 +168,19 @@ export async function knockQurlV2(
   fragment: string,
   opts: QurlV2KnockOptions,
 ): Promise<KnockResult> {
-  // 1. Parse + MANDATORY issuer-signature verification.
-  const frag = await parseAndVerifyFragment(fragment, opts.trustStore);
+  // 1–2. Decode the public transport, then parse + MANDATORY issuer-signature
+  // verification over the exact reconstructed claims bytes. `decode` accepts no
+  // legacy public qv2 transport; the inner parser remains strict and unchanged.
+  const innerFragment = decodeQurlV2Transport(fragment);
+  const frag = await parseAndVerifyFragment(innerFragment, opts.trustStore);
 
-  // 2. relay_url is acted on only AFTER verification succeeds.
+  // 3. relay_url is acted on only AFTER verification succeeds.
   validateRelayUrl(frag.claims.relayUrl, opts.relayAllowlist);
 
-  // 3. Fail fast if the secret doesn't match the signed user key.
+  // 4. Fail fast if the secret doesn't match the signed user key.
   assertPoPLinkage(frag);
 
-  // 4. The per-qURL private key is the agent static identity; the cell key is the
+  // 5. The per-qURL private key is the agent static identity; the cell key is the
   //    server static. Both were already length-validated by the strict parser;
   //    decode again here to hand raw bytes to the knock path.
   const deviceStaticPriv = decodeX25519PrivateKey(
@@ -185,7 +192,7 @@ export async function knockQurlV2(
     frag.claims.cellPublicKeyB64,
   );
 
-  // 5–6. Build the v2 body and knock through the relay using the verified
+  // 6–7. Build the v2 body and knock through the relay using the verified
   //      relay_url as the base; serverId/POST target are derived by `knock`.
   const body = buildQurlV2KnockBody({
     authServiceId: opts.authServiceId,

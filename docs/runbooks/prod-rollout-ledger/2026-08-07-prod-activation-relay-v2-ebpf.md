@@ -64,7 +64,8 @@ exists.
       reports 1.1 and the relay target group is healthy — that ordering is the
       whole reason for the split.
 - [ ] Post-rollout: mint a qURL and confirm the link is
-      `https://qurl.link/#qv2.<claims>.<secret>.<sig>`, that the portal verifies
+      `https://qurl.link/#qv2t1.<counts>.<chunks...>`, that the portal unwraps to
+      the canonical `qv2.<claims>.<secret>.<sig>` artifact and verifies
       the issuer signature locally, knocks through `relay.layerv.ai`, and the
       `*.qurl.site` resource loads protected content rather than the invalid-access
       page.

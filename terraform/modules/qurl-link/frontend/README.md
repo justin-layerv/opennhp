@@ -61,6 +61,14 @@ blocks the agent's `POST /relay/{serverId}` before the backend sees the request.
 The qurl-service qv1 bootstrap bundle also carries its intended relay origin;
 the page accepts it only when it matches this Terraform-rendered static origin.
 
+For qURL v2, the page recognizes qv2-looking fragments only to enter verifier
+mode and clear the sensitive fragment from browser history. It passes the whole
+fragment to `knockQurlV2`; the bundle's focused transport decoder is the single
+owner of the `qv2t1` counts/chunks grammar and restores the exact inner qv2
+artifact before signature verification. Do not duplicate that decoder in
+`index.html`, and do not log caught parser errors because they may describe
+credential-derived input.
+
 Terraform reads `nhp-agent.min.js.sri` to render the browser agent script tag's
 `integrity="sha384-..."` metadata. Do not hand-edit the hash. Regenerate the
 bundle instead; the package test and deploy smoke test recompute SHA-384 from

@@ -30,9 +30,10 @@ export type {
   RenewalOptions,
 } from "./agent/scheduler.js";
 
-// qURL v2 client (keyed-identity bootstrap): parse the `#qv2.…` fragment, verify
-// the issuer signature locally (mandatory — before acting on relay_url/cell key),
-// validate relay_url, and knock through the relay using the per-qURL private key.
+// qURL v2 client (keyed-identity bootstrap): decode the bounded `#qv2t1.…`
+// share transport to the exact inner qv2 artifact, verify the issuer signature
+// locally (mandatory — before acting on relay_url/cell key), validate relay_url,
+// and knock through the relay using the per-qURL private key.
 //
 // The public surface is deliberately construct/call/catch only: the qurl.link page
 // CALLS `knockQurlV2`, CONSTRUCTS a `TrustStore` + `RelayAllowlist`, and CATCHES
@@ -47,6 +48,7 @@ export type {
 } from "./qurl/knock.js";
 export type { Fragment } from "./qurl/fragment.js";
 export { FragmentError } from "./qurl/fragment.js";
+export { QurlV2TransportError } from "./qurl/transport.js";
 export type { Claims, Secret } from "./qurl/claims.js";
 // Parse/encoding/key-length failures can surface from knockQurlV2 (a malformed
 // claims JSON, a wrong-length key, or non-canonical base64 in a part), so a

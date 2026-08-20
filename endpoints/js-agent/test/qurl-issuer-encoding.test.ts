@@ -9,6 +9,7 @@ import { parseFragment, verifyFragment } from "../src/qurl/fragment";
 import { signingInput } from "../src/qurl/claims";
 import { base64UrlEncode } from "../src/qurl/base64url";
 import { wrapUncompressedInSpki } from "./qurl-signed-fragment";
+import { wrapQurlV2TransportFixture } from "./qurl-transport-fixture";
 import type { RelayTransport } from "../src/agent/relay";
 
 // Portal issuer-key ENCODING contract (the qurl.link browser verifier glue).
@@ -169,7 +170,7 @@ describe("portal issuer-key encoding (std base64 -> base64url) contract", () => 
       throw new Error("captured-after-verify");
     };
     await expect(
-      knockQurlV2(fragment, {
+      knockQurlV2(wrapQurlV2TransportFixture(fragment), {
         trustStore: ts,
         relayAllowlist,
         authServiceId: "qurl",

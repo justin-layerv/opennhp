@@ -71,7 +71,10 @@ script dumps `compose logs nhp-server nhp-ac` on that timeout — read those
 (ipset errors) before re-diagnosing.
 
 The curated `local` tier runs the non-qURL wire contract
-(`HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing`).
+(`HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing`) plus
+the offline `ResolveV2` SDK rejection and `QurlLinkFrontend` committed-template
+render fences. The remote qurl.link checks under the latter prefix skip locally;
+only source/render checks execute.
 It exercises **no qURL resolve/handler path** — under `Plugins` only the
 dispatcher 404 (`TestPlugins_UnknownASPIDReturns404`) runs locally; the
 branded-403 qURL path is `requireRemote`. So the local signal is: server+AC

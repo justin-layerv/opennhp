@@ -14,6 +14,7 @@ import { RelayAllowlist } from "../src/qurl/relay-url";
 import { base64UrlEncode } from "../src/qurl/base64url";
 import { makeSignedFragment, freshP256SpkiDer } from "./qurl-signed-fragment";
 import type { RelayTransport } from "../src/agent/relay";
+import { wrapQurlV2TransportFixture } from "./qurl-transport-fixture";
 
 // qURL v2 knock-construction tests. NO Go roundtrip fence exists for the v2 knock
 // (the nhp qurl-v2 branch has no server-side v2 admission path yet), so these are
@@ -148,7 +149,7 @@ describe("knockQurlV2 end-to-end (JS-structural; mock transport)", () => {
     };
 
     await expect(
-      knockQurlV2(lf.body, {
+      knockQurlV2(wrapQurlV2TransportFixture(lf.body), {
         trustStore: lf.ts,
         relayAllowlist: new RelayAllowlist(["relay.example.com"]),
         authServiceId: "asp-1",
@@ -161,6 +162,65 @@ describe("knockQurlV2 end-to-end (JS-structural; mock transport)", () => {
     expect(capturedPacket!.length).toBeGreaterThan(0);
   });
 
+  it("rejects legacy qv2 public transport before sending", async () => {
+    const lf = await makeLinkedFragment();
+    let sent = false;
+    const transport: RelayTransport = async () => {
+      sent = true;
+      return new Uint8Array();
+    };
+    await expect(
+      knockQurlV2(lf.body, {
+        trustStore: lf.ts,
+        relayAllowlist: new RelayAllowlist(["relay.example.com"]),
+        authServiceId: "asp-1",
+        deps: { transport },
+      }),
+    ).rejects.toThrow(/invalid transport/);
+    expect(sent, "must not POST legacy public transport").toBe(false);
+  });
+
+  it("rejects transport-valid malformed or tampered inner data before sending", async () => {
+    const lf = await makeLinkedFragment();
+    const validTransport = wrapQurlV2TransportFixture(lf.body);
+    const reorderedParts = validTransport.split(".");
+    expect(Number(reorderedParts[1])).toBeGreaterThanOrEqual(2);
+    expect(reorderedParts[4]).not.toBe(reorderedParts[5]);
+    [reorderedParts[4], reorderedParts[5]] = [
+      reorderedParts[5]!,
+      reorderedParts[4]!,
+    ];
+
+    const truncatedSignatureParts = validTransport.split(".");
+    const finalIndex = truncatedSignatureParts.length - 1;
+    truncatedSignatureParts[finalIndex] = truncatedSignatureParts[
+      finalIndex
+    ]!.slice(0, -1);
+    expect(truncatedSignatureParts[finalIndex]).not.toBe("");
+
+    for (const [name, transportFragment] of [
+      ["impossible inner base64 length", "qv2t1.1.1.1.A.B.C"],
+      ["reordered claims chunks", reorderedParts.join(".")],
+      ["truncated non-empty signature", truncatedSignatureParts.join(".")],
+    ] as const) {
+      let sent = false;
+      const transport: RelayTransport = async () => {
+        sent = true;
+        return new Uint8Array();
+      };
+      await expect(
+        knockQurlV2(transportFragment, {
+          trustStore: lf.ts,
+          relayAllowlist: new RelayAllowlist(["relay.example.com"]),
+          authServiceId: "asp-1",
+          deps: { transport },
+        }),
+        name,
+      ).rejects.toThrow();
+      expect(sent, `${name} must fail before relay POST`).toBe(false);
+    }
+  });
+
   it("rejects (before sending) when the issuer signature does not verify", async () => {
     const lf = await makeLinkedFragment();
     // A trust store with a DIFFERENT key so verification fails.
@@ -171,7 +231,7 @@ describe("knockQurlV2 end-to-end (JS-structural; mock transport)", () => {
       return new Uint8Array();
     };
     await expect(
-      knockQurlV2(lf.body, {
+      knockQurlV2(wrapQurlV2TransportFixture(lf.body), {
         trustStore: otherSf.ts,
         relayAllowlist: new RelayAllowlist(["relay.example.com"]),
         authServiceId: "asp-1",
@@ -189,7 +249,7 @@ describe("knockQurlV2 end-to-end (JS-structural; mock transport)", () => {
       return new Uint8Array();
     };
     await expect(
-      knockQurlV2(lf.body, {
+      knockQurlV2(wrapQurlV2TransportFixture(lf.body), {
         trustStore: lf.ts,
         relayAllowlist: new RelayAllowlist(["other.example.com"]),
         authServiceId: "asp-1",
@@ -208,7 +268,7 @@ describe("knockQurlV2 end-to-end (JS-structural; mock transport)", () => {
       return new Uint8Array();
     };
     await expect(
-      knockQurlV2(sf.body, {
+      knockQurlV2(wrapQurlV2TransportFixture(sf.body), {
         trustStore: sf.ts,
         relayAllowlist: new RelayAllowlist(["relay.example.com"]),
         authServiceId: "asp-1",
