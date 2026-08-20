@@ -410,6 +410,13 @@ jobs:
       - name: Fence workflow references to tests/scripts modules
         run: python3 -m unittest -v tests.scripts.test_workflow_python_modules_exist
 
+      # Terraform Prod-Drift Lint outgrew its five-minute budget as the static
+      # fence suite expanded: run 32282093338 completed every substantive check
+      # and was cancelled during post-step cleanup. Pin the measured six-minute
+      # replacement so a drive-by cleanup cannot restore the systemic timeout.
+      - name: Test Terraform prod-drift workflow timeout contract
+        run: python3 -m unittest -v tests.scripts.test_terraform_prod_drift_workflow
+
       # Both Claude entry points must use the same proven action SHA and explicit
       # model. Automatic review must remain a default-branch-trusted
       # pull_request_target, same-repo, non-bot, ready-candidate terminal gate

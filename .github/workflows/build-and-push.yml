@@ -1857,7 +1857,13 @@ jobs:
     # lint also runs on push to catch admin-bypass drift. (cr round 10.)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Recent successful PR jobs took 161-293s. Run 32282093338 reached 304s:
+    # every substantive check passed, then the five-minute cap cancelled the
+    # job during post-step cleanup. Six minutes is the smallest whole-minute
+    # bound with useful headroom (67s / 23% over the slowest success); raise it
+    # again only with new sustained timing evidence. The exact value is fenced
+    # by tests/scripts/test_terraform_prod_drift_workflow.py.
+    timeout-minutes: 6
     permissions:
       contents: read
     steps:
