@@ -1324,7 +1324,7 @@
         issuerTrustStore: ${qurl_v2_issuer_trust_store_json},
         relayAllowlist: ${qurl_v2_relay_allowlist_json}
       };
-      const fragment = window.location.hash.substring(1);
+      let activeFragmentRequest = 0;
 
       // From here down we are in the verifier path. Anything that throws during
       // token initialization renders the branded access page instead of leaving
@@ -1339,92 +1339,112 @@
         }
       });
 
-      // qURL v2 (keyed-identity) transports are a distinct, fully async flow.
-      // Route every qv2-looking value through the bundle's strict qv2t1 decoder:
-      // valid transport unwraps and verifies, while legacy/unknown/malformed
-      // transport fails closed on the branded verifier instead of falling through
-      // to the public landing page. The page only classifies and clears the
-      // fragment; transport grammar lives exclusively in the agent bundle.
-      if (fragment.startsWith('qv2')) {
-        document.body.classList.add('verifying');
+      // The controller must also handle same-document navigation. Messaging apps
+      // and browser link handlers can reuse an already-open qurl.link tab, which
+      // changes only location.hash and does not reload this script. Register the
+      // listener before the initial dispatch so every credential takes the same
+      // fail-closed path and is cleared from the address bar immediately.
+      window.addEventListener('hashchange', processLocationFragment);
+      processLocationFragment();
+
+      function processLocationFragment() {
+        const requestID = ++activeFragmentRequest;
+        const fragment = window.location.hash.substring(1);
+
+        // qURL v2 (keyed-identity) transports are a distinct, fully async flow.
+        // Route every qv2-looking value through the bundle's strict qv2t1 decoder:
+        // valid transport unwraps and verifies, while legacy/unknown/malformed
+        // transport fails closed on the branded verifier instead of falling through
+        // to the public landing page. The page only classifies and clears the
+        // fragment; transport grammar lives exclusively in the agent bundle.
+        if (fragment.startsWith('qv2')) {
+          enterVerifierState();
+          clearSensitiveFragment(fragment);
+          handleQurlV2Fragment(fragment, requestID);
+          return;
+        }
+
         clearSensitiveFragment(fragment);
-        handleQurlV2Fragment(fragment);
-        return;
-      }
 
-      clearSensitiveFragment(fragment);
+        const bootstrap = parseQurlBootstrapFragment(fragment);
 
-      const bootstrap = parseQurlBootstrapFragment(fragment);
+        if (!bootstrap) {
+          enterLandingState();
+          return;
+        }
 
-      if (!bootstrap) {
-        return;
-      }
+        enterVerifierState();
 
-      document.body.classList.add('verifying');
+        const hostname = window.location.hostname.toLowerCase();
+        if (!QURL_LINK_CONFIG.allowedHosts.includes(hostname)) {
+          showError('Invalid host: ' + hostname);
+          return;
+        }
 
-      const hostname = window.location.hostname.toLowerCase();
-      if (!QURL_LINK_CONFIG.allowedHosts.includes(hostname)) {
-        showError('Invalid host: ' + hostname);
-        return;
-      }
+        // Token format matches qurl-service token generation
+        // (qurl-service/internal/domain/qurl.go): at_ + 22 base64url chars
+        // (lowercase alphanumeric, underscore, hyphen).
+        if (!/^at_[a-z0-9_-]{22}$/.test(bootstrap.accessToken)) {
+          showError('Invalid access token format');
+          return;
+        }
+        if (bootstrap.agentPrivateKeyB64 && !isX25519KeyB64(bootstrap.agentPrivateKeyB64)) {
+          showError('Invalid agent private key format');
+          return;
+        }
+        if (bootstrap.agentPublicKeyB64 && !isX25519KeyB64(bootstrap.agentPublicKeyB64)) {
+          showError('Invalid agent public key format');
+          return;
+        }
+        if (bootstrap.serverPublicKeyB64 && !isX25519KeyB64(bootstrap.serverPublicKeyB64)) {
+          showError('Invalid server public key format');
+          return;
+        }
+        if (bootstrap.serverPublicKeyB64 && !QURL_LINK_CONFIG.serverStaticPubB64) {
+          showError('Relay verifier is not configured');
+          return;
+        }
+        if (bootstrap.serverPublicKeyB64 &&
+            bootstrap.serverPublicKeyB64 !== QURL_LINK_CONFIG.serverStaticPubB64) {
+          showError('Relay verifier identity mismatch');
+          return;
+        }
 
-      // Token format matches qurl-service token generation
-      // (qurl-service/internal/domain/qurl.go): at_ + 22 base64url chars
-      // (lowercase alphanumeric, underscore, hyphen).
-      if (!/^at_[a-z0-9_-]{22}$/.test(bootstrap.accessToken)) {
-        showError('Invalid access token format');
-        return;
-      }
-      if (bootstrap.agentPrivateKeyB64 && !isX25519KeyB64(bootstrap.agentPrivateKeyB64)) {
-        showError('Invalid agent private key format');
-        return;
-      }
-      if (bootstrap.agentPublicKeyB64 && !isX25519KeyB64(bootstrap.agentPublicKeyB64)) {
-        showError('Invalid agent public key format');
-        return;
-      }
-      if (bootstrap.serverPublicKeyB64 && !isX25519KeyB64(bootstrap.serverPublicKeyB64)) {
-        showError('Invalid server public key format');
-        return;
-      }
-      if (bootstrap.serverPublicKeyB64 && !QURL_LINK_CONFIG.serverStaticPubB64) {
-        showError('Relay verifier is not configured');
-        return;
-      }
-      if (bootstrap.serverPublicKeyB64 &&
-          bootstrap.serverPublicKeyB64 !== QURL_LINK_CONFIG.serverStaticPubB64) {
-        showError('Relay verifier identity mismatch');
-        return;
-      }
+        // Captured BEFORE the 500ms UX delay so t_to_submit_ms measures
+        // script-readiness latency (navigation start -> token validated,
+        // verifier inputs checked) and isn't pinned to the setTimeout floor.
+        const submitReadyMs = (typeof performance !== 'undefined' &&
+          typeof performance.now === 'function') ? performance.now() : null;
 
-      // Captured BEFORE the 500ms UX delay so t_to_submit_ms measures
-      // script-readiness latency (navigation start -> token validated,
-      // verifier inputs checked) and isn't pinned to the setTimeout floor.
-      const submitReadyMs = (typeof performance !== 'undefined' &&
-        typeof performance.now === 'function') ? performance.now() : null;
-
-      // The 500ms delay keeps the spinner visible long enough to register.
-      setTimeout(function() {
-%{ if js_agent_enabled ~}
-        verifyWithRelay(bootstrap).catch(function(error) {
-          showError('Relay verification failed');
-          if (typeof console !== 'undefined' && console.error) {
-            console.error('qURL relay verification failed:', error);
+        // The 500ms delay keeps the spinner visible long enough to register.
+        setTimeout(function() {
+          if (!isActiveFragmentRequest(requestID)) {
+            return;
           }
-        });
+%{ if js_agent_enabled ~}
+          verifyWithRelay(bootstrap, requestID).catch(function(error) {
+            if (!isActiveFragmentRequest(requestID)) {
+              return;
+            }
+            showError('Relay verification failed');
+            if (typeof console !== 'undefined' && console.error) {
+              console.error('qURL relay verification failed:', error);
+            }
+          });
 %{ else ~}
-        var form = document.createElement('form');
-        form.method = 'POST';
-        form.action = 'https://resolve.' + hostname + '/plugins/qurl';
-        appendField(form, 'token', bootstrap.accessToken);
-        appendBrowserTimings(form, submitReadyMs);
-        document.body.appendChild(form);
-        form.submit();
+          var form = document.createElement('form');
+          form.method = 'POST';
+          form.action = 'https://resolve.' + hostname + '/plugins/qurl';
+          appendField(form, 'token', bootstrap.accessToken);
+          appendBrowserTimings(form, submitReadyMs);
+          document.body.appendChild(form);
+          form.submit();
 %{ endif ~}
-      }, 500);
+        }, 500);
+      }
 
 %{ if js_agent_enabled ~}
-      async function verifyWithRelay(bootstrap) {
+      async function verifyWithRelay(bootstrap, requestID) {
         var relayBaseUrl = bootstrap.relayBaseUrl || QURL_LINK_CONFIG.relayBaseUrl;
         var serverStaticPubB64 = bootstrap.serverPublicKeyB64 || QURL_LINK_CONFIG.serverStaticPubB64;
         if (!relayBaseUrl || !serverStaticPubB64) {
@@ -1437,6 +1457,9 @@
         }
 
         var agent = await import('/nhp-agent.min.js');
+        if (!isActiveFragmentRequest(requestID)) {
+          return;
+        }
         var deviceStaticPriv;
         if (bootstrap.agentPrivateKeyB64) {
           deviceStaticPriv = agent.x25519KeyFromBase64(bootstrap.agentPrivateKeyB64);
@@ -1452,6 +1475,10 @@
           qurlAccessToken: bootstrap.accessToken,
           qurlUserAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : ''
         });
+
+        if (!isActiveFragmentRequest(requestID)) {
+          return;
+        }
 
         if (result.kind === 'success' && result.redirectUrl) {
           window.location.replace(result.redirectUrl);
@@ -1551,7 +1578,7 @@
       // so qv2-looking links get a real error page instead of silently rendering the
       // landing page; fails closed when qv2 is not provisioned (empty
       // issuerTrustStore / relayAllowlist). Never touches the qv1 code path.
-      async function handleQurlV2Fragment(fragment) {
+      async function handleQurlV2Fragment(fragment, requestID) {
         var hostname = window.location.hostname.toLowerCase();
         if (!QURL_LINK_CONFIG.allowedHosts.includes(hostname)) {
           showError('Invalid host: ' + hostname);
@@ -1574,9 +1601,15 @@
           // disabled the bundle is absent and this rejects — caught below and
           // surfaced as an error rather than a stuck spinner.
           var agent = await import('/nhp-agent.min.js');
+          if (!isActiveFragmentRequest(requestID)) {
+            return;
+          }
           // TrustStore.fromSpkiDerB64 wants a { kid: SPKI-DER-base64url } map and
           // RelayAllowlist wants host[:port] entries; both come straight from config.
           var trustStore = await agent.TrustStore.fromSpkiDerB64(QURL_LINK_CONFIG.issuerTrustStore);
+          if (!isActiveFragmentRequest(requestID)) {
+            return;
+          }
           var relayAllowlist = new agent.RelayAllowlist(QURL_LINK_CONFIG.relayAllowlist);
 
           // knockQurlV2 strictly unwraps qv2t1, parses+verifies the issuer signature,
@@ -1589,6 +1622,10 @@
             relayAllowlist: relayAllowlist,
             authServiceId: 'qurl'
           });
+
+          if (!isActiveFragmentRequest(requestID)) {
+            return;
+          }
 
           // KnockResult is the SAME discriminated union the qv1 relay path branches
           // on; redirect on success exactly as verifyWithRelay does.
@@ -1610,6 +1647,9 @@
           }
           showError('Relay returned no redirect');
         } catch {
+          if (!isActiveFragmentRequest(requestID)) {
+            return;
+          }
           // knockQurlV2 throws on a transport, verification, relay_url, PoP,
           // key-decoding, or relay/crypto fault. All map to the same branded
           // invalid-access page. Do not print the caught error: parser errors may
@@ -1683,6 +1723,21 @@
         // qv2-looking value, including malformed/unknown/legacy transport, before
         // the decoder reports an error; none should remain in browser history.
         return !!fragment && (fragment.startsWith('qv2') || fragment.startsWith('qv1.') || fragment.startsWith('at_'));
+      }
+
+      function isActiveFragmentRequest(requestID) {
+        return requestID === activeFragmentRequest;
+      }
+
+      function enterVerifierState() {
+        document.documentElement.classList.add('verifying');
+        document.body.classList.remove('error');
+        document.body.classList.add('verifying');
+      }
+
+      function enterLandingState() {
+        document.documentElement.classList.remove('verifying');
+        document.body.classList.remove('verifying', 'error');
       }
 
       function isX25519KeyB64(value) {

@@ -120,6 +120,7 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 			"issuerTrustStore:",
 			"relayAllowlist:",
 			"fragment.startsWith('qv2')",
+			"window.addEventListener('hashchange', processLocationFragment)",
 			"handleQurlV2Fragment",
 			"agent.TrustStore.fromSpkiDerB64(QURL_LINK_CONFIG.issuerTrustStore)",
 			"new agent.RelayAllowlist(QURL_LINK_CONFIG.relayAllowlist)",
@@ -492,9 +493,9 @@ func TestQurlLinkFrontend_QurlV2ShareTransportRoutingRenders(t *testing.T) {
 	verifier := inlineVerifierScript(t, string(raw))
 	for _, want := range []string{
 		"fragment.startsWith('qv2')",
-		"document.body.classList.add('verifying')",
+		"enterVerifierState()",
 		"clearSensitiveFragment(fragment)",
-		"handleQurlV2Fragment(fragment)",
+		"handleQurlV2Fragment(fragment, requestID)",
 		"fragment.startsWith('qv2') || fragment.startsWith('qv1.')",
 		"agent.knockQurlV2(fragment,",
 		"catch {",
@@ -505,11 +506,15 @@ func TestQurlLinkFrontend_QurlV2ShareTransportRoutingRenders(t *testing.T) {
 		}
 	}
 
-	addVerifyingAt := strings.Index(verifier, "document.body.classList.add('verifying')")
+	routeAt := strings.Index(verifier, "if (fragment.startsWith('qv2'))")
+	if routeAt < 0 {
+		t.Fatal("qurl.link verifier has no qv2 dispatch branch.")
+	}
+	addVerifyingAt := strings.Index(verifier[routeAt:], "enterVerifierState()")
 	clearAt := strings.Index(verifier, "clearSensitiveFragment(fragment)")
-	handleAt := strings.Index(verifier, "handleQurlV2Fragment(fragment)")
-	if addVerifyingAt < 0 || clearAt < addVerifyingAt || handleAt < clearAt {
-		t.Fatalf("qurl.link qv2 route ordering is not verifying -> history clear -> handler: verifying=%d clear=%d handler=%d", addVerifyingAt, clearAt, handleAt)
+	handleAt := strings.Index(verifier, "handleQurlV2Fragment(fragment, requestID)")
+	if addVerifyingAt < 0 || clearAt < routeAt+addVerifyingAt || handleAt < clearAt {
+		t.Fatalf("qurl.link qv2 route ordering is not verifying -> history clear -> handler: route=%d verifying=%d clear=%d handler=%d", routeAt, addVerifyingAt, clearAt, handleAt)
 	}
 
 	for _, forbidden := range []string{
@@ -518,6 +523,39 @@ func TestQurlLinkFrontend_QurlV2ShareTransportRoutingRenders(t *testing.T) {
 	} {
 		if strings.Contains(verifier, forbidden) {
 			t.Fatalf("qurl.link verifier retains forbidden legacy/secret-logging wiring %q.", forbidden)
+		}
+	}
+}
+
+// TestQurlLinkFrontend_SameDocumentCredentialNavigationRenders fences the
+// reader seam where an already-open qurl.link tab receives a new fragment. A
+// hash-only navigation does not reload the page, so the initial-load dispatcher
+// alone would leave the credential visible and never invoke the verifier.
+func TestQurlLinkFrontend_SameDocumentCredentialNavigationRenders(t *testing.T) {
+	raw, err := os.ReadFile(qurlLinkTemplatePath(t))
+	if err != nil {
+		t.Fatalf("read qurl-link template: %v", err)
+	}
+	verifier := inlineVerifierScript(t, string(raw))
+
+	listener := "window.addEventListener('hashchange', processLocationFragment)"
+	listenerAt := strings.Index(verifier, listener)
+	dispatchAt := strings.Index(verifier, "processLocationFragment();")
+	handlerAt := strings.Index(verifier, "function processLocationFragment()")
+	fragmentReadAt := strings.Index(verifier, "const fragment = window.location.hash.substring(1)")
+	if listenerAt < 0 || dispatchAt < listenerAt || handlerAt < dispatchAt || fragmentReadAt < handlerAt {
+		t.Fatalf("qurl.link fragment dispatch must register hashchange, run once, then reread location.hash inside the handler: listener=%d dispatch=%d handler=%d read=%d", listenerAt, dispatchAt, handlerAt, fragmentReadAt)
+	}
+
+	for _, want := range []string{
+		"const requestID = ++activeFragmentRequest",
+		"handleQurlV2Fragment(fragment, requestID)",
+		"verifyWithRelay(bootstrap, requestID)",
+		"if (!isActiveFragmentRequest(requestID))",
+		"history.replaceState(null, '', window.location.pathname + window.location.search)",
+	} {
+		if !strings.Contains(verifier, want) {
+			t.Fatalf("qurl.link same-document credential handler is missing %q.", want)
 		}
 	}
 }
@@ -531,6 +569,7 @@ func assertQurlV2VerifierWiring(t *testing.T, script string) {
 		"issuerTrustStore:",
 		"relayAllowlist:",
 		"fragment.startsWith('qv2')",
+		"window.addEventListener('hashchange', processLocationFragment)",
 		"handleQurlV2Fragment",
 		"agent.knockQurlV2(fragment,",
 	} {

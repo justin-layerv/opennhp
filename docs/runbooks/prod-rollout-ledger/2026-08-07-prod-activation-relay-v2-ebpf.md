@@ -68,7 +68,10 @@ exists.
       the canonical `qv2.<claims>.<secret>.<sig>` artifact and verifies
       the issuer signature locally, knocks through `relay.layerv.ai`, and the
       `*.qurl.site` resource loads protected content rather than the invalid-access
-      page.
+      page. Mint a second qURL, open the bare qurl.link landing page first, then
+      navigate that same tab to the second link; confirm the hash is cleared and
+      the protected content opens. This fences the hash-only navigation reader
+      path as well as a fresh page load.
 - [ ] Post-rollout: confirm the relay ALB target group is healthy over HTTPS on
       `/health/live` and that no relay `BootstrapFailure` alarm fired during the
       ELB-health replacement churn.
