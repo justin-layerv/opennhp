@@ -993,6 +993,11 @@ NHP_CONNECTOR_REGISTRATION_WRITE_BUDGET=${connector_authority_cell_config.write_
 NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_REGION=${connector_authority_cell_config.aws_region}
 NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_ACCOUNT_ID=${connector_authority_cell_config.aws_account_id}
 NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN=${connector_authority_cell_config.complete_credential_recovery_alias_arn}
+%{ if connector_authority_cell_config.resolve_connector_resource_alias_arn != null ~}
+NHP_CONNECTOR_RESOURCE_AWS_REGION=${connector_authority_cell_config.aws_region}
+NHP_CONNECTOR_RESOURCE_AWS_ACCOUNT_ID=${connector_authority_cell_config.aws_account_id}
+NHP_CONNECTOR_RESOURCE_ALIAS_ARN=${connector_authority_cell_config.resolve_connector_resource_alias_arn}
+%{ endif ~}
 %{ endif ~}
 # Instance identity and stderr log target for the docker awslogs driver.
 # The docker --log-driver=awslogs flags in the systemd unit (below)

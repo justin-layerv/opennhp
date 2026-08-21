@@ -623,6 +623,13 @@ func (l *AgentPeerLookup) queryAndCache(ctx context.Context, pubKeyB64 string) (
 			return nil, fmt.Errorf("%w: owner_id=%q agent_id=%q got schema_version=%d want %d",
 				ErrAgentLookupSchemaMismatch, row.OwnerID, row.AgentID, row.SchemaVersion, internalauth.QURLAgentKeysSchemaVersion)
 		}
+		if err := internalauth.ValidateQURLAgentKeyRow(*row); err != nil {
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricAgentLookupSchemaMismatch)
+			}
+			return nil, fmt.Errorf("%w: owner_id=%q agent_id=%q invalid schema-v2 credential scope",
+				ErrAgentLookupSchemaMismatch, row.OwnerID, row.AgentID)
+		}
 
 		if selectedRow == nil {
 			selectedRow = row

@@ -61,6 +61,26 @@
         "steady_provisioned_concurrency": 2,
         "steady_reserved_concurrency": 4
       },
+      "layerv-nhp-sandbox-ca-creso-cell0": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 4
+      },
+      "layerv-nhp-sandbox-ca-creso-cell1": {
+        "max_caller_in_flight": 2,
+        "max_caller_requests_per_second": 4,
+        "rollback_retention_seconds": 3600,
+        "rollout_active_provisioned_concurrency": 2,
+        "rollout_reserved_concurrency": 4,
+        "rollout_standby_provisioned_concurrency": 2,
+        "steady_provisioned_concurrency": 2,
+        "steady_reserved_concurrency": 4
+      },
       "layerv-nhp-sandbox-ca-ia": {
         "max_caller_in_flight": 2,
         "max_caller_requests_per_second": 4,
@@ -127,7 +147,8 @@
               "activate_registration": 1,
               "complete_credential_recovery": 1,
               "complete_registration": 1,
-              "issue_registration_otp": 1
+              "issue_registration_otp": 1,
+              "resolve_connector_resource": 1
             },
             "preinvoke_rate_limits": {
               "activate_registration": {
@@ -143,6 +164,10 @@
                 "refill_per_second": 1
               },
               "issue_registration_otp": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "resolve_connector_resource": {
                 "burst": 1,
                 "refill_per_second": 1
               }
@@ -154,7 +179,8 @@
               "activate_registration": 1,
               "complete_credential_recovery": 1,
               "complete_registration": 1,
-              "issue_registration_otp": 1
+              "issue_registration_otp": 1,
+              "resolve_connector_resource": 1
             },
             "preinvoke_rate_limits": {
               "activate_registration": {
@@ -170,6 +196,10 @@
                 "refill_per_second": 1
               },
               "issue_registration_otp": {
+                "burst": 1,
+                "refill_per_second": 1
+              },
+              "resolve_connector_resource": {
                 "burst": 1,
                 "refill_per_second": 1
               }
@@ -217,10 +247,22 @@
     "phase": "measurement",
     "provisioned_cells": {
       "cell0": {
-        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server",
+        "cell_data_kms_key_arn": "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02",
+        "cell_table_prefix": "layerv-nhp-sandbox-cell0",
+        "qurl_resource_key_material_table_arn": "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resource-key-material",
+        "qurl_resources_table_arn": "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources",
+        "resource_key_envelope_kms_key_arn": "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96",
+        "resource_key_software_custody_enabled": true
       },
       "cell1": {
-        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        "caller_role_arn": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server",
+        "cell_data_kms_key_arn": "arn:aws:kms:us-east-2:767397897469:key/fc5121da-c353-4621-b24b-7ec5f79446bd",
+        "cell_table_prefix": "layerv-nhp-sandbox-cell1-cell1",
+        "qurl_resource_key_material_table_arn": "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material",
+        "qurl_resources_table_arn": "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resources",
+        "resource_key_envelope_kms_key_arn": "arn:aws:kms:us-east-2:767397897469:key/1ff3c518-1653-4126-ab7e-039a7e6ab0ff",
+        "resource_key_software_custody_enabled": true
       }
     },
     "qat1_kid": "sandbox-qat1-2026-07-v1",

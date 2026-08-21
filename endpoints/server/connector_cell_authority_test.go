@@ -27,19 +27,20 @@ func TestConfigureConnectorCellAuthorityPublishesOneValidatedGraphAtomically(t *
 		},
 	)
 	if err != nil || loads != 1 || server.connectorRegistrationHandler == nil ||
-		server.credentialRecoveryHandler == nil ||
+		server.credentialRecoveryHandler == nil || server.connectorResourceHandler == nil ||
 		server.connectorRegistrationTiming != validConnectorRegistrationTiming() {
 		t.Fatalf(
-			"configure = %v loads=%d registration=%T recovery=%T timing=%+v",
+			"configure = %v loads=%d registration=%T recovery=%T resource=%T timing=%+v",
 			err,
 			loads,
 			server.connectorRegistrationHandler,
 			server.credentialRecoveryHandler,
+			server.connectorResourceHandler,
 			server.connectorRegistrationTiming,
 		)
 	}
 
-	// A later invalid reconfiguration must clear both capabilities before any
+	// A later invalid reconfiguration must clear all capabilities before any
 	// ambient AWS load, never retain half of the previous graph.
 	bad := validConnectorCellAuthorityEnvironment()
 	bad[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.TrimSuffix(
@@ -59,11 +60,13 @@ func TestConfigureConnectorCellAuthorityPublishesOneValidatedGraphAtomically(t *
 		t.Fatalf("mixed-color configure = %v loads=%d; want closed pre-AWS rejection", err, loads)
 	}
 	if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil ||
+		server.connectorResourceHandler != nil ||
 		server.connectorRegistrationTiming != (connectorRegistrationTiming{}) {
 		t.Fatalf(
-			"invalid reconfiguration retained state: registration=%T recovery=%T timing=%+v",
+			"invalid reconfiguration retained state: registration=%T recovery=%T resource=%T timing=%+v",
 			server.connectorRegistrationHandler,
 			server.credentialRecoveryHandler,
+			server.connectorResourceHandler,
 			server.connectorRegistrationTiming,
 		)
 	}
@@ -89,6 +92,11 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 		ConnectorCredentialRecoveryAWSAccountEnvVar,
 		ConnectorCredentialRecoveryAliasARNEnvVar,
 	}
+	resourceKeys := []string{
+		ConnectorResourceAWSRegionEnvVar,
+		ConnectorResourceAWSAccountEnvVar,
+		ConnectorResourceAliasARNEnvVar,
+	}
 	tests := []struct {
 		name   string
 		mutate func(map[string]string)
@@ -97,9 +105,23 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 			for _, key := range recoveryKeys {
 				delete(env, key)
 			}
+			for _, key := range resourceKeys {
+				delete(env, key)
+			}
 		}},
 		{name: "recovery only", mutate: func(env map[string]string) {
 			for _, key := range registrationKeys {
+				delete(env, key)
+			}
+			for _, key := range resourceKeys {
+				delete(env, key)
+			}
+		}},
+		{name: "resource only", mutate: func(env map[string]string) {
+			for _, key := range registrationKeys {
+				delete(env, key)
+			}
+			for _, key := range recoveryKeys {
 				delete(env, key)
 			}
 		}},
@@ -108,6 +130,9 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 		}},
 		{name: "recovery partial", mutate: func(env map[string]string) {
 			delete(env, ConnectorCredentialRecoveryAliasARNEnvVar)
+		}},
+		{name: "resource partial", mutate: func(env map[string]string) {
+			delete(env, ConnectorResourceAliasARNEnvVar)
 		}},
 		{name: "mixed registration color", mutate: func(env map[string]string) {
 			env[ConnectorRegistrationCompleteAliasEnvVar] = strings.TrimSuffix(
@@ -118,6 +143,12 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 		{name: "mixed recovery color", mutate: func(env map[string]string) {
 			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.TrimSuffix(
 				env[ConnectorCredentialRecoveryAliasARNEnvVar],
+				":blue",
+			) + ":green"
+		}},
+		{name: "mixed resource color", mutate: func(env map[string]string) {
+			env[ConnectorResourceAliasARNEnvVar] = strings.TrimSuffix(
+				env[ConnectorResourceAliasARNEnvVar],
 				":blue",
 			) + ":green"
 		}},
@@ -149,6 +180,14 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 				1,
 			)
 		}},
+		{name: "wrong resource operation", mutate: func(env map[string]string) {
+			env[ConnectorResourceAliasARNEnvVar] = strings.Replace(
+				env[ConnectorResourceAliasARNEnvVar],
+				"-ca-creso-",
+				"-ca-cr-",
+				1,
+			)
+		}},
 		{name: "declared account mismatch", mutate: func(env map[string]string) {
 			env[ConnectorCredentialRecoveryAWSAccountEnvVar] = "999999999999"
 			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(
@@ -165,6 +204,12 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 				"us-east-2",
 				"us-west-2",
 				1,
+			)
+		}},
+		{name: "resource declared account mismatch", mutate: func(env map[string]string) {
+			env[ConnectorResourceAWSAccountEnvVar] = "999999999999"
+			env[ConnectorResourceAliasARNEnvVar] = strings.Replace(
+				env[ConnectorResourceAliasARNEnvVar], "123456789012", "999999999999", 1,
 			)
 		}},
 	}
@@ -187,15 +232,16 @@ func TestConnectorCellAuthorityRejectsPartialAndCrossGraphDriftBeforeAWS(t *test
 			if err == nil || loads != 0 {
 				t.Fatalf("configure = %v loads=%d; want pre-AWS rejection", err, loads)
 			}
-			if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil {
-				t.Fatalf("partial capability published: registration=%T recovery=%T",
-					server.connectorRegistrationHandler, server.credentialRecoveryHandler)
+			if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil ||
+				server.connectorResourceHandler != nil {
+				t.Fatalf("partial capability published: registration=%T recovery=%T resource=%T",
+					server.connectorRegistrationHandler, server.credentialRecoveryHandler, server.connectorResourceHandler)
 			}
 		})
 	}
 }
 
-func TestConnectorCellAuthorityStaysDarkOnlyWhenBothFamiliesAreAbsent(t *testing.T) {
+func TestConnectorCellAuthorityStaysDarkOnlyWhenAllFamiliesAreAbsent(t *testing.T) {
 	t.Parallel()
 
 	server := &UdpServer{}
@@ -210,14 +256,15 @@ func TestConnectorCellAuthorityStaysDarkOnlyWhenBothFamiliesAreAbsent(t *testing
 		},
 	)
 	if err != nil || loads != 0 || server.connectorRegistrationHandler != nil ||
-		server.credentialRecoveryHandler != nil ||
+		server.credentialRecoveryHandler != nil || server.connectorResourceHandler != nil ||
 		server.connectorRegistrationTiming != (connectorRegistrationTiming{}) {
 		t.Fatalf(
-			"dark configure = %v loads=%d registration=%T recovery=%T timing=%+v",
+			"dark configure = %v loads=%d registration=%T recovery=%T resource=%T timing=%+v",
 			err,
 			loads,
 			server.connectorRegistrationHandler,
 			server.credentialRecoveryHandler,
+			server.connectorResourceHandler,
 			server.connectorRegistrationTiming,
 		)
 	}
@@ -250,11 +297,13 @@ func TestConnectorCellAuthorityDoesNotPublishOnAWSOrConstructorFailure(t *testin
 				t.Fatal("configure succeeded")
 			}
 			if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil ||
+				server.connectorResourceHandler != nil ||
 				server.connectorRegistrationTiming != (connectorRegistrationTiming{}) {
 				t.Fatalf(
-					"failure published state: registration=%T recovery=%T timing=%+v",
+					"failure published state: registration=%T recovery=%T resource=%T timing=%+v",
 					server.connectorRegistrationHandler,
 					server.credentialRecoveryHandler,
+					server.connectorResourceHandler,
 					server.connectorRegistrationTiming,
 				)
 			}
@@ -296,9 +345,10 @@ func TestConnectorCellAuthorityRejectsInvalidStartupDependencies(t *testing.T) {
 			if !errors.Is(err, errInvalidConnectorCellAuthorityConfiguration) {
 				t.Fatalf("configure = %v, want invalid startup dependencies", err)
 			}
-			if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil {
-				t.Fatalf("startup dependency failure published capabilities: registration=%T recovery=%T",
-					server.connectorRegistrationHandler, server.credentialRecoveryHandler)
+			if server.connectorRegistrationHandler != nil || server.credentialRecoveryHandler != nil ||
+				server.connectorResourceHandler != nil {
+				t.Fatalf("startup dependency failure published capabilities: registration=%T recovery=%T resource=%T",
+					server.connectorRegistrationHandler, server.credentialRecoveryHandler, server.connectorResourceHandler)
 			}
 		})
 	}
@@ -309,5 +359,8 @@ func validConnectorCellAuthorityEnvironment() map[string]string {
 	for key, value := range validRecoveryEnvironment() {
 		env[key] = value
 	}
+	env[ConnectorResourceAWSRegionEnvVar] = "us-east-2"
+	env[ConnectorResourceAWSAccountEnvVar] = "123456789012"
+	env[ConnectorResourceAliasARNEnvVar] = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-creso-cell0:blue"
 	return env
 }

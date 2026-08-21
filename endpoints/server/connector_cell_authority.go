@@ -25,9 +25,9 @@ func loadConnectorCellAuthorityAWSConfig(ctx context.Context, region string) (aw
 }
 
 // configureConnectorCellAuthority owns the atomic assigned-cell Authority
-// startup boundary. Registration and recovery are either both absent or form
-// one exact four-operation, one-color graph; no AWS client is loaded until that
-// complete graph is valid. The two handlers still receive structurally narrow
+// startup boundary. Registration, recovery, and resource discovery are either
+// all absent or form one exact five-operation, one-color graph; no AWS client is loaded until that
+// complete graph is valid. The handlers still receive structurally narrow
 // clients, so validating together does not widen either runtime capability.
 func (s *UdpServer) configureConnectorCellAuthority(
 	ctx context.Context,
@@ -37,8 +37,9 @@ func (s *UdpServer) configureConnectorCellAuthority(
 	s.connectorRegistrationHandler = nil
 	s.connectorRegistrationTiming = connectorRegistrationTiming{}
 	s.credentialRecoveryHandler = nil
+	s.connectorResourceHandler = nil
 
-	registration, recovery, err := loadConnectorCellAuthorityConfigs(lookupEnv)
+	registration, recovery, resource, err := loadConnectorCellAuthorityConfigs(lookupEnv)
 	if err != nil {
 		return err
 	}
@@ -92,34 +93,58 @@ func (s *UdpServer) configureConnectorCellAuthority(
 		return errInvalidConnectorCellAuthorityConfiguration
 	}
 
-	// Publish both capabilities only after the shared AWS identity and both
+	resourceAuthority, err := connectorauthority.NewConnectorResourceCellClient(
+		awsConfig,
+		boundary,
+		connectorauthority.ConnectorResourceCellTarget{
+			ResolveConnectorResourceAliasARN: resource.aliasARN,
+		},
+	)
+	if err != nil {
+		return errInvalidConnectorCellAuthorityConfiguration
+	}
+	resourceHandler, err := connectorcell.NewConnectorResourceHandler(resourceAuthority, registration.environment)
+	if err != nil {
+		return errInvalidConnectorCellAuthorityConfiguration
+	}
+
+	// Publish all capabilities only after the shared AWS identity and all
 	// narrow clients and handlers have been constructed successfully.
 	s.connectorRegistrationHandler = registrationHandler
 	s.connectorRegistrationTiming = registration.timing
 	s.credentialRecoveryHandler = recoveryHandler
+	s.connectorResourceHandler = resourceHandler
 	return nil
 }
 
 func loadConnectorCellAuthorityConfigs(
 	lookupEnv func(string) (string, bool),
-) (*connectorRegistrationConfig, *credentialRecoveryConfig, error) {
+) (*connectorRegistrationConfig, *credentialRecoveryConfig, *connectorResourceConfig, error) {
 	registration, err := loadConnectorRegistrationConfig(lookupEnv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	recovery, err := loadCredentialRecoveryConfig(lookupEnv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	if registration == nil && recovery == nil {
-		return nil, nil, nil
+	resource, err := loadConnectorResourceConfig(lookupEnv)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if registration == nil || recovery == nil ||
+	if registration == nil && recovery == nil && resource == nil {
+		return nil, nil, nil, nil
+	}
+	if registration == nil || recovery == nil || resource == nil ||
 		registration.environment != recovery.environment ||
 		registration.cellID != recovery.cellID ||
 		registration.region != recovery.region ||
-		registration.accountID != recovery.accountID {
-		return nil, nil, errInvalidConnectorCellAuthorityConfiguration
+		registration.accountID != recovery.accountID ||
+		registration.environment != resource.environment ||
+		registration.cellID != resource.cellID ||
+		registration.region != resource.region ||
+		registration.accountID != resource.accountID {
+		return nil, nil, nil, errInvalidConnectorCellAuthorityConfiguration
 	}
 
 	if err := connectorauthority.ValidateCellTargets(
@@ -129,11 +154,12 @@ func loadConnectorCellAuthorityConfigs(
 			ActivateRegistrationAliasARN:       registration.activateAliasARN,
 			CompleteRegistrationAliasARN:       registration.completeAliasARN,
 			CompleteCredentialRecoveryAliasARN: recovery.aliasARN,
+			ResolveConnectorResourceAliasARN:   resource.aliasARN,
 		},
 	); err != nil {
-		return nil, nil, errInvalidConnectorCellAuthorityConfiguration
+		return nil, nil, nil, errInvalidConnectorCellAuthorityConfiguration
 	}
-	return registration, recovery, nil
+	return registration, recovery, resource, nil
 }
 
 func connectorCellBoundary(config *connectorRegistrationConfig) connectorauthority.CellBoundary {

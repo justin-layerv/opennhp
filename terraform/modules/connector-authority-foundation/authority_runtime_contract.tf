@@ -3,7 +3,7 @@ variable "authority_runtime_contract" {
     Nullable versioned Connector Authority deployment contract. Null keeps the
     foundation dark. A non-null value freezes one environment/account/region,
     one blue-or-green selector, the provisioned-cell caller catalog plus its
-    immutable evidence identity, the exact 3 + 4N Authority operation graph,
+    immutable evidence identity, the exact 3 + 5N Authority operation graph,
     and its evidence-backed concurrency and request-rate envelopes.
     Caller max_replicas includes every simultaneously live old/new or surge
     replica, not only the converged desired count.
@@ -35,7 +35,15 @@ locals {
     "global",
     "functions",
   ])
-  authority_contract_cell_keys = toset(["caller_role_arn"])
+  authority_contract_cell_keys = toset([
+    "caller_role_arn",
+    "cell_table_prefix",
+    "qurl_resources_table_arn",
+    "qurl_resource_key_material_table_arn",
+    "cell_data_kms_key_arn",
+    "resource_key_envelope_kms_key_arn",
+    "resource_key_software_custody_enabled",
+  ])
   authority_contract_global_base_keys = toset([
     "environment",
     "aws_partition",
@@ -100,6 +108,7 @@ locals {
     activate_registration        = "ar"
     complete_registration        = "cr"
     complete_credential_recovery = "ccr"
+    resolve_connector_resource   = "creso"
   }
   # Attended-proof mutation controls are a THIRD operation family, deliberately
   # not merged into the hub or cell maps above. Keeping them separate is the
@@ -108,7 +117,7 @@ locals {
   # preinvoke budget, and authority_selected_alias_targets never offers a proof
   # alias to the Hub task role or a cell server role. The family is empty unless
   # the sandbox-only gate is on, so the committed default reproduces the exact
-  # historical 3 + 4N graph byte for byte.
+  # historical 3 + 5N graph byte for byte.
   authority_contract_proof_operation_suffixes = var.authority_proof_mutation_controls_enabled ? {
     mutate_proof_agent                = "pm"
     prepare_proof_credential_recovery = "pcr"
@@ -131,6 +140,7 @@ locals {
     activate_registration             = "ActivateRegistration"
     complete_registration             = "CompleteRegistration"
     complete_credential_recovery      = "CompleteCredentialRecovery"
+    resolve_connector_resource        = "ResolveConnectorResource"
     mutate_proof_agent                = "MutateProofAgent"
     prepare_proof_credential_recovery = "PrepareProofCredentialRecovery"
   }
@@ -399,9 +409,30 @@ locals {
       for cell_id, cell in local.authority_contract_cells :
       length(cell_id) <= 32 &&
       can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", cell_id)) &&
-      cell.caller_role_arn == "arn:${local.authority_contract_global.aws_partition}:iam::${local.authority_contract_global.aws_account_id}:role/${cell_id == "cell0" ? "layerv-nhp-${var.environment}-server" : "layerv-nhp-${var.environment}-${cell_id}-server"}"
+      cell.caller_role_arn == "arn:${local.authority_contract_global.aws_partition}:iam::${local.authority_contract_global.aws_account_id}:role/${cell_id == "cell0" ? "layerv-nhp-${var.environment}-server" : "layerv-nhp-${var.environment}-${cell_id}-server"}" &&
+      contains([
+        "layerv-nhp-${var.environment}-${cell_id}",
+        "layerv-nhp-${var.environment}-${cell_id}-${cell_id}",
+      ], cell.cell_table_prefix) &&
+      cell.qurl_resources_table_arn == "arn:${local.authority_contract_global.aws_partition}:dynamodb:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:table/${cell.cell_table_prefix}-qurl-resources" &&
+      cell.qurl_resource_key_material_table_arn == "arn:${local.authority_contract_global.aws_partition}:dynamodb:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:table/${cell.cell_table_prefix}-qurl-resource-key-material" &&
+      can(regex(
+        "^arn:${local.authority_contract_global.aws_partition}:kms:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:key/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        cell.cell_data_kms_key_arn,
+      )) &&
+      can(regex(
+        "^arn:${local.authority_contract_global.aws_partition}:kms:${local.authority_contract_global.aws_region}:${local.authority_contract_global.aws_account_id}:key/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        cell.resource_key_envelope_kms_key_arn,
+      )) &&
+      cell.cell_data_kms_key_arn != cell.resource_key_envelope_kms_key_arn &&
+      jsonencode(cell.resource_key_software_custody_enabled) == jsonencode(tobool(cell.resource_key_software_custody_enabled))
     ]) &&
-    length(toset([for cell in values(local.authority_contract_cells) : cell.caller_role_arn])) == length(local.authority_contract_cells),
+    length(toset([for cell in values(local.authority_contract_cells) : cell.caller_role_arn])) == length(local.authority_contract_cells) &&
+    length(toset([for cell in values(local.authority_contract_cells) : cell.cell_table_prefix])) == length(local.authority_contract_cells) &&
+    length(toset([for cell in values(local.authority_contract_cells) : cell.qurl_resources_table_arn])) == length(local.authority_contract_cells) &&
+    length(toset([for cell in values(local.authority_contract_cells) : cell.qurl_resource_key_material_table_arn])) == length(local.authority_contract_cells) &&
+    length(toset([for cell in values(local.authority_contract_cells) : cell.cell_data_kms_key_arn])) == length(local.authority_contract_cells) &&
+    length(toset([for cell in values(local.authority_contract_cells) : cell.resource_key_envelope_kms_key_arn])) == length(local.authority_contract_cells),
     false,
   )
 

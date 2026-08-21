@@ -62,6 +62,31 @@ func FuzzParseFragment(f *testing.F) {
 	})
 }
 
+// FuzzDecodeTransport exercises the unauthenticated outer-fragment framing
+// boundary. An error must never leak partial canonical output; an accept must
+// stay inside the total bound and reconstruct only a qv2 body.
+func FuzzDecodeTransport(f *testing.F) {
+	f.Add("qv2t1.1.1.1.A.B.C")
+	f.Add("qv2.A.B.C")
+	f.Add(strings.Repeat("A", TransportMaxLength+1))
+
+	f.Fuzz(func(t *testing.T, body string) {
+		canonical, err := DecodeTransport(body)
+		if err != nil {
+			if canonical != "" {
+				t.Fatalf("DecodeTransport returned output %q with error %v", canonical, err)
+			}
+			return
+		}
+		if len(body) > TransportMaxLength {
+			t.Fatalf("oversize transport unexpectedly accepted: %d", len(body))
+		}
+		if !strings.HasPrefix(canonical, FragmentPrefix+".") {
+			t.Fatalf("accepted transport returned non-canonical prefix: %q", canonical)
+		}
+	})
+}
+
 // FuzzDecodeB64Canonical asserts the security-critical canonicality property of
 // decodeB64: it accepts a string ONLY if that string is the unique canonical
 // encoding of the bytes it decodes to. If decode succeeds, re-encoding the bytes

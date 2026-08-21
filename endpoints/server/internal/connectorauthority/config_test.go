@@ -17,7 +17,7 @@ const (
 	testCellID      = "cell0"
 )
 
-func TestAuthorityFunctionInventoryIsClosedAndProducesThreePlusFourPerCellNames(t *testing.T) {
+func TestAuthorityFunctionInventoryIsClosedAndProducesThreePlusFivePerCellNames(t *testing.T) {
 	t.Parallel()
 
 	want := map[Operation]authorityFunctionSpec{
@@ -28,6 +28,7 @@ func TestAuthorityFunctionInventoryIsClosedAndProducesThreePlusFourPerCellNames(
 		OperationActivateRegistration:       {operationSuffix: "ar", cellScoped: true},
 		OperationCompleteRegistration:       {operationSuffix: "cr", cellScoped: true},
 		OperationCompleteCredentialRecovery: {operationSuffix: "ccr", cellScoped: true},
+		OperationResolveConnectorResource:   {operationSuffix: "creso", cellScoped: true},
 	}
 	if len(authorityFunctionInventory) != len(want) {
 		t.Fatalf("Authority inventory has %d operations, want %d", len(authorityFunctionInventory), len(want))
@@ -57,6 +58,7 @@ func TestAuthorityFunctionInventoryIsClosedAndProducesThreePlusFourPerCellNames(
 			OperationActivateRegistration,
 			OperationCompleteRegistration,
 			OperationCompleteCredentialRecovery,
+			OperationResolveConnectorResource,
 		} {
 			name, ok := authorityFunctionName(boundary, cellID, operation)
 			if !ok {
@@ -65,8 +67,8 @@ func TestAuthorityFunctionInventoryIsClosedAndProducesThreePlusFourPerCellNames(
 			names[name] = struct{}{}
 		}
 	}
-	if got, wantCount := len(names), 3+4*2; got != wantCount {
-		t.Fatalf("physical names = %d, want 3 + 4N = %d", got, wantCount)
+	if got, wantCount := len(names), 3+5*2; got != wantCount {
+		t.Fatalf("physical names = %d, want 3 + 5N = %d", got, wantCount)
 	}
 	if _, ok := authorityFunctionName(boundary, "", OperationIssueRegistrationOTP); ok {
 		t.Fatal("cell operation accepted without a cell identity")
@@ -105,6 +107,13 @@ func TestConstructorsAcceptExactBlueAndGreenGraphs(t *testing.T) {
 					credentialRecoveryCellTargetForEnvironment(environment, color),
 				); err != nil {
 					t.Fatalf("NewCredentialRecoveryCellClient: %v", err)
+				}
+				if _, err := NewConnectorResourceCellClient(
+					cfg,
+					cellBoundary,
+					connectorResourceCellTargetForEnvironment(environment, color),
+				); err != nil {
+					t.Fatalf("NewConnectorResourceCellClient: %v", err)
 				}
 			})
 		}
@@ -166,7 +175,7 @@ func TestHubConstructorRejectsBoundaryNameAndAliasDrift(t *testing.T) {
 	}
 }
 
-func TestCellTargetsRequireExactFourOperationsAndOneColor(t *testing.T) {
+func TestCellTargetsRequireExactFiveOperationsAndOneColor(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -210,6 +219,12 @@ func TestCellTargetsRequireExactFourOperationsAndOneColor(t *testing.T) {
 		{name: "missing recovery", bound: validCellBoundary(), mutate: func(v *CellTargets) {
 			v.CompleteCredentialRecoveryAliasARN = ""
 		}, field: "complete_credential_recovery"},
+		{name: "missing connector resource", bound: validCellBoundary(), mutate: func(v *CellTargets) {
+			v.ResolveConnectorResourceAliasARN = ""
+		}, field: "resolve_connector_resource"},
+		{name: "connector resource wrong operation", bound: validCellBoundary(), mutate: func(v *CellTargets) {
+			v.ResolveConnectorResourceAliasARN = aliasARN(cellFunction("cr", testCellID), "blue")
+		}, field: "resolve_connector_resource"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -322,6 +337,27 @@ func TestRegistrationAndRecoveryClientsKeepNarrowValidatedSubsets(t *testing.T) 
 			}), test.field)
 		})
 	}
+
+	resourceTests := []struct {
+		name  string
+		bound CellBoundary
+		alias string
+		field string
+	}{
+		{name: "environment", bound: CellBoundary{Boundary: Boundary{Environment: "staging", AccountID: testAccountID, Region: testRegion}, CellID: testCellID}, alias: aliasARN(cellFunction("creso", testCellID), "blue"), field: "environment"},
+		{name: "empty", bound: validCellBoundary(), field: "resolve_connector_resource"},
+		{name: "wrong operation", bound: validCellBoundary(), alias: aliasARN(cellFunction("cr", testCellID), "blue"), field: "resolve_connector_resource"},
+		{name: "wrong cell", bound: validCellBoundary(), alias: aliasARN(cellFunction("creso", "cell1"), "blue"), field: "resolve_connector_resource"},
+		{name: "active", bound: validCellBoundary(), alias: aliasARN(cellFunction("creso", testCellID), "active"), field: "resolve_connector_resource"},
+	}
+	for _, test := range resourceTests {
+		t.Run("resource/"+test.name, func(t *testing.T) {
+			t.Parallel()
+			assertConfigError(t, ValidateConnectorResourceCellTarget(test.bound, ConnectorResourceCellTarget{
+				ResolveConnectorResourceAliasARN: test.alias,
+			}), test.field)
+		})
+	}
 }
 
 func TestTargetValidatorsDoNotRequireAWSClient(t *testing.T) {
@@ -342,6 +378,12 @@ func TestTargetValidatorsDoNotRequireAWSClient(t *testing.T) {
 	); err != nil {
 		t.Fatalf("ValidateCredentialRecoveryCellTarget: %v", err)
 	}
+	if err := ValidateConnectorResourceCellTarget(
+		validCellBoundary(),
+		connectorResourceCellTarget("green"),
+	); err != nil {
+		t.Fatalf("ValidateConnectorResourceCellTarget: %v", err)
+	}
 }
 
 func TestCellConstructorsRejectSDKRegionMismatch(t *testing.T) {
@@ -355,6 +397,11 @@ func TestCellConstructorsRejectSDKRegionMismatch(t *testing.T) {
 	}
 	if _, err := NewCredentialRecoveryCellClient(cfg, validCellBoundary(), validCredentialRecoveryCellTarget()); err == nil {
 		t.Fatal("NewCredentialRecoveryCellClient accepted wrong SDK region")
+	} else {
+		assertConfigError(t, err, "sdk_region")
+	}
+	if _, err := NewConnectorResourceCellClient(cfg, validCellBoundary(), validConnectorResourceCellTarget()); err == nil {
+		t.Fatal("NewConnectorResourceCellClient accepted wrong SDK region")
 	} else {
 		assertConfigError(t, err, "sdk_region")
 	}
@@ -475,6 +522,7 @@ func cellTargetsForEnvironment(environment, color string) CellTargets {
 		ActivateRegistrationAliasARN:       aliasARN(cellFunctionForEnvironment(environment, "ar", testCellID), color),
 		CompleteRegistrationAliasARN:       aliasARN(cellFunctionForEnvironment(environment, "cr", testCellID), color),
 		CompleteCredentialRecoveryAliasARN: aliasARN(cellFunctionForEnvironment(environment, "ccr", testCellID), color),
+		ResolveConnectorResourceAliasARN:   aliasARN(cellFunctionForEnvironment(environment, "creso", testCellID), color),
 	}
 }
 
@@ -505,6 +553,20 @@ func credentialRecoveryCellTarget(color string) CredentialRecoveryCellTarget {
 func credentialRecoveryCellTargetForEnvironment(environment, color string) CredentialRecoveryCellTarget {
 	return CredentialRecoveryCellTarget{
 		CompleteCredentialRecoveryAliasARN: aliasARN(cellFunctionForEnvironment(environment, "ccr", testCellID), color),
+	}
+}
+
+func validConnectorResourceCellTarget() ConnectorResourceCellTarget {
+	return connectorResourceCellTarget("blue")
+}
+
+func connectorResourceCellTarget(color string) ConnectorResourceCellTarget {
+	return connectorResourceCellTargetForEnvironment(testEnvironment, color)
+}
+
+func connectorResourceCellTargetForEnvironment(environment, color string) ConnectorResourceCellTarget {
+	return ConnectorResourceCellTarget{
+		ResolveConnectorResourceAliasARN: aliasARN(cellFunctionForEnvironment(environment, "creso", testCellID), color),
 	}
 }
 

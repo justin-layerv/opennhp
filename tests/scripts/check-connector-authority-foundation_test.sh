@@ -887,8 +887,8 @@ if shell_expected != python_expected:
         "FAIL: shell completion witness and Python AUTHORITY_RUNTIME_FUNCTIONS "
         f"disagree:\n  shell:  {shell_expected}\n  python: {python_expected}"
     )
-if len(shell_expected) != 11:
-    sys.exit(f"FAIL: expected 11 witnessed functions, extracted {len(shell_expected)}")
+if len(shell_expected) != 13:
+    sys.exit(f"FAIL: expected 13 witnessed functions, extracted {len(shell_expected)}")
 LOCKSTEP
 
 echo "Connector Authority foundation checker fixtures passed"

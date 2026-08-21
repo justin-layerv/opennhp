@@ -72,7 +72,7 @@ variable "cell_id" {
 }
 
 variable "connector_authority_cell_config" {
-  description = "Nullable assigned-cell Connector Authority target/config bundle. Null keeps all four cell operations, the Lambda VPC endpoint, and its IAM grant dark."
+  description = "Nullable assigned-cell Connector Authority target/config bundle. The resource alias is null only for the exact pre-creso rollout predecessor; null config keeps all cell operations, the Lambda VPC endpoint, and its IAM grant dark."
   type = object({
     environment                            = string
     aws_account_id                         = string
@@ -81,6 +81,7 @@ variable "connector_authority_cell_config" {
     activate_registration_alias_arn        = string
     complete_registration_alias_arn        = string
     complete_credential_recovery_alias_arn = string
+    resolve_connector_resource_alias_arn   = optional(string)
     authority_lambda_timeout               = string
     handler_budget                         = string
     packet_budget                          = string

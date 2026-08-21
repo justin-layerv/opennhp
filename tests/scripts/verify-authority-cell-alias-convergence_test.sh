@@ -32,6 +32,7 @@ NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN=arn:aws:lambda:us-east-2:76739789
 NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN=arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ar-${cell}:${color}
 NHP_CONNECTOR_REGISTRATION_COMPLETE_ALIAS_ARN=arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-cr-${cell}:${color}
 NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN=arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ccr-${cell}:${color}
+NHP_CONNECTOR_RESOURCE_ALIAS_ARN=arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-creso-${cell}:${color}
 EOF
 }
 
@@ -125,6 +126,7 @@ if output=$(run_case "$case_dir" env 2>&1); then
     && grep -Fq "grep -Ec '^NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN='" "${case_dir}/verify.log" \
     && grep -Fq "ca-iro-cell0:blue" "${case_dir}/verify.log" \
     && grep -Fq "ca-ccr-cell1:blue" "${case_dir}/verify.log" \
+    && grep -Fq "ca-creso-cell1:blue" "${case_dir}/verify.log" \
     && grep -Fq "pointer=blue, cells=2" <<<"$output"; then
     report_pass "selected aliases are proved in both bootstrap and active runtimes"
   else
@@ -132,6 +134,18 @@ if output=$(run_case "$case_dir" env 2>&1); then
   fi
 else
   report_fail "success case passes" "$output"
+fi
+
+case_dir=$(make_case missing-resource-operation)
+sed -i.bak '/NHP_CONNECTOR_RESOURCE_ALIAS_ARN/d' "${case_dir}/fixtures/cell0"
+if output=$(run_case "$case_dir" env 2>&1); then
+  report_fail "missing connector-resource alias is rejected" "$output"
+else
+  if [[ "$output" == *"NHP_CONNECTOR_RESOURCE_ALIAS_ARN"* ]]; then
+    report_pass "missing connector-resource alias is rejected"
+  else
+    report_fail "connector-resource alias failure names the operation" "$output"
+  fi
 fi
 
 case_dir=$(POINTER_COLOR=purple make_case invalid-pointer)

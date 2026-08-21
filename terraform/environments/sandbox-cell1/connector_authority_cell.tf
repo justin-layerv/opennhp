@@ -20,7 +20,7 @@
 # protocol, so the SDK cannot be told. It sits in the caller's OTP callback
 # until the assignment ticket expires. No code is ever emailed, and nothing
 # names a cause. Measured over 30 days: ca-iro-cell1, ca-ar-cell1, ca-cr-cell1
-# and ca-ccr-cell1 have ZERO invocations, against 3/40/32 on cell0. Placement is
+# and ca-ccr-cell1 had ZERO invocations, against 3/40/32 on cell0. Placement was
 # a coin flip, which is why the emailed-code path looked intermittently dead
 # while the sandbox proof — pinned to cell0 — stayed green.
 #
@@ -75,6 +75,13 @@ locals {
       activate_registration_alias_arn        = local.control_cell1_alias_targets["activate_registration"]
       complete_registration_alias_arn        = local.control_cell1_alias_targets["complete_registration"]
       complete_credential_recovery_alias_arn = local.control_cell1_alias_targets["complete_credential_recovery"]
+      # Null is the exact applied-Control predecessor before creso's first
+      # rollout. It preserves today's four-operation server input byte-for-byte;
+      # Control must publish creso before the new NHP runtime is deployed.
+      resolve_connector_resource_alias_arn = try(
+        local.control_cell1_alias_targets["resolve_connector_resource"],
+        null,
+      )
 
       # Reviewed budgets from
       # terraform/modules/compute/tests/connector_authority.tftest.hcl, identical

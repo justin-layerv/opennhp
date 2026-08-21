@@ -44,6 +44,7 @@ variable "connector_authority_cell_config" {
     activate_registration_alias_arn        = string
     complete_registration_alias_arn        = string
     complete_credential_recovery_alias_arn = string
+    resolve_connector_resource_alias_arn   = optional(string)
     authority_lambda_timeout               = string
     handler_budget                         = string
     packet_budget                          = string

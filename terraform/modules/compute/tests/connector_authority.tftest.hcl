@@ -84,6 +84,7 @@ variables {
     activate_registration_alias_arn        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ar-cell0:blue"
     complete_registration_alias_arn        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-cr-cell0:blue"
     complete_credential_recovery_alias_arn = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ccr-cell0:blue"
+    resolve_connector_resource_alias_arn   = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-creso-cell0:blue"
     authority_lambda_timeout               = "3s"
     handler_budget                         = "3200ms"
     packet_budget                          = "3900ms"
@@ -121,7 +122,7 @@ run "complete_cell_graph_uses_one_exact_private_endpoint" {
       toset(jsondecode(aws_iam_role_policy.server_connector_authority[0].policy).Statement[0].Resource) == toset(local.connector_authority_cell_alias_arns) &&
       jsondecode(aws_iam_role_policy.server_connector_authority[0].policy).Statement[0].Condition.StringEquals["aws:SourceVpce"] == aws_vpc_endpoint.connector_authority_lambda[0].id
     )
-    error_message = "Endpoint and role policies must agree on the exact four aliases, cell role, and VPC endpoint."
+    error_message = "Endpoint and role policies must agree on the exact five aliases, cell role, and VPC endpoint."
   }
 
   assert {
@@ -140,9 +141,59 @@ run "complete_cell_graph_uses_one_exact_private_endpoint" {
         "NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_REGION=$${connector_authority_cell_config.aws_region}",
         "NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_ACCOUNT_ID=$${connector_authority_cell_config.aws_account_id}",
         "NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN=$${connector_authority_cell_config.complete_credential_recovery_alias_arn}",
+        "NHP_CONNECTOR_RESOURCE_AWS_REGION=$${connector_authority_cell_config.aws_region}",
+        "NHP_CONNECTOR_RESOURCE_AWS_ACCOUNT_ID=$${connector_authority_cell_config.aws_account_id}",
+        "NHP_CONNECTOR_RESOURCE_ALIAS_ARN=$${connector_authority_cell_config.resolve_connector_resource_alias_arn}",
       ] : strcontains(file("${path.module}/user_data.sh.tpl"), expected)
     ])
     error_message = "The NHP init template must render the complete Authority graph and receipt budgets."
+  }
+
+  assert {
+    condition = (
+      local.connector_authority_resource_enabled &&
+      strcontains(
+        file("${path.module}/user_data.sh.tpl"),
+        "%%{ if connector_authority_cell_config.resolve_connector_resource_alias_arn != null ~}",
+      )
+    )
+    error_message = "The complete graph must enable creso and the template must guard its environment on that exact alias."
+  }
+}
+
+run "four_operation_rollout_predecessor_is_byte_compatible" {
+  command = plan
+
+  variables {
+    connector_authority_cell_config = merge(
+      var.connector_authority_cell_config,
+      { resolve_connector_resource_alias_arn = null },
+    )
+  }
+
+  assert {
+    condition = (
+      local.connector_authority_cell_alias_arns == sort([
+        var.connector_authority_cell_config.issue_registration_otp_alias_arn,
+        var.connector_authority_cell_config.activate_registration_alias_arn,
+        var.connector_authority_cell_config.complete_registration_alias_arn,
+        var.connector_authority_cell_config.complete_credential_recovery_alias_arn,
+      ]) &&
+      toset(jsondecode(aws_vpc_endpoint.connector_authority_lambda[0].policy).Statement[0].Resource) == toset(local.connector_authority_cell_alias_arns) &&
+      toset(jsondecode(aws_iam_role_policy.server_connector_authority[0].policy).Statement[0].Resource) == toset(local.connector_authority_cell_alias_arns)
+    )
+    error_message = "The rollout predecessor must preserve exactly the four applied aliases and no creso invoke reachability."
+  }
+
+  assert {
+    condition = (
+      !local.connector_authority_resource_enabled &&
+      strcontains(
+        file("${path.module}/user_data.sh.tpl"),
+        "%%{ if connector_authority_cell_config.resolve_connector_resource_alias_arn != null ~}",
+      )
+    )
+    error_message = "The rollout predecessor must disable connector-resource and keep its environment behind the exact alias-presence guard."
   }
 }
 
@@ -190,6 +241,7 @@ run "cross_environment_graph_fails_closed" {
       activate_registration_alias_arn        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-prod-ca-ar-cell0:blue"
       complete_registration_alias_arn        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-prod-ca-cr-cell0:blue"
       complete_credential_recovery_alias_arn = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-prod-ca-ccr-cell0:blue"
+      resolve_connector_resource_alias_arn   = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-prod-ca-creso-cell0:blue"
       authority_lambda_timeout               = "3s"
       handler_budget                         = "3200ms"
       packet_budget                          = "3900ms"
@@ -218,6 +270,7 @@ run "sandbox_graph_in_prod_account_fails_closed" {
       activate_registration_alias_arn        = "arn:aws:lambda:us-east-2:235500187906:function:layerv-nhp-sandbox-ca-ar-cell0:blue"
       complete_registration_alias_arn        = "arn:aws:lambda:us-east-2:235500187906:function:layerv-nhp-sandbox-ca-cr-cell0:blue"
       complete_credential_recovery_alias_arn = "arn:aws:lambda:us-east-2:235500187906:function:layerv-nhp-sandbox-ca-ccr-cell0:blue"
+      resolve_connector_resource_alias_arn   = "arn:aws:lambda:us-east-2:235500187906:function:layerv-nhp-sandbox-ca-creso-cell0:blue"
       authority_lambda_timeout               = "3s"
       handler_budget                         = "3200ms"
       packet_budget                          = "3900ms"
@@ -246,6 +299,7 @@ run "non_home_region_graph_fails_closed" {
       activate_registration_alias_arn        = "arn:aws:lambda:us-west-2:767397897469:function:layerv-nhp-sandbox-ca-ar-cell0:blue"
       complete_registration_alias_arn        = "arn:aws:lambda:us-west-2:767397897469:function:layerv-nhp-sandbox-ca-cr-cell0:blue"
       complete_credential_recovery_alias_arn = "arn:aws:lambda:us-west-2:767397897469:function:layerv-nhp-sandbox-ca-ccr-cell0:blue"
+      resolve_connector_resource_alias_arn   = "arn:aws:lambda:us-west-2:767397897469:function:layerv-nhp-sandbox-ca-creso-cell0:blue"
       authority_lambda_timeout               = "3s"
       handler_budget                         = "3200ms"
       packet_budget                          = "3900ms"

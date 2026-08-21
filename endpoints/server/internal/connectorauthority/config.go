@@ -26,7 +26,7 @@ type authorityFunctionSpec struct {
 	cellScoped      bool
 }
 
-// authorityFunctionInventory is the complete seven-operation Authority graph.
+// authorityFunctionInventory is the complete eight-operation Authority graph.
 // Every consumer selects a least-privilege subset from this one closed map;
 // adding a public operation without an explicit physical name and scope is a
 // test failure rather than an ARN accepted by a generic parser.
@@ -38,6 +38,7 @@ var authorityFunctionInventory = map[Operation]authorityFunctionSpec{
 	OperationActivateRegistration:       {operationSuffix: "ar", cellScoped: true},
 	OperationCompleteRegistration:       {operationSuffix: "cr", cellScoped: true},
 	OperationCompleteCredentialRecovery: {operationSuffix: "ccr", cellScoped: true},
+	OperationResolveConnectorResource:   {operationSuffix: "creso", cellScoped: true},
 }
 
 // Boundary pins Hub-facing authority targets to one deployment environment,
@@ -49,7 +50,7 @@ type Boundary struct {
 	Region      string
 }
 
-// CellBoundary adds the provisioned cell identity used by the four cell-scoped
+// CellBoundary adds the provisioned cell identity used by the five cell-scoped
 // physical function names. A separate type prevents Hub construction from
 // accidentally depending on a cell identifier.
 type CellBoundary struct {
@@ -65,15 +66,16 @@ type HubTargets struct {
 	IssueCredentialRecoveryAliasARN string
 }
 
-// CellTargets contains the complete four-alias graph for one cell. It is used
+// CellTargets contains the complete five-alias graph for one cell. It is used
 // as the atomic startup validation surface even though the runtime clients stay
-// split into a three-method registration capability and a one-method recovery
-// capability. All four targets must select the same color.
+// split into three-method registration, one-method recovery, and one-method
+// connector-resource capabilities. All five targets must select the same color.
 type CellTargets struct {
 	IssueRegistrationOTPAliasARN       string
 	ActivateRegistrationAliasARN       string
 	CompleteRegistrationAliasARN       string
 	CompleteCredentialRecoveryAliasARN string
+	ResolveConnectorResourceAliasARN   string
 }
 
 // RegistrationCellTargets is the exact three-alias capability set available
@@ -90,6 +92,10 @@ type RegistrationCellTargets struct {
 // registration operation even if the containing process is miswired.
 type CredentialRecoveryCellTarget struct {
 	CompleteCredentialRecoveryAliasARN string
+}
+
+type ConnectorResourceCellTarget struct {
+	ResolveConnectorResourceAliasARN string
 }
 
 // NewHubClient constructs a hub-only client with a single-attempt Lambda SDK client.
@@ -130,6 +136,7 @@ func ValidateCellTargets(boundary CellBoundary, targets CellTargets) error {
 		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN, OperationActivateRegistration},
 		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN, OperationCompleteRegistration},
 		targetSpec{"complete_credential_recovery", targets.CompleteCredentialRecoveryAliasARN, OperationCompleteCredentialRecovery},
+		targetSpec{"resolve_connector_resource", targets.ResolveConnectorResourceAliasARN, OperationResolveConnectorResource},
 	)
 }
 
@@ -191,6 +198,29 @@ func ValidateCredentialRecoveryCellTarget(boundary CellBoundary, target Credenti
 	)
 }
 
+func NewConnectorResourceCellClient(
+	cfg aws.Config,
+	boundary CellBoundary,
+	target ConnectorResourceCellTarget,
+) (*ConnectorResourceCellClient, error) {
+	if err := ValidateConnectorResourceCellTarget(boundary, target); err != nil {
+		return nil, err
+	}
+	if err := validateSDKRegion(cfg, boundary.Boundary); err != nil {
+		return nil, err
+	}
+	return newConnectorResourceCellClient(newLambdaClient(cfg), target), nil
+}
+
+func ValidateConnectorResourceCellTarget(boundary CellBoundary, target ConnectorResourceCellTarget) error {
+	if err := validateCellBoundaryValues(boundary); err != nil {
+		return err
+	}
+	return validateTargets(boundary.Boundary, boundary.CellID,
+		targetSpec{"resolve_connector_resource", target.ResolveConnectorResourceAliasARN, OperationResolveConnectorResource},
+	)
+}
+
 func newHubClient(api invokeAPI, targets HubTargets) *HubClient {
 	return &HubClient{
 		invoker:                 invoker{api: api},
@@ -213,6 +243,12 @@ func newCredentialRecoveryCellClient(api invokeAPI, target CredentialRecoveryCel
 	return &CredentialRecoveryCellClient{
 		invoker:                    invoker{api: api},
 		completeCredentialRecovery: target.CompleteCredentialRecoveryAliasARN,
+	}
+}
+
+func newConnectorResourceCellClient(api invokeAPI, target ConnectorResourceCellTarget) *ConnectorResourceCellClient {
+	return &ConnectorResourceCellClient{
+		invoker: invoker{api: api}, resolveConnectorResource: target.ResolveConnectorResourceAliasARN,
 	}
 }
 

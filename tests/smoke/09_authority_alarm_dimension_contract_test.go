@@ -9,7 +9,7 @@ package smoke
 // the precedent: an alarm whose dimension set matches no stream the publisher
 // emits watches nothing and, with treat_missing_data=notBreaching, sits in a
 // permanently green OK. Three AC alarms were silently non-functional for months
-// for exactly that reason. The Authority set is 117 alarms across 11 functions
+// for exactly that reason. The Authority set is 135 alarms across 13 functions
 // with a zero-traffic baseline, so the same mistake would be invisible.
 //
 // This file fences the DEPLOYED side in the two ways that need no traffic:
@@ -61,7 +61,7 @@ type authorityOperation struct {
 	completes      bool
 }
 
-// The frozen sandbox graph: 3 Hub operations plus 4 per provisioned cell. Kept
+// The frozen sandbox graph: 3 Hub operations plus 5 per provisioned cell. Kept
 // in lockstep with terraform/modules/connector-authority-foundation and
 // layervai/qurl-service internal/connectorauthorityruntime/config.go.
 func authorityOperations() []authorityOperation {
@@ -73,6 +73,7 @@ func authorityOperations() []authorityOperation {
 		{suffix: "ar", conformance: "ActivateRegistration", cell: true, admissionGated: true},
 		{suffix: "cr", conformance: "CompleteRegistration", cell: true, admissionGated: true, completes: true},
 		{suffix: "ccr", conformance: "CompleteCredentialRecovery", cell: true},
+		{suffix: "creso", conformance: "ResolveConnectorResource", cell: true},
 	}
 }
 

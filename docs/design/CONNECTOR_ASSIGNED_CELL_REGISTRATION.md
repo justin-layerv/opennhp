@@ -18,6 +18,7 @@ When enabled, this composition exclusively owns these qURL Connector messages:
 | `NHP_OTP` | Top-level `aspId=agent` | One-way OTP request; never emits an NHP response |
 | `NHP_REG` | Top-level `aspId=agent` | Registration activation; may emit `NHP_RAK` |
 | `NHP_LST` | Top-level `aspId=agent` and immediate `usrData.query=agent_registration_completion` | Post-RAK completion; may emit `NHP_LRT` |
+| `NHP_LST` | Top-level `usrId=devId=<authenticated agent>`, `aspId=agent`, and immediate `usrData.query=connector_resource`, `version=1` | Post-registration resource resolution; emits an authenticated `NHP_LRT` |
 
 The authenticated NHP header is the sole discriminator between OTP and
 registration because their conservative body predicates intentionally match the
@@ -33,23 +34,25 @@ queries retain their existing dispatch until their separately staged retirement.
 
 ## Startup contract
 
-The ten registration variables and three credential-recovery variables below
-are one atomic, IaC-owned cell configuration. If both families are entirely
-absent the feature stays dark. A partial family, only one family, or any empty,
+The ten registration variables, three credential-recovery variables, and three
+connector-resource variables below are one atomic, IaC-owned cell configuration.
+If all three families are entirely absent the feature stays dark. A partial
+family, only one or two families, or any empty,
 malformed, or inconsistent value fails server startup before AWS client
 creation or UDP bind.
 
 The shared cell-target validator requires one common Terraform-selected
-`:blue` or `:green` graph across all four operations. It rejects `:active`,
+`:blue` or `:green` graph across all five operations. It rejects `:active`,
 `$LATEST`, numeric versions, other named aliases, mixed colors, wrong
 operations, wrong cells, and environment, account, or region drift before AWS
 client creation or UDP bind. Startup loads one AWS identity only after the
-complete graph passes, then gives registration a three-method client and
-credential recovery a separate one-method client.
+complete graph passes, then gives registration a three-method client, credential
+recovery a separate one-method client, and resource resolution its own
+one-method client.
 
 | Variable | Contract |
 |----------|----------|
-| `NHP_CONNECTOR_REGISTRATION_AWS_REGION` | AWS region containing the three cell Authority aliases |
+| `NHP_CONNECTOR_REGISTRATION_AWS_REGION` | AWS region containing the cell Authority aliases |
 | `NHP_CONNECTOR_REGISTRATION_AWS_ACCOUNT_ID` | AWS account containing those aliases |
 | `NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN` | Exact `layerv-nhp-<environment>-ca-iro-<cell>:{blue\|green}` alias ARN |
 | `NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN` | Exact `layerv-nhp-<environment>-ca-ar-<cell>:{blue\|green}` alias ARN |
@@ -62,6 +65,9 @@ credential recovery a separate one-method client.
 | `NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_REGION` | Must equal the registration AWS region |
 | `NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_ACCOUNT_ID` | Must equal the registration AWS account |
 | `NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN` | Exact same-color `layerv-nhp-<environment>-ca-ccr-<cell>:{blue\|green}` alias ARN |
+| `NHP_CONNECTOR_RESOURCE_AWS_REGION` | Must equal the registration AWS region |
+| `NHP_CONNECTOR_RESOURCE_AWS_ACCOUNT_ID` | Must equal the registration AWS account |
+| `NHP_CONNECTOR_RESOURCE_ALIAS_ARN` | Exact same-color `layerv-nhp-<environment>-ca-creso-<cell>:{blue\|green}` alias ARN |
 
 `NHP_ENVIRONMENT` and `NHP_CELL_ID` are also validated and required explicitly
 once any Authority variable above enables the composition, but they do not
@@ -80,7 +86,7 @@ The cell Terraform module validates the complete same-color alias inventory,
 account, region, and the five-value sandbox measurement candidate before it
 creates any reachability. It then renders these variables into the NHP server
 environment, creates a private-DNS Lambda interface endpoint in that cell VPC,
-and grants the cell server role `lambda:InvokeFunction` only for the four exact
+and grants the cell server role `lambda:InvokeFunction` only for the five exact
 aliases and only through that endpoint. The endpoint security group accepts
 HTTPS only from the cell server security group. The native SDK still speaks
 only UDP to its assigned NHP cell; the cell server has no NAT or public Lambda
@@ -156,10 +162,10 @@ handoff, write, and short-write failures have distinct counters.
 The Terraform activation PR and its rollout-ledger entry must, before customer
 traffic:
 
-1. provision one common selected `:blue` or `:green` four-operation graph and
-   restrict the cell server role and its private Lambda endpoint to those four
+1. provision one common selected `:blue` or `:green` five-operation graph and
+   restrict the cell server role and its private Lambda endpoint to those five
    exact aliases, while retaining the separate three-method registration and
-   one-method recovery clients inside the process;
+   one-method recovery and resource clients inside the process;
 2. dashboard request, Authority outcome, and response-delivery counters;
 3. alarm at minimum on `ConnectorRegistrationIngressRejected`,
    `ConnectorRegistrationInvokeFailed`,

@@ -61,7 +61,7 @@ locals {
   #
   # This is a STRUCTURAL threshold derived from the configured budget, not an
   # empirical percentile: the graph has never carried traffic (no AWS/Lambda
-  # Duration datapoint exists for any of the 11 functions yet). The POST-STEP-3
+  # Duration datapoint exists for any of the 13 functions yet). The POST-STEP-3
   # FLAG on the timeout/memory pair in authority_runtime.tf owns the empirical
   # recalibration; tightening the timeout there tightens this automatically.
   authority_duration_alarm_threshold_ms = local.authority_runtime_timeout_seconds * 800
@@ -140,7 +140,7 @@ locals {
       evaluation_periods  = 1
       # The LEADING indicator for the throttle alarm above: AWS publishes
       # ConcurrentExecutions per function for functions carrying a reserved
-      # limit, which all 11 do. Sitting AT the reserved ceiling means the very
+      # limit, which all 13 do. Sitting AT the reserved ceiling means the very
       # next concurrent request is rejected.
       summary = "reached its full reserved concurrency ceiling; the next concurrent request throttles"
     }

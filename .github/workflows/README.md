@@ -65,14 +65,18 @@ documents normal deployment and verification.
 the `ca-*` runtime functions, and the Hub edge + Fargate worker) on every
 sandbox deploy. Control runs first and holds the same `deploy-sandbox-infra`
 writer lock, because Control and cell0 must never apply concurrently. After its
-selector is settled, the cell0 and cell1 Terraform roots read that exact output
-and publish it into their S3 bootstrap objects; each blue/green leg then refreshes
-the affected server fleet before validation. This order is load-bearing: the
-alias ARNs are materialized at Terraform/apply and instance boot, not read
-dynamically by an already-running server. It plans with `-detailed-exitcode`,
-reports `converged` and stops when there is nothing to do, and otherwise applies
-in-run. `Control` renders in the Slack pipeline before Validate, distinguishing
-an apply from a no-op convergence, from a leg superseded by a newer push.
+selector is settled, Control emits a positive `consumer_rollout_ready` receipt.
+Only then does cell0 create a fresh saved plan; cell1 creates its own plan after
+cell0 applies. There is no pre-Control cell plan artifact to reuse. Both roots
+publish the selected aliases into their S3 bootstrap objects, and each
+blue/green leg refreshes the affected server fleet before validation. This order
+is load-bearing: the alias ARNs are materialized at Terraform/apply and instance
+boot, not read dynamically by an already-running server. It plans with
+`-detailed-exitcode`, reports `converged` and stops when there is nothing to do,
+and otherwise applies in-run. `Control` renders in the Slack pipeline before
+Validate, distinguishing an apply from a no-op convergence, from a leg
+superseded by a newer push. Supersession remains a successful no-op, but emits
+no consumer receipt, so that old run cannot plan or roll a predecessor graph.
 
 Validation gates on both cell refreshes and then fails closed unless every
 Authority operation has the selected color in all three materialization layers:
@@ -95,7 +99,10 @@ asserts its own dispatch inputs against the same file, so the attended and
 unattended paths cannot diverge and then revert one another. Changing a value
 there changes live sandbox on the next main push; land it in the same commit as
 the Terraform that needs it. `scripts/check-control-leg-surfaced.sh` fences the
-wiring, the shared writer lock, and the gate-file sourcing.
+wiring, the shared writer lock, the gate-file sourcing, the positive consumer
+receipt, and the complete Control → fresh cell plans → runtime refreshes →
+validation DAG. Its fixtures also prove that superseded and partial-apply
+Control states cannot release a consumer plan.
 
 On an infra-skipped push (a gate-file or docs-only change) Control applies and
 `deploy-sandbox-validate` does not run, because validate still requires both cell

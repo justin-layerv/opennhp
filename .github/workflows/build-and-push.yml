@@ -2246,6 +2246,7 @@ jobs:
       needs.build.result == 'success' &&
       needs.terraform-plan.result == 'success' &&
       needs.deploy-sandbox-control.result == 'success' &&
+      needs.deploy-sandbox-control.outputs.consumer_rollout_ready == 'true' &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
@@ -3620,6 +3621,13 @@ jobs:
       # and Slack could not, because every pre-apply failure also reads as a
       # plain job failure from outside the job.
       apply_outcome: ${{ steps.apply.outcome }}
+      # The consumer barrier is deliberately separate from job success. A
+      # superseded Control leg is a successful no-op so merge bursts do not
+      # paint old runs red, but that old run must not continue into a cell plan
+      # against the predecessor alias graph. This output exists only after this
+      # exact checkout has either proved a Control no-op or applied+verified its
+      # plan (and completed any selector promotion).
+      consumer_rollout_ready: ${{ steps.authorize-consumers.outputs.ready }}
     env:
       CONTROL_ROOT: terraform/control/environments/sandbox
       AUTHORITY_RUNTIME_BASIS: docs/evidence/connector-authority/v1/sandbox-measurement-basis.json
@@ -4173,6 +4181,24 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+      # This is the same-run Control -> consumer handoff. It is intentionally a
+      # positive authorization rather than an inference from job success:
+      # `fresh=false` is a benign successful Control no-op, and a partial apply
+      # can leave enough aliases present for a permissive consumer plan even
+      # though Control has not completed the reviewed transition. The cell0
+      # job requires this exact output before it initializes or plans its root;
+      # cell1 and both runtime refreshes are descendants of cell0.
+      - name: Authorize fresh cell planning
+        id: authorize-consumers
+        if: >-
+          success() &&
+          steps.freshness.outputs.fresh == 'true' &&
+          (steps.plan.outputs.control_status == 'converged' || steps.verify.outcome == 'success') &&
+          (steps.promote-detect.outputs.promote != 'true' || steps.promote-verify.outcome == 'success')
+        run: |
+          echo 'ready=true' >>"$GITHUB_OUTPUT"
+          echo 'Control is exact and verified for this checkout; downstream cell plans must be created fresh.'
+
       # Fires for BOTH post-apply incidents: a failed apply (estate possibly
       # partial) and a successful apply whose proof then failed. The second one
       # needs a snapshot just as much — the operator is being told to go re-run
@@ -4382,7 +4408,8 @@ jobs:
       needs.deploy-sandbox-blue-green.result == 'success' &&
       needs.deploy-sandbox-cell1-blue-green.result == 'success' &&
       needs.deploy-sandbox-qurl.result != 'cancelled' &&
-      needs.deploy-sandbox-control.result != 'cancelled'
+      needs.deploy-sandbox-control.result != 'cancelled' &&
+      needs.deploy-sandbox-control.outputs.consumer_rollout_ready == 'true'
     runs-on: ubuntu-latest
     environment: sandbox
     # Overall budget covers the existing validation/integration/E2E phases, the

@@ -2,7 +2,7 @@
 # Assigned-cell Connector Authority activation (cell0)
 # --------------------------------------------------------------------------
 # Production Control owns the selected Authority color and publishes the exact
-# four-operation alias graph. Derive from that output so a reviewed color flip
+# five-operation alias graph. Derive from that output so a reviewed color flip
 # cannot leave cell0 pinned to retired aliases. The remote-state read is gated
 # because the production Control state does not exist before its foundation
 # rollout; the default-off gate keeps ordinary production plans dark until a
@@ -38,6 +38,13 @@ locals {
       activate_registration_alias_arn        = local.control_cell0_alias_targets["activate_registration"]
       complete_registration_alias_arn        = local.control_cell0_alias_targets["complete_registration"]
       complete_credential_recovery_alias_arn = local.control_cell0_alias_targets["complete_credential_recovery"]
+      # Null is the exact applied-Control predecessor before creso's first
+      # rollout. It preserves today's four-operation server input byte-for-byte;
+      # Control must publish creso before the new NHP runtime is deployed.
+      resolve_connector_resource_alias_arn = try(
+        local.control_cell0_alias_targets["resolve_connector_resource"],
+        null,
+      )
 
       # Reviewed budgets from
       # terraform/modules/compute/tests/connector_authority.tftest.hcl.

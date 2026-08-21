@@ -41,6 +41,8 @@ import (
 //     layer), fed to decodeB64.
 //   - fragment: a full fragment body fed to ParseFragment (which pins wire SHAPE
 //     and strict-parses the parts but does NOT verify the signature).
+//   - transport: a qv2t1 outer fragment body fed to DecodeTransport, which
+//     reconstructs the exact canonical qv2 fragment without interpreting it.
 //   - relay_allowlist: entries + url, fed to ValidateRelayURL(NewRelayAllowlist).
 //   - server_id: cell_public_key_b64 the consumer DECODES and re-fingerprints.
 //   - signature: composed from issuer_signature_vectors.json (not duplicated).
@@ -75,6 +77,8 @@ const (
 	rejectClassKeyLength = "key_length"
 	// rejectClassFragment is a fragment wire-shape rejection.
 	rejectClassFragment = "fragment"
+	// rejectClassTransport is a qv2t1 outer transport framing rejection.
+	rejectClassTransport = "transport"
 	// rejectClassRelayURL is a relay_url HTTPS/allowlist rejection.
 	rejectClassRelayURL = "relay_url"
 	// rejectClassTamper is the signature-class payload-tamper rejection: a valid
@@ -102,13 +106,33 @@ const (
 
 // ConformanceFile is the top-level conformance artifact document.
 type ConformanceFile struct {
-	Artifact       string                      `json:"artifact"`
-	SchemaVersion  int                         `json:"schema_version"`
-	Description    string                      `json:"description"`
-	SourceOfTruth  string                      `json:"source_of_truth"`
-	Notes          []string                    `json:"notes"`
-	SignatureClass ConformanceSignatureClass   `json:"signature_class"`
-	Classes        map[string]ConformanceClass `json:"classes"`
+	Artifact          string                       `json:"artifact"`
+	SchemaVersion     int                          `json:"schema_version"`
+	Description       string                       `json:"description"`
+	SourceOfTruth     string                       `json:"source_of_truth"`
+	Notes             []string                     `json:"notes"`
+	TransportContract ConformanceTransportContract `json:"transport_contract"`
+	SignatureClass    ConformanceSignatureClass    `json:"signature_class"`
+	Classes           map[string]ConformanceClass  `json:"classes"`
+}
+
+type ConformanceTransportContract struct {
+	Prefix             string                     `json:"prefix"`
+	CanonicalPrefix    string                     `json:"canonical_prefix"`
+	ComponentMax       int                        `json:"component_max"`
+	MaxTransportLength int                        `json:"max_transport_length"`
+	Fields             ConformanceTransportFields `json:"fields"`
+}
+
+type ConformanceTransportFields struct {
+	Claims    ConformanceTransportField `json:"claims"`
+	Secret    ConformanceTransportField `json:"secret"`
+	Signature ConformanceTransportField `json:"signature"`
+}
+
+type ConformanceTransportField struct {
+	MaxEncodedLength int `json:"max_encoded_length"`
+	MaxChunks        int `json:"max_chunks"`
 }
 
 // ConformanceSignatureClass records that the signature class is composed from a
@@ -175,6 +199,10 @@ type ConformanceVector struct {
 	// fragment: a full fragment body.
 	Fragment string `json:"fragment"`
 
+	// transport: a qv2t1 outer fragment and its exact canonical qv2 output.
+	TransportFragment string `json:"transport_fragment"`
+	CanonicalFragment string `json:"canonical_fragment"`
+
 	// relay_allowlist: the allowlist entries and the URL to validate.
 	Entries []string `json:"entries"`
 	URL     string   `json:"url"`
@@ -191,6 +219,8 @@ type ConformanceVector struct {
 // vendoring consumer in another language should assert the same id (the README
 // tells vendors to assert artifact + version).
 const ConformanceArtifactID = "qurl-v2-conformance-vectors"
+
+const conformanceSchemaVersion = 2
 
 // parseConformanceFile strictly parses conformance-artifact bytes into a
 // ConformanceFile. It returns an error (never an empty/zero document) when the
@@ -212,11 +242,68 @@ func parseConformanceFile(data []byte) (*ConformanceFile, error) {
 	if cf.Artifact != ConformanceArtifactID {
 		return nil, fmt.Errorf("qurlv2: conformance file has artifact %q, want %q", cf.Artifact, ConformanceArtifactID)
 	}
-	if cf.SchemaVersion == 0 {
-		return nil, errors.New("qurlv2: conformance file missing schema_version")
+	if cf.SchemaVersion != conformanceSchemaVersion {
+		return nil, fmt.Errorf("qurlv2: conformance file has schema_version %d, want %d", cf.SchemaVersion, conformanceSchemaVersion)
 	}
 	if len(cf.Classes) == 0 {
 		return nil, errors.New("qurlv2: conformance file has no classes")
 	}
+	if err := validateConformanceTransportContract(cf.TransportContract); err != nil {
+		return nil, err
+	}
+	transportClass, ok := cf.Classes["transport"]
+	if !ok {
+		return nil, errors.New("qurlv2: conformance file is missing transport class")
+	}
+	if err := validateConformanceTransportClass(transportClass); err != nil {
+		return nil, err
+	}
 	return &cf, nil
+}
+
+func validateConformanceTransportContract(tc ConformanceTransportContract) error {
+	want := ConformanceTransportContract{
+		Prefix:             TransportPrefix,
+		CanonicalPrefix:    FragmentPrefix,
+		ComponentMax:       TransportComponentMax,
+		MaxTransportLength: TransportMaxLength,
+		Fields: ConformanceTransportFields{
+			Claims:    ConformanceTransportField{MaxEncodedLength: transportClaimsMaxLength, MaxChunks: transportClaimsMaxChunks},
+			Secret:    ConformanceTransportField{MaxEncodedLength: transportSecretMaxLength, MaxChunks: transportSecretMaxChunks},
+			Signature: ConformanceTransportField{MaxEncodedLength: transportSigMaxLength, MaxChunks: transportSigMaxChunks},
+		},
+	}
+	if tc != want {
+		return fmt.Errorf("qurlv2: conformance transport contract drifted: got %+v want %+v", tc, want)
+	}
+	return nil
+}
+
+func validateConformanceTransportClass(class ConformanceClass) error {
+	if class.EntryPoint == "" || class.Input != "transport_fragment" || len(class.Vectors) == 0 {
+		return errors.New("qurlv2: malformed conformance transport class header")
+	}
+	seen := make(map[string]struct{}, len(class.Vectors))
+	for _, v := range class.Vectors {
+		if v.Name == "" || v.Reason == "" || v.TransportFragment == "" {
+			return fmt.Errorf("qurlv2: malformed conformance transport vector %q", v.Name)
+		}
+		if _, ok := seen[v.Name]; ok {
+			return fmt.Errorf("qurlv2: duplicate conformance transport vector %q", v.Name)
+		}
+		seen[v.Name] = struct{}{}
+		switch v.Expect {
+		case conformanceAccept:
+			if v.RejectClass != "" || v.CanonicalFragment == "" {
+				return fmt.Errorf("qurlv2: malformed accept conformance transport vector %q", v.Name)
+			}
+		case conformanceReject:
+			if v.RejectClass != rejectClassTransport || v.CanonicalFragment != "" {
+				return fmt.Errorf("qurlv2: malformed reject conformance transport vector %q", v.Name)
+			}
+		default:
+			return fmt.Errorf("qurlv2: conformance transport vector %q has expect %q", v.Name, v.Expect)
+		}
+	}
+	return nil
 }

@@ -29,6 +29,15 @@ func IsRegistrationCompletionIntent(raw []byte) bool {
 	return routeASPQueryIntent(raw, registrationAspID, registrationCompletionQuery)
 }
 
+// IsConnectorResourceIntent recognizes only the registered-agent Connector
+// resource discovery operation. Once this exact aspId/query pair is present,
+// the strict resource decoder owns the body (including malformed duplicate,
+// unknown, and trailing forms) so it can never fall through to permissive
+// ListService dispatch.
+func IsConnectorResourceIntent(raw []byte) bool {
+	return routeASPQueryIntent(raw, connectorResourceAspID, connectorResourceQuery)
+}
+
 func routeRegistrationASPIntent(raw []byte) bool {
 	return routeIntent(raw, registrationAspID, "", false)
 }

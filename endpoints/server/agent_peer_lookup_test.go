@@ -40,10 +40,11 @@ func (f *fakeAgentKeysQuerier) put(pubKeyB64, ownerID, agentID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rows[pubKeyB64] = map[string]types.AttributeValue{
-		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pubKeyB64},
-		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
-		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: agentID},
-		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pubKeyB64},
+		internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: agentID},
+		internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 	}
 }
 
@@ -138,10 +139,11 @@ func cloneAgentKeyRow(row map[string]types.AttributeValue) map[string]types.Attr
 
 func agentKeyTestRow(pubKeyB64, ownerID, agentID string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
-		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pubKeyB64},
-		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
-		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: agentID},
-		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pubKeyB64},
+		internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: agentID},
+		internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 	}
 }
 
@@ -540,10 +542,9 @@ func TestAgentPeerLookup_SchemaVersionMismatchRejects(t *testing.T) {
 	}
 }
 
-// TestAgentPeerLookup_LegacyMissingSchemaVersionAccepted preserves rollout
-// safety for rows written before schema_version existed. The strict rejection
-// path applies to explicit unknown versions, not to legacy version 0.
-func TestAgentPeerLookup_LegacyMissingSchemaVersionAccepted(t *testing.T) {
+// TestAgentPeerLookup_LegacyMissingSchemaVersionRejected pins the intentional
+// pre-production break: v0/v1 rows lack credential scope and fail closed.
+func TestAgentPeerLookup_LegacyMissingSchemaVersionRejected(t *testing.T) {
 	q := newFakeAgentKeysQuerier()
 	pk := pubkeyB64(0x0B)
 	q.put(pk, "owner-legacy", "agent-legacy")
@@ -553,11 +554,8 @@ func TestAgentPeerLookup_LegacyMissingSchemaVersionAccepted(t *testing.T) {
 
 	l := newTestLookup(t, q)
 	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
-	if err != nil {
-		t.Fatalf("legacy lookup: %v", err)
-	}
-	if peer == nil || peer.PublicKeyBase64() != pk {
-		t.Fatalf("legacy peer=%v want pubkey=%q", peer, pk)
+	if !errors.Is(err, ErrAgentLookupSchemaMismatch) || peer != nil {
+		t.Fatalf("legacy peer=%v err=%v want nil/schema mismatch", peer, err)
 	}
 }
 
@@ -585,10 +583,11 @@ func TestAgentPeerLookup_GSIHitBaseRowMissingUnknown(t *testing.T) {
 	}
 
 	q.setGetItem(map[string]types.AttributeValue{
-		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-missing-base"},
-		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-missing-base"},
-		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: "owner-missing-base"},
+		internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-missing-base"},
+		internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 	})
 	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
 	if err != nil {
@@ -618,10 +617,11 @@ func TestAgentPeerLookup_GSIHitBaseRowPublicKeyMismatchUnknown(t *testing.T) {
 	q := &splitAgentKeysQuerier{
 		queryItem: row,
 		getItem: map[string]types.AttributeValue{
-			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: rotatedPK},
-			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-rotated"},
-			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-rotated"},
-			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: rotatedPK},
+			internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: "owner-rotated"},
+			internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-rotated"},
+			internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 		},
 	}
 	l := newTestLookup(t, q)
@@ -632,10 +632,11 @@ func TestAgentPeerLookup_GSIHitBaseRowPublicKeyMismatchUnknown(t *testing.T) {
 	}
 
 	q.setGetItem(map[string]types.AttributeValue{
-		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-rotated"},
-		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-rotated"},
-		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: "owner-rotated"},
+		internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-rotated"},
+		internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 	})
 	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
 	if err != nil {
@@ -683,10 +684,11 @@ func TestAgentPeerLookup_MalformedBaseRow(t *testing.T) {
 	}
 
 	q.setGetItem(map[string]types.AttributeValue{
-		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-malformed-base"},
-		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-malformed-base"},
-		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: "owner-malformed-base"},
+		internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-malformed-base"},
+		internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 	})
 	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
 	if err != nil {
@@ -1289,10 +1291,11 @@ func TestAgentPeerLookup_SameOwnerDuplicatePubkeyUsesCurrentBaseRow(t *testing.T
 		ownerID:      "owner-dup",
 		staleAgentID: "agent-old",
 		currentRow: map[string]types.AttributeValue{
-			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-dup"},
-			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-new"},
-			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: "owner-dup"},
+			internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-new"},
+			internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 		},
 	}
 
@@ -1328,16 +1331,18 @@ func TestAgentPeerLookup_SameOwnerDuplicateLaterGetItemErrorRetryAfter(t *testin
 	ownerID := "owner-dup"
 	q := &sameOwnerDuplicateSecondGetErrorQuerier{
 		firstRow: map[string]types.AttributeValue{
-			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
-			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-first"},
-			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: ownerID},
+			internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-first"},
+			internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 		},
 		secondRow: map[string]types.AttributeValue{
-			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
-			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
-			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-second"},
-			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysPublicKeyAttr:                &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:                  &types.AttributeValueMemberS{Value: ownerID},
+			internalauth.QURLAgentKeysAgentIDAttr:                  &types.AttributeValueMemberS{Value: "agent-second"},
+			internalauth.QURLAgentKeysSchemaVersionAttr:            &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+			internalauth.QURLAgentKeysEnrollmentCredentialKindAttr: &types.AttributeValueMemberS{Value: string(internalauth.QURLEnrollmentCredentialKindAccount)},
 		},
 		secondErr: &types.ProvisionedThroughputExceededException{Message: aws.String("second sibling throttled")},
 	}

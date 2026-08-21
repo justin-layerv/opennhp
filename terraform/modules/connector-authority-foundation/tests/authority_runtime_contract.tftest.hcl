@@ -96,10 +96,22 @@ variables {
     selected_authority_color = "blue"
     provisioned_cells = {
       cell0 = {
-        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        caller_role_arn                       = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        cell_table_prefix                     = "layerv-nhp-sandbox-cell0"
+        qurl_resources_table_arn              = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"
+        qurl_resource_key_material_table_arn  = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resource-key-material"
+        cell_data_kms_key_arn                 = "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02"
+        resource_key_envelope_kms_key_arn     = "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96"
+        resource_key_software_custody_enabled = true
       }
       cell1 = {
-        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        caller_role_arn                       = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        cell_table_prefix                     = "layerv-nhp-sandbox-cell1-cell1"
+        qurl_resources_table_arn              = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resources"
+        qurl_resource_key_material_table_arn  = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material"
+        cell_data_kms_key_arn                 = "arn:aws:kms:us-east-2:767397897469:key/fc5121da-c353-4621-b24b-7ec5f79446bd"
+        resource_key_envelope_kms_key_arn     = "arn:aws:kms:us-east-2:767397897469:key/1ff3c518-1653-4126-ab7e-039a7e6ab0ff"
+        resource_key_software_custody_enabled = true
       }
     }
     provisioned_cells_evidence = {
@@ -154,12 +166,14 @@ variables {
               activate_registration        = 1
               complete_registration        = 1
               complete_credential_recovery = 1
+              resolve_connector_resource   = 1
             }
             preinvoke_rate_limits = {
               issue_registration_otp       = { burst = 2, refill_per_second = 1 }
               activate_registration        = { burst = 2, refill_per_second = 1 }
               complete_registration        = { burst = 2, refill_per_second = 1 }
               complete_credential_recovery = { burst = 2, refill_per_second = 1 }
+              resolve_connector_resource   = { burst = 2, refill_per_second = 1 }
             }
           }
           cell1 = {
@@ -169,12 +183,14 @@ variables {
               activate_registration        = 2
               complete_registration        = 2
               complete_credential_recovery = 2
+              resolve_connector_resource   = 2
             }
             preinvoke_rate_limits = {
               issue_registration_otp       = { burst = 3, refill_per_second = 3 }
               activate_registration        = { burst = 3, refill_per_second = 3 }
               complete_registration        = { burst = 3, refill_per_second = 3 }
               complete_credential_recovery = { burst = 3, refill_per_second = 3 }
+              resolve_connector_resource   = { burst = 3, refill_per_second = 3 }
             }
           }
         }
@@ -253,7 +269,7 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
   assert {
     condition = (
       length(data.aws_ecr_image.authority_runtime) == 1 &&
-      length(local.authority_expected_functions) == 3 + 4 * 2 &&
+      length(local.authority_expected_functions) == 3 + 5 * 2 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-ia"] == 10 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-iro-cell0"] == 9 &&
       local.authority_expected_caller_requests_per_second["layerv-nhp-sandbox-ca-iro-cell1"] == 6 &&
@@ -268,7 +284,7 @@ run "measurement_accepts_hub_group_and_future_cell_catalog" {
         length(targets) == 0
       ])
     )
-    error_message = "Measurement must freeze exact 3 + 4N identities while exposing only complete operation groups present in the contract."
+    error_message = "Measurement must freeze exact 3 + 5N identities while exposing only complete operation groups present in the contract."
   }
 }
 
@@ -524,6 +540,7 @@ run "ready_requires_and_accepts_exact_two_cell_graph" {
               "layerv-nhp-sandbox-ca-ar-cell0",
               "layerv-nhp-sandbox-ca-cr-cell0",
               "layerv-nhp-sandbox-ca-ccr-cell0",
+              "layerv-nhp-sandbox-ca-creso-cell0",
             ] :
             function_name => merge(
               run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.functions["layerv-nhp-sandbox-ca-ia"],
@@ -545,6 +562,7 @@ run "ready_requires_and_accepts_exact_two_cell_graph" {
               "layerv-nhp-sandbox-ca-ar-cell1",
               "layerv-nhp-sandbox-ca-cr-cell1",
               "layerv-nhp-sandbox-ca-ccr-cell1",
+              "layerv-nhp-sandbox-ca-creso-cell1",
             ] :
             function_name => merge(
               run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.functions["layerv-nhp-sandbox-ca-ia"],
@@ -563,23 +581,25 @@ run "ready_requires_and_accepts_exact_two_cell_graph" {
 
   assert {
     condition = (
-      length(output.authority_runtime_contract.functions) == 3 + 4 * 2 &&
+      length(output.authority_runtime_contract.functions) == 3 + 5 * 2 &&
       output.authority_selected_alias_targets.cells == {
         cell0 = {
           issue_registration_otp       = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-iro-cell0:blue"
           activate_registration        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ar-cell0:blue"
           complete_registration        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-cr-cell0:blue"
           complete_credential_recovery = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ccr-cell0:blue"
+          resolve_connector_resource   = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-creso-cell0:blue"
         }
         cell1 = {
           issue_registration_otp       = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-iro-cell1:blue"
           activate_registration        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ar-cell1:blue"
           complete_registration        = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-cr-cell1:blue"
           complete_credential_recovery = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-ccr-cell1:blue"
+          resolve_connector_resource   = "arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-creso-cell1:blue"
         }
       }
     )
-    error_message = "Ready must accept only the complete same-color 3 + 4N graph with result evidence."
+    error_message = "Ready must accept only the complete same-color 3 + 5N graph with result evidence."
   }
 }
 
@@ -862,9 +882,10 @@ run "rejects_cell_role_name_substitution" {
         provisioned_cells = merge(
           run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.provisioned_cells,
           {
-            cell0 = {
-              caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell0-server"
-            }
+            cell0 = merge(
+              run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.provisioned_cells.cell0,
+              { caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell0-server" },
+            )
           },
         )
       },
@@ -884,9 +905,10 @@ run "rejects_duplicate_cell_caller_role" {
         provisioned_cells = merge(
           run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.provisioned_cells,
           {
-            cell1 = {
-              caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
-            }
+            cell1 = merge(
+              run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.provisioned_cells.cell1,
+              { caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server" },
+            )
           },
         )
       },

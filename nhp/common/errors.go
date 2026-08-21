@@ -324,6 +324,17 @@ var (
 	ErrDeviceCredentialConflict      = newError("52303", "device credential conflict")
 	ErrInvalidCompletionRequest      = newError("52304", "invalid completion request")
 
+	// server: registered-agent connector resource resolution (52500+). These
+	// are authenticated LRT verdicts from the assigned cell. The operation is
+	// deliberately NHP-native; these codes are not HTTP status translations.
+	ErrConnectorResourceUnavailable       = newError("52500", "connector resource temporarily unavailable")
+	ErrConnectorResourceIdentityRejected  = newError("52501", "connector resource identity rejected")
+	ErrConnectorResourceEntitlementDenied = newError("52502", "connector resource entitlement denied")
+	ErrConnectorResourceIdentityConflict  = newError("52503", "connector resource identity conflict")
+	ErrConnectorResourceQuotaExceeded     = newError("52504", "connector resource quota exceeded")
+	ErrConnectorResourceRateLimited       = newError("52505", "connector resource rate limited")
+	ErrInvalidConnectorResourceRequest    = newError("52506", "invalid connector resource request")
+
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")
 	ErrACEmptyPassAddress      = newError("53002", "pass address is empty")

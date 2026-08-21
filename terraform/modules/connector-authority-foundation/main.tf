@@ -120,7 +120,7 @@ resource "terraform_data" "foundation_contract" {
 
     precondition {
       condition     = local.authority_contract_graph_valid
-      error_message = "authority_runtime_contract must contain the complete Hub group plus only complete provisioned-cell operation groups, and ready must contain exact 3 + 4N."
+      error_message = "authority_runtime_contract must contain the complete Hub group plus only complete provisioned-cell operation groups, and ready must contain exact 3 + 5N."
     }
 
     precondition {

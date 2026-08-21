@@ -10,23 +10,29 @@ locals {
   connector_authority_home_region = "us-east-2"
   # Blue/green color qualifier carried on every cell alias ARN (the 8th
   # ':'-segment); the fail-closed contract below asserts it is a real color and
-  # that all four operation aliases share it.
+  # that every enabled operation alias shares it.
   connector_authority_cell_alias_color = local.connector_authority_cell_enabled ? try(split(":", var.connector_authority_cell_config.issue_registration_otp_alias_arn)[7], "") : ""
-  connector_authority_cell_alias_arns = local.connector_authority_cell_enabled ? sort([
+  connector_authority_resource_enabled = local.connector_authority_cell_enabled && var.connector_authority_cell_config.resolve_connector_resource_alias_arn != null
+  connector_authority_cell_alias_arns = local.connector_authority_cell_enabled ? sort(concat([
     var.connector_authority_cell_config.issue_registration_otp_alias_arn,
     var.connector_authority_cell_config.activate_registration_alias_arn,
     var.connector_authority_cell_config.complete_registration_alias_arn,
     var.connector_authority_cell_config.complete_credential_recovery_alias_arn,
-  ]) : []
+    ], local.connector_authority_resource_enabled ? [
+    var.connector_authority_cell_config.resolve_connector_resource_alias_arn,
+  ] : [])) : []
   connector_authority_cell_expected_alias_arns = local.connector_authority_cell_enabled ? sort([
-    for suffix in ["iro", "ar", "cr", "ccr"] :
+    for suffix in concat(["iro", "ar", "cr", "ccr"], local.connector_authority_resource_enabled ? ["creso"] : []) :
     "arn:aws:lambda:${var.connector_authority_cell_config.aws_region}:${var.connector_authority_cell_config.aws_account_id}:function:layerv-nhp-${var.connector_authority_cell_config.environment}-ca-${suffix}-${var.cell_id}:${local.connector_authority_cell_alias_color}"
   ]) : []
 }
 
-# One fail-closed boundary owns the four-operation caller graph. A partial
-# config, wrong cell/environment, unqualified target, or mixed alias color
-# cannot create either IAM or network reachability.
+# One fail-closed boundary owns the caller graph. The exact four-operation
+# predecessor exists only so a root plan remains valid before Control's first
+# creso apply; it renders the same user data and IAM as the already-running
+# servers. Once Control publishes creso, the only admitted shape is the complete
+# five-operation graph. Any other partial config, wrong cell/environment,
+# unqualified target, or mixed alias color cannot create IAM or reachability.
 resource "terraform_data" "connector_authority_cell_contract" {
   count = local.connector_authority_cell_enabled ? 1 : 0
 
@@ -60,7 +66,7 @@ resource "terraform_data" "connector_authority_cell_contract" {
         contains(["blue", "green"], local.connector_authority_cell_alias_color) &&
         local.connector_authority_cell_alias_arns == local.connector_authority_cell_expected_alias_arns
       )
-      error_message = "connector_authority_cell_config must be one complete same-color 4-operation alias graph for this exact environment, account, region, and cell."
+      error_message = "connector_authority_cell_config must be the exact same-color 4-operation rollout predecessor or complete 5-operation graph for this environment, account, region, and cell."
     }
     precondition {
       condition = (

@@ -149,7 +149,7 @@ output "authority_cell_alias_targets" {
   description = <<-DESC
     Exact selected-color assigned-cell Authority alias ARNs, keyed by cell id then
     operation (issue_registration_otp, activate_registration, complete_registration,
-    complete_credential_recovery), or null while the runtime is dark.
+    complete_credential_recovery, resolve_connector_resource), or null while the runtime is dark.
 
     Single source of truth for the cell servers' NHP_CONNECTOR_REGISTRATION_* wiring.
     The cell roots read this through terraform_remote_state rather than

@@ -32,6 +32,16 @@
 #       file and fell back to defaults would not deploy the Hub — it would
 #       destroy it. A hardcoded flag list would also drift out of lockstep with
 #       control-sandbox-update.yml's inputs with nothing to detect it.
+#   C8. a successful Control job is not itself consumer authorization. A
+#       superseded leg intentionally succeeds without touching AWS, so Control
+#       emits a separate positive output only after this checkout's no-op or
+#       apply has been verified; cell0 requires that output before planning.
+#   C9. cell1 planning and both runtime refreshes remain descendants of that
+#       cell0 plan, and validation remains a descendant of all of them.
+#   C10. the upstream `terraform-plan` job remains validation-only. Both cell
+#        roots create and consume their saved plans inside their downstream
+#        deploy jobs, after the Control barrier; there is no pre-Control plan
+#        artifact that can survive the four-operation predecessor.
 #
 # Detection is string-grep based, scoped to the relevant job blocks, so it stays
 # runnable without a YAML parser — matching check-packer-failure-surfaced.sh,
@@ -90,16 +100,32 @@ if [ -z "$infra_block" ]; then
   exit 1
 fi
 
+terraform_predeploy_block="$(job_block terraform-plan)"
+cell1_infra_block="$(job_block deploy-sandbox-cell1-infra)"
+blue_green_block="$(job_block deploy-sandbox-blue-green)"
+cell1_blue_green_block="$(job_block deploy-sandbox-cell1-blue-green)"
+validate_block="$(job_block deploy-sandbox-validate)"
+for required_job in terraform_predeploy_block cell1_infra_block blue_green_block cell1_blue_green_block validate_block; do
+  if [ -z "${!required_job}" ]; then
+    echo "check-control-leg-surfaced: required rollout job block '$required_job' is missing in $WF" >&2
+    exit 1
+  fi
+done
+
 # Extract each job's concurrency group so C5 can assert they are the SAME lock
 # rather than that Control names one particular string. Pinning only Control's
 # side would leave a rename of INFRA's group green here while silently splitting
 # the mutual exclusion the whole design rests on — the two roots would become
 # free to apply against the same estate concurrently, with nothing to notice.
 group_of() { # group_of <job block>
-  printf '%s\n' "$1" \
-    | awk '/^    concurrency:/ { inblk = 1; next }
-           inblk && /^    [a-z]/ { exit }
-           inblk && /^      group:/ { sub(/^      group:[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); print; exit }'
+  # Feed awk directly from a here-string. With a large real job block,
+  # `printf | awk` lets awk exit after the early group match while printf is
+  # still writing; under pipefail Linux then reports printf's EPIPE as a false
+  # wiring failure.
+  awk '/^    concurrency:/ { inblk = 1; next }
+       inblk && /^    [a-z]/ { exit }
+       inblk && /^      group:/ { sub(/^      group:[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); print; exit }' \
+    <<<"$1"
 }
 control_group="$(group_of "$control_block")"
 infra_group="$(group_of "$infra_block")"
@@ -190,6 +216,54 @@ need_in "$control_block" '\$\{#gate_flags\[@\]\}" -eq 0' \
   "deploy-sandbox-control must fail closed on an empty gate-flag set; an all-dark gate file is a Hub/Authority teardown and must not apply unattended."
 need_in "$control_block" 'fully dark' \
   "the empty gate-flag guard must say WHY it refused (a fully dark gate file), or the next reader deletes it as redundant."
+
+# C8 — successful supersession is not permission to consume an old graph.
+need_in "$control_block" 'consumer_rollout_ready:[[:space:]]*\$\{\{[[:space:]]*steps\.authorize-consumers\.outputs\.ready[[:space:]]*\}\}' \
+  "deploy-sandbox-control must export a dedicated positive consumer authorization; job success also includes the superseded no-op."
+need_in "$control_block" '^        id:[[:space:]]*authorize-consumers[[:space:]]*$' \
+  "deploy-sandbox-control must have the source step for consumer_rollout_ready."
+need_in "$control_block" "steps\.freshness\.outputs\.fresh == 'true'" \
+  "consumer authorization must require this checkout to remain the fresh Control run; superseded runs must not plan cells."
+need_in "$control_block" "steps\.plan\.outputs\.control_status == 'converged'.*steps\.verify\.outcome == 'success'" \
+  "consumer authorization must require either an exact Control no-op or a verified Control apply; partial applies must stop."
+need_in "$control_block" "steps\.promote-detect\.outputs\.promote != 'true'.*steps\.promote-verify\.outcome == 'success'" \
+  "consumer authorization must wait for any selector promotion to verify before cell planning."
+need_in "$infra_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-control[^]]*\]' \
+  "deploy-sandbox-infra must be a direct descendant of deploy-sandbox-control so its plan is created after Control."
+need_in "$infra_block" "needs\.deploy-sandbox-control\.result == 'success'" \
+  "deploy-sandbox-infra must require the Control job itself to succeed."
+need_in "$infra_block" "needs\.deploy-sandbox-control\.outputs\.consumer_rollout_ready == 'true'" \
+  "deploy-sandbox-infra must require Control's positive same-run authorization, not infer readiness from job success."
+deny_in "$control_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-infra[^]]*\]' \
+  "deploy-sandbox-control must not depend on cell0 infra; that reverses or cycles the Control-first barrier."
+
+# C9 — complete downstream chain: fresh cell plans, both runtime rolls, then
+# the live five-alias readback. These checks are deliberately on direct edges;
+# relying on a transitive relationship through an unrelated job makes a future
+# DAG cleanup able to bypass the barrier silently.
+need_in "$cell1_infra_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-infra[^]]*\]' \
+  "cell1 Terraform must wait for the authorized cell0 Terraform apply."
+need_in "$blue_green_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-infra[^]]*\]' \
+  "cell0 runtime refresh must wait for the fresh cell0 plan/apply."
+need_in "$cell1_blue_green_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-blue-green[^]]*deploy-sandbox-cell1-infra[^]]*\]' \
+  "cell1 runtime refresh must wait for both the cell0 runtime and fresh cell1 plan/apply."
+need_in "$validate_block" 'needs:[[:space:]]*\[[^]]*deploy-sandbox-infra[^]]*deploy-sandbox-blue-green[^]]*deploy-sandbox-cell1-blue-green[^]]*deploy-sandbox-control[^]]*\]' \
+  "sandbox validation must remain downstream of Control, both fresh cell applies, and both runtime refreshes."
+need_in "$validate_block" "needs\.deploy-sandbox-control\.outputs\.consumer_rollout_ready == 'true'" \
+  "sandbox validation must re-require the same-run Control authorization before proving the five-alias live graph."
+
+# C10 — plans are born downstream. Match executable lines only, not comments
+# explaining why the pre-deploy job intentionally does not plan.
+deny_in "$terraform_predeploy_block" '^[[:space:]]+((-[[:space:]]+)?run:[[:space:]]+)?terraform[[:space:]]+plan([[:space:]]|$)' \
+  "the upstream terraform-plan job must stay validation-only; a saved cell plan created before Control can encode the four-operation predecessor."
+need_in "$infra_block" '^[[:space:]]+if ! terraform plan -out=tfplan' \
+  "cell0 must create its saved plan inside the downstream deploy job after Control authorization."
+need_in "$infra_block" 'terraform apply.*tfplan' \
+  "cell0 must apply the saved plan it created after the Control barrier."
+need_in "$cell1_infra_block" '^[[:space:]]+terraform plan -no-color -out=tfplan' \
+  "cell1 must create its saved plan inside its downstream deploy job."
+need_in "$cell1_infra_block" '^[[:space:]]+terraform apply -no-color -auto-approve tfplan' \
+  "cell1 must apply the saved plan it created after the Control barrier."
 
 if [ "$fail" -ne 0 ]; then
   echo "check-control-leg-surfaced: FAILED" >&2

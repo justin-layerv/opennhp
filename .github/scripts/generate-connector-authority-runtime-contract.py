@@ -62,16 +62,65 @@ EXPECTED_CELL_OPERATIONS = {
     "activate_registration",
     "complete_registration",
     "complete_credential_recovery",
+    "resolve_connector_resource",
 }
 EXPECTED_CELLS = {
-    "cell0": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server",
-    "cell1": "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server",
+    "cell0": {
+        "caller_role_arn": (
+            "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        ),
+        "cell_table_prefix": "layerv-nhp-sandbox-cell0",
+        "qurl_resources_table_arn": (
+            "arn:aws:dynamodb:us-east-2:767397897469:table/"
+            "layerv-nhp-sandbox-cell0-qurl-resources"
+        ),
+        "qurl_resource_key_material_table_arn": (
+            "arn:aws:dynamodb:us-east-2:767397897469:table/"
+            "layerv-nhp-sandbox-cell0-qurl-resource-key-material"
+        ),
+        "cell_data_kms_key_arn": (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "49224991-f4c7-4e02-bb23-0003e6326d02"
+        ),
+        "resource_key_envelope_kms_key_arn": (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "eb55226b-3443-4913-8266-ac68c66efe96"
+        ),
+        "resource_key_software_custody_enabled": True,
+    },
+    "cell1": {
+        "caller_role_arn": (
+            "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        ),
+        # Existing cell1 resources carry this doubled Terraform-owned prefix.
+        # It is frozen here explicitly; runtime never resolves aliases or
+        # derives a different table name.
+        "cell_table_prefix": "layerv-nhp-sandbox-cell1-cell1",
+        "qurl_resources_table_arn": (
+            "arn:aws:dynamodb:us-east-2:767397897469:table/"
+            "layerv-nhp-sandbox-cell1-cell1-qurl-resources"
+        ),
+        "qurl_resource_key_material_table_arn": (
+            "arn:aws:dynamodb:us-east-2:767397897469:table/"
+            "layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material"
+        ),
+        "cell_data_kms_key_arn": (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "fc5121da-c353-4621-b24b-7ec5f79446bd"
+        ),
+        "resource_key_envelope_kms_key_arn": (
+            "arn:aws:kms:us-east-2:767397897469:key/"
+            "1ff3c518-1653-4126-ab7e-039a7e6ab0ff"
+        ),
+        "resource_key_software_custody_enabled": True,
+    },
 }
 EXPECTED_CELL_OPERATION_SUFFIXES = {
     "issue_registration_otp": "iro",
     "activate_registration": "ar",
     "complete_registration": "cr",
     "complete_credential_recovery": "ccr",
+    "resolve_connector_resource": "creso",
 }
 EXPECTED_PROOF_OWNER_ID = "layerv-nhp-sandbox-udp-proof"
 EXPECTED_PROOF_CONTROLLER_ROLE_ARN = (
@@ -323,10 +372,26 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     for cell_id, cell in cells.items():
         if CELL_ID.fullmatch(cell_id) is None or len(cell_id) > 32:
             fail(f"invalid provisioned cell ID {cell_id!r}")
-        cell = exact_keys(cell, {"caller_role_arn"}, f"provisioned_cells.{cell_id}")
-        expected_role = EXPECTED_CELLS[cell_id]
-        if cell["caller_role_arn"] != expected_role:
-            fail(f"{cell_id} caller role is not the canonical role ARN")
+        expected_cell = EXPECTED_CELLS[cell_id]
+        cell = exact_keys(cell, set(expected_cell), f"provisioned_cells.{cell_id}")
+        if cell != expected_cell:
+            fail(
+                f"{cell_id} caller/table/KMS identity is not the exact "
+                "Terraform-owned sandbox contract"
+            )
+        if (
+            KEY_ARN.fullmatch(cell["cell_data_kms_key_arn"]) is None
+            or KEY_ARN.fullmatch(cell["resource_key_envelope_kms_key_arn"])
+            is None
+        ):
+            fail(
+                f"{cell_id} cell-data or envelope key is not a raw sandbox CMK ARN"
+            )
+        if (
+            cell["cell_data_kms_key_arn"]
+            == cell["resource_key_envelope_kms_key_arn"]
+        ):
+            fail(f"{cell_id} cell-data and envelope CMKs must be distinct")
 
     raw_global = contract["global"]
     if not isinstance(raw_global, dict):
@@ -422,7 +487,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     })
     functions = contract["functions"]
     if not isinstance(functions, dict) or set(functions) != set(expected_functions):
-        fail("measurement basis must contain the exact complete 3 + 4N Authority graph")
+        fail("measurement basis must contain the exact complete 3 + 5N Authority graph")
     for function_name, operation in expected_functions.items():
         function = exact_keys(
             functions[function_name], FUNCTION_KEYS, f"functions.{function_name}"

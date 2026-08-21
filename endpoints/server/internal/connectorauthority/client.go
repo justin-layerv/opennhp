@@ -67,6 +67,14 @@ type CredentialRecoveryCellClient struct {
 	completeCredentialRecovery string
 }
 
+// ConnectorResourceCellClient exposes only the post-registration resource
+// resolution operation. The target is fixed at construction; callers cannot
+// select another Authority operation or alias.
+type ConnectorResourceCellClient struct {
+	invoker
+	resolveConnectorResource string
+}
+
 // IssueAssignment invokes the configured IssueAssignment alias synchronously.
 func (c *HubClient) IssueAssignment(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationIssueAssignment, c.issueAssignment, payload)
@@ -100,6 +108,10 @@ func (c *RegistrationCellClient) CompleteRegistration(ctx context.Context, paylo
 // CompleteCredentialRecovery invokes the one configured assigned-cell recovery alias synchronously.
 func (c *CredentialRecoveryCellClient) CompleteCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationCompleteCredentialRecovery, c.completeCredentialRecovery, payload)
+}
+
+func (c *ConnectorResourceCellClient) ResolveConnectorResource(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationResolveConnectorResource, c.resolveConnectorResource, payload)
 }
 
 func (c *invoker) invoke(ctx context.Context, operation Operation, target string, payload []byte) ([]byte, error) {

@@ -306,6 +306,10 @@ type UdpServer struct {
 	// once during Start before the listener binds and is never exposed to relay or
 	// generic plugin dispatch.
 	credentialRecoveryHandler credentialRecoveryDirectHandler
+	// connectorResourceHandler is the strict post-registration resource
+	// discovery capability. Exact connector_resource LSTs are claimed even while
+	// this is nil so they cannot reach generic ListService dispatch.
+	connectorResourceHandler connectorResourceDirectHandler
 
 	// signals
 	signals struct {

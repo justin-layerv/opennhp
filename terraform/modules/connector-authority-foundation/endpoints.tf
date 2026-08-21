@@ -37,40 +37,68 @@ locals {
   # accept, and each write is reachable only by the operations that compose it.
   authority_dynamodb_endpoint_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid    = "AuthorityFunctionsData"
-      Effect = "Allow"
-      # A VPC endpoint policy does NOT match an assumed-role session against an
-      # IAM role-ARN (or account-root) Principal: a role-ARN Principal here
-      # silently denies every hub function with "no VPC endpoint policy allows
-      # the dynamodb:* action" even though the identity policy grants it. Scope
-      # with Principal "*" + an aws:PrincipalArn condition instead. Verified in
-      # sandbox: the role-ARN form denied DescribeTable at cold start ->
-      # control_sse_invalid; this form passes. The condition keeps the network
-      # grant to exactly the constructed execution roles (fail-closed intact).
-      Principal = "*"
-      Action = concat(
-        local.authority_runtime_ddb_read_actions,
-        local.authority_runtime_ddb_recovery_write_actions,
-      )
-      Resource = [
-        for name in ["api_keys", "agent_keys", "customers", "api_key_idempotency", "connector_authority"] :
-        local.authority_runtime_table_arns[name]
-      ]
-      Condition = {
-        StringEquals = {
-          "aws:PrincipalArn" = local.authority_runtime_exec_role_arns
+    Statement = [
+      {
+        Sid    = "AuthorityFunctionsData"
+        Effect = "Allow"
+        # A VPC endpoint policy does NOT match an assumed-role session against an
+        # IAM role-ARN (or account-root) Principal: a role-ARN Principal here
+        # silently denies every hub function with "no VPC endpoint policy allows
+        # the dynamodb:* action" even though the identity policy grants it. Scope
+        # with Principal "*" + an aws:PrincipalArn condition instead. Verified in
+        # sandbox: the role-ARN form denied DescribeTable at cold start ->
+        # control_sse_invalid; this form passes. The condition keeps the network
+        # grant to exactly the constructed execution roles (fail-closed intact).
+        Principal = "*"
+        Action = concat(
+          local.authority_runtime_ddb_read_actions,
+          local.authority_runtime_ddb_recovery_write_actions,
+        )
+        Resource = [
+          for name in ["api_keys", "agent_keys", "customers", "api_key_idempotency", "connector_authority"] :
+          local.authority_runtime_table_arns[name]
+        ]
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalArn" = local.authority_runtime_exec_role_arns
+          }
         }
-      }
-    }]
+      },
+      {
+        # Coarse network admission for the two cell-owned tables. The creso
+        # identity policies retain the finer per-table action split.
+        Sid       = "ConnectorResourceCellData"
+        Effect    = "Allow"
+        Principal = "*"
+        Action = [
+          "dynamodb:DeleteItem",
+          "dynamodb:DescribeTable",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:TransactWriteItems",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = sort(flatten([
+          for cell in values(local.authority_contract_cells) : [
+            cell.qurl_resources_table_arn,
+            cell.qurl_resource_key_material_table_arn,
+          ]
+        ]))
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalArn" = local.authority_runtime_connector_resource_role_arns
+          }
+        }
+      },
+    ]
   })
 
   # KMS interface endpoint: all three public-key consumers may GetPublicKey;
   # IssueAssignment alone may Sign. No operation uses kms:Verify.
   authority_kms_endpoint_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
+    Statement = concat(
+      [{
         Sid       = "AuthorityFunctionsQat1PublicKey"
         Effect    = "Allow"
         Principal = "*"
@@ -81,20 +109,76 @@ locals {
             "aws:PrincipalArn" = local.authority_runtime_public_key_role_arns
           }
         }
-      },
-      {
-        Sid       = "IssueAssignmentQat1Sign"
+        },
+        {
+          Sid       = "IssueAssignmentQat1Sign"
+          Effect    = "Allow"
+          Principal = "*"
+          Action    = ["kms:Sign"]
+          Resource  = [aws_kms_key.qat1_signing.arn]
+          Condition = {
+            StringEquals = {
+              "aws:PrincipalArn" = local.authority_runtime_sign_role_arns
+            }
+          }
+        },
+      ],
+      [for statement in [{
+        Sid       = "ConnectorResourceCreateHardwareKey"
         Effect    = "Allow"
         Principal = "*"
-        Action    = ["kms:Sign"]
-        Resource  = [aws_kms_key.qat1_signing.arn]
+        Action    = ["kms:CreateKey"]
+        Resource  = "*"
         Condition = {
           StringEquals = {
-            "aws:PrincipalArn" = local.authority_runtime_sign_role_arns
+            "aws:PrincipalArn"       = local.authority_runtime_connector_resource_hardware_role_arns
+            "aws:RequestTag/app"     = "qurl-service"
+            "aws:RequestTag/purpose" = "qurl-v2-resource-key"
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["app", "owner_id", "purpose", "resource_id"]
+          }
+          Null = {
+            "aws:RequestTag/app"         = "false"
+            "aws:RequestTag/owner_id"    = "false"
+            "aws:RequestTag/purpose"     = "false"
+            "aws:RequestTag/resource_id" = "false"
           }
         }
-      },
-    ]
+        },
+        {
+          Sid       = "ConnectorResourceHardwareKeyLifecycle"
+          Effect    = "Allow"
+          Principal = "*"
+          Action    = ["kms:GetPublicKey", "kms:ScheduleKeyDeletion"]
+          Resource  = "*"
+          Condition = {
+            StringEquals = {
+              "aws:PrincipalArn"        = local.authority_runtime_connector_resource_hardware_role_arns
+              "kms:ResourceTag/purpose" = "qurl-v2-resource-key"
+            }
+          }
+        },
+      ] : statement if length(local.authority_runtime_connector_resource_hardware_role_arns) > 0],
+      [for statement in [{
+        Sid       = "ConnectorResourceGenerateEnvelopeDataKey"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = ["kms:GenerateDataKey"]
+        Resource = sort([
+          for cell in values(local.authority_contract_cells) :
+          cell.resource_key_envelope_kms_key_arn
+          if cell.resource_key_software_custody_enabled
+        ])
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalArn"              = local.authority_runtime_connector_resource_software_role_arns
+            "kms:EncryptionContext:purpose" = "qurl-v2-resource-software-key"
+          }
+        }
+        },
+      ] : statement if length(local.authority_runtime_connector_resource_software_role_arns) > 0],
+    )
   })
 
   authority_secretsmanager_statements = [{

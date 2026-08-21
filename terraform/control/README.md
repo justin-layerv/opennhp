@@ -40,8 +40,8 @@ requires the attended Control rollout workflow.
 
 When the independent runtime gate is enabled against the verified sandbox
 contract, the module deploys the contract's complete graph: three Hub
-operations plus `iro/ar/cr/ccr` for every provisioned cell. The current
-two-cell basis therefore creates 11 functions and 22 closed blue/green aliases.
+operations plus `iro/ar/cr/ccr/creso` for every provisioned cell. The current
+two-cell basis therefore creates 13 functions and 26 closed blue/green aliases.
 On this initial dark bootstrap, both colors intentionally point at the same
 first published version and only the selected color is provisioned. This is not
 yet a working blue/green image-roll or rollback path: the contract's rollout
@@ -52,7 +52,7 @@ Execution IAM and private endpoint policies are operation-specific: IA alone
 signs; IRO/AR alone receive OTP secret and directional Redis access; IRO alone
 sends SES email. The cell callers do not use this Control VPC's Lambda
 endpoint—their own VPC stacks create private-DNS endpoints restricted to their
-four exact same-color aliases. Production remains locked dark until its
+five exact same-color aliases. Production remains locked dark until its
 separate catalog, evidence, and rollout review exist.
 
 The one non-runtime cross-repository identity is the dedicated Connector

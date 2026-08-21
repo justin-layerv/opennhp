@@ -884,10 +884,9 @@ def authority_runtime_input_fixture() -> dict:
             "schema_version": 1,
             "phase": "measurement",
             "selected_authority_color": "blue",
-            "provisioned_cells": {
-                "cell0": {"caller_role_arn": "fixture-cell0"},
-                "cell1": {"caller_role_arn": "fixture-cell1"},
-            },
+            "provisioned_cells": copy.deepcopy(
+                CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS
+            ),
             "provisioned_cells_evidence": copy.deepcopy(evidence),
             "global": {
                 "authority_repository_url": repository,
@@ -900,10 +899,44 @@ def authority_runtime_input_fixture() -> dict:
                 "result_evidence": None,
                 "caller_capacity": {
                     "cell_workers": {
-                        "cell0": {"max_replicas": 2},
-                        "cell1": {"max_replicas": 2},
+                        cell_id: {
+                            "max_replicas": 2,
+                            "preinvoke_limits": {
+                                operation: 1
+                                for operation in (
+                                    CHECKER.AUTHORITY_CELL_OPERATION_SUFFIXES.values()
+                                )
+                            },
+                            "preinvoke_rate_limits": {
+                                operation: {
+                                    "burst": 1,
+                                    "refill_per_second": 1,
+                                }
+                                for operation in (
+                                    CHECKER.AUTHORITY_CELL_OPERATION_SUFFIXES.values()
+                                )
+                            },
+                        }
+                        for cell_id in CHECKER.AUTHORITY_CELLS
                     },
-                    "hub_workers": {"max_replicas": 2},
+                    "hub_workers": {
+                        "max_replicas": 2,
+                        "preinvoke_limits": {
+                            operation: 1
+                            for operation in (
+                                CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS.values()
+                            )
+                        },
+                        "preinvoke_rate_limits": {
+                            operation: {
+                                "burst": 1,
+                                "refill_per_second": 1,
+                            }
+                            for operation in (
+                                CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS.values()
+                            )
+                        },
+                    },
                 },
             },
             "functions": functions,
@@ -1580,7 +1613,30 @@ def runtime_scoped_endpoint_policies(
                         else CHECKER.AUTHORITY_RUNTIME_DYNAMODB_RESOURCES
                     ),
                     "Condition": {"StringEquals": {"aws:PrincipalArn": roles}},
-                }
+                },
+                {
+                    "Sid": "ConnectorResourceCellData",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": [
+                        "dynamodb:DeleteItem",
+                        "dynamodb:DescribeTable",
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:TransactWriteItems",
+                        "dynamodb:UpdateItem",
+                    ],
+                    "Resource": sorted(
+                        CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELL_TABLE_ARNS
+                    ),
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS
+                            )
+                        }
+                    },
+                },
             ],
         }
     )
@@ -1613,6 +1669,25 @@ def runtime_scoped_endpoint_policies(
                             "aws:PrincipalArn": sorted(
                                 CHECKER.AUTHORITY_RUNTIME_SIGN_ROLE_ARNS
                             )
+                        }
+                    },
+                },
+                {
+                    "Sid": "ConnectorResourceGenerateEnvelopeDataKey",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["kms:GenerateDataKey"],
+                    "Resource": sorted(
+                        CHECKER.AUTHORITY_CONNECTOR_RESOURCE_ENVELOPE_KEY_ARNS
+                    ),
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalArn": sorted(
+                                CHECKER.AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS
+                            ),
+                            "kms:EncryptionContext:purpose": (
+                                "qurl-v2-resource-software-key"
+                            ),
                         }
                     },
                 },
@@ -1698,6 +1773,81 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
     Derived from the checker constants so the fixture stays in lockstep with the
     reviewed IAM; every referenced ARN is a known literal.
     """
+    if operation == "resolve_connector_resource":
+        cell = CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS[fn.rsplit("-", 1)[-1]]
+        control_resources = sorted(
+            CHECKER.AUTHORITY_RUNTIME_TABLE_ARNS[table]
+            for table in ("agent_keys", "connector_authority", "customers")
+        )
+        statements = [
+            {
+                "Sid": "LambdaVpcEni",
+                "Effect": "Allow",
+                "Action": sorted(CHECKER.AUTHORITY_RUNTIME_ENI_ACTIONS),
+                "Resource": "*",
+            },
+            {
+                "Sid": "OwnLogStream",
+                "Effect": "Allow",
+                "Action": sorted(CHECKER.AUTHORITY_RUNTIME_LOG_ACTIONS),
+                "Resource": [
+                    f"arn:aws:logs:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                    f"log-group:/aws/lambda/{fn}:*"
+                ],
+            },
+            {
+                "Sid": "ConnectorResourceControlDescribe",
+                "Effect": "Allow",
+                "Action": ["dynamodb:DescribeTable"],
+                "Resource": control_resources,
+            },
+            {
+                "Sid": "ConnectorResourceControlRead",
+                "Effect": "Allow",
+                "Action": ["dynamodb:GetItem"],
+                "Resource": control_resources,
+            },
+            {
+                "Sid": "ConnectorResourceCellDescribe",
+                "Effect": "Allow",
+                "Action": ["dynamodb:DescribeTable"],
+                "Resource": [
+                    cell["qurl_resources_table_arn"],
+                    cell["qurl_resource_key_material_table_arn"],
+                ],
+            },
+            {
+                "Sid": "ConnectorResourceCellResourceData",
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:TransactWriteItems",
+                    "dynamodb:UpdateItem",
+                ],
+                "Resource": [cell["qurl_resources_table_arn"]],
+            },
+            {
+                "Sid": "ConnectorResourceCellKeyMaterial",
+                "Effect": "Allow",
+                "Action": ["dynamodb:DeleteItem", "dynamodb:PutItem"],
+                "Resource": [cell["qurl_resource_key_material_table_arn"]],
+            },
+            {
+                "Sid": "ConnectorResourceGenerateEnvelopeDataKey",
+                "Effect": "Allow",
+                "Action": ["kms:GenerateDataKey"],
+                "Resource": [cell["resource_key_envelope_kms_key_arn"]],
+                "Condition": {
+                    "StringEquals": {
+                        "kms:EncryptionContext:purpose": (
+                            "qurl-v2-resource-software-key"
+                        )
+                    }
+                },
+            },
+        ]
+        return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
     spec = (
         CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM.get(operation)
         or CHECKER.AUTHORITY_RUNTIME_CELL_OPERATION_IAM[operation]
@@ -2264,28 +2414,56 @@ def _runtime_resource_changes() -> list[dict]:
         }
     )
     for fn, spec in functions.items():
+        operation = CHECKER.AUTHORITY_RUNTIME_FUNCTIONS[fn]
+        function_after = {
+            "function_name": fn,
+            "description": f"Connector Authority {operation} (sandbox)",
+            "package_type": "Image",
+            "image_uri": image_uri,
+            "reserved_concurrent_executions": spec[
+                "steady_reserved_concurrency"
+            ],
+            "vpc_config": [
+                {"subnet_ids": [], "security_group_ids": []}
+            ],
+        }
+        if operation == "resolve_connector_resource":
+            cell_id = fn.rsplit("-", 1)[-1]
+            cell = CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS[cell_id]
+            function_after["environment"] = [{
+                "variables": {
+                    "CONNECTOR_AUTHORITY_OPERATION": "ResolveConnectorResource",
+                    "CONNECTOR_AUTHORITY_ENVIRONMENT_ID": "sandbox",
+                    "CONNECTOR_AUTHORITY_ACCOUNT_ID": CHECKER.ACCOUNT_ID,
+                    "CONNECTOR_AUTHORITY_HOME_REGION": CHECKER.AWS_REGION,
+                    "CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN": (
+                        RUNTIME_AUTHORITY_DATA_KEY_ARN
+                    ),
+                    "CONNECTOR_AUTHORITY_CELL_ID": cell_id,
+                    "CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX": ".nhp.layerv.xyz",
+                    "CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX": (
+                        cell["cell_table_prefix"]
+                    ),
+                    "CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN": (
+                        cell["cell_data_kms_key_arn"]
+                    ),
+                    "CONNECTOR_AUTHORITY_RESOURCE_KEY_SERVICE_ROLE_ARN": (
+                        f"arn:aws:iam::{CHECKER.ACCOUNT_ID}:role/{fn}-exec"
+                    ),
+                    "CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN": (
+                        cell["resource_key_envelope_kms_key_arn"]
+                    ),
+                    "CONNECTOR_AUTHORITY_RESOURCE_KEY_SOFTWARE_CUSTODY_ENABLED": (
+                        "true"
+                    ),
+                }
+            }]
         changes.append(
             {
                 "address": f'module.control.aws_lambda_function.authority["{fn}"]',
                 "mode": "managed",
                 "type": "aws_lambda_function",
-                "change": _runtime_create(
-                    {
-                        "function_name": fn,
-                        "description": (
-                            "Connector Authority "
-                            f"{CHECKER.AUTHORITY_RUNTIME_FUNCTIONS[fn]} (sandbox)"
-                        ),
-                        "package_type": "Image",
-                        "image_uri": image_uri,
-                        "reserved_concurrent_executions": spec[
-                            "steady_reserved_concurrency"
-                        ],
-                        "vpc_config": [
-                            {"subnet_ids": [], "security_group_ids": []}
-                        ],
-                    }
-                ),
+                "change": _runtime_create(function_after),
             }
         )
         for color in ("blue", "green"):
@@ -2332,7 +2510,6 @@ def _runtime_resource_changes() -> list[dict]:
                 ),
             }
         )
-        operation = CHECKER.AUTHORITY_RUNTIME_FUNCTIONS[fn]
         changes.append(
             {
                 "address": (
@@ -2683,6 +2860,79 @@ def legacy_authority_runtime_payload() -> dict:
     contract["provisioned_cells"].pop("cell1")
     contract["provisioned_cells_evidence"] = copy.deepcopy(evidence)
     return payload
+
+
+def connector_resource_predecessor_payload() -> dict:
+    """The exact live 11-function contract before creso is introduced."""
+    payload = copy.deepcopy(authority_runtime_input_with_concurrency())
+    contract = payload["authority_runtime_contract"]
+    evidence = copy.deepcopy(
+        CHECKER.AUTHORITY_CONNECTOR_RESOURCE_PREDECESSOR_EVIDENCE
+    )
+    contract["global"]["basis_evidence"] = evidence
+    contract["provisioned_cells_evidence"] = copy.deepcopy(evidence)
+    for function_name in CHECKER.AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS:
+        contract["functions"].pop(function_name)
+    for function in contract["functions"].values():
+        function["basis_evidence"] = copy.deepcopy(evidence)
+    for cell_id in CHECKER.AUTHORITY_CELLS:
+        worker = contract["global"]["caller_capacity"]["cell_workers"][cell_id]
+        worker["preinvoke_limits"].pop("resolve_connector_resource")
+        worker["preinvoke_rate_limits"].pop("resolve_connector_resource")
+        contract["provisioned_cells"][cell_id] = {
+            "caller_role_arn": contract["provisioned_cells"][cell_id][
+                "caller_role_arn"
+            ]
+        }
+    return payload
+
+
+def authority_connector_resource_expansion_fixture(
+    applied_addresses: set[str] | None = None,
+) -> dict:
+    """Exact live 11-function -> 13-function connector-resource migration."""
+    applied = applied_addresses or set()
+    result = authority_runtime_transition_fixture()
+    result["applyable"] = True
+    changes = {item["address"]: item for item in result["resource_changes"]}
+    create_addresses = set(
+        CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES
+    )
+    update_addresses = set(
+        CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES
+    )
+
+    for address, item in changes.items():
+        if address in create_addresses or address in update_addresses:
+            continue
+        change = item["change"]
+        change["actions"] = ["no-op"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+
+    foundation = changes[
+        "module.control.terraform_data.foundation_contract"
+    ]["change"]
+    before_payload = connector_resource_predecessor_payload()
+    after_payload = authority_runtime_input_with_concurrency()
+    foundation["actions"] = ["update"]
+    foundation["before"] = {
+        "input": copy.deepcopy(before_payload),
+        "output": copy.deepcopy(before_payload),
+    }
+    foundation["after"] = {
+        "input": copy.deepcopy(after_payload),
+        "output": copy.deepcopy(after_payload),
+    }
+    foundation["after_unknown"] = {}
+
+    for address in applied:
+        change = changes[address]["change"]
+        change["actions"] = ["no-op"]
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+
+    return result
 
 
 def legacy_authority_lambda_sg_before() -> dict:
@@ -7465,6 +7715,106 @@ class PlanContractTests(unittest.TestCase):
                         proof_policy_consumer=True,
                     )
 
+    def test_exact_connector_resource_runtime_expansion_passes(self) -> None:
+        candidate = authority_connector_resource_expansion_fixture()
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(
+            summary["plan_mode"], "authority-connector-resource-expansion"
+        )
+        changed = {
+            item["address"]
+            for item in candidate["resource_changes"]
+            if item["change"]["actions"] != ["no-op"]
+        }
+        self.assertEqual(len(CHECKER.AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS), 2)
+        self.assertEqual(
+            len(CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES),
+            32,
+        )
+        self.assertEqual(
+            changed,
+            set(CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES)
+            | set(CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES),
+        )
+
+    def test_connector_resource_expansion_partial_retry_passes(self) -> None:
+        creates = set(
+            CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES
+        )
+        updates = set(
+            CHECKER.AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES
+        )
+        complete = creates | updates
+        foundation_address = (
+            "module.control.terraform_data.foundation_contract"
+        )
+        last_nonfoundation = sorted(complete - {foundation_address})[-1]
+        progressions = {
+            # Terraform may fail before or after writing the contract record;
+            # neither ordering may broaden the exact missing-resource set.
+            "foundation-only": {
+                foundation_address
+            },
+            "one-create-only": {sorted(creates)[0]},
+            "one-update-only": {sorted(updates)[0]},
+            "all-creates": creates,
+            "all-updates": updates,
+            "one-resource-remaining": complete - {last_nonfoundation},
+        }
+
+        for state, applied in progressions.items():
+            with self.subTest(state=state):
+                summary = CHECKER.check_plan(
+                    authority_connector_resource_expansion_fixture(applied)
+                )
+                self.assertEqual(
+                    summary["plan_mode"],
+                    "authority-connector-resource-expansion",
+                )
+
+        # Once every exact member has applied, the retry must collapse to a
+        # true no-op. This is the state that releases the downstream workflow's
+        # fresh cell-plan authorization without accepting an extra mutation.
+        converged = authority_connector_resource_expansion_fixture(complete)
+        converged["applyable"] = False
+        summary = CHECKER.check_plan(converged)
+        self.assertEqual(
+            summary["plan_mode"], "no-op"
+        )
+
+    def test_connector_resource_expansion_rejects_predecessor_drift(self) -> None:
+        mutations = (
+            lambda contract: contract["global"]["basis_evidence"].__setitem__(
+                "sha256", "f" * 64
+            ),
+            lambda contract: contract["global"]["caller_capacity"][
+                "cell_workers"
+            ]["cell0"]["preinvoke_limits"].__setitem__(
+                "resolve_connector_resource", 1
+            ),
+            lambda contract: contract["provisioned_cells"]["cell1"].__setitem__(
+                "cell_table_prefix", "layerv-nhp-sandbox-cell1-cell1"
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                candidate = authority_connector_resource_expansion_fixture()
+                foundation = self.change(
+                    candidate, "module.control.terraform_data.foundation_contract"
+                )
+                mutation(
+                    foundation["before"]["input"]["authority_runtime_contract"]
+                )
+                self.assert_rejected(candidate)
+
+    def test_connector_resource_expansion_rejects_foreign_change(self) -> None:
+        candidate = authority_connector_resource_expansion_fixture()
+        foreign = self.change(
+            candidate, CHECKER.AUTHORITY_RUNTIME_SECRETS_ENDPOINT_ADDRESS
+        )
+        foreign["actions"] = ["update"]
+        self.assert_rejected(candidate)
+
     def test_exact_legacy_hub_runtime_expansion_passes(self) -> None:
         candidate = authority_runtime_legacy_expansion_fixture()
         summary = CHECKER.check_plan(candidate)
@@ -7769,7 +8119,7 @@ class PlanContractTests(unittest.TestCase):
             for color in ("blue", "green")
         })
         self.assertEqual(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES, expected)
-        self.assertEqual(len(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES), 39)
+        self.assertEqual(len(CHECKER.AUTHORITY_IMAGE_UPDATE_RESOURCES), 45)
 
     def test_authority_image_update_rejects_non_image_runtime_movement(
         self,
@@ -8449,7 +8799,7 @@ class PlanContractTests(unittest.TestCase):
             # runtime slice; the rest of the alarm set is NHP #3455's own slice.
             and item["address"] not in CHECKER.AUTHORITY_ALARM_RESOURCES
         }
-        # 11 functions x {exec role, exec policy, spillover alarm, log group}.
+        # 13 functions x {exec role, exec policy, spillover alarm, log group}.
         self.assertEqual(
             len(early_applied), 4 * len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
         )
@@ -8522,7 +8872,7 @@ class PlanContractTests(unittest.TestCase):
         projection on a base resource is now admitted by design and is covered by
         ``test_first_projection_outside_the_slice_is_admitted``: state that never
         recorded a value cannot evidence an out-of-band change, and the live
-        sandbox emits 106 such alarm projections (95 metric + 11 composite) on
+        sandbox emits 122 such alarm projections (109 metric + 13 composite) on
         base resources. What must stay rejected is a recorded value that changed,
         which is what this asserts."""
         role = next(
@@ -8917,6 +9267,117 @@ class PlanContractTests(unittest.TestCase):
         change["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
 
+    def test_connector_resource_runtime_rejects_control_query_grant(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = "layerv-nhp-sandbox-ca-creso-cell0"
+        change = self.change(
+            candidate,
+            f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+        )
+        policy = json.loads(change["after"]["policy"])
+        read = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ConnectorResourceControlRead"
+        )
+        read["Action"].append("dynamodb:Query")
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_table_sse_decrypt_grants(
+        self,
+    ) -> None:
+        for sid, resource in (
+            ("AuthorityDynamoDBDecrypt", RUNTIME_AUTHORITY_DATA_KEY_ARN),
+            (
+                "ConnectorResourceCellDynamoDBDecrypt",
+                CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS["cell0"][
+                    "cell_data_kms_key_arn"
+                ],
+            ),
+        ):
+            with self.subTest(sid=sid):
+                candidate = authority_runtime_transition_fixture()
+                fn = "layerv-nhp-sandbox-ca-creso-cell0"
+                change = self.change(
+                    candidate,
+                    f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+                )
+                policy = json.loads(change["after"]["policy"])
+                policy["Statement"].append(
+                    {
+                        "Sid": sid,
+                        "Effect": "Allow",
+                        "Action": ["kms:Decrypt"],
+                        "Resource": [resource],
+                        "Condition": {
+                            "StringEquals": {
+                                "kms:ViaService": (
+                                    f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                                )
+                            }
+                        },
+                    }
+                )
+                change["after"]["policy"] = json.dumps(policy)
+                self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_cell_prefix_drift(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = "layerv-nhp-sandbox-ca-creso-cell1"
+        change = self.change(
+            candidate,
+            f'module.control.aws_lambda_function.authority["{fn}"]',
+        )
+        change["after"]["environment"][0]["variables"][
+            "CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX"
+        ] = "layerv-nhp-sandbox-cell1"
+        self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_endpoint_widening(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        endpoint = self.change(
+            candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS
+        )
+        policy = json.loads(endpoint["after"]["policy"])
+        cell = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ConnectorResourceCellData"
+        )
+        cell["Resource"].append("*")
+        endpoint["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_envelope_context_drift(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        endpoint = self.change(
+            candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS
+        )
+        policy = json.loads(endpoint["after"]["policy"])
+        envelope = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ConnectorResourceGenerateEnvelopeDataKey"
+        )
+        envelope["Condition"]["StringEquals"].pop(
+            "kms:EncryptionContext:purpose"
+        )
+        endpoint["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_contract_rejects_live_prefix_rename(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        foundation = self.change(
+            candidate, "module.control.terraform_data.foundation_contract"
+        )
+        foundation["after"]["input"]["authority_runtime_contract"][
+            "provisioned_cells"
+        ]["cell1"]["cell_table_prefix"] = "layerv-nhp-sandbox-cell1"
+        self.assert_rejected(candidate)
+
     def test_authority_runtime_rejects_refresh_exec_kms_statement(self) -> None:
         # RefreshAssignment builds no KMS client; a Sign statement must be rejected.
         candidate = authority_runtime_transition_fixture()
@@ -9042,7 +9503,7 @@ class PlanContractTests(unittest.TestCase):
 
     def test_exact_authority_alarm_routing_slice_passes(self) -> None:
         """The transition this rollout actually uses: functions settled, alarms
-        moving. 106 creates plus the 11 spillover alarms gaining actions, and
+        moving. 122 creates plus the 13 spillover alarms gaining actions, and
         nothing else."""
         candidate = authority_alarm_routing_fixture()
         summary = CHECKER.check_plan(candidate)
@@ -9053,12 +9514,12 @@ class PlanContractTests(unittest.TestCase):
             if item["change"]["actions"] != ["no-op"]
         }
         self.assertEqual(
-            sum(1 for actions in changed.values() if actions == ["create"]), 106
+            sum(1 for actions in changed.values() if actions == ["create"]), 122
         )
         self.assertEqual(
-            sum(1 for actions in changed.values() if actions == ["update"]), 11
+            sum(1 for actions in changed.values() if actions == ["update"]), 13
         )
-        self.assertEqual(len(changed), 117)
+        self.assertEqual(len(changed), 135)
 
     def test_alarm_routing_slice_still_validates_alarm_contents(self) -> None:
         """The dispatch proof for the mode above.
@@ -9332,7 +9793,7 @@ class PlanContractTests(unittest.TestCase):
         family sets one and leaves the other unset. A CREATION plan renders the
         unset one as ``null``, but once applied, the provider reads an absent
         optional string back as ``""`` — so every steady-state plan carries
-        ``""`` and the verify lane rejected all 55 live alarms (11 functions x 5
+        ``""`` and the verify lane rejected all 65 live alarms (13 functions x 5
         families) as shape drift when the alarms were in fact exactly correct.
 
         The other alarm fixtures build ``after`` from
@@ -11981,7 +12442,7 @@ class LiveContractTests(unittest.TestCase):
 
     def test_live_boundary_admits_the_legacy_hub_predecessor(self) -> None:
         # This proof runs BEFORE the expansion apply, so the live set is still
-        # the legacy Hub trio. Admitting only the complete 11 made the expansion
+        # the legacy Hub trio. Admitting only the complete 13 made the expansion
         # unappliable -- the gate demanded the functions the apply creates.
         # Observed on control-update-apply run 30220568057.
         for extra in ((), (CHECKER.HUB_KEYGEN_FUNCTION_NAME,)):
@@ -12008,7 +12469,7 @@ class LiveContractTests(unittest.TestCase):
 
     def test_live_boundary_rejects_partial_expansion_shapes(self) -> None:
         # Only the two exact endpoints are admitted. Anything part-way through
-        # the 3 -> 11 expansion, or either set missing a member, fails closed.
+        # the 3 -> 13 expansion, or either set missing a member, fails closed.
         complete = list(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
         legacy = list(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
         partial = legacy + [n for n in complete if n not in legacy][:1]
@@ -12563,10 +13024,10 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
         )
 
     def test_observed_fence_plus_alarm_change_set_composes(self) -> None:
-        """The exact 126-address change set the sandbox Control plan produced.
+        """The exact 144-address change set the sandbox Control plan produces.
 
-        Reconstructed from the observed PR-time failure: the 106 pending alarm
-        creates, the 11 in-place spillover updates, the 8 pending Hub
+        Reconstructed from the observed failure class: the 122 pending alarm
+        creates, the 13 in-place spillover updates, the 8 pending Hub
         source-fence actions, and the still-pending Hub identity publication.
         Before the alarm subtraction the fence candidate is not a subset of the
         reviewed fence actions (which is exactly why the plan was rejected);
@@ -12580,7 +13041,7 @@ class HubSourceFenceTransitionTests(unittest.TestCase):
         observed = (
             alarm_slice_changed | set(CHECKER.HUB_SOURCE_FENCE_ACTIONS) | {identity}
         )
-        self.assertEqual(len(observed), 126)
+        self.assertEqual(len(observed), 144)
 
         candidate = observed - {identity}
         self.assertFalse(
@@ -13330,7 +13791,7 @@ class FirstProjectionDriftTests(unittest.TestCase):
         # The counterpart to
         # test_authority_runtime_slice_completion_rejects_drift_outside_slice:
         # base-resource drift that never held a prior value is admitted without
-        # any reviewed kind. This is the live sandbox shape (106 alarm
+        # any reviewed kind. This is the sandbox shape (122 alarm
         # projections on base resources during a slice completion).
         role = next(
             item["address"]
@@ -14415,19 +14876,22 @@ class ComposedTransitionTest(unittest.TestCase):
                     )
 
     def test_blue_green_hold_data_slice_membership(self) -> None:
-        """26 instances: 13 runtime functions x both colours, keyed fn:colour."""
+        """26 reads: 15 functions minus two creso bootstraps, x both colours."""
         slice_ = CHECKER.AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES
         self.assertEqual(len(slice_), 26)
         self.assertEqual(
-            len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF), 13
+            len(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF), 15
         )
         for fn in CHECKER.AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF:
             for color in ("blue", "green"):
-                self.assertIn(
+                address = (
                     "module.control.data.aws_lambda_alias."
-                    f'authority_live["{fn}:{color}"]',
-                    slice_,
+                    f'authority_live["{fn}:{color}"]'
                 )
+                if fn in CHECKER.AUTHORITY_ALIAS_HOLD_BOOTSTRAP_FUNCTIONS:
+                    self.assertNotIn(address, slice_)
+                else:
+                    self.assertIn(address, slice_)
 
     def rehome_fixture(self) -> dict:
         """A window-close carrying one steady-PC re-home blue -> green."""
@@ -15439,8 +15903,8 @@ class ComposedTransitionTest(unittest.TestCase):
         self,
     ) -> None:
         """A partial delete-first re-home set IS the mid-flip hazard; only the
-        complete 11-function recovery classifies (review #3855, aligning the
-        Python elif with the shell fence's exactly-the-11 witness)."""
+        complete 13-function recovery classifies (review #3855, aligning the
+        Python elif with the shell fence's exactly-the-13 witness)."""
         with self.assertRaisesRegex(
             CHECKER.ContractError, "must be an exact no-op"
         ):
@@ -16288,10 +16752,10 @@ class SliceAndAuthorityDigestDriftCompositionTest(unittest.TestCase):
         """The exact 27-entry drift that blocked every Control plan.
 
         22 runtime-slice + 4 proof-function exec identities + 1 digest.
-        AUTHORITY_RUNTIME_RESOURCES covers only the ELEVEN runtime functions, so
+        AUTHORITY_RUNTIME_RESOURCES covers only the THIRTEEN runtime functions, so
         the two proof functions (ca-pcr, ca-pm) sit outside the slice and their
         exec role and policy broke the subset test -- even though their drift is
-        the same benign re-projection as the other eleven.
+        the same benign re-projection as the other thirteen.
 
         Built from the constants rather than a literal list, so it keeps
         describing reality if the function set changes.
@@ -16304,7 +16768,7 @@ class SliceAndAuthorityDigestDriftCompositionTest(unittest.TestCase):
             ):
                 drift.append(self.entry(template.format(function)))
         drift.append(self.entry(CHECKER._AUTHORITY_DIGEST_ADDRESS))
-        self.assertEqual(len(drift), 27)
+        self.assertEqual(len(drift), 31)
         with mock.patch.object(
             CHECKER, "_check_digest_normalization", lambda *a, **k: None
         ), mock.patch.object(

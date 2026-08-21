@@ -43,21 +43,15 @@ func TestConformanceVectors(t *testing.T) {
 	if cf.Artifact != ConformanceArtifactID {
 		t.Fatalf("unexpected artifact id %q", cf.Artifact)
 	}
-	// Pin the schema version this test understands. The loader only rejects a
-	// zero/absent version (so any consumer fails on a malformed file); pinning the
-	// exact value HERE makes a future breaking bump fail loudly against the v1
-	// structs rather than silently misparsing a new shape. A consumer in another
-	// language should assert its supported version the same way (the README tells
-	// vendors to assert artifact + version).
-	if cf.SchemaVersion != 1 {
-		t.Fatalf("this test understands schema_version 1, artifact declares %d", cf.SchemaVersion)
+	if cf.SchemaVersion != conformanceSchemaVersion {
+		t.Fatalf("this test understands schema_version %d, artifact declares %d", conformanceSchemaVersion, cf.SchemaVersion)
 	}
 
 	// Every class named in the task must be present; a renamed/dropped class is a
 	// silent coverage loss, so assert the taxonomy up front.
 	for _, want := range []string{
 		"claims_parse", "secret_parse", "strict_base64",
-		"fragment", "relay_allowlist", "server_id",
+		"fragment", "transport", "relay_allowlist", "server_id",
 	} {
 		if _, ok := cf.Classes[want]; !ok {
 			t.Fatalf("conformance artifact missing required class %q", want)
@@ -75,8 +69,40 @@ func TestConformanceVectors(t *testing.T) {
 	t.Run("secret_parse", func(t *testing.T) { runSecretParseClass(t, cf.Classes["secret_parse"]) })
 	t.Run("strict_base64", func(t *testing.T) { runStrictBase64Class(t, cf.Classes["strict_base64"]) })
 	t.Run("fragment", func(t *testing.T) { runFragmentClass(t, cf.Classes["fragment"]) })
+	t.Run("transport", func(t *testing.T) { runTransportClass(t, cf.Classes["transport"]) })
 	t.Run("relay_allowlist", func(t *testing.T) { runRelayAllowlistClass(t, cf.Classes["relay_allowlist"]) })
 	t.Run("server_id", func(t *testing.T) { runServerIDClass(t, cf.Classes["server_id"]) })
+}
+
+// runTransportClass drives the share-safe outer framing vectors through NHP's
+// real decoder. Accepts must reconstruct the canonical qv2 fragment byte for
+// byte; rejects must return the dedicated transport sentinel before any inner
+// parse or signature semantics are considered.
+func runTransportClass(t *testing.T, class ConformanceClass) {
+	requireNonEmpty(t, "transport", class)
+	for _, v := range class.Vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			got, err := DecodeTransport(v.TransportFragment)
+			switch v.Expect {
+			case conformanceAccept:
+				if err != nil {
+					t.Fatalf("accept transport vector failed: %v", err)
+				}
+				if got != v.CanonicalFragment {
+					t.Fatalf("canonical fragment mismatch\n got: %q\nwant: %q", got, v.CanonicalFragment)
+				}
+			case conformanceReject:
+				if !errors.Is(err, ErrTransport) {
+					t.Fatalf("reject transport vector must return ErrTransport, got %v", err)
+				}
+				if got != "" {
+					t.Fatalf("reject transport vector returned partial output %q", got)
+				}
+			default:
+				t.Fatalf("unknown expect %q", v.Expect)
+			}
+		})
+	}
 }
 
 // runSignatureClass proves the signature class is COMPOSED, not duplicated: it
@@ -475,6 +501,7 @@ var allowedRejectClasses = map[string]map[string]struct{}{
 	"secret_parse":    {rejectClassParse: {}, rejectClassKeyLength: {}},
 	"strict_base64":   {rejectClassEncoding: {}},
 	"fragment":        {rejectClassFragment: {}},
+	"transport":       {rejectClassTransport: {}},
 	"relay_allowlist": {rejectClassRelayURL: {}},
 }
 

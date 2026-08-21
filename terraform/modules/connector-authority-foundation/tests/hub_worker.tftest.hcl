@@ -133,7 +133,13 @@ variables {
     selected_authority_color = "blue"
     provisioned_cells = {
       cell0 = {
-        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        caller_role_arn                       = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        cell_table_prefix                     = "layerv-nhp-sandbox-cell0"
+        qurl_resources_table_arn              = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"
+        qurl_resource_key_material_table_arn  = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resource-key-material"
+        cell_data_kms_key_arn                 = "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02"
+        resource_key_envelope_kms_key_arn     = "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96"
+        resource_key_software_custody_enabled = true
       }
     }
     provisioned_cells_evidence = {
@@ -188,12 +194,14 @@ variables {
               activate_registration        = 1
               complete_registration        = 1
               complete_credential_recovery = 1
+              resolve_connector_resource   = 1
             }
             preinvoke_rate_limits = {
               issue_registration_otp       = { burst = 1, refill_per_second = 1 }
               activate_registration        = { burst = 1, refill_per_second = 1 }
               complete_registration        = { burst = 1, refill_per_second = 1 }
               complete_credential_recovery = { burst = 1, refill_per_second = 1 }
+              resolve_connector_resource   = { burst = 1, refill_per_second = 1 }
             }
           }
         }

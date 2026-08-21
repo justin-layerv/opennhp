@@ -133,7 +133,7 @@ if [[ -n "$plan_json" ]]; then
   # The recovery re-homes exactly those pools (delete,create) and NOTHING else
   # is destructive -- no task-def replacement, no contract change. Admitted only
   # when every destructive action is such a re-home.
-  # The 11 runtime-function steady pools (proof pm/pcr excluded -- they are
+  # The 13 runtime-function steady pools (proof pm/pcr excluded -- they are
   # gone after the teardown). The recovery re-homes the COMPLETE set together;
   # a partial set is itself a hazard and a lone re-home (e.g. an unknown
   # function) must still fall through to the refusal.
@@ -145,6 +145,8 @@ if [[ -n "$plan_json" ]]; then
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ccr-cell1\"]",
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-cr-cell0\"]",
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-cr-cell1\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-creso-cell0\"]",
+      "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-creso-cell1\"]",
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-ia\"]",
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-icr\"]",
       "module.control.aws_lambda_provisioned_concurrency_config.authority[\"layerv-nhp-sandbox-ca-iro-cell0\"]",
@@ -157,7 +159,7 @@ if [[ -n "$plan_json" ]]; then
       | .address
     ] | sort) as $destroyed
     | $destroyed == ($expected | sort)
-    # Delete-first ONLY: a selector flip re-homes the same 11 addresses
+    # Delete-first ONLY: a selector flip re-homes the same 13 addresses
     # create-before-destroy, and this flag must stay false there so the two
     # recovery shapes cannot be misread as simultaneously live (review #3855).
     and ([

@@ -1577,6 +1577,14 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 		return strictErr
 	}
 
+	// Post-registration Connector resource discovery is an exact, strict
+	// registered-agent LST/LRT operation. Keep it ahead of recovery and generic
+	// ListService so malformed claimed requests cannot escape to permissive plugin
+	// decoding and ordinary recovery remains on its disjoint query.
+	if handled, strictErr := s.handleDirectConnectorResource(ppd); handled {
+		return strictErr
+	}
+
 	// Assigned-cell credential recovery is a direct-UDP-only capability. This
 	// branch must stay before buildListResult: that shared plugin seam is also
 	// reachable from HandleRelayForward, clones secret-bearing RawBody, and

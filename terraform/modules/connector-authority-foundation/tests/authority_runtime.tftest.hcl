@@ -1,5 +1,5 @@
 # Plan-only tests for the complete Connector Authority Lambda runtime. They
-# prove the two-cell measurement graph deploys exactly 3 Hub + 4-per-cell
+# prove the two-cell measurement graph deploys exactly 3 Hub + 5-per-cell
 # functions, both closed aliases, steady concurrency, per-operation IAM, and
 # the exact dependency endpoints; that the same contract with the gate off
 # creates nothing; and that the gate fails closed against a null contract.
@@ -168,10 +168,22 @@ variables {
     selected_authority_color = "blue"
     provisioned_cells = {
       cell0 = {
-        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        caller_role_arn                       = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-server"
+        cell_table_prefix                     = "layerv-nhp-sandbox-cell0"
+        qurl_resources_table_arn              = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"
+        qurl_resource_key_material_table_arn  = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resource-key-material"
+        cell_data_kms_key_arn                 = "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02"
+        resource_key_envelope_kms_key_arn     = "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96"
+        resource_key_software_custody_enabled = true
       }
       cell1 = {
-        caller_role_arn = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        caller_role_arn                       = "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-cell1-server"
+        cell_table_prefix                     = "layerv-nhp-sandbox-cell1-cell1"
+        qurl_resources_table_arn              = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resources"
+        qurl_resource_key_material_table_arn  = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material"
+        cell_data_kms_key_arn                 = "arn:aws:kms:us-east-2:767397897469:key/fc5121da-c353-4621-b24b-7ec5f79446bd"
+        resource_key_envelope_kms_key_arn     = "arn:aws:kms:us-east-2:767397897469:key/1ff3c518-1653-4126-ab7e-039a7e6ab0ff"
+        resource_key_software_custody_enabled = true
       }
     }
     provisioned_cells_evidence = {
@@ -226,12 +238,14 @@ variables {
               activate_registration        = 1
               complete_registration        = 1
               complete_credential_recovery = 1
+              resolve_connector_resource   = 1
             }
             preinvoke_rate_limits = {
               issue_registration_otp       = { burst = 1, refill_per_second = 1 }
               activate_registration        = { burst = 1, refill_per_second = 1 }
               complete_registration        = { burst = 1, refill_per_second = 1 }
               complete_credential_recovery = { burst = 1, refill_per_second = 1 }
+              resolve_connector_resource   = { burst = 1, refill_per_second = 1 }
             }
           }
           cell1 = {
@@ -241,12 +255,14 @@ variables {
               activate_registration        = 1
               complete_registration        = 1
               complete_credential_recovery = 1
+              resolve_connector_resource   = 1
             }
             preinvoke_rate_limits = {
               issue_registration_otp       = { burst = 1, refill_per_second = 1 }
               activate_registration        = { burst = 1, refill_per_second = 1 }
               complete_registration        = { burst = 1, refill_per_second = 1 }
               complete_credential_recovery = { burst = 1, refill_per_second = 1 }
+              resolve_connector_resource   = { burst = 1, refill_per_second = 1 }
             }
           }
         }
@@ -321,10 +337,12 @@ variables {
         "layerv-nhp-sandbox-ca-ar-cell0",
         "layerv-nhp-sandbox-ca-cr-cell0",
         "layerv-nhp-sandbox-ca-ccr-cell0",
+        "layerv-nhp-sandbox-ca-creso-cell0",
         "layerv-nhp-sandbox-ca-iro-cell1",
         "layerv-nhp-sandbox-ca-ar-cell1",
         "layerv-nhp-sandbox-ca-cr-cell1",
         "layerv-nhp-sandbox-ca-ccr-cell1",
+        "layerv-nhp-sandbox-ca-creso-cell1",
         ]) : function_name => {
         steady_provisioned_concurrency          = 2
         steady_reserved_concurrency             = 4
@@ -388,20 +406,100 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
 
   assert {
     condition = (
-      length(aws_lambda_function.authority) == 11 &&
-      length(aws_lambda_alias.authority) == 22 &&
-      length(aws_iam_role.authority_exec) == 11 &&
-      length(aws_iam_role_policy.authority_exec) == 11 &&
-      length(aws_lambda_provisioned_concurrency_config.authority) == 11 &&
-      length(aws_cloudwatch_log_group.authority) == 11 &&
-      length(aws_cloudwatch_metric_alarm.authority_spillover) == 11 &&
+      length(aws_lambda_function.authority) == 13 &&
+      length(aws_lambda_alias.authority) == 26 &&
+      length(aws_iam_role.authority_exec) == 13 &&
+      length(aws_iam_role_policy.authority_exec) == 13 &&
+      length(aws_lambda_provisioned_concurrency_config.authority) == 13 &&
+      length(aws_cloudwatch_log_group.authority) == 13 &&
+      length(aws_cloudwatch_metric_alarm.authority_spillover) == 13 &&
       length(aws_security_group.authority_lambda) == 1 &&
       length(aws_vpc_security_group_egress_rule.authority_interface_endpoints) == 1 &&
       length(aws_vpc_security_group_egress_rule.authority_dynamodb) == 1 &&
       length(aws_vpc_security_group_egress_rule.authority_otp_redis) == 1 &&
       length(aws_vpc_security_group_ingress_rule.otp_redis_authority) == 1
     )
-    error_message = "The runtime must plan exactly 11 functions, 22 closed aliases, 11 exec roles/policies, 11 provisioned-concurrency configs, 11 log groups, 11 spillover alarms, and 1 function SG."
+    error_message = "The runtime must plan exactly 13 functions, 26 closed aliases, 13 exec roles/policies, 13 provisioned-concurrency configs, 13 log groups, 13 spillover alarms, and 1 function SG."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_OPERATION == "ResolveConnectorResource" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX == "layerv-nhp-sandbox-cell0" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN == "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN == "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_RESOURCE_KEY_SERVICE_ROLE_ARN == "arn:aws:iam::767397897469:role/layerv-nhp-sandbox-ca-creso-cell0-exec" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell0"].environment[0].variables.CONNECTOR_AUTHORITY_RESOURCE_KEY_SOFTWARE_CUSTODY_ENABLED == "true" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell1"].environment[0].variables.CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX == "layerv-nhp-sandbox-cell1-cell1" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell1"].environment[0].variables.CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN == "arn:aws:kms:us-east-2:767397897469:key/fc5121da-c353-4621-b24b-7ec5f79446bd" &&
+      aws_lambda_function.authority["layerv-nhp-sandbox-ca-creso-cell1"].environment[0].variables.CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN == "arn:aws:kms:us-east-2:767397897469:key/1ff3c518-1653-4126-ab7e-039a7e6ab0ff"
+    )
+    error_message = "Each creso function must receive its exact Terraform-owned canonical or doubled-legacy table prefix, raw cell/envelope CMKs, own execution role, and custody mode."
+  }
+
+  assert {
+    condition = alltrue([
+      for cell_id in ["cell0", "cell1"] :
+      (
+        toset({
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+          statement.Sid => statement
+        }["ConnectorResourceControlRead"].Action) == toset(["dynamodb:GetItem"]) &&
+        toset({
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+          statement.Sid => statement
+        }["ConnectorResourceCellResourceData"].Action) == toset(["dynamodb:GetItem", "dynamodb:TransactWriteItems", "dynamodb:UpdateItem"]) &&
+        toset({
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+          statement.Sid => statement
+        }["ConnectorResourceCellKeyMaterial"].Action) == toset(["dynamodb:DeleteItem", "dynamodb:PutItem"]) &&
+        contains([
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
+        ], "ConnectorResourceGenerateEnvelopeDataKey") &&
+        !contains([
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
+        ], "ConnectorResourceCreateHardwareKey") &&
+        !contains([
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
+        ], "AuthorityDynamoDBDecrypt") &&
+        !contains([
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
+        ], "ConnectorResourceCellDynamoDBDecrypt") &&
+        length(setintersection(
+          toset(flatten([
+            for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+            try(tolist(statement.Action), [statement.Action])
+          ])),
+          toset(["dynamodb:Query", "dynamodb:Scan", "kms:Decrypt", "kms:PutKeyPolicy", "kms:Sign", "kms:TagResource"]),
+        )) == 0
+      )
+    ])
+    error_message = "creso IAM must carry only the exact Control/cell read-write and software-envelope capabilities; Query, Scan, Sign, key-policy mutation, and tag mutation stay absent."
+  }
+
+  assert {
+    condition = (
+      toset({
+        for statement in jsondecode(aws_vpc_endpoint.dynamodb.policy).Statement :
+        statement.Sid => statement
+        }["ConnectorResourceCellData"].Resource) == toset([
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resource-key-material",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material",
+        "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell1-cell1-qurl-resources",
+      ]) &&
+      toset({
+        for statement in jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement :
+        statement.Sid => statement
+        }["ConnectorResourceGenerateEnvelopeDataKey"].Resource) == toset([
+        "arn:aws:kms:us-east-2:767397897469:key/1ff3c518-1653-4126-ab7e-039a7e6ab0ff",
+        "arn:aws:kms:us-east-2:767397897469:key/eb55226b-3443-4913-8266-ac68c66efe96",
+      ]) &&
+      !contains([
+        for statement in jsondecode(aws_vpc_endpoint.interface["kms"].policy).Statement : statement.Sid
+      ], "ConnectorResourceCreateHardwareKey")
+    )
+    error_message = "Dependency endpoint policies must admit the exact cell tables and raw envelope keys to creso without rendering empty hardware-custody statements."
   }
 
   assert {
@@ -614,20 +712,20 @@ run "alarm_set_is_complete_and_every_alarm_is_actionable" {
 
   assert {
     condition = (
-      length(aws_cloudwatch_metric_alarm.authority_spillover) == 11 &&
-      length(aws_cloudwatch_metric_alarm.authority_runtime) == 55 &&
-      length(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization) == 11 &&
-      length(aws_cloudwatch_metric_alarm.authority_terminal_outcome) == 22 &&
+      length(aws_cloudwatch_metric_alarm.authority_spillover) == 13 &&
+      length(aws_cloudwatch_metric_alarm.authority_runtime) == 65 &&
+      length(aws_cloudwatch_composite_alarm.authority_non_provisioned_initialization) == 13 &&
+      length(aws_cloudwatch_metric_alarm.authority_terminal_outcome) == 26 &&
       length(aws_cloudwatch_metric_alarm.authority_admission_rejected) == 8 &&
       length(aws_cloudwatch_metric_alarm.authority_adapter_contract_violation) == 4 &&
       length(aws_cloudwatch_metric_alarm.authority_adapter_late_result) == 4 &&
       length(aws_cloudwatch_metric_alarm.authority_completion_identity_rejected) == 2
     )
-    error_message = "The runtime alarm set must be exactly 11 spillover + 55 platform + 11 composite + 22 terminal-outcome + 8 admission + 4 contract-violation + 4 late-result + 2 completion-identity alarms."
+    error_message = "The runtime alarm set must be exactly 13 spillover + 65 platform + 13 composite + 26 terminal-outcome + 8 admission + 4 contract-violation + 4 late-result + 2 completion-identity alarms."
   }
 
   # Omitting a function from any per-function alarm family is the failure this
-  # catches: every one of the 11 functions must carry all five platform alarms,
+  # catches: every one of the 13 functions must carry all five platform alarms,
   # the spillover alarm, the composite, and both terminal-outcome alarms.
   assert {
     condition = alltrue(flatten([
@@ -1112,6 +1210,17 @@ run "ssm_pointer_steers_every_colour_bearing_rendering" {
   assert {
     condition     = local.authority_runtime_selected_color == "green"
     error_message = "With the pointer gate on, the effective selector must be the SSM value."
+  }
+
+  assert {
+    condition = (
+      length(data.aws_lambda_alias.authority_live) == 22 &&
+      alltrue([
+        for key, alias in data.aws_lambda_alias.authority_live :
+        !strcontains(key, "-creso-")
+      ])
+    )
+    error_message = "The live-alias hold must read all 22 established aliases and bootstrap only the four new creso aliases."
   }
 
   assert {

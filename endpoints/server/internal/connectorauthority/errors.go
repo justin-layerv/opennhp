@@ -1,6 +1,10 @@
 package connectorauthority
 
-import "fmt"
+import (
+	"fmt"
+
+	conformance "github.com/layervai/qurl-conformance"
+)
 
 // Operation identifies one fixed authority capability. It is safe for error reporting.
 type Operation string
@@ -13,6 +17,7 @@ const (
 	OperationActivateRegistration       Operation = "activate_registration"
 	OperationCompleteRegistration       Operation = "complete_registration"
 	OperationCompleteCredentialRecovery Operation = "complete_credential_recovery"
+	OperationResolveConnectorResource   Operation = conformance.ConnectorResourceLSTV1AuthorityOperation
 )
 
 // FailureKind is a redacted, programmatic invocation failure classification.

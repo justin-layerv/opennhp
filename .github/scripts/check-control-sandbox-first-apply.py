@@ -553,7 +553,7 @@ LEGACY_OTP_REDIS_USER_TYPE = "aws_elasticache_user"
 # Connector Authority runtime slice (Step 4).
 #
 # The runtime deploys the complete frozen two-cell graph: 3 Hub functions plus
-# 4 functions for each of cell0/cell1, both closed blue/green aliases, per-operation
+# 5 functions for each of cell0/cell1, both closed blue/green aliases, per-operation
 # execution roles, steady provisioned/reserved concurrency, spillover alarms,
 # a dedicated function SG, and the lockstep opening of only the dependency
 # endpoints those functions reach. It is an
@@ -587,6 +587,7 @@ AUTHORITY_CELL_OPERATION_SUFFIXES = {
     "ar": "activate_registration",
     "cr": "complete_registration",
     "ccr": "complete_credential_recovery",
+    "creso": "resolve_connector_resource",
 }
 AUTHORITY_RUNTIME_CELL_FUNCTIONS = {
     f"{CONTROL_PREFIX.removesuffix('-control')}-ca-{suffix}-{cell_id}": operation
@@ -597,6 +598,11 @@ AUTHORITY_RUNTIME_FUNCTIONS = {
     **AUTHORITY_RUNTIME_HUB_FUNCTIONS,
     **AUTHORITY_RUNTIME_CELL_FUNCTIONS,
 }
+AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS = frozenset(
+    function_name
+    for function_name, operation in AUTHORITY_RUNTIME_CELL_FUNCTIONS.items()
+    if operation == "resolve_connector_resource"
+)
 AUTHORITY_PROOF_FUNCTIONS = {
     AUTHORITY_PROOF_FUNCTION_NAME: AUTHORITY_PROOF_OPERATION,
     AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME: AUTHORITY_PROOF_RECOVERY_OPERATION,
@@ -688,6 +694,7 @@ AUTHORITY_OPERATION_CONFORMANCE_NAME = {
     "activate_registration": "ActivateRegistration",
     "complete_registration": "CompleteRegistration",
     "complete_credential_recovery": "CompleteCredentialRecovery",
+    "resolve_connector_resource": "ResolveConnectorResource",
     "mutate_proof_agent": "MutateProofAgent",
     "prepare_proof_credential_recovery": "PrepareProofCredentialRecovery",
 }
@@ -834,6 +841,18 @@ AUTHORITY_ALARM_RESOURCES = {
     if address not in AUTHORITY_PROOF_ALARM_RESOURCES
 }
 AUTHORITY_RUNTIME_RESOURCES.update(AUTHORITY_ALARM_RESOURCES)
+# Exact create-only half of the one-time 11 -> 13 runtime migration. Match the
+# quoted Terraform for_each key, not a suffix or operation substring, so a new
+# resource family is admitted only when it belongs to one of the two reviewed
+# creso functions. Shared runtime resources remain outside this set.
+AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES = frozenset(
+    address
+    for address in AUTHORITY_RUNTIME_RESOURCES
+    if any(
+        f'"{function_name}' in address
+        for function_name in AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS
+    )
+)
 AUTHORITY_PROOF_RESOURCES: dict[str, str] = {
     **AUTHORITY_PROOF_ALARM_RESOURCES,
 }
@@ -887,12 +906,23 @@ AUTHORITY_PROOF_CONSUMER_LIVE_ALIAS_DATA_RESOURCES = frozenset(
     for function_name in AUTHORITY_PROOF_CONSUMER_FUNCTIONS
     for color in ("blue", "green")
 )
-# The blue/green hold reads every runtime alias's live version so the selected
-# colour can keep serving it; all 13 functions x both colours, present in state
-# exactly while the hold gate is on.
+# New operations have no aliases to read on their first apply. This exact
+# temporary set must match authority_alias_hold_bootstrap_operations in
+# authority_runtime.tf and be emptied after the rollout ledger proves the
+# aliases exist.
+AUTHORITY_ALIAS_HOLD_BOOTSTRAP_FUNCTIONS = frozenset(
+    {
+        "layerv-nhp-sandbox-ca-creso-cell0",
+        "layerv-nhp-sandbox-ca-creso-cell1",
+    }
+)
+# The blue/green hold reads every established runtime alias's live version so
+# the selected colour can keep serving it. The four creso aliases are the exact
+# first-apply bootstrap exception; all other functions remain closed.
 AUTHORITY_BLUE_GREEN_LIVE_ALIAS_DATA_RESOURCES = frozenset(
     f'module.control.data.aws_lambda_alias.authority_live["{_fn}:{_color}"]'
     for _fn in AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
+    if _fn not in AUTHORITY_ALIAS_HOLD_BOOTSTRAP_FUNCTIONS
     for _color in ("blue", "green")
 )
 AUTHORITY_PROOF_ROLLOUT_LIVE_ALIAS_DATA_RESOURCES = frozenset(
@@ -987,7 +1017,7 @@ AUTHORITY_RUNTIME_LEGACY_EXPANSION_REPLACE_ADDRESSES = frozenset(
 # The reviewed image migration retags every Authority function that exists in
 # the complete sandbox graph. The target image is the first published artifact
 # containing the attended-proof PM/PCR operations, so the two proof functions
-# participate alongside the eleven steady runtime functions. Keep the admitted
+# participate alongside the thirteen steady runtime functions. Keep the admitted
 # set to immutable-image function and alias updates only.
 AUTHORITY_IMAGE_UPDATE_RESOURCES = {
     address: resource_type
@@ -1078,6 +1108,17 @@ AUTHORITY_RUNTIME_LEGACY_HUB_EVIDENCE_CANDIDATES = tuple(
         ),
     )
 )
+# The currently applied 11-function sandbox contract. The connector-resource
+# expansion reconstructs this complete predecessor from the validated 13-
+# function after-contract and accepts it only at this reviewed evidence point.
+# This is a rollout transition pin, not a list of generally supported bases.
+AUTHORITY_CONNECTOR_RESOURCE_PREDECESSOR_EVIDENCE = {
+    "path": "docs/evidence/connector-authority/v1/sandbox-measurement-basis.json",
+    "repository": "layervai/nhp",
+    "schema_version": 1,
+    "sha256": "f67fe72ee1b390dae9cfb9e27c43b6c82d9f4860e2ebc696f4e001bdf1fa6b27",
+    "source_commit": "7002a9edf80426cf4eef3f5419f2deb172592613",
+}
 _AUTHORITY_FUNCTION_UPDATE_COMPUTED_FIELDS = frozenset(
     {"last_modified", "qualified_arn", "qualified_invoke_arn", "version"}
 )
@@ -1645,6 +1686,76 @@ AUTHORITY_RUNTIME_TABLE_ARNS = {
         f"{CONTROL_PREFIX}-connector-authority"
     ),
 }
+# Terraform-owned assigned-cell topology for ResolveConnectorResource. These
+# are raw key ARNs and exact table prefixes, not aliases or runtime discovery.
+# cell1 deliberately retains its live doubled legacy prefix; renaming the live
+# tables is outside this additive rollout.
+AUTHORITY_CONNECTOR_RESOURCE_CELLS = {
+    "cell0": {
+        "caller_role_arn": (
+            f"arn:aws:iam::{ACCOUNT_ID}:role/layerv-nhp-sandbox-server"
+        ),
+        "cell_table_prefix": "layerv-nhp-sandbox-cell0",
+        "qurl_resources_table_arn": (
+            f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+            "layerv-nhp-sandbox-cell0-qurl-resources"
+        ),
+        "qurl_resource_key_material_table_arn": (
+            f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+            "layerv-nhp-sandbox-cell0-qurl-resource-key-material"
+        ),
+        "cell_data_kms_key_arn": (
+            f"arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
+            "49224991-f4c7-4e02-bb23-0003e6326d02"
+        ),
+        "resource_key_envelope_kms_key_arn": (
+            f"arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
+            "eb55226b-3443-4913-8266-ac68c66efe96"
+        ),
+        "resource_key_software_custody_enabled": True,
+    },
+    "cell1": {
+        "caller_role_arn": (
+            f"arn:aws:iam::{ACCOUNT_ID}:role/layerv-nhp-sandbox-cell1-server"
+        ),
+        "cell_table_prefix": "layerv-nhp-sandbox-cell1-cell1",
+        "qurl_resources_table_arn": (
+            f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+            "layerv-nhp-sandbox-cell1-cell1-qurl-resources"
+        ),
+        "qurl_resource_key_material_table_arn": (
+            f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+            "layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material"
+        ),
+        "cell_data_kms_key_arn": (
+            f"arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
+            "fc5121da-c353-4621-b24b-7ec5f79446bd"
+        ),
+        "resource_key_envelope_kms_key_arn": (
+            f"arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
+            "1ff3c518-1653-4126-ab7e-039a7e6ab0ff"
+        ),
+        "resource_key_software_custody_enabled": True,
+    },
+}
+AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS = frozenset(
+    f"arn:aws:iam::{ACCOUNT_ID}:role/{function_name}-exec"
+    for function_name, operation in AUTHORITY_RUNTIME_FUNCTIONS.items()
+    if operation == "resolve_connector_resource"
+)
+AUTHORITY_CONNECTOR_RESOURCE_CELL_TABLE_ARNS = frozenset(
+    table_arn
+    for cell in AUTHORITY_CONNECTOR_RESOURCE_CELLS.values()
+    for table_arn in (
+        cell["qurl_resources_table_arn"],
+        cell["qurl_resource_key_material_table_arn"],
+    )
+)
+AUTHORITY_CONNECTOR_RESOURCE_ENVELOPE_KEY_ARNS = frozenset(
+    cell["resource_key_envelope_kms_key_arn"]
+    for cell in AUTHORITY_CONNECTOR_RESOURCE_CELLS.values()
+    if cell["resource_key_software_custody_enabled"]
+)
 # Per-table resources. Only agent_keys is read through a GSI (the pubkey index
 # used by refresh/recovery identity resolution, agent_keys_repo.go GetByPublicKey);
 # api_keys and connector_authority are reached only by primary key, so they carry
@@ -1890,6 +2001,16 @@ AUTHORITY_RUNTIME_OPENED_ADDRESSES = frozenset(
         AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS,
     }
 )
+# ResolveConnectorResource adds access only to DynamoDB and KMS. The function
+# graph also advances the generated foundation contract; Secrets Manager,
+# email, and the shared interface-endpoint SG must remain no-op.
+AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES = frozenset(
+    {
+        "module.control.terraform_data.foundation_contract",
+        AUTHORITY_RUNTIME_DYNAMODB_ADDRESS,
+        AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS,
+    }
+)
 AUTHORITY_RUNTIME_LEGACY_EXPANSION_UPDATE_ADDRESSES = frozenset(
     AUTHORITY_RUNTIME_OPENED_ADDRESSES
     | {
@@ -1961,6 +2082,7 @@ _AUTHORITY_RUNTIME_NORMALIZATION_PLAN_MODES = frozenset(
         "no-op",
         "authority-runtime-slice",
         "authority-runtime-slice-retry",
+        "authority-connector-resource-expansion",
         "authority-runtime-legacy-expansion",
         "authority-runtime-legacy-expansion-hub-identity",
         "authority-runtime-legacy-expansion-provisioned-cell-catalog",
@@ -3783,6 +3905,7 @@ def _require_authority_runtime_binding(
         )
         or not isinstance(catalog, dict)
         or set(catalog) != set(AUTHORITY_CELLS)
+        or catalog != AUTHORITY_CONNECTOR_RESOURCE_CELLS
     ):
         raise ContractError("foundation runtime contract graph is not exact measurement")
     if proof_enabled is not None and inferred_proof_enabled is not proof_enabled:
@@ -4437,6 +4560,56 @@ def _is_exact_legacy_hub_runtime_expansion(
         if before_payload == expected_before:
             return True
     return False
+
+
+def _is_exact_connector_resource_runtime_expansion(
+    before_values: dict[str, Any],
+    after_values: dict[str, Any],
+) -> bool:
+    """Prove the one-time live 11-function -> 13-function creso expansion.
+
+    Build the entire reviewed predecessor from the fully validated after-
+    contract. The only semantic additions are the two creso functions, their
+    per-cell admission budgets, and the cell-owned resource/KMS coordinates.
+    All four evidence classes advance together to the new measurement basis.
+    """
+    try:
+        if not _require_authority_runtime_binding(
+            after_values, proof_enabled=False
+        ):
+            return False
+    except ContractError:
+        # This predicate competes with other exact foundation-update lanes. A
+        # non-creso after-contract is simply not this transition; its own lane
+        # remains responsible for accepting or rejecting it.
+        return False
+    before_payload = before_values.get("input")
+    after_payload = after_values.get("input")
+    if not isinstance(before_payload, dict) or not isinstance(after_payload, dict):
+        return False
+
+    expected_before = json.loads(json.dumps(after_payload))
+    contract = expected_before["authority_runtime_contract"]
+    evidence = dict(AUTHORITY_CONNECTOR_RESOURCE_PREDECESSOR_EVIDENCE)
+    contract["global"]["basis_evidence"] = evidence
+    contract["provisioned_cells_evidence"] = evidence
+
+    for function_name in AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS:
+        contract["functions"].pop(function_name)
+    for function in contract["functions"].values():
+        function["basis_evidence"] = evidence
+
+    for cell_id in AUTHORITY_CELLS:
+        worker = contract["global"]["caller_capacity"]["cell_workers"][cell_id]
+        worker["preinvoke_limits"].pop("resolve_connector_resource")
+        worker["preinvoke_rate_limits"].pop("resolve_connector_resource")
+        contract["provisioned_cells"][cell_id] = {
+            "caller_role_arn": contract["provisioned_cells"][cell_id][
+                "caller_role_arn"
+            ]
+        }
+
+    return before_payload == expected_before
 
 
 def _is_exact_legacy_authority_sg_before(before: Any) -> bool:
@@ -5892,7 +6065,13 @@ def _check_authority_dynamodb_endpoint_policy(
     proof_enabled: bool = False,
     legacy_recovery_resources: bool = False,
 ) -> None:
-    stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsData")
+    statements = _endpoint_allow_statements(after, address, 2)
+    if set(statements) != {
+        "AuthorityFunctionsData",
+        "ConnectorResourceCellData",
+    }:
+        raise ContractError(f"{address} DynamoDB statement set drifted")
+    stmt = statements["AuthorityFunctionsData"]
     expected_principals = set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS)
     if proof_enabled:
         expected_principals.update(AUTHORITY_PROOF_EXEC_ROLE_ARNS)
@@ -5915,13 +6094,44 @@ def _check_authority_dynamodb_endpoint_policy(
         raise ContractError(
             f"{address} resources must be exactly the reviewed base-table set"
         )
+    cell_data = statements["ConnectorResourceCellData"]
+    if _authority_principalarn_condition(cell_data, address) != set(
+        AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS
+    ):
+        raise ContractError(
+            f"{address} cell-data principals must be exactly the creso roles"
+        )
+    if _authority_string_set(cell_data.get("Action"), address, "Action") != {
+        "dynamodb:DeleteItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:UpdateItem",
+    }:
+        raise ContractError(f"{address} cell-data actions drifted")
+    if _authority_string_set(
+        cell_data.get("Resource"), address, "Resource"
+    ) != set(AUTHORITY_CONNECTOR_RESOURCE_CELL_TABLE_ARNS):
+        raise ContractError(
+            f"{address} cell-data resources must be exactly the two tables per cell"
+        )
 
 
 def _check_authority_kms_endpoint_policy(
     after: dict[str, Any], address: str
 ) -> None:
-    statements = _endpoint_allow_statements(after, address, 2)
-    if set(statements) != {"AuthorityFunctionsQat1PublicKey", "IssueAssignmentQat1Sign"}:
+    # Sandbox's closed cell catalog is software-custody-only. Hardware custody
+    # remains supported by the reusable Terraform module, but is intentionally
+    # not an admissible sandbox transition until this exact endpoint checker,
+    # the exec-policy checker, and their fixtures gain the reviewed CreateKey /
+    # lifecycle statements together.
+    statements = _endpoint_allow_statements(after, address, 3)
+    if set(statements) != {
+        "AuthorityFunctionsQat1PublicKey",
+        "IssueAssignmentQat1Sign",
+        "ConnectorResourceGenerateEnvelopeDataKey",
+    }:
         raise ContractError(f"{address} KMS statement set drifted")
     public_key = statements["AuthorityFunctionsQat1PublicKey"]
     sign = statements["IssueAssignmentQat1Sign"]
@@ -5950,6 +6160,25 @@ def _check_authority_kms_endpoint_policy(
             or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None
         ):
             raise ContractError(f"{address} must target exactly the qat1 signing key")
+
+    envelope = statements["ConnectorResourceGenerateEnvelopeDataKey"]
+    if _authority_string_set(envelope.get("Action"), address, "Action") != {
+        "kms:GenerateDataKey"
+    }:
+        raise ContractError(f"{address} envelope-key action drifted")
+    if _authority_string_set(
+        envelope.get("Resource"), address, "Resource"
+    ) != set(AUTHORITY_CONNECTOR_RESOURCE_ENVELOPE_KEY_ARNS):
+        raise ContractError(f"{address} envelope-key resources drifted")
+    if envelope.get("Principal") != "*" or envelope.get("Condition") != {
+        "StringEquals": {
+            "aws:PrincipalArn": sorted(AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS),
+            "kms:EncryptionContext:purpose": "qurl-v2-resource-software-key",
+        }
+    }:
+        raise ContractError(
+            f"{address} envelope-key principal or encryption context drifted"
+        )
 
 
 def _check_authority_secrets_endpoint_policy(
@@ -6384,6 +6613,138 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
         )
 
 
+def _check_authority_connector_resource_exec_role_policy(
+    after: dict[str, Any], fn: str
+) -> None:
+    """Pin sandbox creso to exact Control/cell and software-custody grants.
+
+    The reusable Terraform module also supports hardware custody. This checker
+    is deliberately the exact sandbox transition checker, and both provisioned
+    sandbox cells are closed to ``resource_key_software_custody_enabled=true``
+    by the reviewed catalog below. A future hardware-custody cell must extend
+    this policy and the KMS endpoint checker with its two exact SIDs before its
+    plan is admissible; today that unsupported shape fails closed.
+    """
+    cell_id = fn.rsplit("-", 1)[-1]
+    cell = AUTHORITY_CONNECTOR_RESOURCE_CELLS.get(cell_id)
+    if cell is None:
+        raise ContractError(f"{fn} connector-resource cell is not provisioned")
+    policy = _authority_decode_policy(after, fn)
+    statements = policy.get("Statement") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("Version") != "2012-10-17"
+        or not isinstance(statements, list)
+    ):
+        raise ContractError(f"{fn} execution policy is not a 2012-10-17 document")
+    by_sid: dict[str, dict[str, Any]] = {}
+    for statement in statements:
+        if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
+            raise ContractError(f"{fn} execution statements must all be Allow objects")
+        if any(
+            key in statement
+            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal")
+        ):
+            raise ContractError(f"{fn} execution statement uses a forbidden element")
+        sid = statement.get("Sid")
+        if not isinstance(sid, str) or sid in by_sid:
+            raise ContractError(f"{fn} execution statement Sid missing or duplicated")
+        by_sid[sid] = statement
+
+    expected_sids = {
+        "LambdaVpcEni",
+        "OwnLogStream",
+        "ConnectorResourceControlDescribe",
+        "ConnectorResourceControlRead",
+        "ConnectorResourceCellDescribe",
+        "ConnectorResourceCellResourceData",
+        "ConnectorResourceCellKeyMaterial",
+        "ConnectorResourceGenerateEnvelopeDataKey",
+    }
+    if set(by_sid) != expected_sids:
+        raise ContractError(
+            f"{fn} connector-resource statement set drifted: "
+            f"{sorted(by_sid)} != {sorted(expected_sids)}"
+        )
+
+    eni = by_sid["LambdaVpcEni"]
+    if _authority_string_set(eni.get("Action"), fn, "ENI Action") != set(
+        AUTHORITY_RUNTIME_ENI_ACTIONS
+    ) or eni.get("Resource") not in ("*", ["*"]):
+        raise ContractError(f"{fn} ENI statement drifted")
+    log_stmt = by_sid["OwnLogStream"]
+    expected_log = (
+        f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/aws/lambda/{fn}:*"
+    )
+    if _authority_string_set(log_stmt.get("Action"), fn, "log Action") != set(
+        AUTHORITY_RUNTIME_LOG_ACTIONS
+    ) or _authority_string_set(log_stmt.get("Resource"), fn, "log Resource") != {
+        expected_log
+    }:
+        raise ContractError(f"{fn} own-log statement drifted")
+    control_tables = {
+        AUTHORITY_RUNTIME_TABLE_ARNS[table]
+        for table in ("agent_keys", "connector_authority", "customers")
+    }
+    exact = {
+        "ConnectorResourceControlDescribe": (
+            {"dynamodb:DescribeTable"},
+            control_tables,
+        ),
+        "ConnectorResourceControlRead": ({"dynamodb:GetItem"}, control_tables),
+        "ConnectorResourceCellDescribe": (
+            {"dynamodb:DescribeTable"},
+            {
+                cell["qurl_resources_table_arn"],
+                cell["qurl_resource_key_material_table_arn"],
+            },
+        ),
+        "ConnectorResourceCellResourceData": (
+            {
+                "dynamodb:GetItem",
+                "dynamodb:TransactWriteItems",
+                "dynamodb:UpdateItem",
+            },
+            {cell["qurl_resources_table_arn"]},
+        ),
+        "ConnectorResourceCellKeyMaterial": (
+            {"dynamodb:DeleteItem", "dynamodb:PutItem"},
+            {cell["qurl_resource_key_material_table_arn"]},
+        ),
+    }
+    for sid, (actions, resources) in exact.items():
+        statement = by_sid[sid]
+        if _authority_string_set(
+            statement.get("Action"), fn, f"{sid} Action"
+        ) != actions or _authority_string_set(
+            statement.get("Resource"), fn, f"{sid} Resource"
+        ) != resources:
+            raise ContractError(f"{fn} {sid} actions/resources drifted")
+        if "Condition" in statement:
+            raise ContractError(f"{fn} {sid} must be unconditional")
+
+    envelope = by_sid["ConnectorResourceGenerateEnvelopeDataKey"]
+    if (
+        _authority_string_set(envelope.get("Action"), fn, "envelope Action")
+        != {"kms:GenerateDataKey"}
+        or _authority_string_set(
+            envelope.get("Resource"), fn, "envelope Resource"
+        )
+        != {cell["resource_key_envelope_kms_key_arn"]}
+        or envelope.get("Condition")
+        != {
+            "StringEquals": {
+                "kms:EncryptionContext:purpose": "qurl-v2-resource-software-key"
+            }
+        }
+    ):
+        raise ContractError(f"{fn} envelope data-key grant drifted")
+
+    for sid in ("LambdaVpcEni", "OwnLogStream"):
+        if "Condition" in by_sid[sid]:
+            raise ContractError(f"{fn} {sid} must be unconditional")
+
+
 def _check_authority_exec_role_policy(
     after: dict[str, Any],
     fn: str,
@@ -6405,6 +6766,9 @@ def _check_authority_exec_role_policy(
         return
     if operation == AUTHORITY_PROOF_RECOVERY_OPERATION:
         _check_authority_proof_recovery_exec_role_policy(after, fn)
+        return
+    if operation == "resolve_connector_resource":
+        _check_authority_connector_resource_exec_role_policy(after, fn)
         return
     if operation in AUTHORITY_RUNTIME_CELL_OPERATION_IAM:
         _check_authority_cell_exec_role_policy(after, fn, operation)
@@ -7414,6 +7778,71 @@ def _check_authority_runtime_resources(
                 "synchronous RequestResponse contract"
             )
 
+        environment = function_after.get("environment")
+        variables = (
+            environment[0].get("variables")
+            if isinstance(environment, list)
+            and len(environment) == 1
+            and isinstance(environment[0], dict)
+            and isinstance(environment[0].get("variables"), dict)
+            else {}
+        )
+        resource_keys = {
+            "CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX",
+            "CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN",
+            "CONNECTOR_AUTHORITY_RESOURCE_KEY_SERVICE_ROLE_ARN",
+            "CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN",
+            "CONNECTOR_AUTHORITY_RESOURCE_KEY_SOFTWARE_CUSTODY_ENABLED",
+        }
+        observed_resource = {
+            key: value for key, value in variables.items() if key in resource_keys
+        }
+        if _operation == "resolve_connector_resource":
+            cell_id = fn.rsplit("-", 1)[-1]
+            cell = AUTHORITY_CONNECTOR_RESOURCE_CELLS[cell_id]
+            expected_resource = {
+                "CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX": cell["cell_table_prefix"],
+                "CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN": cell[
+                    "cell_data_kms_key_arn"
+                ],
+                "CONNECTOR_AUTHORITY_RESOURCE_KEY_SERVICE_ROLE_ARN": (
+                    f"arn:aws:iam::{ACCOUNT_ID}:role/{fn}-exec"
+                ),
+                "CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN": cell[
+                    "resource_key_envelope_kms_key_arn"
+                ],
+                "CONNECTOR_AUTHORITY_RESOURCE_KEY_SOFTWARE_CUSTODY_ENABLED": "true",
+            }
+            if observed_resource != expected_resource:
+                raise ContractError(f"{fn} connector-resource environment drifted")
+            expected_identity = {
+                "CONNECTOR_AUTHORITY_OPERATION": "ResolveConnectorResource",
+                "CONNECTOR_AUTHORITY_ENVIRONMENT_ID": "sandbox",
+                "CONNECTOR_AUTHORITY_ACCOUNT_ID": ACCOUNT_ID,
+                "CONNECTOR_AUTHORITY_HOME_REGION": AWS_REGION,
+                "CONNECTOR_AUTHORITY_CELL_ID": cell_id,
+                "CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX": ".nhp.layerv.xyz",
+            }
+            if any(
+                variables.get(key) != value
+                for key, value in expected_identity.items()
+            ):
+                raise ContractError(
+                    f"{fn} connector-resource identity environment drifted"
+                )
+            data_key = variables.get("CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN")
+            if (
+                not isinstance(data_key, str)
+                or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(data_key) is None
+            ):
+                raise ContractError(
+                    f"{fn} connector-resource data-key environment drifted"
+                )
+        elif observed_resource:
+            raise ContractError(
+                f"{fn} unexpectedly carries connector-resource environment"
+            )
+
     proof_environment = {
         "CONNECTOR_AUTHORITY_PROOF_OWNER_ID": AUTHORITY_PROOF_OWNER_ID,
         "CONNECTOR_AUTHORITY_PROOF_AGENT_ID_PREFIX": "qurl-go-sandbox-",
@@ -7718,7 +8147,7 @@ def _authority_basis_evidence(payload: dict[str, Any]) -> list[dict[str, Any]]:
     # identical across ALL functions, so any function the contract carries must
     # also satisfy the reviewed FROM/TO evidence pins. Enumerating only the Hub
     # functions would leave a contract that carries more (this repository's
-    # expanded 3 + 4N graph) with its per-cell basis_evidence unpinned by the
+    # expanded 3 + 5N graph) with its per-cell basis_evidence unpinned by the
     # image-update checks. Every object this adds must match the reviewed pins,
     # so the wider enumeration is strictly fail-closed. Note this is independent
     # of AUTHORITY_IMAGE_UPDATE_RESOURCES, which stays Hub-only because only the
@@ -9645,7 +10074,7 @@ def _check_authority_steady_pc_completion(
 
     Every create must land on the contract's selected colour with exactly the
     generator's steady allocation for that function (1 for the attended-proof
-    pm/pcr pair, 2 for the eleven runtime functions). A create on the standby
+    pm/pcr pair, 2 for the thirteen runtime functions). A create on the standby
     colour, or any other allocation, raises.
     """
     selected = _selected_authority_color_from_contract(
@@ -11631,12 +12060,12 @@ def _check_authority_proof_prepare_recovery_drift(
 
 
 # Every Authority exec IDENTITY -- the role and its inline policy, for all
-# thirteen functions including the two proof ones (ca-pcr, ca-pm).
+# fifteen functions including the two proof ones (ca-pcr, ca-pm).
 #
-# AUTHORITY_RUNTIME_RESOURCES covers only the ELEVEN runtime functions, so the
+# AUTHORITY_RUNTIME_RESOURCES covers only the THIRTEEN runtime functions, so the
 # two proof functions' exec role and policy sit outside the runtime slice. Their
 # drift therefore broke the slice subset test even though it is the same benign
-# re-projection as the other eleven. That was 4 of the 27 entries that blocked
+# re-projection as the other thirteen. That was 4 of the 27 entries that blocked
 # every Control plan.
 #
 # Scoped to exec identities, deliberately NOT to AUTHORITY_PROOF_RESOURCES: that
@@ -14416,6 +14845,63 @@ def check_plan(
         if actual_non_noop.get(address) == ["create", "delete"]
     }
     foundation_change = by_address[authority_contract_address]["change"]
+    # One-time addition of ResolveConnectorResource to the already-live
+    # 11-function runtime. Admit an interrupted apply as well as the initial
+    # plan: each exact create/update may already be a no-op, but nothing outside
+    # this closed set may move. The foundation either proves the exact reviewed
+    # predecessor transition or is already at the fully validated after-state.
+    connector_resource_creates_pending = {
+        address
+        for address in AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES
+        if actual_non_noop.get(address) == ["create"]
+    }
+    connector_resource_updates_pending = {
+        address
+        for address in AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES
+        if actual_non_noop.get(address) == ["update"]
+    }
+    connector_resource_expansion_action_shape = (
+        runtime_mode
+        and bool(changed)
+        and all(
+            actual_non_noop.get(address) in (None, ["create"])
+            for address in AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_CREATE_ADDRESSES
+        )
+        and all(
+            actual_non_noop.get(address) in (None, ["update"])
+            for address in AUTHORITY_CONNECTOR_RESOURCE_EXPANSION_UPDATE_ADDRESSES
+        )
+        and changed
+        == connector_resource_creates_pending | connector_resource_updates_pending
+    )
+    connector_resource_foundation_expands = False
+    connector_resource_foundation_already_expanded = False
+    if connector_resource_expansion_action_shape:
+        connector_resource_foundation_expands = (
+            actual_non_noop.get(authority_contract_address) == ["update"]
+            and _is_exact_connector_resource_runtime_expansion(
+                foundation_change.get("before", {}),
+                foundation_change.get("after", {}),
+            )
+        )
+        if actual_non_noop.get(authority_contract_address) is None:
+            try:
+                connector_resource_foundation_already_expanded = (
+                    _require_authority_runtime_binding(
+                        foundation_change.get("after", {}), proof_enabled=False
+                    )
+                )
+            except ContractError:
+                # A partial shape belonging to another reviewed foundation
+                # lane is not this migration and must fall through to that lane.
+                connector_resource_foundation_already_expanded = False
+    authority_connector_resource_expansion = (
+        connector_resource_expansion_action_shape
+        and (
+            connector_resource_foundation_expands
+            or connector_resource_foundation_already_expanded
+        )
+    )
     legacy_expansion_action_shape = (
         runtime_mode
         and bool(legacy_candidate_changed)
@@ -15021,6 +15507,13 @@ def check_plan(
             plan,
             refresh_disabled=refresh_disabled,
         )
+    elif authority_connector_resource_expansion:
+        plan_mode = "authority-connector-resource-expansion"
+        _require_create_shapes(
+            connector_resource_creates_pending,
+            by_address,
+            "connector-resource Authority resources must be new",
+        )
     elif authority_runtime_legacy_expansion:
         plan_mode_parts = ["authority-runtime-legacy-expansion"]
         if hub_identity_changed:
@@ -15169,11 +15662,11 @@ def check_plan(
     elif (
         changed
         and changed
-        # Subset of the WITH_PROOF set (13). Post-teardown only the 11 runtime
-        # functions exist, so a real recovery is those 11 -- which the shell
-        # fence hardcodes exactly. The 13-superset here also still admits the
+        # Subset of the WITH_PROOF set (15). Post-teardown only the 13 runtime
+        # functions exist, so a real recovery is those 13 -- which the shell
+        # fence hardcodes exactly. The 15-superset here also still admits the
         # historical single-ca-pm completion from before the teardown. Keep the
-        # shell's 11-list and this set in lockstep: both are the same runtime
+        # shell's 13-list and this set in lockstep: both are the same runtime
         # functions, the shell simply excludes the deleted proof pair.
         <= {
             f"{AUTHORITY_STEADY_PC_PREFIX}\"{fn}\"]"
@@ -15186,7 +15679,7 @@ def check_plan(
         # delete,create recoveries only arise from a fleet-wide stuck flip, so
         # they are all-or-nothing: a PARTIAL delete-first set is the mid-flip
         # hazard itself and falls through to the terminal reject. This matches
-        # the shell fence's exactly-the-11 witness (review #3855). Pure-create
+        # the shell fence's exactly-the-13 witness (review #3855). Pure-create
         # residuals stay subset-tolerant -- the 2026-08-11 shape was a single
         # function's pending allocation.
         and (
@@ -15275,6 +15768,7 @@ def check_plan(
             "Hub artifact bootstrap, reviewed Redis split, the exact detached "
             "legacy OTP Redis user delete, exact Authority "
             "contract binding, the exact provisioned-cell catalog create, the exact "
+            "connector-resource Authority expansion, the exact "
             "legacy Authority expansion, the exact Hub identity migration, the exact "
             "Authority runtime slice or image update, the exact Authority alarm "
             "routing slice, the exact attended-proof enablement or rollback, the exact "
@@ -16884,7 +17378,7 @@ def check_live(
             "Control state object is not versioned under the exact KMS key"
         )
 
-    # The Control/authority prefixes own no Lambda while dark; exactly the 11
+    # The Control/authority prefixes own no Lambda while dark; exactly the 13
     # complete functions once the runtime slice is live; and additionally the
     # Hub keygen function once the Hub worker slice (5b) is live (the keygen only
     # appears alongside the runtime). Any other function set fails closed.
@@ -16901,9 +17395,9 @@ def check_live(
             raise ContractError("Control Lambda inventory evidence is malformed")
         live_lambda_names.add(name)
     # This proof runs BEFORE the apply, so it must admit the predecessor state as
-    # well as the successor. The complete graph is the 11 functions, but the
+    # well as the successor. The complete graph is the 13 functions, but the
     # legacy Hub-only trio is exactly what is live until the expansion applies;
-    # accepting only the 11 makes that expansion unappliable, because the gate
+    # accepting only the 13 makes that expansion unappliable, because the gate
     # demands the very functions the apply is about to create. Both sets are
     # named constants and each is matched whole, so this admits two exact live
     # shapes rather than relaxing the check to a subset or prefix test.
@@ -16921,8 +17415,8 @@ def check_live(
     ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "3 legacy Hub-facing Authority functions, the exact 11 complete "
-            "Authority functions, or the exact 12-function attended-proof graph "
+            "3 legacy Hub-facing Authority functions, the exact 13 complete "
+            "Authority functions, or the exact 15-function attended-proof graph "
             "(each optionally plus the Hub keygen once the worker slice is live) "
             "are admitted"
         )

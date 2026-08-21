@@ -217,9 +217,12 @@ class ManifestValidationTests(unittest.TestCase):
         } | {
             f"layerv-nhp-sandbox-ca-{suffix}-{cell_id}"
             for cell_id in ("cell0", "cell1")
-            for suffix in ("iro", "ar", "cr", "ccr")
+            for suffix in ("iro", "ar", "cr", "ccr", "creso")
         }
         self.assertEqual(set(contract["functions"]), expected_functions)
+        self.assertEqual(
+            contract["provisioned_cells"], CHECKER.EXPECTED_CELLS
+        )
 
     def assert_rejected(self, mutate) -> None:
         value = copy.deepcopy(self.manifest)
@@ -518,7 +521,7 @@ class GitBindingTests(unittest.TestCase):
             proof_mutation_controls_enabled=True,
         )
         self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr)
-        self.assertEqual(json.loads(enabled_result.stdout)["function_count"], 13)
+        self.assertEqual(json.loads(enabled_result.stdout)["function_count"], 15)
 
         enabled = json.loads(enabled_output.read_text(encoding="utf-8"))
         contract = enabled["authority_runtime_contract"]

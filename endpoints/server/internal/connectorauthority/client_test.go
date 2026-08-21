@@ -42,6 +42,7 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	hubMethods := exportedMethods(reflect.TypeOf((*HubClient)(nil)))
 	registrationMethods := exportedMethods(reflect.TypeOf((*RegistrationCellClient)(nil)))
 	recoveryMethods := exportedMethods(reflect.TypeOf((*CredentialRecoveryCellClient)(nil)))
+	resourceMethods := exportedMethods(reflect.TypeOf((*ConnectorResourceCellClient)(nil)))
 
 	wantHub := []string{"IssueAssignment", "IssueCredentialRecovery", "RefreshAssignment"}
 	if !reflect.DeepEqual(hubMethods, wantHub) {
@@ -52,6 +53,24 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	}
 	if want := []string{"CompleteCredentialRecovery"}; !reflect.DeepEqual(recoveryMethods, want) {
 		t.Fatalf("CredentialRecoveryCellClient methods = %v, want %v", recoveryMethods, want)
+	}
+	if want := []string{"ResolveConnectorResource"}; !reflect.DeepEqual(resourceMethods, want) {
+		t.Fatalf("ConnectorResourceCellClient methods = %v, want %v", resourceMethods, want)
+	}
+}
+
+func TestConnectorResourceCellClientUsesOnlyPinnedAliasAndOneAttempt(t *testing.T) {
+	t.Parallel()
+	target := validConnectorResourceCellTarget()
+	api := &fakeInvokeAPI{output: &lambda.InvokeOutput{StatusCode: http.StatusOK, Payload: []byte(`{"version":1}`)}}
+	client := newConnectorResourceCellClient(api, target)
+	response, err := client.ResolveConnectorResource(liveContext(t), []byte(`{"version":1}`))
+	if err != nil || string(response) != `{"version":1}` {
+		t.Fatalf("ResolveConnectorResource = %q, %v", response, err)
+	}
+	if len(api.inputs) != 1 || api.inputs[0].FunctionName == nil ||
+		*api.inputs[0].FunctionName != target.ResolveConnectorResourceAliasARN || len(api.options) != 1 || api.options[0] != 0 {
+		t.Fatalf("invocations = %#v options=%v", api.inputs, api.options)
 	}
 }
 
@@ -166,6 +185,11 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			operation: OperationCompleteCredentialRecovery,
 			target:    aliasARN(cellFunction("ccr", testCellID), "blue"),
 		},
+		{
+			name:      "resolve connector resource",
+			operation: OperationResolveConnectorResource,
+			target:    aliasARN(cellFunction("creso", testCellID), "blue"),
+		},
 	}
 
 	for _, test := range tests {
@@ -189,6 +213,9 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			recovery := newCredentialRecoveryCellClient(api, CredentialRecoveryCellTarget{
 				CompleteCredentialRecoveryAliasARN: tests[6].target,
 			})
+			resource := newConnectorResourceCellClient(api, ConnectorResourceCellTarget{
+				ResolveConnectorResourceAliasARN: tests[7].target,
+			})
 			switch test.operation {
 			case OperationIssueAssignment:
 				test.call = hub.IssueAssignment
@@ -204,6 +231,8 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 				test.call = registration.CompleteRegistration
 			case OperationCompleteCredentialRecovery:
 				test.call = recovery.CompleteCredentialRecovery
+			case OperationResolveConnectorResource:
+				test.call = resource.ResolveConnectorResource
 			default:
 				t.Fatalf("unhandled operation %q", test.operation)
 			}

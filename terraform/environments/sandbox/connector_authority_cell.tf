@@ -53,6 +53,13 @@ locals {
       activate_registration_alias_arn        = local.control_cell0_alias_targets["activate_registration"]
       complete_registration_alias_arn        = local.control_cell0_alias_targets["complete_registration"]
       complete_credential_recovery_alias_arn = local.control_cell0_alias_targets["complete_credential_recovery"]
+      # Null is the exact applied-Control predecessor before creso's first
+      # rollout. It preserves today's four-operation server input byte-for-byte;
+      # Control must publish creso before the new NHP runtime is deployed.
+      resolve_connector_resource_alias_arn = try(
+        local.control_cell0_alias_targets["resolve_connector_resource"],
+        null,
+      )
 
       # Reviewed budgets from
       # terraform/modules/compute/tests/connector_authority.tftest.hcl.

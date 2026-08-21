@@ -4,8 +4,8 @@
 # gate is flipped (var.authority_runtime_functions_enabled). Until then every
 # resource below is count/for_each empty and the foundation stays dark.
 #
-# SCOPE: the exact complete contract graph: 3 Hub functions plus 4 functions
-# for every provisioned cell. A ready two-cell sandbox therefore deploys 11
+# SCOPE: the exact complete contract graph: 3 Hub functions plus 5 functions
+# for every provisioned cell. A ready two-cell sandbox therefore deploys 13
 # functions. Partial cell groups are rejected by authority_runtime_contract.tf.
 #
 # DARK-FIRST: functions, both closed blue/green aliases, operation-specific
@@ -70,7 +70,7 @@ locals {
   # Release-critical attended-proof rollout only. The ordinary contract remains
   # fixed on its reviewed blue selector; these two explicit colors own the
   # bounded IA/RA/ICR + ca-pm rehearsal without generalising the complete
-  # eleven-function rollout system. Both must be null or both closed colors.
+  # thirteen-function rollout system. Both must be null or both closed colors.
   authority_proof_policy_rollout_active = (
     var.authority_proof_policy_selected_color != null &&
     var.authority_proof_policy_prepared_color != null
@@ -126,10 +126,23 @@ locals {
       for color in local.authority_runtime_alias_colors :
       "${function_name}:${color}" => {
         function_name = function_name
+        operation     = fn.operation
         color         = color
       }
     }
   ]...)
+
+  # A newly introduced operation has no live aliases for the hold to read on
+  # its first apply. This exact, temporary bootstrap set makes both closed
+  # aliases follow the first published version while every already-live
+  # operation retains normal selected/standby semantics. Remove the operation
+  # from this set immediately after both aliases exist; the rollout ledger
+  # carries that required convergence step. Keeping the exemption operation-
+  # scoped (rather than function-name- or environment-shaped) covers both
+  # assigned cells without creating an arbitrary bypass surface.
+  authority_alias_hold_bootstrap_operations = toset([
+    "resolve_connector_resource",
+  ])
 
   # Execution-role identity is constructed (account + deterministic name) so the
   # endpoint policies that reference these principals are fully known at plan
@@ -175,7 +188,7 @@ locals {
   # Env-only axes (no principal grant): operations that consume the cell DNS
   # suffix (every op that mints or refreshes assignment endpoint data;
   # IssueRegistrationOTP intentionally excluded) and the admission-gated ops.
-  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "mutate_proof_agent", "prepare_proof_credential_recovery"]
+  authority_cell_dns_operations  = ["issue_assignment", "refresh_assignment", "issue_credential_recovery", "activate_registration", "complete_registration", "complete_credential_recovery", "resolve_connector_resource", "mutate_proof_agent", "prepare_proof_credential_recovery"]
   authority_admission_operations = ["activate_registration", "complete_registration"]
   # Attended-proof axis. ca-pm owns the mutation capability. IA/RA/ICR receive
   # a staged proof-aware version while both live aliases remain unchanged; a
@@ -227,6 +240,29 @@ locals {
     if contains(local.authority_ses_operations, fn.operation)
   ]) : []
 
+  # ResolveConnectorResource is the only operation that crosses from the
+  # Control-owned identity/placement tables into the assigned cell's resource
+  # tables and resource-key custody. Keep its principal sets explicit so the
+  # DynamoDB and KMS endpoint policies can admit only the creso functions to
+  # those cell-owned dependencies.
+  authority_runtime_connector_resource_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if fn.operation == "resolve_connector_resource"
+  ]) : []
+  authority_runtime_connector_resource_hardware_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if fn.operation == "resolve_connector_resource" &&
+    !local.authority_contract_cells[fn.cell_id].resource_key_software_custody_enabled
+  ]) : []
+  authority_runtime_connector_resource_software_role_arns = local.authority_runtime_functions_deploy ? sort([
+    for function_name, fn in local.authority_runtime_functions :
+    local.authority_runtime_exec_role_arn[function_name]
+    if fn.operation == "resolve_connector_resource" &&
+    local.authority_contract_cells[fn.cell_id].resource_key_software_custody_enabled
+  ]) : []
+
   # Environment-owned public cell DNS suffix (LayerV-owned; leading dot). It
   # matches the live native-UDP cell endpoints (e.g. cell0.nhp.layerv.xyz) and
   # is required by every operation that mints or refreshes assignment endpoint
@@ -242,11 +278,12 @@ locals {
   #
   # RECONCILED against the live handler in layervai/qurl-service (origin/main
   # internal/connectorauthorityruntime + internal/connectorauthority +
-  # internal/repository/dynamodb). DynamoDB invokes the authority data CMK with
-  # the caller's execution-role credentials, so every operation needs
-  # kms:Decrypt on that exact key through DynamoDB in addition to its exact
-  # table-scoped DynamoDB grant. Each op also needs dynamodb:DescribeTable to
-  # read and verify that SSE key at cold start. KMS on the identity layer is the
+  # internal/repository/dynamodb). Existing operations retain their scoped
+  # DynamoDB-mediated kms:Decrypt grant. ResolveConnectorResource deliberately
+  # does not: its constructor uses DescribeTable only to compare KMSMasterKeyArn,
+  # and its create path never invokes KMS against either the Control or cell
+  # table SSE CMK. Each op also needs dynamodb:DescribeTable to read and verify
+  # that SSE key at cold start. KMS on the identity layer is the
   # separate qat1 assignment-ticket key for IssueAssignment only (GetPublicKey
   # to load the key, Sign to mint the ticket). ENI lifecycle keeps the
   # AWS-required Resource="*" (plan-sanctioned); no other statement uses that
@@ -267,12 +304,13 @@ locals {
     },
   ] : []
 
-  # DynamoDB performs the CMK call on behalf of the Lambda execution role. Keep
-  # this distinct from direct KMS use: the exact authority-data key is usable
-  # only when the request comes through DynamoDB, while the operation's
+  # Retained operations use the CMK through DynamoDB under their execution role.
+  # Keep this distinct from direct KMS use: the exact authority-data key is
+  # usable only when the request comes through DynamoDB, while the operation's
   # table-scoped DynamoDB statements remain the finer data boundary. ca-pm
   # retains its separately named proof grant because its policy is independently
-  # byte-checked as an attended mutation capability.
+  # byte-checked as an attended mutation capability. creso is excluded at the
+  # policy composition site because its implemented path performs no Decrypt.
   authority_runtime_dynamodb_decrypt_statements = local.authority_runtime_functions_deploy ? [{
     Sid      = "AuthorityDynamoDBDecrypt"
     Effect   = "Allow"
@@ -637,7 +675,108 @@ locals {
         Resource = local.authority_runtime_table_resources.connector_authority
       },
     ]
+    resolve_connector_resource = [
+      {
+        # Exactly the three Control base tables the creso constructor verifies
+        # at cold start. Indexes and Query/Scan are deliberately absent.
+        Sid    = "ConnectorResourceControlDescribe"
+        Effect = "Allow"
+        Action = ["dynamodb:DescribeTable"]
+        Resource = [
+          local.authority_runtime_table_arns.agent_keys,
+          local.authority_runtime_table_arns.connector_authority,
+          local.authority_runtime_table_arns.customers,
+        ]
+      },
+      {
+        Sid    = "ConnectorResourceControlRead"
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem"]
+        Resource = [
+          local.authority_runtime_table_arns.agent_keys,
+          local.authority_runtime_table_arns.connector_authority,
+          local.authority_runtime_table_arns.customers,
+        ]
+      },
+    ]
   }, local.authority_runtime_proof_mutation_operation_statements, local.authority_runtime_proof_recovery_operation_statements)
+
+  # Cell-specific creso grants cannot live in the operation-only map above:
+  # cell0 and cell1 intentionally have different Terraform-owned table prefixes
+  # and raw CMKs (including the current doubled legacy cell1 prefix). The
+  # contract closes each ARN before it reaches these statements.
+  authority_runtime_connector_resource_cell_statements = {
+    for cell_id, cell in local.authority_contract_cells :
+    cell_id => concat(
+      [
+        {
+          Sid      = "ConnectorResourceCellDescribe"
+          Effect   = "Allow"
+          Action   = ["dynamodb:DescribeTable"]
+          Resource = [cell.qurl_resources_table_arn, cell.qurl_resource_key_material_table_arn]
+        },
+        {
+          Sid      = "ConnectorResourceCellResourceData"
+          Effect   = "Allow"
+          Action   = ["dynamodb:GetItem", "dynamodb:TransactWriteItems", "dynamodb:UpdateItem"]
+          Resource = [cell.qurl_resources_table_arn]
+        },
+        {
+          Sid      = "ConnectorResourceCellKeyMaterial"
+          Effect   = "Allow"
+          Action   = ["dynamodb:DeleteItem", "dynamodb:PutItem"]
+          Resource = [cell.qurl_resource_key_material_table_arn]
+        },
+      ],
+      [for statement in [
+        {
+          Sid      = "ConnectorResourceGenerateEnvelopeDataKey"
+          Effect   = "Allow"
+          Action   = ["kms:GenerateDataKey"]
+          Resource = [cell.resource_key_envelope_kms_key_arn]
+          Condition = {
+            StringEquals = {
+              "kms:EncryptionContext:purpose" = "qurl-v2-resource-software-key"
+            }
+          }
+        },
+      ] : statement if cell.resource_key_software_custody_enabled],
+      [for statement in [
+        {
+          Sid      = "ConnectorResourceCreateHardwareKey"
+          Effect   = "Allow"
+          Action   = ["kms:CreateKey"]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "aws:RequestTag/app"     = "qurl-service"
+              "aws:RequestTag/purpose" = "qurl-v2-resource-key"
+            }
+            "ForAllValues:StringEquals" = {
+              "aws:TagKeys" = ["app", "owner_id", "purpose", "resource_id"]
+            }
+            Null = {
+              "aws:RequestTag/app"         = "false"
+              "aws:RequestTag/owner_id"    = "false"
+              "aws:RequestTag/purpose"     = "false"
+              "aws:RequestTag/resource_id" = "false"
+            }
+          }
+        },
+        {
+          Sid      = "ConnectorResourceHardwareKeyLifecycle"
+          Effect   = "Allow"
+          Action   = ["kms:GetPublicKey", "kms:ScheduleKeyDeletion"]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "kms:ResourceTag/purpose" = "qurl-v2-resource-key"
+            }
+          }
+        },
+      ] : statement if !cell.resource_key_software_custody_enabled],
+    )
+  }
 
   authority_runtime_proof_policy_consumer_statements = [
     {
@@ -870,6 +1009,13 @@ locals {
       contains(local.authority_cell_dns_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_CELL_DNS_SUFFIX = local.authority_cell_dns_suffix
       } : {},
+      fn.operation == "resolve_connector_resource" ? {
+        CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX                     = local.authority_contract_cells[fn.cell_id].cell_table_prefix
+        CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN                 = local.authority_contract_cells[fn.cell_id].cell_data_kms_key_arn
+        CONNECTOR_AUTHORITY_RESOURCE_KEY_SERVICE_ROLE_ARN         = local.authority_runtime_exec_role_arn[function_name]
+        CONNECTOR_AUTHORITY_RESOURCE_KEY_ENVELOPE_KMS_KEY_ARN     = local.authority_contract_cells[fn.cell_id].resource_key_envelope_kms_key_arn
+        CONNECTOR_AUTHORITY_RESOURCE_KEY_SOFTWARE_CUSTODY_ENABLED = tostring(local.authority_contract_cells[fn.cell_id].resource_key_software_custody_enabled)
+      } : {},
       contains(local.authority_public_key_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_ALIAS_ARN = aws_kms_alias.qat1_signing.arn
         CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_KID       = tostring(var.authority_runtime_contract.qat1_kid)
@@ -1043,7 +1189,7 @@ resource "aws_iam_role_policy" "authority_exec" {
     Version = "2012-10-17"
     Statement = concat(
       local.authority_runtime_common_exec_statements,
-      each.value.operation == "mutate_proof_agent" ? [] : local.authority_runtime_dynamodb_decrypt_statements,
+      contains(["mutate_proof_agent", "resolve_connector_resource"], each.value.operation) ? [] : local.authority_runtime_dynamodb_decrypt_statements,
       [
         {
           Sid    = "OwnLogStream"
@@ -1056,6 +1202,11 @@ resource "aws_iam_role_policy" "authority_exec" {
         },
       ],
       local.authority_runtime_operation_statements[each.value.operation],
+      flatten([
+        for cell_id, statements in local.authority_runtime_connector_resource_cell_statements :
+        statements
+        if each.value.operation == "resolve_connector_resource" && each.value.cell_id == cell_id
+      ]),
     )
   })
 }
@@ -1222,7 +1373,10 @@ data "aws_lambda_alias" "authority_live" {
   for_each = (
     var.authority_blue_green_alias_hold_enabled &&
     local.authority_runtime_functions_deploy
-  ) ? local.authority_runtime_aliases : {}
+    ) ? {
+    for key, alias in local.authority_runtime_aliases : key => alias
+    if !contains(local.authority_alias_hold_bootstrap_operations, alias.operation)
+  } : {}
 
   function_name = each.value.function_name
   name          = each.value.color
@@ -1259,6 +1413,7 @@ resource "aws_lambda_alias" "authority" {
   function_version = (
     var.authority_blue_green_alias_hold_enabled &&
     local.authority_runtime_functions_deploy &&
+    !contains(local.authority_alias_hold_bootstrap_operations, each.value.operation) &&
     !(
       var.authority_proof_mutation_controls_enabled &&
       contains(keys(local.authority_proof_policy_pinned_functions), each.value.function_name)
