@@ -698,10 +698,11 @@ agent_registration_relay_base_url = "https://relay.qurl.link.layerv.xyz"
 # agent_otp_ses.tf fails the plan if this is ever set in prod.
 agent_otp_ci_send_gate_enabled = true
 
-# Receive mailbox for the per-PR OTP gate: SES accepts mail for
+# Receive mailbox for qurl-go's OTP gate: SES accepts mail for
 # otp-gate@ci-otp.notify.layerv.xyz (a dedicated subdomain with its own MX --
 # notify.layerv.xyz itself is untouched), stores it to S3, and notifies SQS so
-# CI can read the emailed code. Sandbox only; the fence in
+# CI can read the emailed code. The mailbox role admits only qurl-go's
+# pull_request subject and exact refs/heads/main subject. Sandbox only; the fence in
 # agent_otp_ci_mailbox.tf fails the plan if this is ever set in prod.
 #
 # OWNERSHIP NOTE: enabling this makes THIS ROOT the owner of the sandbox

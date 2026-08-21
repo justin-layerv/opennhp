@@ -1066,7 +1066,7 @@ variable "agent_otp_registration_enabled" {
 }
 
 variable "agent_otp_ci_mailbox_enabled" {
-  description = "Creates the CI receive mailbox for the per-PR OTP gate (agent_otp_ci_mailbox.tf): a dedicated `ci-otp.<sender domain>` receiving subdomain with its own MX, an SES receipt rule storing raw mail to S3, an SQS arrival queue, and read access for the GitHub Actions role. NON-PROD ONLY — a precondition fails the plan when environment == \"prod\", because this routes OTP mail somewhere CI can read it. Also requires agent_otp_enabled = true (the subdomain derives from the OTP sender domain) and a region where SES email RECEIVING is available. Note this activates an SES receipt rule set, and an account has only one active set. Default false."
+  description = "Creates the CI receive mailbox for the qurl-go OTP gate (agent_otp_ci_mailbox.tf): a dedicated `ci-otp.<sender domain>` receiving subdomain with its own MX, an SES receipt rule storing raw mail to S3, an SQS arrival queue, and read access for the GitHub Actions role. NON-PROD ONLY — a precondition fails the plan when environment == \"prod\", because this routes OTP mail somewhere CI can read it. Also requires agent_otp_enabled = true (the subdomain derives from the OTP sender domain) and a region where SES email RECEIVING is available. Note this activates an SES receipt rule set, and an account has only one active set. Default false."
   type        = bool
   default     = false
 }
@@ -1265,7 +1265,7 @@ variable "qurl_github_repo" {
 }
 
 variable "qurl_go_github_repo" {
-  description = "GitHub repository for the qURL Go SDK. Used only to build the OIDC trust subject for the per-PR OTP registration gate's mailbox-read role (agent_otp_ci_mailbox.tf) — repo:<github_org>/<this>:pull_request. Note this repo is PUBLIC; fork pull requests receive no OIDC token, so only in-repo branches can assume that role, and it grants nothing but reads of a CI-only OTP mailbox."
+  description = "GitHub repository for the qURL Go SDK. Used only to build the two exact OIDC trust subjects for the OTP registration gate's mailbox-read role (agent_otp_ci_mailbox.tf): repo:<github_org>/<this>:pull_request and repo:<github_org>/<this>:ref:refs/heads/main. Note this repo is PUBLIC: the pull_request subject is not itself a fork boundary, so the consumer workflow rejects fork heads before AWS authentication and relies on GitHub withholding its required repository secrets; independently, this role grants nothing but reads of a CI-only OTP mailbox."
   type        = string
   default     = "qurl-go"
 }

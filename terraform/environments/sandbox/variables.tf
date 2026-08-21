@@ -617,7 +617,7 @@ variable "agent_otp_email_from" {
 }
 
 variable "agent_otp_ci_mailbox_enabled" {
-  description = "Creates the CI receive mailbox (SES inbound -> S3 -> SQS) the per-PR OTP registration gate reads, in module nhp's agent_otp_ci_mailbox.tf. Must be DECLARED here and PASSED THROUGH module.nhp below — setting it only in terraform.tfvars makes it an undeclared variable this root ignores, so the module keeps its false default and the mailbox is silently never created (exactly how the sibling send-gate flag shipped inert). Non-prod only; a precondition in the module fails the plan otherwise. Default false."
+  description = "Creates the CI receive mailbox (SES inbound -> S3 -> SQS) the qurl-go OTP registration gate reads, in module nhp's agent_otp_ci_mailbox.tf. Must be DECLARED here and PASSED THROUGH module.nhp below — setting it only in terraform.tfvars makes it an undeclared variable this root ignores, so the module keeps its false default and the mailbox is silently never created (exactly how the sibling send-gate flag shipped inert). Non-prod only; a precondition in the module fails the plan otherwise. Default false."
   type        = bool
   default     = false
 }

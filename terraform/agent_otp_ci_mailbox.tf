@@ -2,7 +2,7 @@
 # Agent-OTP CI receive mailbox — SES inbound → S3 → SQS (NON-PROD)
 # =====================================================================
 #
-# The receive half of the per-PR OTP gate. qurl-go's end-to-end test needs a
+# The receive half of qurl-go's OTP gate. Its end-to-end test needs a
 # code that genuinely ARRIVED BY EMAIL: an OTP is only valid against the
 # authority that minted it, so the loop cannot be faked hermetically. This
 # gives CI a real mailbox to read.
@@ -64,7 +64,7 @@ resource "terraform_data" "agent_otp_ci_mailbox_fence" {
   lifecycle {
     precondition {
       condition     = var.environment != "prod"
-      error_message = "agent_otp_ci_mailbox_enabled must never be true in prod: it routes OTP mail into an S3 bucket CI can read. The per-PR OTP gate targets sandbox only."
+      error_message = "agent_otp_ci_mailbox_enabled must never be true in prod: it routes OTP mail into an S3 bucket CI can read. The qurl-go OTP gate targets sandbox only."
     }
     precondition {
       condition     = local.agent_otp_ses_enabled
@@ -367,15 +367,18 @@ resource "aws_ses_receipt_rule" "agent_otp_ci_mailbox" {
 #
 # A DEDICATED role, for the same reason the send gate has one (see
 # agent_otp_ses.tf): nhp-<env>-github-actions carries terraform-apply-equivalent
-# permissions on the environment, a pull_request workflow runs the workflow file
-# FROM THE PR BRANCH, and binding one to the sandbox GitHub environment is
-# rejected by its deployment branch policy anyway. Granting mailbox reads on the
-# shared apply role would hand PR-time access to all of it.
+# permissions on the environment, while this role is needed by both the
+# pull_request gate and one protected qurl-go main-branch canary. Granting
+# mailbox reads on the shared apply role would hand either caller access to all
+# of the apply role's permissions.
 #
-# NOTE the consumer here is layervai/qurl-go, a PUBLIC repository. Fork pull
-# requests receive no OIDC token, so only branches inside the repo can assume
-# this — and what they get is the ability to read a mailbox that only ever
-# contains OTP codes minted for a CI-only test account.
+# NOTE the consumer here is layervai/qurl-go, a PUBLIC repository. The existing
+# pull_request OIDC subject does not encode the head repository and is therefore
+# not, by itself, a fork boundary. The consumer workflow rejects fork heads
+# before AWS authentication, and GitHub withholds its required repository
+# secrets from fork pull_request runs. The exact subjects below have no
+# environment form or wildcard; regardless of caller, the role can perform only
+# the mailbox reads in the inline policy below.
 resource "aws_iam_role" "qurl_go_otp_mailbox_gate" {
   count = local.agent_otp_ci_mailbox_enabled ? 1 : 0
 
@@ -384,6 +387,8 @@ resource "aws_iam_role" "qurl_go_otp_mailbox_gate" {
   # the em dash (U+2014). Terraform plans such a description cleanly and
   # CreateRole then fails at apply, which is how the sibling send-gate role
   # broke main. Keep punctuation in this string to plain ASCII.
+  # Keep the existing description byte-for-byte so this rollout changes only
+  # the trust document. Its "Per-PR" label predates the protected main canary.
   description = "Per-PR OTP registration gate for ${var.github_org}/${var.qurl_go_github_repo} - drains the CI mailbox queue and reads its messages, nothing else"
 
   assume_role_policy = jsonencode({
@@ -395,7 +400,10 @@ resource "aws_iam_role" "qurl_go_otp_mailbox_gate" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.qurl_go_github_repo}:pull_request"
+          "token.actions.githubusercontent.com:sub" = [
+            "repo:${var.github_org}/${var.qurl_go_github_repo}:pull_request",
+            "repo:${var.github_org}/${var.qurl_go_github_repo}:ref:refs/heads/main",
+          ]
         }
       }
     }]
@@ -449,12 +457,12 @@ resource "aws_iam_role_policy" "qurl_go_otp_mailbox_gate" {
 # literals. They are surfaced here and injected into that workflow as
 # configuration.
 output "agent_otp_ci_mailbox_queue_url" {
-  description = "SQS queue the per-PR OTP gate long-polls for mail arrival notifications."
+  description = "SQS queue the qurl-go OTP gate long-polls for mail arrival notifications."
   value       = local.agent_otp_ci_mailbox_enabled ? aws_sqs_queue.agent_otp_ci_mailbox[0].url : ""
 }
 
 output "agent_otp_ci_mailbox_bucket" {
-  description = "S3 bucket holding raw inbound OTP messages for the per-PR gate."
+  description = "S3 bucket holding raw inbound OTP messages for the qurl-go gate."
   value       = local.agent_otp_ci_mailbox_enabled ? aws_s3_bucket.agent_otp_ci_mailbox[0].id : ""
 }
 
@@ -469,6 +477,6 @@ output "agent_otp_ci_mailbox_recipient" {
 }
 
 output "qurl_go_otp_mailbox_gate_role_arn" {
-  description = "Role the qurl-go per-PR OTP registration gate assumes. Minimal by construction: drain the CI mailbox queue and read its messages, nothing else."
+  description = "Role the qurl-go pull-request gate and protected main canary assume. Minimal by construction: drain the CI mailbox queue and read its messages, nothing else."
   value       = local.agent_otp_ci_mailbox_enabled ? aws_iam_role.qurl_go_otp_mailbox_gate[0].arn : ""
 }

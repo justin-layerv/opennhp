@@ -704,6 +704,11 @@ jobs:
       - name: Test staged qURL agent transaction IAM boundary
         run: python3 tests/scripts/test_qurl_agent_transact_iam.py
 
+      - name: Test qurl-go OTP mailbox trust and plan boundary
+        run: |
+          python3 -m py_compile .github/scripts/check-qurl-go-otp-mailbox-gate-plan.py
+          python3 tests/scripts/test_qurl_go_otp_mailbox_gate.py
+
       - name: Test source-locked production Hub DNS boundary
         run: python3 tests/scripts/test_prod_hub_dns.py
 
