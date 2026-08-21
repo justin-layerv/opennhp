@@ -6633,9 +6633,9 @@ def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> Non
 
 
 def _check_authority_connector_resource_exec_role_policy(
-    after: dict[str, Any], fn: str
+    after: dict[str, Any], fn: str, control_data_key_arn: str
 ) -> None:
-    """Pin sandbox creso to exact Control/cell and software-custody grants.
+    """Pin creso to exact Control/cell SSE and software-custody grants.
 
     The reusable Terraform module also supports hardware custody. This checker
     is deliberately the exact sandbox transition checker, and both provisioned
@@ -6675,9 +6675,11 @@ def _check_authority_connector_resource_exec_role_policy(
         "OwnLogStream",
         "ConnectorResourceControlDescribe",
         "ConnectorResourceControlRead",
+        "ConnectorResourceControlDynamoDBDecrypt",
         "ConnectorResourceCellDescribe",
         "ConnectorResourceCellResourceData",
         "ConnectorResourceCellKeyMaterial",
+        "ConnectorResourceCellDynamoDBDecrypt",
         "ConnectorResourceGenerateEnvelopeDataKey",
     }
     if set(by_sid) != expected_sids:
@@ -6742,6 +6744,57 @@ def _check_authority_connector_resource_exec_role_policy(
         if "Condition" in statement:
             raise ContractError(f"{fn} {sid} must be unconditional")
 
+    def decrypt_condition(table_names: list[str]) -> dict[str, Any]:
+        return {
+            "StringEquals": {
+                "kms:ViaService": f"dynamodb.{AWS_REGION}.amazonaws.com",
+                "kms:EncryptionContext:aws:dynamodb:subscriberId": ACCOUNT_ID,
+                "kms:EncryptionContext:aws:dynamodb:tableName": table_names,
+            }
+        }
+
+    if (
+        not isinstance(control_data_key_arn, str)
+        or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(control_data_key_arn) is None
+    ):
+        raise ContractError(f"{fn} Control data-key binding is invalid")
+    control_decrypt = by_sid["ConnectorResourceControlDynamoDBDecrypt"]
+    control_table_names = [
+        AUTHORITY_RUNTIME_TABLE_ARNS[table].rsplit("/", 1)[-1]
+        for table in ("agent_keys", "connector_authority", "customers")
+    ]
+    if (
+        _authority_string_set(
+            control_decrypt.get("Action"), fn, "Control decrypt Action"
+        )
+        != {"kms:Decrypt"}
+        or _authority_string_set(
+            control_decrypt.get("Resource"), fn, "Control decrypt Resource"
+        )
+        != {control_data_key_arn}
+        or control_decrypt.get("Condition")
+        != decrypt_condition(control_table_names)
+    ):
+        raise ContractError(f"{fn} Control DynamoDB decrypt grant drifted")
+
+    cell_decrypt = by_sid["ConnectorResourceCellDynamoDBDecrypt"]
+    cell_table_names = [
+        cell["qurl_resources_table_arn"].rsplit("/", 1)[-1],
+        cell["qurl_resource_key_material_table_arn"].rsplit("/", 1)[-1],
+    ]
+    if (
+        _authority_string_set(
+            cell_decrypt.get("Action"), fn, "cell decrypt Action"
+        )
+        != {"kms:Decrypt"}
+        or _authority_string_set(
+            cell_decrypt.get("Resource"), fn, "cell decrypt Resource"
+        )
+        != {cell["cell_data_kms_key_arn"]}
+        or cell_decrypt.get("Condition") != decrypt_condition(cell_table_names)
+    ):
+        raise ContractError(f"{fn} cell DynamoDB decrypt grant drifted")
+
     envelope = by_sid["ConnectorResourceGenerateEnvelopeDataKey"]
     if (
         _authority_string_set(envelope.get("Action"), fn, "envelope Action")
@@ -6770,6 +6823,7 @@ def _check_authority_exec_role_policy(
     operation: str,
     *,
     proof_policy_consumer: bool = False,
+    connector_resource_control_data_key_arn: str = "",
 ) -> None:
     """Validate one function's per-operation execution (identity) policy.
 
@@ -6787,7 +6841,9 @@ def _check_authority_exec_role_policy(
         _check_authority_proof_recovery_exec_role_policy(after, fn)
         return
     if operation == "resolve_connector_resource":
-        _check_authority_connector_resource_exec_role_policy(after, fn)
+        _check_authority_connector_resource_exec_role_policy(
+            after, fn, connector_resource_control_data_key_arn
+        )
         return
     if operation in AUTHORITY_RUNTIME_CELL_OPERATION_IAM:
         _check_authority_cell_exec_role_policy(after, fn, operation)
@@ -7686,6 +7742,15 @@ def _check_authority_runtime_resources(
     if not isinstance(functions, dict) or selected not in ("blue", "green"):
         raise ContractError("runtime slice cannot resolve the bound contract functions")
 
+    authority_data_key_arn = _authority_runtime_after(
+        by_address, "module.control.aws_kms_key.authority_data"
+    ).get("arn")
+    if (
+        not isinstance(authority_data_key_arn, str)
+        or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(authority_data_key_arn) is None
+    ):
+        raise ContractError("Authority runtime Control data-key binding is invalid")
+
     operations = (
         AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF
         if set(AUTHORITY_PROOF_FUNCTIONS).issubset(functions)
@@ -7766,6 +7831,15 @@ def _check_authority_runtime_resources(
             ),
             fn,
         )
+        function_environment = function_after.get("environment")
+        function_variables = (
+            function_environment[0].get("variables")
+            if isinstance(function_environment, list)
+            and len(function_environment) == 1
+            and isinstance(function_environment[0], dict)
+            and isinstance(function_environment[0].get("variables"), dict)
+            else {}
+        )
         _check_authority_exec_role_policy(
             _authority_runtime_after(
                 by_address,
@@ -7782,6 +7856,11 @@ def _check_authority_runtime_resources(
                     "issue_credential_recovery",
                 }
             ),
+            connector_resource_control_data_key_arn=(
+                authority_data_key_arn
+                if _operation == "resolve_connector_resource"
+                else ""
+            ),
         )
 
         for color in ("blue", "green"):
@@ -7797,15 +7876,7 @@ def _check_authority_runtime_resources(
                 "synchronous RequestResponse contract"
             )
 
-        environment = function_after.get("environment")
-        variables = (
-            environment[0].get("variables")
-            if isinstance(environment, list)
-            and len(environment) == 1
-            and isinstance(environment[0], dict)
-            and isinstance(environment[0].get("variables"), dict)
-            else {}
-        )
+        variables = function_variables
         resource_keys = {
             "CONNECTOR_AUTHORITY_CELL_TABLE_PREFIX",
             "CONNECTOR_AUTHORITY_CELL_DATA_KMS_KEY_ARN",
@@ -7850,10 +7921,7 @@ def _check_authority_runtime_resources(
                     f"{fn} connector-resource identity environment drifted"
                 )
             data_key = variables.get("CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN")
-            if (
-                not isinstance(data_key, str)
-                or _AUTHORITY_DATA_KEY_ARN_RE.fullmatch(data_key) is None
-            ):
+            if data_key != authority_data_key_arn:
                 raise ContractError(
                     f"{fn} connector-resource data-key environment drifted"
                 )

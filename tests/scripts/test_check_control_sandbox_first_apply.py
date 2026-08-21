@@ -550,7 +550,7 @@ def applied_provisioned_cell_item(cell_id: str) -> str:
 def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
     data_key_arn = (
         f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
-        "key/data123"
+        "key/00000000-0000-0000-0000-000000000002"
     )
     result: dict[str, tuple[dict, dict]] = {
         "module.control.aws_vpc.control": (
@@ -1802,6 +1802,32 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                 "Resource": control_resources,
             },
             {
+                "Sid": "ConnectorResourceControlDynamoDBDecrypt",
+                "Effect": "Allow",
+                "Action": ["kms:Decrypt"],
+                "Resource": [RUNTIME_AUTHORITY_DATA_KEY_ARN],
+                "Condition": {
+                    "StringEquals": {
+                        "kms:ViaService": (
+                            f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                        ),
+                        "kms:EncryptionContext:aws:dynamodb:subscriberId": (
+                            CHECKER.ACCOUNT_ID
+                        ),
+                        "kms:EncryptionContext:aws:dynamodb:tableName": [
+                            CHECKER.AUTHORITY_RUNTIME_TABLE_ARNS[table].rsplit(
+                                "/", 1
+                            )[-1]
+                            for table in (
+                                "agent_keys",
+                                "connector_authority",
+                                "customers",
+                            )
+                        ],
+                    }
+                },
+            },
+            {
                 "Sid": "ConnectorResourceControlRead",
                 "Effect": "Allow",
                 "Action": ["dynamodb:GetItem"],
@@ -1831,6 +1857,28 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                 "Effect": "Allow",
                 "Action": ["dynamodb:DeleteItem", "dynamodb:PutItem"],
                 "Resource": [cell["qurl_resource_key_material_table_arn"]],
+            },
+            {
+                "Sid": "ConnectorResourceCellDynamoDBDecrypt",
+                "Effect": "Allow",
+                "Action": ["kms:Decrypt"],
+                "Resource": [cell["cell_data_kms_key_arn"]],
+                "Condition": {
+                    "StringEquals": {
+                        "kms:ViaService": (
+                            f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
+                        ),
+                        "kms:EncryptionContext:aws:dynamodb:subscriberId": (
+                            CHECKER.ACCOUNT_ID
+                        ),
+                        "kms:EncryptionContext:aws:dynamodb:tableName": [
+                            cell["qurl_resources_table_arn"].rsplit("/", 1)[-1],
+                            cell["qurl_resource_key_material_table_arn"].rsplit(
+                                "/", 1
+                            )[-1],
+                        ],
+                    }
+                },
             },
             {
                 "Sid": "ConnectorResourceGenerateEnvelopeDataKey",
@@ -9284,17 +9332,12 @@ class PlanContractTests(unittest.TestCase):
         change["after"]["policy"] = json.dumps(policy)
         self.assert_rejected(candidate)
 
-    def test_connector_resource_runtime_rejects_table_sse_decrypt_grants(
+    def test_connector_resource_runtime_requires_both_table_sse_decrypt_grants(
         self,
     ) -> None:
-        for sid, resource in (
-            ("AuthorityDynamoDBDecrypt", RUNTIME_AUTHORITY_DATA_KEY_ARN),
-            (
-                "ConnectorResourceCellDynamoDBDecrypt",
-                CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS["cell0"][
-                    "cell_data_kms_key_arn"
-                ],
-            ),
+        for sid in (
+            "ConnectorResourceControlDynamoDBDecrypt",
+            "ConnectorResourceCellDynamoDBDecrypt",
         ):
             with self.subTest(sid=sid):
                 candidate = authority_runtime_transition_fixture()
@@ -9304,23 +9347,125 @@ class PlanContractTests(unittest.TestCase):
                     f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
                 )
                 policy = json.loads(change["after"]["policy"])
-                policy["Statement"].append(
-                    {
-                        "Sid": sid,
-                        "Effect": "Allow",
-                        "Action": ["kms:Decrypt"],
-                        "Resource": [resource],
-                        "Condition": {
-                            "StringEquals": {
-                                "kms:ViaService": (
-                                    f"dynamodb.{CHECKER.AWS_REGION}.amazonaws.com"
-                                )
-                            }
-                        },
-                    }
-                )
+                policy["Statement"] = [
+                    statement
+                    for statement in policy["Statement"]
+                    if statement["Sid"] != sid
+                ]
                 change["after"]["policy"] = json.dumps(policy)
                 self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_decrypt_scope_drift(self) -> None:
+        mutations = {
+            "direct without ViaService": lambda statement: statement.pop(
+                "Condition"
+            ),
+            "wrong service": lambda statement: statement["Condition"][
+                "StringEquals"
+            ].__setitem__("kms:ViaService", "lambda.us-east-2.amazonaws.com"),
+            "wrong subscriber": lambda statement: statement["Condition"][
+                "StringEquals"
+            ].__setitem__(
+                "kms:EncryptionContext:aws:dynamodb:subscriberId",
+                "000000000000",
+            ),
+            "cross-cell key": lambda statement: statement.__setitem__(
+                "Resource",
+                [
+                    CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS["cell1"][
+                        "cell_data_kms_key_arn"
+                    ]
+                ],
+            ),
+            "envelope key": lambda statement: statement.__setitem__(
+                "Resource",
+                [
+                    CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS["cell0"][
+                        "resource_key_envelope_kms_key_arn"
+                    ]
+                ],
+            ),
+            "unrelated table": lambda statement: statement["Condition"][
+                "StringEquals"
+            ].__setitem__(
+                "kms:EncryptionContext:aws:dynamodb:tableName",
+                ["layerv-nhp-sandbox-cell0-unrelated"],
+            ),
+        }
+        for sid in (
+            "ConnectorResourceControlDynamoDBDecrypt",
+            "ConnectorResourceCellDynamoDBDecrypt",
+        ):
+            for name, mutate in mutations.items():
+                with self.subTest(sid=sid, name=name):
+                    candidate = authority_runtime_transition_fixture()
+                    fn = "layerv-nhp-sandbox-ca-creso-cell0"
+                    change = self.change(
+                        candidate,
+                        f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+                    )
+                    policy = json.loads(change["after"]["policy"])
+                    decrypt = next(
+                        statement
+                        for statement in policy["Statement"]
+                        if statement["Sid"] == sid
+                    )
+                    mutate(decrypt)
+                    change["after"]["policy"] = json.dumps(policy)
+                    self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_control_decrypt_key_mismatch(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = "layerv-nhp-sandbox-ca-creso-cell0"
+        change = self.change(
+            candidate,
+            f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+        )
+        policy = json.loads(change["after"]["policy"])
+        decrypt = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ConnectorResourceControlDynamoDBDecrypt"
+        )
+        decrypt["Resource"] = [
+            CHECKER.AUTHORITY_CONNECTOR_RESOURCE_CELLS["cell0"][
+                "cell_data_kms_key_arn"
+            ]
+        ]
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_connector_resource_runtime_rejects_coupled_control_key_drift(
+        self,
+    ) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = "layerv-nhp-sandbox-ca-creso-cell0"
+        alternate_key_arn = (
+            f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+            "key/00000000-0000-0000-0000-000000000099"
+        )
+        function = self.change(
+            candidate,
+            f'module.control.aws_lambda_function.authority["{fn}"]',
+        )
+        function["after"]["environment"][0]["variables"][
+            "CONNECTOR_AUTHORITY_DATA_KMS_KEY_ARN"
+        ] = alternate_key_arn
+        policy_change = self.change(
+            candidate,
+            f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+        )
+        policy = json.loads(policy_change["after"]["policy"])
+        decrypt = next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ConnectorResourceControlDynamoDBDecrypt"
+        )
+        decrypt["Resource"] = [alternate_key_arn]
+        policy_change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
 
     def test_connector_resource_runtime_rejects_cell_prefix_drift(self) -> None:
         candidate = authority_runtime_transition_fixture()
@@ -10536,7 +10681,7 @@ def state_fixture() -> dict:
     by_address["module.control.aws_security_group.otp_redis"]["id"] = (
         RUNTIME_OTP_REDIS_SG_ID
     )
-    data_key_arn = f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:key/data123"
+    data_key_arn = RUNTIME_AUTHORITY_DATA_KEY_ARN
     by_address["module.control.aws_kms_key.authority_data"].update(
         {
             "arn": data_key_arn,

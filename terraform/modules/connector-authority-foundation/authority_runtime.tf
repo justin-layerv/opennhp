@@ -278,14 +278,16 @@ locals {
   #
   # RECONCILED against the live handler in layervai/qurl-service (origin/main
   # internal/connectorauthorityruntime + internal/connectorauthority +
-  # internal/repository/dynamodb). Existing operations retain their scoped
-  # DynamoDB-mediated kms:Decrypt grant. ResolveConnectorResource deliberately
-  # does not: its constructor uses DescribeTable only to compare KMSMasterKeyArn,
-  # and its create path never invokes KMS against either the Control or cell
-  # table SSE CMK. Each op also needs dynamodb:DescribeTable to read and verify
-  # that SSE key at cold start. KMS on the identity layer is the
-  # separate qat1 assignment-ticket key for IssueAssignment only (GetPublicKey
-  # to load the key, Sign to mint the ticket). ENI lifecycle keeps the
+  # internal/repository/dynamodb). Every data-reading operation needs a scoped
+  # DynamoDB-mediated kms:Decrypt grant in addition to its table actions:
+  # DynamoDB authorizes customer-managed table keys against the caller's role.
+  # ResolveConnectorResource carries two purpose-named grants because it crosses
+  # the Control/cell ownership boundary; the grants are separately pinned to the
+  # three Control tables and its own cell's two tables. Each op also needs
+  # dynamodb:DescribeTable to read and verify that SSE key at cold start. KMS on
+  # the identity layer is the separate qat1 assignment-ticket key for
+  # IssueAssignment only (GetPublicKey to load the key, Sign to mint the
+  # ticket). ENI lifecycle keeps the
   # AWS-required Resource="*" (plan-sanctioned); no other statement uses that
   # escape.
   # ----------------------------------------------------------------------------
@@ -309,8 +311,9 @@ locals {
   # usable only when the request comes through DynamoDB, while the operation's
   # table-scoped DynamoDB statements remain the finer data boundary. ca-pm
   # retains its separately named proof grant because its policy is independently
-  # byte-checked as an attended mutation capability. creso is excluded at the
-  # policy composition site because its implemented path performs no Decrypt.
+  # byte-checked as an attended mutation capability. creso is excluded from this
+  # shared statement because its cross-boundary Control grant is separately named
+  # and additionally fenced by DynamoDB's exact table-name encryption context.
   authority_runtime_dynamodb_decrypt_statements = local.authority_runtime_functions_deploy ? [{
     Sid      = "AuthorityDynamoDBDecrypt"
     Effect   = "Allow"
@@ -677,6 +680,22 @@ locals {
     ]
     resolve_connector_resource = [
       {
+        # The first non-replay path strongly reads exact agent identity,
+        # assignment, and owner rows. DynamoDB evaluates the Control table CMK
+        # against the creso execution role, so GetItem alone is insufficient.
+        Sid      = "ConnectorResourceControlDynamoDBDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [aws_kms_key.authority_data.arn]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                                  = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            "kms:EncryptionContext:aws:dynamodb:subscriberId" = data.aws_caller_identity.current.account_id
+            "kms:EncryptionContext:aws:dynamodb:tableName"    = [local.control_table_names.agent_keys, local.control_table_names.connector_authority, local.control_table_names.customers]
+          }
+        }
+      },
+      {
         # Exactly the three Control base tables the creso constructor verifies
         # at cold start. Indexes and Query/Scan are deliberately absent.
         Sid    = "ConnectorResourceControlDescribe"
@@ -709,6 +728,22 @@ locals {
     for cell_id, cell in local.authority_contract_cells :
     cell_id => concat(
       [
+        {
+          # Replay is the first domain read, before Control identity lookup.
+          # Scope the caller-side SSE authorization to this function's exact
+          # cell CMK and the two tables that CMK protects for this operation.
+          Sid      = "ConnectorResourceCellDynamoDBDecrypt"
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt"]
+          Resource = [cell.cell_data_kms_key_arn]
+          Condition = {
+            StringEquals = {
+              "kms:ViaService"                                  = "dynamodb.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+              "kms:EncryptionContext:aws:dynamodb:subscriberId" = data.aws_caller_identity.current.account_id
+              "kms:EncryptionContext:aws:dynamodb:tableName"    = ["${cell.cell_table_prefix}-qurl-resources", "${cell.cell_table_prefix}-qurl-resource-key-material"]
+            }
+          }
+        },
         {
           Sid      = "ConnectorResourceCellDescribe"
           Effect   = "Allow"

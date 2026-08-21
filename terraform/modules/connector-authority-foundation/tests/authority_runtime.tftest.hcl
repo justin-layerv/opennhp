@@ -462,19 +462,62 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
         !contains([
           for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
         ], "AuthorityDynamoDBDecrypt") &&
-        !contains([
-          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement.Sid
-        ], "ConnectorResourceCellDynamoDBDecrypt") &&
+        {
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+          statement.Sid => statement
+          }["ConnectorResourceControlDynamoDBDecrypt"] == {
+          Sid      = "ConnectorResourceControlDynamoDBDecrypt"
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt"]
+          Resource = [aws_kms_key.authority_data.arn]
+          Condition = {
+            StringEquals = {
+              "kms:ViaService"                                  = "dynamodb.us-east-2.amazonaws.com"
+              "kms:EncryptionContext:aws:dynamodb:subscriberId" = "767397897469"
+              "kms:EncryptionContext:aws:dynamodb:tableName" = [
+                "layerv-nhp-sandbox-control-qurl-agent-keys",
+                "layerv-nhp-sandbox-control-connector-authority",
+                "layerv-nhp-sandbox-control-qurl-customers",
+              ]
+            }
+          }
+        } &&
+        {
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
+          statement.Sid => statement
+          }["ConnectorResourceCellDynamoDBDecrypt"] == {
+          Sid      = "ConnectorResourceCellDynamoDBDecrypt"
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt"]
+          Resource = [cell_id == "cell0" ? "arn:aws:kms:us-east-2:767397897469:key/49224991-f4c7-4e02-bb23-0003e6326d02" : "arn:aws:kms:us-east-2:767397897469:key/fc5121da-c353-4621-b24b-7ec5f79446bd"]
+          Condition = {
+            StringEquals = {
+              "kms:ViaService"                                  = "dynamodb.us-east-2.amazonaws.com"
+              "kms:EncryptionContext:aws:dynamodb:subscriberId" = "767397897469"
+              "kms:EncryptionContext:aws:dynamodb:tableName" = cell_id == "cell0" ? [
+                "layerv-nhp-sandbox-cell0-qurl-resources",
+                "layerv-nhp-sandbox-cell0-qurl-resource-key-material",
+                ] : [
+                "layerv-nhp-sandbox-cell1-cell1-qurl-resources",
+                "layerv-nhp-sandbox-cell1-cell1-qurl-resource-key-material",
+              ]
+            }
+          }
+        } &&
+        length([
+          for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement : statement
+          if contains(try(tolist(statement.Action), [statement.Action]), "kms:Decrypt")
+        ]) == 2 &&
         length(setintersection(
           toset(flatten([
             for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
             try(tolist(statement.Action), [statement.Action])
           ])),
-          toset(["dynamodb:Query", "dynamodb:Scan", "kms:Decrypt", "kms:PutKeyPolicy", "kms:Sign", "kms:TagResource"]),
+          toset(["dynamodb:Query", "dynamodb:Scan", "kms:PutKeyPolicy", "kms:Sign", "kms:TagResource"]),
         )) == 0
       )
     ])
-    error_message = "creso IAM must carry only the exact Control/cell read-write and software-envelope capabilities; Query, Scan, Sign, key-policy mutation, and tag mutation stay absent."
+    error_message = "creso IAM must carry exactly two DynamoDB-mediated decrypt grants for the Control CMK and its own cell CMK, plus only the exact Control/cell read-write and software-envelope capabilities; cross-cell keys, direct decrypt, Query, Scan, Sign, key-policy mutation, and tag mutation stay absent."
   }
 
   assert {
