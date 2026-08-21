@@ -1220,7 +1220,9 @@ resource "aws_iam_role_policy" "context_lookups" {
 # qurl-service#1237: the pre-deploy agent-key inventory gate. The promotion
 # workflow runs the gate binary out of the qurl image immediately before
 # deploy-qurl; it needs a complete strongly consistent Scan of exactly the two
-# qurl agent-identity tables and nothing else.
+# qurl agent-identity tables. The sandbox-only second statement supports the
+# governed schema-v2 canary binding verifier from qurl-service#1418; it reads
+# only the Control connector-authority table and never ships to production.
 #
 # Deliberately its OWN inline policy rather than another statement inside
 # `context_lookups`: that policy is a reviewed relay-DMZ boundary resource
@@ -1246,8 +1248,8 @@ resource "aws_iam_role_policy" "qurl_agent_key_inventory" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
+    Statement = concat(
+      [{
         Sid    = "DynamoDBQurlAgentKeyInventoryGate"
         Effect = "Allow"
         Action = ["dynamodb:Scan"]
@@ -1255,8 +1257,14 @@ resource "aws_iam_role_policy" "qurl_agent_key_inventory" {
           "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-qurl-api-keys",
           "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-qurl-agent-keys"
         ]
-      }
-    ]
+      }],
+      var.environment == "sandbox" ? [{
+        Sid      = "DynamoDBQurlCanaryBindingVerifier"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Scan"]
+        Resource = ["arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-sandbox-control-connector-authority"]
+      }] : []
+    )
   })
 }
 

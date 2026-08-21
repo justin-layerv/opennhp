@@ -569,6 +569,7 @@ lint-workflows:
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@python3 tests/scripts/test_qurl_agent_transact_iam.py
+	@python3 tests/scripts/test_qurl_canary_verifier_iam.py
 	@python3 tests/scripts/test_qurl_go_otp_mailbox_gate.py
 	@python3 tests/scripts/test_prod_hub_dns.py
 	@python3 tests/scripts/test_sandbox_cell1_qurl_service_security_contract.py
