@@ -12467,15 +12467,56 @@ class LiveContractTests(unittest.TestCase):
                     len(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS) + len(extra),
                 )
 
+    def test_live_boundary_admits_the_exact_pre_creso_predecessor(self) -> None:
+        # This is the live shape between the original 3 -> 11 cell-runtime
+        # expansion and the one-time 11 -> 13 creso expansion. Freeze both its
+        # membership and cardinality so a future cell/operation cannot silently
+        # widen this historical predecessor.
+        self.assertEqual(len(CHECKER.AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS), 11)
+        self.assertEqual(
+            set(CHECKER.AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS),
+            set(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
+            - set(CHECKER.AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS),
+        )
+        for extra in ((), (CHECKER.HUB_KEYGEN_FUNCTION_NAME,)):
+            with (
+                self.subTest(hub_keygen=bool(extra)),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                live_fixture(root)
+                write_json(
+                    root / "control-lambdas.json",
+                    [
+                        {"FunctionName": name, "Runtime": None}
+                        for name in (
+                            *CHECKER.AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS,
+                            *extra,
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    CHECKER.check_live(root)["authority_function_count"],
+                    len(CHECKER.AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS)
+                    + len(extra),
+                )
+
     def test_live_boundary_rejects_partial_expansion_shapes(self) -> None:
-        # Only the two exact endpoints are admitted. Anything part-way through
-        # the 3 -> 13 expansion, or either set missing a member, fails closed.
+        # Only exact historical endpoints are admitted. Anything part-way
+        # through either 3 -> 11 or 11 -> 13, or any set missing a member,
+        # fails closed.
         complete = list(CHECKER.AUTHORITY_RUNTIME_FUNCTIONS)
         legacy = list(CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS)
-        partial = legacy + [n for n in complete if n not in legacy][:1]
+        pre_creso = list(CHECKER.AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS)
+        partial_cell_runtime = legacy + [n for n in pre_creso if n not in legacy][:1]
+        partial_creso = pre_creso + [
+            n for n in complete if n not in pre_creso
+        ][:1]
         for payload in (
-            partial,
+            partial_cell_runtime,
+            partial_creso,
             complete[:-1],
+            pre_creso[:-1],
             legacy[:-1],
         ):
             with (
@@ -12488,7 +12529,9 @@ class LiveContractTests(unittest.TestCase):
                     root / "control-lambdas.json",
                     [{"FunctionName": n, "Runtime": None} for n in payload],
                 )
-                with self.assertRaises(CHECKER.ContractError):
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError, "11-function pre-creso predecessor"
+                ):
                     CHECKER.check_live(root)
 
     def test_live_boundary_rejects_unexpected_or_malformed_lambdas(self) -> None:

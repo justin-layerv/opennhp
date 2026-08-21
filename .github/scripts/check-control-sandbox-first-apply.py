@@ -603,6 +603,25 @@ AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS = frozenset(
     for function_name, operation in AUTHORITY_RUNTIME_CELL_FUNCTIONS.items()
     if operation == "resolve_connector_resource"
 )
+# Exact live predecessor for the one-time connector-resource expansion. Keep
+# every name frozen instead of deriving the set as "all current functions except
+# creso": a future Hub function, cell, or operation must not silently widen what
+# the pre-apply live-boundary gate accepts as the historical 11-function shape.
+AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS = frozenset(
+    {
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ia",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ra",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-icr",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-iro-cell0",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ar-cell0",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-cr-cell0",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ccr-cell0",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-iro-cell1",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ar-cell1",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-cr-cell1",
+        f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ccr-cell1",
+    }
+)
 AUTHORITY_PROOF_FUNCTIONS = {
     AUTHORITY_PROOF_FUNCTION_NAME: AUTHORITY_PROOF_OPERATION,
     AUTHORITY_PROOF_RECOVERY_FUNCTION_NAME: AUTHORITY_PROOF_RECOVERY_OPERATION,
@@ -17378,10 +17397,12 @@ def check_live(
             "Control state object is not versioned under the exact KMS key"
         )
 
-    # The Control/authority prefixes own no Lambda while dark; exactly the 13
-    # complete functions once the runtime slice is live; and additionally the
-    # Hub keygen function once the Hub worker slice (5b) is live (the keygen only
-    # appears alongside the runtime). Any other function set fails closed.
+    # The Control/authority prefixes own no Lambda while dark; exactly the 3
+    # legacy Hub functions before the cell runtime; exactly the frozen 11-function
+    # pre-creso predecessor during the connector-resource rollout; exactly the 13
+    # complete functions once that expansion is live; or the exact 15-function
+    # attended-proof graph. The Hub keygen may additionally exist once the Hub
+    # worker slice (5b) is live. Any other function set fails closed.
     # `control-lambdas.json` is the reviewed `aws lambda list-functions`
     # projection (function objects filtered to the control and layerv-nhp-<env>-ca-
     # prefixes).
@@ -17394,20 +17415,20 @@ def check_live(
         if not isinstance(name, str):
             raise ContractError("Control Lambda inventory evidence is malformed")
         live_lambda_names.add(name)
-    # This proof runs BEFORE the apply, so it must admit the predecessor state as
-    # well as the successor. The complete graph is the 13 functions, but the
-    # legacy Hub-only trio is exactly what is live until the expansion applies;
-    # accepting only the 13 makes that expansion unappliable, because the gate
-    # demands the very functions the apply is about to create. Both sets are
-    # named constants and each is matched whole, so this admits two exact live
-    # shapes rather than relaxing the check to a subset or prefix test.
+    # This proof runs BEFORE the apply, so it must admit each exact historical
+    # predecessor as well as the successors. Every set is named and matched
+    # whole; no subset or prefix test can turn a partial expansion into an
+    # admitted live shape.
     complete_authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS)
     proof_authority_functions = set(AUTHORITY_RUNTIME_FUNCTIONS_WITH_PROOF)
     legacy_authority_functions = set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)
+    pre_creso_authority_functions = set(AUTHORITY_RUNTIME_PRE_CRESO_FUNCTIONS)
     if live_lambda_names not in (
         set(),
         legacy_authority_functions,
         legacy_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
+        pre_creso_authority_functions,
+        pre_creso_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
         complete_authority_functions,
         complete_authority_functions | {HUB_KEYGEN_FUNCTION_NAME},
         proof_authority_functions,
@@ -17415,8 +17436,9 @@ def check_live(
     ):
         raise ContractError(
             "Control prefix owns an unexpected Lambda function set; only the exact "
-            "3 legacy Hub-facing Authority functions, the exact 13 complete "
-            "Authority functions, or the exact 15-function attended-proof graph "
+            "3 legacy Hub-facing Authority functions, the exact 11-function "
+            "pre-creso predecessor, the exact 13 complete Authority functions, "
+            "or the exact 15-function attended-proof graph "
             "(each optionally plus the Hub keygen once the worker slice is live) "
             "are admitted"
         )
