@@ -60,13 +60,6 @@ while IFS=$'\t' read -r status file _rest; do
 			terraform_changed=true
 			prod_env_changed=true
 			;;
-		# This temporary root is production-only and has its own state and
-		# post-merge saved-plan workflow. Never gate it on the unrelated
-		# sandbox legacy-root plan.
-		terraform/staged/qurl-agent-transact-iam/*)
-			terraform_changed=true
-			prod_env_changed=true
-			;;
 		# Membership rule for this arm: the file can change the sandbox plan
 		# graph. Two entries are non-obvious —
 		# .github/control-sandbox-runtime-gates.json and its reader qualify

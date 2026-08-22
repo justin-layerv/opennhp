@@ -75,7 +75,6 @@ locals {
           "dynamodb:DescribeTable",
           "dynamodb:GetItem",
           "dynamodb:PutItem",
-          "dynamodb:TransactWriteItems",
           "dynamodb:UpdateItem",
         ]
         Resource = sort(flatten([

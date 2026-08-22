@@ -568,7 +568,7 @@ lint-workflows:
 	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
-	@python3 tests/scripts/test_qurl_agent_transact_iam.py
+	@python3 tests/scripts/test_no_invalid_dynamodb_transaction_actions.py
 	@python3 tests/scripts/test_qurl_canary_verifier_iam.py
 	@python3 tests/scripts/test_qurl_go_otp_mailbox_gate.py
 	@python3 tests/scripts/test_prod_hub_dns.py

@@ -9,9 +9,15 @@ change before any separately authorized production rollout.
 
 Read-only sandbox baseline on 2026-08-21: the live cell0 qurl-service task
 renders `CONNECTOR_AUTH_ENABLED=true` and the now-retired active-registration
-flag as `true`; IAM simulation returns `implicitDeny` for both
-`dynamodb:TransactWriteItems` and `dynamodb:ConditionCheckItem` on the exact
-cell0 qurl-resources table. A full 187,388-item table scan found zero
+flag as `true`; IAM simulation returns `implicitDeny` for
+`dynamodb:ConditionCheckItem` on the exact cell0 qurl-resources table, while
+the transaction's constituent `PutItem` action is already `allowed`. AWS IAM
+Access Analyzer rejects `dynamodb:TransactWriteItems` as a nonexistent action;
+PR #3926 merged that invalid spelling but it has not been applied. The
+corrective source change removes both nonexistent DynamoDB `Transact*` IAM
+actions from active generated policies and retains the required constituent
+actions. A full
+187,388-item table scan found zero
 `tunnel_registration` rows, zero `tunnel_session` rows, and 169 active tunnel
 resources; none has `sharing_desired_state`, so all 169 intentionally become
 off rather than receiving an implicit-on backfill.
@@ -20,21 +26,40 @@ off rather than receiving an implicit-on backfill.
       qurl-reverse-tunnel-server; land the NHP validator, qurl-service, qRTS,
       Connector/daemon, and CLI contracts without deploying an incompatible
       partial set.
-- [ ] Pre-rollout: after PR #3926 is merged, check out that merged `main` in
-      sandbox and create a saved, reviewed target plan for exactly
-      `module.nhp.module.qurl_service[0].aws_iam_role_policy.task_tunnel_session_fence[0]`.
+- [ ] Pre-rollout: after the corrective IAM source change is merged, check out
+      that merged `main` in sandbox and create a saved, reviewed target plan for
+      exactly
+      `module.nhp.module.qurl_service[0].aws_iam_role_policy.task_tunnel_session_fence[0]`
+      and `module.nhp.module.qurl_service[0].aws_iam_role_policy.task_dynamodb`.
       The target set must also include both
       `module.nhp.terraform_data.qurl_tunnel_active_registration_preconditions`
       and `module.nhp.terraform_data.qurl_tunnel_registration_preconditions`
       so Terraform can record their already-declared state-only move. On the
       2026-08-21 sandbox state, that target plan is exactly one IAM-policy add,
-      zero changes, zero destroys, plus the no-op precondition address move.
+      one IAM-policy in-place change, zero destroys, plus the no-op precondition
+      address move. The update removes only the two inert invalid transaction
+      action spellings; all constituent permissions remain.
       Apply the saved target plan only; do not run the full apply yet because
       it also creates the env-flag-free qurl-service task-definition revision.
-      Wait until IAM simulation allows both actions on the exact cell0
-      qurl-resources table and still returns `implicitDeny` for each action on
-      a sibling table and the resources-table index. Do not deploy the
-      consuming qurl-service build before this gate is green.
+      Read back the live policy and require its only action/resource to be
+      `dynamodb:ConditionCheckItem` on the exact cell0 qurl-resources table;
+      validate that document with IAM Access Analyzer and reject any nonexistent
+      DynamoDB `Transact*` action. Principal simulation must still show the
+      already-granted constituent `dynamodb:PutItem` on that table. The IAM
+      simulator does not faithfully resource-evaluate the permission-only
+      `ConditionCheckItem` action in isolation, so confirm its effective grant
+      with the bounded sandbox BindOrGet transaction smoke after service deploy;
+      no sibling-table or index grant may appear in policy readback. Do not
+      deploy the consuming qurl-service build before the source/readback gates
+      are green.
+- [ ] Pre-rollout: apply the Connector Authority correction only from its own
+      saved, reviewed control plan. The 2026-08-21 targeted sandbox plan contains
+      exactly three in-place changes and no create or destroy: both
+      `resolve_connector_resource` execution policies replace the invalid write
+      action with `PutItem`, and the DynamoDB endpoint policy removes the invalid
+      action while retaining its existing `PutItem`. Access Analyzer reports no
+      error or security-warning finding for the rendered documents. Do not
+      combine this source task with a production control apply.
 - [ ] Rollout: only after the targeted IAM pre-grant and its exact-scope
       simulations are green, deploy sandbox NHP token validation first, then
       qurl-service, qurl-reverse-tunnel-server, and Connector/CLI consumers in

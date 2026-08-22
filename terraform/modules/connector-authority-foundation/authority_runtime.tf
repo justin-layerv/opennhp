@@ -751,9 +751,12 @@ locals {
           Resource = [cell.qurl_resources_table_arn, cell.qurl_resource_key_material_table_arn]
         },
         {
-          Sid      = "ConnectorResourceCellResourceData"
-          Effect   = "Allow"
-          Action   = ["dynamodb:GetItem", "dynamodb:TransactWriteItems", "dynamodb:UpdateItem"]
+          Sid    = "ConnectorResourceCellResourceData"
+          Effect = "Allow"
+          # Connector resource transactions put replay/resource/sentinel rows
+          # and update existing rows. DynamoDB authorizes those constituent
+          # actions; TransactWriteItems is an API operation, not an IAM action.
+          Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
           Resource = [cell.qurl_resources_table_arn]
         },
         {

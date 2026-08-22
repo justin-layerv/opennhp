@@ -1320,7 +1320,7 @@ variable "qurl_scanner_lambda_image_tag_ssm_param" {
 }
 
 variable "qurl_resources_table_arn" {
-  description = "Exact ARN of the qurl-resources DynamoDB table. The qurl-service task role receives TransactWriteItems + ConditionCheckItem on this table only for immutable tunnel-session binding; scanner Lambdas separately use it for lifecycle writes and status-index queries. Thread from `module.dynamodb.qurl_resources_table_arn`. Empty is valid only when connector auth and scanners are disabled."
+  description = "Exact ARN of the qurl-resources DynamoDB table. The qurl-service task role receives ConditionCheckItem on this table only for immutable tunnel-session binding; the existing table policy supplies the transaction's constituent PutItem authorization, while scanner Lambdas separately use this ARN for lifecycle writes and status-index queries. Thread from `module.dynamodb.qurl_resources_table_arn`. Empty is valid only when connector auth and scanners are disabled."
   type        = string
   default     = ""
 }

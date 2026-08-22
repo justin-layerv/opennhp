@@ -1762,6 +1762,15 @@ AUTHORITY_CONNECTOR_RESOURCE_ROLE_ARNS = frozenset(
     for function_name, operation in AUTHORITY_RUNTIME_FUNCTIONS.items()
     if operation == "resolve_connector_resource"
 )
+AUTHORITY_DYNAMODB_TRANSACTION_ACTION_CORRECTION_ADDRESSES = frozenset(
+    {
+        "module.control.aws_vpc_endpoint.dynamodb",
+        *(
+            f'module.control.aws_iam_role_policy.authority_exec["{function_name}"]'
+            for function_name in AUTHORITY_CONNECTOR_RESOURCE_FUNCTIONS
+        ),
+    }
+)
 AUTHORITY_CONNECTOR_RESOURCE_CELL_TABLE_ARNS = frozenset(
     table_arn
     for cell in AUTHORITY_CONNECTOR_RESOURCE_CELLS.values()
@@ -6125,7 +6134,6 @@ def _check_authority_dynamodb_endpoint_policy(
         "dynamodb:DescribeTable",
         "dynamodb:GetItem",
         "dynamodb:PutItem",
-        "dynamodb:TransactWriteItems",
         "dynamodb:UpdateItem",
     }:
         raise ContractError(f"{address} cell-data actions drifted")
@@ -6723,7 +6731,7 @@ def _check_authority_connector_resource_exec_role_policy(
         "ConnectorResourceCellResourceData": (
             {
                 "dynamodb:GetItem",
-                "dynamodb:TransactWriteItems",
+                "dynamodb:PutItem",
                 "dynamodb:UpdateItem",
             },
             {cell["qurl_resources_table_arn"]},
@@ -9407,11 +9415,15 @@ def _claim_authority_hub_exec_policy_update(
         return frozenset()
 
     staged = _claim_authority_proof_consumer_staging(changed, actual_non_noop, by_address)
+    transaction_action_correction = _claim_dynamodb_transaction_action_correction(
+        changed, actual_non_noop, by_address
+    )
     claimed = {
         address
         for address in changed
         if address in AUTHORITY_EXEC_POLICY_ADDRESSES
         and (actual_non_noop.get(address) or ()) == ["update"]
+        and address not in transaction_action_correction
     }
     if staged and (claimed & set(staged)):
         return None
@@ -9880,6 +9892,123 @@ def _authority_contract_target_image(by_address: dict[str, Any]) -> str | None:
         return None
     target = payload.get("authority_image_uri")
     return target if isinstance(target, str) and "@sha256:" in target else None
+
+
+def _dynamodb_transaction_action_correction_after(
+    before: dict[str, Any], address: str
+) -> dict[str, Any]:
+    """Return the sole accepted correction of a generated DynamoDB policy."""
+    policy = _authority_decode_policy(before, address)
+    if not isinstance(policy, dict):
+        raise ContractError(f"{address} policy must be an object")
+    corrected = copy.deepcopy(policy)
+    statements = corrected.get("Statement")
+    if not isinstance(statements, list):
+        raise ContractError(f"{address} policy statements are malformed")
+    expected_sid = (
+        "ConnectorResourceCellData"
+        if address == "module.control.aws_vpc_endpoint.dynamodb"
+        else "ConnectorResourceCellResourceData"
+    )
+    matches = [
+        statement
+        for statement in statements
+        if isinstance(statement, dict) and statement.get("Sid") == expected_sid
+    ]
+    if len(matches) != 1:
+        raise ContractError(
+            f"{address} must contain exactly one {expected_sid} statement"
+        )
+    actions = matches[0].get("Action")
+    if not isinstance(actions, list) or any(
+        not isinstance(action, str) for action in actions
+    ):
+        raise ContractError(f"{address} {expected_sid} actions are malformed")
+    if actions.count("dynamodb:TransactWriteItems") != 1:
+        raise ContractError(
+            f"{address} {expected_sid} must contain the retired transaction action once"
+        )
+    index = actions.index("dynamodb:TransactWriteItems")
+    if address == "module.control.aws_vpc_endpoint.dynamodb":
+        if actions.count("dynamodb:PutItem") != 1:
+            raise ContractError(
+                f"{address} {expected_sid} must already authorize PutItem"
+            )
+        actions.pop(index)
+    else:
+        if "dynamodb:PutItem" in actions:
+            raise ContractError(
+                f"{address} {expected_sid} must not duplicate PutItem"
+            )
+        actions[index] = "dynamodb:PutItem"
+    return corrected
+
+
+def _is_exact_dynamodb_transaction_action_correction(
+    item: dict[str, Any], address: str
+) -> bool:
+    change = item.get("change")
+    if not isinstance(change, dict) or change.get("actions") != ["update"]:
+        return False
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    try:
+        expected_policy = _dynamodb_transaction_action_correction_after(before, address)
+        actual_policy = _authority_decode_policy(after, address)
+    except ContractError:
+        return False
+    expected_after = copy.deepcopy(before)
+    expected_after["policy"] = json.dumps(
+        expected_policy, separators=(",", ":"), sort_keys=True
+    )
+    actual_after = copy.deepcopy(after)
+    try:
+        actual_after["policy"] = json.dumps(
+            actual_policy, separators=(",", ":"), sort_keys=True
+        )
+    except (TypeError, ValueError):
+        return False
+    return actual_after == expected_after
+
+
+def _claim_dynamodb_transaction_action_correction(
+    changed: set[str],
+    actual_non_noop: dict[str, Any],
+    by_address: dict[str, Any],
+) -> frozenset[str]:
+    """Claim pending members of the closed three-policy IAM correction."""
+    pending = changed & set(AUTHORITY_DYNAMODB_TRANSACTION_ACTION_CORRECTION_ADDRESSES)
+    if not pending:
+        return frozenset()
+    if any(actual_non_noop.get(address) != ["update"] for address in pending):
+        return frozenset()
+    if any(
+        not _is_exact_dynamodb_transaction_action_correction(
+            by_address.get(address, {}), address
+        )
+        for address in pending
+    ):
+        return frozenset()
+    return frozenset(pending)
+
+
+def _validate_dynamodb_transaction_action_correction(
+    claimed: frozenset[str],
+    by_address: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    del plan
+    if not claimed or not claimed <= AUTHORITY_DYNAMODB_TRANSACTION_ACTION_CORRECTION_ADDRESSES:
+        raise ContractError("DynamoDB transaction-action correction scope drifted")
+    for address in claimed:
+        if not _is_exact_dynamodb_transaction_action_correction(
+            by_address.get(address, {}), address
+        ):
+            raise ContractError(
+                f"{address} is not the exact DynamoDB transaction-action correction"
+            )
 
 
 def _claim_authority_image_roll(
@@ -11018,6 +11147,11 @@ def _validate_authority_reserved_envelope_widen(
 
 
 _COMPOSABLE_TRANSITIONS: tuple[tuple[str, Any, Any], ...] = (
+    (
+        "dynamodb-transaction-action-correction",
+        _claim_dynamodb_transaction_action_correction,
+        _validate_dynamodb_transaction_action_correction,
+    ),
     (
         "authority-proof-rollout-retirement",
         _claim_authority_proof_rollout_retirement,
@@ -15747,6 +15881,15 @@ def check_plan(
             _exec_policy_only, by_address, plan
         )
     elif (
+        _transaction_action_only := _claim_dynamodb_transaction_action_correction(
+            changed, actual_non_noop, by_address
+        )
+    ) and set(_transaction_action_only) == changed and not deposed_by_address:
+        plan_mode = "dynamodb-transaction-action-correction"
+        _validate_dynamodb_transaction_action_correction(
+            _transaction_action_only, by_address, plan
+        )
+    elif (
         changed
         and changed
         # Subset of the WITH_PROOF set (15). Post-teardown only the 13 runtime
@@ -15978,6 +16121,7 @@ def check_plan(
             # to the digest parameter are exactly what precedes a roll, so this
             # is the transition most likely to carry the drift.
             "authority-image-roll",
+            "dynamodb-transaction-action-correction",
             # The one-time envelope widen absorbs a riding publish (image-roll
             # stands down for it), so the same publisher-written digest drift
             # can accompany it; the full-inventory validator re-proves uniform

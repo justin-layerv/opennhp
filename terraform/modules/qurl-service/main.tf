@@ -872,11 +872,10 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           "dynamodb:DeleteItem",
           "dynamodb:Query",
           "dynamodb:BatchGetItem",
-          "dynamodb:TransactGetItems",
-          "dynamodb:TransactWriteItems",
-          # ConditionCheckItem is a SEPARATE action from TransactWriteItems, and
-          # holding the latter does not imply it. A transaction that carries a
-          # ConditionCheck leg is authorized per-leg, so minting an API key --
+          # DynamoDB authorizes transactions per constituent item action; there
+          # are no TransactGetItems/TransactWriteItems IAM actions. A transaction
+          # that carries a ConditionCheck leg therefore needs this separate
+          # authorization, so minting an API key --
           # which condition-checks the owning customer row before writing the
           # credential -- fails with AccessDeniedException on
           # `dynamodb:ConditionCheckItem` even though every write action is
@@ -973,10 +972,12 @@ resource "aws_iam_role_policy" "task_dynamodb" {
 }
 
 # Connector session binding atomically condition-checks the parent resource and
-# writes the immutable resource+session fence in qurl-resources. Keep these two
-# transaction authorizations in a separate policy so they cannot leak onto the
-# sibling table/index list in task_dynamodb, and so rollout can pre-grant this
-# exact policy before deploying the qurl-service build that consumes it.
+# writes the immutable resource+session fence in qurl-resources. DynamoDB
+# authorizes each transaction item by its constituent action: task_dynamodb
+# already grants PutItem on this table, while this exact policy adds only the
+# missing ConditionCheckItem action. Keeping it separate prevents that new
+# authorization from leaking onto sibling tables/indexes and lets rollout
+# pre-grant it before deploying the qurl-service build that consumes it.
 resource "aws_iam_role_policy" "task_tunnel_session_fence" {
   count = var.connector_auth_enabled ? 1 : 0
 
@@ -986,12 +987,9 @@ resource "aws_iam_role_policy" "task_tunnel_session_fence" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid    = "TunnelSessionFenceAccess"
-      Effect = "Allow"
-      Action = [
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:TransactWriteItems",
-      ]
+      Sid      = "TunnelSessionFenceAccess"
+      Effect   = "Allow"
+      Action   = ["dynamodb:ConditionCheckItem"]
       Resource = [var.qurl_resources_table_arn]
     }]
   })
@@ -999,7 +997,7 @@ resource "aws_iam_role_policy" "task_tunnel_session_fence" {
   lifecycle {
     precondition {
       condition     = var.qurl_resources_table_arn != ""
-      error_message = "connector_auth_enabled=true requires qurl_resources_table_arn so tunnel-session TransactWriteItems and ConditionCheckItem can be scoped to the exact resources table."
+      error_message = "connector_auth_enabled=true requires qurl_resources_table_arn so tunnel-session ConditionCheckItem can be scoped to the exact resources table."
     }
   }
 }

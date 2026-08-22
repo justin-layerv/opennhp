@@ -12,7 +12,6 @@
       ".github/workflows/control-sandbox-update.yml",
       ".github/workflows/prod-hub-dns-update.yml",
       ".github/workflows/promote-to-prod.yml",
-      ".github/workflows/qurl-agent-transact-iam.yml",
       ".github/workflows/recover-sandbox-terraform-read.yml",
       ".github/workflows/terraform-plan-pr.yml",
       ".github/workflows/validate-workflows.yml"

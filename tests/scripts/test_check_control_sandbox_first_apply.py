@@ -54,7 +54,7 @@ PROD_CONTROL_VARIABLES_PATH = (
 )
 EXPECTED_AWS_PROVIDER_VERSION = "6.55.0"
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
-    ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
+    ROOT / "tests/fixtures/terraform/no-op-envelope-1.14.3.json"
 )
 REAL_REDIS_IAM_CREATE_FIXTURE_PATH = (
     ROOT
@@ -1623,7 +1623,6 @@ def runtime_scoped_endpoint_policies(
                         "dynamodb:DescribeTable",
                         "dynamodb:GetItem",
                         "dynamodb:PutItem",
-                        "dynamodb:TransactWriteItems",
                         "dynamodb:UpdateItem",
                     ],
                     "Resource": sorted(
@@ -1847,7 +1846,7 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                 "Effect": "Allow",
                 "Action": [
                     "dynamodb:GetItem",
-                    "dynamodb:TransactWriteItems",
+                    "dynamodb:PutItem",
                     "dynamodb:UpdateItem",
                 ],
                 "Resource": [cell["qurl_resources_table_arn"]],
@@ -14538,6 +14537,120 @@ class ComposedTransitionTest(unittest.TestCase):
         }
         return by
 
+    @staticmethod
+    def transaction_action_correction_fixture() -> dict:
+        """The closed two-role-plus-endpoint policy correction."""
+        role_statement = {
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:TransactWriteItems",
+                "dynamodb:UpdateItem",
+            ],
+            "Effect": "Allow",
+            "Resource": ["arn:aws:dynamodb:us-east-2:767397897469:table/resources"],
+            "Sid": "ConnectorResourceCellResourceData",
+        }
+        endpoint_statement = {
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:TransactWriteItems",
+                "dynamodb:UpdateItem",
+            ],
+            "Effect": "Allow",
+            "Principal": "*",
+            "Resource": ["arn:aws:dynamodb:us-east-2:767397897469:table/resources"],
+            "Sid": "ConnectorResourceCellData",
+        }
+        fixture = {}
+        for address in sorted(
+            CHECKER.AUTHORITY_DYNAMODB_TRANSACTION_ACTION_CORRECTION_ADDRESSES
+        ):
+            statement = (
+                endpoint_statement
+                if address == "module.control.aws_vpc_endpoint.dynamodb"
+                else role_statement
+            )
+            before = {
+                "id": address,
+                "policy": json.dumps(
+                    {"Statement": [statement], "Version": "2012-10-17"},
+                    separators=(",", ":"),
+                ),
+            }
+            expected_policy = CHECKER._dynamodb_transaction_action_correction_after(
+                before, address
+            )
+            after = copy.deepcopy(before)
+            after["policy"] = json.dumps(expected_policy, separators=(",", ":"))
+            fixture[address] = {
+                "change": {
+                    "actions": ["update"],
+                    "before": before,
+                    "after": after,
+                }
+            }
+        return fixture
+
+    def test_transaction_action_correction_claims_and_validates_all_policies(self) -> None:
+        by = self.transaction_action_correction_fixture()
+        changed = set(by)
+        actions = {address: ["update"] for address in changed}
+        claimed = CHECKER._claim_dynamodb_transaction_action_correction(
+            changed, actions, by
+        )
+        self.assertEqual(set(claimed), changed)
+        CHECKER._validate_dynamodb_transaction_action_correction(claimed, by, {})
+
+    def test_transaction_action_correction_admits_partial_apply_retry(self) -> None:
+        by = self.transaction_action_correction_fixture()
+        address = next(iter(by))
+        claimed = CHECKER._claim_dynamodb_transaction_action_correction(
+            {address}, {address: ["update"]}, by
+        )
+        self.assertEqual(claimed, frozenset({address}))
+
+    def test_transaction_action_correction_refuses_a_second_policy_change(self) -> None:
+        by = self.transaction_action_correction_fixture()
+        address = next(
+            item
+            for item in by
+            if item != "module.control.aws_vpc_endpoint.dynamodb"
+        )
+        after_policy = json.loads(by[address]["change"]["after"]["policy"])
+        after_policy["Statement"][0]["Resource"].append("arn:aws:dynamodb:::table/extra")
+        by[address]["change"]["after"]["policy"] = json.dumps(after_policy)
+        changed = set(by)
+        actions = {item: ["update"] for item in changed}
+        self.assertEqual(
+            CHECKER._claim_dynamodb_transaction_action_correction(
+                changed, actions, by
+            ),
+            frozenset(),
+        )
+
+    def test_transaction_action_correction_refuses_non_update_shape(self) -> None:
+        by = self.transaction_action_correction_fixture()
+        address = next(iter(by))
+        by[address]["change"]["actions"] = ["delete", "create"]
+        actions = {item: by[item]["change"]["actions"] for item in by}
+        self.assertEqual(
+            CHECKER._claim_dynamodb_transaction_action_correction(
+                set(by), actions, by
+            ),
+            frozenset(),
+        )
+
+    def test_transaction_action_correction_composes_with_image_roll(self) -> None:
+        by = self.image_roll_fixture()
+        by.update(self.transaction_action_correction_fixture())
+        changed = set(by)
+        actions = {address: by[address]["change"]["actions"] for address in changed}
+        self.assertEqual(
+            CHECKER._compose_admitted_transitions(changed, actions, by, {}, {}),
+            "composed-authority-image-roll-with-dynamodb-transaction-action-correction",
+        )
+
     def test_image_roll_claims_functions_aliases_and_contract(self) -> None:
         by = self.image_roll_fixture()
         changed = set(by)
@@ -16339,6 +16452,7 @@ class ComposedTransitionTest(unittest.TestCase):
                 "authority-proof-enable",
                 "authority-proof-consumer-staging",
                 "authority-hub-exec-policy-update",
+                "dynamodb-transaction-action-correction",
                 "hub-client-edge-port-migration",
                 # Publish tracking makes the resolved digest move on its own, so
                 # the foundation contract now lands alongside whatever else a

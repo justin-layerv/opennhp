@@ -701,8 +701,8 @@ jobs:
           shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
           bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
 
-      - name: Test staged qURL agent transaction IAM boundary
-        run: python3 tests/scripts/test_qurl_agent_transact_iam.py
+      - name: Reject invalid DynamoDB transaction IAM actions
+        run: python3 tests/scripts/test_no_invalid_dynamodb_transaction_actions.py
 
       - name: Test qURL canary verifier IAM and plan boundary
         run: |

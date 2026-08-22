@@ -1734,24 +1734,6 @@ jobs:
         working-directory: terraform/control/environments/${{ matrix.environment }}
         run: terraform validate
 
-      - name: Terraform staged qURL agent transaction IAM init (no backend)
-        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
-        working-directory: terraform/staged/qurl-agent-transact-iam
-        run: |
-          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
-          terraform init -backend=false
-
-      - name: Terraform staged qURL agent transaction IAM validate
-        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
-        working-directory: terraform/staged/qurl-agent-transact-iam
-        run: terraform validate
-
-      - name: Test staged qURL agent transaction IAM contract
-        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
-        run: |
-          python3 tests/scripts/test_qurl_agent_transact_iam.py
-          tests/scripts/classify-terraform-plan-pr-changes_test.sh
-
       - name: Terraform production Hub DNS init and validate (source-locked)
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/environments/prod-hub-dns

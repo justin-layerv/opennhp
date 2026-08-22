@@ -472,10 +472,7 @@ run "private_prod_primary_accepts_cell_local_http" {
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
-      statement.Action == [
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:TransactWriteItems",
-      ] &&
+      statement.Action == ["dynamodb:ConditionCheckItem"] &&
       statement.Resource == ["arn:aws:dynamodb:us-east-2:235500187906:table/layerv-nhp-prod-cell1-cell1-qurl-resources"] &&
       !can(statement.Condition)
       if statement.Sid == "TunnelSessionFenceAccess"
@@ -483,7 +480,7 @@ run "private_prod_primary_accepts_cell_local_http" {
       for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
       statement if statement.Sid == "TunnelSessionFenceAccess"
     ]) == 1
-    error_message = "production Connector session fencing must grant only ConditionCheckItem + TransactWriteItems on the exact production qurl-resources table"
+    error_message = "production Connector session fencing must grant only ConditionCheckItem on the exact production qurl-resources table"
   }
 }
 

@@ -195,10 +195,7 @@ run "default_is_cell_identity_with_no_control_grant" {
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
-      statement.Action == [
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:TransactWriteItems",
-      ] &&
+      statement.Action == ["dynamodb:ConditionCheckItem"] &&
       statement.Resource == ["arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"] &&
       !contains(statement.Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources/index/*") &&
       !can(statement.Condition)
@@ -207,16 +204,15 @@ run "default_is_cell_identity_with_no_control_grant" {
       for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
       statement if statement.Sid == "TunnelSessionFenceAccess"
     ]) == 1
-    error_message = "tunnel-session transaction IAM must grant exactly ConditionCheckItem + TransactWriteItems on the qurl-resources table without indexes or conditions"
+    error_message = "tunnel-session transaction IAM must grant exactly ConditionCheckItem on the qurl-resources table without indexes or conditions"
   }
 
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
-      !contains(statement.Action, "dynamodb:ConditionCheckItem") &&
-      !contains(statement.Action, "dynamodb:TransactWriteItems")
+      !contains(statement.Action, "dynamodb:ConditionCheckItem")
     ])
-    error_message = "cell-mode tunnel-session transaction actions leaked into a broader DynamoDB statement"
+    error_message = "cell-mode tunnel-session ConditionCheckItem leaked into a broader DynamoDB statement"
   }
 
   assert {
@@ -239,10 +235,9 @@ run "missing_resources_arn_does_not_broaden_primary_table_access" {
   assert {
     condition = length(aws_iam_role_policy.task_tunnel_session_fence) == 0 && alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
-      !contains(statement.Action, "dynamodb:ConditionCheckItem") &&
-      !contains(statement.Action, "dynamodb:TransactWriteItems")
+      !contains(statement.Action, "dynamodb:ConditionCheckItem")
     ])
-    error_message = "transaction actions were inferred from the broad DynamoDB table list instead of the exact qurl_resources_table_arn"
+    error_message = "ConditionCheckItem was inferred from the broad DynamoDB table list instead of the exact qurl_resources_table_arn"
   }
 }
 
@@ -372,10 +367,10 @@ run "control_identity_grants_and_selects_the_control_namespace" {
     error_message = "Control identity mode does not grant decrypt on the Control tables' KMS key"
   }
 
-  # ConditionCheckItem is authorized separately from TransactWriteItems. Minting
+  # DynamoDB authorizes transaction legs by their constituent actions. Minting
   # an API key condition-checks the owning customer row inside the transaction,
-  # so without this action every POST /v1/api-keys returns 500 and no customer or
-  # agent can enroll -- while every write action above looks correctly granted.
+  # so without ConditionCheckItem every POST /v1/api-keys returns 500 and no
+  # customer or agent can enroll -- while every write action above looks correct.
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
@@ -383,6 +378,15 @@ run "control_identity_grants_and_selects_the_control_namespace" {
       if statement.Sid == "ControlIdentityAccess"
     ])
     error_message = "Control identity grant omits dynamodb:ConditionCheckItem; transactional API-key mint will 500"
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      !contains(statement.Action, "dynamodb:TransactGetItems") &&
+      !contains(statement.Action, "dynamodb:TransactWriteItems")
+    ])
+    error_message = "qurl-service task policy includes nonexistent DynamoDB Transact* IAM actions instead of constituent item actions"
   }
 
   # Every identity read is a key or index lookup, which is what keeps validation

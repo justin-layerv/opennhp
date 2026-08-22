@@ -448,7 +448,7 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
         toset({
           for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
           statement.Sid => statement
-        }["ConnectorResourceCellResourceData"].Action) == toset(["dynamodb:GetItem", "dynamodb:TransactWriteItems", "dynamodb:UpdateItem"]) &&
+        }["ConnectorResourceCellResourceData"].Action) == toset(["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]) &&
         toset({
           for statement in jsondecode(aws_iam_role_policy.authority_exec["layerv-nhp-sandbox-ca-creso-${cell_id}"].policy).Statement :
           statement.Sid => statement
@@ -705,6 +705,7 @@ run "gate_on_deploys_complete_two_cell_graph_and_exact_dependencies" {
       jsondecode(local.interface_endpoint_policies["kms"]).Statement[1].Action == ["kms:Sign"] &&
       contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:DescribeTable") &&
       !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:DeleteItem") &&
+      !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:TransactGetItems") &&
       !contains(jsondecode(local.dynamodb_endpoint_policy).Statement[0].Action, "dynamodb:TransactWriteItems")
     )
     error_message = "KMS endpoint must separate exact public-key and sign principals; DynamoDB must include DescribeTable without Delete/Transact*."
