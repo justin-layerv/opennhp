@@ -467,13 +467,12 @@ frps_min_size         = 3
 frps_max_size         = 3
 frps_desired_capacity = 3
 
-# qurl-service connector auth + active-registration reads. This is a consistent
-# set enforced at plan time by terraform_data.qurl_tunnel_active_registration_preconditions:
-# qurl_connector_active_registrations_enabled requires qurl_connector_auth_enabled +
-# deploy_frps + qurl_router_enabled + enable_instance_hrw + MULTIVALUE — all
-# satisfied here (qurl_router_enabled/enable_qurl_site_authz already true above).
+# qurl-service Connector sharing. Active tunnel registrations are authoritative;
+# terraform_data.qurl_tunnel_registration_preconditions therefore requires
+# deploy_qurl_service + deploy_frps + qurl_router_enabled + enable_instance_hrw +
+# MULTIVALUE whenever this is true. All are satisfied here
+# (qurl_router_enabled/enable_qurl_site_authz are already true above).
 qurl_connector_auth_enabled                         = true
-qurl_connector_active_registrations_enabled         = true
 enable_instance_hrw                                 = true
 qurl_reverse_tunnel_server_cloud_map_routing_policy = "MULTIVALUE"
 

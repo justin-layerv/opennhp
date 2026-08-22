@@ -147,34 +147,39 @@ resource "terraform_data" "connector_routing_id_preconditions" {
   }
 }
 
-# qurl-service's active-registration read gate makes `upstream_addrs`
-# authoritative for tunnel resources. A half flip is worse than a no-op:
-# without reporter writes it fails tunnels closed, and without router
-# discovery the per-instance private endpoints are rejected by the AC
-# allowlist. Keep the rollout contract encoded at plan time.
-resource "terraform_data" "qurl_tunnel_active_registration_preconditions" {
-  count = var.qurl_connector_active_registrations_enabled ? 1 : 0
+# Active tunnel registrations are authoritative whenever Connector sharing is
+# enabled. A half-configured topology fails tunnels closed: without reporter
+# writes there is no routable registration, and without router discovery the
+# per-instance private endpoints are rejected by the AC allowlist. Keep that
+# unconditional post-cutover contract encoded at plan time.
+moved {
+  from = terraform_data.qurl_tunnel_active_registration_preconditions
+  to   = terraform_data.qurl_tunnel_registration_preconditions
+}
+
+resource "terraform_data" "qurl_tunnel_registration_preconditions" {
+  count = var.qurl_connector_auth_enabled ? 1 : 0
 
   lifecycle {
     precondition {
-      condition     = var.qurl_connector_auth_enabled
-      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_connector_auth_enabled=true so qurl-service mounts the tunnel auth and registration endpoints."
+      condition     = var.deploy_qurl_service
+      error_message = "qurl_connector_auth_enabled=true requires deploy_qurl_service=true so the Connector sharing and registration endpoints have an execution path."
     }
     precondition {
       condition     = var.deploy_frps
-      error_message = "qurl_connector_active_registrations_enabled=true requires deploy_frps=true so qurl-reverse-tunnel-server can publish active target rows."
+      error_message = "qurl_connector_auth_enabled=true requires deploy_frps=true so qurl-reverse-tunnel-server can publish authoritative tunnel registrations."
     }
     precondition {
       condition     = var.qurl_router_enabled
-      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_router_enabled=true so qurl-router consumes upstream_addrs."
+      error_message = "qurl_connector_auth_enabled=true requires qurl_router_enabled=true so qurl-router consumes authoritative tunnel registrations."
     }
     precondition {
       condition     = var.enable_instance_hrw
-      error_message = "qurl_connector_active_registrations_enabled=true requires enable_instance_hrw=true because active registrations publish per-instance private endpoints validated through router discovery."
+      error_message = "qurl_connector_auth_enabled=true requires enable_instance_hrw=true because tunnel registrations publish per-instance private endpoints validated through router discovery."
     }
     precondition {
       condition     = var.qurl_reverse_tunnel_server_cloud_map_routing_policy == "MULTIVALUE"
-      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_reverse_tunnel_server_cloud_map_routing_policy=\"MULTIVALUE\" so router discovery sees every active instance IP."
+      error_message = "qurl_connector_auth_enabled=true requires qurl_reverse_tunnel_server_cloud_map_routing_policy=\"MULTIVALUE\" so router discovery sees every active instance IP."
     }
   }
 }
@@ -3160,8 +3165,7 @@ module "qurl_service" {
   adot_collector_image  = var.qurl_adot_collector_image
 
   # Connector auth feature gate (qurl-service PR #277; default false until #405/#396 land)
-  connector_auth_enabled                 = var.qurl_connector_auth_enabled
-  connector_active_registrations_enabled = var.qurl_connector_active_registrations_enabled
+  connector_auth_enabled = var.qurl_connector_auth_enabled
 
   # depends_on:
   #  - terraform_data.nhp_internal_auth_seed: ensure the HMAC secret is seeded

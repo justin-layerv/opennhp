@@ -633,7 +633,8 @@ module "qurl_service" {
   container_memory    = local.qurl_service_container_memory
   desired_count       = 1
 
-  dynamodb_table_arns = module.dynamodb.qurl_table_arns
+  dynamodb_table_arns      = module.dynamodb.qurl_table_arns
+  qurl_resources_table_arn = module.dynamodb.qurl_resources_table_arn
   # These pre-existing cell1 tables were created by module.dynamodb with the
   # infrastructure namespace plus cell_id. Keep the runtime prefix byte-exact;
   # renaming applied stateful tables is unrelated to canonicalizing the new,
@@ -705,9 +706,8 @@ module "qurl_service" {
   otel_tracing_enabled   = false
   otel_log_correlation   = false
 
-  connector_auth_enabled                 = false
-  connector_active_registrations_enabled = false
-  target_health_alarm_enabled            = true
+  connector_auth_enabled      = false
+  target_health_alarm_enabled = true
 
   depends_on = [
     terraform_data.qurl_service_runtime_contract,

@@ -442,6 +442,8 @@ run "private_prod_primary_accepts_cell_local_http" {
     nhp_resources_customer_id_prefix = "00000000000000000000000001"
     nhp_server_internal_url          = "http://server.nhp.prod-cell1.internal:8888"
     nhp_server_security_group_id     = "sg-11111111111111111"
+    connector_auth_enabled           = true
+    qurl_resources_table_arn         = "arn:aws:dynamodb:us-east-2:235500187906:table/layerv-nhp-prod-cell1-cell1-qurl-resources"
   }
 
   assert {
@@ -465,6 +467,23 @@ run "private_prod_primary_accepts_cell_local_http" {
       )
     )
     error_message = "A provisioned private production cell must accept its SG-fenced internal HTTP origin without public domain or HTTPS requirements while retaining the exact non-wildcard CORS origin required by qurl-service startup validation."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
+      statement.Action == [
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:TransactWriteItems",
+      ] &&
+      statement.Resource == ["arn:aws:dynamodb:us-east-2:235500187906:table/layerv-nhp-prod-cell1-cell1-qurl-resources"] &&
+      !can(statement.Condition)
+      if statement.Sid == "TunnelSessionFenceAccess"
+      ]) && length([
+      for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
+      statement if statement.Sid == "TunnelSessionFenceAccess"
+    ]) == 1
+    error_message = "production Connector session fencing must grant only ConditionCheckItem + TransactWriteItems on the exact production qurl-resources table"
   }
 }
 

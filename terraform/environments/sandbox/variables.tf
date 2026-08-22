@@ -2342,12 +2342,6 @@ variable "qurl_connector_auth_enabled" {
   default     = false
 }
 
-variable "qurl_connector_active_registrations_enabled" {
-  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
-  type        = bool
-  default     = false
-}
-
 # ── NHP-Relay (#2208) — mirrored from parent terraform/variables.tf ──
 variable "deploy_relay" {
   description = "Deploy the NHP-Relay stack (autoscaling fleet + internet-facing ALB). Default off; sandbox enables for the dark launch. The fleet shares one keypair and authenticates by pubkey + relay.toml registration (not source IP) once the server runs DisableRelayPeerValidation=true (5c, #2627); baseline one instance per AZ. See #2629."

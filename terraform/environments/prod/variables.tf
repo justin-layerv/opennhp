@@ -777,12 +777,6 @@ variable "require_connector_routing_id" {
   default     = false
 }
 
-variable "qurl_connector_active_registrations_enabled" {
-  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
-  type        = bool
-  default     = false
-}
-
 # ==================== qurl-reverse-tunnel-server deploy + sizing (per-AZ + canary) ====================
 # PR 3 only declares the NEW per-AZ / blue/green / canary variables here.
 # The existing tfvars values for `deploy_frps` / `frps_*` are already

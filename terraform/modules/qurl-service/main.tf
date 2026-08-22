@@ -395,10 +395,6 @@ locals {
     # creation endpoint (#405) and the per-AZ FRPS assignment (#396) deploy
     # together. Flipped to true per-env via tfvars once those land.
     { name = "CONNECTOR_AUTH_ENABLED", value = var.connector_auth_enabled ? "true" : "false" },
-    # Active-registration read gate (qurl-service #732). Registration writes
-    # can dark-launch while this remains false; flipping true makes
-    # `upstream_addrs` authoritative for tunnel routing.
-    { name = "QURL_CONNECTOR_ACTIVE_REGISTRATIONS_ENABLED", value = var.connector_active_registrations_enabled ? "true" : "false" },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
     { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },
@@ -974,6 +970,38 @@ resource "aws_iam_role_policy" "task_dynamodb" {
       }] : [],
     )
   })
+}
+
+# Connector session binding atomically condition-checks the parent resource and
+# writes the immutable resource+session fence in qurl-resources. Keep these two
+# transaction authorizations in a separate policy so they cannot leak onto the
+# sibling table/index list in task_dynamodb, and so rollout can pre-grant this
+# exact policy before deploying the qurl-service build that consumes it.
+resource "aws_iam_role_policy" "task_tunnel_session_fence" {
+  count = var.connector_auth_enabled ? 1 : 0
+
+  name = "tunnel-session-fence"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "TunnelSessionFenceAccess"
+      Effect = "Allow"
+      Action = [
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:TransactWriteItems",
+      ]
+      Resource = [var.qurl_resources_table_arn]
+    }]
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_resources_table_arn != ""
+      error_message = "connector_auth_enabled=true requires qurl_resources_table_arn so tunnel-session TransactWriteItems and ConditionCheckItem can be scoped to the exact resources table."
+    }
+  }
 }
 
 # qURL v2 issuer signing — kms:Sign on the single terraform-provisioned issuer

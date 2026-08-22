@@ -1078,12 +1078,6 @@ variable "connector_auth_enabled" {
   default     = false
 }
 
-variable "connector_active_registrations_enabled" {
-  description = "Enable authoritative active tunnel target reads from qurl-reverse-tunnel-server registration rows. When false, qurl-service continues to emit only legacy per-AZ upstream_addr values even if registration writes are arriving. Flip after reporter and router active-target support are deployed and observed healthy."
-  type        = bool
-  default     = false
-}
-
 # ==================== QURL agent → nhp-server bootstrap chain (Wave 5) ====================
 
 variable "deploy_qurl_bootstrap_chain" {
@@ -1326,7 +1320,7 @@ variable "qurl_scanner_lambda_image_tag_ssm_param" {
 }
 
 variable "qurl_resources_table_arn" {
-  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem + DeleteItem from the scanner Lambdas, plus Query on `status-index` for active-resource rechecks). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  description = "Exact ARN of the qurl-resources DynamoDB table. The qurl-service task role receives TransactWriteItems + ConditionCheckItem on this table only for immutable tunnel-session binding; scanner Lambdas separately use it for lifecycle writes and status-index queries. Thread from `module.dynamodb.qurl_resources_table_arn`. Empty is valid only when connector auth and scanners are disabled."
   type        = string
   default     = ""
 }

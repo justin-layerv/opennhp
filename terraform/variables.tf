@@ -1625,12 +1625,6 @@ variable "qurl_connector_auth_enabled" {
   default     = false
 }
 
-variable "qurl_connector_active_registrations_enabled" {
-  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while the reporter and AC discovery rollout are verified. Flip per-env only after qurl-service, qurl-reverse-tunnel-server, and qurl-router active-target support are deployed and healthy."
-  type        = bool
-  default     = false
-}
-
 # ==================== Grafana Cloud Dashboards ====================
 
 variable "grafana_dashboards_enabled" {

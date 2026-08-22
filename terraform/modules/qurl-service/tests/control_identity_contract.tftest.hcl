@@ -80,6 +80,7 @@ variables {
   ecr_repo_url                           = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-qurl"
   image_tag_ssm_param                    = "/layerv-nhp-sandbox/qurl-api-image-tag"
   dynamodb_table_arns                    = ["arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"]
+  qurl_resources_table_arn               = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"
   auth0_domain                           = "auth.layerv.ai"
   jwt_secret_arn                         = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-jwt-AbCdEf"
   internal_service_token_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:qurl-internal-AbCdEf"
@@ -127,9 +128,10 @@ variables {
   # Pin the image so the task definition is fully known at plan time; without
   # it the URI resolves from SSM and container_definitions stays unknown, which
   # makes every environment assertion below unevaluable.
-  image_uri             = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-qurl@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  source_revision       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  dynamodb_table_prefix = "layerv-nhp-sandbox-cell0"
+  image_uri              = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-qurl@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source_revision        = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  dynamodb_table_prefix  = "layerv-nhp-sandbox-cell0"
+  connector_auth_enabled = true
 }
 
 # Cell compatibility mode is the default and must stay byte-identical to the
@@ -189,6 +191,70 @@ run "default_is_cell_identity_with_no_control_grant" {
     ])
     error_message = "cell identity mode granted decrypt on the Control KMS key"
   }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
+      statement.Action == [
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:TransactWriteItems",
+      ] &&
+      statement.Resource == ["arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources"] &&
+      !contains(statement.Resource, "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-qurl-resources/index/*") &&
+      !can(statement.Condition)
+      if statement.Sid == "TunnelSessionFenceAccess"
+      ]) && length([
+      for statement in jsondecode(aws_iam_role_policy.task_tunnel_session_fence[0].policy).Statement :
+      statement if statement.Sid == "TunnelSessionFenceAccess"
+    ]) == 1
+    error_message = "tunnel-session transaction IAM must grant exactly ConditionCheckItem + TransactWriteItems on the qurl-resources table without indexes or conditions"
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      !contains(statement.Action, "dynamodb:ConditionCheckItem") &&
+      !contains(statement.Action, "dynamodb:TransactWriteItems")
+    ])
+    error_message = "cell-mode tunnel-session transaction actions leaked into a broader DynamoDB statement"
+  }
+
+  assert {
+    condition = alltrue([
+      for env in jsondecode(aws_ecs_task_definition.qurl.container_definitions)[0].environment :
+      env.name != "QURL_CONNECTOR_ACTIVE_REGISTRATIONS_ENABLED"
+    ])
+    error_message = "retired QURL_CONNECTOR_ACTIVE_REGISTRATIONS_ENABLED is still rendered into the task definition"
+  }
+}
+
+run "missing_resources_arn_does_not_broaden_primary_table_access" {
+  command = apply
+
+  variables {
+    connector_auth_enabled   = false
+    qurl_resources_table_arn = ""
+  }
+
+  assert {
+    condition = length(aws_iam_role_policy.task_tunnel_session_fence) == 0 && alltrue([
+      for statement in jsondecode(aws_iam_role_policy.task_dynamodb.policy).Statement :
+      !contains(statement.Action, "dynamodb:ConditionCheckItem") &&
+      !contains(statement.Action, "dynamodb:TransactWriteItems")
+    ])
+    error_message = "transaction actions were inferred from the broad DynamoDB table list instead of the exact qurl_resources_table_arn"
+  }
+}
+
+run "connector_auth_requires_resources_arn" {
+  command = plan
+
+  variables {
+    connector_auth_enabled   = true
+    qurl_resources_table_arn = ""
+  }
+
+  expect_failures = [aws_iam_role_policy.task_tunnel_session_fence]
 }
 
 run "control_identity_grants_and_selects_the_control_namespace" {
