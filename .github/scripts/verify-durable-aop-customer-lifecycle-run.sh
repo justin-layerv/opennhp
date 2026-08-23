@@ -26,7 +26,7 @@ QURL_INTEGRATIONS_PR_BRANCH=fix/exact-session-lifecycle-smoke
 # Exact merged protected-lane source plus the reviewed customer source whose
 # named CLI integration job is bound below. Changes require a new review and
 # receipt contract; callers cannot override either value.
-APPROVED_INFRA_SHA=5df6c96a08ffdc4adb52d0ea87fcd89fd7c22256
+APPROVED_INFRA_SHA=d30d3fce3a6c3cf15e1340a5106b6cc76bce7e82
 APPROVED_INTEGRATIONS_SHA=356ecd44bbf09fca392247d971bbc093b337d4e5
 RUN_ID=${CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID:?CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID is required}
 RUN_ATTEMPT=${CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT:?CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT is required}
@@ -43,6 +43,9 @@ CELL1_ASG=${CUTOVER_EXPECTED_CELL1_ASG:?CUTOVER_EXPECTED_CELL1_ASG is required}
 AC_COLOR=${CUTOVER_EXPECTED_AC_COLOR:?CUTOVER_EXPECTED_AC_COLOR is required}
 AC_ASG=${CUTOVER_EXPECTED_AC_ASG:?CUTOVER_EXPECTED_AC_ASG is required}
 : "${GH_TOKEN:?GH_TOKEN is required}"
+NHP_GH_TOKEN=$GH_TOKEN
+CUSTOMER_GH_TOKEN=${CUTOVER_CUSTOMER_GH_TOKEN:?CUTOVER_CUSTOMER_GH_TOKEN is required}
+unset GH_TOKEN GITHUB_TOKEN PUBLIC_GH_TOKEN CUTOVER_CUSTOMER_GH_TOKEN CUTOVER_CONNECTOR_GH_TOKEN
 
 [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ &&
    "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ && "$BUILD_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
@@ -62,10 +65,85 @@ done
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+customer_gh() {
+  env -u GITHUB_TOKEN -u NHP_GH_TOKEN -u PUBLIC_GH_TOKEN \
+    GH_TOKEN="$CUSTOMER_GH_TOKEN" gh "$@"
+}
+nhp_gh() {
+  env -u GITHUB_TOKEN -u CUSTOMER_GH_TOKEN -u PUBLIC_GH_TOKEN \
+    GH_TOKEN="$NHP_GH_TOKEN" gh "$@"
+}
+
+public_api_get() {
+  local path=$1 output=$2 status bytes
+  status=$(env -u GH_TOKEN -u GITHUB_TOKEN -u NHP_GH_TOKEN -u CUSTOMER_GH_TOKEN \
+    -u PUBLIC_GH_TOKEN -u CUTOVER_CUSTOMER_GH_TOKEN -u CUTOVER_CONNECTOR_GH_TOKEN \
+    curl --disable --fail --silent --show-error \
+      --proto '=https' --tlsv1.2 --max-redirs 0 \
+      --connect-timeout 10 --max-time 30 --max-filesize 4194304 \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2022-11-28' \
+      --output "$output" --write-out '%{http_code}' \
+      "https://api.github.com/$path") || {
+    echo "public GitHub authority request failed" >&2
+    return 1
+  }
+  [[ "$status" == 200 ]] || {
+    echo "public GitHub authority request did not return 200" >&2
+    return 1
+  }
+  [[ -f "$output" && ! -L "$output" ]] || {
+    echo "public GitHub authority response is not a regular file" >&2
+    return 1
+  }
+  bytes=$(wc -c <"$output" | tr -d '[:space:]')
+  [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 && "$bytes" -le 4194304 ]] || {
+    echo "public GitHub authority response exceeds the bounded size" >&2
+    return 1
+  }
+  jq -e . "$output" >/dev/null || {
+    echo "public GitHub authority response is not JSON" >&2
+    return 1
+  }
+}
+
+authority_api_get() {
+  local access=$1 repository=$2 path=$3 output=$4
+  case "$access:$repository" in
+    private:layervai/nhp)
+      nhp_gh api "$path" >"$output"
+      ;;
+    public:layervai/qurl-go)
+      [[ "$path" == "repos/layervai/qurl-go/git/ref/tags/v0.8.0" ||
+         "$path" == "repos/layervai/qurl-go/actions/runs/${QURL_GO_CI_RUN_ID}/attempts/${QURL_GO_CI_RUN_ATTEMPT}" ||
+         "$path" == "repos/layervai/qurl-go/actions/runs/${QURL_GO_CI_RUN_ID}/attempts/${QURL_GO_CI_RUN_ATTEMPT}/jobs?per_page=100" ]] || {
+        echo "public qurl-go authority route is not allowlisted" >&2
+        return 1
+      }
+      public_api_get "$path" "$output"
+      ;;
+    public:layervai/qurl-integrations)
+      [[ "$path" == "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}" ||
+         "$path" == "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}/jobs?per_page=100" ]] || {
+        echo "public qurl-integrations authority route is not allowlisted" >&2
+        return 1
+      }
+      public_api_get "$path" "$output"
+      ;;
+    *)
+      echo "repository authority transport classification is invalid" >&2
+      return 1
+      ;;
+  esac
+}
 
 verify_run() {
-  local repository=$1 run_id=$2 attempt=$3 head=$4 workflow=$5 event=$6 label=$7 run
-  run=$(gh api "repos/${repository}/actions/runs/${run_id}/attempts/${attempt}")
+  local access=$1 repository=$2 run_id=$3 attempt=$4 head=$5 workflow=$6 event=$7 label=$8 run
+  local run_file
+  run_file=$(mktemp "$WORK/run.XXXXXX")
+  authority_api_get "$access" "$repository" \
+    "repos/${repository}/actions/runs/${run_id}/attempts/${attempt}" "$run_file"
+  run=$(<"$run_file")
   jq -e --arg repository "$repository" --arg run_id "$run_id" --arg head "$head" \
     --arg workflow "$workflow" --arg event "$event" --argjson attempt "$attempt" '
       (.id | tostring) == $run_id and .repository.full_name == $repository and
@@ -80,11 +158,19 @@ verify_run() {
 }
 
 verify_job_step() {
-  local repository=$1 run_id=$2 attempt=$3 job=$4 step=$5 label=$6 jobs
-  jobs=$(gh api --paginate \
-    "repos/${repository}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100" --slurp)
+  local access=$1 repository=$2 run_id=$3 attempt=$4 job=$5 step=$6 label=$7 jobs
+  local jobs_file
+  jobs_file=$(mktemp "$WORK/jobs.XXXXXX")
+  authority_api_get "$access" "$repository" \
+    "repos/${repository}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100" "$jobs_file"
+  jq -e '.total_count <= 100 and (.jobs | type == "array") and (.jobs | length) == .total_count' \
+    "$jobs_file" >/dev/null || {
+    echo "$label job list exceeds the bounded single-page authority" >&2
+    return 1
+  }
+  jobs=$(<"$jobs_file")
   jq -e --arg job "$job" --arg step "$step" '
-    [.[].jobs[] | select(.name == $job and .conclusion == "success")] as $jobs |
+    [.jobs[] | select(.name == $job and .conclusion == "success")] as $jobs |
     ($jobs | length == 1) and
     ([$jobs[0].steps[]? | select(.name == $step and .conclusion == "success")] | length == 1)
   ' >/dev/null <<<"$jobs" || {
@@ -94,9 +180,12 @@ verify_job_step() {
 }
 
 verify_integrations_pr_job_authority() {
-  local run jobs
-  run=$(gh api \
-    "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}")
+  local run jobs run_file jobs_file
+  run_file=$(mktemp "$WORK/integrations-run.XXXXXX")
+  authority_api_get public layervai/qurl-integrations \
+    "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}" \
+    "$run_file"
+  run=$(<"$run_file")
   jq -e --arg run_id "$QURL_INTEGRATIONS_CI_RUN_ID" --arg head "$INTEGRATIONS_SHA" \
     --arg branch "$QURL_INTEGRATIONS_PR_BRANCH" --arg base "$QURL_INTEGRATIONS_PR_BASE" \
     --argjson attempt "$QURL_INTEGRATIONS_CI_RUN_ATTEMPT" --argjson pr "$QURL_INTEGRATIONS_PR" '
@@ -112,10 +201,18 @@ verify_integrations_pr_job_authority() {
       echo "qurl-integrations lifecycle integration run is not the exact reviewed PR attempt" >&2
       return 1
     }
-  jobs=$(gh api --paginate \
-    "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}/jobs?per_page=100" --slurp)
+  jobs_file=$(mktemp "$WORK/integrations-jobs.XXXXXX")
+  authority_api_get public layervai/qurl-integrations \
+    "repos/layervai/qurl-integrations/actions/runs/${QURL_INTEGRATIONS_CI_RUN_ID}/attempts/${QURL_INTEGRATIONS_CI_RUN_ATTEMPT}/jobs?per_page=100" \
+    "$jobs_file"
+  jq -e '.total_count <= 100 and (.jobs | type == "array") and (.jobs | length) == .total_count' \
+    "$jobs_file" >/dev/null || {
+    echo "qurl-integrations lifecycle job list exceeds the bounded single-page authority" >&2
+    return 1
+  }
+  jobs=$(<"$jobs_file")
   jq -e --arg head "$INTEGRATIONS_SHA" '
-    [.[].jobs[] | select(.name == "cli / test" and .head_sha == $head and .conclusion == "success")] as $jobs |
+    [.jobs[] | select(.name == "cli / test" and .head_sha == $head and .conclusion == "success")] as $jobs |
     ($jobs | length == 1) and
     ([$jobs[0].steps[]? | select(.name == "Run tests with coverage" and .conclusion == "success")] | length == 1)
   ' >/dev/null <<<"$jobs" || {
@@ -128,7 +225,7 @@ INTEGRATIONS_SHA=$APPROVED_INTEGRATIONS_SHA
 [[ "$INTEGRATIONS_SHA" =~ ^[0-9a-f]{40}$ ]] || {
   echo "qurl-integrations lifecycle source is not the final reviewed authority" >&2; exit 1;
 }
-customer_run=$(gh api "repos/${CUSTOMER_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}")
+customer_run=$(customer_gh api "repos/${CUSTOMER_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}")
 INFRA_SHA=$(jq -er --arg repository "$CUSTOMER_REPOSITORY" --arg run "$RUN_ID" \
   --arg workflow "$CUSTOMER_WORKFLOW" --argjson attempt "$RUN_ATTEMPT" '
   select((.id | tostring) == $run and .repository.full_name == $repository and
@@ -144,7 +241,7 @@ INFRA_SHA=$(jq -er --arg repository "$CUSTOMER_REPOSITORY" --arg run "$RUN_ID" \
   echo "qurl-infra lifecycle source is not the final reviewed execution authority" >&2; exit 1;
 }
 
-jobs=$(gh api --paginate \
+jobs=$(customer_gh api --paginate \
   "repos/${CUSTOMER_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" --slurp)
 jq -e '
   [.[].jobs[] | select(.name == "Protected qURL sharing sandbox lifecycle")] as $protected |
@@ -172,7 +269,7 @@ jq -e '
 }
 
 artifact_name="durable-aop-lifecycle-receipt-${INTEGRATIONS_SHA}"
-artifacts=$(gh api --paginate \
+artifacts=$(customer_gh api --paginate \
   "repos/${CUSTOMER_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" --slurp)
 artifact=$(jq -ce --arg name "$artifact_name" --arg run "$RUN_ID" '
   [.[].artifacts[] | select(.name == $name and .expired == false)] |
@@ -186,7 +283,7 @@ artifact=$(jq -ce --arg name "$artifact_name" --arg run "$RUN_ID" '
 }
 artifact_id=$(jq -r '.id | tostring' <<<"$artifact")
 artifact_digest=$(jq -r .digest <<<"$artifact")
-gh api "repos/${CUSTOMER_REPOSITORY}/actions/artifacts/${artifact_id}/zip" >"$WORK/customer.zip"
+customer_gh api "repos/${CUSTOMER_REPOSITORY}/actions/artifacts/${artifact_id}/zip" >"$WORK/customer.zip"
 [[ "sha256:$(sha256_file "$WORK/customer.zip")" == "$artifact_digest" ]] || {
   echo "downloaded lifecycle artifact digest differs from GitHub authority" >&2; exit 1;
 }
@@ -358,16 +455,19 @@ if seen != expected:
     raise SystemExit("verified-subjects does not bind the exact lifecycle subjects")
 PY
 
-qurl_go_tag=$(gh api "repos/${QURL_GO_REPOSITORY}/git/ref/tags/v0.8.0")
+qurl_go_tag_file=$WORK/qurl-go-tag.json
+authority_api_get public "$QURL_GO_REPOSITORY" \
+  "repos/${QURL_GO_REPOSITORY}/git/ref/tags/v0.8.0" "$qurl_go_tag_file"
+qurl_go_tag=$(<"$qurl_go_tag_file")
 jq -e --arg sha "$QURL_GO_SOURCE_SHA" '
   .ref == "refs/tags/v0.8.0" and .object.sha == $sha and .object.type == "commit" and
   (.object.url | type == "string" and endswith("/git/commits/" + $sha))
 ' >/dev/null <<<"$qurl_go_tag" || {
   echo "qurl-go v0.8.0 tag is not the exact reviewed integration source" >&2; exit 1;
 }
-verify_run "$QURL_GO_REPOSITORY" "$QURL_GO_CI_RUN_ID" "$QURL_GO_CI_RUN_ATTEMPT" \
+verify_run public "$QURL_GO_REPOSITORY" "$QURL_GO_CI_RUN_ID" "$QURL_GO_CI_RUN_ATTEMPT" \
   "$QURL_GO_SOURCE_SHA" "$QURL_GO_CI_WORKFLOW" push "qurl-go lifecycle integration tests"
-verify_job_step "$QURL_GO_REPOSITORY" "$QURL_GO_CI_RUN_ID" "$QURL_GO_CI_RUN_ATTEMPT" \
+verify_job_step public "$QURL_GO_REPOSITORY" "$QURL_GO_CI_RUN_ID" "$QURL_GO_CI_RUN_ATTEMPT" \
   "vet + test -race" "go test -race + coverage" "qurl-go lifecycle integration tests"
 
 verify_integrations_pr_job_authority
@@ -408,15 +508,15 @@ producer_run=$(jq -r .deployment.producer.run_id "$AUTHORITY")
 producer_attempt=$(jq -r .deployment.producer.run_attempt "$AUTHORITY")
 nhp_artifact_id=$(jq -r .artifact.id "$AUTHORITY")
 nhp_artifact_digest=$(jq -r .artifact.digest "$AUTHORITY")
-verify_run "$NHP_REPOSITORY" "$producer_run" "$producer_attempt" "$RECOVERY_SHA" \
+verify_run private "$NHP_REPOSITORY" "$producer_run" "$producer_attempt" "$RECOVERY_SHA" \
   "$NHP_PRODUCER_WORKFLOW" workflow_dispatch "NHP deployment producer"
-build_receipt=$(GITHUB_REPOSITORY=$NHP_REPOSITORY \
+build_receipt=$(GH_TOKEN=$NHP_GH_TOKEN GITHUB_REPOSITORY=$NHP_REPOSITORY \
   "$VERIFY_BUILD_ONLY" "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$REPAIR_SHA")
 [[ "$build_receipt" == "v1|${BUILD_RUN_ID}|${BUILD_RUN_ATTEMPT}|${REPAIR_SHA}" ]] || {
   echo "NHP repair build-only receipt is malformed" >&2; exit 1;
 }
 
-nhp_artifacts=$(gh api --paginate \
+nhp_artifacts=$(nhp_gh api --paginate \
   "repos/${NHP_REPOSITORY}/actions/runs/${producer_run}/artifacts?per_page=100" --slurp)
 jq -e --arg id "$nhp_artifact_id" --arg name "durable-aop-nhp-deployment-${REPAIR_SHA}" \
   --arg digest "$nhp_artifact_digest" --arg run "$producer_run" '
@@ -428,7 +528,7 @@ jq -e --arg id "$nhp_artifact_id" --arg name "durable-aop-nhp-deployment-${REPAI
 ' >/dev/null <<<"$nhp_artifacts" || {
   echo "embedded NHP artifact identity differs from GitHub authority" >&2; exit 1;
 }
-gh api "repos/${NHP_REPOSITORY}/actions/artifacts/${nhp_artifact_id}/zip" >"$WORK/nhp.zip"
+nhp_gh api "repos/${NHP_REPOSITORY}/actions/artifacts/${nhp_artifact_id}/zip" >"$WORK/nhp.zip"
 [[ "sha256:$(sha256_file "$WORK/nhp.zip")" == "$nhp_artifact_digest" ]] || {
   echo "downloaded NHP artifact digest differs from GitHub authority" >&2; exit 1;
 }

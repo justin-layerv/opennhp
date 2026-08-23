@@ -3,8 +3,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRIPT=$ROOT/.github/scripts/verify-durable-aop-connector-lifecycle-run.sh
-CONNECTOR=0000000000000000000000000000000000000000
-CONNECTOR_PR=0000000000000000000000000000000000000000
+CONNECTOR=2222222222222222222222222222222222222222
+CONNECTOR_PR=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
+CONNECTOR_BASE=e70923168818da0b8002e5e63e7dcfe9e060ba12
+CONNECTOR_TREE=4444444444444444444444444444444444444444
+CONNECTOR_MAIN=5555555555555555555555555555555555555555
 NHP=0123456789012345678901234567890123456789
 RECOVERY=9999999999999999999999999999999999999999
 QURL_GO=d02c25995df085f0437c7a572714c26e907a8a59
@@ -12,7 +15,16 @@ SERVER_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/artifact"
-export FAKE_MODE=ok FAKE_CONNECTOR=$CONNECTOR FAKE_CONNECTOR_PR=$CONNECTOR_PR FAKE_NHP=$NHP FAKE_SERVER_DIGEST=$SERVER_DIGEST
+export FAKE_MODE=ok FAKE_CONNECTOR=$CONNECTOR FAKE_CONNECTOR_PR=$CONNECTOR_PR FAKE_CONNECTOR_BASE=$CONNECTOR_BASE \
+  FAKE_CONNECTOR_TREE=$CONNECTOR_TREE FAKE_CONNECTOR_MAIN=$CONNECTOR_MAIN FAKE_NHP=$NHP \
+  FAKE_SERVER_DIGEST=$SERVER_DIGEST
+
+grep -q "APPROVED_CONNECTOR_PR_HEAD_SHA=${CONNECTOR_PR}" "$SCRIPT"
+grep -q "APPROVED_CONNECTOR_PR_BASE_SHA=${CONNECTOR_BASE}" "$SCRIPT"
+if grep -qE 'APPROVED_CONNECTOR_MERGE_SHA|CUTOVER_CONNECTOR_LIFECYCLE_SOURCE_SHA|/pulls/609' "$SCRIPT"; then
+  echo "connector verifier accepts a compile-time or caller-supplied merge SHA" >&2
+  exit 1
+fi
 
 jq -cn --arg connector "$CONNECTOR" --arg controller "$RECOVERY" '
   {schema_version:1,phase:"pre_removal",repository:"layervai/qurl-connector",commit_sha:$connector,
@@ -53,13 +65,7 @@ cat >"$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
-if [[ "$args" == *'/pulls/609'* ]]; then
-  head=$FAKE_CONNECTOR_PR; merge=$FAKE_CONNECTOR; merged=true; state=closed
-  [[ "$FAKE_MODE" != pr_drift ]] || head=1111111111111111111111111111111111111111
-  [[ "$FAKE_MODE" != unmerged ]] || { merged=false; state=open; }
-  jq -cn --arg head "$head" --arg merge "$merge" --arg state "$state" --argjson merged "$merged" \
-    '{number:609,state:$state,merged:$merged,merge_commit_sha:$merge,head:{sha:$head,repo:{full_name:"layervai/qurl-connector"}}}'
-elif [[ "$args" == *'/actions/runs/77/attempts/2/jobs'* ]]; then
+if [[ "$args" == *'/actions/runs/77/attempts/2/jobs'* ]]; then
   conclusion=success; [[ "$FAKE_MODE" != missing_step ]] || conclusion=failed
   steps='["Authenticate exact deployment manifest","Run exact strict proof inventory","Build allowlisted strict proof evidence","Upload non-secret strict proof evidence","Require complete published proof gate"]'
   jq -cn --arg conclusion "$conclusion" --argjson steps "$steps" \
@@ -72,9 +78,46 @@ elif [[ "$args" == *'/actions/artifacts/88/zip'* ]]; then
   cat "$FAKE_ZIP"
 elif [[ "$args" == *'/actions/runs/77'* ]]; then
   conclusion=success; [[ "$FAKE_MODE" != failed_run ]] || conclusion=failure
-  jq -cn --arg sha "$FAKE_CONNECTOR" --arg conclusion "$conclusion" \
-    '{head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,
+  repo=layervai/qurl-connector; head_repo=$repo
+  [[ "$FAKE_MODE" != run_repo_drift ]] || repo=layervai/other
+  [[ "$FAKE_MODE" != run_head_repo_drift ]] || head_repo=layervai/other
+  jq -cn --arg sha "$FAKE_CONNECTOR" --arg conclusion "$conclusion" --arg repo "$repo" --arg head_repo "$head_repo" \
+    '{repository:{full_name:$repo},head_repository:{full_name:$head_repo},
+      head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,
       status:"completed",conclusion:$conclusion,path:".github/workflows/sandbox-smoke.yml"}'
+elif [[ "$args" == *"/git/commits/${FAKE_CONNECTOR_PR}"* ]]; then
+  sha=$FAKE_CONNECTOR_PR; tree=$FAKE_CONNECTOR_TREE
+  [[ "$FAKE_MODE" != reviewed_commit_drift ]] || sha=1111111111111111111111111111111111111111
+  [[ "$FAKE_MODE" != reviewed_tree_drift ]] || tree=1111111111111111111111111111111111111111
+  jq -cn --arg sha "$sha" --arg tree "$tree" '{sha:$sha,tree:{sha:$tree}}'
+elif [[ "$args" == *"/compare/${FAKE_CONNECTOR_BASE}...${FAKE_CONNECTOR_PR}"* ]]; then
+  status=ahead; base=$FAKE_CONNECTOR_BASE; head=$FAKE_CONNECTOR_PR; ahead=2; behind=0
+  [[ "$FAKE_MODE" != base_status_drift ]] || status=diverged
+  [[ "$FAKE_MODE" != base_sha_drift ]] || base=1111111111111111111111111111111111111111
+  [[ "$FAKE_MODE" != base_head_drift ]] || head=1111111111111111111111111111111111111111
+  jq -cn --arg status "$status" --arg base "$base" --arg head "$head" \
+    --argjson ahead "$ahead" --argjson behind "$behind" \
+    '{status:$status,ahead_by:$ahead,behind_by:$behind,base_commit:{sha:$base},merge_base_commit:{sha:$base},commits:[{sha:$head}]}'
+elif [[ "$args" == *"/git/commits/${FAKE_CONNECTOR}"* ]]; then
+  tree=$FAKE_CONNECTOR_TREE; parent=$FAKE_CONNECTOR_BASE; verified=true; reason=valid
+  [[ "$FAKE_MODE" != run_tree_drift ]] || tree=1111111111111111111111111111111111111111
+  [[ "$FAKE_MODE" != run_parent_drift ]] || parent=1111111111111111111111111111111111111111
+  [[ "$FAKE_MODE" != run_signature_drift ]] || { verified=false; reason=unsigned; }
+  jq -cn --arg sha "$FAKE_CONNECTOR" --arg tree "$tree" --arg parent "$parent" \
+    --argjson verified "$verified" --arg reason "$reason" \
+    '{sha:$sha,tree:{sha:$tree},parents:[{sha:$parent}],verification:{verified:$verified,reason:$reason}}'
+elif [[ "$args" == *'/git/ref/heads/main'* ]]; then
+  sha=$FAKE_CONNECTOR_MAIN; ref=refs/heads/main; type=commit
+  [[ "$FAKE_MODE" != main_ref_malformed ]] || sha=invalid
+  [[ "$FAKE_MODE" != main_ref_name_drift ]] || ref=refs/heads/release
+  [[ "$FAKE_MODE" != main_ref_type_drift ]] || type=tag
+  [[ "$FAKE_MODE" != main_equal ]] || sha=$FAKE_CONNECTOR
+  jq -cn --arg sha "$sha" --arg ref "$ref" --arg type "$type" '{ref:$ref,object:{sha:$sha,type:$type}}'
+elif [[ "$args" == *"/compare/${FAKE_CONNECTOR}...${FAKE_CONNECTOR_MAIN}"* ]]; then
+  status=ahead; base=$FAKE_CONNECTOR; ahead=1; behind=0
+  [[ "$FAKE_MODE" != main_not_ancestor ]] || { status=diverged; base=1111111111111111111111111111111111111111; behind=1; }
+  jq -cn --arg status "$status" --arg base "$base" --argjson ahead "$ahead" --argjson behind "$behind" \
+    '{status:$status,ahead_by:$ahead,behind_by:$behind,base_commit:{sha:$base},merge_base_commit:{sha:$base}}'
 else
   echo "unexpected gh call: $args" >&2
   exit 99
@@ -84,8 +127,7 @@ chmod +x "$WORK/bin/gh"
 
 run() {
   PATH="$WORK/bin:$PATH" GH_TOKEN=x CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID=77 \
-    CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT=2 CUTOVER_CONNECTOR_LIFECYCLE_SOURCE_SHA=$CONNECTOR \
-    CUTOVER_CONNECTOR_PR_HEAD_SHA=$CONNECTOR_PR \
+    CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT=2 \
     CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=$NHP CUTOVER_EXPECTED_NHP_CONTROLLER_SOURCE_SHA=$RECOVERY \
     CUTOVER_EXPECTED_NHP_SERVER_DIGEST=$SERVER_DIGEST \
     CUTOVER_CONNECTOR_NHP_CONTROLLER_RUN_ID=66 CUTOVER_CONNECTOR_NHP_CONTROLLER_RUN_ATTEMPT=3 "$SCRIPT"
@@ -93,7 +135,11 @@ run() {
 
 proof=$(run)
 [[ "$proof" == "v1|layervai/qurl-connector|77|2|${CONNECTOR}|${CONNECTOR_PR}|${QURL_GO}|88|${FAKE_ZIP_DIGEST}|66|3|55|4|${RECOVERY}|${NHP}|${SERVER_DIGEST}" ]]
-for mode in pr_drift unmerged failed_run missing_step artifact_drift; do
+FAKE_MODE=main_equal
+[[ "$(run)" == "$proof" ]]
+for mode in reviewed_commit_drift reviewed_tree_drift base_status_drift base_sha_drift base_head_drift \
+  run_tree_drift run_parent_drift run_signature_drift run_repo_drift run_head_repo_drift \
+  main_ref_malformed main_ref_name_drift main_ref_type_drift main_not_ancestor failed_run missing_step artifact_drift; do
   export FAKE_MODE=$mode
   if run >/dev/null 2>&1; then
     echo "connector lifecycle verifier accepted $mode authority" >&2

@@ -26,6 +26,9 @@ RECOVERY_ORCHESTRATOR_SHA=${CUTOVER_RECOVERY_ORCHESTRATOR_SHA:-${GITHUB_SHA:-}}
 # tree API before any schema-3 adoption or fleet refresh.
 APPROVED_REPAIR_SOURCE_SHA=422b1d9acac53d50fe5602158fb02c8120ef108d
 APPROVED_REPAIR_RUNTIME_MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
+APPROVED_CUSTOMER_INFRA_SHA=d30d3fce3a6c3cf15e1340a5106b6cc76bce7e82
+APPROVED_INTEGRATIONS_SHA=356ecd44bbf09fca392247d971bbc093b337d4e5
+APPROVED_CONNECTOR_PR_HEAD_SHA=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
 GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-layervai/nhp}
 AWS_REGION=${AWS_REGION:-us-east-2}
 export AWS_REGION GITHUB_REPOSITORY
@@ -343,7 +346,8 @@ validate_customer_lifecycle_receipt() {
     build_run build_attempt server_digest ac_digest authority_sha extra <<<"$CUSTOMER_LIFECYCLE_RECEIPT"
   [[ -z "$extra" && "$version" == v2 && "$repository" == layervai/qurl-integrations-infra &&
      "$run" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ &&
-     "$infra_sha" =~ ^[0-9a-f]{40}$ && "$integrations_sha" =~ ^[0-9a-f]{40}$ &&
+     "$infra_sha" == "$APPROVED_CUSTOMER_INFRA_SHA" &&
+     "$integrations_sha" == "$APPROVED_INTEGRATIONS_SHA" &&
      "$artifact_id" =~ ^[1-9][0-9]*$ && "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ &&
      "$producer_run" =~ ^[1-9][0-9]*$ && "$producer_attempt" =~ ^[1-9][0-9]*$ &&
      "$nhp_artifact_id" =~ ^[1-9][0-9]*$ && "$nhp_artifact_digest" =~ ^sha256:[0-9a-f]{64}$ &&
@@ -365,7 +369,7 @@ validate_connector_lifecycle_receipt() {
     <<<"$CONNECTOR_LIFECYCLE_RECEIPT"
   [[ -z "$extra" && "$version" == v1 && "$repository" == layervai/qurl-connector &&
      "$run" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ &&
-     "$merge_sha" =~ ^[0-9a-f]{40}$ && "$pr_head_sha" =~ ^[0-9a-f]{40}$ &&
+     "$merge_sha" =~ ^[0-9a-f]{40}$ && "$pr_head_sha" == "$APPROVED_CONNECTOR_PR_HEAD_SHA" &&
      "$qurl_go_sha" == d02c25995df085f0437c7a572714c26e907a8a59 &&
      "$artifact_id" =~ ^[1-9][0-9]*$ && "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ &&
      "$controller_run" =~ ^[1-9][0-9]*$ && "$controller_attempt" =~ ^[1-9][0-9]*$ &&
@@ -763,9 +767,7 @@ if jq -e '.schema == 3 and .phase == "complete"' >/dev/null 2>&1 <<<"$RAW_STATE"
   assert_completed_repair_slot sandbox-cell1 server "$CELL1_COLOR" "$CELL1_ASG" "$SERVER_REPAIR_PROVENANCE"
   assert_completed_repair_slot sandbox ac "$AC_COLOR" "$AC_ASG" "$AC_REPAIR_PROVENANCE"
   validate_customer_lifecycle_receipt
-  [[ "$CONNECTOR_LIFECYCLE_RECEIPT" =~ ^v1\|layervai/qurl-connector\|[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{40}\|[0-9a-f]{40}\|[0-9a-f]{40}\|[1-9][0-9]*\|sha256:[0-9a-f]{64}\|[1-9][0-9]*\|[1-9][0-9]*\|[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{40}\|[0-9a-f]{40}\|sha256:[0-9a-f]{64}$ ]] || {
-    echo "completed connector lifecycle receipt is malformed" >&2; exit 1;
-  }
+  validate_connector_lifecycle_receipt
   [[ "$(get_param "$FLOOR_PARAM")" == "$TARGET_PROFILE" ]] || { echo "completed durable profile floor is missing" >&2; exit 1; }
   echo "durable AOP schema-3 recovery is already complete at repair source $REPAIR_SOURCE_SHA"
   exit 0
@@ -861,6 +863,8 @@ if [[ "$PHASE" != complete ]]; then
     "$VERIFY_LIFECYCLE"
   CUTOVER_ORIGINAL_SOURCE_ROOT=$ORIGINAL_ROOT CUTOVER_EXPECTED_CELL1_ASG=$CELL1_ASG \
     CUTOVER_EXPECTED_CELL1_COLOR=$CELL1_COLOR "$VERIFY_TOPOLOGY" "$CELL1_ASG" cutover-cell1 15 true
+  : "${CUTOVER_CUSTOMER_GH_TOKEN:?CUTOVER_CUSTOMER_GH_TOKEN is required for terminal customer lifecycle verification}"
+  : "${CUTOVER_CONNECTOR_GH_TOKEN:?CUTOVER_CONNECTOR_GH_TOKEN is required for terminal connector lifecycle verification}"
   candidate_lifecycle=$(CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=$REPAIR_SOURCE_SHA \
     CUTOVER_EXPECTED_RECOVERY_ORCHESTRATOR_SHA=$RECOVERY_ORCHESTRATOR_SHA \
     CUTOVER_EXPECTED_REPAIR_BUILD_RUN_ID=$REPAIR_BUILD_RUN_ID \
@@ -876,7 +880,8 @@ if [[ "$PHASE" != complete ]]; then
     exit 1
   }
   CUSTOMER_LIFECYCLE_RECEIPT=$candidate_lifecycle
-  candidate_connector_lifecycle=$(CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=$REPAIR_SOURCE_SHA \
+  candidate_connector_lifecycle=$(GH_TOKEN=$CUTOVER_CONNECTOR_GH_TOKEN \
+    CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=$REPAIR_SOURCE_SHA \
     CUTOVER_EXPECTED_NHP_CONTROLLER_SOURCE_SHA=$RECOVERY_ORCHESTRATOR_SHA \
     CUTOVER_EXPECTED_NHP_SERVER_DIGEST=${SERVER_REPAIR_PROVENANCE##*|} "$VERIFY_CONNECTOR_LIFECYCLE")
   [[ -z "$CONNECTOR_LIFECYCLE_RECEIPT" || "$CONNECTOR_LIFECYCLE_RECEIPT" == "$candidate_connector_lifecycle" ]] || {

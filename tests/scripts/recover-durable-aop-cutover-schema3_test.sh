@@ -13,10 +13,12 @@ ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398c
 ORIGINAL_LOCK_DIGEST=6c7224d78837a4d56547409439d9bce30efa9b214367c4f19fd13cc3fe3b2ebd
 SERVER_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 AC_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-CONNECTOR=0000000000000000000000000000000000000000
-CONNECTOR_PR=0000000000000000000000000000000000000000
+CONNECTOR=2222222222222222222222222222222222222222
+CONNECTOR_PR=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
+CONNECTOR_BASE=e70923168818da0b8002e5e63e7dcfe9e060ba12
+CONNECTOR_TREE=4444444444444444444444444444444444444444
 QURL_GO=d02c25995df085f0437c7a572714c26e907a8a59
-INFRA=5df6c96a08ffdc4adb52d0ea87fcd89fd7c22256
+INFRA=d30d3fce3a6c3cf15e1340a5106b6cc76bce7e82
 INTEGRATIONS=356ecd44bbf09fca392247d971bbc093b337d4e5
 export QURL_GO
 WORK=$(mktemp -d)
@@ -26,6 +28,8 @@ export FAKE_PARAMS=$WORK/params FAKE_ASGS=$WORK/asgs FAKE_ACTIONS=$WORK/actions
 export FAKE_ORIGINAL_STATE_RECORD=$WORK/original-state FAKE_ORIGINAL_LOCK_RECORD=$WORK/original-lock
 export FAKE_ORIGINAL=$ORIGINAL FAKE_REPAIR=$REPAIR FAKE_SERVER_DIGEST=$SERVER_DIGEST FAKE_AC_DIGEST=$AC_DIGEST
 export FAKE_RECOVERY=$RECOVERY FAKE_CONNECTOR=$CONNECTOR FAKE_CONNECTOR_PR=$CONNECTOR_PR
+export FAKE_CONNECTOR_BASE=$CONNECTOR_BASE
+export FAKE_CONNECTOR_TREE=$CONNECTOR_TREE
 export FAKE_INFRA=$INFRA FAKE_INTEGRATIONS=$INTEGRATIONS
 
 jq -cn --arg connector "$CONNECTOR" --arg controller "$RECOVERY" '
@@ -260,11 +264,19 @@ cat >"$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+if [[ "$args" == *'repos/layervai/qurl-integrations-infra/'* ]]; then
+  [[ "${GH_TOKEN:-}" == customer-x ]] || { echo "qurl-infra API used the wrong token" >&2; exit 98; }
+elif [[ "$args" == *'repos/layervai/qurl-connector/'* ]]; then
+  [[ "${GH_TOKEN:-}" == connector-x ]] || { echo "qurl-connector API used the wrong token" >&2; exit 98; }
+elif [[ "$args" == *'repos/layervai/nhp/'* ]]; then
+  [[ "${GH_TOKEN:-}" == x ]] || { echo "NHP API used a private lifecycle token" >&2; exit 98; }
+elif [[ "$args" == *'repos/layervai/qurl-go/'* || "$args" == *'repos/layervai/qurl-integrations/'* ]]; then
+  echo "public API was incorrectly called through authenticated gh" >&2; exit 98
+else
+  [[ "${GH_TOKEN:-}" == x ]] || { echo "NHP API used a private lifecycle token" >&2; exit 98; }
+fi
 if [[ "$args" == *'/actions/runs/32635672597' ]]; then
   jq -cn --arg sha "$FAKE_ORIGINAL" '{head_sha:$sha,head_branch:"main",event:"push",status:"completed",conclusion:"failure",path:".github/workflows/build-and-push.yml"}'
-elif [[ "$args" == *'repos/layervai/qurl-connector/pulls/609'* ]]; then
-  jq -cn --arg head "$FAKE_CONNECTOR_PR" --arg merge "$FAKE_CONNECTOR" \
-    '{number:609,state:"closed",merged:true,merge_commit_sha:$merge,head:{sha:$head,repo:{full_name:"layervai/qurl-connector"}}}'
 elif [[ "$args" == *'/actions/runs/900/attempts/2/jobs'* ]]; then
   steps='["Verify exact qurl-integrations source","Verify qurl-connector module selection","Verify qurl-integrations binary attestation","Verify exact repaired NHP deployment authority","Verify exact lifecycle integration-test authorities","Acquire customer Auth0 JWT through public API","Create ordinary customer API key","Run host customer-lifecycle smoke","Run host sibling-continuity journey","Run host CRID lifecycle journey","Run hardened customer-lifecycle smoke","Run hardened sibling-continuity journey","Revoke ordinary customer API key","Verify revoked key rejection after cache horizon","Build immutable durable AOP lifecycle receipt","Upload immutable durable AOP lifecycle receipt"]'
   jq -cn --argjson steps "$steps" '[{jobs:[{name:"Protected qURL sharing sandbox lifecycle",conclusion:"success",steps:[$steps[]|{name:.,conclusion:"success"}]}]}]'
@@ -299,7 +311,18 @@ elif [[ "$args" == *'/actions/runs/901/artifacts'* ]]; then
 elif [[ "$args" == *'/actions/artifacts/902/zip'* ]]; then
   cat "$FAKE_CONNECTOR_ZIP"
 elif [[ "$args" == *'/actions/runs/901' ]]; then
-  jq -cn --arg sha "$FAKE_CONNECTOR" '{head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,status:"completed",conclusion:"success",path:".github/workflows/sandbox-smoke.yml"}'
+  jq -cn --arg sha "$FAKE_CONNECTOR" \
+    '{repository:{full_name:"layervai/qurl-connector"},head_repository:{full_name:"layervai/qurl-connector"},head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,status:"completed",conclusion:"success",path:".github/workflows/sandbox-smoke.yml"}'
+elif [[ "$args" == *"/git/commits/${FAKE_CONNECTOR_PR}"* ]]; then
+  jq -cn --arg sha "$FAKE_CONNECTOR_PR" --arg tree "$FAKE_CONNECTOR_TREE" '{sha:$sha,tree:{sha:$tree}}'
+elif [[ "$args" == *"/compare/${FAKE_CONNECTOR_BASE}...${FAKE_CONNECTOR_PR}"* ]]; then
+  jq -cn --arg base "$FAKE_CONNECTOR_BASE" --arg head "$FAKE_CONNECTOR_PR" \
+    '{status:"ahead",ahead_by:2,behind_by:0,base_commit:{sha:$base},merge_base_commit:{sha:$base},commits:[{sha:$head}]}'
+elif [[ "$args" == *"/git/commits/${FAKE_CONNECTOR}"* ]]; then
+  jq -cn --arg sha "$FAKE_CONNECTOR" --arg tree "$FAKE_CONNECTOR_TREE" --arg parent "$FAKE_CONNECTOR_BASE" \
+    '{sha:$sha,tree:{sha:$tree},parents:[{sha:$parent}],verification:{verified:true,reason:"valid"}}'
+elif [[ "$args" == *'/git/ref/heads/main'* ]]; then
+  jq -cn --arg sha "$FAKE_CONNECTOR" '{ref:"refs/heads/main",object:{sha:$sha,type:"commit"}}'
 elif [[ "$args" == *'/git/trees/'* ]]; then
   target_blob=9de09c2cb4a8a8bf8ba9d4c2bf1bfb5263331e5d
   [[ "${FAKE_RUNTIME_MANIFEST_FAILURE:-}" != true ]] || target_blob=2222222222222222222222222222222222222222
@@ -341,6 +364,56 @@ else
   echo "unexpected gh $args" >&2
   exit 99
 fi
+EOF
+
+cat >"$WORK/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${GH_TOKEN:-} && -z ${GITHUB_TOKEN:-} && -z ${NHP_GH_TOKEN:-} &&
+   -z ${CUSTOMER_GH_TOKEN:-} && -z ${PUBLIC_GH_TOKEN:-} &&
+   -z ${CUTOVER_CUSTOMER_GH_TOKEN:-} && -z ${CUTOVER_CONNECTOR_GH_TOKEN:-} ]]
+for arg in "$@"; do [[ ${arg,,} != *authorization* ]]; done
+output= url=; disable=0; fail=0; silent=0; show_error=0; tls=0; proto=0; no_redirect=0; bounded=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --disable) disable=1; shift ;;
+    --fail) fail=1; shift ;;
+    --silent) silent=1; shift ;;
+    --show-error) show_error=1; shift ;;
+    --tlsv1.2) tls=1; shift ;;
+    --proto) [[ $2 == '=https' ]]; proto=1; shift 2 ;;
+    --max-redirs) [[ $2 == 0 ]]; no_redirect=1; shift 2 ;;
+    --connect-timeout) [[ $2 == 10 ]]; shift 2 ;;
+    --max-time) [[ $2 == 30 ]]; shift 2 ;;
+    --max-filesize) [[ $2 == 4194304 ]]; bounded=1; shift 2 ;;
+    --header) [[ $2 == 'Accept: application/vnd.github+json' || $2 == 'X-GitHub-Api-Version: 2022-11-28' ]]; shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    --write-out) [[ $2 == '%{http_code}' ]]; shift 2 ;;
+    https://api.github.com/*) [[ -z $url ]]; url=$1; shift ;;
+    *) echo "unexpected curl fixture argument: $1" >&2; exit 98 ;;
+  esac
+done
+[[ $disable == 1 && $fail == 1 && $silent == 1 && $show_error == 1 && $tls == 1 &&
+   $proto == 1 && $no_redirect == 1 && $bounded == 1 && -n $output && -n $url ]]
+case "${url#https://api.github.com/}" in
+  repos/layervai/qurl-go/git/ref/tags/v0.8.0)
+    jq -cn --arg sha "$QURL_GO" '{ref:"refs/tags/v0.8.0",object:{sha:$sha,type:"commit",url:("https://api.github.com/repos/layervai/qurl-go/git/commits/"+$sha)}}' >"$output"
+    ;;
+  repos/layervai/qurl-go/actions/runs/32621063743/attempts/1)
+    jq -cn --arg sha "$QURL_GO" '{id:32621063743,repository:{full_name:"layervai/qurl-go"},head_repository:{full_name:"layervai/qurl-go"},head_sha:$sha,head_branch:"main",event:"push",run_attempt:1,status:"completed",conclusion:"success",path:".github/workflows/ci.yml"}' >"$output"
+    ;;
+  repos/layervai/qurl-go/actions/runs/32621063743/attempts/1/jobs?per_page=100)
+    jq -cn '{total_count:1,jobs:[{name:"vet + test -race",conclusion:"success",steps:[{name:"go test -race + coverage",conclusion:"success"}]}]}' >"$output"
+    ;;
+  repos/layervai/qurl-integrations/actions/runs/32658570640/attempts/1)
+    jq -cn --arg integrations "$FAKE_INTEGRATIONS" '{id:32658570640,repository:{full_name:"layervai/qurl-integrations"},head_repository:{full_name:"layervai/qurl-integrations"},head_sha:$integrations,head_branch:"fix/exact-session-lifecycle-smoke",event:"pull_request",run_attempt:1,status:"completed",conclusion:"failure",path:".github/workflows/cli.yml",pull_requests:[{number:1247,head:{sha:$integrations},base:{sha:"f1aa5795a0d45b73bd06fbf64d1dc179c4dc2a29"}}]}' >"$output"
+    ;;
+  repos/layervai/qurl-integrations/actions/runs/32658570640/attempts/1/jobs?per_page=100)
+    jq -cn --arg integrations "$FAKE_INTEGRATIONS" '{total_count:1,jobs:[{name:"cli / test",head_sha:$integrations,conclusion:"success",steps:[{name:"Run tests with coverage",conclusion:"success"}]}]}' >"$output"
+    ;;
+  *) echo "unexpected public API route: $url" >&2; exit 98 ;;
+esac
+printf 200
 EOF
 
 cat >"$WORK/helpers/provenance" <<'EOF'
@@ -392,7 +465,8 @@ seed() {
 }
 
 invoke() {
-  PATH="$WORK/bin:$PATH" AWS_REGION=us-east-2 GH_TOKEN=x GITHUB_REPOSITORY=layervai/nhp \
+  PATH="$WORK/bin:$PATH" AWS_REGION=us-east-2 GH_TOKEN=x CUTOVER_CUSTOMER_GH_TOKEN=customer-x \
+    CUTOVER_CONNECTOR_GH_TOKEN=connector-x GITHUB_REPOSITORY=layervai/nhp \
     CUTOVER_RECOVERY_ORCHESTRATOR_SHA=$RECOVERY \
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify \
     CUTOVER_VERIFY_LIFECYCLE_SCRIPT=$WORK/helpers/verify CUTOVER_VERIFY_TOPOLOGY_SCRIPT=$WORK/helpers/verify \
@@ -465,8 +539,36 @@ if grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"; then exit 1;
 invoke >/dev/null
 [[ "$(awk -F '\t' '$1=="/sandbox/nhp/minimum-protocol-profile" {print $2}' "$FAKE_PARAMS")" == durable-aop-v1 ]]
 
+# COMPLETE replay has no hard lock and therefore must keep the reviewed source
+# identities inside both stored lifecycle receipts as terminal authority. A
+# different but shape-valid SHA cannot satisfy replay.
+cp "$FAKE_PARAMS" "$WORK/params.complete"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+mutated=$(jq -c --arg old "$INFRA" --arg new 9999999999999999999999999999999999999999 \
+  '.repair.customer_lifecycle |= sub($old;$new)' <<<"$state")
+awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
+  "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+if invoke >/dev/null 2>&1; then echo "COMPLETE replay accepted another customer infra SHA" >&2; exit 1; fi
+
+cp "$WORK/params.complete" "$FAKE_PARAMS"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+mutated=$(jq -c --arg old "$INTEGRATIONS" --arg new 9999999999999999999999999999999999999999 \
+  '.repair.customer_lifecycle |= sub($old;$new)' <<<"$state")
+awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
+  "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+if invoke >/dev/null 2>&1; then echo "COMPLETE replay accepted another integrations SHA" >&2; exit 1; fi
+
+cp "$WORK/params.complete" "$FAKE_PARAMS"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+mutated=$(jq -c --arg old "$CONNECTOR_PR" --arg new 9999999999999999999999999999999999999999 \
+  '.repair.connector_lifecycle |= sub($old;$new)' <<<"$state")
+awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
+  "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+if invoke >/dev/null 2>&1; then echo "COMPLETE replay accepted another connector PR head SHA" >&2; exit 1; fi
+
 # Shape-valid receipt substitution cannot move COMPLETE to a different repaired
 # server image digest.
+cp "$WORK/params.complete" "$FAKE_PARAMS"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 mutated=$(jq -c --arg old "$SERVER_DIGEST" --arg new sha256:9999999999999999999999999999999999999999999999999999999999999999 \
   '.repair.connector_lifecycle |= sub($old;$new)' <<<"$state")

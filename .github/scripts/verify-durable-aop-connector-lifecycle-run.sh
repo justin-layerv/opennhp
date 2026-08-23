@@ -10,8 +10,8 @@ set -euo pipefail
 REPOSITORY=layervai/qurl-connector
 WORKFLOW_PATH=.github/workflows/sandbox-smoke.yml
 QURL_GO_V080_SHA=d02c25995df085f0437c7a572714c26e907a8a59
-APPROVED_CONNECTOR_PR_HEAD_SHA=0000000000000000000000000000000000000000
-APPROVED_CONNECTOR_MERGE_SHA=0000000000000000000000000000000000000000
+APPROVED_CONNECTOR_PR_HEAD_SHA=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
+APPROVED_CONNECTOR_PR_BASE_SHA=e70923168818da0b8002e5e63e7dcfe9e060ba12
 RUN_ID=${CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID:?CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID is required}
 RUN_ATTEMPT=${CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT:?CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT is required}
 NHP_SOURCE_SHA=${CUTOVER_EXPECTED_REPAIR_SOURCE_SHA:?CUTOVER_EXPECTED_REPAIR_SOURCE_SHA is required}
@@ -32,37 +32,82 @@ NHP_SERVER_DIGEST=${CUTOVER_EXPECTED_NHP_SERVER_DIGEST:?CUTOVER_EXPECTED_NHP_SER
   exit 2
 }
 
-# This gate is intentionally unreachable before #609 merges.  The protected
-# runner executes connector main, so bind both reviewed authorities: the final
-# PR head and GitHub's exact merged-main commit.  A later main run is not
-# interchangeable with this one-time release proof.
-pr=$(gh api "repos/${REPOSITORY}/pulls/609")
-CONNECTOR_PR_HEAD_SHA=$(jq -er '
-  select(.number == 609 and .head.repo.full_name == "layervai/qurl-connector" and
-    .state == "closed" and .merged == true and
-    (.head.sha | type == "string" and test("^[0-9a-f]{40}$")) and
-    (.merge_commit_sha | type == "string" and test("^[0-9a-f]{40}$"))) | .head.sha
-' <<<"$pr") || {
-  echo "connector lifecycle source is not the exact merged qurl-connector PR #609 authority" >&2
-  exit 1
-}
-CONNECTOR_SHA=$(jq -r .merge_commit_sha <<<"$pr")
-[[ "$CONNECTOR_PR_HEAD_SHA" == "$APPROVED_CONNECTOR_PR_HEAD_SHA" &&
-   "$CONNECTOR_SHA" == "$APPROVED_CONNECTOR_MERGE_SHA" ]] || {
-  echo "connector lifecycle authority is not the final reviewed/merged #609 source" >&2
-  exit 1
-}
-
+# GitHub's Pull Requests endpoint needs a permission that this read-only App
+# deliberately does not have. Instead, derive the merged source only from the
+# attended successful main run. Then prove with Contents-read APIs that its Git
+# tree exactly equals the reviewed #609 head tree and that the run commit is
+# still on current main. A caller supplies only the run identity, never a merge
+# SHA or source claim.
 run=$(gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}")
-jq -e --arg sha "$CONNECTOR_SHA" --arg path "$WORKFLOW_PATH" --argjson attempt "$RUN_ATTEMPT" '
-  .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .run_attempt == $attempt and
-  .status == "completed" and .conclusion == "success" and
-  (.path == $path or
-   .path == ("layervai/qurl-connector/" + $path + "@refs/heads/" + .head_branch))
-' >/dev/null <<<"$run" || {
+CONNECTOR_SHA=$(jq -er --arg path "$WORKFLOW_PATH" --argjson attempt "$RUN_ATTEMPT" '
+  select(
+    .repository.full_name == "layervai/qurl-connector" and
+    .head_repository.full_name == "layervai/qurl-connector" and
+    (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    .head_branch == "main" and .event == "workflow_dispatch" and .run_attempt == $attempt and
+    .status == "completed" and .conclusion == "success" and
+    (.path == $path or
+     .path == ("layervai/qurl-connector/" + $path + "@refs/heads/main"))
+  ) | .head_sha
+' <<<"$run") || {
   echo "connector lifecycle run is not the exact successful attended PR #609 workflow attempt" >&2
   exit 1
 }
+
+reviewed_commit=$(gh api "repos/${REPOSITORY}/git/commits/${APPROVED_CONNECTOR_PR_HEAD_SHA}")
+reviewed_tree=$(jq -er --arg sha "$APPROVED_CONNECTOR_PR_HEAD_SHA" '
+  select(.sha == $sha and (.tree.sha | type == "string" and test("^[0-9a-f]{40}$"))) | .tree.sha
+' <<<"$reviewed_commit") || {
+  echo "reviewed qurl-connector PR #609 head commit is unavailable or malformed" >&2
+  exit 1
+}
+reviewed_base=$(gh api \
+  "repos/${REPOSITORY}/compare/${APPROVED_CONNECTOR_PR_BASE_SHA}...${APPROVED_CONNECTOR_PR_HEAD_SHA}")
+jq -e --arg base "$APPROVED_CONNECTOR_PR_BASE_SHA" --arg head "$APPROVED_CONNECTOR_PR_HEAD_SHA" '
+  .status == "ahead" and .ahead_by > 0 and .behind_by == 0 and
+  .base_commit.sha == $base and .merge_base_commit.sha == $base and
+  (.commits | type == "array" and length > 0 and .[-1].sha == $head)
+' >/dev/null <<<"$reviewed_base" || {
+  echo "reviewed qurl-connector PR #609 head no longer has the exact reviewed base authority" >&2
+  exit 1
+}
+
+run_commit=$(gh api "repos/${REPOSITORY}/git/commits/${CONNECTOR_SHA}")
+run_tree=$(jq -er --arg sha "$CONNECTOR_SHA" --arg base "$APPROVED_CONNECTOR_PR_BASE_SHA" '
+  select(
+    .sha == $sha and
+    (.tree.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.parents | type == "array" and length == 1 and .[0].sha == $base) and
+    .verification.verified == true and .verification.reason == "valid"
+  ) | .tree.sha
+' <<<"$run_commit") || {
+  echo "attended connector lifecycle run commit is not the exact signed squash authority" >&2
+  exit 1
+}
+[[ "$run_tree" == "$reviewed_tree" ]] || {
+  echo "attended connector main run does not execute the exact reviewed #609 source tree" >&2
+  exit 1
+}
+
+main_ref=$(gh api "repos/${REPOSITORY}/git/ref/heads/main")
+main_sha=$(jq -er '
+  select(.ref == "refs/heads/main" and .object.type == "commit" and
+    (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))) | .object.sha
+' <<<"$main_ref") || {
+  echo "qurl-connector main ref is unavailable or malformed" >&2
+  exit 1
+}
+if [[ "$main_sha" != "$CONNECTOR_SHA" ]]; then
+  main_compare=$(gh api "repos/${REPOSITORY}/compare/${CONNECTOR_SHA}...${main_sha}")
+  jq -e --arg run "$CONNECTOR_SHA" '
+    .status == "ahead" and .ahead_by > 0 and .behind_by == 0 and
+    .base_commit.sha == $run and .merge_base_commit.sha == $run
+  ' >/dev/null <<<"$main_compare" || {
+    echo "attended connector lifecycle run commit is not an ancestor of current main" >&2
+    exit 1
+  }
+fi
+CONNECTOR_PR_HEAD_SHA=$APPROVED_CONNECTOR_PR_HEAD_SHA
 
 jobs=$(gh api --paginate "repos/${REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" --slurp)
 jq -e '

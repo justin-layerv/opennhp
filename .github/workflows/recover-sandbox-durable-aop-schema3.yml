@@ -89,26 +89,53 @@ jobs:
           path: .cutover-original-e9
           persist-credentials: false
 
-      # github.token is scoped to this NHP repository and is not authority to
-      # read the protected cross-repository customer/connector runs or their
-      # immutable artifacts.  Mint one least-privilege installation token over
-      # the exact reviewed repository set; absence of any installation grant
-      # fails this step rather than falling back to a PAT or the caller token.
-      - name: Mint exact recovery receipt reader token
-        id: recovery_receipt_token
+      # github.token remains private to this NHP repository. Public repository
+      # authority is read through bounded anonymous HTTPS. Each private
+      # lifecycle repository gets its own least-privilege token so installation
+      # drift fails before AWS credentials or schema adoption, without coupling
+      # unrelated repository selections.
+      - name: Mint customer lifecycle reader token
+        id: customer_lifecycle_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
           private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
           owner: layervai
           repositories: |
-            nhp
             qurl-integrations-infra
-            qurl-integrations
-            qurl-go
+          permission-actions: read
+          permission-contents: read
+
+      - name: Verify customer lifecycle reader access
+        env:
+          GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api repos/layervai/qurl-integrations-infra --jq .full_name)" == layervai/qurl-integrations-infra ]]
+          gh api 'repos/layervai/qurl-integrations-infra/actions/runs?per_page=1' >/dev/null
+          gh api 'repos/layervai/qurl-integrations-infra/contents/.github/workflows/qurl-sharing-sandbox.yml?ref=main' >/dev/null
+
+      - name: Mint connector lifecycle reader token
+        id: connector_lifecycle_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
             qurl-connector
           permission-actions: read
           permission-contents: read
+
+      - name: Verify connector lifecycle reader access
+        env:
+          GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api repos/layervai/qurl-connector --jq .full_name)" == layervai/qurl-connector ]]
+          [[ "$(gh api repos/layervai/qurl-connector/git/commits/16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8 --jq .sha)" == 16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8 ]]
+          gh api 'repos/layervai/qurl-connector/actions/runs?per_page=1' >/dev/null
+          gh api 'repos/layervai/qurl-connector/contents/.github/workflows/sandbox-smoke.yml?ref=main' >/dev/null
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -120,7 +147,9 @@ jobs:
       - name: Adopt and advance exact schema-3 recovery
         env:
           AWS_REGION: us-east-2
-          GH_TOKEN: ${{ steps.recovery_receipt_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          CUTOVER_CUSTOMER_GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}
+          CUTOVER_CONNECTOR_GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}
           CUTOVER_ORIGINAL_SOURCE_SHA: e9b11398a4cea98da6ae5b41cfe635562e1b7c72
           CUTOVER_ORIGINAL_RUN_ID: '32635672597'
           CUTOVER_ORIGINAL_SOURCE_ROOT: ${{ github.workspace }}/.cutover-original-e9

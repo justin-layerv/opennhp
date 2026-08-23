@@ -12,19 +12,50 @@ BUILD_VERIFIER = ROOT / ".github/scripts/verify-durable-aop-build-only-run.sh"
 
 class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
     def assert_exact_receipt_token_contract(self, text):
-        self.assertIn("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1", text)
-        self.assertIn("owner: layervai", text)
-        match = re.search(r"(?m)^\s{10}repositories: \|\n((?:\s{12}[^\n]+\n)+)", text)
-        self.assertIsNotNone(match)
+        token_action = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
+        self.assertEqual(text.count(token_action), 2)
+        self.assertEqual(text.count("          owner: layervai"), 2)
+        repositories = re.findall(r"(?m)^\s{10}repositories: \|\n((?:\s{12}[^\n]+\n)+)", text)
         self.assertEqual(
-            [line.strip() for line in match.group(1).splitlines()],
-            ["nhp", "qurl-integrations-infra", "qurl-integrations", "qurl-go", "qurl-connector"],
+            [[line.strip() for line in block.splitlines()] for block in repositories],
+            [["qurl-integrations-infra"], ["qurl-connector"]],
         )
-        self.assertIn("GH_TOKEN: ${{ steps.recovery_receipt_token.outputs.token }}", text)
-        self.assertNotIn("GH_TOKEN: ${{ github.token }}", text)
+        self.assertEqual(text.count("          permission-actions: read"), 2)
+        self.assertEqual(text.count("          permission-contents: read"), 2)
+        self.assertNotIn("permission-pull-requests:", text)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", text)
+        self.assertIn("CUTOVER_CUSTOMER_GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}", text)
+        self.assertIn("CUTOVER_CONNECTOR_GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}", text)
         self.assertNotRegex(text, re.compile(r"GH_TOKEN:\s*\$\{\{\s*secrets\.", re.MULTILINE))
-        permissions = re.findall(r"(?m)^\s{10}permission-([a-z-]+):\s*([^\s]+)\s*$", text)
-        self.assertEqual(permissions, [("actions", "read"), ("contents", "read")])
+        for repository, workflow in (
+            ("qurl-integrations-infra", "qurl-sharing-sandbox.yml"),
+            ("qurl-connector", "sandbox-smoke.yml"),
+        ):
+            self.assertIn(f"gh api repos/layervai/{repository} --jq .full_name", text)
+            self.assertIn(f"repos/layervai/{repository}/actions/runs?per_page=1", text)
+            self.assertIn(f"repos/layervai/{repository}/contents/.github/workflows/{workflow}?ref=main", text)
+
+        customer_mint = text.index("- name: Mint customer lifecycle reader token")
+        customer_check = text.index("- name: Verify customer lifecycle reader access")
+        connector_mint = text.index("- name: Mint connector lifecycle reader token")
+        connector_check = text.index("- name: Verify connector lifecycle reader access")
+        aws = text.index("- name: Configure AWS credentials")
+        self.assertIn(
+            "GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}",
+            text[customer_check:connector_mint],
+        )
+        self.assertIn(
+            "GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}",
+            text[connector_check:aws],
+        )
+        self.assertIn(
+            "repos/layervai/qurl-connector/git/commits/16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8 --jq .sha",
+            text[connector_check:aws],
+        )
+        self.assertLess(customer_mint, customer_check)
+        self.assertLess(customer_check, connector_mint)
+        self.assertLess(connector_mint, connector_check)
+        self.assertLess(connector_check, aws)
 
     def test_workflow_is_attended_exact_source_and_non_cancelable(self):
         text = WORKFLOW.read_text()
@@ -44,17 +75,23 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         mutations = (
             text.replace("            qurl-connector\n", "            qurl-connector\n            unrelated-repo\n", 1),
             text.replace(
-                "GH_TOKEN: ${{ steps.recovery_receipt_token.outputs.token }}",
+                "GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}",
                 "GH_TOKEN: ${{ github.token }}",
                 1,
             ),
             text.replace(
-                "GH_TOKEN: ${{ steps.recovery_receipt_token.outputs.token }}",
+                "GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}",
                 "GH_TOKEN: ${{ secrets.CALLER_PAT }}",
                 1,
             ),
             text.replace("          permission-actions: read\n", "", 1),
             text.replace("          permission-contents: read", "          permission-contents: write", 1),
+            text.replace("gh api 'repos/layervai/qurl-connector/actions/runs?per_page=1' >/dev/null\n", "", 1),
+            text.replace(
+                "CUTOVER_CUSTOMER_GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}",
+                "CUTOVER_CUSTOMER_GH_TOKEN: ${{ github.token }}",
+                1,
+            ),
         )
         for mutation in mutations:
             with self.assertRaises(AssertionError):
@@ -96,7 +133,7 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         ac = text.index('write_state repaired')
         ready = text.index("schema3-ac-ready")
         lifecycle = text.index('candidate_lifecycle=$(CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=')
-        connector = text.index('candidate_connector_lifecycle=$(CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=')
+        connector = text.index('candidate_connector_lifecycle=$(GH_TOKEN=$CUTOVER_CONNECTOR_GH_TOKEN')
         floor = text.rindex("ensure_exact_floor")
         release = text.index('ssm-live-env-lock.sh" release')
         self.assertLess(cell0, cell1)

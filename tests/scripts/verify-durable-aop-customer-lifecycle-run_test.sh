@@ -168,6 +168,15 @@ cat >"$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+if [[ "$args" == *'repos/layervai/qurl-integrations-infra/'* ]]; then
+  [[ "${GH_TOKEN:-}" == customer-x ]] || { echo "qurl-infra API used the wrong token" >&2; exit 98; }
+elif [[ "$args" == *'repos/layervai/nhp/'* ]]; then
+  [[ "${GH_TOKEN:-}" == x ]] || { echo "NHP API used the wrong token" >&2; exit 98; }
+elif [[ "$args" == *'repos/layervai/qurl-go/'* || "$args" == *'repos/layervai/qurl-integrations/'* ]]; then
+  echo "public API was incorrectly called through authenticated gh" >&2; exit 98
+else
+  echo "unexpected gh repository route: $args" >&2; exit 98
+fi
 if [[ "$args" == *'/actions/runs/77/attempts/2/jobs'* ]]; then
   steps='["Verify exact qurl-integrations source","Verify qurl-connector module selection","Verify qurl-integrations binary attestation","Verify exact repaired NHP deployment authority","Verify exact lifecycle integration-test authorities","Acquire customer Auth0 JWT through public API","Create ordinary customer API key","Run host customer-lifecycle smoke","Run host sibling-continuity journey","Run host CRID lifecycle journey","Run hardened customer-lifecycle smoke","Run hardened sibling-continuity journey","Revoke ordinary customer API key","Verify revoked key rejection after cache horizon","Build immutable durable AOP lifecycle receipt","Upload immutable durable AOP lifecycle receipt"]'
   [[ "$FAKE_MODE" != missing_step ]] || steps='["Verify exact qurl-integrations source"]'
@@ -186,28 +195,6 @@ elif [[ "$args" == *'/actions/artifacts/88/zip'* ]]; then
   elif [[ "$FAKE_MODE" == auth_mutation ]]; then cat "$FAKE_BAD_AUTH_ZIP"
   elif [[ "$FAKE_MODE" == integration_mutation ]]; then cat "$FAKE_BAD_INTEGRATION_ZIP"
   else cat "$FAKE_CUSTOMER_ZIP"; fi
-elif [[ "$args" == *'/git/ref/tags/v0.8.0'* ]]; then
-  sha=d02c25995df085f0437c7a572714c26e907a8a59
-  [[ "$FAKE_MODE" != qurl_go_tag_drift ]] || sha=9999999999999999999999999999999999999999
-  jq -cn --arg sha "$sha" '{ref:"refs/tags/v0.8.0",object:{sha:$sha,type:"commit",url:("https://api.github.com/repos/layervai/qurl-go/git/commits/"+$sha)}}'
-elif [[ "$args" == *'/actions/runs/32621063743/attempts/1/jobs'* ]]; then
-  conclusion=success; [[ "$FAKE_MODE" != qurl_go_job_failed ]] || conclusion=failure
-  jq -cn --arg conclusion "$conclusion" '[{jobs:[{name:"vet + test -race",conclusion:$conclusion,steps:[{name:"go test -race + coverage",conclusion:$conclusion}]}]}]'
-elif [[ "$args" == *'/actions/runs/32621063743/attempts/1'* ]]; then
-  conclusion=success; [[ "$FAKE_MODE" != qurl_go_run_failed ]] || conclusion=failure
-  jq -cn --arg conclusion "$conclusion" '{id:32621063743,repository:{full_name:"layervai/qurl-go"},head_repository:{full_name:"layervai/qurl-go"},head_sha:"d02c25995df085f0437c7a572714c26e907a8a59",head_branch:"main",event:"push",run_attempt:1,status:"completed",conclusion:$conclusion,path:".github/workflows/ci.yml"}'
-elif [[ "$args" == *'/actions/runs/32658570640/attempts/1/jobs'* ]]; then
-  conclusion=success; [[ "$FAKE_MODE" != integrations_job_failed ]] || conclusion=failure
-  sha=$FAKE_INTEGRATIONS; [[ "$FAKE_MODE" != integrations_run_drift ]] || sha=9999999999999999999999999999999999999999
-  jq -cn --arg sha "$sha" --arg conclusion "$conclusion" '[{jobs:[{name:"cli / test",head_sha:$sha,conclusion:$conclusion,steps:[{name:"Run tests with coverage",conclusion:$conclusion}]}]}]'
-elif [[ "$args" == *'/actions/runs/32658570640/attempts/1'* ]]; then
-  conclusion=failure; [[ "$FAKE_MODE" != integrations_run_failed ]] || conclusion=success
-  sha=$FAKE_INTEGRATIONS; [[ "$FAKE_MODE" != integrations_run_drift ]] || sha=9999999999999999999999999999999999999999
-  branch=fix/exact-session-lifecycle-smoke; [[ "$FAKE_MODE" != integrations_branch_drift ]] || branch=other
-  pr=1247; [[ "$FAKE_MODE" != integrations_pr_drift ]] || pr=1248
-  base=f1aa5795a0d45b73bd06fbf64d1dc179c4dc2a29
-  [[ "$FAKE_MODE" != integrations_base_drift ]] || base=9999999999999999999999999999999999999999
-  jq -cn --arg sha "$sha" --arg conclusion "$conclusion" --arg branch "$branch" --arg base "$base" --argjson pr "$pr" '{id:32658570640,repository:{full_name:"layervai/qurl-integrations"},head_repository:{full_name:"layervai/qurl-integrations"},head_sha:$sha,head_branch:$branch,event:"pull_request",run_attempt:1,status:"completed",conclusion:$conclusion,path:".github/workflows/cli.yml",pull_requests:[{number:$pr,head:{sha:$sha},base:{sha:$base}}]}'
 elif [[ "$args" == *'/actions/runs/66/artifacts'* ]]; then
   jq -cn --arg name "durable-aop-nhp-deployment-${FAKE_REPAIR}" --arg digest "$FAKE_NHP_DIGEST" \
     '[{artifacts:[{id:99,name:$name,digest:$digest,expired:false,size_in_bytes:500,workflow_run:{id:66}}]}]'
@@ -246,8 +233,91 @@ fi
 EOF
 chmod +x "$WORK/bin/gh"
 
-run() {
-  PATH="$WORK/bin:$PATH" GH_TOKEN=x \
+cat >"$WORK/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${GH_TOKEN:-} && -z ${GITHUB_TOKEN:-} && -z ${NHP_GH_TOKEN:-} &&
+   -z ${CUSTOMER_GH_TOKEN:-} && -z ${PUBLIC_GH_TOKEN:-} &&
+   -z ${CUTOVER_CUSTOMER_GH_TOKEN:-} && -z ${CUTOVER_CONNECTOR_GH_TOKEN:-} ]] || {
+  echo "public API request inherited an authorization token" >&2; exit 98;
+}
+for arg in "$@"; do
+  [[ ${arg,,} != *authorization* ]] || { echo "public API request supplied an Authorization option" >&2; exit 98; }
+done
+
+disable=0 fail=0 silent=0 show_error=0 tls=0 proto=0 no_redirect=0 bounded=0 output= url=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --disable) disable=1; shift ;;
+    --fail) fail=1; shift ;;
+    --silent) silent=1; shift ;;
+    --show-error) show_error=1; shift ;;
+    --tlsv1.2) tls=1; shift ;;
+    --proto) [[ $2 == '=https' ]]; proto=1; shift 2 ;;
+    --max-redirs) [[ $2 == 0 ]]; no_redirect=1; shift 2 ;;
+    --connect-timeout) [[ $2 == 10 ]]; shift 2 ;;
+    --max-time) [[ $2 == 30 ]]; shift 2 ;;
+    --max-filesize) [[ $2 == 4194304 ]]; bounded=1; shift 2 ;;
+    --header)
+      [[ $2 == 'Accept: application/vnd.github+json' || $2 == 'X-GitHub-Api-Version: 2022-11-28' ]]
+      shift 2
+      ;;
+    --output) output=$2; shift 2 ;;
+    --write-out) [[ $2 == '%{http_code}' ]]; shift 2 ;;
+    https://api.github.com/*) [[ -z $url ]]; url=$1; shift ;;
+    *) echo "unexpected curl fixture argument: $1" >&2; exit 98 ;;
+  esac
+done
+[[ $disable == 1 && $fail == 1 && $silent == 1 && $show_error == 1 && $tls == 1 &&
+   $proto == 1 && $no_redirect == 1 && $bounded == 1 && -n $output && -n $url ]]
+
+if [[ ${FAKE_MODE:-} == public_oversize ]]; then
+  head -c 4194305 /dev/zero | tr '\0' x >"$output"
+elif [[ ${FAKE_MODE:-} == public_malformed ]]; then
+  printf '{' >"$output"
+else
+  path=${url#https://api.github.com/}
+  total=1
+  [[ ${FAKE_MODE:-} != public_unbounded ]] || total=101
+  [[ ${FAKE_MODE:-} != public_incomplete_page ]] || total=2
+  case "$path" in
+    repos/layervai/qurl-go/git/ref/tags/v0.8.0)
+      sha=d02c25995df085f0437c7a572714c26e907a8a59
+      [[ ${FAKE_MODE:-} != qurl_go_tag_drift ]] || sha=9999999999999999999999999999999999999999
+      jq -cn --arg sha "$sha" '{ref:"refs/tags/v0.8.0",object:{sha:$sha,type:"commit",url:("https://api.github.com/repos/layervai/qurl-go/git/commits/"+$sha)}}' >"$output"
+      ;;
+    repos/layervai/qurl-go/actions/runs/32621063743/attempts/1)
+      conclusion=success; [[ ${FAKE_MODE:-} != qurl_go_run_failed ]] || conclusion=failure
+      jq -cn --arg conclusion "$conclusion" '{id:32621063743,repository:{full_name:"layervai/qurl-go"},head_repository:{full_name:"layervai/qurl-go"},head_sha:"d02c25995df085f0437c7a572714c26e907a8a59",head_branch:"main",event:"push",run_attempt:1,status:"completed",conclusion:$conclusion,path:".github/workflows/ci.yml"}' >"$output"
+      ;;
+    repos/layervai/qurl-go/actions/runs/32621063743/attempts/1/jobs?per_page=100)
+      conclusion=success; [[ ${FAKE_MODE:-} != qurl_go_job_failed ]] || conclusion=failure
+      jq -cn --arg conclusion "$conclusion" --argjson total "$total" '{total_count:$total,jobs:[{name:"vet + test -race",conclusion:$conclusion,steps:[{name:"go test -race + coverage",conclusion:$conclusion}]}]}' >"$output"
+      ;;
+    repos/layervai/qurl-integrations/actions/runs/32658570640/attempts/1)
+      conclusion=failure; [[ ${FAKE_MODE:-} != integrations_run_failed ]] || conclusion=success
+      sha=$FAKE_INTEGRATIONS; [[ ${FAKE_MODE:-} != integrations_run_drift ]] || sha=9999999999999999999999999999999999999999
+      branch=fix/exact-session-lifecycle-smoke; [[ ${FAKE_MODE:-} != integrations_branch_drift ]] || branch=other
+      pr=1247; [[ ${FAKE_MODE:-} != integrations_pr_drift ]] || pr=1248
+      base=f1aa5795a0d45b73bd06fbf64d1dc179c4dc2a29
+      [[ ${FAKE_MODE:-} != integrations_base_drift ]] || base=9999999999999999999999999999999999999999
+      jq -cn --arg sha "$sha" --arg conclusion "$conclusion" --arg branch "$branch" --arg base "$base" --argjson pr "$pr" '{id:32658570640,repository:{full_name:"layervai/qurl-integrations"},head_repository:{full_name:"layervai/qurl-integrations"},head_sha:$sha,head_branch:$branch,event:"pull_request",run_attempt:1,status:"completed",conclusion:$conclusion,path:".github/workflows/cli.yml",pull_requests:[{number:$pr,head:{sha:$sha},base:{sha:$base}}]}' >"$output"
+      ;;
+    repos/layervai/qurl-integrations/actions/runs/32658570640/attempts/1/jobs?per_page=100)
+      conclusion=success; [[ ${FAKE_MODE:-} != integrations_job_failed ]] || conclusion=failure
+      sha=$FAKE_INTEGRATIONS; [[ ${FAKE_MODE:-} != integrations_run_drift ]] || sha=9999999999999999999999999999999999999999
+      jq -cn --arg sha "$sha" --arg conclusion "$conclusion" --argjson total "$total" '{total_count:$total,jobs:[{name:"cli / test",head_sha:$sha,conclusion:$conclusion,steps:[{name:"Run tests with coverage",conclusion:$conclusion}]}]}' >"$output"
+      ;;
+    *) echo "unexpected or crossed public API route: $url" >&2; exit 98 ;;
+  esac
+fi
+printf '%s' "$([[ ${FAKE_MODE:-} == public_non_200 ]] && printf 503 || printf 200)"
+EOF
+chmod +x "$WORK/bin/curl"
+
+run_script() {
+  local target=$1
+  PATH="$WORK/bin:$PATH" GH_TOKEN=x CUTOVER_CUSTOMER_GH_TOKEN=${CUSTOMER_TOKEN:-customer-x} \
     CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID=77 CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT=2 \
     CUTOVER_CUSTOMER_LIFECYCLE_INFRA_SHA=$INFRA CUTOVER_CUSTOMER_LIFECYCLE_INTEGRATIONS_SHA=$INTEGRATIONS \
     CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=$REPAIR CUTOVER_EXPECTED_RECOVERY_ORCHESTRATOR_SHA=$RECOVERY \
@@ -255,20 +325,51 @@ run() {
     CUTOVER_EXPECTED_SERVER_DIGEST=$SERVER_DIGEST CUTOVER_EXPECTED_AC_DIGEST=$AC_DIGEST \
     CUTOVER_EXPECTED_CELL0_COLOR=green CUTOVER_EXPECTED_CELL0_ASG=layerv-nhp-sandbox-server-green \
     CUTOVER_EXPECTED_CELL1_COLOR=blue CUTOVER_EXPECTED_CELL1_ASG=layerv-nhp-sandbox-cell1-server \
-    CUTOVER_EXPECTED_AC_COLOR=green CUTOVER_EXPECTED_AC_ASG=layerv-nhp-sandbox-ac-green "$SCRIPT"
+    CUTOVER_EXPECTED_AC_COLOR=green CUTOVER_EXPECTED_AC_ASG=layerv-nhp-sandbox-ac-green "$target"
 }
+run() { run_script "$SCRIPT"; }
 
 receipt=$(run)
 [[ "$receipt" == "v2|layervai/qurl-integrations-infra|77|2|${INFRA}|${INTEGRATIONS}|88|${CUSTOMER_DIGEST}|66|3|99|${NHP_DIGEST}|${REPAIR}|${RECOVERY}|55|4|${SERVER_DIGEST}|${AC_DIGEST}|${AUTHORITY_SHA}" ]]
+if CUSTOMER_TOKEN=wrong run >/dev/null 2>&1; then
+  echo "customer lifecycle verifier accepted the wrong private-repository token" >&2
+  exit 1
+fi
 for mode in failed_customer_run missing_step authority_mutation journey_mutation auth_mutation integration_mutation \
   qurl_go_tag_drift qurl_go_run_failed qurl_go_job_failed integrations_run_failed integrations_run_drift \
   integrations_branch_drift integrations_pr_drift integrations_base_drift integrations_job_failed \
-  producer_drift build_drift nhp_zip_drift; do
+  producer_drift build_drift nhp_zip_drift public_non_200 public_oversize public_malformed \
+  public_unbounded public_incomplete_page; do
   export FAKE_MODE=$mode
   if run >/dev/null 2>&1; then
     echo "customer lifecycle verifier accepted $mode authority" >&2
     exit 1
   fi
 done
+
+sed "s/curl --disable/curl --disable --header 'Authorization: Bearer injected'/" \
+  "$SCRIPT" >"$WORK/public-auth-header.sh"
+chmod +x "$WORK/public-auth-header.sh"
+if FAKE_MODE=ok run_script "$WORK/public-auth-header.sh" >"$WORK/public-auth-header.log" 2>&1; then
+  echo "customer lifecycle verifier sent an Authorization header to a public API" >&2
+  exit 1
+fi
+grep -F "public API request supplied an Authorization option" "$WORK/public-auth-header.log" >/dev/null
+
+sed 's/curl --disable/GH_TOKEN=leaked curl --disable/' "$SCRIPT" >"$WORK/public-token-leak.sh"
+chmod +x "$WORK/public-token-leak.sh"
+if FAKE_MODE=ok run_script "$WORK/public-token-leak.sh" >"$WORK/public-token-leak.log" 2>&1; then
+  echo "customer lifecycle verifier leaked a token to a public API" >&2
+  exit 1
+fi
+grep -F "public API request inherited an authorization token" "$WORK/public-token-leak.log" >/dev/null
+
+sed 's/^QURL_GO_REPOSITORY=.*/QURL_GO_REPOSITORY=layervai\/nhp/' "$SCRIPT" >"$WORK/public-crossed-route.sh"
+chmod +x "$WORK/public-crossed-route.sh"
+if FAKE_MODE=ok run_script "$WORK/public-crossed-route.sh" >"$WORK/public-crossed-route.log" 2>&1; then
+  echo "customer lifecycle verifier accepted a crossed public repository route" >&2
+  exit 1
+fi
+grep -F "repository authority transport classification is invalid" "$WORK/public-crossed-route.log" >/dev/null
 
 echo "verify-durable-aop-customer-lifecycle-run: all tests passed"
