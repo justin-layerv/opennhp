@@ -1130,7 +1130,9 @@ resource "aws_iam_role_policy" "context_lookups" {
         Effect = "Allow"
         Action = [
           "autoscaling:StartInstanceRefresh",
-          "autoscaling:CancelInstanceRefresh"
+          "autoscaling:CancelInstanceRefresh",
+          "autoscaling:SuspendProcesses",
+          "autoscaling:ResumeProcesses"
         ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
       },
@@ -1184,7 +1186,9 @@ resource "aws_iam_role_policy" "context_lookups" {
         Effect = "Allow"
         Action = [
           "autoscaling:StartInstanceRefresh",
-          "autoscaling:CancelInstanceRefresh"
+          "autoscaling:CancelInstanceRefresh",
+          "autoscaling:SuspendProcesses",
+          "autoscaling:ResumeProcesses"
         ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
       },

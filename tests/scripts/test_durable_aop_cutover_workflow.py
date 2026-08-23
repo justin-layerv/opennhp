@@ -90,6 +90,30 @@ class DurableAOPCutoverWorkflowTest(unittest.TestCase):
                 path,
             )
 
+    def test_blue_green_role_can_restore_and_fence_asg_processes(self):
+        ecr = (ROOT / "terraform/modules/ecr/main.tf").read_text()
+        # context_lookups has explicit relay-enabled and disabled policy
+        # documents. Both must authorize the generic blue/green prepare and
+        # the one-time cutover so a later environment toggle cannot remove
+        # the process fence at runtime.
+        self.assertEqual(ecr.count('"autoscaling:SuspendProcesses"'), 2)
+        self.assertEqual(ecr.count('"autoscaling:ResumeProcesses"'), 2)
+        branches = re.findall(
+            r'Sid\s+= "ASGRefreshManage"(?P<body>.*?)Resource\s+= "(?P<resource>[^"]+)"',
+            ecr,
+            re.S,
+        )
+        self.assertEqual(len(branches), 2)
+        for statement, resource in branches:
+            self.assertIn('"autoscaling:StartInstanceRefresh"', statement)
+            self.assertIn('"autoscaling:CancelInstanceRefresh"', statement)
+            self.assertIn('"autoscaling:SuspendProcesses"', statement)
+            self.assertIn('"autoscaling:ResumeProcesses"', statement)
+            self.assertEqual(
+                resource,
+                "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*",
+            )
+
     def test_standalone_main_ref_dispatch_is_removed(self):
         self.assertFalse((ROOT / ".github/workflows/sandbox-durable-aop-cutover.yml").exists())
         self.assertFalse((ROOT / ".github/scripts/dispatch-and-poll-durable-aop-cutover.sh").exists())
