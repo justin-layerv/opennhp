@@ -472,10 +472,188 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
     ),
 )
 
+EXPECTED_ASG_PROCESS_FENCING_ADDRESS = (
+    "module.nhp.module.ecr.aws_iam_role_policy.context_lookups"
+)
+ASG_PROCESS_FENCING_BEFORE_ACTIONS = (
+    "autoscaling:StartInstanceRefresh",
+    "autoscaling:CancelInstanceRefresh",
+)
+ASG_PROCESS_FENCING_AFTER_ACTIONS = ASG_PROCESS_FENCING_BEFORE_ACTIONS + (
+    "autoscaling:SuspendProcesses",
+    "autoscaling:ResumeProcesses",
+)
+EXPECTED_ASG_PROCESS_FENCING_RESOURCE = (
+    "arn:aws:autoscaling:us-east-2:767397897469:"
+    "autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
+)
+EXPECTED_ASG_PROCESS_FENCING_ROW = {
+    "id": "nhp-sandbox-github-actions:context-lookups",
+    "name": "context-lookups",
+    "name_prefix": "",
+    "role": "nhp-sandbox-github-actions",
+}
+EXPECTED_ASG_PROCESS_FENCING_IDENTITY = {
+    "account_id": "767397897469",
+    "name": "context-lookups",
+    "role": "nhp-sandbox-github-actions",
+}
+
 
 def is_dmz_boundary_address(address: str) -> bool:
     """Return whether a managed address belongs to the manual DMZ boundary."""
     return any(pattern.search(address) for pattern in DMZ_BOUNDARY_ADDRESS_PATTERNS)
+
+
+def validate_asg_process_fencing_iam_migration(
+    boundary_changes: list[dict[str, Any]],
+) -> list[str] | None:
+    """Admit only the exact one-way ASG process-fencing permission update."""
+    mutations = [
+        raw
+        for raw in boundary_changes
+        if tuple((raw.get("change") or {}).get("actions") or ()) != ("no-op",)
+    ]
+    if len(mutations) != 1:
+        return None
+    raw = mutations[0]
+    if str(raw.get("address", "")) != EXPECTED_ASG_PROCESS_FENCING_ADDRESS:
+        return None
+
+    errors: list[str] = []
+    change = raw.get("change") or {}
+    if (
+        raw.get("mode") != "managed"
+        or raw.get("type") != "aws_iam_role_policy"
+        or raw.get("name") != "context_lookups"
+        or tuple(change.get("actions") or ()) != ("update",)
+    ):
+        errors.append(
+            "ASG process-fencing IAM migration must be one managed in-place update"
+        )
+    if set(change) != {
+        "actions",
+        "before",
+        "after",
+        "after_unknown",
+        "before_sensitive",
+        "after_sensitive",
+        "before_identity",
+        "after_identity",
+    }:
+        errors.append(
+            "ASG process-fencing IAM migration change envelope is noncanonical"
+        )
+    if (
+        change.get("before_identity") != EXPECTED_ASG_PROCESS_FENCING_IDENTITY
+        or change.get("after_identity") != EXPECTED_ASG_PROCESS_FENCING_IDENTITY
+    ):
+        errors.append(
+            "ASG process-fencing IAM migration identity metadata is noncanonical"
+        )
+
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return errors + [
+            "ASG process-fencing IAM migration requires complete before/after rows"
+        ]
+    if (
+        set(before) != {*EXPECTED_ASG_PROCESS_FENCING_ROW, "policy"}
+        or set(after) != {*EXPECTED_ASG_PROCESS_FENCING_ROW, "policy"}
+        or {key: before.get(key) for key in EXPECTED_ASG_PROCESS_FENCING_ROW}
+        != EXPECTED_ASG_PROCESS_FENCING_ROW
+        or {key: after.get(key) for key in EXPECTED_ASG_PROCESS_FENCING_ROW}
+        != EXPECTED_ASG_PROCESS_FENCING_ROW
+    ):
+        errors.append(
+            "ASG process-fencing IAM migration resource rows are noncanonical"
+        )
+    if change.get("before_sensitive") != {} or change.get("after_sensitive") != {}:
+        errors.append(
+            "ASG process-fencing IAM migration sensitivity masks must be exact empty objects"
+        )
+    if change.get("after_unknown") != {}:
+        errors.append(
+            "ASG process-fencing IAM migration after-unknown mask must be an exact empty object"
+        )
+
+    policies: list[dict[str, Any]] = []
+    for label, value in (
+        ("before", before.get("policy")),
+        ("after", after.get("policy")),
+    ):
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else None
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            errors.append(
+                f"ASG process-fencing IAM migration {label} policy must be valid JSON"
+            )
+            parsed = {}
+        policies.append(parsed)
+    before_policy, after_policy = policies
+    if (
+        {key: value for key, value in before_policy.items() if key != "Statement"}
+        != {"Version": "2012-10-17"}
+        or {key: value for key, value in after_policy.items() if key != "Statement"}
+        != {"Version": "2012-10-17"}
+    ):
+        return errors + [
+            "ASG process-fencing IAM policies must retain the exact top-level schema"
+        ]
+
+    def split_asg_statement(
+        policy: dict[str, Any], label: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        statements = policy.get("Statement")
+        if not isinstance(statements, list) or not all(
+            isinstance(statement, dict) for statement in statements
+        ):
+            errors.append(
+                f"ASG process-fencing IAM {label} policy must contain statement objects"
+            )
+            return None, []
+        matches = [
+            statement
+            for statement in statements
+            if statement.get("Sid") == "ASGRefreshManage"
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"ASG process-fencing IAM {label} policy requires exactly one ASGRefreshManage statement"
+            )
+            return None, []
+        return matches[0], [
+            statement for statement in statements if statement is not matches[0]
+        ]
+
+    before_asg, before_rest = split_asg_statement(before_policy, "before")
+    after_asg, after_rest = split_asg_statement(after_policy, "after")
+    if before_rest != after_rest:
+        errors.append(
+            "ASG process-fencing IAM migration changed a non-ASGRefreshManage statement"
+        )
+    if before_asg is not None:
+        expected_before = {
+            "Sid": "ASGRefreshManage",
+            "Effect": "Allow",
+            "Action": list(ASG_PROCESS_FENCING_BEFORE_ACTIONS),
+            "Resource": EXPECTED_ASG_PROCESS_FENCING_RESOURCE,
+        }
+        if before_asg != expected_before:
+            errors.append(
+                "ASGRefreshManage before-statement does not match the reviewed baseline"
+            )
+        if after_asg != {
+            **expected_before,
+            "Action": list(ASG_PROCESS_FENCING_AFTER_ACTIONS),
+        }:
+            errors.append(
+                "ASGRefreshManage may add only SuspendProcesses and ResumeProcesses"
+            )
+    return errors
 
 
 EXPECTED_UDP_SOURCE_FENCE_COMPUTE_PREFIX = "module.nhp.module.compute"
@@ -1202,6 +1380,12 @@ def validate_dmz_boundary_noop(
         if not is_dmz_boundary_address(address):
             continue
         boundary_changes.append(raw)
+
+    process_fencing_errors = validate_asg_process_fencing_iam_migration(
+        boundary_changes
+    )
+    if process_fencing_errors is not None:
+        return errors + process_fencing_errors
 
     # The client-edge port migration is a second reviewed boundary shape,
     # independent of the source-fence replacement. Check it before the generic

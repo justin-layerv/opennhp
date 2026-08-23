@@ -2987,6 +2987,186 @@ class OpenEdgeFencedTopologyAcceptanceTests(unittest.TestCase):
         )
 
 
+class ASGProcessFencingIAMMigrationTests(unittest.TestCase):
+    ADDRESS = checker.EXPECTED_ASG_PROCESS_FENCING_ADDRESS
+    RESOURCE = checker.EXPECTED_ASG_PROCESS_FENCING_RESOURCE
+
+    def _policy(
+        self,
+        actions: tuple[str, ...],
+        *,
+        resource: str | None = None,
+        describe_action: str = "ec2:DescribeInstances",
+    ) -> str:
+        return json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "ContextLookups",
+                        "Effect": "Allow",
+                        "Action": [describe_action, "ssm:GetParameter"],
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "ASGRefreshManage",
+                        "Effect": "Allow",
+                        "Action": list(actions),
+                        "Resource": resource or self.RESOURCE,
+                    },
+                ],
+            },
+            sort_keys=True,
+        )
+
+    def _change(
+        self,
+        *,
+        after_actions: tuple[str, ...] = checker.ASG_PROCESS_FENCING_AFTER_ACTIONS,
+        before_resource: str | None = None,
+        after_resource: str | None = None,
+        after_describe: str = "ec2:DescribeInstances",
+    ) -> dict[str, Any]:
+        return {
+            "address": self.ADDRESS,
+            "mode": "managed",
+            "type": "aws_iam_role_policy",
+            "name": "context_lookups",
+            "change": {
+                "actions": ["update"],
+                "before": {
+                    **checker.EXPECTED_ASG_PROCESS_FENCING_ROW,
+                    "policy": self._policy(
+                        checker.ASG_PROCESS_FENCING_BEFORE_ACTIONS,
+                        resource=before_resource,
+                    ),
+                },
+                "after": {
+                    **checker.EXPECTED_ASG_PROCESS_FENCING_ROW,
+                    "policy": self._policy(
+                        after_actions,
+                        resource=after_resource,
+                        describe_action=after_describe,
+                    ),
+                },
+                "before_sensitive": {},
+                "after_sensitive": {},
+                "after_unknown": {},
+                "before_identity": checker.EXPECTED_ASG_PROCESS_FENCING_IDENTITY,
+                "after_identity": checker.EXPECTED_ASG_PROCESS_FENCING_IDENTITY,
+            },
+        }
+
+    def test_exact_process_fencing_actions_are_admitted(self) -> None:
+        for allow_udp_migration in (False, True):
+            with self.subTest(allow_udp_migration=allow_udp_migration):
+                self.assertEqual(
+                    checker.validate_dmz_boundary_noop(
+                        {"resource_changes": [self._change()]},
+                        allow_udp_source_fence_replacement=allow_udp_migration,
+                    ),
+                    [],
+                )
+
+    def test_action_mutations_are_refused(self) -> None:
+        for actions in (
+            checker.ASG_PROCESS_FENCING_BEFORE_ACTIONS,
+            checker.ASG_PROCESS_FENCING_AFTER_ACTIONS
+            + ("autoscaling:TerminateInstanceInAutoScalingGroup",),
+            (
+                "autoscaling:StartInstanceRefresh",
+                "autoscaling:SuspendProcesses",
+                "autoscaling:ResumeProcesses",
+            ),
+        ):
+            with self.subTest(actions=actions):
+                self.assertTrue(
+                    checker.validate_dmz_boundary_noop(
+                        {"resource_changes": [self._change(after_actions=actions)]}
+                    )
+                )
+
+    def test_resource_or_other_statement_mutation_is_refused(self) -> None:
+        for change in (
+            self._change(after_resource="*"),
+            self._change(before_resource="*", after_resource="*"),
+            self._change(after_describe="ec2:DescribeNetworkInterfaces"),
+        ):
+            with self.subTest(change=change):
+                self.assertTrue(
+                    checker.validate_dmz_boundary_noop(
+                        {"resource_changes": [change]}
+                    )
+                )
+
+    def test_row_shape_sensitivity_and_unknown_mutations_are_refused(self) -> None:
+        changed_row = self._change()
+        changed_row["change"]["after"]["role"] = "another-role"
+        missing_row_field = self._change()
+        del missing_row_field["change"]["before"]["id"]
+        extra_row_field = self._change()
+        extra_row_field["change"]["after"]["extra"] = "value"
+        changed_mask = self._change()
+        changed_mask["change"]["after_sensitive"] = {"policy": True}
+        matching_masks = self._change()
+        matching_masks["change"]["before_sensitive"] = {"policy": True}
+        matching_masks["change"]["after_sensitive"] = {"policy": True}
+        missing_mask = self._change()
+        del missing_mask["change"]["before_sensitive"]
+        unknown = self._change()
+        unknown["change"]["after_unknown"] = {"policy": True}
+        missing_unknown = self._change()
+        del missing_unknown["change"]["after_unknown"]
+        wrong_identities = self._change()
+        wrong_identities["change"]["before_identity"] = {
+            **checker.EXPECTED_ASG_PROCESS_FENCING_IDENTITY,
+            "role": "other-role",
+        }
+        wrong_identities["change"]["after_identity"] = {
+            **checker.EXPECTED_ASG_PROCESS_FENCING_IDENTITY,
+            "role": "other-role",
+        }
+        missing_identity = self._change()
+        del missing_identity["change"]["after_identity"]
+        extra_change_field = self._change()
+        extra_change_field["change"]["replace_paths"] = []
+        replaced = self._change()
+        replaced["change"]["actions"] = ["delete", "create"]
+        for change in (
+            changed_row,
+            missing_row_field,
+            extra_row_field,
+            changed_mask,
+            matching_masks,
+            missing_mask,
+            unknown,
+            missing_unknown,
+            wrong_identities,
+            missing_identity,
+            extra_change_field,
+            replaced,
+        ):
+            with self.subTest(change=change):
+                self.assertTrue(
+                    checker.validate_dmz_boundary_noop(
+                        {"resource_changes": [change]}
+                    )
+                )
+
+    def test_a_second_boundary_mutation_falls_back_to_generic_refusal(self) -> None:
+        other = {
+            "address": "module.nhp.module.relay[0].aws_lb.relay",
+            "mode": "managed",
+            "change": {"actions": ["update"], "before": {}, "after": {}},
+        }
+        errors = checker.validate_dmz_boundary_noop(
+            {"resource_changes": [self._change(), other]}
+        )
+        self.assertTrue(
+            any("refuses relay-DMZ boundary change" in error for error in errors)
+        )
+
+
 class OpenEdgeTransitionBoundaryTests(unittest.TestCase):
     """The fence-to-open swap is a third reviewed boundary shape.
 
