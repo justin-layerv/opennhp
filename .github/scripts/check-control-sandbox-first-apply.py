@@ -8,6 +8,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import ipaddress
 import json
 import re
 import sys
@@ -12804,7 +12805,8 @@ def _check_state_normalization_drift(
         for item in digest_drift:
             _check_digest_normalization(item, by_address, spec=_AUTHORITY_DIGEST_SPEC)
         _check_provider_reprojection_drift(
-            [item for item in drift if item.get("address") != _AUTHORITY_DIGEST_ADDRESS]
+            [item for item in drift if item.get("address") != _AUTHORITY_DIGEST_ADDRESS],
+            by_address,
         )
         if digest_drift:
             return "provider-reprojection-with-authority-digest"
@@ -12890,6 +12892,12 @@ _PROVIDER_REPROJECTION_ADDRESSES = frozenset(
         "module.control.aws_lb_target_group.hub[0]",
         "module.control.aws_security_group.hub_nlb[0]",
         "module.control.aws_ssm_parameter.hub_public_key[0]",
+        # AWS owns the S3 managed prefix list behind this gateway endpoint.
+        # When AWS expands it, the provider re-projects the computed
+        # ``cidr_blocks`` collection even though the endpoint itself remains an
+        # exact planned no-op. The dedicated validator below binds every other
+        # endpoint field and the full plan identity before admitting it.
+        HUB_WORKER_S3_ENDPOINT_ADDRESS,
     }
     # Every Authority alarm re-projects `ok_actions` and
     # `insufficient_data_actions` from absent to []. 106 of them applied with
@@ -13021,7 +13029,142 @@ def _require_hub_identity_seeding(
         )
 
 
-def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
+def _canonical_ipv4_cidr_set(value: Any, address: str, side: str) -> set[str]:
+    """Require a nonempty unique list of canonical IPv4 CIDR strings."""
+    if not isinstance(value, list) or not value or len(value) > 1_000:
+        raise ContractError(
+            f"{address} {side} cidr_blocks must be a non-empty bounded list"
+        )
+    if not all(isinstance(item, str) for item in value) or len(value) != len(set(value)):
+        raise ContractError(
+            f"{address} {side} cidr_blocks must contain unique strings"
+        )
+    for item in value:
+        try:
+            network = ipaddress.ip_network(item, strict=True)
+        except ValueError as exc:
+            raise ContractError(
+                f"{address} {side} cidr_blocks contains a non-canonical CIDR: {item!r}"
+            ) from exc
+        if network.version != 4 or str(network) != item:
+            raise ContractError(
+                f"{address} {side} cidr_blocks must contain canonical IPv4 CIDRs"
+            )
+    return set(value)
+
+
+def _require_hub_s3_cidr_projection(
+    item: dict[str, Any],
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Admit only AWS's computed expansion of the exact S3 prefix-list view."""
+    address = HUB_WORKER_S3_ENDPOINT_ADDRESS
+    expected_identity = {
+        "address": address,
+        "index": 0,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": "hub_s3",
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_vpc_endpoint",
+    }
+    if set(item) != {*expected_identity, "change"} or any(
+        item.get(field) != value for field, value in expected_identity.items()
+    ):
+        raise ContractError(f"{address} CIDR projection identity is not exact")
+
+    change = item.get("change")
+    if (
+        not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["update"]
+        or change.get("after_unknown") != {}
+    ):
+        raise ContractError(f"{address} CIDR projection envelope is not exact")
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError(f"{address} CIDR projection values must be objects")
+    changed_fields = {
+        field
+        for field in set(before) | set(after)
+        if field not in before
+        or field not in after
+        or not _json_equal(before[field], after[field])
+    }
+    if changed_fields != {"cidr_blocks"}:
+        raise ContractError(
+            f"{address} may re-project only cidr_blocks; "
+            f"changed_fields={sorted(changed_fields)}"
+        )
+
+    before_cidrs = _canonical_ipv4_cidr_set(
+        before.get("cidr_blocks"), address, "before"
+    )
+    after_cidrs = _canonical_ipv4_cidr_set(
+        after.get("cidr_blocks"), address, "after"
+    )
+    if not before_cidrs < after_cidrs:
+        # Deliberately do not infer that an AWS remove+add consolidation is
+        # benign. A shrink, replacement, or consolidation stops the deploy for
+        # a fresh review even though this computed field may legitimately move.
+        raise ContractError(
+            f"{address} cidr_blocks must be a strict AWS-managed prefix-list expansion"
+        )
+
+    expected_sensitive_keys = {
+        "cidr_blocks",
+        "dns_entry",
+        "dns_options",
+        "network_interface_ids",
+        "route_table_ids",
+        "security_group_ids",
+        "subnet_configuration",
+        "subnet_ids",
+        "tags",
+        "tags_all",
+    }
+    for side, cidrs in (("before", before_cidrs), ("after", after_cidrs)):
+        sensitive = change.get(f"{side}_sensitive")
+        if (
+            not isinstance(sensitive, dict)
+            or set(sensitive) != expected_sensitive_keys
+            or sensitive.get("cidr_blocks") != [False] * len(cidrs)
+            or sensitive.get("dns_entry") != []
+            or sensitive.get("dns_options")
+            != [{"private_dns_specified_domains": []}]
+            or sensitive.get("network_interface_ids") != []
+            # The Control VPC intentionally has exactly three isolated route
+            # tables. A topology change must update the endpoint/state contract
+            # under review rather than riding this computed-CIDR projection.
+            or sensitive.get("route_table_ids") != [False, False, False]
+            or sensitive.get("security_group_ids") != []
+            or sensitive.get("subnet_configuration") != []
+            or sensitive.get("subnet_ids") != []
+            or sensitive.get("tags") != {}
+            or sensitive.get("tags_all") != {}
+        ):
+            raise ContractError(
+                f"{address} {side}_sensitive CIDR projection mask is not exact"
+            )
+
+    planned = by_address.get(address, {}).get("change")
+    if (
+        not isinstance(planned, dict)
+        or planned.get("actions") != ["no-op"]
+        or not _json_equal(planned.get("before"), after)
+        or not _json_equal(planned.get("after"), after)
+    ):
+        raise ContractError(
+            f"{address} CIDR projection must match the exact planned no-op state"
+        )
+    _check_hub_s3_endpoint_policy(after, address)
+
+
+def _check_provider_reprojection_drift(
+    drift: list[dict[str, Any]],
+    by_address: dict[str, dict[str, Any]],
+) -> None:
     """Require every admitted re-projection to be a pure state normalization.
 
     The address allowlist alone would admit ANY change to those resources. This
@@ -13031,6 +13174,9 @@ def _check_provider_reprojection_drift(drift: list[dict[str, Any]]) -> None:
     """
     for item in drift:
         address = item.get("address")
+        if address == HUB_WORKER_S3_ENDPOINT_ADDRESS:
+            _require_hub_s3_cidr_projection(item, by_address)
+            continue
         change = item.get("change")
         before = change.get("before") if isinstance(change, dict) else None
         after = change.get("after") if isinstance(change, dict) else None

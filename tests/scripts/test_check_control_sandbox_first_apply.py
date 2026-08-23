@@ -4478,6 +4478,90 @@ def authority_digest_refresh_candidate(*, hub: bool = False) -> tuple[dict, dict
     return candidate, prior_state
 
 
+def hub_s3_cidr_projection_fixture() -> tuple[dict, dict]:
+    """Exact Terraform 1.14.3/AWS 6.55.0 S3 prefix-list projection."""
+    before_cidrs = [
+        "18.34.252.0/22",
+        "52.219.141.0/24",
+    ]
+    after_cidrs = [
+        *before_cidrs,
+        "3.5.100.0/22",
+        "3.5.104.0/21",
+    ]
+    after = {
+        "cidr_blocks": after_cidrs,
+        "policy": json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "HubPullLayers",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "s3:GetObject",
+                        "Resource": CHECKER.HUB_S3_LAYER_BUCKET_ARN,
+                    }
+                ],
+            }
+        ),
+        "prefix_list_id": "pl-7ba54012",
+        "route_table_ids": ["rtb-a", "rtb-b", "rtb-c"],
+        "service_name": f"com.amazonaws.{CHECKER.AWS_REGION}.s3",
+        "vpc_endpoint_type": "Gateway",
+        "vpc_id": "vpc-control",
+    }
+    before = {**copy.deepcopy(after), "cidr_blocks": before_cidrs}
+
+    def sensitive(count: int) -> dict:
+        return {
+            "cidr_blocks": [False] * count,
+            "dns_entry": [],
+            "dns_options": [{"private_dns_specified_domains": []}],
+            "network_interface_ids": [],
+            "route_table_ids": [False, False, False],
+            "security_group_ids": [],
+            "subnet_configuration": [],
+            "subnet_ids": [],
+            "tags": {},
+            "tags_all": {},
+        }
+
+    drift = {
+        "address": CHECKER.HUB_WORKER_S3_ENDPOINT_ADDRESS,
+        "index": 0,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": "hub_s3",
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_vpc_endpoint",
+        "change": {
+            "actions": ["update"],
+            "after": copy.deepcopy(after),
+            "after_sensitive": sensitive(len(after_cidrs)),
+            "after_unknown": {},
+            "before": before,
+            "before_sensitive": sensitive(len(before_cidrs)),
+        },
+    }
+    planned = {
+        "address": CHECKER.HUB_WORKER_S3_ENDPOINT_ADDRESS,
+        "index": 0,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": "hub_s3",
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_vpc_endpoint",
+        "change": {
+            "actions": ["no-op"],
+            "after": copy.deepcopy(after),
+            "after_unknown": {},
+            "before": copy.deepcopy(after),
+        },
+    }
+    return drift, planned
+
+
 def dual_digest_refresh_candidate() -> tuple[dict, dict]:
     candidate, prior_state = authority_digest_refresh_candidate()
     hub_candidate, _ = authority_digest_refresh_candidate(hub=True)
@@ -5640,7 +5724,7 @@ class PlanContractTests(unittest.TestCase):
                 },
             },
         ]
-        CHECKER._check_provider_reprojection_drift(drift)
+        CHECKER._check_provider_reprojection_drift(drift, {})
 
     def test_provider_reprojection_admits_inline_policy_readback(self) -> None:
         """`inline_policy` is a deprecated Optional+Computed read-back of the
@@ -5676,8 +5760,161 @@ class PlanContractTests(unittest.TestCase):
                         },
                     },
                 }
-            ]
+            ],
+            {},
         )
+
+    def test_provider_reprojection_admits_exact_hub_s3_cidr_expansion(self) -> None:
+        drift, planned = hub_s3_cidr_projection_fixture()
+
+        CHECKER._check_provider_reprojection_drift(
+            [drift],
+            {planned["address"]: planned},
+        )
+
+    def test_provider_reprojection_composes_live_four_entry_shape(self) -> None:
+        candidate, prior_state = authority_digest_refresh_candidate()
+        digest = copy.deepcopy(candidate["resource_drift"][0])
+        hub_drift, hub_planned = hub_s3_cidr_projection_fixture()
+        policy = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "ConnectorResourceControlDynamoDBDecrypt",
+                        "Effect": "Allow",
+                        "Action": ["kms:Decrypt"],
+                        "Resource": "arn:aws:kms:us-east-2:767397897469:key/control",
+                    }
+                ],
+            }
+        )
+        roles = []
+        for cell in ("cell0", "cell1"):
+            address = (
+                'module.control.aws_iam_role.authority_exec["'
+                f'layerv-nhp-sandbox-ca-creso-{cell}"]'
+            )
+            roles.append(
+                {
+                    "address": address,
+                    "change": {
+                        "before": {"inline_policy": []},
+                        "after": {
+                            "inline_policy": [
+                                {
+                                    "name": f"connector-authority-creso-{cell}",
+                                    "policy": policy,
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+        drift = [*roles, digest, hub_drift]
+        by_address = {
+            item["address"]: item
+            for item in CHECKER._reconstruct_refresh_only_changes(
+                prior_state,
+                [digest],
+            )
+        }
+        by_address[hub_planned["address"]] = hub_planned
+
+        for order in (drift, list(reversed(drift))):
+            with self.subTest(order=[item["address"] for item in order]):
+                self.assertEqual(
+                    CHECKER._check_state_normalization_drift(
+                        order,
+                        by_address,
+                        refresh_only=False,
+                    ),
+                    "provider-reprojection-with-authority-digest",
+                )
+                self.assertEqual(
+                    CHECKER._normalization_drift_sha256(order),
+                    CHECKER._normalization_drift_sha256(drift),
+                )
+
+    def test_provider_reprojection_rejects_hub_s3_cidr_mutations(self) -> None:
+        def corrupt_policy(item: dict, planned: dict) -> None:
+            for side in ("before", "after"):
+                item["change"][side]["policy"] = "{}"
+                planned["change"][side]["policy"] = "{}"
+
+        cases = {
+            "empty": lambda item, planned: item["change"]["after"].__setitem__(
+                "cidr_blocks", []
+            ),
+            "scalar": lambda item, planned: item["change"]["after"].__setitem__(
+                "cidr_blocks", "3.5.100.0/22"
+            ),
+            "shrink": lambda item, planned: item["change"].__setitem__(
+                "after",
+                {
+                    **item["change"]["after"],
+                    "cidr_blocks": ["18.34.252.0/22"],
+                },
+            ),
+            "replacement": lambda item, planned: item["change"]["after"].__setitem__(
+                "cidr_blocks", ["10.0.0.0/8", "18.34.252.0/22"]
+            ),
+            "duplicate": lambda item, planned: item["change"]["after"][
+                "cidr_blocks"
+            ].append(item["change"]["after"]["cidr_blocks"][0]),
+            "noncanonical": lambda item, planned: item["change"]["after"][
+                "cidr_blocks"
+            ].append("3.5.100.1/22"),
+            "IPv6": lambda item, planned: item["change"]["after"][
+                "cidr_blocks"
+            ].append("2001:db8::/32"),
+            "second field": lambda item, planned: item["change"]["after"].__setitem__(
+                "service_name", "com.amazonaws.us-east-2.ec2"
+            ),
+            "wrong action": lambda item, planned: item["change"].__setitem__(
+                "actions", ["delete", "create"]
+            ),
+            "wrong type": lambda item, planned: item.__setitem__(
+                "type", "aws_security_group"
+            ),
+            "sensitive CIDR": lambda item, planned: item["change"][
+                "after_sensitive"
+            ]["cidr_blocks"].__setitem__(0, True),
+            "short CIDR mask": lambda item, planned: item["change"][
+                "after_sensitive"
+            ]["cidr_blocks"].pop(),
+            "short route mask": lambda item, planned: item["change"][
+                "after_sensitive"
+            ]["route_table_ids"].pop(),
+            "missing sensitive key": lambda item, planned: item["change"][
+                "after_sensitive"
+            ].pop("tags_all"),
+            "planned update": lambda item, planned: planned["change"].__setitem__(
+                "actions", ["update"]
+            ),
+            "planned mismatch": lambda item, planned: planned["change"][
+                "after"
+            ].__setitem__("prefix_list_id", "pl-attacker"),
+            "invalid stable policy": corrupt_policy,
+        }
+        for label, mutate in cases.items():
+            drift, planned = hub_s3_cidr_projection_fixture()
+            mutate(drift, planned)
+            with (
+                self.subTest(label=label),
+                self.assertRaises(CHECKER.ContractError),
+            ):
+                CHECKER._check_provider_reprojection_drift(
+                    [drift],
+                    {planned["address"]: planned},
+                )
+
+        drift, _ = hub_s3_cidr_projection_fixture()
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "must match the exact planned no-op state",
+        ):
+            CHECKER._check_provider_reprojection_drift([drift], {})
 
     def test_provider_reprojection_rejects_malformed_inline_policy(self) -> None:
         """Shape is asserted even though content deliberately is not."""
@@ -5705,7 +5942,8 @@ class PlanContractTests(unittest.TestCase):
                                     "after": {"inline_policy": value},
                                 },
                             }
-                        ]
+                        ],
+                        {},
                     )
 
     def test_provider_reprojection_rejects_anything_but_normalization(self) -> None:
@@ -5754,7 +5992,7 @@ class PlanContractTests(unittest.TestCase):
         for label, item in cases.items():
             with self.subTest(label):
                 with self.assertRaises(CHECKER.ContractError):
-                    CHECKER._check_provider_reprojection_drift([item])
+                    CHECKER._check_provider_reprojection_drift([item], {})
 
     def test_exact_hub_digest_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = authority_digest_refresh_candidate(hub=True)
