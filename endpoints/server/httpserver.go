@@ -29,7 +29,6 @@ import (
 
 	"github.com/OpenNHP/opennhp/endpoints/server/health"
 	"github.com/OpenNHP/opennhp/nhp/common"
-	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 	"github.com/OpenNHP/opennhp/nhp/version"
@@ -37,14 +36,17 @@ import (
 )
 
 type HttpServer struct {
-	id            string
-	udpServer     *UdpServer
-	httpServer    *http.Server
-	ginEngine     *gin.Engine
-	listenAddr    *net.TCPAddr
+	id         string
+	udpServer  *UdpServer
+	httpServer *http.Server
+	ginEngine  *gin.Engine
+	listenAddr *net.TCPAddr
+	// tlsEnabled records the protocol of the listener actually launched by
+	// Start. It deliberately does not follow later httpConfig replacement while
+	// updateHttpConfig leaves an already-running listener in place.
+	tlsEnabled    bool
 	healthManager *health.Manager
 	knockManager  *health.Manager // includes AC peer check for knock-traffic readiness
-	httpForwarder *HttpKnockForwarder
 
 	// internalAuthSigner and internalAuthRequire together specify the
 	// internal-auth rollout state for rollout-gated /nhp/internal
@@ -158,12 +160,9 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	// - With CloudFront: trust origin-facing CIDRs → extract real client IP
 	// - Without CloudFront: trust nobody → use RemoteAddr (NLB-preserved source IP)
 	// This also fixes a pre-existing issue: Gin v1.11 trusts ALL proxies by default,
-	// allowing X-Forwarded-For spoofing for NHP knocks. ctx.ClientIP() is
-	// the source of req.SrcIp on the HTTP knock path (see line ~672/704);
-	// req.SrcIp lands in ACTokenEntry.KnockSrcIP, which PR-2b's validate
-	// endpoint cross-checks against the FRP login source IP — if this
-	// configuration regresses, the cross-check becomes attacker-controlled
-	// on both sides. Fail loudly here rather than swallowing the error.
+	// allowing X-Forwarded-For spoofing on plugin and internal HTTP routes.
+	// Those routes use ClientIP for source gates, audit attribution, and plugin
+	// authentication inputs, so fail loudly rather than trusting Gin's default.
 	if validCIDRs := parseTrustedCIDRs(os.Getenv("NHP_TRUSTED_PROXY_CIDRS")); len(validCIDRs) > 0 {
 		if err := hs.ginEngine.SetTrustedProxies(validCIDRs); err != nil {
 			return fmt.Errorf("failed to set trusted proxies: %w", err)
@@ -249,23 +248,9 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		hs.internalAuthEmit = us.metrics.IncrCounter
 	}
 
-	// Initialize HTTP knock forwarder for server-to-server forwarding.
-	// Requires storage backend (for AC assignment lookup). CloudMap is optional
-	// (used for health filtering of stale assignments if enabled).
-	if us.storage != nil {
-		var emitMetric MetricCounter
-		if us.metrics != nil {
-			emitMetric = us.metrics.IncrCounter
-		}
-		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort, emitMetric, hs.internalAuthSigner)
-		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d, cloudMap=%t, signed=%t)", us.localIp, listenPort, us.cloudMap != nil, hs.internalAuthSigner != nil)
-	}
-
-	// Wire both sides of cross-server hop attestation (issue #1127) — the
-	// forwarder signs outgoing hops and the receiver builds its trust anchor.
-	// Extracted so the wiring is unit-tested (TestInitForwardHopAttestation):
-	// a regression that dropped it would silently disable the security gate,
-	// surfacing only as permanently-flat ForwardHopAttest* metrics.
+	// Build the receiver trust anchor for legacy internal-HTTP hop attestation.
+	// The direct HTTP admission/forwarding sender is retired, but verifying an
+	// inbound envelope remains fail-closed during rollout overlap.
 	hs.initForwardHopAttestation(us)
 
 	hs.initRouter()
@@ -293,12 +278,14 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	}
 
 	hs.wg.Add(1)
+	hs.tlsEnabled = false
 	if hc.EnableTLS {
 		certFilePath := filepath.Join(ExeDirPath, hc.TLSCertFile)
 		keyFilePath := filepath.Join(ExeDirPath, hc.TLSKeyFile)
 		_, err1 := os.Stat(certFilePath)
 		_, err2 := os.Stat(keyFilePath)
 		if err1 == nil && err2 == nil {
+			hs.tlsEnabled = true
 			go func() {
 				defer hs.wg.Done()
 				log.Info("Listening https on %s", hs.listenAddr.String())
@@ -441,11 +428,6 @@ func (hs *HttpServer) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5500*time.Millisecond)
 	defer cancel() // Always cancel context to release resources
 	_ = hs.httpServer.Shutdown(ctx)
-
-	// Stop accepting new forwards and wait for in-flight ones to complete
-	if hs.httpForwarder != nil {
-		hs.httpForwarder.Stop()
-	}
 
 	hs.wg.Wait()
 	log.Info("==================================================")
@@ -790,6 +772,8 @@ func (hs *HttpServer) initRouter() {
 	//                   should expect both names.
 	nhpInternal := g.Group("/nhp/internal")
 	nhpInternal.POST("/knock", hs.handleInternalKnock)
+	nhpInternal.POST("/agent-sessions/close", hs.handleInternalAgentSessionClose)
+	nhpInternal.POST("/agent-sessions/close-exact", hs.handleInternalExactSessionClose)
 	nhpInternal.POST("/token/validate", hs.handleInternalTokenValidate)
 	nhpInternal.POST("/ac-revocations/sweep", hs.handleInternalACRevocationSweep)
 	nhpInternal.POST("/ac-revocations/sweep/:ac_id", hs.handleInternalACRevocationSweep)
@@ -1170,9 +1154,8 @@ func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
 // them, but an AC instance can disappear silently (ASG replace, NAT rebind,
 // EC2 shutdown without clean teardown) and the server has no inbound signal
 // to prune it. Including those dead connections in the broadcast wastes the
-// transaction timeout (~5s) per dead peer, draining the budget on peers
-// that will never ACK. Callers that drop every connection fall through to
-// the no-AC path and retry via the HTTP knock forwarder.
+// transaction timeout per dead peer. Callers that drop every connection handle
+// the resulting native no-AC outcome without invoking direct HTTP admission.
 func filterLiveACConns(conns []*ACConn, threshold time.Duration) (kept []*ACConn, dropped int) {
 	if len(conns) == 0 {
 		return nil, 0
@@ -1180,17 +1163,25 @@ func filterLiveACConns(conns []*ACConn, threshold time.Duration) (kept []*ACConn
 	cutoffNanos := time.Now().Add(-threshold).UnixNano()
 	kept = make([]*ACConn, 0, len(conns))
 	for _, c := range conns {
-		if c == nil || c.ConnData == nil || c.ConnData.IsClosed() {
-			dropped++
-			continue
-		}
-		if atomic.LoadInt64(&c.ConnData.LastLocalRecvTime) < cutoffNanos {
+		if !acConnTransportLiveAt(c, cutoffNanos) {
 			dropped++
 			continue
 		}
 		kept = append(kept, c)
 	}
 	return kept, dropped
+}
+
+func acConnTransportLiveAt(conn *ACConn, cutoffNanos int64) bool {
+	return conn != nil && conn.ConnData != nil && !conn.ConnData.IsClosed() &&
+		atomic.LoadInt64(&conn.ConnData.LastLocalRecvTime) >= cutoffNanos
+}
+
+// acConnAuthorityEligibleAt is the single live-serving predicate shared by
+// knock routing and critical AC health. Cloud authority additionally requires
+// the post-AAK ready bit; non-cloud topology retains transport-only behavior.
+func acConnAuthorityEligibleAt(conn *ACConn, cutoffNanos int64, authorityRequired bool) bool {
+	return acConnTransportLiveAt(conn, cutoffNanos) && conn.sessionControlReady(authorityRequired)
 }
 
 // staleACConnThreshold returns the effective staleness threshold for this
@@ -1241,6 +1232,22 @@ func (s *UdpServer) snapshotLiveACConns(acId string) (kept []*ACConn, droppedCou
 	if droppedCount > 0 {
 		s.metrics.AddCounterWithDims(MetricACConnStaleFiltered, float64(droppedCount), nil)
 	}
+	if s.sessionControlAuthorityRequired() {
+		authoritative := kept[:0]
+		authorityDropped := 0
+		for _, conn := range kept {
+			if !conn.sessionControlReady(true) {
+				authorityDropped++
+				continue
+			}
+			authoritative = append(authoritative, conn)
+		}
+		kept = authoritative
+		droppedCount += authorityDropped
+		if authorityDropped > 0 {
+			s.metrics.AddCounterWithDims(MetricACConnAuthorityNotReadyFiltered, float64(authorityDropped), nil)
+		}
+	}
 	return kept, droppedCount
 }
 
@@ -1256,346 +1263,22 @@ func (s *UdpServer) hasLiveACConn(acId string) bool {
 
 	cutoffNanos := time.Now().Add(-s.staleACConnThreshold()).UnixNano()
 	for _, c := range s.acConnectionMap[acId] {
-		if c == nil || c.ConnData == nil || c.ConnData.IsClosed() {
-			continue
-		}
-		if atomic.LoadInt64(&c.ConnData.LastLocalRecvTime) >= cutoffNanos {
+		if acConnAuthorityEligibleAt(c, cutoffNanos, s.sessionControlAuthorityRequired()) {
 			return true
 		}
 	}
 	return false
 }
 
-func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
-	hs.wg.Add(1)
-	defer hs.wg.Done()
-	s := hs.udpServer
-	srcIp := req.SrcIp
-
-	// req.Ctx is set by runPluginAuth and handleInternalKnock — every code
-	// path that reaches handleHttpOpenResource sets it. Fall back to
-	// context.Background() defensively rather than panicking on a future
-	// regression that forgets to populate the field.
-	ctx := req.Ctx
-	if ctx == nil {
-		log.Warning("httpserver-agent(%s#%s)[handleHttpOpenResource] req.Ctx unexpectedly nil; using Background()", req.UserId, req.DeviceId)
-		ctx = context.Background()
-	}
-
-	knkMsg := &common.AgentKnockMsg{
-		UserId:         req.UserId,
-		DeviceId:       req.DeviceId,
-		OrganizationId: req.OrganizationId,
-		AuthServiceId:  req.AuthServiceId,
-		ResourceId:     res.ResourceId,
-	}
-
-	if req.Command == "exit" {
-		knkMsg.HeaderType = core.NHP_EXT
-	}
-
-	ackMsg = &common.ServerKnockAckMsg{
-		AuthProviderToken: req.Token,
-		AgentAddr:         srcIp,
-		OpenTime:          res.OpenTime,
-	}
-
-	// Phase 0B: one bounded reason per FAILED knock, emitted once on return so
-	// every failure exit funnels through a single point ("" = success = no emit).
-	// KnockNoAC + the ErrServerACOpsFailed path stay for alarm continuity.
-	var knockFailReason KnockFailReason
-	defer func() {
-		// Structural backstop against silent under-counting (the failure mode
-		// hardest to notice): every error return must be attributed. If a FUTURE
-		// exit sets err but forgets to classify a reason, surface it as unknown
-		// rather than drop it — a rising unknown_all_ac_ops_failed bar is
-		// self-evident on the dashboard. Success paths return err==nil, so this
-		// never false-positives. (err is a named return, readable here.)
-		if knockFailReason == "" && err != nil {
-			knockFailReason = KnockFailUnknownAllACOpsFailed
-		}
-		if knockFailReason != "" {
-			s.recordKnockFailReason(knockFailReason)
-		}
-	}()
-
-	if len(res.Resources) == 0 {
-		// Defensive catalog guard: callers that reach the open path
-		// with no concrete AC destinations should fail before any
-		// connection or pinhole work. Internal-knock requests resolve
-		// storage-backed resources before this point, so this catches
-		// malformed catalog entries and non-internal call paths.
-		err = common.ErrResourceNotFound
-		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
-		ackMsg.ErrMsg = err.Error()
-		knockFailReason = KnockFailNoResources // Phase 0B (emitted on return)
-		return
-	}
-
-	// PART II: determine knock src ip address and resource dst ip addresses
-	srcAddr := &common.NetAddress{Ip: srcIp}
-
-	acDstIpMap := make(map[string][]*common.NetAddress)
-	for resName, info := range res.Resources {
-		addrs, exist := acDstIpMap[resName]
-		if exist {
-			addrs = append(addrs, info.Addr)
-			acDstIpMap[resName] = addrs
-		} else {
-			acDstIpMap[resName] = []*common.NetAddress{info.Addr}
-		}
-	}
-
-	// qurl-service#948: AZ-scoped knock AC fan-out. The per-resource loop below
-	// opens pinholes only on THIS server's locally-connected AC slice, but the
-	// qurl.site AC NLB can send the viewer's post-resolve GET to another AZ. Fan
-	// the knock out through the assignment row so one peer server per non-local AZ
-	// opens its local AC slice too. Origin knocks only: a forwarded knock carries
-	// Forwarded=true and is skipped, bounding depth to one hop. The defer makes
-	// every return path, including the no-local-AC failover's early return below,
-	// block until peer pinholes are open before we ack. The fan-out is
-	// coverage-only; the ack still comes from the local broadcast / failover.
-	if s.knockACFanoutEnabled() && !req.Forwarded && hs.httpForwarder != nil && s.storage != nil {
-		fanoutBase := context.WithoutCancel(ctx)
-		var fanoutWg sync.WaitGroup
-		fannedAcIds := make(map[string]bool, len(res.Resources))
-		for _, info := range res.Resources {
-			if info == nil || info.ACId == "" || fannedAcIds[info.ACId] {
-				continue
-			}
-			fannedAcIds[info.ACId] = true
-			fanoutWg.Add(1)
-			go func(acId string) {
-				defer fanoutWg.Done()
-				fctx, fcancel := context.WithTimeout(fanoutBase, DefaultForwardTimeout)
-				defer fcancel()
-				fwdReq, fwdRes := buildForwardedKnock(req, res)
-				accepted, ferr := hs.httpForwarder.FanoutHttpKnock(fctx, acId, fwdReq, fwdRes)
-				if ferr != nil {
-					log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[handleHttpOpenResource] knock fan-out skipped: %v", req.UserId, req.DeviceId, srcIp, acId, ferr)
-					return
-				}
-				log.Info("httpserver-agent(%s#%s@%s)-ac(%s)[handleHttpOpenResource] knock fan-out opened pinholes on %d peer server(s)", req.UserId, req.DeviceId, srcIp, acId, accepted)
-			}(info.ACId)
-		}
-		defer fanoutWg.Wait()
-	}
-
-	// PART III: request ac operation for each resource and block for response
-	var acWg sync.WaitGroup
-	var artMsgsMutex sync.Mutex
-	artMsgs := make(map[string]*common.ACOpsResultMsg)
-	ackMsg.ResourceHost = make(map[string]string)
-	ackMsg.ACTokens = make(map[string]string)
-	ackMsg.PreAccessActions = make(map[string]*common.PreAccessInfo)
-
-	knockHadNoAC := false
-	// Phase 0B: capture the no-local-AC failover forward so the terminal failure
-	// label can be derived from its 0A outcome. Single-resource for qURL;
-	// multi-resource keeps the last attempt and lets a forward outcome win over a
-	// sibling resource's local AC-op failure — a bounded dominant choice, adjacent
-	// to the multi-resource re-resolve limitation tracked in #2452.
-	forwardAttempted := false
-	var lastForwardOutcome ForwardOutcome
-	// Phase 0F: the acId a failed knock was for, so the server-side failure can
-	// be JOINED offline to the AC-side all-unconnected episode (0D) by acId +
-	// time — that join is what distinguishes "AC absent cell-wide" (AC was
-	// all-unconnected then) from "AC mis-routed" (AC was connected elsewhere).
-	// A single server cannot determine cell-wide reachability alone.
-	var lastKnockACID string
-
-	// openTime is loop-invariant — derived only from res.OpenTime and
-	// knkMsg.HeaderType, both fixed for this call. Hoisted out so the
-	// post-Wait PublishACKTokens call below has access to the same
-	// effective openTime without re-deriving it. See the UDP-knock
-	// twin in udpserver.go and knock_headertype_gate.go for the
-	// HeaderType-gate rationale (#1154).
-	openTime := res.OpenTime
-	if knkMsg.HeaderType == core.NHP_EXT {
-		openTime = 1 // timeout in 1 second
-	}
-
-	// logCtx is the per-knock agent-identity prefix shared by the re-knock
-	// retry's logs; loop-invariant, so build it once.
-	logCtx := fmt.Sprintf("httpserver-agent(%s#%s@%s)", knkMsg.UserId, knkMsg.DeviceId, srcIp)
-
-	for resName, addrs := range acDstIpMap {
-		resInfo := res.Resources[resName]
-		if resInfo == nil {
-			continue
-		}
-		acId := resInfo.ACId
-		lastKnockACID = acId // Phase 0F: for the offline AC-reachability join
-		connsCopy, droppedStale := s.snapshotLiveACConns(acId)
-		if droppedStale > 0 {
-			log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[handleHttpOpenResource] filtered %d stale/closed AC connection(s) (threshold=%v)",
-				knkMsg.UserId, knkMsg.DeviceId, srcIp, acId, droppedStale, s.staleACConnThreshold())
-		}
-		if len(connsCopy) == 0 {
-			// No local AC connection — try HTTP forwarding to an assigned
-			// server. The forwardHopFromContext guard is defensive: an
-			// onward forward would emit verifiedHop+1, so refuse to start
-			// one once the incoming hop is already at the ceiling (issue
-			// #1127) rather than emit a forward the next server will 403.
-			// A forward carries res.ResourceId as the resId the peer
-			// resolves by; an empty group id would 400 "missing aspId or
-			// resId" at the peer — the same silent failure this forward fix
-			// addresses, reintroduced from a malformed catalog entry. Don't
-			// burn a doomed forward: warn so a regression is observable
-			// (this path has no alarm yet, #2449) and fall through to the
-			// no-AC result, which counts KnockNoAC.
-			canForward := hs.httpForwarder != nil && !req.Forwarded && forwardHopFromContext(ctx) < maxForwardHops
-			if canForward && res.ResourceId == "" {
-				log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] skipping forward: resolved resource has empty ResourceId", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
-				canForward = false
-			}
-			if canForward {
-				fwdCtx, fwdCancel := context.WithTimeout(ctx, DefaultForwardTimeout)
-				// req from the /plugins/:aspid path carries only aspId; the
-				// resId lives in res. The internal-knock receiver resolves by
-				// (aspId, resId) and 400s "missing aspId or resId" on a bare
-				// req, so forward a copy that carries the identity. See
-				// buildForwardedKnock for the full rationale.
-				fwdReq, fwdRes := buildForwardedKnock(req, res)
-				fwdAck, fwdOutcome, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, fwdReq, fwdRes)
-				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
-				// Phase 0A: split the opaque KnockForwardFailure by cause. The
-				// KnockForwardSuccess/Failure counters below stay for alarm continuity.
-				s.recordKnockForwardOutcome(fwdOutcome)
-				forwardAttempted, lastForwardOutcome = true, fwdOutcome // Phase 0B
-				if fwdErr == nil && fwdAck != nil && fwdAck.ErrCode == common.ErrSuccess.ErrorCode() {
-					log.Info("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] knock forwarded successfully", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
-					s.metrics.IncrCounter(MetricKnockForwardSuccess)
-					// Complete on the single-resource qURL path. For a
-					// multi-resource group this returns the peer's whole-group
-					// ack and skips siblings servable locally; the re-resolve
-					// equivalence (AC placement, per-sub-resource OpenTime) is
-					// tracked in #2452. Newly reachable, not new control flow —
-					// the forward branch was dead (always 400'd) before this fix.
-					return fwdAck, nil
-				}
-				if fwdErr != nil {
-					log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] forward failed: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId, fwdErr)
-					s.metrics.IncrCounter(MetricKnockForwardFailure)
-				}
-			}
-
-			knockHadNoAC = true
-			log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] no ac connection is available", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
-			artMsg := &common.ACOpsResultMsg{}
-			err = common.ErrACConnectionNotFound
-			artMsg.ErrCode = common.ErrACConnectionNotFound.ErrorCode()
-			artMsg.ErrMsg = err.Error()
-			artMsgsMutex.Lock()
-			artMsgs[resName] = artMsg
-			artMsgsMutex.Unlock()
-			continue
-		}
-
-		acWg.Add(1)
-		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
-			defer acWg.Done()
-
-			// broadcastACOpenWithReknock wraps the broadcast with a single
-			// re-snapshot retry on the blue/green reassignment-window timeout
-			// (qurl-service#976); it still funnels through
-			// resolveProcessACOperationBroadcast, which lets handler-site
-			// integration tests inject a fake AC response — see
-			// httpserver_publish_acktokens_test.go. ctx is the request-scoped
-			// context, so the retry backoff aborts if the client disconnects.
-			// res carries qURL v2 revocation metadata (P4a) for the AOP; nil-safe.
-			artMsg, err := s.broadcastACOpenWithReknock(ctx, knkMsg, info.ACId, connsCopy, srcAddr, dstAddrs, openTime, res, logCtx)
-			artMsgsMutex.Lock()
-			artMsgs[name] = artMsg
-			if err == nil {
-				ackMsg.ResourceHost[name] = info.DestHost()
-				ackMsg.ACTokens[name] = artMsg.ACToken
-				ackMsg.PreAccessActions[name] = artMsg.PreAccessAction
-			}
-			artMsgsMutex.Unlock()
-		}(resName, resInfo, addrs)
-	}
-	acWg.Wait()
-
-	// PR-2a: persist AC-issued tokens AFTER acWg.Wait so PR-2b's
-	// /nhp/internal/token/validate reader doesn't race the AC
-	// goroutines still mutating ackMsg.ACTokens. See PublishACKTokens
-	// for the contract.
-	//
-	// ownerId is "" on the HTTP path: HTTP knocks authenticate via the
-	// qurl.link SPA (session-based) rather than the pubkey-bound agent
-	// registry, so there's no agentPeerLookup result to pull from.
-	// Downstream consumers of /nhp/internal/token/validate must treat
-	// an empty owner_id as "identity not resolved at this hop" and
-	// either fall back or reject per their own policy. Future: HTTP
-	// knock identity could flow from the qurl.link SPA's authenticated
-	// session into the knkMsg, then into this slot — tracked in #2149.
-	if publishErr := s.PublishACKTokens(ctx, knkMsg, ackMsg, srcIp, int(openTime), ""); publishErr != nil {
-		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, publishErr)
-		ackMsg.ErrCode = common.ErrServerTokenPersistFailed.ErrorCode()
-		ackMsg.ErrMsg = common.ErrServerTokenPersistFailed.Error()
-		knockFailReason = KnockFailTokenPublishFailed // Phase 0B (emitted on return)
-		return ackMsg, common.ErrServerTokenPersistFailed
-	}
-
-	// Increment once per knock request (not per resource) for alarm accuracy
-	if knockHadNoAC {
-		s.metrics.IncrCounter(MetricKnockNoAC)
-	}
-
-	var successCount int
-	for _, artMsg := range artMsgs {
-		if artMsg.ErrCode == common.ErrSuccess.ErrorCode() {
-			successCount++
-		}
-	}
-
-	if successCount == 0 {
-		// Collect specific error messages from each failed AC operation
-		// so callers (e.g., QURL plugin) can surface actionable diagnostics.
-		var details []string
-		for resName, artMsg := range artMsgs {
-			if artMsg.ErrMsg != "" {
-				details = append(details, fmt.Sprintf("%s: %s", resName, artMsg.ErrMsg))
-			}
-		}
-		// Phase 0B reason (emitted once on return via the deferred emit above).
-		// Phase 0F: fold the AC-reachability join key (reason, ac_id, local_no_ac,
-		// forward_outcome) INTO this single knock-failure log rather than a second
-		// per-failure line — pair it offline with the AC-side all-unconnected
-		// episode (0D) by acId+time to split "absent cell-wide" (Candidate F) from
-		// "mis-routed" (Candidates A/B/D/E). src_ip is the log prefix below.
-		// Phase 0E: server_asg names the color/ASG this qURL knock landed on, so a
-		// mis-route (knock reached a server whose cell can't admit it) is visible
-		// here on the failure path without any per-knock work on the success path.
-		// s (== hs.udpServer) is non-nil here: the broadcast path above already
-		// dereferenced it unguarded (snapshotLiveACConns, the AC-ops broadcast), so
-		// reaching this exit guarantees it. The guard is cheap belt-and-suspenders
-		// for a FUTURE refactor that might reach an error exit before those derefs
-		// — the 0B deferred emit is nil-safe for the same forward-looking reason —
-		// since ASGName takes a lock and would panic on a nil receiver.
-		serverASG := ""
-		if s != nil {
-			serverASG = s.ASGName()
-		}
-		knockFailReason = deriveKnockFailReason(artMsgs, forwardAttempted, lastForwardOutcome)
-		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] all AC operations failed: reason=%s ac_id=%s local_no_ac=%t forward_outcome=%s server_asg=%s details=%v",
-			knkMsg.UserId, knkMsg.DeviceId, srcIp, knockFailReason, lastKnockACID, knockHadNoAC, lastForwardOutcome, serverASG, details)
-		if len(details) > 0 {
-			err = fmt.Errorf("%w (%s)", common.ErrServerACOpsFailed, strings.Join(details, "; "))
-		} else {
-			err = common.ErrServerACOpsFailed
-		}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		ackMsg.ErrMsg = err.Error()
-		return
-	}
-
-	log.Info("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] succeed", knkMsg.UserId, knkMsg.DeviceId, srcIp)
-	ackMsg.ErrCode = common.ErrSuccess.ErrorCode()
-	ackMsg.ErrMsg = common.ErrSuccess.Error()
-
-	return ackMsg, nil
+func (hs *HttpServer) handleHttpOpenResource(_ *common.HttpKnockRequest, _ *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+	// HTTP application admission used to synthesize an AOP without an
+	// authenticated NHP-Agent public key. NHP 1.2 has one strict AOP identity
+	// contract, so this compatibility path is intentionally retired. HTTP packet
+	// relay remains available for a real authenticated NHP KNK/RKN envelope.
+	return &common.ServerKnockAckMsg{
+		ErrCode: common.ErrHTTPAccessOperationUnsupported.ErrorCode(),
+		ErrMsg:  common.ErrHTTPAccessOperationUnsupported.Error(),
+	}, common.ErrHTTPAccessOperationUnsupported
 }
 
 func (hs *HttpServer) NewHttpServerHelper() *plugins.HttpServerPluginHelper {
@@ -1608,9 +1291,10 @@ func (hs *HttpServer) NewHttpServerHelper() *plugins.HttpServerPluginHelper {
 
 	// ResolveResourceFunc mirrors the headless /nhp/internal/knock resolver:
 	// it routes (aspId, resId) through the server-owned catalog
-	// (resolveInternalKnockResource) so an HTTP plugin can open pinholes
-	// against catalog-authoritative routing instead of trusting routing it
-	// received in its own upstream response body (#2540).
+	// (resolveInternalKnockResource) so HTTP plugins consume
+	// catalog-authoritative resource metadata instead of trusting routing they
+	// received in an upstream response body (#2540). Direct HTTP admission is
+	// retired independently by AuthWithHttpCallbackFunc above.
 	//
 	// The lookup context is the lifecycle context (internalKnockResourceLookupContext),
 	// NOT the plugin's per-request context — same as the headless caller. The
@@ -1843,13 +1527,12 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	// (Source==SourceAPI) start the chain and carry no attestation. Only
 	// runs in cloud mode (device + Cloud Map present); legacy/local mode
 	// skips it entirely. See docs/design/INTERNAL_FORWARD_HOP_ATTESTATION.md.
-	verifiedHop := 0
 	// hopVerifyEcdh returns nil unless udpServer/device/fleetTrust are all set.
 	// Fetch the static ECDH once (also reused below). A constructed device
 	// always has a scheme-0 ECDH (core.NewDevice returns nil otherwise), so
 	// the nil branch is defensive — if it were ever nil, skip verification
 	// (legacy posture) rather than strict-reject every forward on
-	// errForwardHopECDHFailed. Both sender and receiver hardcode scheme 0.
+	// errForwardHopECDHFailed. Historical senders and this receiver use scheme 0.
 	if selfEcdh := hs.hopVerifyEcdh(); selfEcdh != nil {
 		// fwdReq.Source is bound into the MAC, so a verified attestation is
 		// pinned to the Source it was minted with (a flip is a MAC mismatch).
@@ -1878,7 +1561,6 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 			// origin (qurl-service) never attests, so an attestation carried
 			// with Source="api" can only come from a fleet member, and its
 			// hop is bounded by maxForwardHops like any other.
-			verifiedHop = fwdReq.Attestation.Hop
 			hs.emitForwardHop(MetricForwardHopAttestSuccess)
 		case errors.Is(hopErr, errForwardHopMissing) && fwdReq.Source == SourceAPI:
 			// Origin request: no attestation expected. Hop stays 0.
@@ -1913,33 +1595,10 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		}
 	}
 
-	// Decide whether to mark as forwarded based on the request source.
-	// API callers (e.g., qurl-service) set Source="api" so the receiving server
-	// can forward to the correct server if the AC isn't connected locally.
-	// Server-to-server forwards (empty Source) set Forwarded=true to prevent loops.
-	switch fwdReq.Source {
-	case SourceAPI:
-		// API-originated: allow forwarding to find the correct server.
-		// Phase 0E routing exposure (which color a qURL knock landed on, origin
-		// CloudMap today) is captured on the FAILURE path only — see server_asg in
-		// the terminal "all AC operations failed" log in handleHttpOpenResource —
-		// so no ASGName/AC-conn lock runs per knock on the success hot path, and
-		// the signal lands exactly where it matters (a mis-routed knock fails).
-	case "":
-		// Server-to-server: block re-forwarding (loop prevention)
-		fwdReq.Request.Forwarded = true
-	default:
-		log.Warning("handleInternalKnock: unexpected Source value %q, treating as server-to-server", fwdReq.Source)
-		fwdReq.Request.Forwarded = true
-	}
-	// Carry the verified hop down to handleHttpOpenResource → the
-	// forwarder, which emits verifiedHop+1 on any onward forward so the
-	// hop counter stays monotonic across the chain. Bound it with the
-	// knock-processing budget (see withKnockProcessingBudget) so the AC-open
-	// reknock retry short-circuits within that budget (5s, kept ≤ qurl-service's
-	// knock-client budget) on this path — ctx.Request.Context() carries no deadline
-	// of its own. defer cancel() is safe: handleHttpOpenResource runs synchronously below.
-	knockCtx, cancel := withKnockProcessingBudget(contextWithForwardHop(ctx.Request.Context(), verifiedHop))
+	// Preserve the bounded-processing context established by this authenticated
+	// pre-handler. The terminal is deliberately synchronous and fail-closed; it
+	// must not forward or dispatch an AC operation.
+	knockCtx, cancel := withKnockProcessingBudget(ctx.Request.Context())
 	defer cancel()
 	fwdReq.Request.Ctx = knockCtx
 

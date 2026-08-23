@@ -197,6 +197,7 @@ func TestResourceInfo_DestHost_PortSuffixWithZeroPort(t *testing.T) {
 // If a JSON tag is ever renamed on one side only, this catches it.
 func TestServerACOpsMsg_QurlV2Metadata_RoundTrip(t *testing.T) {
 	orig := &ServerACOpsMsg{
+		SessionId:        0x0123456789abcdef,
 		UserId:           "u",
 		AuthServiceId:    "asp",
 		ResourceId:       "res",
@@ -206,7 +207,7 @@ func TestServerACOpsMsg_QurlV2Metadata_RoundTrip(t *testing.T) {
 
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
-		SessionId:             "sess_123",
+		QurlSessionId:         "sess_123",
 		AdmissionId:           "adm_test123",
 		RevocationEpoch:       42,
 		Deadline:              1781910300,
@@ -224,11 +225,14 @@ func TestServerACOpsMsg_QurlV2Metadata_RoundTrip(t *testing.T) {
 	if got.QurlUserPublicKeyHash != orig.QurlUserPublicKeyHash {
 		t.Errorf("QurlUserPublicKeyHash = %q, want %q", got.QurlUserPublicKeyHash, orig.QurlUserPublicKeyHash)
 	}
+	if got.SessionId != orig.SessionId {
+		t.Errorf("NHP SessionId = %#x, want %#x", got.SessionId, orig.SessionId)
+	}
 	if got.ResourcePublicKeyHash != orig.ResourcePublicKeyHash {
 		t.Errorf("ResourcePublicKeyHash = %q, want %q", got.ResourcePublicKeyHash, orig.ResourcePublicKeyHash)
 	}
-	if got.SessionId != orig.SessionId {
-		t.Errorf("SessionId = %q, want %q", got.SessionId, orig.SessionId)
+	if got.QurlSessionId != orig.QurlSessionId {
+		t.Errorf("QurlSessionId = %q, want %q", got.QurlSessionId, orig.QurlSessionId)
 	}
 	if got.AdmissionId != orig.AdmissionId {
 		t.Errorf("AdmissionId = %q, want %q", got.AdmissionId, orig.AdmissionId)
@@ -328,7 +332,7 @@ func TestServerACOpsMsg_V2AOP_EmitsExpectedKeys(t *testing.T) {
 	v2 := &ServerACOpsMsg{
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
-		SessionId:             "sess_123",
+		QurlSessionId:         "sess_123",
 		AdmissionId:           "adm_test123",
 		RevocationEpoch:       42,
 		Deadline:              1781910300,
@@ -341,7 +345,7 @@ func TestServerACOpsMsg_V2AOP_EmitsExpectedKeys(t *testing.T) {
 	for _, key := range []string{
 		`"qurlUsrPubKeyHash":"a1b2c3"`,
 		`"resPubKeyHash":"d4e5f6"`,
-		`"sessId":"sess_123"`,
+		`"qurlSessId":"sess_123"`,
 		`"admId":"adm_test123"`,
 		`"revEpoch":42`,
 		`"deadline":1781910300`,
@@ -377,10 +381,11 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 		UserAddr:      "203.0.113.10:54321",
 		TransactionId: 1,
 		Timestamp:     1781910000,
+		SessionId:     0x0123456789abcdef,
 		AdmissionRevocationData: &ForwardAdmissionRevocationData{
 			QurlUserPublicKeyHash: "qhash",
 			ResourcePublicKeyHash: "rhash",
-			SessionId:             "sess-live",
+			QurlSessionId:         "sess-live",
 			AdmissionId:           "adm-123",
 			Deadline:              1781910300,
 		},
@@ -405,9 +410,10 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 	wire := string(v2Bytes)
 	for _, want := range []string{
 		`"admissionRevocationData":`,
+		`"sessId":81985529216486895`,
 		`"qurlUsrPubKeyHash":"qhash"`,
 		`"resPubKeyHash":"rhash"`,
-		`"sessId":"sess-live"`,
+		`"qurlSessId":"sess-live"`,
 		`"admId":"adm-123"`,
 		`"deadline":1781910300`,
 		`"resolvedResourceData":`,
@@ -423,6 +429,9 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 	var roundTrip ServerForwardMsg
 	if err := json.Unmarshal(v2Bytes, &roundTrip); err != nil {
 		t.Fatalf("unmarshal v2 forward: %v", err)
+	}
+	if roundTrip.SessionId != v2.SessionId {
+		t.Fatalf("forward NHP SessionId = %#x, want %#x", roundTrip.SessionId, v2.SessionId)
 	}
 	if roundTrip.AdmissionRevocationData == nil {
 		t.Fatalf("unmarshaled v2 forward lost admissionRevocationData: %+v", roundTrip)

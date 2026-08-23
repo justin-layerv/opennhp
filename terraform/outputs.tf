@@ -142,6 +142,11 @@ output "dynamodb_ack_tokens_table_name" {
   value       = module.dynamodb.ack_tokens_table_name
 }
 
+output "dynamodb_session_control_table_name" {
+  description = "DynamoDB table name for durable NHP session-control authority"
+  value       = module.dynamodb.session_control_table_name
+}
+
 # DynamoDB Tables - ARNs (for cross-stack references, monitoring, backups)
 output "dynamodb_licenses_table_arn" {
   description = "DynamoDB table ARN for licenses"
@@ -161,6 +166,11 @@ output "dynamodb_resources_table_arn" {
 output "dynamodb_ack_tokens_table_arn" {
   description = "DynamoDB table ARN for ACK token metadata"
   value       = module.dynamodb.ack_tokens_table_arn
+}
+
+output "dynamodb_session_control_table_arn" {
+  description = "DynamoDB table ARN for durable NHP session-control authority"
+  value       = module.dynamodb.session_control_table_arn
 }
 
 output "dynamodb_qurl_customers_table_name" {

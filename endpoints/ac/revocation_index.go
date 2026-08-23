@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	utilebpf "github.com/OpenNHP/opennhp/nhp/utils/ebpf"
 )
@@ -126,8 +127,8 @@ func scopeKeysForEntry(entry *AccessEntry) []indexKey {
 	if entry.ResourcePublicKeyHash != "" {
 		keys = append(keys, indexKey{scopeResource, entry.ResourcePublicKeyHash})
 	}
-	if entry.SessionId != "" {
-		keys = append(keys, indexKey{scopeSession, entry.SessionId})
+	if entry.QurlSessionId != "" {
+		keys = append(keys, indexKey{scopeSession, entry.QurlSessionId})
 	}
 	if entry.AdmissionId != "" {
 		keys = append(keys, indexKey{scopeAdmission, entry.AdmissionId})
@@ -549,6 +550,108 @@ func (a *UdpAC) ApplyRevocation(scope revocationScope, scopeKey string, epoch ui
 func (a *UdpAC) deleteThenFlushEntry(token string, entry *AccessEntry) {
 	a.deleteToken(token, entry)
 	a.flushEntryNow(entry)
+}
+
+// CloseNHPSession tears down every live AccessEntry carrying the exact
+// authenticated AOP server identity plus sessionID. The token snapshot is
+// taken from the dedicated base-session index, then each entry follows the
+// same delete-before-flush ordering as immediate revocation. Missing sessions
+// are an idempotent success.
+func (a *UdpAC) CloseNHPSession(serverPublicKey, sessionOwnerID string, sessionID uint64) int {
+	if a == nil || a.nhpSessions == nil || a.tokenStore == nil || serverPublicKey == "" || !common.ValidNHPSessionOwnerID(sessionOwnerID) || sessionID == 0 {
+		return 0
+	}
+	closed := 0
+	for _, token := range a.nhpSessions.tokens(serverPublicKey, sessionOwnerID, sessionID) {
+		entry, ok := a.tokenStore.Load(token)
+		if !ok || entry == nil || entry.NHPSessionId != sessionID || entry.NHPServerPublicKey != serverPublicKey || entry.NHPSessionOwnerId != sessionOwnerID {
+			continue
+		}
+		a.deleteThenFlushEntry(token, entry)
+		closed++
+	}
+	return closed
+}
+
+// CloseNHPExactSession tears down one logical NHP session independent of the
+// fleet server process that originally opened it. The issuance timestamp keeps
+// a later reuse of the same random uint64 distinct.
+func (a *UdpAC) CloseNHPExactSession(agentPublicKey string, sessionID uint64, issuedAtMillis int64) int {
+	if a == nil || a.nhpSessions == nil || a.tokenStore == nil ||
+		!common.ValidNHPAgentPublicKey(agentPublicKey) || sessionID == 0 || issuedAtMillis <= 0 {
+		return 0
+	}
+	closed := 0
+	for _, token := range a.nhpSessions.exactTokens(agentPublicKey, sessionID, issuedAtMillis) {
+		entry, ok := a.tokenStore.Load(token)
+		if !ok || entry == nil || entry.NHPAgentPublicKey != agentPublicKey ||
+			entry.NHPSessionId != sessionID || entry.NHPSessionIssuedAtMillis != issuedAtMillis {
+			continue
+		}
+		a.deleteThenFlushEntry(token, entry)
+		closed++
+	}
+	return closed
+}
+
+// CloseNHPAgentSessionsThrough closes every session for an authenticated agent
+// issued at or before the EXT cutoff. Sessions issued after the cutoff are a
+// fresh post-EXT cycle and survive.
+func (a *UdpAC) CloseNHPAgentSessionsThrough(agentPublicKey string, issuedThroughMillis int64) int {
+	if a == nil || a.nhpSessions == nil || a.tokenStore == nil ||
+		!common.ValidNHPAgentPublicKey(agentPublicKey) || issuedThroughMillis <= 0 {
+		return 0
+	}
+	closed := 0
+	for _, token := range a.nhpSessions.agentTokens(agentPublicKey) {
+		entry, ok := a.tokenStore.Load(token)
+		if !ok || entry == nil || entry.NHPAgentPublicKey != agentPublicKey ||
+			entry.NHPSessionIssuedAtMillis <= 0 || entry.NHPSessionIssuedAtMillis > issuedThroughMillis {
+			continue
+		}
+		a.deleteThenFlushEntry(token, entry)
+		closed++
+	}
+	return closed
+}
+
+// CloseNHPRunBeforeAttempt closes admissions from older attempts of one RunID.
+// Fresh RunIDs are separate index keys, so make-before-break siblings survive.
+func (a *UdpAC) CloseNHPRunBeforeAttempt(agentPublicKey, runID string, attempt uint64) int {
+	if a == nil || a.nhpSessions == nil || a.tokenStore == nil || attempt == 0 ||
+		!common.ValidNHPAgentPublicKey(agentPublicKey) || common.ValidateAgentKnockRunID(runID) != nil {
+		return 0
+	}
+	closed := 0
+	for _, token := range a.nhpSessions.runTokens(agentPublicKey, runID) {
+		entry, ok := a.tokenStore.Load(token)
+		if !ok || entry == nil || entry.NHPAgentPublicKey != agentPublicKey ||
+			entry.NHPRunID != runID || entry.NHPRunAttempt == 0 || entry.NHPRunAttempt >= attempt {
+			continue
+		}
+		a.deleteThenFlushEntry(token, entry)
+		closed++
+	}
+	return closed
+}
+
+// CloseAllNHPSessions is the AC fail-closed lease/boot-flush primitive. It is
+// intentionally scoped to entries admitted by NHP and leaves unrelated local
+// access-controller state alone.
+func (a *UdpAC) CloseAllNHPSessions() int {
+	if a == nil || a.nhpSessions == nil || a.tokenStore == nil {
+		return 0
+	}
+	closed := 0
+	for _, token := range a.nhpSessions.allTokens() {
+		entry, ok := a.tokenStore.Load(token)
+		if !ok || entry == nil || entry.NHPSessionId == 0 {
+			continue
+		}
+		a.deleteThenFlushEntry(token, entry)
+		closed++
+	}
+	return closed
 }
 
 // flushEntryNow forces every FlowKey the entry has scheduled to fire its flush

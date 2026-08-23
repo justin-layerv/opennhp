@@ -233,6 +233,19 @@ FilterMode = 1
 		if err := ac.loadBaseConfig(); err != nil {
 			t.Fatalf("loadBaseConfig: %v", err)
 		}
+		// loadBaseConfig starts a process-global file watcher. Close the exact
+		// watcher created by this table row before the next row overwrites the
+		// global handle; otherwise prior temp-directory watchers survive into
+		// later rows and package-level race runs become order-sensitive.
+		watch := baseConfigWatch
+		if watch != nil {
+			if err := watch.Close(); err != nil {
+				t.Fatalf("close base config watcher: %v", err)
+			}
+			if baseConfigWatch == watch {
+				baseConfigWatch = nil
+			}
+		}
 		return ac.config
 	}
 
@@ -347,9 +360,8 @@ func TestLoadPeers_MalformedTOML(t *testing.T) {
 // safety branch in updateBaseConfig's `a.config == nil` (first-load)
 // path. A fresh boot that already has EnableL3FlushOnExpiry=true with
 // L3FlushDryRun=false (the most-dangerous case the safety exists for)
-// must land in dry-run mode regardless of the TOML setting; the
-// operator has to reload with the same explicit false to enter
-// real-flush mode.
+// must land in dry-run mode unless the distinct durable acknowledgement is
+// present; an explicit false alone cannot be distinguished from omission.
 //
 // Regression fence for cr task #48 first-load gap (the previous
 // implementation only guarded the reload path).
@@ -368,6 +380,23 @@ func TestL3FlushDryRunSafety_FirstLoad_ForcesDryRun(t *testing.T) {
 	}
 	if !ac.config.EnableL3FlushOnExpiry {
 		t.Errorf("EnableL3FlushOnExpiry should still be true; got false")
+	}
+}
+
+func TestL3FlushDryRunSafety_FirstLoad_RespectsDurableRealModeAcknowledgement(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	conf := Config{
+		EnableL3FlushOnExpiry:       true,
+		L3FlushDryRun:               false,
+		L3FlushRealModeAcknowledged: true,
+	}
+	if err := ac.updateBaseConfig(conf); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ac.config.L3FlushDryRun || !ac.config.L3FlushRealModeAcknowledged {
+		t.Fatalf("durably acknowledged first load = dryRun:%t acknowledged:%t, want false/true",
+			ac.config.L3FlushDryRun, ac.config.L3FlushRealModeAcknowledged)
 	}
 }
 
@@ -417,6 +446,22 @@ func TestL3FlushDryRunSafety_Reload_ForcesDryRunOnFalseToTrueEdge(t *testing.T) 
 	}
 	if !ac.config.L3FlushDryRun {
 		t.Errorf("reload safety should have forced L3FlushDryRun=true on false→true edge; got false")
+	}
+}
+
+func TestL3FlushDryRunSafety_Reload_RespectsDurableRealModeAcknowledgement(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: false}); err != nil {
+		t.Fatalf("first load: unexpected error: %v", err)
+	}
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: true, L3FlushDryRun: false,
+		L3FlushRealModeAcknowledged: true}); err != nil {
+		t.Fatalf("reload: unexpected error: %v", err)
+	}
+	if ac.config.L3FlushDryRun || !ac.config.L3FlushRealModeAcknowledged {
+		t.Fatalf("durably acknowledged reload = dryRun:%t acknowledged:%t, want false/true",
+			ac.config.L3FlushDryRun, ac.config.L3FlushRealModeAcknowledged)
 	}
 }
 

@@ -426,6 +426,9 @@ AgentKeysTable = "${dynamodb_agent_keys_table}"
 %{ if dynamodb_ack_tokens_table != null ~}
 AckTokensTable = "${dynamodb_ack_tokens_table}"
 %{ endif ~}
+%{ if dynamodb_session_control_table != null ~}
+SessionControlTable = "${dynamodb_session_control_table}"
+%{ endif ~}
 %{ endif ~}
 
 %{ if storage_backend == "etcd" && etcd_endpoint != "" ~}

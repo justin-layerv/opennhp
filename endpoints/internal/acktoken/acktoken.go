@@ -36,8 +36,9 @@ const ttlGraceSeconds int64 = 60
 // that earned the pinhole.
 //
 // RunID is the agent's authenticated knock/Login-cycle identifier. Registered-
-// agent native UDP knocks populate it from the KNK application body; intentional
-// legacy and HTTP ACK paths that carry no RunID write the empty string.
+// agent native UDP knocks populate it from the KNK application body. Generic
+// and HTTP bookkeeping entries may store an empty string, but those entries do
+// not satisfy the signed positive token-validation contract.
 //
 // User is *common.AgentUser and is legitimately nil during the ACK-path
 // window before the agent identity is captured. Readers (the validate
@@ -49,13 +50,23 @@ const ttlGraceSeconds int64 = 60
 // A future caller that writes to a stored entry must either swap a fresh
 // entry in via Store or guard the entry with a mutex.
 type ACTokenEntry struct {
-	User       *common.AgentUser
+	User *common.AgentUser
+	// ResourceId is the ACK token map/catalog key used by the AC path.
 	ResourceId string
-	ACTokens   map[string]string
-	KnockSrcIP string
-	RunID      string
-	OpenTime   int
-	ExpireTime time.Time
+	// ProtectedResourceId is the authenticated public resource subject the
+	// session may serve. It is distinct from the catalog key above.
+	ProtectedResourceId string
+	ACTokens            map[string]string
+	KnockSrcIP          string
+	RunID               string
+	SessionId           uint64
+	OpenTime            int
+	// SessionExpireTime is the AC authorization deadline (issuance +
+	// OpenTime). ExpireTime is deliberately later because it includes the
+	// late-packet token-resolution buffer; consumers must fence serving with
+	// SessionExpireTime instead.
+	SessionExpireTime time.Time
+	ExpireTime        time.Time
 }
 
 // GetExpireTime implements common.TokenEntry. It lives in this package
@@ -74,31 +85,39 @@ var _ common.TokenEntry = (*ACTokenEntry)(nil)
 // PersistedItem is the DynamoDB persistence shape for an ACTokenEntry,
 // keyed by HashToken(token) so the raw token never lands in the table.
 type PersistedItem struct {
-	TokenHash      string `dynamodbav:"token_hash"`
-	ResourceID     string `dynamodbav:"resource_id,omitempty"`
-	UserPresent    bool   `dynamodbav:"user_present,omitempty"`
-	UserID         string `dynamodbav:"user_id,omitempty"`
-	DeviceID       string `dynamodbav:"device_id,omitempty"`
-	OrganizationID string `dynamodbav:"organization_id,omitempty"`
-	AuthServiceID  string `dynamodbav:"auth_service_id,omitempty"`
-	OwnerID        string `dynamodbav:"owner_id,omitempty"`
-	KnockSrcIP     string `dynamodbav:"knock_src_ip,omitempty"`
-	RunID          string `dynamodbav:"run_id,omitempty"`
-	OpenTime       int64  `dynamodbav:"open_time,omitempty"`
-	ExpiresAtNanos int64  `dynamodbav:"expires_at_nanos"`
-	TTL            int64  `dynamodbav:"ttl"`
+	TokenHash             string `dynamodbav:"token_hash"`
+	ResourceID            string `dynamodbav:"resource_id,omitempty"`
+	ProtectedResourceID   string `dynamodbav:"protected_resource_id,omitempty"`
+	UserPresent           bool   `dynamodbav:"user_present,omitempty"`
+	UserID                string `dynamodbav:"user_id,omitempty"`
+	DeviceID              string `dynamodbav:"device_id,omitempty"`
+	OrganizationID        string `dynamodbav:"organization_id,omitempty"`
+	AuthServiceID         string `dynamodbav:"auth_service_id,omitempty"`
+	OwnerID               string `dynamodbav:"owner_id,omitempty"`
+	KnockSrcIP            string `dynamodbav:"knock_src_ip,omitempty"`
+	RunID                 string `dynamodbav:"run_id,omitempty"`
+	SessionID             uint64 `dynamodbav:"session_id,omitempty"`
+	OpenTime              int64  `dynamodbav:"open_time,omitempty"`
+	SessionExpiresAtNanos int64  `dynamodbav:"session_expires_at_nanos,omitempty"`
+	ExpiresAtNanos        int64  `dynamodbav:"expires_at_nanos"`
+	TTL                   int64  `dynamodbav:"ttl"`
 }
 
 // ItemFromEntry marshals an entry into its persisted shape under token.
 func ItemFromEntry(token string, entry *ACTokenEntry) PersistedItem {
 	item := PersistedItem{
-		TokenHash:      HashToken(token),
-		ResourceID:     entry.ResourceId,
-		KnockSrcIP:     entry.KnockSrcIP,
-		RunID:          entry.RunID,
-		OpenTime:       int64(entry.OpenTime),
-		ExpiresAtNanos: entry.ExpireTime.UTC().UnixNano(),
-		TTL:            entry.ExpireTime.UTC().Unix() + ttlGraceSeconds,
+		TokenHash:           HashToken(token),
+		ResourceID:          entry.ResourceId,
+		ProtectedResourceID: entry.ProtectedResourceId,
+		KnockSrcIP:          entry.KnockSrcIP,
+		RunID:               entry.RunID,
+		SessionID:           entry.SessionId,
+		OpenTime:            int64(entry.OpenTime),
+		ExpiresAtNanos:      entry.ExpireTime.UTC().UnixNano(),
+		TTL:                 entry.ExpireTime.UTC().Unix() + ttlGraceSeconds,
+	}
+	if !entry.SessionExpireTime.IsZero() {
+		item.SessionExpiresAtNanos = entry.SessionExpireTime.UTC().UnixNano()
 	}
 	if entry.User != nil {
 		item.UserPresent = true
@@ -124,9 +143,10 @@ func EntryFromItem(item PersistedItem) *ACTokenEntry {
 			OwnerId:        item.OwnerID,
 		}
 	}
-	return &ACTokenEntry{
-		User:       user,
-		ResourceId: item.ResourceID,
+	entry := &ACTokenEntry{
+		User:                user,
+		ResourceId:          item.ResourceID,
+		ProtectedResourceId: item.ProtectedResourceID,
 		// ACTokens is intentionally not persisted in the shared store.
 		// /nhp/internal/token/validate does not read it, and validate-path
 		// readers must not depend on local-vs-shared entries carrying
@@ -134,9 +154,14 @@ func EntryFromItem(item PersistedItem) *ACTokenEntry {
 		ACTokens:   map[string]string{},
 		KnockSrcIP: item.KnockSrcIP,
 		RunID:      item.RunID,
+		SessionId:  item.SessionID,
 		OpenTime:   int(item.OpenTime),
 		ExpireTime: time.Unix(0, item.ExpiresAtNanos).UTC(),
 	}
+	if item.SessionExpiresAtNanos != 0 {
+		entry.SessionExpireTime = time.Unix(0, item.SessionExpiresAtNanos).UTC()
+	}
+	return entry
 }
 
 // HashToken returns the hex SHA-256 of token — the DynamoDB partition key,

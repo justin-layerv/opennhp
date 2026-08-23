@@ -365,7 +365,7 @@ func refreshV2Admission(req *common.NhpAuthRequest, helper *plugins.NhpServerPlu
 //     qurl_id on the refresh response, so the pinhole ResourceGroup is keyed by the
 //     AC's ac_id. (The qURL/resource identity that matters for revocation rides the
 //     hashes below, not this group id.)
-//   - SessionId is set from the authorize response (the first slice where a
+//   - QurlSessionId is set from the authorize response (the first slice where a
 //     session id exists); AdmissionId is empty (authorize records no new admission).
 //   - There is no RedirectUrl (re-knocks do not re-navigate).
 //
@@ -396,7 +396,7 @@ func buildV2RefreshResourceData(resp *AdmissionAuthorizeResponse, claims *qurlv2
 		// (no new admission decision on a refresh).
 		QurlUserPublicKeyHash: qurlUserKeyHash,
 		ResourcePublicKeyHash: resourceKeyHash,
-		SessionId:             resp.SessionID,
+		QurlSessionId:         resp.SessionID,
 		Deadline:              deadline,
 	}
 }

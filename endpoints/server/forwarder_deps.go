@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -107,8 +108,8 @@ type ForwarderDeps interface {
 	// receiver routes its single-resource ackMsg through this chokepoint
 	// after a successful broadcast so the empty-token guard, the
 	// maps.Clone isolation, and any future metrics/logging applied in
-	// PublishACKTokens reach the forward path identically to the local
-	// UDP/HTTP knock paths.
+	// PublishACKTokens reach the forward path identically to the native UDP
+	// knock path.
 	//
 	// ownerId is the server-resolved tenant identity from the pubkey-
 	// bound agent registry lookup; pass "" on paths without pubkey-
@@ -140,3 +141,13 @@ type ForwarderDeps interface {
 
 // Compile-time check that UdpServer implements ForwarderDeps.
 var _ ForwarderDeps = (*UdpServer)(nil)
+
+// forwardedNHPSessionDeps is the fail-closed session-reservation seam used by
+// authenticated NHP_FWD receivers. It stays separate from ForwarderDeps so
+// transport-only test doubles need not implement session state they never use.
+type forwardedNHPSessionDeps interface {
+	VerifyForwardedDurableNHPSession(context.Context, *common.AgentKnockMsg) (common.AgentSessionReceipt, error)
+	ReserveForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt, expiresAt time.Time) error
+	ReleaseForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt time.Time)
+	CompensateForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt time.Time) bool
+}

@@ -6,17 +6,8 @@ import (
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
-	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
-
-// reknockRetryTransactionTimeout is one server→AC AOP transaction timeout as a
-// Duration: both the worst-case cost of the single reknock retry and the deadline
-// margin below which broadcastACOpenWithReknock skips that retry (it could not
-// finish before the caller's HttpKnockProcessingBudget deadline). It tracks the
-// AC-open-specific ServerACOpenTransactionResponseTimeoutMs (1.5s) — NOT the shared
-// ServerLocalTransactionResponseTimeoutMs, which the DB/forward paths keep at 4.7s.
-const reknockRetryTransactionTimeout = time.Duration(core.ServerACOpenTransactionResponseTimeoutMs) * time.Millisecond
 
 // broadcastACOpenWithReknock runs the NHP-AOP "open" broadcast for one resource
 // and, when the broadcast's aggregate result is the transaction-timeout signature
@@ -73,12 +64,9 @@ const reknockRetryTransactionTimeout = time.Duration(core.ServerACOpenTransactio
 //     the client re-knocks and the AC's pinhole write was idempotent.
 //   - The AC open is idempotent (ipset add -exist / eBPF upsert), so a resend
 //     reaching an AC that already applied the rule is a no-op.
-//   - Exactly one retry after a short backoff bounds the added latency
-//     (defaultReknockRetryBackoff + one transaction timeout ≈ 1.3s; whole AC-open ≈
-//     3.3s worst case) and keeps the whole knock well within the knock-client budget
-//     (see defaultReknockRetryBackoff for the arithmetic). The single retry is a HARD
-//     ceiling, not a starting point: a SECOND retry would risk blowing that budget —
-//     do not turn this into a loop.
+//   - Exactly one retry after a short backoff bounds the added latency. The
+//     single retry is a HARD ceiling, not a starting point; do not turn this
+//     into a loop.
 //
 // Operational notes (bounded, not bugs):
 //   - "Timeout" here is ANY transaction timeout, not necessarily a reassignment.
@@ -87,31 +75,12 @@ const reknockRetryTransactionTimeout = time.Duration(core.ServerACOpenTransactio
 //     single-retry ceiling + idempotency bound the blast radius; watch the
 //     KnockReknockRetry vs KnockReknockRetrySuccess ratio: a degrading ratio driven
 //     by AC overload rather than a migration is the signal to act on.
-//   - On the HTTP path the retry is ALSO gated by the caller's deadline
-//     (HttpKnockProcessingBudget): if less than one transaction timeout of budget
-//     remains it is skipped (KnockReknockDeadlineSkipped) instead of held, so a
-//     broad flip does not pile up per-resource goroutines each waiting ~one
-//     transaction timeout for a caller that has already given up. The UDP path
-//     carries no deadline, so there the single-retry ceiling is the only bound.
-//   - The two forward RECEIVER paths differ deliberately. The HTTP internal-knock
-//     receiver (handleHttpOpenResource) DOES wrap its AC-open in this retry, because
-//     qurl-service is still waiting its 7s knock timeout there. The UDP
-//     server-to-server receiver (HandleForwardRequest) does NOT — see the rationale at
-//     its call site (forward.go): its caller is a forwarding server bounded by the 2s
-//     ForwardTimeout (forward.go:40 — NOT msghandler's unrelated 10s
-//     DefaultForwardTimeout), which has already given up before a ~3.3s reknock could
-//     return, so there is no in-flight forwarded
-//     transaction left to rescue and wrapping would only burn a held goroutine per
-//     forwarded timeout during the broad-flip window. Both forward paths recover a
-//     genuinely lost open via the client's next re-knock against the settled topology
-//     (the first AOP was idempotent).
 //
-// Used by BOTH knock paths: the UDP handleNhpOpenResource (the qURL v1/v2 browser
-// and SDK knock path, which passes the server lifecycle context so a pending retry
-// abandons on shutdown) and the HTTP handleHttpOpenResource (qurl-service's
-// internal knock, which passes the request context so it abandons on client
-// disconnect). It funnels through resolveProcessACOperationBroadcast so
-// handler-site integration tests can inject a fake AC response.
+// Used by the native UDP handleNhpOpenResource path, which passes the server
+// lifecycle context so a pending retry abandons on shutdown. The retired direct
+// HTTP admission seam never reaches this helper. It funnels through
+// resolveProcessACOperationBroadcast so handler-site integration tests can inject
+// a fake AC response.
 func (s *UdpServer) broadcastACOpenWithReknock(
 	ctx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -130,41 +99,15 @@ func (s *UdpServer) broadcastACOpenWithReknock(
 
 	// The retry backoff: the zero value (the production default) resolves to
 	// defaultReknockRetryBackoff; timeout-path tests set a tiny per-instance value
-	// via shortenReknockBackoff. Read once so the budget check and the pause agree.
+	// via shortenReknockBackoff.
 	backoff := s.reknockRetryBackoff
 	if backoff <= 0 {
 		backoff = defaultReknockRetryBackoff
 	}
 
-	// The broadcast aggregated to the timeout signature — the reassignment-window
-	// case. BEFORE pausing to re-snapshot, check the budget: if the caller's
-	// deadline can't cover the backoff PLUS another transaction timeout, skip the
-	// retry now rather than burning the backoff on a knock that cannot finish before
-	// the caller (qurl-service) gives up — shedding load exactly during a broad flip.
-	// The client's next re-knock retries against then-fresh conns. HTTP knocks carry
-	// the HttpKnockProcessingBudget deadline (set by withKnockProcessingBudget on
-	// both HTTP entry points, so its clock already includes admission time); the UDP
-	// path passes the lifecycle context (no deadline) so this no-ops there.
-	//
-	// The threshold is backoff + one transaction timeout — the wall time the retry
-	// path needs (pause for conns to re-register, then one transaction for the
-	// resend). A retry, once issued, runs under the broadcast's own transaction
-	// timeout, NOT this parent deadline (processACOperationBroadcast WithoutCancels
-	// the parent), so the deadline gates only the decision to START the retry path,
-	// not its duration; this check is what keeps a proceeding retry from overrunning
-	// the caller (it rests on DefaultBroadcastTimeout > the transaction timeout,
-	// fenced by TestBroadcastTimeoutExceedsTransactionTimeout).
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < reknockRetryTransactionTimeout+backoff {
-		s.metrics.IncrCounter(MetricKnockReknockDeadlineSkipped)
-		log.Warning("%s-ac(%s)[broadcastACOpenWithReknock] skipping reknock retry: < backoff + one transaction timeout (%v) of the knock budget remains; client re-knock will retry",
-			logCtx, acId, reknockRetryTransactionTimeout+backoff)
-		return artMsg, err
-	}
-
 	// Give the just-closed conns a beat to be pruned and a fresh registration a beat
 	// to land, then re-snapshot. Abort the wait if the caller's context is done
-	// (server shutdown on the UDP path via the lifecycle ctx; client disconnect on
-	// the HTTP path via the request ctx).
+	// (server shutdown on the native UDP path via the lifecycle context).
 	select {
 	case <-time.After(backoff):
 	case <-ctx.Done():

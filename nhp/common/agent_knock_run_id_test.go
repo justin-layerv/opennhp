@@ -72,22 +72,23 @@ func TestValidateAgentKnockRunIDForAuthService(t *testing.T) {
 func TestAgentKnockMsgRunIDJSONContract(t *testing.T) {
 	t.Parallel()
 
-	const canonical = `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789abcdef"}`
+	const canonical = `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789abcdef","runAttempt":1}`
 	tests := []struct {
 		name        string
 		body        string
 		wantErr     bool
 		wantRunID   string
+		wantAttempt uint64
 		wantUserID  string
 		wantDataKey any
 		wantClass   error
 		forbidClass error
 	}{
-		{name: "canonical", body: canonical, wantRunID: "0123456789abcdef", wantUserID: "user"},
+		{name: "canonical", body: canonical, wantRunID: "0123456789abcdef", wantAttempt: 1, wantUserID: "user"},
 		{name: "missing accepted generically", body: `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector"}`, wantUserID: "user"},
 		{name: "empty accepted generically", body: `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","runId":""}`, wantUserID: "user"},
 		{name: "unknown extension remains accepted", body: `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","futureField":true}`, wantUserID: "user"},
-		{name: "escaped canonical key", body: strings.Replace(canonical, `"runId"`, `"r\u0075nId"`, 1), wantRunID: "0123456789abcdef", wantUserID: "user"},
+		{name: "escaped canonical key", body: strings.Replace(canonical, `"runId"`, `"r\u0075nId"`, 1), wantRunID: "0123456789abcdef", wantAttempt: 1, wantUserID: "user"},
 		{name: "duplicate unrelated top-level field retains legacy semantics", body: `{"headerType":1,"usrId":"first","usrId":"second","aspId":"other","resId":"connector"}`, wantUserID: "second"},
 		{name: "duplicate nested key retains legacy semantics", body: `{"headerType":1,"usrId":"user","devId":"device","aspId":"other","resId":"connector","usrData":{"key":1,"key":2}}`, wantUserID: "user", wantDataKey: float64(2)},
 		{name: "duplicate runId", body: strings.Replace(canonical, `"runId":"0123456789abcdef"`, `"runId":"0123456789abcdef","runId":"fedcba9876543210"`, 1), wantErr: true},
@@ -100,6 +101,14 @@ func TestAgentKnockMsgRunIDJSONContract(t *testing.T) {
 		{name: "short invalid", body: strings.Replace(canonical, "0123456789abcdef", "0123456789abcde", 1), wantErr: true, wantClass: ErrInvalidAgentKnockRunID},
 		{name: "null is body parse", body: strings.Replace(canonical, `"0123456789abcdef"`, "null", 1), wantErr: true, forbidClass: ErrInvalidAgentKnockRunID},
 		{name: "non-string is body parse", body: strings.Replace(canonical, `"0123456789abcdef"`, "123", 1), wantErr: true, forbidClass: ErrInvalidAgentKnockRunID},
+		{name: "runAttempt zero", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":0`, 1), wantErr: true},
+		{name: "runAttempt null", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":null`, 1), wantErr: true},
+		{name: "runAttempt string", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":"1"`, 1), wantErr: true},
+		{name: "runAttempt exponent", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":1e0`, 1), wantErr: true},
+		{name: "runAttempt overflow", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":18446744073709551616`, 1), wantErr: true},
+		{name: "runAttempt duplicate", body: strings.Replace(canonical, `"runAttempt":1`, `"runAttempt":1,"runAttempt":2`, 1), wantErr: true},
+		{name: "runAttempt alias", body: strings.Replace(canonical, `"runAttempt"`, `"run_attempt"`, 1), wantErr: true},
+		{name: "runAttempt escaped canonical key", body: strings.Replace(canonical, `"runAttempt"`, `"run\u0041ttempt"`, 1), wantRunID: "0123456789abcdef", wantAttempt: 1, wantUserID: "user"},
 		{name: "trailing value", body: canonical + `{}`, wantErr: true},
 		{name: "top-level null", body: `null`, wantErr: true},
 		{name: "top-level scalar", body: `42`, wantErr: true},
@@ -129,6 +138,9 @@ func TestAgentKnockMsgRunIDJSONContract(t *testing.T) {
 			}
 			if msg.RunID != tc.wantRunID {
 				t.Fatalf("RunID = %q, want %q", msg.RunID, tc.wantRunID)
+			}
+			if msg.RunAttempt != tc.wantAttempt {
+				t.Fatalf("RunAttempt = %d, want %d", msg.RunAttempt, tc.wantAttempt)
 			}
 			if msg.UserId != tc.wantUserID {
 				t.Fatalf("UserId = %q, want %q", msg.UserId, tc.wantUserID)
@@ -188,11 +200,12 @@ func TestAgentKnockMsgMarshalRunIDWireName(t *testing.T) {
 		AuthServiceId: RegisteredAgentAuthServiceID,
 		ResourceId:    "connector",
 		RunID:         "0123456789abcdef",
+		RunAttempt:    1,
 	})
 	if err != nil {
 		t.Fatalf("json.Marshal() = %v", err)
 	}
-	const want = `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789abcdef"}`
+	const want = `{"headerType":1,"usrId":"user","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789abcdef","runAttempt":1}`
 	if string(raw) != want {
 		t.Fatalf("marshal = %s, want %s", raw, want)
 	}

@@ -609,7 +609,15 @@ jobs:
             .github/scripts/prune-missing-asg-target-groups.sh \
             .github/scripts/wait-for-instance-refresh.sh \
             .github/scripts/deploy-relay.sh \
+            .github/scripts/classify-durable-aop-cutover-lock-release.sh \
+            .github/scripts/classify-durable-aop-cutover-resume.sh \
+            .github/scripts/acquire-durable-aop-cutover-lock.sh \
+            .github/scripts/assert-durable-aop-mutation-allowed.sh \
             .github/scripts/dispatch-and-poll-blue-green.sh \
+            .github/scripts/durable-aop-cutover.sh \
+            .github/scripts/run-durable-aop-cutover-under-lock.sh \
+            .github/scripts/verify-durable-aop-image-provenance.sh \
+            .github/scripts/nhp-profile-order.sh \
             .github/scripts/dispatch-and-poll-canary.sh \
             .github/scripts/emit-deployment-window-metric.sh \
             .github/scripts/verify-asg-instances-healthy.sh \
@@ -620,6 +628,13 @@ jobs:
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
+            tests/scripts/classify-durable-aop-cutover-lock-release_test.sh \
+            tests/scripts/classify-durable-aop-cutover-resume_test.sh \
+            tests/scripts/assert-durable-aop-mutation-allowed_test.sh \
+            tests/scripts/durable-aop-cutover_test.sh \
+            tests/scripts/durable-aop-recovery-lock_test.sh \
+            tests/scripts/verify-durable-aop-image-provenance_test.sh \
+            tests/scripts/nhp-profile-order_test.sh \
             tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/verify-asg-instances-healthy_test.sh \
             tests/scripts/verify-authority-cell-alias-convergence_test.sh \
@@ -629,6 +644,14 @@ jobs:
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
+          bash tests/scripts/classify-durable-aop-cutover-lock-release_test.sh
+          bash tests/scripts/classify-durable-aop-cutover-resume_test.sh
+          bash tests/scripts/assert-durable-aop-mutation-allowed_test.sh
+          bash tests/scripts/nhp-profile-order_test.sh
+          bash tests/scripts/durable-aop-cutover_test.sh
+          bash tests/scripts/durable-aop-recovery-lock_test.sh
+          bash tests/scripts/verify-durable-aop-image-provenance_test.sh
+          python3 tests/scripts/test_durable_aop_cutover_workflow.py
           bash tests/scripts/emit-deployment-window-metric_test.sh
           bash tests/scripts/verify-asg-instances-healthy_test.sh
           bash tests/scripts/verify-authority-cell-alias-convergence_test.sh

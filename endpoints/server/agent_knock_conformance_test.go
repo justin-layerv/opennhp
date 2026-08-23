@@ -10,15 +10,15 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-func TestAgentKnockRunIDConformanceSchemaV3(t *testing.T) {
+func TestAgentKnockRunIDConformanceSchemaV4(t *testing.T) {
 	t.Parallel()
 
 	vectors, err := conformance.AgentKnockApplication()
 	if err != nil {
 		t.Fatalf("load qurl-conformance agent knock application vectors: %v", err)
 	}
-	if vectors.SchemaVersion != 3 {
-		t.Fatalf("schema version = %d, want 3", vectors.SchemaVersion)
+	if vectors.SchemaVersion != 4 {
+		t.Fatalf("schema version = %d, want 4", vectors.SchemaVersion)
 	}
 
 	for _, tc := range vectors.RequestCases {
@@ -31,6 +31,12 @@ func TestAgentKnockRunIDConformanceSchemaV3(t *testing.T) {
 
 			nativeErr := parseErr
 			if nativeErr == nil {
+				// Schema v4 isolates the RunID grammar. The mandatory retry
+				// ordinal is covered by the native schema that supersedes this
+				// held conformance artifact, so give this focused legacy vector a
+				// canonical attempt rather than letting an unrelated missing-field
+				// error mask its RunID expectation.
+				msg.RunAttempt = 1
 				nativeErr = validateRegisteredAgentKnockRunID(&msg)
 			}
 			assertAgentKnockConformanceExpectation(t, "native_connector", tc.NativeConnector, msg.RunID, nativeErr)

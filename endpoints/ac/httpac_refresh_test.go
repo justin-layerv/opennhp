@@ -214,3 +214,66 @@ func TestHandleHttpRefreshOperations_PastAbsoluteDeadlineRejectsViaVerify(t *tes
 		t.Errorf("expected 'token expired' for past-absolute-deadline token; got %q", rec.Body.String())
 	}
 }
+
+func TestHandleHttpRefreshOperations_CloseBetweenVerifyAndMutationCannotResurrectSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	scheduler := NewScheduler(&NoOpFlusher{}, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = scheduler.Shutdown(ctx)
+	})
+	agent := testNHPAgentKey('A')
+	ua := &UdpAC{
+		config:      &Config{FilterMode: FilterMode_IPTABLES},
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		revIndex:    newRevocationIndex(),
+		nhpSessions: newNHPSessionIndex(),
+		expirySched: scheduler,
+	}
+	ua.sessionFlushComplete.Store(true)
+	ua.sessionControlLeaseHeld.Store(true)
+	ua.sessionFlushGeneration.Store(1)
+	entry := &AccessEntry{
+		User:                     &common.AgentUser{UserId: "registered"},
+		SrcAddrs:                 []*common.NetAddress{{Ip: "192.0.2.10"}},
+		DstAddrs:                 []*common.NetAddress{{Ip: "192.0.2.20", Port: 443, Protocol: "tcp"}},
+		OpenTime:                 60,
+		NHPSessionId:             77,
+		NHPServerPublicKey:       "server",
+		NHPSessionOwnerId:        "00112233445566778899aabbccddeeff",
+		NHPAgentPublicKey:        agent,
+		NHPSessionIssuedAtMillis: 1000,
+	}
+	token := ua.GenerateAccessToken(entry)
+	ha := &HttpAC{ua: ua}
+	ha.beforeSessionControlRefreshFence = func() {
+		ua.sessionControlFlushMu.Lock()
+		defer ua.sessionControlFlushMu.Unlock()
+		if err := ua.nhpSessions.beginExactCloseFence(agent, 77, 1000); err != nil {
+			t.Fatalf("begin exact close fence: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if closed, err := ua.closeNHPExactSessionVerified(ctx, agent, 77, 1000); err != nil || closed != 1 {
+			t.Fatalf("close during refresh = %d, %v, want 1", closed, err)
+		}
+		if err := ua.nhpSessions.commitExactCloseFence(agent, 77, 1000); err != nil {
+			t.Fatalf("commit exact close fence: %v", err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	ha.HandleHttpRefreshOperations(c, &common.HttpRefreshRequest{Token: token, SrcIp: "192.0.2.10"})
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "token expired") {
+		t.Fatalf("refresh response = %d %q, want collapsed expiry", rec.Code, rec.Body.String())
+	}
+	if _, ok := ua.tokenStore.Load(token); ok {
+		t.Fatal("refresh restored a token removed by the converged close")
+	}
+	if got := len(entry.snapshotScheduledKeys()); got != 0 {
+		t.Fatalf("refresh recorded %d post-close flow keys", got)
+	}
+}

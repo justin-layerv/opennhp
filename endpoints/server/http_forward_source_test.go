@@ -15,11 +15,9 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-// newForwardingTestServer creates a minimal HttpServer with an initialized UdpServer
-// (empty AC connection map) and an HttpKnockForwarder backed by the given storage.
-// This is sufficient to exercise handleInternalKnock through to the forwarding
-// decision in handleHttpOpenResource.
-func newForwardingTestServer(storage StorageBackend) *HttpServer {
+// newInternalKnockTestServer creates a minimal server that can exercise the
+// authenticated pre-handler before the retired admission terminal.
+func newInternalKnockTestServer() *HttpServer {
 	udpSrv := &UdpServer{
 		acConnectionMap: make(map[string][]*ACConn),
 		authServiceMap: common.AuthSvcProviderMap{
@@ -47,11 +45,7 @@ func newForwardingTestServer(storage StorageBackend) *HttpServer {
 		},
 		// metrics is nil — Publisher.IncrCounter is nil-safe
 	}
-	hs := &HttpServer{
-		udpServer:     udpSrv,
-		httpForwarder: NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil),
-	}
-	return hs
+	return &HttpServer{udpServer: udpSrv}
 }
 
 // buildKnockRequest creates a valid HttpKnockForwardRequest. Resource only
@@ -125,7 +119,6 @@ func TestHandleInternalKnock_ResourceLookupUsesLifecycleCtx(t *testing.T) {
 			lifecycleCtx:    lifecycleCtx,
 			metrics:         metrics.NewPublisherForTest(t),
 		},
-		httpForwarder: NewHttpKnockForwarder(NewMemoryStorage(), nil, "10.0.0.1", 8888, nil, nil),
 	}
 	fwdReq := HttpKnockForwardRequest{
 		Request: &common.HttpKnockRequest{
@@ -157,6 +150,7 @@ func TestHandleInternalKnock_ResourceLookupUsesLifecycleCtx(t *testing.T) {
 	c.Request.RemoteAddr = "10.0.1.100:12345"
 
 	hs.handleInternalKnock(c)
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 
 	select {
 	case got := <-seenCtx:
@@ -171,87 +165,51 @@ func TestHandleInternalKnock_ResourceLookupUsesLifecycleCtx(t *testing.T) {
 	}
 }
 
-// TestHandleInternalKnock_APISource_AllowsForwarding verifies that when
-// Source=SourceAPI, the handler does NOT set Forwarded=true, allowing the
-// knock to be forwarded to another server. We verify this by checking that
-// the httpForwarder's storage backend (GetACAssignment) IS called.
-func TestHandleInternalKnock_APISource_AllowsForwarding(t *testing.T) {
+// TestHandleInternalKnock_APISourceReachesRetiredAdmission verifies that an
+// API origin clears the source gate and reaches the retired terminal without
+// reviving cross-server application admission.
+func TestHandleInternalKnock_APISourceReachesRetiredAdmission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	storage := NewMemoryStorage()
-	hs := newForwardingTestServer(storage)
+	hs := newInternalKnockTestServer()
 
 	fwdReq := buildKnockRequest(SourceAPI)
 	w := callHandleInternalKnock(t, hs, fwdReq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("unexpected status %d, body: %s", w.Code, w.Body.String())
-	}
-
-	if storage.GetCallCount("GetACAssignment") == 0 {
-		t.Error("Source=SourceAPI: expected httpForwarder to be called (GetACAssignment), but it was not — Forwarded was incorrectly set to true")
-	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 }
 
-// TestHandleInternalKnock_EmptySource_BlocksForwarding verifies that when
-// Source is empty (server-to-server forwarding), the handler sets Forwarded=true,
-// preventing the knock from being forwarded again. We verify this by checking
-// that the httpForwarder's storage backend is NOT called.
-func TestHandleInternalKnock_EmptySource_BlocksForwarding(t *testing.T) {
+// TestHandleInternalKnock_EmptySourceReachesRetiredAdmission verifies that a
+// historical server-to-server source passes the retained pre-handler checks
+// before the unsupported terminal.
+func TestHandleInternalKnock_EmptySourceReachesRetiredAdmission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	storage := NewMemoryStorage()
-	hs := newForwardingTestServer(storage)
+	hs := newInternalKnockTestServer()
 
 	fwdReq := buildKnockRequest("") // empty source = server-to-server
 	w := callHandleInternalKnock(t, hs, fwdReq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("unexpected status %d, body: %s", w.Code, w.Body.String())
-	}
-
-	var resp HttpKnockForwardResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-	if resp.AckMsg == nil {
-		t.Fatalf("AckMsg is nil, response: %s", w.Body.String())
-	}
-	if resp.AckMsg.OpenTime != 77 {
-		t.Fatalf("AckMsg.OpenTime = %d, want storage-resolved OpenTime 77", resp.AckMsg.OpenTime)
-	}
-
-	if storage.GetCallCount("GetACAssignment") != 0 {
-		t.Error("Source='': expected httpForwarder NOT to be called (Forwarded should be true), but GetACAssignment was called — loop prevention is broken")
-	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 }
 
-// TestHandleInternalKnock_UnknownSource_BlocksForwarding verifies that an
-// unrecognized Source value is treated as server-to-server (Forwarded=true),
-// preventing forwarding. This tests the defensive default behavior.
-func TestHandleInternalKnock_UnknownSource_BlocksForwarding(t *testing.T) {
+// TestHandleInternalKnock_UnknownSourceReachesRetiredAdmission verifies that an
+// unrecognized source cannot revive admission behavior.
+func TestHandleInternalKnock_UnknownSourceReachesRetiredAdmission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	storage := NewMemoryStorage()
-	hs := newForwardingTestServer(storage)
+	hs := newInternalKnockTestServer()
 
 	fwdReq := buildKnockRequest("unknown")
 	w := callHandleInternalKnock(t, hs, fwdReq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("unexpected status %d, body: %s", w.Code, w.Body.String())
-	}
-
-	if storage.GetCallCount("GetACAssignment") != 0 {
-		t.Error("Source='unknown': expected httpForwarder NOT to be called (unknown source should block forwarding), but GetACAssignment was called")
-	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 }
 
 // TestForwardRequest_SourceOmittedFromJSON verifies that an empty Source field
 // is omitted from JSON serialization (via the omitempty tag). This is a contract
-// test ensuring that forwardToServer's constructed request (which never sets Source)
-// produces JSON without the "source" key, so the receiving server treats it as a
-// server-to-server forward and sets Forwarded=true.
+// test ensuring that a legacy server-to-server envelope remains distinguishable
+// from SourceAPI while rolling versions overlap.
 func TestForwardRequest_SourceOmittedFromJSON(t *testing.T) {
 	req := &HttpKnockForwardRequest{
 		Request:  &common.HttpKnockRequest{},

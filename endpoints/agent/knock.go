@@ -29,8 +29,8 @@ func (a *UdpAgent) knockWithRequest(
 	// resolution, message construction, or queueing. Registered-agent callers
 	// must always supply it; legacy auth services may omit it, but may not supply
 	// a malformed value.
-	if err := validateKnockRunID(requestTarget.AuthServiceId, requestTarget.RunID); err != nil {
-		return knockRunIDErrorAck(), err
+	if err := validateKnockRunBinding(requestTarget.AuthServiceId, requestTarget.RunID, requestTarget.RunAttempt); err != nil {
+		return knockRunBindingErrorAck(err), err
 	}
 
 	// Register against teardown before doing any work: beginTrackedOp does the
@@ -109,6 +109,16 @@ func (a *UdpAgent) knockWithRequest(
 			}
 		}
 		return ackMsg, err
+	}
+
+	if requestTarget.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		receipt, receiptErr := common.AgentSessionReceiptFromKnockAck(ackMsg, requestTarget.RunID, requestTarget.RunAttempt)
+		if receiptErr != nil {
+			ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
+			ackMsg.ErrMsg = receiptErr.Error()
+			return ackMsg, receiptErr
+		}
+		res.setSessionReceipt(receipt, requestTarget.ServerPeer)
 	}
 
 	// deal with ac PASS_ACCESS_IP mode
@@ -214,7 +224,11 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 		return ackMsg, err
 	}
 
-	err = json.Unmarshal(serverPpd.BodyMessage, ackMsg)
+	if res.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		err = common.DecodeRegisteredAgentKnockAckMsg(serverPpd.BodyMessage, ackMsg, res.RunID, res.RunAttempt, res.ResourceId)
+	} else {
+		err = json.Unmarshal(serverPpd.BodyMessage, ackMsg)
+	}
 	if err != nil {
 		log.Error("agent(%s#%d)[KnockRequest] failed to parse %s message: %v", knkMsg.UserId, knkMd.TransactionId, core.HeaderTypeToString(serverPpd.HeaderType), err)
 		ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
@@ -232,27 +246,38 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	return ackMsg, nil
 }
 
-func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
+func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerExactSessionCloseAckMsg, err error) {
 	res = res.snapshot()
+	if err := validateKnockRunBinding(res.AuthServiceId, res.RunID, res.RunAttempt); err != nil {
+		return exactCloseRunBindingErrorAck(err), err
+	}
 
-	// Keep validation ahead of resolveServerAddr: invalid registered-agent
-	// requests must be rejected locally without DNS or UDP activity.
-	if err := validateKnockRunID(res.AuthServiceId, res.RunID); err != nil {
-		return knockRunIDErrorAck(), err
+	// Resource-shaped EXT used to ask the server to create a one-second session.
+	// That operation is retired: exact close authority is only the immutable
+	// receipt captured from a successful registered-agent ACK.
+	receipt, ok := res.getSessionReceipt()
+	if !ok || receipt == nil || receipt.serverPeer == nil {
+		return exactCloseErrorAck(common.ErrInvalidInput), common.ErrInvalidInput
+	}
+	if err := common.ValidateAgentSessionReceipt(receipt.AgentSessionReceipt); err != nil {
+		return exactCloseErrorAck(common.ErrInvalidInput), common.ErrInvalidInput
+	}
+	if res.RunID != receipt.RunID || res.RunAttempt != receipt.RunAttempt {
+		return exactCloseErrorAck(common.ErrInvalidInput), common.ErrInvalidInput
 	}
 	// Own a lifecycle token because this API is also called directly by the SDK.
 	// The background knock sub-routine may call it while its parent routine holds
 	// another token; that nested Add is intentional and is serialized against
 	// Stop's Wait by beginTrackedOp's lifecycle lock.
 	if !a.beginTrackedOp() {
-		return &common.ServerKnockAckMsg{
+		return &common.ServerExactSessionCloseAckMsg{
 			ErrCode: common.ErrPacketToMessageRoutineStopped.ErrorCode(),
 			ErrMsg:  common.ErrPacketToMessageRoutineStopped.Error(),
 		}, common.ErrPacketToMessageRoutineStopped
 	}
 	defer a.wg.Done()
 
-	serverPeer := res.GetServerPeer()
+	serverPeer := receipt.serverPeer
 	addr, err := resolveServerAddr(serverPeer, a.knockUserID(), "ExitKnockRequest")
 	if err != nil {
 		return nil, err
@@ -267,22 +292,27 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	// review-time comment on literal constants.
 	headerType := core.NHP_EXT
 
-	knkMsg := a.buildAgentKnockMsg(res, headerType)
+	knkMsg := &common.AgentExactSessionCloseMsg{
+		HeaderType: headerType, AuthServiceID: common.RegisteredAgentAuthServiceID,
+		CellID: receipt.CellID, SessionID: receipt.SessionID,
+		SessionIssuedAtMillis: receipt.SessionIssuedAtMillis,
+		RunID:                 receipt.RunID, RunAttempt: receipt.RunAttempt,
+	}
 
 	knkBytes, marshalErr := json.Marshal(knkMsg)
 	if marshalErr != nil {
-		log.Error("agent(%s)[ExitKnockRequest] failed to marshal EXT message: %v", knkMsg.UserId, marshalErr)
+		log.Error("agent(%s)[ExitKnockRequest] failed to marshal exact EXT message: %v", a.knockUserID(), marshalErr)
 		return nil, marshalErr
 	}
 	// #1154 invariant: wire arg here MUST equal knkMsg.HeaderType above.
 	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData, 1) // buffered: see awaitTransactionResponse
 
-	ackMsg = &common.ServerKnockAckMsg{}
+	ackMsg = &common.ServerExactSessionCloseAckMsg{}
 	if !a.IsRunning() {
 		// Not-running only happens during/after Stop(): expected teardown (this
 		// runs from the knock sub-routine's defer on every restart), not an error.
-		log.Debug("agent(%s#%d)[ExitKnockRequest] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		log.Debug("agent(%s#%d)[ExitKnockRequest] MsgData channel closed or being closed, skip sending", a.knockUserID(), knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -293,7 +323,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	// the SDK export and is tracked above so Stop cannot tear down the device
 	// before the response wait observes signals.stop and returns.
 	if !a.sendOrStop(knkMd) {
-		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip sending", a.knockUserID(), knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -304,7 +334,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	// awaitTransactionResponse.
 	serverPpd, ok := a.awaitTransactionResponse(knkMd.ResponseMsgCh)
 	if !ok {
-		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip waiting for response", knkMsg.UserId, knkMd.TransactionId)
+		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip waiting for response", a.knockUserID(), knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -312,7 +342,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 
 	if serverPpd.Error != nil {
-		log.Error("agent(%s#%d)[ExitKnockRequest] failed to receive response from server %s: %v", knkMsg.UserId, knkMd.TransactionId, addrStr, serverPpd.Error)
+		log.Error("agent(%s#%d)[ExitKnockRequest] failed to receive response from server %s: %v", a.knockUserID(), knkMd.TransactionId, addrStr, serverPpd.Error)
 		err = serverPpd.Error
 		ackMsg.ErrCode = common.ErrTransactionFailedByTimeout.ErrorCode()
 		ackMsg.ErrMsg = serverPpd.Error.Error()
@@ -320,7 +350,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 
 	if serverPpd.HeaderType == core.NHP_COK {
-		log.Error("agent(%s#%d)[ExitKnockRequest] terminated by server's cookie message", knkMsg.UserId, knkMd.TransactionId)
+		log.Error("agent(%s#%d)[ExitKnockRequest] terminated by server's cookie message", a.knockUserID(), knkMd.TransactionId)
 		err = common.ErrKnockTerminatedByCookie
 		ackMsg.ErrCode = common.ErrKnockTerminatedByCookie.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -328,28 +358,34 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 
 	if serverPpd.HeaderType != core.NHP_ACK {
-		log.Error("agent(%s#%d)[ExitKnockRequest] response has wrong type: %s", knkMsg.UserId, knkMd.TransactionId, core.HeaderTypeToString(serverPpd.HeaderType))
+		log.Error("agent(%s#%d)[ExitKnockRequest] response has wrong type: %s", a.knockUserID(), knkMd.TransactionId, core.HeaderTypeToString(serverPpd.HeaderType))
 		err = common.ErrTransactionRepliedWithWrongType
 		ackMsg.ErrCode = common.ErrTransactionRepliedWithWrongType.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return ackMsg, err
 	}
 
-	err = json.Unmarshal(serverPpd.BodyMessage, ackMsg)
+	err = common.DecodeServerExactSessionCloseAckMsg(serverPpd.BodyMessage, ackMsg)
 	if err != nil {
-		log.Error("agent(%s#%d)[ExitKnockRequest] failed to parse %s message: %v", knkMsg.UserId, knkMd.TransactionId, core.HeaderTypeToString(serverPpd.HeaderType), err)
+		log.Error("agent(%s#%d)[ExitKnockRequest] failed to parse %s message: %v", a.knockUserID(), knkMd.TransactionId, core.HeaderTypeToString(serverPpd.HeaderType), err)
 		ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return ackMsg, err
 	}
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
-		log.Error("agent(%s#%d)[ExitKnockRequest] response error: %s", knkMsg.UserId, knkMd.TransactionId, ackMsg.ErrMsg)
+		log.Error("agent(%s#%d)[ExitKnockRequest] response error: %s", a.knockUserID(), knkMd.TransactionId, ackMsg.ErrMsg)
 		err = common.ErrorFromResponse(ackMsg.ErrCode, ackMsg.ErrMsg)
 		return ackMsg, err
 	}
 
-	log.Info("agent(%s#%d)[ExitKnockRequest] succeed", knkMsg.UserId, knkMd.TransactionId)
+	if err := common.ValidateServerExactSessionCloseAck(*ackMsg, receipt.AgentSessionReceipt); err != nil {
+		ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
+
+	log.Info("agent(%s#%d)[ExitKnockRequest] succeed", a.knockUserID(), knkMd.TransactionId)
 	return ackMsg, nil
 }
 
@@ -363,6 +399,7 @@ func (a *UdpAgent) buildAgentKnockMsg(res *KnockTarget, headerType int) *common.
 		AuthServiceId:  res.AuthServiceId,
 		ResourceId:     res.ResourceId,
 		RunID:          res.RunID,
+		RunAttempt:     res.RunAttempt,
 		CheckResults:   state.checkResults,
 		UserData:       state.user.UserData,
 	}
@@ -372,18 +409,40 @@ func (a *UdpAgent) knockUserID() string {
 	return a.snapshotKnockUserState().user.UserId
 }
 
-func validateKnockRunID(authServiceID, runID string) error {
+func validateKnockRunBinding(authServiceID, runID string, runAttempt uint64) error {
 	if err := common.ValidateAgentKnockRunIDForAuthService(authServiceID, runID); err != nil {
 		return common.ErrKnockRunIDInvalid
+	}
+	if authServiceID == common.RegisteredAgentAuthServiceID && runAttempt == 0 {
+		return common.ErrKnockRunAttemptInvalid
+	}
+	if authServiceID != common.RegisteredAgentAuthServiceID && runID == "" && runAttempt != 0 {
+		return common.ErrKnockRunAttemptInvalid
 	}
 	return nil
 }
 
-func knockRunIDErrorAck() *common.ServerKnockAckMsg {
-	return &common.ServerKnockAckMsg{
-		ErrCode: common.ErrKnockRunIDInvalid.ErrorCode(),
-		ErrMsg:  common.ErrKnockRunIDInvalid.Error(),
+func knockRunBindingErrorAck(err error) *common.ServerKnockAckMsg {
+	publicErr := common.ErrKnockRunIDInvalid
+	if errors.Is(err, common.ErrKnockRunAttemptInvalid) {
+		publicErr = common.ErrKnockRunAttemptInvalid
 	}
+	return &common.ServerKnockAckMsg{
+		ErrCode: publicErr.ErrorCode(),
+		ErrMsg:  publicErr.Error(),
+	}
+}
+
+func exactCloseErrorAck(publicErr *common.Error) *common.ServerExactSessionCloseAckMsg {
+	return &common.ServerExactSessionCloseAckMsg{ErrCode: publicErr.ErrorCode(), ErrMsg: publicErr.Error()}
+}
+
+func exactCloseRunBindingErrorAck(err error) *common.ServerExactSessionCloseAckMsg {
+	publicErr := common.ErrKnockRunIDInvalid
+	if errors.Is(err, common.ErrKnockRunAttemptInvalid) {
+		publicErr = common.ErrKnockRunAttemptInvalid
+	}
+	return exactCloseErrorAck(publicErr)
 }
 
 // agent -> ac, pre-access

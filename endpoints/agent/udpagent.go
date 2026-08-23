@@ -48,6 +48,7 @@ type KnockResource struct {
 	AuthServiceId  string `json:"aspId"`
 	ResourceId     string `json:"resId"`
 	RunID          string `json:"runId,omitempty"`
+	RunAttempt     uint64 `json:"runAttempt,omitempty"`
 	ServerHostname string `json:"serverHostname"`
 	ServerIp       string `json:"serverIp"`
 	ServerPort     int    `json:"serverPort"`
@@ -73,6 +74,15 @@ type KnockTarget struct {
 	KnockResource
 	ServerPeer           *core.UdpPeer
 	LastKnockSuccessTime time.Time
+	sessionReceipt       *agentSessionReceipt
+}
+
+// agentSessionReceipt couples the public immutable receipt with the exact
+// server peer that issued it. Later assignment changes must not redirect an
+// exact retirement to a different cell/key.
+type agentSessionReceipt struct {
+	common.AgentSessionReceipt
+	serverPeer *core.UdpPeer
 }
 
 func (kt *KnockTarget) SetResource(res *KnockResource) {
@@ -96,6 +106,22 @@ func (kt *KnockTarget) GetServerPeer() *core.UdpPeer {
 	return kt.ServerPeer
 }
 
+func (kt *KnockTarget) setSessionReceipt(receipt common.AgentSessionReceipt, peer *core.UdpPeer) {
+	kt.Lock()
+	defer kt.Unlock()
+	kt.sessionReceipt = &agentSessionReceipt{AgentSessionReceipt: receipt, serverPeer: peer}
+}
+
+func (kt *KnockTarget) getSessionReceipt() (*agentSessionReceipt, bool) {
+	kt.Lock()
+	defer kt.Unlock()
+	if kt.sessionReceipt == nil {
+		return nil, false
+	}
+	copy := *kt.sessionReceipt
+	return &copy, true
+}
+
 // snapshot returns one immutable view of the per-knock resource and server.
 // In particular, a cookie retry must reuse the exact caller-owned RunID from
 // its initial KNK rather than observing a concurrent resource reload.
@@ -103,10 +129,32 @@ func (kt *KnockTarget) snapshot() *KnockTarget {
 	kt.Lock()
 	defer kt.Unlock()
 
-	return &KnockTarget{
-		KnockResource: kt.KnockResource,
-		ServerPeer:    kt.ServerPeer,
+	var receipt *agentSessionReceipt
+	if kt.sessionReceipt != nil {
+		copied := *kt.sessionReceipt
+		receipt = &copied
 	}
+	return &KnockTarget{
+		KnockResource:  kt.KnockResource,
+		ServerPeer:     kt.ServerPeer,
+		sessionReceipt: receipt,
+	}
+}
+
+// NewSessionRetirementTarget constructs a target that can send only the
+// receipt-based exact-session EXT. It is used by the exported SDK after the
+// caller returns the receipt from the original successful knock ACK.
+func NewSessionRetirementTarget(receipt common.AgentSessionReceipt, peer *core.UdpPeer) (*KnockTarget, error) {
+	if err := common.ValidateAgentSessionReceipt(receipt); err != nil || peer == nil {
+		return nil, common.ErrInvalidInput
+	}
+	target := &KnockTarget{KnockResource: KnockResource{
+		AuthServiceId: common.RegisteredAgentAuthServiceID,
+		RunID:         receipt.RunID,
+		RunAttempt:    receipt.RunAttempt,
+	}, ServerPeer: peer}
+	target.setSessionReceipt(receipt, peer)
+	return target, nil
 }
 
 type UdpAgent struct {

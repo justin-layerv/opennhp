@@ -45,6 +45,201 @@ func TestMakeFlowKey_HappyPath(t *testing.T) {
 	}
 }
 
+type gatedAuthoritativeFlusher struct {
+	started chan int
+	release chan struct{}
+	calls   atomic.Int32
+	active  atomic.Int32
+	max     atomic.Int32
+}
+
+func newGatedAuthoritativeFlusher() *gatedAuthoritativeFlusher {
+	return &gatedAuthoritativeFlusher{started: make(chan int, 4), release: make(chan struct{}, 4)}
+}
+
+func (f *gatedAuthoritativeFlusher) Flush(ctx context.Context, _ FlowKey) error {
+	call := int(f.calls.Add(1))
+	active := f.active.Add(1)
+	for {
+		current := f.max.Load()
+		if active <= current || f.max.CompareAndSwap(current, active) {
+			break
+		}
+	}
+	f.started <- call
+	select {
+	case <-f.release:
+		f.active.Add(-1)
+		return nil
+	case <-ctx.Done():
+		f.active.Add(-1)
+		return ctx.Err()
+	}
+}
+
+func TestFlushNowAndWaitSerializesWithNaturalExpiry(t *testing.T) {
+	flusher := newGatedAuthoritativeFlusher()
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Millisecond), WithWheelSize(64), WithFlushCallTimeout(time.Second))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	key := mustKey(t, "192.0.2.10", "192.0.2.20", 443, FlowProtoTCP)
+	scheduler.Schedule(key, time.Now().Add(time.Millisecond))
+	select {
+	case got := <-flusher.started:
+		if got != 1 {
+			t.Fatalf("first call = %d, want natural expiry call 1", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("natural expiry did not enter the flusher")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- scheduler.FlushNowAndWait(context.Background(), key, nil) }()
+	select {
+	case got := <-flusher.started:
+		t.Fatalf("authoritative call %d overlapped natural expiry", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	flusher.release <- struct{}{}
+	select {
+	case got := <-flusher.started:
+		if got != 2 {
+			t.Fatalf("second call = %d, want authoritative call 2", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authoritative flush did not start after natural expiry")
+	}
+	flusher.release <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatalf("FlushNowAndWait() error = %v", err)
+	}
+	if got := flusher.max.Load(); got != 1 {
+		t.Fatalf("maximum concurrent flushes = %d, want 1", got)
+	}
+}
+
+func TestFlushNowAndWaitBlocksConcurrentScheduleUntilTeardownCompletes(t *testing.T) {
+	flusher := newGatedAuthoritativeFlusher()
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Hour), WithFlushCallTimeout(time.Second))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	key := mustKey(t, "192.0.2.30", "192.0.2.40", 8443, FlowProtoTCP)
+	scheduler.Schedule(key, time.Now().Add(time.Hour))
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- scheduler.FlushNowAndWait(context.Background(), key, nil) }()
+	select {
+	case <-flusher.started:
+	case <-time.After(time.Second):
+		t.Fatal("authoritative flush did not start")
+	}
+
+	scheduleDone := make(chan struct{})
+	go func() {
+		scheduler.Schedule(key, time.Now().Add(2*time.Hour))
+		close(scheduleDone)
+	}()
+	select {
+	case <-scheduleDone:
+		t.Fatal("concurrent Schedule bypassed the authoritative in-flight fence")
+	case <-time.After(20 * time.Millisecond):
+	}
+	flusher.release <- struct{}{}
+	if err := <-flushDone; err != nil {
+		t.Fatalf("FlushNowAndWait() error = %v", err)
+	}
+	select {
+	case <-scheduleDone:
+	case <-time.After(time.Second):
+		t.Fatal("Schedule did not resume after authoritative teardown")
+	}
+	if got := scheduler.EntryCount(); got != 1 {
+		t.Fatalf("rescheduled entries = %d, want 1 after the post-close admission", got)
+	}
+	if got := flusher.max.Load(); got != 1 {
+		t.Fatalf("maximum concurrent flushes = %d, want 1", got)
+	}
+}
+
+type failOnceAuthoritativeFlusher struct {
+	calls atomic.Int32
+	done  chan struct{}
+}
+
+func (f *failOnceAuthoritativeFlusher) Flush(context.Context, FlowKey) error {
+	if f.calls.Add(1) == 1 {
+		return errors.New("injected authoritative flush failure")
+	}
+	close(f.done)
+	return nil
+}
+
+// A failed exact-close flush must leave the key scheduled. Otherwise an
+// ambiguous teardown failure would delete the only durable in-process retry
+// and the allow rule could survive until the AC reboots. This exercises the
+// ordinary worker journey after the failed authoritative attempt, rather than
+// merely calling FlushNowAndWait a second time.
+func TestFlushNowAndWaitFailurePreservesNaturalRetry(t *testing.T) {
+	flusher := &failOnceAuthoritativeFlusher{done: make(chan struct{})}
+	scheduler := NewScheduler(flusher, WithTickInterval(5*time.Millisecond), WithWheelSize(64), WithFlushCallTimeout(time.Second))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+
+	key := mustKey(t, "192.0.2.31", "192.0.2.41", 8443, FlowProtoTCP)
+	scheduler.Schedule(key, time.Now().Add(50*time.Millisecond))
+	if err := scheduler.FlushNowAndWait(context.Background(), key, nil); err == nil {
+		t.Fatal("FlushNowAndWait() error = nil, want injected failure")
+	}
+	if got := scheduler.EntryCount(); got != 1 {
+		t.Fatalf("entries after failed authoritative flush = %d, want 1 retained retry", got)
+	}
+
+	select {
+	case <-flusher.done:
+	case <-time.After(time.Second):
+		t.Fatal("retained entry did not receive its natural retry")
+	}
+	if got := flusher.calls.Load(); got != 2 {
+		t.Fatalf("flush calls = %d, want failed authoritative attempt plus one natural retry", got)
+	}
+	if got := scheduler.EntryCount(); got != 0 {
+		t.Fatalf("entries after successful natural retry = %d, want 0", got)
+	}
+}
+
+func TestScheduler_ReanchorReplacesLaterDeadlineWithoutFlush(t *testing.T) {
+	scheduler := NewScheduler(&NoOpFlusher{}, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	key := mustKey(t, "192.0.2.50", "192.0.2.60", 443, FlowProtoTCP)
+	base := time.Now()
+	later := base.Add(2 * time.Hour)
+	survivorDeadline := base.Add(time.Hour)
+	scheduler.Schedule(key, later)
+
+	if err := scheduler.reanchor(key, survivorDeadline); err != nil {
+		t.Fatalf("reanchor() error = %v", err)
+	}
+
+	shard := scheduler.shards[key.shard()]
+	shard.mu.Lock()
+	entry := shard.entries[key]
+	if entry == nil {
+		shard.mu.Unlock()
+		t.Fatal("reanchor() removed the shared FlowKey")
+	}
+	gotDeadline := entry.deadlineNs
+	shard.mu.Unlock()
+	if want := monoNsAt(survivorDeadline); gotDeadline != want {
+		t.Fatalf("reanchored deadline = %d, want surviving deadline %d", gotDeadline, want)
+	}
+	if got := scheduler.EntryCount(); got != 1 {
+		t.Fatalf("EntryCount after reanchor() = %d, want 1", got)
+	}
+	if got := scheduler.Metrics().FlushTotal; got != 0 {
+		t.Fatalf("FlushTotal after reanchor() = %d, want 0", got)
+	}
+}
+
 func TestMakeFlowKey_RejectsUnspecifiedIPs(t *testing.T) {
 	// 0.0.0.0 / :: would let a single flush wipe AC-wide kernel
 	// state if accidentally written to ipset; reject at boundary.

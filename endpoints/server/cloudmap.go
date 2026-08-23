@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -42,14 +43,20 @@ const (
 	// DefaultCloudMapOperationTimeout is the default timeout for Cloud Map API calls.
 	DefaultCloudMapOperationTimeout = 5 * time.Second
 
+	// DiscoverInstances has no continuation token and returns at most 100
+	// entries. A full page is therefore ambiguous and must not be treated as an
+	// authoritative fleet snapshot. Deployment keeps every cell below this cap.
+	cloudMapDiscoverMaxResults int32 = 100
+
 	// Cloud Map instance attribute keys — shared between registerWithCloudMap (writer)
 	// and refreshInstancesCache (reader).
-	CloudMapAttrIPv4 = "AWS_INSTANCE_IPV4"
-	CloudMapAttrIP   = "ip" // fallback IP attribute
-	CloudMapAttrAZ   = "AVAILABILITY_ZONE"
-	CloudMapAttrPort = "NHP_PORT"
-	CloudMapAttrKey  = "PUBLIC_KEY"
-	CloudMapAttrASG  = "ASG_NAME"
+	CloudMapAttrIPv4     = "AWS_INSTANCE_IPV4"
+	CloudMapAttrIP       = "ip" // fallback IP attribute
+	CloudMapAttrAZ       = "AVAILABILITY_ZONE"
+	CloudMapAttrPort     = "NHP_PORT"
+	CloudMapAttrHTTPPort = "HTTP_PORT"
+	CloudMapAttrKey      = "PUBLIC_KEY"
+	CloudMapAttrASG      = "ASG_NAME"
 )
 
 // HealthChecker is the interface for checking server health.
@@ -117,7 +124,7 @@ func (c CloudMapConfig) GetOperationTimeout() time.Duration {
 //
 // Implements the HealthChecker interface.
 type CloudMapClient struct {
-	client           *servicediscovery.Client
+	client           cloudMapAPI
 	namespaceName    string
 	serviceName      string
 	serviceID        string // srv-xxx for RegisterInstance
@@ -132,6 +139,16 @@ type CloudMapClient struct {
 
 	// Singleflight to deduplicate concurrent refresh requests
 	sfGroup singleflight.Group
+
+	// discoverFreshFn is a narrow test seam for exercising cache-staleness
+	// recovery without an AWS client. Production clients leave it nil.
+	discoverFreshFn func(context.Context) ([]ServerInfo, error)
+}
+
+type cloudMapAPI interface {
+	DiscoverInstances(context.Context, *servicediscovery.DiscoverInstancesInput, ...func(*servicediscovery.Options)) (*servicediscovery.DiscoverInstancesOutput, error)
+	RegisterInstance(context.Context, *servicediscovery.RegisterInstanceInput, ...func(*servicediscovery.Options)) (*servicediscovery.RegisterInstanceOutput, error)
+	DeregisterInstance(context.Context, *servicediscovery.DeregisterInstanceInput, ...func(*servicediscovery.Options)) (*servicediscovery.DeregisterInstanceOutput, error)
 }
 
 // Compile-time check that CloudMapClient implements HealthChecker
@@ -235,7 +252,7 @@ func (c *CloudMapClient) DiscoverServerInstances(ctx context.Context) ([]ServerI
 
 	// Cache miss - refresh via singleflight
 	result, err, _ := c.sfGroup.Do("refresh-instances", func() (any, error) {
-		return c.refreshInstancesCache()
+		return c.refreshInstancesCache(ctx, false)
 	})
 	if err != nil {
 		return nil, err
@@ -250,30 +267,83 @@ func (c *CloudMapClient) DiscoverServerInstances(ctx context.Context) ([]ServerI
 	return out, nil
 }
 
+// DiscoverServerInstancesFresh bypasses a still-valid cache under a separate
+// singleflight key. Fleet-close fanout uses this on retry, and the receiver
+// uses it once after a membership miss, because the ordinary 30-second cache
+// TTL is as long as the entire close event. The force refresh is serialized by
+// instancesMu with ordinary refreshes and therefore wins with the newest
+// completed snapshot rather than racing an older cache write.
+func (c *CloudMapClient) DiscoverServerInstancesFresh(ctx context.Context) ([]ServerInfo, error) {
+	if c == nil {
+		return nil, errors.New("cloud map client is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.discoverFreshFn != nil {
+		instances, err := c.discoverFreshFn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]ServerInfo, len(instances))
+		copy(out, instances)
+		return out, nil
+	}
+	result, err, _ := c.sfGroup.Do("force-refresh-instances", func() (any, error) {
+		return c.refreshInstancesCache(ctx, true)
+	})
+	if err != nil {
+		return nil, err
+	}
+	instances, ok := result.([]ServerInfo)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type %T from force-refresh-instances", result)
+	}
+	out := make([]ServerInfo, len(instances))
+	copy(out, instances)
+	return out, nil
+}
+
 // refreshInstancesCache fetches full server instance details from Cloud Map.
-func (c *CloudMapClient) refreshInstancesCache() ([]ServerInfo, error) {
+func (c *CloudMapClient) refreshInstancesCache(ctx context.Context, force bool) ([]ServerInfo, error) {
 	c.instancesMu.Lock()
 	defer c.instancesMu.Unlock()
 
-	if time.Now().Before(c.instancesExpiry) && c.cachedInstances != nil {
+	if !force && time.Now().Before(c.instancesExpiry) && c.cachedInstances != nil {
 		return c.cachedInstances, nil
 	}
 
-	fetchCtx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
+	if c.client == nil {
+		return nil, errors.New("cloud map discovery client is unavailable")
+	}
+	timeout := c.operationTimeout
+	if timeout <= 0 {
+		timeout = DefaultCloudMapOperationTimeout
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	result, err := c.client.DiscoverInstances(fetchCtx, &servicediscovery.DiscoverInstancesInput{
 		NamespaceName: aws.String(c.namespaceName),
 		ServiceName:   aws.String(c.serviceName),
 		HealthStatus:  sdtypes.HealthStatusFilterHealthy,
+		MaxResults:    aws.Int32(cloudMapDiscoverMaxResults),
 	})
 	if err != nil {
 		log.Warning("Cloud Map DiscoverInstances (full) failed: %v", err)
 		return nil, fmt.Errorf("cloud map discovery failed: %w", err)
 	}
 
-	var servers []ServerInfo
+	if len(result.Instances) >= int(cloudMapDiscoverMaxResults) {
+		return nil, fmt.Errorf("cloud map discovery returned the maximum %d instances; snapshot may be truncated", cloudMapDiscoverMaxResults)
+	}
+
+	serversByID := make(map[string]ServerInfo, len(result.Instances))
 	for _, inst := range result.Instances {
+		instanceID := aws.ToString(inst.InstanceId)
+		if instanceID == "" {
+			return nil, errors.New("cloud map discovery returned an instance without an ID")
+		}
 		ip := inst.Attributes[CloudMapAttrIPv4]
 		if ip == "" {
 			ip = inst.Attributes[CloudMapAttrIP]
@@ -288,18 +358,36 @@ func (c *CloudMapClient) refreshInstancesCache() ([]ServerInfo, error) {
 				port = p
 			}
 		}
+		httpPort := 0
+		if portStr, ok := inst.Attributes[CloudMapAttrHTTPPort]; ok {
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
+				httpPort = p
+			}
+		}
 
 		srv := ServerInfo{
-			ID:         aws.ToString(inst.InstanceId),
+			ID:         instanceID,
 			IP:         ip,
 			InternalIP: ip, // Cloud Map registers VPC IPs
 			AZ:         inst.Attributes[CloudMapAttrAZ],
 			Port:       port,
+			HTTPPort:   httpPort,
 			PubKey:     inst.Attributes[CloudMapAttrKey],
 			ASGName:    inst.Attributes[CloudMapAttrASG],
 		}
-		servers = append(servers, srv)
+		if prior, exists := serversByID[instanceID]; exists {
+			if prior != srv {
+				return nil, fmt.Errorf("cloud map discovery returned conflicting rows for instance %s", instanceID)
+			}
+			continue
+		}
+		serversByID[instanceID] = srv
 	}
+	servers := make([]ServerInfo, 0, len(serversByID))
+	for _, server := range serversByID {
+		servers = append(servers, server)
+	}
+	sort.Slice(servers, func(i, j int) bool { return servers[i].ID < servers[j].ID })
 
 	c.cachedInstances = servers
 	c.instancesExpiry = time.Now().Add(c.cacheTTL)
@@ -337,8 +425,8 @@ func (c *CloudMapClient) RegisterInstanceAttributes(ctx context.Context, instanc
 }
 
 // DeregisterInstance removes this server from Cloud Map.
-// Called on graceful shutdown so peers stop forwarding to us immediately
-// instead of waiting for the 2s HTTP timeout per forward attempt.
+// Called on graceful shutdown so peers stop selecting this server for native
+// forwarding and fleet trust.
 func (c *CloudMapClient) DeregisterInstance(ctx context.Context, instanceID string) error {
 	if c.serviceID == "" {
 		return fmt.Errorf("cloud map service ID not configured")

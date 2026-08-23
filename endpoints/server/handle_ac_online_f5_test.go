@@ -58,7 +58,7 @@ func TestHandleACOnline_F5StrictReject_RejectsRevokedPubkey(t *testing.T) {
 
 	s := newF5TestServer(t, mem, true)
 
-	body, marshalErr := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "doesnt-matter-rejected-before-license-lookup"})
+	body, marshalErr := json.Marshal(readyACOnlineMsg(acId, "doesnt-matter-rejected-before-license-lookup"))
 	if marshalErr != nil {
 		t.Fatalf("marshal body: %v", marshalErr)
 	}
@@ -127,7 +127,7 @@ func TestHandleACOnline_F5StrictReject_NoLicenseRateLimiter(t *testing.T) {
 	// invariant is "F5 still rejects without a rate limiter."
 	s := newF5TestServer(t, mem, true)
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: ""})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, ""))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -226,7 +226,7 @@ func TestHandleACOnline_F5_BypassedInNonCloudMode(t *testing.T) {
 		storageConfig: &StorageConfig{Backend: StorageBackendEtcd},
 	}
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: ""})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, ""))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -309,7 +309,7 @@ func TestHandleACOnline_F5StrictReject_RejectsRevokedPubkeyOnExistingPeer(t *tes
 	// AFTER the AC was trusted.
 	s.acPeerMap[revokedPubkeyB64] = preexistingPeer
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "doesnt-matter"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "doesnt-matter"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -378,7 +378,7 @@ func TestHandleACOnline_F5StrictReject_NonRevokedPubkeyOnSameACIDPasses(t *testi
 
 	s := newF5TestServer(t, mem, true)
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "key-with-no-license-row"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "key-with-no-license-row"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -432,7 +432,7 @@ func TestHandleACOnline_F5PermitMode_AllowsRevokedPubkey(t *testing.T) {
 	// acPubkeyRevokeVerifyRequire intentionally false (permit mode).
 	s := newF5TestServer(t, mem, false)
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "key-with-no-license-row"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "key-with-no-license-row"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -515,7 +515,7 @@ func TestHandleACOnline_F5RateLimitHoist_SkipsLookupOnRateLimited(t *testing.T) 
 	// fencing. Empty LicenseKey would otherwise short-circuit
 	// validateACLicense at its missing-key branch, but we expect
 	// the rate-limit hoist to reject before that runs anyway.
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: ""})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, ""))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -616,7 +616,7 @@ func TestHandleACOnline_F5StrictReject_FeedsLicenseRateLimiter(t *testing.T) {
 		t.Fatalf("precondition: s.cloudMap = %v, want nil (F5 must be the reject point, not handleACServerAssignment)", s.cloudMap)
 	}
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "doesnt-matter"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "doesnt-matter"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -658,7 +658,7 @@ func TestHandleACOnline_F5PermitMode_StorageErrorEmitsLookupErr(t *testing.T) {
 	// acPubkeyRevokeVerifyRequire intentionally false (permit mode).
 	s := newF5TestServer(t, storage, false)
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "key-with-no-license-row"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "key-with-no-license-row"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -710,7 +710,7 @@ func TestHandleACOnline_F5StorageError_AllowsRegistration(t *testing.T) {
 
 	s := newF5TestServer(t, storage, true) // strict mode
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId, LicenseKey: "key-with-no-license-row"})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, "key-with-no-license-row"))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,

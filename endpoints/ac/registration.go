@@ -69,8 +69,9 @@ const (
 	// to refresh server peer state and validate server health. This is the primary
 	// mechanism for confirming server liveness — NHP_KPL is unidirectional and cannot
 	// confirm receipt. Only validated NHP_AOL responses update LastSeen.
-	// Set to 2 * KeepaliveInterval = 20 seconds.
-	RegistrationRefreshInterval = 2
+	// Set to every KeepaliveInterval (10 seconds). A successful authenticated
+	// AAK is the control-lease heartbeat; KPL never renews this lease.
+	RegistrationRefreshInterval = 1
 
 	// MaxServerDownReregBackoff caps circuit-breaker backoff when server-down
 	// re-registration keeps failing.
@@ -1051,6 +1052,10 @@ type ACRegistration struct {
 	// stopped prevents double Stop() calls from panicking (closing stopCh twice)
 	stopped atomic.Bool
 
+	// controlLeaseExpired coalesces one fail-closed session flush per episode
+	// where every authenticated server control is outside the 30-second lease.
+	controlLeaseExpired atomic.Bool
+
 	// serverDownReregFailures tracks consecutive failures of server-down triggered
 	// re-registration attempts (used for circuit-breaker backoff).
 	serverDownReregFailures atomic.Int32
@@ -1073,8 +1078,9 @@ type ACRegistration struct {
 	// startup, so we build once and reuse to avoid per-call aws.String allocations.
 	cachedACIdDim types.Dimension
 
-	// cachedAOLBytes is the pre-marshaled ACOnlineMsg. Config is immutable after
-	// startup, so we marshal once and reuse across register/connect/refresh calls.
+	// cachedAOLBytes is retained for construction-time validation and bare unit
+	// fixtures. Production sends call currentAOLBytes so a control-gap flush
+	// generation change is reflected on the very next authenticated AOL.
 	cachedAOLBytes []byte
 
 	// lastNLBRegistrationNano is a monotonic-ish (UnixNano) timestamp of
@@ -1128,6 +1134,38 @@ type ACRegistration struct {
 	// nlbReregistrationInterval. IMMUTABLE after NewACRegistration on
 	// the same terms (see comment above).
 	allUnconnectedThreshold uint32
+}
+
+func (r *ACRegistration) decodeCurrentSessionControlAAK(ppd *core.PacketParserData) (common.ServerACAckMsg, error) {
+	var aak common.ServerACAckMsg
+	if ppd == nil {
+		return aak, errors.New("nil NHP_AAK response")
+	}
+	if err := common.DecodeServerACAckMsg(ppd.BodyMessage, &aak); err != nil {
+		return aak, err
+	}
+	if common.IsSuccessErrCode(aak.ErrCode) {
+		if r == nil || r.ac == nil || !common.ValidNHPACBootID(r.ac.bootID) ||
+			aak.BootID != r.ac.bootID || aak.SessionFlushGeneration != r.ac.sessionFlushGeneration.Load() ||
+			ppd.SenderTrxId == 0 || aak.AOLTransactionID != ppd.SenderTrxId {
+			return aak, errors.New("NHP_AAK does not bind the current AC boot, flush generation, and AOL transaction")
+		}
+	}
+	return aak, nil
+}
+
+func (r *ACRegistration) acceptCurrentSessionControlAAK(aak *common.ServerACAckMsg) {
+	if r == nil || r.ac == nil || aak == nil {
+		return
+	}
+	r.ac.sessionControlFlushMu.Lock()
+	defer r.ac.sessionControlFlushMu.Unlock()
+	if !common.IsSuccessErrCode(aak.ErrCode) || !aak.Registered || !r.ac.sessionFlushComplete.Load() ||
+		aak.BootID != r.ac.bootID || aak.SessionFlushGeneration != r.ac.sessionFlushGeneration.Load() {
+		return
+	}
+	r.ac.sessionControlLeaseHeld.Store(true)
+	r.controlLeaseExpired.Store(false)
 }
 
 // resolveRegion mirrors the AWS SDK's region resolution chain (AWS_REGION
@@ -1223,11 +1261,14 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 
 	// Marshal ACOnlineMsg once — config is immutable after startup.
 	aolMsg := &common.ACOnlineMsg{
-		ACId:          ac.config.ACId,
-		AuthServiceId: ac.config.AuthServiceId,
-		ResourceIds:   ac.config.ResourceIds,
-		LicenseKey:    ac.config.LicenseKey,
-		ACVersion:     ac.config.ACVersion,
+		ACId:                   ac.config.ACId,
+		AuthServiceId:          ac.config.AuthServiceId,
+		ResourceIds:            ac.config.ResourceIds,
+		LicenseKey:             ac.config.LicenseKey,
+		ACVersion:              ac.config.ACVersion,
+		BootID:                 ac.bootID,
+		SessionFlushGeneration: ac.sessionFlushGeneration.Load(),
+		SessionFlushComplete:   ac.sessionFlushComplete.Load(),
 	}
 	aolBytes, err := json.Marshal(aolMsg)
 	if err != nil {
@@ -1260,6 +1301,27 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 			Dimensions: dims,
 		}),
 	}, nil
+}
+
+func (r *ACRegistration) currentAOLBytes() ([]byte, error) {
+	if r == nil || r.ac == nil || r.ac.config == nil {
+		return nil, errors.New("AC registration is not initialized")
+	}
+	msg := &common.ACOnlineMsg{
+		ACId:                   r.ac.config.ACId,
+		AuthServiceId:          r.ac.config.AuthServiceId,
+		ResourceIds:            r.ac.config.ResourceIds,
+		LicenseKey:             r.ac.config.LicenseKey,
+		ACVersion:              r.ac.config.ACVersion,
+		BootID:                 r.ac.bootID,
+		SessionFlushGeneration: r.ac.sessionFlushGeneration.Load(),
+		SessionFlushComplete:   r.ac.sessionFlushComplete.Load(),
+	}
+	if msg.BootID != "" && (!common.ValidNHPACBootID(msg.BootID) ||
+		msg.SessionFlushGeneration == 0 || !msg.SessionFlushComplete) {
+		return nil, errors.New("AC session-control state is not ready for registration")
+	}
+	return json.Marshal(msg)
 }
 
 // resilienceJitterFactor returns a deterministic value in the inclusive
@@ -2082,12 +2144,9 @@ func (r *ACRegistration) register() error {
 
 	log.Info("Registering AC %s via endpoint %s (resolved to %s)", r.ac.config.ACId, r.ac.config.ServerEndpoint, sendAddr.String())
 
-	// Use pre-marshaled AOL bytes (config is immutable after startup).
-	// cachedAOLBytes is set by NewACRegistration, which returns an error on
-	// marshal failure. A nil value here means a bug in the construction path.
-	// Intentional panic: this is a programming error, not a runtime condition.
-	if r.cachedAOLBytes == nil {
-		panic("BUG: cachedAOLBytes is nil — NewACRegistration should have returned an error")
+	aolBytes, err := r.currentAOLBytes()
+	if err != nil {
+		return err
 	}
 
 	// Add peer to device for encryption
@@ -2110,7 +2169,7 @@ func (r *ACRegistration) register() error {
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        registrationPeer.PublicKey(),
-		Message:       r.cachedAOLBytes,
+		Message:       aolBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -2249,10 +2308,10 @@ func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParser
 
 	case core.NHP_AAK:
 		// Server responded with ACK - this server is assigned to us
-		var aakMsg common.ServerACAckMsg
-		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+		aakMsg, decodeErr := r.decodeCurrentSessionControlAAK(ppd)
+		if decodeErr != nil {
 			r.removeTransientPeer(registrationPeer)
-			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
+			return fmt.Errorf("failed to parse NHP_AAK: %w", decodeErr)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
@@ -2368,6 +2427,7 @@ func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParser
 			r.registrationPeer = serverPeer
 			r.mu.Unlock()
 			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept but no keepalive)", aakMsg.ACAddr, aakMsg.Registered)
+			r.acceptCurrentSessionControlAAK(&aakMsg)
 
 			// Send registration success metric
 			r.recordRegistrationSuccess(dimValDirect)
@@ -2440,6 +2500,7 @@ func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParser
 				r.mu.Unlock()
 				log.Warning("Failed to connect to assigned peers (%v), keeping response peer %s", err, serverPeer.Host())
 				r.recordRegistrationSuccess(dimValDirect)
+				r.acceptCurrentSessionControlAAK(&aakMsg)
 				return nil
 			}
 
@@ -2452,6 +2513,7 @@ func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParser
 			}
 
 			r.recordRegistrationSuccess(dimValPeerRedispatch)
+			r.acceptCurrentSessionControlAAK(&aakMsg)
 			return nil
 		}
 
@@ -2519,6 +2581,7 @@ func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParser
 
 		// Send registration success metric
 		r.recordRegistrationSuccess(dimValDirect)
+		r.acceptCurrentSessionControlAAK(&aakMsg)
 
 		return nil
 
@@ -2838,7 +2901,11 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	}
 	server.Peer = peer
 
-	// Send NHP_AOL to register with this server (use cached bytes)
+	aolBytes, err := r.currentAOLBytes()
+	if err != nil {
+		return err
+	}
+	// Send NHP_AOL to register with this server.
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
@@ -2851,7 +2918,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        peer.PublicKey(),
-		Message:       r.cachedAOLBytes,
+		Message:       aolBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -2900,11 +2967,11 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 			return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 		}
 
-		var aakMsg common.ServerACAckMsg
-		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+		aakMsg, decodeErr := r.decodeCurrentSessionControlAAK(ppd)
+		if decodeErr != nil {
 			r.removeAssignmentPeer(peer)
 			server.Peer = nil
-			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
+			return fmt.Errorf("failed to parse NHP_AAK: %w", decodeErr)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
@@ -2915,6 +2982,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 
 		server.SetConnected(true)
 		server.UpdateLastSeen()
+		r.acceptCurrentSessionControlAAK(&aakMsg)
 		log.Info("Connected to assigned server %s:%d (ACAddr=%s)", server.Target.IP, server.Target.Port, aakMsg.ACAddr)
 		return nil
 	}
@@ -2962,7 +3030,8 @@ func (r *ACRegistration) keepaliveLoop() {
 			// continues sending keep-alives successfully (UDP works).
 			// By re-sending NHP_AOL periodically, we ensure the server always
 			// has our peer state.
-			// Note: tickCount is incremented before the check, so first refresh happens after 6 ticks (60s).
+			// tickCount is incremented before the check, so with the current
+			// interval the first authenticated refresh happens after 10 seconds.
 			if tickCount >= RegistrationRefreshInterval {
 				tickCount = 0
 				r.refreshAssignedServerRegistrations()
@@ -3075,6 +3144,11 @@ func (r *ACRegistration) refreshAssignedServerRegistrations() {
 
 // refreshSingleServer sends NHP_AOL to a single assigned server to refresh registration.
 func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *net.UDPAddr) {
+	aolBytes, err := r.currentAOLBytes()
+	if err != nil {
+		log.Warning("Cannot refresh AC registration before session-control readiness: %v", err)
+		return
+	}
 	// Create message data for sending (use cached AOL bytes)
 	// Use buffered channel to prevent sender from blocking if we timeout
 	md := &core.MsgData{
@@ -3084,7 +3158,7 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        server.Peer.PublicKey(),
-		Message:       r.cachedAOLBytes,
+		Message:       aolBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -3129,9 +3203,9 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 	switch ppd.HeaderType {
 	case core.NHP_AAK:
 		// Server acknowledged - peer state refreshed
-		var aakMsg common.ServerACAckMsg
-		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
-			log.Warning("Failed to parse refresh NHP_AAK from %s: %v", sendAddr.String(), err)
+		aakMsg, decodeErr := r.decodeCurrentSessionControlAAK(ppd)
+		if decodeErr != nil {
+			log.Warning("Failed to parse refresh NHP_AAK from %s: %v", sendAddr.String(), decodeErr)
 			return
 		}
 
@@ -3156,6 +3230,7 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 			}
 
 			server.UpdateLastSeen()
+			r.acceptCurrentSessionControlAAK(&aakMsg)
 			log.Debug("Refreshed registration with server %s", sendAddr.String())
 		} else {
 			log.Warning("Refresh rejected by server %s at %s: %s - %s", server.Target.IP, sendAddr.String(), aakMsg.ErrCode, aakMsg.ErrMsg)
@@ -3295,6 +3370,10 @@ func (r *ACRegistration) checkServerHealth() {
 	if downConnectedCount != connectedCount {
 		return
 	}
+	if err := r.expireSessionControlLease(); err != nil {
+		log.Error("All authenticated server controls expired and NHP session cleanup is incomplete: %v", err)
+		return
+	}
 
 	if cooldownUntil := time.Unix(0, r.serverDownReregCooldownUntil.Load()); time.Now().Before(cooldownUntil) {
 		log.Warning("All %d connected servers appear down, but re-registration is in backoff until %s", connectedCount, cooldownUntil.Format(time.RFC3339))
@@ -3323,6 +3402,17 @@ func (r *ACRegistration) checkServerHealth() {
 	} else if firstDownServer != nil {
 		log.Debug("Server %s appears down but re-registration already in progress", firstDownServer.Target.IP)
 	}
+}
+
+func (r *ACRegistration) expireSessionControlLease() error {
+	if !r.controlLeaseExpired.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := r.ac.flushLiveNHPSessionsForControlGap(); err != nil {
+		r.controlLeaseExpired.Store(false)
+		return err
+	}
+	return nil
 }
 
 // handleServerDown handles when assigned-server health degrades enough to
@@ -3595,6 +3685,10 @@ func (r *ACRegistration) checkAllUnconnected() {
 	}
 
 	if newTicks < r.allUnconnectedThreshold {
+		return
+	}
+	if err := r.expireSessionControlLease(); err != nil {
+		log.Error("All server controls remain unconnected and NHP session cleanup is incomplete: %v", err)
 		return
 	}
 

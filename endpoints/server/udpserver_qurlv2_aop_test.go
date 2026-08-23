@@ -34,7 +34,7 @@ func TestStampQurlV2RevocationMetadata_FromResourceData(t *testing.T) {
 	res := &common.ResourceData{
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
-		SessionId:             "sess_live_1",
+		QurlSessionId:         "sess_live_1",
 		AdmissionId:           "adm_test123",
 		Deadline:              1781910300,
 	}
@@ -48,8 +48,8 @@ func TestStampQurlV2RevocationMetadata_FromResourceData(t *testing.T) {
 	if aop.ResourcePublicKeyHash != "d4e5f6" {
 		t.Errorf("ResourcePublicKeyHash = %q, want %q", aop.ResourcePublicKeyHash, "d4e5f6")
 	}
-	if aop.SessionId != "sess_live_1" {
-		t.Errorf("SessionId = %q, want %q (carried on the authorize/re-knock path)", aop.SessionId, "sess_live_1")
+	if aop.QurlSessionId != "sess_live_1" {
+		t.Errorf("QurlSessionId = %q, want %q (carried on the authorize/re-knock path)", aop.QurlSessionId, "sess_live_1")
 	}
 	if aop.AdmissionId != "adm_test123" {
 		t.Errorf("AdmissionId = %q, want %q", aop.AdmissionId, "adm_test123")
@@ -73,7 +73,7 @@ func TestStampQurlV2RevocationMetadata_NilResource(t *testing.T) {
 
 	if aop.QurlUserPublicKeyHash != "" || aop.ResourcePublicKeyHash != "" ||
 		aop.AdmissionId != "" || aop.Deadline != 0 ||
-		aop.SessionId != "" || aop.RevocationEpoch != 0 {
+		aop.QurlSessionId != "" || aop.RevocationEpoch != 0 {
 		t.Errorf("nil res must leave all qURL v2 AOP fields zero, got %#v", aop)
 	}
 }

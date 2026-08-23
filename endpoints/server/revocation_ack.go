@@ -10,9 +10,13 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
-// HandleRevocationAck processes a single NHP_RVA packet: an AC's
-// proof-of-delivery acknowledgement of an NHP_REV the server fanned out (P4e
-// Slice 3, #2793). It unmarshals the ACRevocationAckMsg, resolves the acking
+// HandleRevocationAck processes a single NHP_RVA packet. A body carrying the
+// session-close kind is first routed through the strict pre-publication AOL
+// waiter: that path binds the authenticated key, exact ConnData, durable event
+// selector, boot, and flush generation without consulting acConnectionMap.
+// NHP_REV/NHP_RVA is a push/ack protocol, not a core LocalTransaction.
+// Kind absence enters the generic qURL proof-of-delivery path below. It
+// unmarshals the ACRevocationAckMsg, resolves the acking
 // AC slot identity from the cryptographically-authenticated connection pubkey
 // (NOT a body field), and clears that slot's pending-revoke tracker for the
 // acked (scope, scope_key) at or below the acked epoch — which stops the
@@ -54,6 +58,9 @@ import (
 // (proof-of-delivery metric), but there is no pending tracker to clear. The
 // engine is armed by NHP_REVOCATION_RETRY_ENABLED — see revocation_retry.go.
 func (s *UdpServer) HandleRevocationAck(ppd *core.PacketParserData) error {
+	if handled, err := s.handleACSessionControlFenceAck(ppd); handled || err != nil {
+		return err
+	}
 	ackMsg := &common.ACRevocationAckMsg{}
 	if err := json.Unmarshal(ppd.BodyMessage, ackMsg); err != nil {
 		log.Error("[Server][HandleRevocationAck] failed to parse NHP_RVA message: %v", err)

@@ -77,6 +77,31 @@ create_table() {
     --billing-mode PAY_PER_REQUEST >/dev/null
 }
 
+# Create the composite-key durable session-control table plus its KEYS_ONLY
+# due-work GSI. Correctness uses strong base-table PK/SK reads; the GSI exists
+# only so the bounded recovery worker can discover due rows in the same shape
+# as the cloud deployment.
+create_session_control_table() {
+  local name="nhp-session-control"
+  if ddb describe-table --table-name "$name" >/dev/null 2>&1; then
+    echo "  table $name already exists"
+    return 0
+  fi
+  echo "  creating table $name (pk=pk, sk=sk, gsi=due-index)"
+  ddb create-table \
+    --table-name "$name" \
+    --attribute-definitions \
+      AttributeName=pk,AttributeType=S \
+      AttributeName=sk,AttributeType=S \
+      AttributeName=due_shard,AttributeType=S \
+      AttributeName=due_sort,AttributeType=S \
+    --key-schema \
+      AttributeName=pk,KeyType=HASH \
+      AttributeName=sk,KeyType=RANGE \
+    --global-secondary-indexes '[{"IndexName":"due-index","KeySchema":[{"AttributeName":"due_shard","KeyType":"HASH"},{"AttributeName":"due_sort","KeyType":"RANGE"}],"Projection":{"ProjectionType":"KEYS_ONLY"}}]' \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+}
+
 # Seed an active, never-expiring license so the cloud-mode AC license check
 # passes (permit mode accepts an unbound license, so no pubkey allowlist is
 # needed). Idempotent: put-item overwrites.
@@ -140,6 +165,7 @@ up() {
   create_table "nhp-ac-assignments" "ac_id"
   create_table "nhp-licenses" "license_key_sha256"
   create_table "nhp-resources" "resource_id"
+  create_session_control_table
   seed_license
 
   echo "smoke-local-stack: building + starting nhp-server (first build is slow)..."

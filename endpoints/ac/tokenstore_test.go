@@ -849,7 +849,7 @@ func TestAccessEntry_JSONOmitsQurlV2Metadata(t *testing.T) {
 		OpenTime:              60,
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
-		SessionId:             "sess_123",
+		QurlSessionId:         "sess_123",
 		AdmissionId:           "adm_test123",
 		RevocationEpoch:       42,
 		Deadline:              1781910300,
@@ -865,7 +865,7 @@ func TestAccessEntry_JSONOmitsQurlV2Metadata(t *testing.T) {
 	for _, field := range []string{
 		"QurlUserPublicKeyHash",
 		"ResourcePublicKeyHash",
-		"SessionId",
+		"QurlSessionId",
 		"AdmissionId",
 		"RevocationEpoch",
 		"Deadline",
@@ -1811,6 +1811,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_OwnsAndIsCancelable(t *testing.T) {
 
 	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		&common.AgentUser{UserId: "u-temp-nat"},
 		[]*common.NetAddress{{Ip: tempAccessAolIP}},
 		dstAddrs,
@@ -1874,6 +1875,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_TempEntryExpiryDoesNotCancel(t *test
 	// Long-lived owner mints + Schedules the flush, exactly as the
 	// rewired temp handler does.
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		tempEntry.User,
 		tempEntry.SrcAddrs,
 		dstAddrs,
@@ -1913,6 +1915,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_NaturalExpiryAfterFlushDeadline(t *t
 
 	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		&common.AgentUser{UserId: "u-temp-nat"},
 		[]*common.NetAddress{{Ip: tempAccessAolIP}},
 		dstAddrs,
@@ -1956,6 +1959,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_OneEntryOwnsAllTuples(t *testing.T) 
 		{Ip: "10.0.0.2", Port: 8443},
 	}
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		&common.AgentUser{UserId: "u-temp-nat"},
 		[]*common.NetAddress{{Ip: tempAccessAolIP}},
 		dstAddrs,
@@ -1998,6 +2002,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_NoSchedulerStoresNothing(t *testing.
 
 	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		&common.AgentUser{UserId: "u-temp-nat"},
 		[]*common.NetAddress{{Ip: tempAccessAolIP}},
 		dstAddrs,
@@ -2044,6 +2049,7 @@ func TestUdpAC_RegisterTempAccessFlushEntry_KeysOnNatIPNotSrcAddrs(t *testing.T)
 
 	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
 	flushEntry := a.registerTempAccessFlushEntry(
+		nil,
 		&common.AgentUser{UserId: "u-temp-nat"},
 		[]*common.NetAddress{{Ip: tempAccessAolIP}},
 		dstAddrs,

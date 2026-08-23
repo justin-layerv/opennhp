@@ -52,7 +52,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,12 +86,9 @@ const (
 	// not an auth decision.
 	maxForwardHops = 2
 
-	// forwardHopFleetCacheTTL throttles Cloud Map discovery for the trust
-	// anchor. Chosen as 30s independently of (but equal to)
-	// httpForwardHealthDecay — both are "one health-decay window", so a
-	// newly-joined server becomes a trusted forwarder within roughly the
-	// same window it becomes a forward target. They are not code-coupled;
-	// if one is retuned the other need not follow.
+	// forwardHopFleetCacheTTL throttles Cloud Map discovery for the receiver
+	// trust anchor. A newly joined rolling-overlap sender becomes trusted within
+	// roughly one fleet-health window.
 	forwardHopFleetCacheTTL = 30 * time.Second
 
 	// forwardHopFleetErrorRetry is how soon discovery is retried after a
@@ -137,41 +133,6 @@ var (
 	errForwardHopECDHFailed  = errors.New("forward hop attest: ECDH derivation failed")
 	errForwardHopBadMAC      = errors.New("forward hop attest: MAC mismatch")
 )
-
-// forwardHopCtxKey carries the verified incoming hop count from the
-// receiving handler down to the forwarder (which emits incoming+1). A
-// distinct unexported key type avoids context-value collisions.
-//
-// Why a context value rather than an explicit parameter: the hop must
-// travel handleInternalKnock → handleHttpOpenResource → ForwardHttpKnock
-// → forwardToServer. handleHttpOpenResource is the shared knock handler
-// reached from several entry points (agent UDP knock, direct HTTP knock)
-// that have no hop concept; threading an explicit `hop int` through it
-// would force every unrelated caller to pass 0. Instead the value rides
-// the request's own context.Context — the channel handleHttpOpenResource
-// already consumes (`ctx := req.Ctx`). This is request-scoped processing
-// state on the existing context, not a new context-in-struct anti-pattern
-// (req.Ctx already holds the context regardless).
-type forwardHopCtxKeyType struct{}
-
-var forwardHopCtxKey = forwardHopCtxKeyType{}
-
-func contextWithForwardHop(ctx context.Context, hop int) context.Context {
-	return context.WithValue(ctx, forwardHopCtxKey, hop)
-}
-
-// forwardHopFromContext returns the verified incoming hop (0 if absent —
-// the origin case). 0 is the safe default: a request with no recorded
-// hop is treated as an origin, so the next forward becomes hop 1.
-func forwardHopFromContext(ctx context.Context) int {
-	if ctx == nil {
-		return 0
-	}
-	if v, ok := ctx.Value(forwardHopCtxKey).(int); ok {
-		return v
-	}
-	return 0
-}
 
 // forwardHopReqBind returns the canonical hex identity of a knock,
 // binding an attestation to THIS specific request so a compromised peer
@@ -257,37 +218,6 @@ func forwardHopMACKey(ecdhSecret []byte) []byte {
 	return m.Sum(nil)
 }
 
-// buildForwardHopAttestation produces the signed hop attestation a
-// forwarding server attaches to an outgoing /nhp/internal/knock. selfEcdh
-// is this server's static keypair; peerPubB64 is the base64 NHP pubkey of
-// the target server (from its ServerInfo); source is the envelope Source
-// being sent (empty for a server-to-server hop). The MAC is computed under
-// the per-pair key derived from ECDH(selfPriv, peerPub).
-func buildForwardHopAttestation(selfEcdh core.Ecdh, selfPubB64, peerPubB64 string, hop int, now time.Time, source string, req *common.HttpKnockRequest) (*ForwardHopAttestation, error) {
-	if selfEcdh == nil {
-		return nil, fmt.Errorf("forward hop attest: nil self ecdh")
-	}
-	if selfPubB64 == "" {
-		return nil, fmt.Errorf("forward hop attest: empty self pubkey")
-	}
-	peerPub, err := base64.StdEncoding.DecodeString(peerPubB64)
-	if err != nil {
-		return nil, fmt.Errorf("forward hop attest: decode peer pubkey: %w", err)
-	}
-	macKey := forwardHopMACKey(selfEcdh.SharedSecret(peerPub))
-	if macKey == nil {
-		return nil, errForwardHopECDHFailed
-	}
-	ts := now.Unix()
-	mac := internalauth.ComputeHMACHex(macKey, forwardHopSigningString(selfPubB64, hop, ts, source, forwardHopReqBind(req)))
-	return &ForwardHopAttestation{
-		SenderPubKey: selfPubB64,
-		Hop:          hop,
-		Timestamp:    ts,
-		MAC:          mac,
-	}, nil
-}
-
 // verifyForwardHopAttestation checks a received hop attestation against
 // the receiver's own key (selfEcdh) and the set of known fleet pubkeys.
 // Returns nil iff the attestation is well-formed, within the hop ceiling,
@@ -356,25 +286,13 @@ func verifyForwardHopAttestation(selfEcdh core.Ecdh, att *ForwardHopAttestation,
 	return nil
 }
 
-// initForwardHopAttestation wires both sides of cross-server hop attestation
-// (issue #1127) from the UdpServer: the SENDER (forwarder signs outgoing hops
-// with this server's NHP identity) and the RECEIVER (the fleetTrust anchor
-// over Cloud Map). It no-ops without a device keypair — the legacy/local
-// posture, in which both signing and verification stay disabled. Called from
-// Start after the forwarder is constructed; the forwarder side is skipped if
-// no forwarder exists (no storage backend).
-//
-// Extracted from Start so the wiring is directly unit-testable
-// (TestInitForwardHopAttestation): a refactor that dropped one side would
-// silently disable the gate, surfacing only as permanently-flat
-// ForwardHopAttest* metrics — the quietest possible failure for a security
-// control.
+// initForwardHopAttestation builds the receiver trust anchor for historical
+// server-to-server HTTP envelopes during rollout overlap. Direct HTTP
+// forwarding is retired, so this server no longer wires an outbound signer.
+// It no-ops without a device keypair or Cloud Map fleet registry.
 func (hs *HttpServer) initForwardHopAttestation(us *UdpServer) {
 	if us == nil || us.device == nil {
 		return
-	}
-	if hs.httpForwarder != nil {
-		hs.httpForwarder.EnableForwardHopAttestation(us.device.GetEcdhByCipherScheme(0), us.device.PublicKeyBase64())
 	}
 	if us.cloudMap != nil {
 		// Method values close over us.cloudMap / us.device, both fixed for

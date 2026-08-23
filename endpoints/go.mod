@@ -25,7 +25,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/layervai/nhp/internalauth v0.2.0
-	github.com/layervai/qurl-conformance v0.12.7-0.20260820232730-daba31877fb6
+	github.com/layervai/qurl-conformance v0.13.0
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pion/webrtc/v4 v4.2.18

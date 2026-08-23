@@ -107,6 +107,25 @@ type ACAssignment struct {
 	// ACAssignment{RevokedPubKeys: []string{}} save still round-trips
 	// as nil. #1536's CLI normalizes on the operator-tooling side too.
 	RevokedPubKeys []string `json:"revoked_pubkeys,omitempty" dynamodbav:"revoked_pubkeys,omitempty,stringset"`
+
+	// SessionControlTargets is the authoritative bounded set of AC process
+	// boots that may own NHP access rules for this AC ID. A target remains
+	// required when its live control connection disappears; membership changes
+	// only when the same authenticated AC static key reports a completed newer
+	// boot flush, or through an explicit control-plane decommission.
+	SessionControlTargets []ACSessionControlTarget `json:"session_control_targets,omitempty" dynamodbav:"session_control_targets,omitempty"`
+}
+
+// ACSessionControlTarget identifies one fail-closed AC process boot. PublicKey
+// is the authenticated Curve25519 static key in canonical standard base64;
+// BootID is a per-process random identity and FlushGeneration is monotonic
+// within that boot.
+type ACSessionControlTarget struct {
+	PublicKey       string `json:"public_key" dynamodbav:"public_key"`
+	BootID          string `json:"boot_id" dynamodbav:"boot_id"`
+	FlushGeneration uint64 `json:"flush_generation" dynamodbav:"flush_generation"`
+	RegisteredAt    int64  `json:"registered_at" dynamodbav:"registered_at"`
+	LastSeen        int64  `json:"last_seen" dynamodbav:"last_seen"`
 }
 
 // Clone returns a copy of the assignment, safe to mutate without
@@ -125,6 +144,10 @@ func (a *ACAssignment) Clone() *ACAssignment {
 	if a.AssignedServers != nil {
 		clone.AssignedServers = make([]ServerInfo, len(a.AssignedServers))
 		copy(clone.AssignedServers, a.AssignedServers)
+	}
+	if a.SessionControlTargets != nil {
+		clone.SessionControlTargets = make([]ACSessionControlTarget, len(a.SessionControlTargets))
+		copy(clone.SessionControlTargets, a.SessionControlTargets)
 	}
 	// Normalize empty → nil per the RevokedPubKeys construction
 	// contract above. The `clone := *a` above shallow-copies the
@@ -146,6 +169,7 @@ type ServerInfo struct {
 	InternalIP string `json:"internal_ip,omitempty" dynamodbav:"internal_ip,omitempty"` // VPC IP for server-to-server forwarding
 	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`                   // Availability Zone
 	Port       int    `json:"port" dynamodbav:"port"`                                   // NHP UDP port (default 62206)
+	HTTPPort   int    `json:"http_port,omitempty" dynamodbav:"http_port,omitempty"`     // Direct private HTTP port for authenticated fleet control
 	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"`         // Server's public key (for forwarding)
 	ASGName    string `json:"asg_name,omitempty" dynamodbav:"asg_name,omitempty"`       // ASG name for blue/green filtering
 }
@@ -392,7 +416,11 @@ type DynamoDBConfig struct {
 	// /nhp/internal/token/validate reads it on a local tokenStore miss
 	// so validation works across a multi-server fleet.
 	AckTokensTable string `toml:"AckTokensTable"`
-	Endpoint       string `toml:"Endpoint,omitempty"` // For local development
+	// SessionControlTable holds non-expiring authority plus durable session,
+	// close-operation, and per-target recovery rows. Pending rows never rely on
+	// DynamoDB TTL for correctness; recovery reads the base PK/SK strongly.
+	SessionControlTable string `toml:"SessionControlTable"`
+	Endpoint            string `toml:"Endpoint,omitempty"` // For local development
 }
 
 // EtcdStorageConfig configures the etcd storage backend.
@@ -426,10 +454,11 @@ func DefaultStorageConfig() StorageConfig {
 	return StorageConfig{
 		Backend: "dynamodb",
 		DynamoDB: DynamoDBConfig{
-			Region:             "us-east-2",
-			LicensesTable:      "nhp-licenses",
-			ACAssignmentsTable: "nhp-ac-assignments",
-			ResourcesTable:     "nhp-resources",
+			Region:              "us-east-2",
+			LicensesTable:       "nhp-licenses",
+			ACAssignmentsTable:  "nhp-ac-assignments",
+			ResourcesTable:      "nhp-resources",
+			SessionControlTable: "nhp-session-control",
 		},
 		Cache: CacheConfig{
 			MaxEntries:         10000,
@@ -476,9 +505,8 @@ func NewCachedStorage(backend StorageBackend, config CacheConfig) *CachedStorage
 // would race the F4/F5 registration kernels reading the cached entry on
 // a concurrent AOL (#1540). The cost is one Clone per call — a shallow
 // struct copy plus small slice copies — immaterial next to the work each
-// call fronts: a storage round-trip on a cache miss, and on the forward
-// path (http_forward.go, udpserver.go) the cross-server forward
-// round-trip. Those forward lookups do run per knock that needs
+// call fronts: a storage round-trip on a cache miss, and on the native forward
+// path the cross-server round-trip. Those forward lookups do run per knock that needs
 // forwarding, but prod forward traffic is sparse and the registration
 // kernels are periodic, so the rate is low regardless.
 func (cs *CachedStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {

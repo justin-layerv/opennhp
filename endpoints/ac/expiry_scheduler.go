@@ -904,6 +904,161 @@ func (s *Scheduler) RescheduleEarlier(key FlowKey, deadline time.Time) {
 	s.scheduleEntry(key, deadline, true)
 }
 
+// FlushNowAndWait takes authoritative per-key ownership through the same
+// inFlight barrier used by Schedule and the natural-expiry worker. A caller may
+// supply a preFlush hook for established-flow teardown; the hook and coarse
+// flusher both run while new scheduling for this key is blocked. On failure the
+// key is reinserted at its prior deadline (or the next tick when no prior entry
+// existed), preserving retry work instead of converting a failed close into an
+// empty-index success on the next control event.
+func (s *Scheduler) FlushNowAndWait(ctx context.Context, key FlowKey, preFlush func(context.Context, FlowKey) error) (err error) {
+	if s == nil || !s.started.Load() {
+		return errors.New("expiry scheduler is not running")
+	}
+	if s.dryRun.Load() {
+		return errors.New("authoritative flush cannot run in dry-run mode")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	shard := s.shards[key.shard()]
+	for {
+		shard.mu.Lock()
+		current := shard.entries[key]
+		if current == nil || current.inFlight == nil {
+			originalDeadline := nowMonoNs()
+			if current != nil {
+				originalDeadline = current.deadlineNs
+				current.gen.Store(0)
+				s.wheelMu.Lock()
+				s.unlinkLocked(current)
+				s.wheelMu.Unlock()
+			}
+			owned := &expiryEntry{FlowKey: key, deadlineNs: originalDeadline, authoritativeFlush: true, inFlight: make(chan struct{})}
+			owned.gen.Store(s.genCounter.Add(1))
+			shard.entries[key] = owned
+			if current == nil {
+				s.metricEntries.Add(1)
+			}
+			shard.mu.Unlock()
+
+			flushCtx, cancel := context.WithTimeout(ctx, s.flushCallTimeout)
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						err = fmt.Errorf("authoritative flush panic: %v", recovered)
+					}
+				}()
+				if preFlush != nil {
+					if hookErr := preFlush(flushCtx, key); hookErr != nil {
+						err = hookErr
+						return
+					}
+				}
+				if flushErr := s.flusher.Flush(withAuthoritativeFlush(flushCtx), key); flushErr != nil {
+					err = flushErr
+				}
+			}()
+			cancel()
+
+			shard.mu.Lock()
+			done := owned.inFlight
+			if shard.entries[key] == owned {
+				if err == nil {
+					delete(shard.entries, key)
+					owned.gen.Store(0)
+					s.metricEntries.Add(-1)
+				} else {
+					if owned.deadlineNs < nowMonoNs() {
+						owned.deadlineNs = nowMonoNs()
+					}
+					s.wheelMu.Lock()
+					s.insertLocked(owned)
+					s.wheelMu.Unlock()
+				}
+			}
+			// Close the barrier while shard.mu is still held, then clear it on
+			// the retained-error entry before publishing the unlocked state.
+			// Schedule wakes only after this unlock and can never observe a nil
+			// barrier before the authoritative work is complete.
+			close(done)
+			if err != nil && shard.entries[key] == owned {
+				owned.inFlight = nil
+			}
+			shard.mu.Unlock()
+
+			if errors.Is(err, context.Canceled) && s.ctx.Err() != nil {
+				return err
+			}
+			s.metricFlushTotal.Add(1)
+			if err != nil {
+				s.metricFlushErr.Add(1)
+				s.recordBreakerErr()
+			}
+			return err
+		}
+		wait := current.inFlight
+		shard.mu.Unlock()
+		select {
+		case <-wait:
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+}
+
+// reanchor replaces key's scheduled deadline without flushing its kernel
+// state. Verified session cleanup uses this when the AccessEntry being removed
+// shares key with another live entry: the shared rule must survive, but its
+// scheduler ownership must move to the surviving entry's latest deadline
+// rather than retaining a later deadline owned only by the removed entry.
+//
+// An in-flight flush has already begun tearing the shared rule down, so it
+// cannot be converted into a preservation operation. Return an error instead
+// of acknowledging session cleanup with a scheduler state that no longer
+// describes the kernel rule. Lock order remains shard.mu before wheelMu.
+func (s *Scheduler) reanchor(key FlowKey, deadline time.Time) error {
+	if s == nil || !s.started.Load() {
+		return errors.New("expiry scheduler is not running")
+	}
+	if deadline.Round(0) == deadline {
+		return errors.New("reanchor deadline has no monotonic reading")
+	}
+
+	deadlineNs := monoNsAt(deadline)
+	shard := s.shards[key.shard()]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	existing := shard.entries[key]
+	if existing != nil && existing.inFlight != nil {
+		return errors.New("cannot preserve FlowKey while its flush is in flight")
+	}
+	if existing != nil && existing.deadlineNs == deadlineNs {
+		return nil
+	}
+
+	entry := &expiryEntry{FlowKey: key, deadlineNs: deadlineNs}
+	entry.gen.Store(s.genCounter.Add(1))
+
+	s.wheelMu.Lock()
+	if existing != nil {
+		existing.gen.Store(0)
+		s.unlinkLocked(existing)
+	}
+	s.insertLocked(entry)
+	s.wheelMu.Unlock()
+
+	shard.entries[key] = entry
+	if existing == nil {
+		s.metricEntries.Add(1)
+	}
+	return nil
+}
+
 // scheduleEntry is the shared body of Schedule and RescheduleEarlier. When
 // pullEarlier is false (Schedule) it skips on existing.deadlineNs >=
 // deadlineNs (longest-wins). When true (RescheduleEarlier) it skips only on
@@ -1132,6 +1287,26 @@ func (s *Scheduler) IsBreakerOpen() bool { return s.breakerOpen.Load() }
 // EntryCount returns the number of currently scheduled entries.
 // Useful for the scheduler_entries_total gauge.
 func (s *Scheduler) EntryCount() int64 { return s.metricEntries.Load() }
+
+// SnapshotKeys returns the live scheduled FlowKeys without changing their
+// deadlines. Boot recovery uses this immediately after kernel enumeration to
+// synchronously tear down inherited rules before the AC reports ready.
+func (s *Scheduler) SnapshotKeys() []FlowKey {
+	if s == nil {
+		return nil
+	}
+	keys := make([]FlowKey, 0, max(0, int(s.metricEntries.Load())))
+	for _, shard := range s.shards {
+		shard.mu.Lock()
+		for key, entry := range shard.entries {
+			if entry != nil && entry.gen.Load() != 0 {
+				keys = append(keys, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return keys
+}
 
 // FlushMetrics snapshots the dispatch counters.
 // FlushMetrics is the operator-facing snapshot of scheduler state.

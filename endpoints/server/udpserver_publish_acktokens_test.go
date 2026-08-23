@@ -78,16 +78,18 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 	}
 
 	knkMsg := &common.AgentKnockMsg{
-		UserId:         "u-int",
-		DeviceId:       "d-int",
-		OrganizationId: "o-int",
-		AuthServiceId:  common.RegisteredAgentAuthServiceID,
-		ResourceId:     resName,
-		RunID:          wantRunID,
+		UserId:             "u-int",
+		DeviceId:           "d-int",
+		OrganizationId:     "o-int",
+		AuthServiceId:      common.RegisteredAgentAuthServiceID,
+		ResourceId:         resName,
+		RunID:              wantRunID,
+		NHPSessionId:       1,
+		NHPSessionIssuedAt: time.Now(),
 	}
 	srcAddr := &common.NetAddress{Ip: knockerIP, Port: 51820}
-	ackMsg := &common.ServerKnockAckMsg{OpenTime: wantOpen}
-	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg}
+	ackMsg := &common.ServerKnockAckMsg{SessionId: 1, OpenTime: wantOpen}
+	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg, SessionId: 1, SessionIssuedAt: knkMsg.NHPSessionIssuedAt}
 	res := &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId: resName,
@@ -99,6 +101,7 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 				},
 			},
 		},
+		ResourcePublicKeyB64: testProtectedResourceID,
 	}
 
 	gotAck, err := s.handleNhpOpenResource(req, res)
@@ -135,6 +138,9 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 	if entry.ResourceId != resName {
 		t.Errorf("entry.ResourceId = %q, want %q", entry.ResourceId, resName)
 	}
+	if entry.ProtectedResourceId != testProtectedResourceID {
+		t.Errorf("entry.ProtectedResourceId = %q, want resolved public resource %q", entry.ProtectedResourceId, testProtectedResourceID)
+	}
 	if entry.KnockSrcIP != knockerIP {
 		t.Errorf("entry.KnockSrcIP = %q, want %q — the cross-check input PR-2b feeds into the FRP login gate would be wrong", entry.KnockSrcIP, knockerIP)
 	}
@@ -166,10 +172,14 @@ func TestPublishACKTokens_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
 	const token = "legacy-token"
 	s := &UdpServer{tokenStore: common.NewTokenStore[*ACTokenEntry]()}
 	err := s.PublishACKTokens(context.Background(), &common.AgentKnockMsg{
-		AuthServiceId: "legacy",
-		RunID:         "0123456789abcdef",
+		AuthServiceId:      "legacy",
+		ResourceId:         "public-resource",
+		RunID:              "0123456789abcdef",
+		NHPSessionId:       1,
+		NHPSessionIssuedAt: time.Now(),
 	}, &common.ServerKnockAckMsg{
-		ACTokens: map[string]string{"resource": token},
+		SessionId: 1,
+		ACTokens:  map[string]string{"resource": token},
 	}, "203.0.113.42", 60, "")
 	if err != nil {
 		t.Fatalf("PublishACKTokens: %v", err)
@@ -215,10 +225,10 @@ func TestHandleNhpOpenResource_PublishACKTokens_NoLeakOnFail(t *testing.T) {
 		},
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "u-fail", ResourceId: "r-fail"}
+	knkMsg := &common.AgentKnockMsg{UserId: "u-fail", ResourceId: "r-fail", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
 	srcAddr := &common.NetAddress{Ip: "198.51.100.4"}
-	ackMsg := &common.ServerKnockAckMsg{}
-	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg}
+	ackMsg := &common.ServerKnockAckMsg{SessionId: 1}
+	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg, SessionId: 1, SessionIssuedAt: knkMsg.NHPSessionIssuedAt}
 	res := &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId: "r-fail",
@@ -276,10 +286,10 @@ func TestHandleNhpOpenResource_NilBroadcastResult(t *testing.T) {
 		},
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "u-nil", ResourceId: "r-nil"}
+	knkMsg := &common.AgentKnockMsg{UserId: "u-nil", ResourceId: "r-nil", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
 	srcAddr := &common.NetAddress{Ip: "198.51.100.9"}
-	ackMsg := &common.ServerKnockAckMsg{}
-	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg}
+	ackMsg := &common.ServerKnockAckMsg{SessionId: 1}
+	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg, SessionId: 1, SessionIssuedAt: knkMsg.NHPSessionIssuedAt}
 	res := &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId: "r-nil",

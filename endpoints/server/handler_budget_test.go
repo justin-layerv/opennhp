@@ -179,6 +179,24 @@ func TestDispatchHandler_ProtectedReservePreservesRKNProgress(t *testing.T) {
 		return len(s.protectedHandlerSem) == 0
 	})
 
+	// An authenticated exact-session EXT is the teardown path for an existing
+	// admission. It must retain progress under the same saturated general
+	// partition; its protected body is strictly mirrored to the outer type by
+	// HandleKnockRequest before any close authority is used.
+	extRan := make(chan struct{})
+	s.dispatchHandler(newDispatchPPD(core.NHP_EXT, `{}`), func(*core.PacketParserData) error {
+		close(extRan)
+		return nil
+	})
+	select {
+	case <-extRan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exact-session EXT did not run from protected reserve")
+	}
+	waitFor(t, 2*time.Second, "protected EXT slot released", func() bool {
+		return len(s.protectedHandlerSem) == 0
+	})
+
 	close(generalRelease)
 	waitFor(t, 2*time.Second, "handler pressure recovered", func() bool {
 		return !s.handlerOverload.Load() && len(s.handlerSem) == 0
@@ -217,12 +235,12 @@ func TestDispatchHandler_ProtectedReserveExhaustionIsDistinct(t *testing.T) {
 }
 
 func TestProtectedHandlerTypes(t *testing.T) {
-	for _, headerType := range []int{core.NHP_RKN, core.NHP_RLY} {
+	for _, headerType := range []int{core.NHP_RKN, core.NHP_RLY, core.NHP_EXT} {
 		if !isProtectedHandlerType(headerType) {
 			t.Errorf("%s must be protected", core.HeaderTypeToString(headerType))
 		}
 	}
-	for _, headerType := range []int{core.NHP_KNK, core.DHP_KNK, core.NHP_EXT, core.NHP_OTP} {
+	for _, headerType := range []int{core.NHP_KNK, core.DHP_KNK, core.NHP_OTP} {
 		if isProtectedHandlerType(headerType) {
 			t.Errorf("%s must not consume protected capacity", core.HeaderTypeToString(headerType))
 		}

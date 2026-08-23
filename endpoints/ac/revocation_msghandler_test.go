@@ -1,9 +1,11 @@
 package ac
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -500,6 +502,7 @@ func TestHandleUdpACRevocation_AppliedEventDoesNotIncrementRejectMetric(t *testi
 		config:       &Config{ACId: "test-ac"},
 		tokenStore:   common.NewTokenStore[*AccessEntry](),
 		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
 		expirySched:  sched,
 		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
 	}
@@ -562,13 +565,425 @@ func acWithSendCapture(t *testing.T) (*UdpAC, chan *core.MsgData) {
 		device:       core.NewDevice(core.NHP_AC, testPrivateKey(), nil),
 		tokenStore:   common.NewTokenStore[*AccessEntry](),
 		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
 		expirySched:  sched,
 		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
 		sendMsgCh:    sendCh,
 	}
 	a.installExpiryHook()
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(1)
+	a.sessionFlushComplete.Store(true)
+	a.sessionControlLeaseHeld.Store(true)
 	a.running.Store(true)
 	return a, sendCh
+}
+
+func sessionClosePPD(t *testing.T, msg common.ACSessionCloseMsg) *core.PacketParserData {
+	t.Helper()
+	body, err := json.Marshal(&msg)
+	if err != nil {
+		t.Fatalf("marshal session close: %v", err)
+	}
+	return &core.PacketParserData{
+		BodyMessage:  body,
+		ConnData:     &core.ConnectionData{},
+		RemotePubKey: serverPubKey32(),
+	}
+}
+
+func TestHandleUdpACRevocationSessionControlScopesAndAck(t *testing.T) {
+	const (
+		agentKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		runID    = "0123456789abcdef"
+	)
+	t.Run("exact session", func(t *testing.T) {
+		a, sendCh := acWithSendCapture(t)
+		a.storeToken("target", &AccessEntry{NHPSessionId: 77, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 100})
+		a.storeToken("same-id-new-issuance", &AccessEntry{NHPSessionId: 77, NHPServerPublicKey: "server", NHPSessionOwnerId: "ffeeddccbbaa99887766554433221100", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 101})
+		a.storeToken("different-session", &AccessEntry{NHPSessionId: 78, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 100})
+		a.storeToken("different-agent", &AccessEntry{NHPSessionId: 77, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: testNHPAgentKey('B'), NHPSessionIssuedAtMillis: 100})
+		msg := common.ACSessionCloseMsg{
+			Kind:                  common.ACSessionCloseKind,
+			Scope:                 common.ACSessionCloseScopeExact,
+			EventID:               "ffeeddccbbaa99887766554433221100",
+			AgentPublicKey:        agentKey,
+			SessionID:             77,
+			SessionIssuedAtMillis: 100,
+		}
+		if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+			t.Fatalf("HandleUdpACRevocation() error = %v", err)
+		}
+		if _, ok := a.tokenStore.Load("target"); ok {
+			t.Fatal("exact target survived close")
+		}
+		for _, token := range []string{"same-id-new-issuance", "different-session", "different-agent"} {
+			if _, ok := a.tokenStore.Load(token); !ok {
+				t.Fatalf("exact close removed sibling %q", token)
+			}
+		}
+		var ack common.ACSessionCloseAckMsg
+		if err := common.DecodeACSessionCloseAckMsg(drainOneAck(t, sendCh).Message, &ack); err != nil {
+			t.Fatalf("decode strict exact ack: %v", err)
+		}
+		if ack.Scope != msg.Scope || ack.EventID != msg.EventID || ack.AgentPublicKey != agentKey ||
+			ack.SessionID != 77 || ack.SessionIssuedAtMillis != 100 || ack.Closed != 1 ||
+			ack.BootID != a.bootID || ack.FlushGeneration != 1 {
+			t.Fatalf("exact ack = %#v", ack)
+		}
+	})
+
+	t.Run("agent cutoff", func(t *testing.T) {
+		a, sendCh := acWithSendCapture(t)
+		a.storeToken("old", &AccessEntry{NHPSessionId: 1, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 100})
+		a.storeToken("new", &AccessEntry{NHPSessionId: 2, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 300})
+		if got := len(a.nhpSessions.agentTokens(agentKey)); got != 2 {
+			t.Fatalf("agent index tokens = %d, want 2", got)
+		}
+		msg := common.ACSessionCloseMsg{
+			Kind:                common.ACSessionCloseKind,
+			Scope:               common.ACSessionCloseScopeAgent,
+			EventID:             "ffeeddccbbaa99887766554433221100",
+			AgentPublicKey:      agentKey,
+			IssuedThroughMillis: 200,
+		}
+		if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+			t.Fatalf("HandleUdpACRevocation() error = %v", err)
+		}
+		if _, ok := a.tokenStore.Load("old"); ok {
+			t.Fatal("old agent session survived cutoff")
+		}
+		if _, ok := a.tokenStore.Load("new"); !ok {
+			t.Fatal("post-cutoff agent session was closed")
+		}
+		var ack common.ACSessionCloseAckMsg
+		if err := json.Unmarshal(drainOneAck(t, sendCh).Message, &ack); err != nil {
+			t.Fatalf("decode ack: %v", err)
+		}
+		if ack.Scope != msg.Scope || ack.EventID != msg.EventID || ack.Closed != 1 ||
+			ack.BootID != a.bootID || ack.FlushGeneration != 1 {
+			t.Fatalf("ack = %#v", ack)
+		}
+	})
+
+	t.Run("run barrier", func(t *testing.T) {
+		a, sendCh := acWithSendCapture(t)
+		a.storeToken("attempt-1", &AccessEntry{NHPSessionId: 1, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 100, NHPRunID: runID, NHPRunAttempt: 1})
+		a.storeToken("attempt-2", &AccessEntry{NHPSessionId: 2, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 200, NHPRunID: runID, NHPRunAttempt: 2})
+		a.storeToken("sibling", &AccessEntry{NHPSessionId: 3, NHPServerPublicKey: "server", NHPSessionOwnerId: "00112233445566778899aabbccddeeff", NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: 100, NHPRunID: "fedcba9876543210", NHPRunAttempt: 1})
+		if got := len(a.nhpSessions.runTokens(agentKey, runID)); got != 2 {
+			t.Fatalf("run index tokens = %d, want 2", got)
+		}
+		msg := common.ACSessionCloseMsg{
+			Kind:           common.ACSessionCloseKind,
+			Scope:          common.ACSessionCloseScopeRun,
+			EventID:        "ffeeddccbbaa99887766554433221100",
+			AgentPublicKey: agentKey,
+			RunID:          runID,
+			RunAttempt:     2,
+		}
+		if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+			t.Fatalf("HandleUdpACRevocation() error = %v", err)
+		}
+		if _, ok := a.tokenStore.Load("attempt-1"); ok {
+			t.Fatal("older run attempt survived barrier")
+		}
+		if _, ok := a.tokenStore.Load("attempt-2"); !ok {
+			t.Fatal("current run attempt was closed")
+		}
+		if _, ok := a.tokenStore.Load("sibling"); !ok {
+			t.Fatal("fresh sibling RunID was closed")
+		}
+		var ack common.ACSessionCloseAckMsg
+		if err := json.Unmarshal(drainOneAck(t, sendCh).Message, &ack); err != nil {
+			t.Fatalf("decode ack: %v", err)
+		}
+		if ack.Scope != msg.Scope || ack.RunID != runID || ack.RunAttempt != 2 || ack.Closed != 1 {
+			t.Fatalf("ack = %#v", ack)
+		}
+	})
+}
+
+func TestExactSessionCloseRetriesActualRuleAfterTransientFlushFailure(t *testing.T) {
+	const agentKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	flusher := &failFirstSessionControlFlusher{}
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	sendCh := make(chan *core.MsgData, 2)
+	a := &UdpAC{
+		config:       &Config{ACId: "test-ac", FilterMode: FilterMode_IPTABLES},
+		device:       core.NewDevice(core.NHP_AC, testPrivateKey(), nil),
+		tokenStore:   common.NewTokenStore[*AccessEntry](),
+		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
+		expirySched:  scheduler,
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
+		sendMsgCh:    sendCh,
+	}
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(1)
+	a.sessionFlushComplete.Store(true)
+	a.sessionControlLeaseHeld.Store(true)
+	a.running.Store(true)
+
+	key, err := MakeFlowKey("192.0.2.50", "192.0.2.60", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             77,
+		NHPServerPublicKey:       "server",
+		NHPSessionOwnerId:        "00112233445566778899aabbccddeeff",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 100,
+	}
+	target.recordScheduledKey(key)
+	targetToken := a.GenerateAccessToken(target)
+	sibling := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             77,
+		NHPServerPublicKey:       "server",
+		NHPSessionOwnerId:        "ffeeddccbbaa99887766554433221100",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 101,
+	}
+	siblingToken := a.GenerateAccessToken(sibling)
+	scheduler.Schedule(key, time.Now().Add(time.Hour))
+	msg := common.ACSessionCloseMsg{
+		Kind:                  common.ACSessionCloseKind,
+		Scope:                 common.ACSessionCloseScopeExact,
+		EventID:               "0123456789abcdeffedcba9876543210",
+		AgentPublicKey:        agentKey,
+		SessionID:             77,
+		SessionIssuedAtMillis: 100,
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err == nil {
+		t.Fatal("first exact close unexpectedly converged")
+	}
+	if len(sendCh) != 0 {
+		t.Fatal("failed exact close emitted an RVA")
+	}
+	if _, ok := a.tokenStore.Load(targetToken); !ok {
+		t.Fatal("failed exact close destructively removed retry state")
+	}
+	if got := a.VerifyAccessToken(targetToken); got != nil {
+		t.Fatal("pending exact-close token remained usable")
+	}
+	if a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, 77, 100)) {
+		t.Fatal("failed exact cleanup admitted the target tuple")
+	}
+	if !a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, 77, 101)) {
+		t.Fatal("pending exact cleanup rejected a sibling issuance")
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+		t.Fatalf("retry exact close error = %v", err)
+	}
+	if got := flusher.count(); got != 2 {
+		t.Fatalf("flush calls = %d, want actual key retried once", got)
+	}
+	if _, ok := a.tokenStore.Load(targetToken); ok {
+		t.Fatal("converged exact close retained target token")
+	}
+	if _, ok := a.tokenStore.Load(siblingToken); !ok {
+		t.Fatal("converged exact close removed sibling token")
+	}
+	var ack common.ACSessionCloseAckMsg
+	if err := common.DecodeACSessionCloseAckMsg(drainOneAck(t, sendCh).Message, &ack); err != nil {
+		t.Fatalf("decode retry ack: %v", err)
+	}
+	if ack.Scope != common.ACSessionCloseScopeExact || ack.SessionID != 77 ||
+		ack.SessionIssuedAtMillis != 100 || ack.Closed != 1 || ack.BootID != a.bootID || ack.FlushGeneration != 1 {
+		t.Fatalf("retry exact ack = %#v", ack)
+	}
+}
+
+type failFirstSessionControlFlusher struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *failFirstSessionControlFlusher) Flush(context.Context, FlowKey) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls == 1 {
+		return errors.New("injected transient flush failure")
+	}
+	return nil
+}
+
+func (f *failFirstSessionControlFlusher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func TestSessionControlCloseRetriesActualRuleAfterTransientFlushFailure(t *testing.T) {
+	const agentKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	flusher := &failFirstSessionControlFlusher{}
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	sendCh := make(chan *core.MsgData, 2)
+	a := &UdpAC{
+		config:       &Config{ACId: "test-ac", FilterMode: FilterMode_IPTABLES},
+		device:       core.NewDevice(core.NHP_AC, testPrivateKey(), nil),
+		tokenStore:   common.NewTokenStore[*AccessEntry](),
+		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
+		expirySched:  scheduler,
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
+		sendMsgCh:    sendCh,
+	}
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(1)
+	a.sessionFlushComplete.Store(true)
+	a.sessionControlLeaseHeld.Store(true)
+	a.running.Store(true)
+
+	key, err := MakeFlowKey("192.0.2.10", "192.0.2.20", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             1,
+		NHPServerPublicKey:       "server",
+		NHPSessionOwnerId:        "00112233445566778899aabbccddeeff",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 100,
+	}
+	entry.recordScheduledKey(key)
+	token := a.GenerateAccessToken(entry)
+	scheduler.Schedule(key, time.Now().Add(time.Hour))
+	msg := common.ACSessionCloseMsg{
+		Kind:                common.ACSessionCloseKind,
+		Scope:               common.ACSessionCloseScopeAgent,
+		EventID:             "ffeeddccbbaa99887766554433221100",
+		AgentPublicKey:      agentKey,
+		IssuedThroughMillis: 200,
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err == nil {
+		t.Fatal("first close unexpectedly converged")
+	}
+	if len(sendCh) != 0 {
+		t.Fatal("failed close emitted an RVA")
+	}
+	if _, ok := a.tokenStore.Load(token); !ok {
+		t.Fatal("failed close destructively removed retry state")
+	}
+	if got := len(entry.snapshotScheduledKeys()); got != 1 {
+		t.Fatalf("failed close retained %d keys, want 1", got)
+	}
+	if got := a.VerifyAccessToken(token); got != nil {
+		t.Fatal("closing token remained usable after teardown began")
+	}
+	if scheduler.IsBreakerOpen() {
+		t.Fatal("single direct flush failure should not be inferred through the scheduler breaker")
+	}
+	newer := sessionFenceEntry(agentKey, 2, 201)
+	if a.nhpSessions.admitsSession(newer) {
+		t.Fatal("failed agent cleanup admitted a newer same-agent session while cutoff was pending")
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+		t.Fatalf("retry close error = %v", err)
+	}
+	if flusher.count() != 2 {
+		t.Fatalf("flush calls = %d, want actual key retried once", flusher.count())
+	}
+	if _, ok := a.tokenStore.Load(token); ok {
+		t.Fatal("converged close retained token")
+	}
+	if !a.nhpSessions.admitsSession(newer) {
+		t.Fatal("successful agent cleanup retry did not admit a post-cutoff session")
+	}
+	drainOneAck(t, sendCh)
+}
+
+func TestRunSessionCloseDoesNotAdmitRequestedAttemptUntilRetryConverges(t *testing.T) {
+	const (
+		agentKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		runID    = "0123456789abcdef"
+	)
+	flusher := &failFirstSessionControlFlusher{}
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	sendCh := make(chan *core.MsgData, 2)
+	a := &UdpAC{
+		config:       &Config{ACId: "test-ac", FilterMode: FilterMode_IPTABLES},
+		device:       core.NewDevice(core.NHP_AC, testPrivateKey(), nil),
+		tokenStore:   common.NewTokenStore[*AccessEntry](),
+		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
+		expirySched:  scheduler,
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
+		sendMsgCh:    sendCh,
+	}
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(1)
+	a.sessionFlushComplete.Store(true)
+	a.sessionControlLeaseHeld.Store(true)
+	a.running.Store(true)
+
+	key, err := MakeFlowKey("192.0.2.30", "192.0.2.40", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             1,
+		NHPServerPublicKey:       "server",
+		NHPSessionOwnerId:        "00112233445566778899aabbccddeeff",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 100,
+		NHPRunID:                 runID,
+		NHPRunAttempt:            1,
+	}
+	entry.recordScheduledKey(key)
+	token := a.GenerateAccessToken(entry)
+	scheduler.Schedule(key, time.Now().Add(time.Hour))
+	msg := common.ACSessionCloseMsg{
+		Kind:           common.ACSessionCloseKind,
+		Scope:          common.ACSessionCloseScopeRun,
+		EventID:        "0123456789abcdeffedcba9876543210",
+		AgentPublicKey: agentKey,
+		RunID:          runID,
+		RunAttempt:     2,
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err == nil {
+		t.Fatal("first run close unexpectedly converged")
+	}
+	if len(sendCh) != 0 {
+		t.Fatal("failed run close emitted an RVA")
+	}
+	if _, ok := a.tokenStore.Load(token); !ok {
+		t.Fatal("failed run close removed retry state")
+	}
+	if err := a.runAttemptBarriers().requireExact(agentKey, runID, 2, 1); !errors.Is(err, errNHPRunAttemptBarrierPending) {
+		t.Fatalf("requested attempt after failed cleanup = %v, want pending", err)
+	}
+
+	if err := a.HandleUdpACRevocation(sessionClosePPD(t, msg)); err != nil {
+		t.Fatalf("retry run close error = %v", err)
+	}
+	if got := flusher.count(); got != 2 {
+		t.Fatalf("flush calls = %d, want actual key retried once", got)
+	}
+	if _, ok := a.tokenStore.Load(token); ok {
+		t.Fatal("converged run close retained older attempt")
+	}
+	if err := a.runAttemptBarriers().requireExact(agentKey, runID, 2, 1); err != nil {
+		t.Fatalf("requested attempt after retry convergence = %v", err)
+	}
+	drainOneAck(t, sendCh)
 }
 
 // drainOneAck returns the single MsgData enqueued on sendCh, or fails if none /

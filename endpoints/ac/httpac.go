@@ -37,8 +37,9 @@ type HttpAC struct {
 	ginEngine  *gin.Engine
 	listenAddr *net.TCPAddr
 
-	wg      sync.WaitGroup
-	running atomic.Bool
+	wg                               sync.WaitGroup
+	running                          atomic.Bool
+	beforeSessionControlRefreshFence func()
 
 	// signals
 	signals struct {
@@ -234,6 +235,25 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 		// deadline" — see #1960 (the cr-flagged buffer-edge oracle).
 		// Operator triage stays distinguishable via the log line.
 		log.Error("token verification failed")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "token expired"})
+		return
+	}
+	if ha.beforeSessionControlRefreshFence != nil {
+		ha.beforeSessionControlRefreshFence()
+	}
+
+	// VerifyAccessToken releases its session-control fence before returning.
+	// Reacquire it and bind the pointer to current token/index membership across
+	// the complete kernel mutation below. A close may have won in that narrow
+	// gap; in that case the token is absent or marked closing and refresh must
+	// not resurrect the stale AccessEntry after the close already converged.
+	ha.ua.sessionControlFlushMu.Lock()
+	defer ha.ua.sessionControlFlushMu.Unlock()
+	current, currentFound := ha.ua.tokenStore.Load(req.Token)
+	if !currentFound || current != entry || entry.sessionControlClosing.Load() ||
+		(entry.NHPSessionId != 0 && (!ha.ua.sessionAdmissionReady() || ha.ua.nhpSessions == nil ||
+			!ha.ua.nhpSessions.containsExactToken(req.Token, entry) || !ha.ua.nhpSessions.admitsSession(entry))) {
+		log.Error("token lost session-control membership before refresh")
 		c.JSON(http.StatusOK, gin.H{"errMsg": "token expired"})
 		return
 	}

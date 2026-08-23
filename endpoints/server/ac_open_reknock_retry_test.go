@@ -9,6 +9,7 @@ import (
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
 // These tests pin broadcastACOpenWithReknock — the single re-snapshot retry the
@@ -225,9 +226,9 @@ func TestHandleNhpOpenResource_ReknockRetry_ConvertsTimeoutToSuccess(t *testing.
 	}
 	shortenReknockBackoff(t, s)
 
-	knkMsg := &common.AgentKnockMsg{UserId: "viewer", DeviceId: "d1", ResourceId: resName}
+	knkMsg := &common.AgentKnockMsg{UserId: "viewer", DeviceId: "d1", ResourceId: resName, NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
 	srcAddr := &common.NetAddress{Ip: "203.0.113.42", Port: 51820}
-	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: &common.ServerKnockAckMsg{OpenTime: 60}}
+	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: &common.ServerKnockAckMsg{SessionId: 1, OpenTime: 60}, SessionId: 1, SessionIssuedAt: knkMsg.NHPSessionIssuedAt}
 	res := &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId: resName,
@@ -260,35 +261,32 @@ func TestHandleNhpOpenResource_ReknockRetry_ConvertsTimeoutToSuccess(t *testing.
 // stop firing (the whole mode-2 fix no-ops); this turns that regression into a red
 // build instead of a silent production degradation.
 func TestBroadcastTimeoutExceedsTransactionTimeout(t *testing.T) {
-	if DefaultBroadcastTimeout <= reknockRetryTransactionTimeout {
-		t.Fatalf("reknock retry predicate depends on the transaction timeout (%v) firing before the broadcast timeout (%v); keep DefaultBroadcastTimeout > ServerACOpenTransactionResponseTimeoutMs. Do NOT instead broaden the predicate to context.DeadlineExceeded — see broadcastACOpenWithReknock's godoc: the ctx-cancel arm does not Close() the conn, so that would resend to un-pruned dead conns", reknockRetryTransactionTimeout, DefaultBroadcastTimeout)
+	transactionTimeout := time.Duration(core.ServerACOpenTransactionResponseTimeoutMs) * time.Millisecond
+	if DefaultBroadcastTimeout <= transactionTimeout {
+		t.Fatalf("reknock retry predicate depends on the transaction timeout (%v) firing before the broadcast timeout (%v); keep DefaultBroadcastTimeout > ServerACOpenTransactionResponseTimeoutMs. Do NOT instead broaden the predicate to context.DeadlineExceeded — see broadcastACOpenWithReknock's godoc: the ctx-cancel arm does not Close() the conn, so that would resend to un-pruned dead conns", transactionTimeout, DefaultBroadcastTimeout)
 	}
 }
 
-// TestBroadcastACOpenWithReknock_MetricEmissionPoints pins WHERE each of the four
+// TestBroadcastACOpenWithReknock_MetricEmissionPoints pins WHERE each of the three
 // reknock counters fires — the emission-point semantics the ledger runbook routes
-// an on-call decision on. It is the regression fence for the "no fresh conns"
-// (stuck-migration) and "deadline skipped" (budget-starved) cases each being a
-// DISTINCT counter, not conflated with "Retry without Success". Reads counters via
+// an on-call decision on. It is the regression fence for "no fresh conns" being a
+// distinct counter, not conflated with "Retry without Success". Reads counters via
 // the shared metrics.NewPublisherForTest / CountersForTest helpers (same idiom as
 // the rest of the server suite).
 func TestBroadcastACOpenWithReknock_MetricEmissionPoints(t *testing.T) {
 	const acId = "sandbox-ac"
 
 	for _, tc := range []struct {
-		name          string
-		seedConn      bool // seed a live conn the retry's re-snapshot will find
-		retrySucc     bool // does the retry (2nd broadcast) succeed?
-		tightDeadline bool // pass a ctx with < one txn timeout of budget left
-		wantRetry     float64
-		wantSuccess   float64
-		wantNoFresh   float64
-		wantSkipped   float64
+		name        string
+		seedConn    bool // seed a live conn the retry's re-snapshot will find
+		retrySucc   bool // does the retry (2nd broadcast) succeed?
+		wantRetry   float64
+		wantSuccess float64
+		wantNoFresh float64
 	}{
 		{name: "retry_then_succeed", seedConn: true, retrySucc: true, wantRetry: 1, wantSuccess: 1},
 		{name: "retry_then_fail", seedConn: true, wantRetry: 1},
 		{name: "no_fresh_conns", wantNoFresh: 1},
-		{name: "deadline_skipped", seedConn: true, tightDeadline: true, wantSkipped: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := newTestServerForBroadcast(t)
@@ -314,107 +312,18 @@ func TestBroadcastACOpenWithReknock_MetricEmissionPoints(t *testing.T) {
 				return timeoutResult()
 			}
 
-			ctx := context.Background()
-			if tc.tightDeadline {
-				// Half a transaction timeout of budget left → below the
-				// backoff + one-txn-timeout skip threshold (the check runs BEFORE the
-				// backoff), but still in the future so the deadline hasn't fired.
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(context.Background(), reknockRetryTransactionTimeout/2)
-				defer cancel()
-			}
-			_, _ = callReknockCtx(t, ctx, s, acId, initial)
+			_, _ = callReknockCtx(t, context.Background(), s, acId, initial)
 
 			counters, _ := s.metrics.CountersForTest(t)
 			for name, want := range map[string]float64{
-				MetricKnockReknockRetry:           tc.wantRetry,
-				MetricKnockReknockRetrySuccess:    tc.wantSuccess,
-				MetricKnockReknockNoFreshConns:    tc.wantNoFresh,
-				MetricKnockReknockDeadlineSkipped: tc.wantSkipped,
+				MetricKnockReknockRetry:        tc.wantRetry,
+				MetricKnockReknockRetrySuccess: tc.wantSuccess,
+				MetricKnockReknockNoFreshConns: tc.wantNoFresh,
 			} {
 				if got := counters[name]; got != want {
 					t.Errorf("counter %s = %v, want %v", name, got, want)
 				}
 			}
 		})
-	}
-}
-
-// TestReknockRetryFitsKnockProcessingBudget fences the OTHER latency invariant the
-// single retry rests on: two full transaction timeouts plus the backoff (2×1.5s +
-// 300ms ≈ 3.3s) must fit under the server's own HttpKnockProcessingBudget (5s, kept
-// tight and ≤ qurl-service's knock-client budget). The ordering guard above only protects
-// broadcast-vs-transaction; nothing else catches that raising the AC-open
-// ServerACOpenTransactionResponseTimeoutMs (which the retry doubles) could push a
-// reknock-retried knock over that budget. This turns that into a red build. If it
-// ever fails, lower the timeout/backoff or drop the retry — do NOT add a second
-// retry (see broadcastACOpenWithReknock's "HARD ceiling" note).
-//
-// SCOPE: bounds only the AC-open slice — see defaultReknockRetryBackoff's godoc for
-// the necessary-but-not-sufficient decomposition (the deadline short-circuit in
-// broadcastACOpenWithReknock is what enforces the end-to-end bound). It reads
-// defaultReknockRetryBackoff (the const), NOT the per-instance
-// UdpServer.reknockRetryBackoff field, so shortenReknockBackoff cannot mask it, and it
-// reads HttpKnockProcessingBudget / reknockRetryTransactionTimeout (the production
-// consts) so the arithmetic tracks production.
-func TestReknockRetryFitsKnockProcessingBudget(t *testing.T) {
-	worstCase := 2*reknockRetryTransactionTimeout + defaultReknockRetryBackoff
-	if worstCase >= HttpKnockProcessingBudget {
-		t.Fatalf("reknock worst-case AC-open latency (2×%v + %v = %v) must stay under HttpKnockProcessingBudget (%v); raising ServerACOpenTransactionResponseTimeoutMs or defaultReknockRetryBackoff — or adding a second retry — would blow it", reknockRetryTransactionTimeout, defaultReknockRetryBackoff, worstCase, HttpKnockProcessingBudget)
-	}
-}
-
-// TestHandleHttpOpenResource_ReknockRetry_ConvertsTimeoutToSuccess is the HTTP
-// twin of TestHandleNhpOpenResource_ReknockRetry_… — it fences the retry WIRING on
-// the second knock handler (handleHttpOpenResource, qurl-service's internal knock).
-// A regression reverting that call site back to a bare
-// resolveProcessACOperationBroadcast(...) would fail no other test; this catches it.
-func TestHandleHttpOpenResource_ReknockRetry_ConvertsTimeoutToSuccess(t *testing.T) {
-	const (
-		acId    = "sandbox-ac-http"
-		resName = "resource-http"
-	)
-
-	var calls int32
-	us := &UdpServer{
-		tokenStore: common.NewTokenStore[*ACTokenEntry](),
-		acConnectionMap: map[string][]*ACConn{
-			acId: {newACConnWithLastRecv(time.Now().UnixNano())},
-		},
-		processACOperationBroadcastFn: func(
-			_ context.Context, _ *common.AgentKnockMsg, _ []*ACConn,
-			_ *common.NetAddress, _ []*common.NetAddress, openTime uint32, _ *common.ResourceData,
-		) (*common.ACOpsResultMsg, error) {
-			if atomic.AddInt32(&calls, 1) == 1 {
-				return timeoutResult()
-			}
-			return &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode(), ACToken: "at_http_retry_ok", OpenTime: openTime}, nil
-		},
-	}
-	shortenReknockBackoff(t, us)
-	hs := &HttpServer{udpServer: us}
-
-	req := &common.HttpKnockRequest{
-		UserId: "viewer", DeviceId: "d1", OrganizationId: "o1", AuthServiceId: "asp1",
-		ResourceId: resName, SrcIp: "203.0.113.77", Ctx: context.Background(),
-	}
-	res := &common.ResourceData{
-		ResourceGroup: common.ResourceGroup{
-			ResourceId: resName, OpenTime: 60,
-			Resources: map[string]*common.ResourceInfo{
-				resName: {ACId: acId, Addr: &common.NetAddress{Port: 443, Protocol: "tcp"}},
-			},
-		},
-	}
-
-	gotAck, err := hs.handleHttpOpenResource(req, res)
-	if err != nil {
-		t.Fatalf("handleHttpOpenResource returned error despite a retryable timeout: %v", err)
-	}
-	if gotAck.ErrCode != common.ErrSuccess.ErrorCode() {
-		t.Fatalf("ack ErrCode = %q, want success — the wired re-knock retry must convert the transaction timeout into a success on the HTTP path too", gotAck.ErrCode)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("broadcast called %d times, want 2 (initial timeout + 1 wired retry through handleHttpOpenResource)", got)
 	}
 }

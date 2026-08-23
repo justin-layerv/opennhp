@@ -26,10 +26,11 @@ ac_filter_mode     = 1
 # L3 flush-on-expiry sandbox rollout levers. Sandbox remains on
 # FilterMode=EBPFXDP, so enabled L3 flush uses BpfFlusher; the conntrack backend
 # knob is only load-bearing under FilterMode=IPTABLES.
-enable_l3_flush_on_expiry    = true
-l3_flush_dry_run             = false
-l3_flush_conntrack_backend   = "exec"
-l3_flush_conntrack_pool_size = 0
+enable_l3_flush_on_expiry       = true
+l3_flush_dry_run                = false
+l3_flush_real_mode_acknowledged = true
+l3_flush_conntrack_backend      = "exec"
+l3_flush_conntrack_pool_size    = 0
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
 #   - "qurl"               — viewer-side qurl-link / SPA resolve flow

@@ -170,7 +170,7 @@ func TestACRegistration_HandleRedispatch_PrunesRetiredPeersBeforeConnect(t *test
 		t.Fatalf("marshal NHP_AAK: %v", err)
 	}
 	for _, md := range requests {
-		md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_AAK, BodyMessage: aakBody}
+		md.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, aakBody)
 	}
 	select {
 	case err := <-result:
@@ -276,7 +276,7 @@ func TestACRegistration_HandleRedispatch_RotatingSharedKeyConvergesActualGroup(t
 		}
 		memberIPs := devicePeerIPs(t, device, sharedKeyBytes)
 		for _, md := range requests {
-			md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_AAK, BodyMessage: aakBody}
+			md.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, aakBody)
 		}
 		select {
 		case err := <-result:
@@ -371,7 +371,7 @@ func TestACRegistration_AuthoritativeTransitionsSerialize(t *testing.T) {
 		t.Fatalf("marshal NHP_AAK: %v", err)
 	}
 	for _, md := range firstRequests {
-		md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_AAK, BodyMessage: aakBody}
+		md.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, aakBody)
 	}
 	select {
 	case err := <-firstResult:
@@ -398,7 +398,7 @@ func TestACRegistration_AuthoritativeTransitionsSerialize(t *testing.T) {
 		}
 	}
 	for _, md := range secondRequests {
-		md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_AAK, BodyMessage: aakBody}
+		md.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, aakBody)
 	}
 	select {
 	case err := <-secondResult:
@@ -436,7 +436,7 @@ func TestACRegistration_StopCancelsPrefenceAuthoritativeResponse(t *testing.T) {
 	}
 	responseResult := make(chan error, 1)
 	go func() {
-		responseResult <- reg.handleRegistrationResponse(&core.PacketParserData{
+		responseResult <- handleTestRegistrationResponse(reg, &core.PacketParserData{
 			HeaderType:  core.NHP_AAK,
 			BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 		}, pending)
@@ -549,7 +549,7 @@ func TestACRegistration_StopCancellationDoesNotDegradeEmbeddedAAKToSuccess(t *te
 
 	result := make(chan error, 1)
 	go func() {
-		result <- reg.handleRegistrationResponse(&core.PacketParserData{
+		result <- handleTestRegistrationResponse(reg, &core.PacketParserData{
 			HeaderType:  core.NHP_AAK,
 			BodyMessage: aakBody,
 		}, registrationPeer)
@@ -629,7 +629,7 @@ func TestACRegistration_LateAuthoritativeResponseCannotRepopulateAfterStop(t *te
 			}
 
 			reg.Stop()
-			err := reg.handleRegistrationResponse(tt.ppd, pending)
+			err := handleTestRegistrationResponse(reg, tt.ppd, pending)
 			if !errors.Is(err, ErrRegistrationStopped) {
 				t.Fatalf("late response error = %v, want ErrRegistrationStopped", err)
 			}
@@ -659,7 +659,7 @@ func TestACRegistration_MalformedARDCleansPendingPeer(t *testing.T) {
 		t.Fatalf("beginRegistrationAttempt: %v", err)
 	}
 
-	err := reg.handleRegistrationResponse(&core.PacketParserData{
+	err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_ARD,
 		BodyMessage: []byte(`{not-json`),
 	}, pending)
@@ -727,7 +727,7 @@ func TestACRegistration_HandleRedispatch_PreservesPendingRegistrationPeer(t *tes
 		t.Fatalf("marshal NHP_AAK: %v", err)
 	}
 	for _, md := range requests {
-		md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_AAK, BodyMessage: aakBody}
+		md.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, aakBody)
 	}
 	select {
 	case err := <-result:
@@ -738,7 +738,7 @@ func TestACRegistration_HandleRedispatch_PreservesPendingRegistrationPeer(t *tes
 		t.Fatal("timed out waiting for out-of-band redispatch")
 	}
 
-	if err := reg.handleRegistrationResponse(&core.PacketParserData{
+	if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, pendingPeer); err != nil {
@@ -1001,7 +1001,7 @@ func TestACRegistration_DirectAAK_ConvergesFullSharedKeyGroup(t *testing.T) {
 		t.Fatal("test setup: new direct peer unexpectedly entered the full group")
 	}
 
-	err := reg.handleRegistrationResponse(&core.PacketParserData{
+	err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, newPeer)
@@ -1042,7 +1042,7 @@ func TestACRegistration_DirectAAK_RejectsFullStaticGroup(t *testing.T) {
 				PubKeyBase64: base64.StdEncoding.EncodeToString(registrationKeyBytes), Type: core.NHP_SERVER,
 			}
 			device.AddPeer(registrationPeer)
-			err := reg.handleRegistrationResponse(&core.PacketParserData{
+			err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 				HeaderType: core.NHP_AAK,
 				BodyMessage: mustJSON(t, common.ServerACAckMsg{
 					ErrCode:      common.ErrSuccess.ErrorCode(),
@@ -1092,7 +1092,7 @@ func TestACRegistration_DirectAAK_CleansRetainedNilAddressPeer(t *testing.T) {
 	// The legacy direct AAK accepts a peer whose address cannot currently
 	// resolve but omits it from assignedServers. Its ownership must still be
 	// recorded, or no later priorServers delta can discover it.
-	if err := reg.handleRegistrationResponse(&core.PacketParserData{
+	if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, retainedPeer); err != nil {
@@ -1114,7 +1114,7 @@ func TestACRegistration_DirectAAK_CleansRetainedNilAddressPeer(t *testing.T) {
 	// remove it, and preserve the statically configured same-key endpoint.
 	newPeer := &core.UdpPeer{Ip: "10.100.10.103", Port: testServerListenPort, PubKeyBase64: sharedPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(newPeer)
-	if err := reg.handleRegistrationResponse(&core.PacketParserData{
+	if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, newPeer); err != nil {
@@ -1141,7 +1141,7 @@ func TestACRegistration_RedispatchCleansRetainedNilAddressPeerAcrossKeys(t *test
 	oldPubKey := base64.StdEncoding.EncodeToString(oldKeyBytes)
 	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: testServerListenPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(oldPeer)
-	if err := reg.handleRegistrationResponse(&core.PacketParserData{
+	if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, oldPeer); err != nil {
@@ -1165,10 +1165,7 @@ func TestACRegistration_RedispatchCleansRetainedNilAddressPeerAcrossKeys(t *test
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for cross-key redispatch request")
 	}
-	request.ResponseMsgCh <- &core.PacketParserData{
-		HeaderType:  core.NHP_AAK,
-		BodyMessage: []byte(`{"errCode":"0"}`),
-	}
+	request.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, []byte(`{"errCode":"0"}`))
 	select {
 	case err := <-result:
 		if err != nil {
@@ -1202,7 +1199,7 @@ func TestACRegistration_FailedRedispatchClearsSupersededRegistrationPeer(t *test
 	oldPubKey := base64.StdEncoding.EncodeToString(oldKeyBytes)
 	oldPeer := &core.UdpPeer{Ip: "not-an-ip", Port: testServerListenPort, PubKeyBase64: oldPubKey, Type: core.NHP_SERVER}
 	device.AddPeer(oldPeer)
-	if err := reg.handleRegistrationResponse(&core.PacketParserData{
+	if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: []byte(`{"errCode":"0","registered":true}`),
 	}, oldPeer); err != nil {
@@ -1273,7 +1270,7 @@ func TestACRegistration_EmbeddedPeersFailureRetainsUsableResponsePeer(t *testing
 			// running=false makes every embedded-peer connection fail after its
 			// temporary Device add. The response handler deliberately degrades to
 			// the viable response peer instead of failing registration.
-			if err := reg.handleRegistrationResponse(&core.PacketParserData{
+			if err := handleTestRegistrationResponse(reg, &core.PacketParserData{
 				HeaderType:  core.NHP_AAK,
 				BodyMessage: mustJSON(t, aak),
 			}, registrationPeer); err != nil {
@@ -1346,7 +1343,7 @@ func TestACRegistration_EmbeddedPeersSuccessRetiresOnlyResponsePeer(t *testing.T
 
 	result := make(chan error, 1)
 	go func() {
-		result <- reg.handleRegistrationResponse(&core.PacketParserData{
+		result <- handleTestRegistrationResponse(reg, &core.PacketParserData{
 			HeaderType:  core.NHP_AAK,
 			BodyMessage: aakBody,
 		}, registrationPeer)
@@ -1358,10 +1355,7 @@ func TestACRegistration_EmbeddedPeersSuccessRetiresOnlyResponsePeer(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for embedded-peer connection request")
 	}
-	request.ResponseMsgCh <- &core.PacketParserData{
-		HeaderType:  core.NHP_AAK,
-		BodyMessage: peerAAKBody,
-	}
+	request.ResponseMsgCh <- successfulTestAAKPacket(reg.ac, peerAAKBody)
 	select {
 	case err := <-result:
 		if err != nil {

@@ -517,7 +517,7 @@ resource "aws_autoscaling_group" "server_green" {
     # deployment/incident control. Terraform must not resume a deliberately
     # frozen standby group during an unrelated infrastructure update. Keep this
     # list in lockstep with the blue ASG in main.tf.
-    ignore_changes = [desired_capacity, min_size, suspended_processes]
+    ignore_changes = [desired_capacity, min_size, max_size, suspended_processes]
   }
 }
 

@@ -178,6 +178,123 @@ func TestPacketFromUDPDatagramPreservesDirectReceipt(t *testing.T) {
 	}
 }
 
+func TestRecvPacketRoutineKeepaliveMaintainsExistingTupleOnly(t *testing.T) {
+	serverListen, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP server: %v", err)
+	}
+	remote, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		_ = serverListen.Close()
+		t.Fatalf("ListenUDP remote: %v", err)
+	}
+
+	server := newTestUdpServer(t)
+	server.listenConn = serverListen
+	server.listenAddr = serverListen.LocalAddr().(*net.UDPAddr)
+	server.listenAddrStr = server.listenAddr.String()
+	server.signals.stop = make(chan struct{})
+	cacheCh := make(chan *preCheckThreatCache, 1)
+	server.observePreCheckThreatCache = func(cache *preCheckThreatCache) { cacheCh <- cache }
+	server.wg.Add(1)
+	go server.recvPacketRoutine()
+	var threats *preCheckThreatCache
+	select {
+	case threats = <-cacheCh:
+	case <-time.After(time.Second):
+		t.Fatal("receive routine did not expose its precheck cache")
+	}
+	t.Cleanup(func() {
+		close(server.signals.stop)
+		_ = serverListen.Close()
+		_ = remote.Close()
+		server.wg.Wait()
+	})
+
+	write := func(wire []byte) {
+		t.Helper()
+		if _, err := remote.WriteToUDP(wire, server.listenAddr); err != nil {
+			t.Fatalf("WriteToUDP: %v", err)
+		}
+	}
+	remoteAddr := remote.LocalAddr().(*net.UDPAddr)
+	remoteIP := remoteAddr.IP.String()
+	if got := threats.Increment(remoteIP); got != 1 {
+		t.Fatalf("seed precheck threat count = %d, want 1", got)
+	}
+	if got := threats.Increment(remoteIP); got != 2 {
+		t.Fatalf("seed precheck threat count = %d, want 2", got)
+	}
+	kpl := make([]byte, core.RelayPacketMinimalLength)
+
+	// A valid KPL from an unknown tuple is structurally accepted but cannot
+	// establish server connection state.
+	write(kpl)
+	waitFor(t, time.Second, "unknown KPL read", func() bool {
+		return atomic.LoadUint64(&server.stats.totalRecvBytes) >= uint64(len(kpl))
+	})
+	server.remoteConnectionMapMutex.Lock()
+	_, found := server.remoteConnectionMap[remoteAddr.String()]
+	server.remoteConnectionMapMutex.Unlock()
+	if found {
+		t.Fatal("unknown unauthenticated KPL created a UDP connection")
+	}
+	if got, ok := threats.Count(remoteIP); !ok || got != 2 {
+		t.Fatalf("unknown KPL precheck threat count = %d, present=%v; want unchanged 2", got, ok)
+	}
+
+	// Once the same tuple is established by authenticated traffic, KPL may
+	// maintain it. The receive timestamp and queued packet are both observable
+	// before the connection routine consumes the keepalive.
+	recvQueue := make(chan *core.Packet, 1)
+	conn := &UdpConn{
+		evictSignal: make(chan struct{}),
+		ConnData: &core.ConnectionData{
+			Device:           server.device,
+			RemoteAddr:       remoteAddr,
+			RecvQueue:        recvQueue,
+			SendQueue:        make(chan *core.Packet, 1),
+			StopSignal:       make(chan struct{}),
+			BlockSignal:      make(chan struct{}),
+			SetTimeoutSignal: make(chan struct{}, 1),
+		},
+	}
+	atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, 1)
+	server.remoteConnectionMapMutex.Lock()
+	server.remoteConnectionMap[remoteAddr.String()] = conn
+	server.remoteConnectionMapMutex.Unlock()
+
+	write(kpl)
+	waitFor(t, time.Second, "known KPL refresh", func() bool {
+		return atomic.LoadInt64(&conn.ConnData.LastLocalRecvTime) > 1
+	})
+	select {
+	case pkt := <-recvQueue:
+		if pkt.HeaderType != core.NHP_KPL {
+			t.Fatalf("queued type = %s, want NHP_KPL", core.HeaderTypeToString(pkt.HeaderType))
+		}
+		server.device.ReleasePoolPacket(pkt)
+	case <-time.After(time.Second):
+		t.Fatal("known KPL was not forwarded to the existing connection")
+	}
+	if got, ok := threats.Count(remoteIP); !ok || got != 2 {
+		t.Fatalf("known KPL precheck threat count = %d, present=%v; want unchanged 2", got, ok)
+	}
+
+	// Appendix A2.1 deliberately short-circuits KPL structural validation in
+	// the current 1.1 parser, so this test does not invent a "malformed KPL"
+	// shape. It pins only the real authority boundary: unknown tuples cannot be
+	// created, while an existing tuple can be maintained without clearing its
+	// source-IP threat history.
+	server.remoteConnectionMapMutex.Lock()
+	stored, found := server.remoteConnectionMap[remoteAddr.String()]
+	mapLen := len(server.remoteConnectionMap)
+	server.remoteConnectionMapMutex.Unlock()
+	if !found || stored != conn || mapLen != 1 {
+		t.Fatalf("known KPL changed connection map: found=%v stored=%p want=%p len=%d", found, stored, conn, mapLen)
+	}
+}
+
 func TestPacketDataForInboundUsesEachPacketReceipt(t *testing.T) {
 	connData := &core.ConnectionData{}
 	first := &core.Packet{ReceivedAtNanos: 101}
@@ -965,7 +1082,9 @@ func TestRunRegisterWithRetry_FirstCallSucceeds(t *testing.T) {
 		calls++
 		return nil
 	}
-	s.runRegisterWithRetry(register, 3, time.Millisecond)
+	if err := s.runRegisterWithRetry(register, 3, time.Millisecond); err != nil {
+		t.Fatalf("runRegisterWithRetry() error = %v", err)
+	}
 
 	if calls != 1 {
 		t.Errorf("expected 1 register call, got %d", calls)
@@ -997,7 +1116,9 @@ func TestRunRegisterWithRetry_RetriesThenSucceeds(t *testing.T) {
 		}
 		return nil
 	}
-	s.runRegisterWithRetry(register, 3, time.Millisecond)
+	if err := s.runRegisterWithRetry(register, 3, time.Millisecond); err != nil {
+		t.Fatalf("runRegisterWithRetry() error = %v", err)
+	}
 
 	if calls != 3 {
 		t.Errorf("expected 3 register calls (2 fail + 1 success), got %d", calls)
@@ -1008,10 +1129,10 @@ func TestRunRegisterWithRetry_RetriesThenSucceeds(t *testing.T) {
 	}
 }
 
-// TestRunRegisterWithRetry_ExhaustsBudget fences the prod-degraded path:
-// every attempt fails. The failure metric must increment exactly once
-// (page-worthy signal) and the loop must exit so the refresh routine can
-// take over.
+// TestRunRegisterWithRetry_ExhaustsBudget fences the fail-closed path: every
+// attempt fails. The failure metric must increment exactly once and Start's
+// caller must receive the terminal error; an undiscoverable server must not
+// admit session-control work.
 func TestRunRegisterWithRetry_ExhaustsBudget(t *testing.T) {
 	mp := metrics.NewPublisherForTest(t)
 	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
@@ -1026,7 +1147,9 @@ func TestRunRegisterWithRetry_ExhaustsBudget(t *testing.T) {
 		calls++
 		return errors.New("Cloud Map down")
 	}
-	s.runRegisterWithRetry(register, 3, time.Millisecond)
+	if err := s.runRegisterWithRetry(register, 3, time.Millisecond); err == nil {
+		t.Fatal("runRegisterWithRetry() error = nil, want exhausted registration failure")
+	}
 
 	if calls != 3 {
 		t.Errorf("expected 3 register calls (full budget), got %d", calls)
@@ -2044,15 +2167,32 @@ func mockACResponder(sendMsgCh <-chan *core.MsgData, delay time.Duration, respEr
 					Error:      respErr,
 				}
 				if respErr == nil {
-					artMsg := &common.ACOpsResultMsg{
-						ErrCode: common.ErrSuccess.ErrorCode(),
-					}
-					ppd.BodyMessage, _ = json.Marshal(artMsg)
+					ppd.BodyMessage, ppd.Error = successARTBodyForAOP(md, 0)
 				}
 				md.ResponseMsgCh <- ppd
 			}(md)
 		}
 	}()
+}
+
+// successARTBodyForAOP mirrors the AC's 1.2 requirement to echo the exact
+// process-owner and numeric session carried by the authenticated AOP. A
+// nonzero sessionOverride is reserved for mismatch-path tests.
+func successARTBodyForAOP(md *core.MsgData, sessionOverride uint64) ([]byte, error) {
+	var aop common.ServerACOpsMsg
+	err := common.DecodeServerACOpsMsg(md.Message, &aop)
+	if err != nil {
+		return nil, err
+	}
+	sessionID := aop.SessionId
+	if sessionOverride != 0 {
+		sessionID = sessionOverride
+	}
+	return json.Marshal(&common.ACOpsResultMsg{
+		SessionOwnerId: aop.SessionOwnerId,
+		SessionId:      sessionID,
+		ErrCode:        common.ErrSuccess.ErrorCode(),
+	})
 }
 
 // newTestServerForBroadcast creates a minimal UdpServer suitable for
@@ -2114,6 +2254,19 @@ func newTestACConn(t *testing.T, ip string, port int, acId string, device ...*co
 	}
 }
 
+func reserveTestNHPSession(t *testing.T, s *UdpServer, knk *common.AgentKnockMsg, openTime uint32) {
+	t.Helper()
+	if s == nil || knk == nil {
+		t.Fatal("test NHP session reservation requires a server and knock")
+	}
+	agentKey := bytes.Repeat([]byte{0x7a}, core.PublicKeySize)
+	knk.NHPAgentPublicKey = base64.StdEncoding.EncodeToString(agentKey)
+	expiresAt := knk.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
+	if err := s.sessionRegistry().reserveExact(agentKey, knk.NHPSessionId, knk.NHPSessionIssuedAt, expiresAt); err != nil {
+		t.Fatalf("reserve test NHP session %d: %v", knk.NHPSessionId, err)
+	}
+}
+
 // TestBroadcast_ReturnsOnFirstSuccess verifies that the broadcast returns
 // immediately on the first AC success (low latency) while remaining goroutines
 // continue in the background so all ACs still get the ipset pinhole.
@@ -2132,11 +2285,11 @@ func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 				n := aopCount.Add(1)
 				// Stagger responses: 0ms, 50ms, 100ms
 				time.Sleep(time.Duration(n-1) * 50 * time.Millisecond)
-				artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-				body, _ := json.Marshal(artMsg)
+				body, bodyErr := successARTBodyForAOP(md, 0)
 				md.ResponseMsgCh <- &core.PacketParserData{
 					HeaderType:  core.NHP_ART,
 					BodyMessage: body,
+					Error:       bodyErr,
 				}
 				allDone.Done()
 			}(md)
@@ -2149,7 +2302,8 @@ func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2188,11 +2342,11 @@ func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
 				n := aopCount.Add(1)
 				if n == 2 {
 					// Second AC succeeds
-					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-					body, _ := json.Marshal(artMsg)
+					body, bodyErr := successARTBodyForAOP(md, 0)
 					md.ResponseMsgCh <- &core.PacketParserData{
 						HeaderType:  core.NHP_ART,
 						BodyMessage: body,
+						Error:       bodyErr,
 					}
 				} else {
 					// Others fail
@@ -2212,7 +2366,8 @@ func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
 		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2254,7 +2409,8 @@ func TestBroadcastCancellation_AllFail(t *testing.T) {
 		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2275,7 +2431,8 @@ func TestBroadcastCancellation_SingleConn(t *testing.T) {
 		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2308,11 +2465,11 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 				defer allDone.Done()
 				if n <= 2 {
 					// Respond immediately with success
-					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-					body, _ := json.Marshal(artMsg)
+					body, bodyErr := successARTBodyForAOP(md, 0)
 					md.ResponseMsgCh <- &core.PacketParserData{
 						HeaderType:  core.NHP_ART,
 						BodyMessage: body,
+						Error:       bodyErr,
 					}
 				}
 				// n == 3: never respond — the goroutine's context timeout will
@@ -2337,7 +2494,8 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2375,11 +2533,11 @@ func TestBroadcast_ParentContextCancellationDoesNotAbort(t *testing.T) {
 			go func(md *core.MsgData) {
 				defer allDone.Done()
 				aopCount.Add(1)
-				artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-				body, _ := json.Marshal(artMsg)
+				body, bodyErr := successARTBodyForAOP(md, 0)
 				md.ResponseMsgCh <- &core.PacketParserData{
 					HeaderType:  core.NHP_ART,
 					BodyMessage: body,
+					Error:       bodyErr,
 				}
 			}(md)
 		}
@@ -2391,7 +2549,8 @@ func TestBroadcast_ParentContextCancellationDoesNotAbort(t *testing.T) {
 		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
 	}
 
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2434,7 +2593,8 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 	}()
 
 	conn := newTestACConn(t, "10.0.0.1", 47051, "test-ac")
-	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knkMsg, 60)
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
@@ -2451,6 +2611,79 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 
 	if elapsed > 1*time.Second {
 		t.Errorf("Should have returned immediately, took %v", elapsed)
+	}
+}
+
+func TestProcessACOperation_RejectsMismatchedARTSessionID(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+	go func() {
+		md := <-sendCh
+		body, bodyErr := successARTBodyForAOP(md, 456)
+		if bodyErr == nil {
+			var art common.ACOpsResultMsg
+			bodyErr = json.Unmarshal(body, &art)
+			art.ACToken = "must-not-be-used"
+			if bodyErr == nil {
+				body, bodyErr = json.Marshal(&art)
+			}
+		}
+		md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_ART, BodyMessage: body, Error: bodyErr}
+	}()
+	conn := newTestACConn(t, "10.0.0.1", 47051, "test-ac")
+	knock := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 123, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knock, 60)
+	result, err := s.processACOperation(context.Background(), knock, conn,
+		&common.NetAddress{Ip: "192.168.1.100", Port: 443},
+		[]*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}, 60, nil)
+	if !errors.Is(err, common.ErrACOperationFailed) {
+		t.Fatalf("mismatched ART error = %v, want ErrACOperationFailed", err)
+	}
+	if result == nil || result.ErrCode != common.ErrACOperationFailed.ErrorCode() || result.ACToken != "" {
+		t.Fatalf("mismatched ART result = %+v, want fail-closed result without token", result)
+	}
+}
+
+func TestProcessACOperation_RejectsMissingOrExpiredSessionBeforeSend(t *testing.T) {
+	for name, knock := range map[string]*common.AgentKnockMsg{
+		"zero session id":       {UserId: "test-user", NHPSessionIssuedAt: time.Now()},
+		"missing issuance time": {UserId: "test-user", NHPSessionId: 123},
+		"expired lifetime":      {UserId: "test-user", NHPSessionId: 123, NHPSessionIssuedAt: time.Now().Add(-time.Minute)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, sendCh := newTestServerForBroadcast(t)
+			conn := newTestACConn(t, "10.0.0.1", 47051, "test-ac")
+			result, err := s.processACOperation(context.Background(), knock, conn,
+				&common.NetAddress{Ip: "192.168.1.100", Port: 443},
+				[]*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}, 30, nil)
+			if !errors.Is(err, common.ErrACOperationFailed) || result == nil || result.ErrCode != common.ErrACOperationFailed.ErrorCode() {
+				t.Fatalf("invalid session result = %+v, %v; want fail closed", result, err)
+			}
+			select {
+			case sent := <-sendCh:
+				t.Fatalf("invalid session emitted AOP: %+v", sent)
+			default:
+			}
+		})
+	}
+}
+
+func TestProcessACOperation_RejectsNonCanonicalACIDBeforeAOP(t *testing.T) {
+	for _, acID := range []string{"", "   ", " ac-a", "ac-a ", "ac\n-a", string([]byte{0xff})} {
+		t.Run(fmt.Sprintf("%q", acID), func(t *testing.T) {
+			s, sendCh := newTestServerForBroadcast(t)
+			knock := &common.AgentKnockMsg{UserId: "test-user", NHPSessionId: 124, NHPSessionIssuedAt: time.Now()}
+			result, err := s.processACOperation(context.Background(), knock, newTestACConn(t, "10.0.0.1", 47051, acID),
+				&common.NetAddress{Ip: "192.168.1.100", Port: 443},
+				[]*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}, 30, nil)
+			if !errors.Is(err, common.ErrACOperationFailed) || result == nil || result.ErrCode != common.ErrACOperationFailed.ErrorCode() {
+				t.Fatalf("non-canonical AC id result = %+v, %v; want fail closed", result, err)
+			}
+			select {
+			case sent := <-sendCh:
+				t.Fatalf("non-canonical AC id emitted AOP: %+v", sent)
+			default:
+			}
+		})
 	}
 }
 

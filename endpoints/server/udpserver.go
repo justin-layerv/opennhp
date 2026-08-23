@@ -3,7 +3,9 @@ package server
 import (
 	"container/list"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/OpenNHP/opennhp/nhp/etcd"
@@ -40,6 +43,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 	"github.com/OpenNHP/opennhp/nhp/utils"
 	"github.com/OpenNHP/opennhp/nhp/version"
+	"github.com/layervai/nhp/internalauth"
 )
 
 var (
@@ -301,6 +305,10 @@ type UdpServer struct {
 	// observeRelayRejectedBodyCleared is a TEST-ONLY SEAM proving generic
 	// authenticated-relay rejection clears decrypted bodies. Production leaves nil.
 	observeRelayRejectedBodyCleared func([]byte)
+	// observePreCheckThreatCache is a TEST-ONLY SEAM that exposes the otherwise
+	// receive-routine-local cache so the real UDP path can assert that the
+	// unauthenticated KPL exception never clears threat history. Production nil.
+	observePreCheckThreatCache func(*preCheckThreatCache)
 	// credentialRecoveryHandler is the direct-UDP-only assigned-cell recovery
 	// capability. Nil is the dark, absent-configuration state. It is constructed
 	// once during Start before the listener binds and is never exposed to relay or
@@ -346,7 +354,98 @@ type UdpServer struct {
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
 	storage       StorageBackend // DynamoDB (cloud) or etcd (on-prem)
 	storageConfig *StorageConfig
-	forwarder     *ServerForwarder // Server-to-server knock forwarding
+	// sessionControlStore is separate from StorageBackend because routing
+	// assignments expire and may be rewritten, while session authority and
+	// pending close work must survive disconnects and process restarts.
+	sessionControlStore sessionControlStore
+	// sessionControlCellID is the canonical NHP_CELL_ID resolved exactly once
+	// during cloud Start before the UDP listener binds. It is immutable after
+	// Start and is the cell authority used by AOL fence snapshots/activation.
+	sessionControlCellID string
+	// acSessionControlAdmission serializes the durable Prepare -> catch-up ->
+	// Activate -> publish transition per AC identity. Its bookkeeping mutex is
+	// never held while waiting for the keyed mutex and the keyed mutex is never
+	// nested with server map locks; store/network work therefore cannot block a
+	// global connection-map critical section.
+	acSessionControlAdmissionMu sync.Mutex
+	acSessionControlAdmissions  map[string]*acSessionControlAdmissionLock
+	// acSessionControlAuthorityGates linearize AOP enqueue with AOL authority
+	// transitions per exact AC ID/public-key target. AOP holds one read unit from
+	// its final readiness check through send enqueue; AOL holds the full weight
+	// through Prepare/catch-up/Activate, publication, and AAK enqueue. The map
+	// bookkeeping mutex is never held while acquiring or doing store/network work.
+	acSessionControlAuthorityGatesMu sync.Mutex
+	acSessionControlAuthorityGates   map[acSessionControlAuthorityGateKey]*acSessionControlAuthorityGate
+	// sessionControlCellGate closes the same-process interval between durable
+	// session admission and exact-close preparation. The global acquisition
+	// order is owner gate before cell gate: AOP takes both read sides through its
+	// final durable intent/readiness checks and send enqueue; AOL takes owner
+	// write then cell read; close preparation takes only cell write. Never retain
+	// either read gate while invoking close compensation.
+	sessionControlCellGateOnce sync.Once
+	sessionControlCellGate     *semaphore.Weighted
+	// acSessionControlFenceWaiters correlates the strict, unsolicited NHP_RVA
+	// push acknowledgement with the exact pre-publication AC connection and
+	// durable fence. NHP_REV is intentionally not a core transaction request,
+	// so this registry is independent of Device.LocalTransactionMap. Its mutex
+	// is leaf-local and is never held across network or store operations.
+	acSessionControlFenceWaitersMu sync.Mutex
+	acSessionControlFenceWaiters   map[acSessionControlFenceWaiterKey]*acSessionControlFenceWaiter
+	// sendACSessionControlFenceFn is a test-only seam for the synchronous strict
+	// REV/RVA catch-up exchange. Production leaves it nil.
+	sendACSessionControlFenceFn func(context.Context, *ACConn, sessionControlFenceAuthority) error
+	// sendACSessionControlTaskFn is the exact-ACK variant used by durable task
+	// delivery. Production leaves it nil; tests can observe the decoded RVA
+	// without constructing encrypted UDP packets.
+	sendACSessionControlTaskFn func(context.Context, *ACConn, sessionControlExactCloseTaskAuthority) (common.ACSessionCloseAckMsg, error)
+	// sessionControlAOLBudget is a test-only seam for deterministically proving
+	// that post-AAK finalization does not inherit an exhausted catch-up budget.
+	// Production leaves it zero and HandleACOnline uses DefaultStorageTimeout.
+	sessionControlAOLBudget time.Duration
+	sessionControlRecovery  sessionControlRecoveryRuntime
+	forwarder               *ServerForwarder // Server-to-server knock forwarding
+
+	// agentSessions is the authoritative process-local base NHP session
+	// allocator/close registry. Lazy initialization keeps bare unit-test server
+	// literals safe while Start initializes it before the listener accepts work.
+	agentSessionsOnce sync.Once
+	agentSessions     *liveNHPSessionRegistry
+	// acSessionOwnerID is a random per-process boot identity. The fleet shares
+	// one Noise server key, so AC session indexes require this additional
+	// authenticated AOP/ART scope to isolate same-ID sessions across processes.
+	acSessionOwnerOnce sync.Once
+	acSessionOwnerID   string
+	acSessionOwnerErr  error
+	// agentSessionCloseWork coalesces duplicate direct and fleet EXT work by
+	// authenticated agent key. One handler remains the leader for local retries
+	// and origin fan-out; followers advance its cutoff/deadline and return rather
+	// than consuming another handler slot for the same close loop.
+	agentSessionCloseWorkMu              sync.Mutex
+	agentSessionCloseWork                map[string]*agentSessionCloseWork
+	agentSessionCloseWorkerMu            sync.Mutex
+	agentSessionCloseWorkerWG            sync.WaitGroup
+	agentSessionCloseWorkersStopping     bool
+	agentSessionCloseWorkerActive        int
+	agentSessionClosePriorityQueue       []func()
+	agentSessionCloseRegularQueue        []func()
+	agentSessionClosePriorityOutstanding int
+	agentSessionCloseRegularOutstanding  int
+	// agentSessionCloseBeforeFinalizeFn is a deterministic test barrier for the
+	// follower-at-finalization race. Production leaves it nil.
+	agentSessionCloseBeforeFinalizeFn func()
+	// processACSessionCloseFn is a test seam for the bodyless EXT close worker.
+	// Production always leaves it nil and uses processACSessionClose.
+	processACSessionCloseFn func(context.Context, uint64, *ACConn) error
+	// broadcastAgentSessionCloseFn is a test seam for shutdown/cancellation of
+	// the origin fan-out. Production leaves it nil and uses Cloud Map plus direct
+	// private HTTP; it never enters the bounded NHP peer-forwarding cache.
+	broadcastAgentSessionCloseFn func(context.Context, *agentSessionCloseFleetEvent)
+	fleetCloseSigner             *internalauth.Signer
+	fleetCloseHTTPClient         *http.Client
+	// fleetCloseHTTPPortAllowedFn is a test-only seam for loopback listeners
+	// allocated on ephemeral ports. Production leaves it nil and accepts only
+	// ports matched by the Terraform VPC ingress contract.
+	fleetCloseHTTPPortAllowedFn func(int) bool
 
 	// Cloud Map client for server health discovery.
 	// Used to filter stale AC assignments pointing to terminated servers.
@@ -454,14 +553,14 @@ type UdpServer struct {
 
 	// processACOperationBroadcastFn — TEST-ONLY SEAM.
 	//
-	// Indirection the local UDP/HTTP knock handlers go through to reach
+	// Indirection the native UDP knock handler goes through to reach
 	// processACOperationBroadcast. Production paths leave it nil; the
 	// resolveProcessACOperationBroadcast helper picks the real method
 	// when unset. Tests set it on a literal UdpServer to inject a fake
 	// AC response (populating artMsg.ACToken without driving real Noise
 	// cipher state), which is the only practical way to fence the
 	// load-bearing post-Wait PublishACKTokens call from the handler
-	// entry point — see {udp,http}server_publish_acktokens_test.go.
+	// entry point — see udpserver_publish_acktokens_test.go.
 	//
 	// Not a stable production knob: package-private, no setter, no
 	// documented production semantics. If you find yourself wanting to
@@ -546,8 +645,7 @@ type UdpServer struct {
 // knock handlers should call to drive the AC broadcast. Production
 // returns the bound method; tests that set processACOperationBroadcastFn
 // directly on the UdpServer literal get their fake. Centralizing the
-// fallback here keeps the two call sites in handleNhpOpenResource and
-// handleHttpOpenResource identical.
+// fallback here keeps the native handleNhpOpenResource call site testable.
 func (s *UdpServer) resolveProcessACOperationBroadcast() func(
 	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -599,12 +697,25 @@ type UdpConn struct {
 }
 
 type ACConn struct {
-	ConnData       *core.ConnectionData
-	ACPeer         *core.UdpPeer
-	ACCipherScheme int
-	ACId           string
-	ServiceId      string
-	Apps           []string
+	ConnData        *core.ConnectionData
+	ACPeer          *core.UdpPeer
+	ACCipherScheme  int
+	ACId            string
+	ServiceId       string
+	Apps            []string
+	BootID          string
+	FlushGeneration uint64
+	// sessionControlAuthorityReady is set only after the durable target has
+	// caught up through the exact control-directory version and activated.
+	// A counted reconnect clears the old connection's bit before Prepare, so a
+	// PREPARING target remains available for control recovery but cannot receive
+	// a new AOP.
+	sessionControlAuthorityReady atomic.Bool
+	// sessionControlTarget is the immutable durable READY authority consumed by
+	// PrepareSessionIntentCurrent. It is published before the ready bit and
+	// cleared after that bit during replacement, so the local bit remains only
+	// a fast-path optimization rather than an authority substitute.
+	sessionControlTarget atomic.Pointer[sessionControlTargetAuthority]
 }
 
 type DBConn struct {
@@ -642,6 +753,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	log.SetGlobalLogger(s.log)
 
 	log.Info("=========================================================")
+	if _, err := s.sessionOwnerID(); err != nil {
+		return fmt.Errorf("initialize AC session owner identity: %w", err)
+	}
 	log.Info("=== NHP-Server %s started              ===", version.Version)
 	log.Info("=== REVISION %s ===", version.CommitId)
 	log.Info("=== RELEASE %s                       ===", version.BuildTime)
@@ -683,7 +797,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		// flipping strict. The rollout playbook is "watch legacy
 		// drain to zero, then watch mismatch stay at zero in burn-in,
 		// then flip NHP_KNOCK_HEADERTYPE_VERIFY=true."
-		log.Info("Knock HeaderType verify gate: permit mode (#1154); watch %s (rollout) and %s (attack) before flipping NHP_KNOCK_HEADERTYPE_VERIFY=true",
+		log.Info("Knock HeaderType verify gate: permit mode (#1154); watch %s (rollout) and %s (producer/parser drift) before flipping NHP_KNOCK_HEADERTYPE_VERIFY=true",
 			MetricKnockHeaderTypeLegacy, MetricKnockHeaderTypeMismatch)
 	}
 
@@ -796,14 +910,27 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	ackTokenStoreInitFailed := false
 	s.storageConfig, err = s.loadStorageConfig()
 	if err != nil {
-		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
-		// Continue without storage - fall back to etcd/local config for AC discovery
+		return fmt.Errorf("load storage config before session-control authority: %w", err)
 	} else if s.storageConfig != nil && s.storageConfig.Backend != "" {
+		if s.storageConfig.Backend == StorageBackendDynamoDB && s.storageConfig.DynamoDB.SessionControlTable == "" {
+			return errors.New("DynamoDB storage requires SessionControlTable before accepting AOL/knock traffic")
+		}
+		if s.storageConfig.Backend == StorageBackendDynamoDB {
+			// Resolve the durable authority cell once, before any listener can
+			// accept AOL/knock traffic. There is deliberately no cell0 fallback:
+			// a missing or noncanonical deployment identity must fail closed.
+			if err := s.configureCloudSessionControlCellID(); err != nil {
+				return err
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		s.storage, err = CreateStorageBackend(ctx, *s.storageConfig)
 		if err != nil {
+			if s.storageConfig.Backend == StorageBackendDynamoDB {
+				return fmt.Errorf("create DynamoDB storage required by session-control authority: %w", err)
+			}
 			log.Warning("Failed to create storage backend (%s): %v", s.storageConfig.Backend, err)
 			// Continue without storage - fall back to etcd/local config
 		} else {
@@ -823,11 +950,29 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		// emit MetricAgentLookupInitFailure (deferred to after the
 		// metrics publisher is constructed; see flag above) so the
 		// failure surfaces in alarms instead of disappearing into
-		// the noise. We do NOT fail-fast here: matches the existing
-		// pattern for "Failed to create storage backend" three
-		// lines above (Warning-and-continue), which on-prem
-		// etcd/file-config deployments rely on.
+		// the noise. DynamoDB construction and the dedicated session-control
+		// authority fail Start above; only optional lookup construction keeps
+		// the existing degraded behavior. On-prem etcd/file-config deployments
+		// remain outside that cloud authority requirement.
 		if s.storage != nil {
+			if s.storageConfig.Backend == StorageBackendDynamoDB {
+				sessionStore, sessionStoreErr := NewSessionControlStoreFromStorage(ctx, s.storage)
+				if sessionStoreErr != nil {
+					return fmt.Errorf("initialize mandatory session-control authority: %w", sessionStoreErr)
+				}
+				s.sessionControlStore = sessionStore
+				if _, ok := sessionStore.(sessionControlRequestStore); !ok {
+					return errors.New("initialize mandatory session-control request authority: incomplete store capability")
+				}
+				if err := s.validateSessionControlExactRetirementCapabilities(); err != nil {
+					return fmt.Errorf("initialize mandatory session-control exact retirement authority: %w", err)
+				}
+				if err := s.validateSessionControlRecoveryCapabilities(); err != nil {
+					return fmt.Errorf("initialize mandatory session-control recovery authority: %w", err)
+				}
+				log.Info("Session-control authority initialized (DDB, strong startup read succeeded)")
+			}
+
 			lookup, lookupErr := NewAgentPeerLookupFromStorage(s.storage)
 			if lookupErr != nil {
 				log.Error("Failed to initialize agent peer lookup: %v", lookupErr)
@@ -994,6 +1139,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return float64(samples[0].Value.Uint64())
 	})
 	// Initialize server-to-server forwarder
+	s.sessionRegistry()
 	s.forwarder = NewServerForwarder(s)
 	s.forwarder.Start()
 
@@ -1196,14 +1342,6 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 	s.localMac = utils.GetMacAddress(s.localIp)
 
-	// In cloud mode, fetch instance identity from IMDS and register public key with Cloud Map.
-	// Boot-time call retries on transient failures; the refresh routine started below
-	// re-asserts every cloudMapRegisterRefreshInterval so a registration drop (issue #1681)
-	// self-heals.
-	if cloudMode && s.cloudMap != nil {
-		s.registerWithCloudMapWithRetry()
-	}
-
 	s.recordServerStartup()
 
 	// load asp resources and plugins
@@ -1263,6 +1401,29 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		}
 	}
 
+	if err := s.configureAgentSessionCloseFleetAuth(); err != nil {
+		return err
+	}
+
+	// Register only after HTTP configuration is loaded. Fleet-wide EXT close
+	// propagation targets each healthy instance's direct private HTTP port; a
+	// registration that advertised UDP identity before HTTP_PORT was known would
+	// create an avoidable partial-delivery window. Periodic refresh below
+	// re-asserts the complete attribute set.
+	if cloudMode && s.cloudMap != nil {
+		if err := s.registerWithCloudMapWithRetry(); err != nil {
+			// loadHttpConfig starts the private HTTP listener before its actual
+			// bound port can be advertised. Tear it down on the fail-closed
+			// registration exit so a caller that handles Start's error without
+			// immediately terminating the process cannot leave a partial server.
+			if s.httpServer != nil {
+				s.httpServer.Stop()
+				s.httpServer = nil
+			}
+			return err
+		}
+	}
+
 	s.remoteConnectionMap = make(map[string]*UdpConn)
 	s.connectionsByIP = make(map[string]*list.List)
 	s.acConnectionMap = make(map[string][]*ACConn)
@@ -1283,6 +1444,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 
 	s.recvMsgCh = s.device.DecryptedMsgQueue
 	s.sendMsgCh = make(chan *core.MsgData, core.SendQueueSize)
+	// All fallible startup and lifecycle initialization is complete before the
+	// durable reconciler owns a goroutine. Its first sweep is ticker-delayed, so
+	// the device/send routines and running flag below are visible before work can
+	// be dispatched. This also guarantees a failed Start cannot leak a worker
+	// rooted in context.Background.
+	if err := s.startSessionControlRecovery(); err != nil {
+		return fmt.Errorf("start mandatory session-control recovery: %w", err)
+	}
 
 	// start device routines
 	s.device.Start()
@@ -1403,10 +1572,14 @@ func (s *UdpServer) Stop() {
 		return
 	}
 	s.running.Store(false)
-	// stop http server first
-	if s.httpServer != nil {
-		s.httpServer.Stop()
-	}
+	s.agentSessionCloseWorkerMu.Lock()
+	s.agentSessionCloseWorkersStopping = true
+	s.agentSessionCloseWorkerMu.Unlock()
+	// Stop HTTP ingress first: once recovery cancellation begins, no new request
+	// may be accepted that depends on that durable reconciler. Recovery still
+	// stops before AC drain, so no new close delivery starts while connection
+	// ownership is being torn down.
+	s.stopHTTPAndSessionControlRecovery()
 	if s.etcdConn != nil {
 		s.etcdConn.Close()
 	}
@@ -1484,6 +1657,7 @@ func (s *UdpServer) Stop() {
 	s.outboundConnStartMutex.Lock()
 	s.outboundConnStartMutex.Unlock()
 	s.wg.Wait()
+	s.agentSessionCloseWorkerWG.Wait()
 	// Close storage backend AFTER wg.Wait() so in-flight goroutines
 	// (e.g., refreshAssignmentTTL) finish their storage operations first.
 	if s.storage != nil {
@@ -1498,7 +1672,15 @@ func (s *UdpServer) Stop() {
 	s.log.Close()
 }
 
-// ACPeerCount returns the number of unique AC peers with active connections.
+func (s *UdpServer) stopHTTPAndSessionControlRecovery() {
+	if s.httpServer != nil {
+		s.httpServer.Stop()
+	}
+	s.stopSessionControlRecovery()
+}
+
+// ACPeerCount returns the number of unique AC IDs with at least one live,
+// authority-eligible connection.
 // This counts distinct AC IDs (not total connections per AC, which may be >1
 // during blue/green deployments). For health checking, at least one AC peer
 // means knock traffic can be processed.
@@ -1506,7 +1688,18 @@ func (s *UdpServer) Stop() {
 func (s *UdpServer) ACPeerCount() int {
 	s.acConnectionMapMutex.RLock()
 	defer s.acConnectionMapMutex.RUnlock()
-	return len(s.acConnectionMap)
+	cutoffNanos := time.Now().Add(-s.staleACConnThreshold()).UnixNano()
+	authorityRequired := s.sessionControlAuthorityRequired()
+	count := 0
+	for _, conns := range s.acConnectionMap {
+		for _, conn := range conns {
+			if acConnAuthorityEligibleAt(conn, cutoffNanos, authorityRequired) {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 // MaxACConnsForAnyID returns the maximum number of connections held by any
@@ -1966,15 +2159,20 @@ func (s *UdpServer) registerWithCloudMap() error {
 		}
 		instanceID, instanceAZ, asgName = s.snapshotInstanceIdentity()
 	}
+	httpPort := s.effectiveHTTPPort()
+	if httpPort == 0 {
+		return errors.New("Cloud Map registration requires a running plaintext VPC-admitted fleet-control HTTP listener")
+	}
 
 	// Re-assert with current attributes. RegisterInstance REPLACES all
 	// attributes for the instance ID, so we must include IP, AZ, port,
-	// pubkey on every call.
+	// pubkey, and the actual bound fleet-control HTTP port on every call.
 	attrs := map[string]string{
-		CloudMapAttrIPv4: s.localIp,
-		CloudMapAttrAZ:   instanceAZ,
-		CloudMapAttrPort: strconv.Itoa(s.config.ListenPort),
-		CloudMapAttrKey:  s.device.PublicKeyBase64(),
+		CloudMapAttrIPv4:     s.localIp,
+		CloudMapAttrAZ:       instanceAZ,
+		CloudMapAttrPort:     strconv.Itoa(s.config.ListenPort),
+		CloudMapAttrKey:      s.device.PublicKeyBase64(),
+		CloudMapAttrHTTPPort: strconv.Itoa(httpPort),
 	}
 	if asgName != "" {
 		attrs[CloudMapAttrASG] = asgName
@@ -1987,6 +2185,67 @@ func (s *UdpServer) registerWithCloudMap() error {
 		return fmt.Errorf("Cloud Map RegisterInstance: %w", err)
 	}
 	return nil
+}
+
+const agentSessionCloseFleetMACDomain = "opennhp/agent-session-close-fleet/v1\x00"
+
+// configureAgentSessionCloseFleetAuth derives a purpose-specific HTTP HMAC key
+// from the deployed NHP server static private key. The key is shared by every
+// process in a cell today, so it authenticates fleet membership, not a unique
+// instance. Exact source IP + Cloud Map membership provide the instance-target
+// binding used by the receiver.
+func (s *UdpServer) configureAgentSessionCloseFleetAuth() error {
+	if s == nil || s.config == nil {
+		return errors.New("missing server config for fleet close authentication")
+	}
+	privateKey, err := base64.StdEncoding.DecodeString(s.config.PrivateKeyBase64)
+	if err != nil || len(privateKey) != core.PrivateKeySize {
+		return errors.New("invalid server private key for fleet close authentication")
+	}
+	defer core.SetZero(privateKey)
+	mac := hmac.New(sha256.New, privateKey)
+	_, _ = mac.Write([]byte(agentSessionCloseFleetMACDomain))
+	derived := mac.Sum(nil)
+	defer core.SetZero(derived)
+	signer, err := internalauth.New(base64.RawURLEncoding.EncodeToString(derived))
+	if err != nil {
+		return fmt.Errorf("construct fleet close authenticator: %w", err)
+	}
+	s.fleetCloseSigner = signer
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = 2 * time.Second
+	transport.ResponseHeaderTimeout = 3 * time.Second
+	transport.IdleConnTimeout = 30 * time.Second
+	transport.MaxIdleConns = 32
+	transport.MaxIdleConnsPerHost = 2
+	s.fleetCloseHTTPClient = &http.Client{
+		Transport: transport,
+		Timeout:   agentSessionCloseEventTTL,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("fleet close redirects are forbidden")
+		},
+	}
+	return nil
+}
+
+func (s *UdpServer) effectiveHTTPPort() int {
+	if s == nil || s.httpServer == nil || !s.httpServer.IsRunning() || s.httpServer.listenAddr == nil {
+		return 0
+	}
+	hs := s.httpServer
+	if hs.tlsEnabled || !fleetCloseHTTPPortIsVPCAdmitted(hs.listenAddr.Port) {
+		return 0
+	}
+	return hs.listenAddr.Port
+}
+
+// fleetCloseHTTPPortIsVPCAdmitted mirrors the two VPC-scoped TCP ingress rules
+// in terraform/modules/compute/main.tf. Do not advertise a configured listener
+// through Cloud Map unless sibling instances can actually reach it.
+func fleetCloseHTTPPortIsVPCAdmitted(port int) bool {
+	return port == 62206 || port == 8888
 }
 
 // InstanceID returns the EC2 instance ID, or "" if IMDS hasn't completed.
@@ -2095,16 +2354,21 @@ func (s *UdpServer) fetchInstanceIdentityFromIMDS() error {
 // retries at process start. The retry budget covers a transient IMDS or
 // Cloud Map hiccup that would otherwise leave the server permanently
 // absent from auto-assignment until the next deploy (issue #1681). After
-// exhaustion, the periodic refresh routine takes over.
-func (s *UdpServer) registerWithCloudMapWithRetry() {
-	s.runRegisterWithRetry(s.registerWithCloudMap, cloudMapRegisterInitialAttempts, cloudMapRegisterInitialBackoff)
+// exhaustion, Start fails closed: an undiscoverable server cannot safely admit
+// sessions whose later fleet-close work depends on reaching every live owner.
+func (s *UdpServer) registerWithCloudMapWithRetry() error {
+	return s.runRegisterWithRetry(s.registerWithCloudMap, cloudMapRegisterInitialAttempts, cloudMapRegisterInitialBackoff)
 }
 
 // runRegisterWithRetry is the parameterized retry loop that
 // registerWithCloudMapWithRetry delegates to. Split out so tests can
 // drive the loop with a fake register fn and a near-zero backoff
 // without paying boot timing in the test path.
-func (s *UdpServer) runRegisterWithRetry(register func() error, attempts int, backoff time.Duration) {
+func (s *UdpServer) runRegisterWithRetry(register func() error, attempts int, backoff time.Duration) error {
+	if register == nil || attempts <= 0 {
+		return errors.New("Cloud Map registration retry requires a callback and positive attempt budget")
+	}
+	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		err := register()
 		if err == nil {
@@ -2114,20 +2378,21 @@ func (s *UdpServer) runRegisterWithRetry(register func() error, attempts int, ba
 			// but guarded against future encoding changes anyway).
 			log.Info("Registered with Cloud Map: instance=%s, az=%s, asg=%s, pubkey=%.12s...",
 				instanceID, instanceAZ, asgName, s.device.PublicKeyBase64())
-			return
+			return nil
 		}
+		lastErr = err
 		if attempt == attempts {
-			log.Error("Cloud Map registration failed after %d attempts: %v (refresh routine will continue retrying every %s; auto-assignment falls back to hostname-only identity until then)",
-				attempts, err, cloudMapRegisterRefreshInterval)
+			log.Error("Cloud Map registration failed after %d attempts: %v (server remains unavailable)", attempts, err)
 			if s.metrics != nil {
 				s.metrics.IncrCounter(MetricCloudMapRegisterFailure)
 			}
-			return
+			break
 		}
 		log.Warning("Cloud Map registration attempt %d/%d failed: %v (retrying in %s)",
 			attempt, attempts, err, backoff)
 		time.Sleep(backoff)
 	}
+	return fmt.Errorf("Cloud Map registration required before accepting traffic: %w", lastErr)
 }
 
 // cloudMapRegisterRefreshRoutine periodically re-asserts the Cloud Map
@@ -2376,8 +2641,8 @@ func packetFromUDPDatagram(device *core.Device, raw []byte, receivedAtNanos int6
 	}
 
 	// Preserve the standard-packet fast path exactly as it behaved before relay
-	// envelopes existed: RecvPrecheck performs its full authenticated protocol
-	// validation after this copy. Do not mirror the oversized branch's exact
+	// envelopes existed: RecvPrecheck performs structural protocol validation
+	// after this copy. Do not mirror the oversized branch's exact
 	// clear-header length check here; doing so would silently change admission
 	// semantics for every existing <= 4,096-byte direct NHP packet.
 	pkt := device.AllocatePoolPacket()
@@ -2406,6 +2671,9 @@ func (s *UdpServer) recvPacketRoutine() {
 		PreCheckThreatCacheTTL,
 		func() { s.metrics.IncrCounter(MetricPreCheckThreatEviction) },
 	)
+	if s.observePreCheckThreatCache != nil {
+		s.observePreCheckThreatCache(preCheckThreats)
+	}
 	// Load-bearing single-reader invariant: this buffer is reused by exactly one
 	// recvPacketRoutine goroutine and every admitted datagram is copied before the
 	// next read. The extra byte makes a datagram above the authenticated relay
@@ -2485,15 +2753,27 @@ func (s *UdpServer) recvPacketRoutine() {
 			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddrStr, err)
 			continue
 		}
-		// Any successful precheck from this IP clears the IP's counter:
-		// if any port from a source looks legitimate, the source isn't
-		// a scanner. Semantics change from the old IP:port keying,
-		// where one port succeeding didn't affect others.
-		preCheckThreats.Clear(ipStr)
-
 		s.remoteConnectionMapMutex.Lock()
 		conn, found := s.remoteConnectionMap[addrStr]
 		s.remoteConnectionMapMutex.Unlock()
+
+		// Appendix A2.1 KPL is deliberately unauthenticated and exists only
+		// to maintain an already-established UDP tuple. A structurally valid
+		// keepalive therefore cannot establish a connection or clear the
+		// source-IP precheck threat history. Known tuples still receive it so
+		// their connection routine can refresh the idle timer.
+		if pkt.HeaderType == core.NHP_KPL && !found {
+			s.device.ReleasePoolPacket(pkt)
+			log.Info("Discard [NHP_KPL] from unknown UDP tuple (%s -> %s)", addrStr, s.listenAddrStr)
+			continue
+		}
+		// Appendix A2.1 KPL is unauthenticated, so it must never erase
+		// structural-failure history. Other structurally valid 1.1 packets keep
+		// the existing cache-clear behavior until a separately negotiated keyed
+		// header profile exists.
+		if pkt.HeaderType != core.NHP_KPL {
+			preCheckThreats.Clear(ipStr)
+		}
 
 		if found {
 			// existing connection
@@ -3346,7 +3626,7 @@ func isProtectedHandlerType(headerType int) bool {
 	// fences are TestCookieVerifyRejectsBadCookieOnNonOverloadedServer and
 	// TestCookieVerifyRejectsWrongRemote. Do not route pre-validation headers
 	// here or the protected reserve would become source-spoofable.
-	return headerType == core.NHP_RKN || headerType == core.NHP_RLY
+	return headerType == core.NHP_RKN || headerType == core.NHP_RLY || headerType == core.NHP_EXT
 }
 
 func handlerPressureRecoveryThreshold(generalCapacity int) int64 {
@@ -3437,7 +3717,7 @@ type handlerPanicStackGate struct {
 // value outside the registry.
 //
 // The key domain is bounded HERE rather than relying on callers, so the map can
-// never exceed one entry per registered header type plus the -1 bucket (~34).
+// never exceed one entry per registered header type plus the -1 bucket (~36).
 // dispatchHandler is only reached with validated types today, so the fold is
 // unreachable — but this map is keyed by a field that originates in a received
 // packet, and "an attacker cannot choose this value" is exactly the kind of
@@ -4362,8 +4642,8 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 // stampQurlV2RevocationMetadata copies the qURL v2 revocation metadata (P4a)
 // from res onto the AOP. Pure + nil-safe so the production stamp and the test
 // doubles share ONE mapping and cannot drift (mirrors the AC-side
-// accessEntryFromAOP extraction). res is nil on the local non-v2 path and a
-// catalog ResourceData on legacy forward/http paths. Upgraded native forwards
+// accessEntryFromAOP extraction). res is nil on the local non-v2 path and may
+// be catalog ResourceData on legacy callers. Upgraded native forwards
 // merge the origin admission's narrow revocation sidecar into the receiver's
 // catalog ResourceData before stamping. All fields are omitempty, so the AOP stays
 // additive/wire-compatible (pre-v2 ACs ignore unknown keys).
@@ -4397,14 +4677,14 @@ func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.Re
 	}
 	aopMsg.QurlUserPublicKeyHash = res.QurlUserPublicKeyHash
 	aopMsg.ResourcePublicKeyHash = res.ResourcePublicKeyHash
-	aopMsg.SessionId = res.SessionId
+	aopMsg.QurlSessionId = res.QurlSessionId
 	aopMsg.AdmissionId = res.AdmissionId
 	aopMsg.Deadline = res.Deadline
 }
 
 // res carries the qURL v2 revocation metadata (P4a) to stamp onto the AOP. It is
-// nil on the local admission path for non-qURL-v2 knocks, and a catalog
-// ResourceData on legacy forward/http paths. Native forwards merge a narrow
+// nil on the local admission path for non-qURL-v2 knocks, and may be catalog
+// ResourceData on legacy callers. Native forwards merge a narrow
 // revocation sidecar from the origin admission before this stamp. The stamped fields are
 // all omitempty, so the AOP stays additive and wire-compatible: pre-v2 ACs
 // simply ignore keys they don't know. No flag check is needed here — only the v2
@@ -4418,6 +4698,43 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		log.Critical("processACOperation with nil input argument")
 		err = common.ErrInvalidInput
 		return
+	}
+	if !conn.sessionControlReady(s.sessionControlAuthorityRequired()) {
+		log.Warning("processACOperation rejected AC connection without active session-control authority")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+	}
+	if knkMsg.NHPSessionId == 0 {
+		log.Error("processACOperation rejected missing NHP session id")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	if knkMsg.NHPSessionIssuedAt.IsZero() {
+		log.Error("processACOperation rejected missing NHP session issuance time")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	if !common.ValidNHPAgentPublicKey(knkMsg.NHPAgentPublicKey) {
+		log.Error("processACOperation rejected missing authenticated NHP-Agent public key")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	if knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID &&
+		(common.ValidateAgentKnockRunID(knkMsg.RunID) != nil || knkMsg.RunAttempt == 0) {
+		log.Error("processACOperation rejected missing registered-agent retry binding")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	validACID := utf8.ValidString(conn.ACId) && strings.TrimSpace(conn.ACId) != "" && strings.TrimSpace(conn.ACId) == conn.ACId
+	for _, r := range conn.ACId {
+		if unicode.IsControl(r) {
+			validACID = false
+			break
+		}
+	}
+	if !validACID {
+		log.Error("processACOperation rejected non-canonical AC id")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	sessionOwnerID, ownerErr := s.sessionOwnerID()
+	if ownerErr != nil {
+		log.Error("processACOperation failed to establish AC session owner identity: %v", ownerErr)
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
 	}
 
 	artMsg = &common.ACOpsResultMsg{}
@@ -4446,19 +4763,131 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		artMsg.ErrMsg = "AC peer address not initialized"
 		return
 	}
-	if openTime == 0 {
-		openTime = DefaultIpOpenTime
+	if openTime == 0 || !time.Now().Before(knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime)*time.Second)) {
+		log.Error("processACOperation rejected invalid or expired NHP session lifetime")
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	sessionExpiresAt := knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
+	aopOpenTime := openTime
+	if aopOpenTime > ^uint32(0)-uint32(ACOpenCompensationTime) {
+		aopOpenTime = ^uint32(0)
+	} else {
+		aopOpenTime += uint32(ACOpenCompensationTime)
+	}
+	if beginErr := s.sessionRegistry().beginOpen(knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt); beginErr != nil {
+		log.Warning("server-agent(%s@%s)-ac(%s)[processACOperation] NHP session is not openable: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, beginErr)
+		return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, common.ErrACOperationFailed
+	}
+	acAdmitted := false
+	defer func() {
+		// AC OpenTime is relative to when the AC receives the AOP, not the
+		// session issuance timestamp. Retain exact close work conservatively
+		// from ART completion through the full compensated AC lifetime while
+		// keeping beginOpen fenced by sessionExpiresAt.
+		acRetainUntil := time.Now().Add(time.Duration(aopOpenTime) * time.Second)
+		finishErr := s.sessionRegistry().finishOpen(knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt, sessionExpiresAt, acRetainUntil, conn.ACId, acAdmitted)
+		if finishErr != nil && acAdmitted {
+			log.Warning("server-agent(%s@%s)-ac(%s)[processACOperation] NHP session closed while AOP was in flight", knkMsg.UserId, srcAddr.String(), conn.ACId)
+			err = common.ErrACOperationFailed
+			artMsg = &common.ACOpsResultMsg{
+				SessionId:      knkMsg.NHPSessionId,
+				SessionOwnerId: sessionOwnerID,
+				ErrCode:        common.ErrACOperationFailed.ErrorCode(),
+				ErrMsg:         common.ErrACOperationFailed.Error(),
+			}
+		}
+	}()
+
+	var releaseAuthorityRead func()
+	var releaseCellRead func()
+	var durableIntent *sessionControlSessionIntentPreparation
+	if s.sessionControlAuthorityRequired() {
+		candidate, candidateErr := sessionControlCandidateForKnock(s.sessionControlCellID, knkMsg)
+		if candidateErr != nil {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, candidateErr
+		}
+		var gateErr error
+		releaseAuthorityRead, gateErr = s.acquireACSessionControlAuthorityRead(ctx, conn)
+		if gateErr != nil {
+			log.Warning("server-agent(%s@%s)-ac(%s)[processACOperation] authority gate unavailable: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, gateErr)
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		defer func() {
+			if releaseAuthorityRead != nil {
+				releaseAuthorityRead()
+			}
+		}()
+		releaseCellRead, gateErr = s.acquireSessionControlCellRead(ctx)
+		if gateErr != nil {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		defer func() {
+			if releaseCellRead != nil {
+				releaseCellRead()
+			}
+		}()
+		if !conn.sessionControlReady(true) {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		targetPtr := conn.sessionControlTarget.Load()
+		if targetPtr == nil {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		target := *targetPtr
+		if validateSessionControlTargetAuthority(target) != nil || !target.ready() || target.RetiredAtMillis != 0 ||
+			target.ControlCellID != candidate.CellID || target.ACID != conn.ACId || target.PublicKey != conn.ACPeer.PubKeyBase64 ||
+			target.BootID != conn.BootID || target.FlushGeneration != conn.FlushGeneration {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		deliveryDeadline := time.Now().Add(DefaultBroadcastTimeout)
+		if deadline, ok := ctx.Deadline(); ok {
+			deliveryDeadline = deadline
+		}
+		retainUntilMillis, retainErr := sessionControlRetainUntilMillis(candidate, aopOpenTime, deliveryDeadline)
+		if retainErr != nil {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode(), ErrMsg: common.ErrACOperationFailed.Error()}, retainErr
+		}
+		durableIntent, gateErr = s.prepareDurableSessionIntent(ctx, candidate, target,
+			sessionExpiresAt.UnixMilli(), retainUntilMillis)
+		if gateErr != nil {
+			log.Warning("server-agent(%s@%s)-ac(%s)[processACOperation] durable intent rejected: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, gateErr)
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+		currentTarget := conn.sessionControlTarget.Load()
+		if currentTarget == nil || *currentTarget != target || !conn.sessionControlReady(true) {
+			return &common.ACOpsResultMsg{ErrCode: common.ErrACSessionControlNotReady.ErrorCode(), ErrMsg: common.ErrACSessionControlNotReady.Error()}, common.ErrACSessionControlNotReady
+		}
+	}
+
+	aopSessionID := knkMsg.NHPSessionId
+	aopAgentPublicKey := knkMsg.NHPAgentPublicKey
+	aopIssuedAtMillis := knkMsg.NHPSessionIssuedAt.UnixMilli()
+	aopRunID := knkMsg.RunID
+	aopRunAttempt := knkMsg.RunAttempt
+	if durableIntent != nil {
+		authority := durableIntent.Intent.Session
+		aopSessionID = authority.SessionID
+		aopAgentPublicKey = authority.AgentPublicKey
+		aopIssuedAtMillis = authority.IssuedAtMillis
+		aopRunID = authority.RunID
+		aopRunAttempt = authority.RunAttempt
 	}
 
 	aopMsg := &common.ServerACOpsMsg{
-		UserId:           knkMsg.UserId,
-		DeviceId:         knkMsg.DeviceId,
-		OrganizationId:   knkMsg.OrganizationId,
-		AuthServiceId:    knkMsg.AuthServiceId,
-		ResourceId:       knkMsg.ResourceId,
-		SourceAddrs:      srcAddrs,
-		DestinationAddrs: dstAddrs,
-		OpenTime:         openTime + ACOpenCompensationTime, // compensate ac open time
+		SessionId:             aopSessionID,
+		SessionOwnerId:        sessionOwnerID,
+		AgentPublicKey:        aopAgentPublicKey,
+		SessionIssuedAtMillis: aopIssuedAtMillis,
+		RunID:                 aopRunID,
+		RunAttempt:            aopRunAttempt,
+		UserId:                knkMsg.UserId,
+		DeviceId:              knkMsg.DeviceId,
+		OrganizationId:        knkMsg.OrganizationId,
+		AuthServiceId:         knkMsg.AuthServiceId,
+		ResourceId:            knkMsg.ResourceId,
+		SourceAddrs:           srcAddrs,
+		DestinationAddrs:      dstAddrs,
+		OpenTime:              aopOpenTime, // compensate AC open time without uint32 wraparound
 	}
 	// qURL v2 revocation metadata (P4a): stamp from res via the shared pure
 	// helper so prod and the test doubles can't diverge (see its godoc).
@@ -4479,7 +4908,6 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		Message:       aopBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData),
 	}
-
 	if !s.IsRunning() {
 		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] MsgData channel closed or being closed, skip sending", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr)
 		err = common.ErrPacketToMessageRoutineStopped
@@ -4488,7 +4916,26 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		return
 	}
 
-	s.sendMsgCh <- aopMd
+	select {
+	case s.sendMsgCh <- aopMd:
+		if releaseCellRead != nil {
+			releaseCellRead()
+			releaseCellRead = nil
+		}
+		if releaseAuthorityRead != nil {
+			releaseAuthorityRead()
+			releaseAuthorityRead = nil
+		}
+	case <-ctx.Done():
+		artMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		artMsg.ErrMsg = ctx.Err().Error()
+		return artMsg, ctx.Err()
+	case <-s.signals.stop:
+		err = common.ErrPacketToMessageRoutineStopped
+		artMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return artMsg, err
+	}
 
 	// wait for ac sending back operation result
 	// block until transaction completes or context is canceled
@@ -4545,11 +4992,22 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		return
 	}
 
-	err = json.Unmarshal(acPpd.BodyMessage, artMsg)
+	err = common.DecodeACOpsResultMsg(acPpd.BodyMessage, artMsg)
 	if err != nil {
 		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] failed to parse %s message: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, core.HeaderTypeToString(acPpd.HeaderType), err)
 		artMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
 		artMsg.ErrMsg = err.Error()
+		return
+	}
+	if artMsg.SessionId != aopMsg.SessionId || artMsg.SessionOwnerId != aopMsg.SessionOwnerId {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] ART session identity mismatch", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr)
+		err = common.ErrACOperationFailed
+		artMsg = &common.ACOpsResultMsg{
+			SessionId:      aopMsg.SessionId,
+			SessionOwnerId: aopMsg.SessionOwnerId,
+			ErrCode:        common.ErrACOperationFailed.ErrorCode(),
+			ErrMsg:         err.Error(),
+		}
 		return
 	}
 
@@ -4561,6 +5019,7 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		err = common.ErrACOperationFailed
 		return
 	}
+	acAdmitted = true
 
 	return artMsg, nil
 }
@@ -4759,6 +5218,20 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	srcAddr := req.SrcAddr
 	addrStr := srcAddr.String()
 	ackMsg = req.Ack
+	if bindErr := bindRegisteredAgentProtectedResource(knkMsg, res); bindErr != nil {
+		log.Warning("server-agent(%s@%s)[handleNhpOpenResource] rejected protected resource binding: %v", knkMsg.UserId, addrStr, bindErr)
+		err = common.ErrResourceNotFound
+		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
+	// ResourceData may be a shared catalog pointer. Clone before attaching the
+	// transient NHP session used by server-to-server forwarding so concurrent
+	// knocks cannot overwrite one another's session identity.
+	resWithSession := *res
+	resWithSession.NHPSessionId = req.SessionId
+	resWithSession.NHPSessionIssuedAt = req.SessionIssuedAt
+	res = &resWithSession
 
 	acDstIpMap := make(map[string][]*common.NetAddress)
 	for resName, info := range res.Resources {
@@ -4889,16 +5362,12 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 
 	knockHadNoAC := false
 
-	// openTime is loop-invariant — derived only from res.OpenTime and
-	// knkMsg.HeaderType, both fixed for this call. Hoisted out so the
-	// post-Wait PublishACKTokens call below has access to the same
-	// effective openTime without re-deriving it. The NHP_EXT branch
-	// is the #1154 MitM type-flip payoff; the body-authenticated
-	// HeaderType is fenced upstream by the gate documented at the
-	// knockHeaderTypeVerifyRequire field and in knock_headertype_gate.go.
+	// openTime is loop-invariant and comes from the resolved resource. On the
+	// current 1.1 envelope, EXT remains a body-bearing, resource-scoped close;
+	// the strict encrypted-body HeaderType mirror is checked before this point.
 	openTime := res.OpenTime
 	if knkMsg.HeaderType == core.NHP_EXT {
-		openTime = 1 // timeout in 1 second
+		openTime = 1
 	}
 
 	// logCtx is the per-knock agent-identity prefix shared by the re-knock
@@ -4989,11 +5458,16 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	//
 	// Non-cloud-mode: agentPeerLookup is nil (no DDB-backed agent
 	// registry wired). ResolveOwnerIDByPubKey returns "" via its
-	// receiver nil-guard — same empty-contract as the HTTP/forward
-	// paths. Cache-eviction observability tracked in #2148.
+	// receiver nil-guard — the same empty contract as legacy entries.
+	// Cache-eviction observability tracked in #2148.
 	ownerId := s.ResolveOwnerIDByPubKey(s.LifecycleCtx(), req.PublicKey)
 	if publishErr := s.PublishACKTokens(s.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
 		log.Error("server-agent(%s@%s)[handleNhpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, addrStr, publishErr)
+		if agentPubKey, keyErr := decodeAgentPublicKey(req.PublicKey); keyErr == nil {
+			s.compensateFailedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)
+		} else {
+			log.Error("server-agent(%s@%s)[handleNhpOpenResource] cannot compensate token-publish failure with invalid authenticated public key", knkMsg.UserId, addrStr)
+		}
 		err = common.ErrServerTokenPersistFailed
 		ackMsg.ErrCode = common.ErrServerTokenPersistFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -5487,7 +5961,9 @@ func (s *UdpServer) ProcessACOperation(
 	openTime uint32,
 	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime, res)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
+	defer cancel()
+	return s.processACOperation(ctx, knkMsg, acConn, srcAddr, dstAddrs, openTime, res)
 }
 
 // ProcessACOperationBroadcast wraps the internal processACOperationBroadcast

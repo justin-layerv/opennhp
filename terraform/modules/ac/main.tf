@@ -1006,13 +1006,13 @@ locals {
     ipset_max_elements    = var.ipset_max_elements
     # L3 flush-on-expiry — defaults preserve pre-flush behavior. The Go-side
     # first-load safety (endpoints/ac/config.go::updateBaseConfig) forces
-    # dry-run on a boot where EnableL3FlushOnExpiry=true and L3FlushDryRun
-    # is unset/false, so a single reload with real-flush requested is still
-    # safe; operators acknowledge by reapplying with l3_flush_dry_run=false.
-    enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry
-    l3_flush_dry_run             = var.l3_flush_dry_run
-    l3_flush_conntrack_backend   = lower(var.l3_flush_conntrack_backend)
-    l3_flush_conntrack_pool_size = var.l3_flush_conntrack_pool_size
+    # dry-run on a boot where real flush is requested without the distinct
+    # durable acknowledgement. Operators set that bit only after dry-run soak.
+    enable_l3_flush_on_expiry       = var.enable_l3_flush_on_expiry
+    l3_flush_dry_run                = var.l3_flush_dry_run
+    l3_flush_real_mode_acknowledged = var.l3_flush_real_mode_acknowledged
+    l3_flush_conntrack_backend      = lower(var.l3_flush_conntrack_backend)
+    l3_flush_conntrack_pool_size    = var.l3_flush_conntrack_pool_size
     # Per-instance key generation
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
@@ -1134,8 +1134,8 @@ resource "terraform_data" "ac_user_data_filter_mode_render_check" {
   }
 }
 
-# Plan-time render lint for the four operator-drivable L3 flush-on-expiry
-# fields in config.toml. All four are env-root tfvars levers consumed by the AC
+# Plan-time render lint for the five operator-drivable L3 flush-on-expiry
+# fields in config.toml. All five are env-root tfvars levers consumed by the AC
 # at config load (endpoints/ac/config.go), so a template typo/refactor that
 # drops any line silently no-ops the operator's IaC control with no plan-time
 # failure: EnableL3FlushOnExpiry / L3FlushDryRun are the #2192 flush flags;
@@ -1150,10 +1150,11 @@ resource "terraform_data" "ac_user_data_l3_conntrack_render_check" {
       condition = alltrue([
         strcontains(local.user_data, "\nEnableL3FlushOnExpiry = ${var.enable_l3_flush_on_expiry}\n"),
         strcontains(local.user_data, "\nL3FlushDryRun = ${var.l3_flush_dry_run}\n"),
+        strcontains(local.user_data, "\nL3FlushRealModeAcknowledged = ${var.l3_flush_real_mode_acknowledged}\n"),
         strcontains(local.user_data, "\nL3FlushConntrackBackend = \"${lower(var.l3_flush_conntrack_backend)}\"\n"),
         strcontains(local.user_data, "\nL3FlushConntrackPoolSize = ${var.l3_flush_conntrack_pool_size}\n"),
       ])
-      error_message = "AC user_data must render EnableL3FlushOnExpiry, L3FlushDryRun, L3FlushConntrackBackend, and L3FlushConntrackPoolSize into config.toml so the #2192 flush-on-expiry flags and the #2940 netlink rollout gate can be driven through managed Terraform config."
+      error_message = "AC user_data must render EnableL3FlushOnExpiry, L3FlushDryRun, L3FlushRealModeAcknowledged, L3FlushConntrackBackend, and L3FlushConntrackPoolSize into config.toml so the flush-on-expiry authority and netlink rollout gate can be driven through managed Terraform config."
     }
   }
 }
@@ -1170,8 +1171,9 @@ resource "terraform_data" "ac_user_data_l3_flush_render_check" {
       condition = alltrue([
         strcontains(local.user_data, "\nEnableL3FlushOnExpiry = ${var.enable_l3_flush_on_expiry}\n"),
         strcontains(local.user_data, "\nL3FlushDryRun = ${var.l3_flush_dry_run}\n"),
+        strcontains(local.user_data, "\nL3FlushRealModeAcknowledged = ${var.l3_flush_real_mode_acknowledged}\n"),
       ])
-      error_message = "AC user_data must render EnableL3FlushOnExpiry and L3FlushDryRun into config.toml so the L3 flush-on-expiry rollout can be driven through managed Terraform config."
+      error_message = "AC user_data must render EnableL3FlushOnExpiry, L3FlushDryRun, and L3FlushRealModeAcknowledged into config.toml so the L3 flush-on-expiry rollout can be driven through managed Terraform config."
     }
   }
 }
@@ -1658,7 +1660,10 @@ resource "aws_autoscaling_group" "ac" {
     # blue-green-deploy.yml scales this ASG down to warm standby,
     # the next `terraform apply` would reset desired_capacity/
     # min_size back to `var.ac_min_capacity` unless we ignore them.
-    ignore_changes = [desired_capacity, min_size]
+    # Capacity and process suspension are deployment-owned. The durable-AOP
+    # one-way cut sets a retired color to min=max=desired=0 and suspends all
+    # scaling; only a later exact-image blue/green prepare may restore it.
+    ignore_changes = [desired_capacity, min_size, max_size, suspended_processes]
   }
 }
 

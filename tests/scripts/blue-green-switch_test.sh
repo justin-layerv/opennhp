@@ -51,8 +51,14 @@ name=$(opt_val --name "$@" || true)
 
 case "$svc/$sub" in
   ssm/get-parameter)
-    val=$(awk -F'\t' -v n="$name" '$1==n{print $2; f=1} END{exit !f}' "$FAKE_PARAMS") || exit 255
-    [[ -z "$val" ]] && exit 255
+    val=$(awk -F'\t' -v n="$name" '$1==n{print $2; f=1} END{exit !f}' "$FAKE_PARAMS") || {
+      echo "An error occurred (ParameterNotFound) when calling GetParameter" >&2
+      exit 255
+    }
+    if [[ -z "$val" ]]; then
+      echo "An error occurred (ParameterNotFound) when calling GetParameter" >&2
+      exit 255
+    fi
     printf '%s\n' "$val"
     ;;
   ssm/put-parameter)
@@ -379,6 +385,85 @@ if [[ "$RC" -eq 0 ]] \
   report_pass "explicit reconciliation re-applies the current color to every server listener"
 else
   report_fail "current-color listener reconciliation" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 15: once the durable floor is installed, an unrecorded legacy slot
+# is permanently ineligible even for switch-only/reconcile callers.
+{
+  printf '/sandbox/nhp/minimum-protocol-profile\tdurable-aop-v1\n'
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+} > "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -ne 0 && ! -s "$FAKE_MODIFY" && ! -s "$FAKE_PUTS" && "$OUT" == *"below minimum"* ]]; then
+  report_pass "durable minimum rejects an unrecorded legacy target slot"
+else
+  report_fail "durable minimum blocks legacy target" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 16: the exact profile record binds both profile and image.
+{
+  printf '/sandbox/nhp/minimum-protocol-profile\tdurable-aop-v1\n'
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/green-image-tag\t0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/server/green-protocol-profile\tv1|durable-aop-v1|0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+} > "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -eq 0 && "$OUT" == *"target=durable-aop-v1 minimum=durable-aop-v1"* ]]; then
+  report_pass "exact durable slot record remains switchable at the floor"
+else
+  report_fail "exact durable record accepted" "rc=$RC out=<<<$OUT>>>"
+fi
+
+# --- Case 17: changing only the image tag invalidates the record before any
+# listener mutation.
+sed -i.bak 's/green-image-tag\t0123456789012345678901234567890123456789/green-image-tag\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -ne 0 && ! -s "$FAKE_MODIFY" && ! -s "$FAKE_PUTS" && "$OUT" == *"does not bind its current image"* ]]; then
+  report_pass "stale profile record cannot authorize a different image"
+else
+  report_fail "slot record binds exact image" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
+fi
+
+# --- Case 18: before the floor advances, an ordinary helper invocation cannot
+# activate a prepared durable slot without the dedicated cutover ledger.
+{
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/green-image-tag\t0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/server/green-protocol-profile\tv1|durable-aop-v1|0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+} > "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -ne 0 && ! -s "$FAKE_MODIFY" && ! -s "$FAKE_PUTS" && "$OUT" == *"without the dedicated cutover ledger"* ]]; then
+  report_pass "durable standby cannot be activated outside the dedicated cutover"
+else
+  report_fail "upward profile activation requires cutover ledger" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
+fi
+
+# --- Case 19: the exact image-bound ledger authorizes cell0 only after the AC
+# switch phase. This is the retry-safe path the dedicated cutover uses.
+{
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/green-image-tag\t0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/server/green-protocol-profile\tv1|durable-aop-v1|0123456789012345678901234567890123456789\n'
+  printf '/sandbox/nhp/cutovers/durable-aop-v1/state\t%s\n' \
+    '{"schema":2,"image":"0123456789012345678901234567890123456789","orchestrator_sha":"0123456789012345678901234567890123456789","lock_owner":"nhp:123:durable-aop-cutover:0123456789012345678901234567890123456789","phase":"ac_switched"}'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+} > "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -eq 0 && -s "$FAKE_MODIFY" && "$OUT" == *"target=durable-aop-v1 minimum=legacy-aop-v1"* ]]; then
+  report_pass "exact post-AC cutover ledger authorizes cell0 durable activation"
+else
+  report_fail "dedicated ledger authorizes ordered upward activation" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
 fi
 
 echo

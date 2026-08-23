@@ -390,6 +390,79 @@ resource "aws_dynamodb_table" "ack_tokens" {
   })
 }
 
+# ==================== nhp_session_control Table ====================
+# Durable authority and recovery state for NHP session-control operations.
+#
+# Correctness reads use the base PK/SK only and request strong consistency.
+# The due-index is a liveness accelerator for bounded recovery workers; a
+# missing or stale GSI result is never evidence that close work has converged.
+#
+# PK/SK row families include:
+#   AC#<ac-id> / AUTHORITY, TARGET#..., OP#...
+#   AGENT#<agent-key-hash> / SESSION#...
+#   EVENT#<event-id>#<shard> / META, TASK#...
+#   TARGET#<target-hash> / EVENT#...
+#
+# Pending authority, session, event, operation, and task rows intentionally
+# omit ttl. Only rows whose required AC targets have acknowledged convergence
+# receive ttl; DynamoDB TTL deletion is never a correctness transition.
+
+resource "aws_dynamodb_table" "session_control" {
+  name                        = "${var.name_prefix}-${var.cell_id}-nhp-session-control"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  attribute {
+    name = "due_shard"
+    type = "S"
+  }
+
+  attribute {
+    name = "due_sort"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "due-index"
+    hash_key        = "due_shard"
+    range_key       = "due_sort"
+    projection_type = "KEYS_ONLY"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-nhp-session-control"
+    Component = "nhp-server"
+    Cell      = var.cell_id
+    Purpose   = "Durable NHP session-control authority and recovery"
+  })
+}
+
 # ==================== IAM Policy for Server Storage Access ====================
 # This policy is attached to NHP Server IAM roles.
 #
@@ -456,6 +529,31 @@ resource "aws_iam_policy" "dynamodb_read" {
         Resource = [
           aws_dynamodb_table.ack_tokens.arn
         ]
+      },
+      {
+        # Transactions are authorized by their constituent item operations;
+        # DynamoDB has no TransactWriteItems IAM action. Base-table Query and
+        # GetItem are the only correctness reads for this authority store.
+        Sid    = "DynamoDBSessionControlAuthority"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:ConditionCheckItem",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = [
+          aws_dynamodb_table.session_control.arn
+        ]
+      },
+      {
+        # due-index is discovery only. Workers strong-read the base row before
+        # claiming work, so the GSI receives Query and no write/read widening.
+        Sid      = "DynamoDBSessionControlDueIndex"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = "${aws_dynamodb_table.session_control.arn}/index/due-index"
       }
       ], var.deploy_qurl_tables ? [
       {

@@ -308,12 +308,9 @@ class ExactOwnerReleaseTests(unittest.TestCase):
 class SwitchTrafficGuardTests(unittest.TestCase):
     """The premise the `switch == skipped` release branch is built on.
 
-    Releasing on a skipped switch is safe ONLY because switch-traffic skips
-    exclusively when deploy-to-standby did not succeed - i.e. before any
-    listener moved. If a future edit gives switch-traffic another upstream
-    dependency, or another condition that can skip it after the boundary has
-    already moved, that branch silently turns into a fence leak. Pin the guard
-    here so the change that would break it cannot go green.
+    Releasing on a skipped switch is safe only when standby deployment did not
+    succeed, or when the explicit prepare-only action intentionally stops
+    before listeners. Pin that closed union here.
     """
 
     def setUp(self) -> None:
@@ -324,13 +321,14 @@ class SwitchTrafficGuardTests(unittest.TestCase):
         needs = [needs] if isinstance(needs, str) else list(needs)
         self.assertEqual(sorted(needs), ["deploy-to-standby", "prepare"])
 
-    def test_switch_traffic_skips_only_when_the_standby_deploy_did_not_succeed(
+    def test_switch_traffic_skips_only_for_pre_switch_outcomes(
         self,
     ) -> None:
         condition = " ".join(self.job["if"].split())
         self.assertEqual(
             condition,
-            "always() && needs.prepare.result == 'success' && "
+            "always() && inputs.action != 'prepare-only' && "
+            "needs.prepare.result == 'success' && "
             "(needs.deploy-to-standby.result == 'success' || "
             "needs.deploy-to-standby.result == 'skipped')",
         )

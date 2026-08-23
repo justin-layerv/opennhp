@@ -19,6 +19,12 @@ func mustStoreACToken(t *testing.T, s *UdpServer, token string, entry *ACTokenEn
 
 func mustPublishACKTokens(t *testing.T, s *UdpServer, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
 	t.Helper()
+	if knkMsg.NHPSessionIssuedAt.IsZero() {
+		knkMsg.NHPSessionIssuedAt = time.Now()
+	}
+	if knkMsg.NHPSessionId == 0 {
+		knkMsg.NHPSessionId = ackMsg.SessionId
+	}
 	if err := s.PublishACKTokens(context.Background(), knkMsg, ackMsg, srcIp, openTime, ownerId); err != nil {
 		t.Fatalf("PublishACKTokens: %v", err)
 	}
@@ -65,7 +71,7 @@ func TestGenerateAccessToken_Uniqueness(t *testing.T) {
 // TestStoreACToken_RoundTrip fences PR-2a's load-bearing invariant: a
 // token written to the store via the ACK-construction path
 // (storeACToken) must be resolvable via VerifyAccessToken. Before
-// PR-2a, the three ACK sites (udpserver, httpserver, forward) wrote
+// PR-2a, ACK construction wrote
 // ackMsg.ACTokens[name] = artMsg.ACToken without any corresponding
 // store call — every token issued via the ACK path returned nil from
 // VerifyAccessToken, which made PR-2b's /nhp/internal/token/validate
@@ -257,8 +263,8 @@ func TestStoreACToken_BufferConstantMatchesAC(t *testing.T) {
 }
 
 // TestNewACKTokenEntry_ProducesShapeAllACKSitesShare fences the
-// shape contract every ACK site relies on. The three call sites
-// (udpserver.go, httpserver.go, forward.go) all flow through
+// shape contract every ACK site relies on. Native UDP and forwarded-knock
+// publication both flow through
 // PublishACKTokens, which in turn calls NewACKTokenEntry per token.
 //
 // Adding direct tests at all three sites would require driving the
@@ -284,24 +290,24 @@ func TestStoreACToken_BufferConstantMatchesAC(t *testing.T) {
 //     without corrupting stored entries).
 //   - OpenTime is the caller's int conversion of the resource's
 //     openTime (uint32 truncation is the caller's problem).
-//   - ExpireTime sits in the (now+OpenTime, now+OpenTime+5+ε) window
-//     — the +5s late-packet buffer is what the AC honors.
+//   - SessionExpireTime is the caller-computed session deadline and
+//     ExpireTime is exactly five seconds later for late token resolution.
 //   - RunID is copied exactly from a registered-agent authenticated knock body.
 func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 	knkMsg := &common.AgentKnockMsg{
-		UserId:         "user-1",
-		DeviceId:       "device-2",
-		OrganizationId: "org-3",
-		AuthServiceId:  common.RegisteredAgentAuthServiceID,
-		ResourceId:     "wire-resource", // intentionally distinct from caller arg
-		RunID:          "0123456789abcdef",
+		UserId:              "user-1",
+		DeviceId:            "device-2",
+		OrganizationId:      "org-3",
+		AuthServiceId:       common.RegisteredAgentAuthServiceID,
+		ResourceId:          "wire-resource", // intentionally distinct from caller arg
+		ProtectedResourceId: testProtectedResourceID,
+		RunID:               "0123456789abcdef",
 	}
 	acTokens := map[string]string{"r-1": "ac-tok-abc"}
 
 	const openTime = 60
-	before := time.Now()
-	entry := NewACKTokenEntry(knkMsg, "r-1", acTokens, "203.0.113.7", openTime, "")
-	after := time.Now()
+	sessionExpireTime := time.Now().Add(openTime * time.Second)
+	entry := NewACKTokenEntry(knkMsg, "r-1", acTokens, "203.0.113.7", openTime, "", 1, sessionExpireTime)
 
 	if entry == nil {
 		t.Fatal("NewACKTokenEntry returned nil")
@@ -332,6 +338,9 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 		t.Errorf("ResourceId = %q, want %q (must come from caller arg, not knkMsg.ResourceId %q)",
 			entry.ResourceId, "r-1", knkMsg.ResourceId)
 	}
+	if entry.ProtectedResourceId != testProtectedResourceID {
+		t.Errorf("ProtectedResourceId = %q, want resolved public subject %q (knock key is %q, catalog token key is %q)", entry.ProtectedResourceId, testProtectedResourceID, knkMsg.ResourceId, entry.ResourceId)
+	}
 
 	// ACTokens plumbed (snapshot via maps.Clone — entries are
 	// isolated from post-publish mutation of the source map).
@@ -354,14 +363,12 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 		t.Errorf("OpenTime = %d, want %d", entry.OpenTime, openTime)
 	}
 
-	// ExpireTime invariant: now + (OpenTime + 5)s. The check window
-	// is [before+OpenTime+5s, after+OpenTime+5s] — a couple of µs
-	// wide, deterministic across machines.
-	wantMin := before.Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second)
-	wantMax := after.Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second)
-	if entry.ExpireTime.Before(wantMin) || entry.ExpireTime.After(wantMax) {
-		t.Errorf("ExpireTime = %v, want in [%v, %v] (now + OpenTime + 5s late-packet buffer)",
-			entry.ExpireTime, wantMin, wantMax)
+	if !entry.SessionExpireTime.Equal(sessionExpireTime) {
+		t.Errorf("SessionExpireTime = %v, want %v", entry.SessionExpireTime, sessionExpireTime)
+	}
+	wantTokenExpiry := sessionExpireTime.Add(accessTokenLatePacketBufferSeconds * time.Second)
+	if !entry.ExpireTime.Equal(wantTokenExpiry) {
+		t.Errorf("ExpireTime = %v, want %v", entry.ExpireTime, wantTokenExpiry)
 	}
 
 	if entry.RunID != knkMsg.RunID {
@@ -372,8 +379,9 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 func TestNewACKTokenEntry_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
 	entry := NewACKTokenEntry(&common.AgentKnockMsg{
 		AuthServiceId: "legacy",
+		ResourceId:    "public-resource",
 		RunID:         "0123456789abcdef",
-	}, "resource", map[string]string{"resource": "token"}, "203.0.113.7", 60, "")
+	}, "resource", map[string]string{"resource": "token"}, "203.0.113.7", 60, "", 1, time.Now().Add(time.Minute))
 	if entry.RunID != "" {
 		t.Fatalf("legacy entry.RunID = %q, want empty", entry.RunID)
 	}
@@ -394,8 +402,8 @@ func TestNewACKTokenEntry_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
 // Three cases:
 //  1. Non-empty ownerId → User.OwnerId == that string.
 //     OrganizationId stays untouched (client-supplied value).
-//  2. Empty ownerId → User.OwnerId == "". Mirrors the HTTP/forward-
-//     receiver paths where pubkey-resolved identity is unavailable.
+//  2. Empty ownerId → User.OwnerId == "". Mirrors legacy entries where
+//     pubkey-resolved identity is unavailable.
 //     Downstream consumers MUST treat empty as "identity not
 //     resolved at this hop."
 //  3. ownerId and knkMsg.OrganizationId differ → both land
@@ -411,7 +419,7 @@ func TestNewACKTokenEntry_OwnerIdPropagates(t *testing.T) {
 	}
 
 	t.Run("non-empty ownerId lands on User.OwnerId", func(t *testing.T) {
-		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "owner-from-pubkey-lookup")
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "owner-from-pubkey-lookup", 1, time.Now().Add(time.Minute))
 		if entry.User == nil {
 			t.Fatal("entry.User is nil")
 		}
@@ -427,14 +435,14 @@ func TestNewACKTokenEntry_OwnerIdPropagates(t *testing.T) {
 	})
 
 	t.Run("empty ownerId surfaces as empty User.OwnerId", func(t *testing.T) {
-		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "")
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "", 1, time.Now().Add(time.Minute))
 		if entry.User.OwnerId != "" {
 			t.Errorf("User.OwnerId = %q, want \"\" (empty marks identity-not-resolved-at-this-hop)", entry.User.OwnerId)
 		}
 	})
 
 	t.Run("ownerId and OrganizationId are independent", func(t *testing.T) {
-		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "different-owner")
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "different-owner", 1, time.Now().Add(time.Minute))
 		// Pin both fields to explicit values, not just !=. A swap-bug
 		// (OwnerId populated from knkMsg.OrganizationId and vice-versa)
 		// would still produce two different strings — only explicit
@@ -450,54 +458,86 @@ func TestNewACKTokenEntry_OwnerIdPropagates(t *testing.T) {
 	})
 }
 
-// TestNewACKTokenEntry_ZeroOpenTime fences the boundary at
-// OpenTime=0 — the helper still produces a valid entry whose
-// ExpireTime is now + 5s (just the late-packet buffer). This is a
-// reachable shape today: udpserver/httpserver default openTime to
-// 60 only when the resource has none; nothing structurally prevents
-// a future caller from passing 0. The test pins the helper's
-// behavior so a future regression that special-cases OpenTime=0
-// (e.g., sets ExpireTime to "never") surfaces visibly.
-//
-// Also fences the nil-acTokens normalization: callers may pass nil
-// (e.g. before ackMsg.ACTokens is initialized) and the stored entry's
-// ACTokens map must be non-nil and empty. PR-2b's reader iterates
-// without a nil-guard; a future regression that re-introduces the
-// nil shape would surface as an index-on-nil panic in the validate
-// path instead of here.
 func TestNewACKTokenEntry_ZeroOpenTime(t *testing.T) {
-	knkMsg := &common.AgentKnockMsg{UserId: "u"}
-
-	before := time.Now()
-	entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 0, "")
-	after := time.Now()
-
-	wantMin := before.Add(time.Duration(accessTokenLatePacketBufferSeconds) * time.Second)
-	wantMax := after.Add(time.Duration(accessTokenLatePacketBufferSeconds) * time.Second)
-	if entry.ExpireTime.Before(wantMin) || entry.ExpireTime.After(wantMax) {
-		t.Errorf("ExpireTime = %v, want in [%v, %v] (now + 5s buffer when OpenTime=0)",
-			entry.ExpireTime, wantMin, wantMax)
+	knkMsg := &common.AgentKnockMsg{UserId: "u", ResourceId: "public-resource"}
+	if entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 0, "", 1, time.Now()); entry != nil {
+		t.Fatalf("NewACKTokenEntry with zero open time = %+v, want nil", entry)
 	}
+}
 
-	if entry.ACTokens == nil {
-		t.Error("entry.ACTokens is nil; helper must normalize nil acTokens input to an empty map so callers don't see nil-vs-empty")
+func TestNewACKTokenEntry_RejectsInvalidSession(t *testing.T) {
+	knkMsg := &common.AgentKnockMsg{UserId: "u", ResourceId: "public-resource"}
+	if entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 60, "", 0, time.Now().Add(time.Minute)); entry != nil {
+		t.Fatalf("NewACKTokenEntry with zero session id = %+v, want nil", entry)
 	}
-	if len(entry.ACTokens) != 0 {
-		t.Errorf("entry.ACTokens len = %d, want 0 (nil input must produce empty, not populated)", len(entry.ACTokens))
+	if entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 60, "", 1, time.Time{}); entry != nil {
+		t.Fatalf("NewACKTokenEntry with zero session deadline = %+v, want nil", entry)
+	}
+}
+
+func TestNewACKTokenEntry_RejectsMissingProtectedResource(t *testing.T) {
+	if entry := NewACKTokenEntry(nil, "q_catalog", nil, "127.0.0.1", 60, "", 1, time.Now().Add(time.Minute)); entry != nil {
+		t.Fatalf("NewACKTokenEntry with nil knock = %+v, want nil", entry)
+	}
+	if entry := NewACKTokenEntry(&common.AgentKnockMsg{AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1"}, "q_catalog", nil, "127.0.0.1", 60, "", 1, time.Now().Add(time.Minute)); entry != nil {
+		t.Fatalf("NewACKTokenEntry with missing protected resource = %+v, want nil", entry)
+	}
+	if entry := NewACKTokenEntry(&common.AgentKnockMsg{AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1", ProtectedResourceId: "malformed"}, "q_catalog", nil, "127.0.0.1", 60, "", 1, time.Now().Add(time.Minute)); entry != nil {
+		t.Fatalf("NewACKTokenEntry with malformed protected resource = %+v, want nil", entry)
+	}
+	if entry := NewACKTokenEntry(&common.AgentKnockMsg{AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: testProtectedResourceID, ProtectedResourceId: testProtectedResourceID}, "q_catalog", nil, "127.0.0.1", 60, "", 1, time.Now().Add(time.Minute)); entry != nil {
+		t.Fatalf("NewACKTokenEntry with cross-wired knock/public resource = %+v, want nil", entry)
+	}
+	legacy := NewACKTokenEntry(&common.AgentKnockMsg{AuthServiceId: "legacy", ResourceId: "legacy-catalog-key"}, "q_catalog", nil, "127.0.0.1", 60, "", 1, time.Now().Add(time.Minute))
+	if legacy == nil || legacy.ProtectedResourceId != "" {
+		t.Fatalf("generic entry = %+v, want stored without a public protected-resource assertion", legacy)
+	}
+}
+
+func TestPublishACKTokens_RejectsInvalidLifetime(t *testing.T) {
+	s := &UdpServer{tokenStore: common.NewTokenStore[*ACTokenEntry]()}
+	validKnock := func() *common.AgentKnockMsg {
+		return &common.AgentKnockMsg{UserId: "u", AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1", ProtectedResourceId: testProtectedResourceID, NHPSessionId: 123, NHPSessionIssuedAt: time.Now()}
+	}
+	validACK := func() *common.ServerKnockAckMsg {
+		return &common.ServerKnockAckMsg{SessionId: 123, ACTokens: map[string]string{"r": "token"}}
+	}
+	tests := map[string]struct {
+		knock    *common.AgentKnockMsg
+		ack      *common.ServerKnockAckMsg
+		openTime int
+	}{
+		"missing session id":         {knock: validKnock(), ack: &common.ServerKnockAckMsg{ACTokens: map[string]string{"r": "token"}}, openTime: 60},
+		"mismatched session id":      {knock: validKnock(), ack: &common.ServerKnockAckMsg{SessionId: 456, ACTokens: map[string]string{"r": "token"}}, openTime: 60},
+		"zero open time":             {knock: validKnock(), ack: validACK(), openTime: 0},
+		"negative open time":         {knock: validKnock(), ack: validACK(), openTime: -1},
+		"missing issuance time":      {knock: &common.AgentKnockMsg{UserId: "u", AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1", ProtectedResourceId: testProtectedResourceID, NHPSessionId: 123}, ack: validACK(), openTime: 60},
+		"missing protected resource": {knock: &common.AgentKnockMsg{UserId: "u", AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1", NHPSessionId: 123, NHPSessionIssuedAt: time.Now()}, ack: validACK(), openTime: 60},
+		"expired session lifetime":   {knock: &common.AgentKnockMsg{UserId: "u", AuthServiceId: common.RegisteredAgentAuthServiceID, ResourceId: "connector-knock-1", ProtectedResourceId: testProtectedResourceID, NHPSessionId: 123, NHPSessionIssuedAt: time.Now().Add(-time.Minute)}, ack: validACK(), openTime: 30},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := s.PublishACKTokens(context.Background(), test.knock, test.ack, "203.0.113.5", test.openTime, "owner"); err == nil {
+				t.Fatal("PublishACKTokens accepted invalid lifetime")
+			}
+			if got := s.VerifyAccessToken("token"); got != nil {
+				t.Fatalf("invalid publication persisted token: %+v", got)
+			}
+		})
 	}
 }
 
 // TestPublishACKTokens_PersistsAfterWait fences the load-bearing
-// invariant Option A of PR-2a's concurrency fix introduced: the local
-// UDP/HTTP knock handlers must publish AC-issued tokens to tokenStore
+// invariant Option A of PR-2a's concurrency fix introduced: the native UDP
+// knock handler must publish AC-issued tokens to tokenStore
 // AFTER acWg.Wait() returns, not from inside an AC goroutine. Before
 // the fix the publication happened while sibling goroutines for other
 // resources were still mutating ackMsg.ACTokens under artMsgsMutex, so
 // PR-2b's /nhp/internal/token/validate could race the writers.
 // NewACKTokenEntry's maps.Clone now also isolates stored entries from
 // any future post-publish mutation (defense in depth). Driving the
-// full handleNhpOpenResource / handleHttpOpenResource handlers from a
-// unit test requires real cipher state; this test fences the post-Wait
+// full handleNhpOpenResource handler from a unit test requires real cipher
+// state; this test fences the post-Wait
 // publication property directly on the helper instead.
 //
 // Specifically pins:
@@ -522,8 +562,10 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 		DeviceId:       "d-1",
 		OrganizationId: "o-1",
 		AuthServiceId:  "asp-1",
+		ResourceId:     "public-resource",
 	}
 	ackMsg := &common.ServerKnockAckMsg{
+		SessionId: 1,
 		ACTokens: map[string]string{
 			"resource-a": "ac-token-a",
 			"resource-b": "ac-token-b",
@@ -539,6 +581,9 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 	}
 	if entryA.ResourceId != "resource-a" {
 		t.Errorf("entryA.ResourceId = %q, want %q", entryA.ResourceId, "resource-a")
+	}
+	if entryA.ProtectedResourceId != "" {
+		t.Errorf("entryA.ProtectedResourceId = %q, want no public-resource assertion for generic auth service", entryA.ProtectedResourceId)
 	}
 	if entryA.KnockSrcIP != "203.0.113.42" {
 		t.Errorf("entryA.KnockSrcIP = %q, want %q", entryA.KnockSrcIP, "203.0.113.42")
@@ -556,6 +601,9 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 	}
 	if entryB.ResourceId != "resource-b" {
 		t.Errorf("entryB.ResourceId = %q, want %q", entryB.ResourceId, "resource-b")
+	}
+	if !entryA.SessionExpireTime.Equal(entryB.SessionExpireTime) {
+		t.Fatalf("multi-resource session deadlines differ: %v != %v", entryA.SessionExpireTime, entryB.SessionExpireTime)
 	}
 
 	// Empty-token case: VerifyAccessToken on "" must return nil.
@@ -579,7 +627,7 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 }
 
 // TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale
-// fences the production shape of the local UDP/HTTP knock handlers:
+// fences the production shape of the native UDP knock handler:
 // many AC goroutines mutate ackMsg.ACTokens under artMsgsMutex in
 // parallel, the handler calls acWg.Wait(), then PublishACKTokens
 // runs once. The property under test is "every non-empty token gets
@@ -600,9 +648,10 @@ func TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale(t *testing.T) 
 	s := &UdpServer{
 		tokenStore: common.NewTokenStore[*ACTokenEntry](),
 	}
-	knkMsg := &common.AgentKnockMsg{UserId: "u-multi"}
+	knkMsg := &common.AgentKnockMsg{UserId: "u-multi", ResourceId: "public-resource-multi"}
 	ackMsg := &common.ServerKnockAckMsg{
-		ACTokens: make(map[string]string),
+		SessionId: 1,
+		ACTokens:  make(map[string]string),
 	}
 
 	const resourceCount = 32

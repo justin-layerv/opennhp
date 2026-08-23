@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -15,13 +16,34 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+func bindServerSessionAuthorityForPluginCallback(callbackReq *common.NhpAuthRequest,
+	sessionID uint64, issuedAt time.Time, agentPublicKey, runID string, runAttempt uint64,
+) (*common.NhpAuthRequest, error) {
+	if callbackReq == nil || callbackReq.Msg == nil || sessionID == 0 || issuedAt.IsZero() ||
+		!common.ValidNHPAgentPublicKey(agentPublicKey) {
+		return nil, common.ErrInvalidInput
+	}
+	requestCopy := *callbackReq
+	messageCopy := *callbackReq.Msg
+	requestCopy.SessionId = sessionID
+	requestCopy.SessionIssuedAt = issuedAt
+	requestCopy.PublicKey = agentPublicKey
+	messageCopy.NHPSessionId = sessionID
+	messageCopy.NHPSessionIssuedAt = issuedAt
+	messageCopy.NHPAgentPublicKey = agentPublicKey
+	messageCopy.RunID = runID
+	messageCopy.RunAttempt = runAttempt
+	requestCopy.Msg = &messageCopy
+	return &requestCopy, nil
+}
+
 // HandleKnockRequest
 // Server will respond with success or error with NHP_ACK message
 func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	ackBytes, userId, err := s.buildKnockAck(ppd)
+	ackBytes, userId, admission, err := s.buildKnockAckWithAdmission(ppd)
 	if err != nil {
 		// Only a marshal failure reaches here; the ack cannot be sent.
 		// An auth REJECT is not this error — it rides inside ackBytes
@@ -32,7 +54,67 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) error {
 	}
 
 	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
-	return s.forwardToTransaction(ppd.ConnData, ppd.SenderTrxId, ackMd, "server-agent", "HandleKnockRequest", userId, ppd.ConnData.RemoteAddr.String())
+	sendErr := s.forwardToTransaction(ppd.ConnData, ppd.SenderTrxId, ackMd, "server-agent", "HandleKnockRequest", userId, ppd.ConnData.RemoteAddr.String())
+	if sendErr != nil {
+		s.compensateSuccessfulACKBytes(ppd.RemotePubKey, ackBytes)
+		return errors.Join(sendErr, s.compensateDurableAdmission(admission))
+	}
+	if admission != nil {
+		markCtx, markCancel := udpCorrelationCtx(DefaultStorageTimeout, userId, ppd.SenderTrxId)
+		markErr := s.markDurableSessionAckEnqueued(markCtx, admission.Candidate)
+		markCancel()
+		if markErr != nil {
+			s.compensateSuccessfulACKBytes(ppd.RemotePubKey, ackBytes)
+			closeErr := s.compensateDurableAdmission(admission)
+			return errors.Join(fmt.Errorf("mark durable NHP ACK boundary: %w", markErr), closeErr)
+		}
+	}
+	return nil
+}
+
+// compensateSuccessfulACKBytes closes only a successfully admitted session
+// whose serialized ACK could not be delivered by an observable transport
+// operation. Denials and DHP replies carry no base session and are no-ops.
+func (s *UdpServer) compensateSuccessfulACKBytes(agentPubKey, ackBytes []byte) {
+	var closeAck common.ServerExactSessionCloseAckMsg
+	if json.Unmarshal(ackBytes, &closeAck) == nil && closeAck.CloseEventID != "" {
+		// Exact-retirement success is already durable before its ACK is built.
+		// An ACK transport failure is recovered by the caller replaying the same
+		// receipt and must not schedule a second process-local compensation path.
+		return
+	}
+	var ack common.ServerKnockAckMsg
+	if json.Unmarshal(ackBytes, &ack) != nil || !common.IsSuccessErrCode(ack.ErrCode) || ack.SessionId == 0 {
+		return
+	}
+	s.compensateFailedNHPSessionFleet(agentPubKey, ack.SessionId, time.Time{}, ack.OpenTime)
+}
+
+func (s *UdpServer) compensateDurableAdmission(admission *sessionControlAdmissionReceipt) error {
+	if admission == nil {
+		return nil
+	}
+	retainUntilMillis := admission.Candidate.ReservationDeadlineMillis
+	if admission.OpenTime > 0 {
+		lifetimeSeconds := uint64(admission.OpenTime) + uint64(ACOpenCompensationTime)
+		if lifetimeSeconds > uint64(math.MaxInt64/time.Second.Milliseconds()) {
+			return errors.New("durable exact-session compensation lifetime overflow")
+		}
+		lifetimeMillis := int64(lifetimeSeconds) * time.Second.Milliseconds()
+		nowMillis := time.Now().UnixMilli()
+		if nowMillis > math.MaxInt64-lifetimeMillis {
+			return errors.New("durable exact-session compensation retention overflow")
+		}
+		if derived := nowMillis + lifetimeMillis; derived > retainUntilMillis {
+			retainUntilMillis = derived
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	defer cancel()
+	if err := s.ensureDurableExactSessionClose(ctx, admission.Candidate, retainUntilMillis); err != nil {
+		return fmt.Errorf("prepare durable exact-session compensation: %w", err)
+	}
+	return nil
 }
 
 // buildKnockAck runs the knock authorization pipeline for ppd and returns the
@@ -52,6 +134,21 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) error {
 // knock pipeline while replying through the relay (EncryptedPktCh + WriteToUDP)
 // instead of forwardToTransaction.
 func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, error) {
+	ack, userID, _, err := s.buildKnockAckWithAdmission(ppd)
+	return ack, userID, err
+}
+
+func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]byte, string, *sessionControlAdmissionReceipt, error) {
+	if ppd == nil {
+		return nil, "", nil, errors.New("nil knock packet")
+	}
+	if ppd.HeaderType == core.NHP_EXT && len(ppd.BodyMessage) == 0 {
+		return nil, "", nil, errors.New("bodyless NHP_EXT is not authenticated authority on the current envelope")
+	}
+	if ppd.HeaderType == core.NHP_EXT {
+		ack, userID, err := s.buildAgentExactSessionCloseAck(ppd)
+		return ack, userID, nil, err
+	}
 	knockStart := time.Now()
 	s.metrics.IncrCounter(MetricKnockRequest)
 
@@ -82,6 +179,11 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 	// returns non-nil. Keeping this a local makes a stray bare `return` a
 	// compile error rather than a silent ack-suppression regression.
 	var closureErr error
+	var sessionReserved bool
+	var durableCandidate *sessionControlSessionCandidate
+	var durableCompensationErr error
+	var reservedSessionID uint64
+	var reservedSessionIssuedAt time.Time
 
 	func() {
 		// parse knockMsg
@@ -127,7 +229,7 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		// "HMAC". See knock_headertype_gate.go for policy details.
 		//
 		// Expected wire types at this point are the knock family:
-		// NHP_KNK, NHP_RKN, NHP_EXT (DHP_KNK was carved off at the
+		// NHP_KNK, NHP_RKN, and NHP_EXT (DHP_KNK was carved off at the
 		// early branch above). If a future refactor routes additional
 		// wire types through this handler, the gate's body==wire
 		// comparison stays correct as long as agents populate
@@ -161,20 +263,29 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		}
 		knkMsg.HeaderType = useType
 
-		// The registered-agent native UDP path is the qURL Connector RunID
-		// producer boundary. Reject omission or a noncanonical value before
-		// pubkey lookup, auth-provider resolution, or any AC work so an old
-		// Connector cannot silently create an unbound ACK token. The generic
-		// parser still permits missing/empty for other auth handlers, and the
-		// separate HTTP knock path does not enter buildKnockAck.
-		if runIDErr := validateRegisteredAgentKnockRunID(knkMsg); runIDErr != nil {
-			closureErr = common.ErrKnockRunIDInvalid
-			ackMsg.ErrCode = common.ErrKnockRunIDInvalid.ErrorCode()
-			ackMsg.ErrMsg = closureErr.Error()
-			log.Warning("server-agent(%s#%d@%s)[HandleKnockRequest] rejected registered-agent knock with missing or invalid runId",
+		// The registered-agent native UDP path is the qURL Connector retry
+		// binding boundary. Reject omission before peer lookup, catalog reads, or
+		// AC work. Malformed nonempty values were already rejected by the strict
+		// application-body decoder above.
+		if bindingErr := validateRegisteredAgentKnockRunID(knkMsg); bindingErr != nil {
+			publicErr := common.ErrKnockRunIDInvalid
+			if errors.Is(bindingErr, common.ErrKnockRunAttemptInvalid) {
+				publicErr = common.ErrKnockRunAttemptInvalid
+			}
+			closureErr = publicErr
+			ackMsg.ErrCode = publicErr.ErrorCode()
+			ackMsg.ErrMsg = publicErr.Error()
+			log.Warning("server-agent(%s#%d@%s)[HandleKnockRequest] rejected registered-agent knock with missing or invalid retry binding",
 				knkMsg.UserId, transactionId, addrStr)
 			return
 		}
+		if len(ppd.RemotePubKey) != core.PublicKeySize {
+			closureErr = common.ErrInvalidInput
+			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+			ackMsg.ErrMsg = common.ErrServerACOpsFailed.Error()
+			return
+		}
+		knkMsg.NHPAgentPublicKey = base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 
 		// Cloud mode agent peer resolution: with
 		// DisableAgentPeerValidation=true the noise responder skipped
@@ -235,6 +346,56 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 			return
 		}
 
+		// The NHP-Server assigns one non-zero 8-byte session identifier for
+		// this access request before any AOP is emitted. The same value is
+		// carried through AOP, required back on ART, and returned on the ACK;
+		// neither the agent nor an auth plugin may choose or rewrite it.
+		reservedSessionIssuedAt = time.Now()
+		for range sessionControlRuntimeSessionIDAttempts {
+			reservedSessionID, closureErr = s.sessionRegistry().reserveNew(ppd.RemotePubKey, reservedSessionIssuedAt)
+			if closureErr != nil {
+				break
+			}
+			knkMsg.NHPSessionId = reservedSessionID
+			knkMsg.NHPSessionIssuedAt = reservedSessionIssuedAt
+			if !s.sessionControlAuthorityRequired() {
+				break
+			}
+
+			candidate, candidateErr := sessionControlCandidateForKnock(s.sessionControlCellID, knkMsg)
+			if candidateErr == nil {
+				reserveCtx, reserveCancel := udpCorrelationCtx(DefaultStorageTimeout, knkMsg.UserId, transactionId)
+				candidateErr = s.reserveDurableSession(reserveCtx, candidate)
+				reserveCancel()
+			}
+			if candidateErr == nil {
+				durableCandidate = &candidate
+				break
+			}
+			s.sessionRegistry().release(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt)
+			reservedSessionID = 0
+			if errors.Is(candidateErr, errSessionControlSessionCollision) {
+				continue
+			}
+			closureErr = candidateErr
+			break
+		}
+		if closureErr != nil || reservedSessionID == 0 ||
+			(s.sessionControlAuthorityRequired() && durableCandidate == nil) {
+			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to reserve NHP session authority: %v",
+				knkMsg.UserId, transactionId, addrStr, closureErr)
+			closureErr = common.ErrServerACOpsFailed
+			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+			ackMsg.ErrMsg = closureErr.Error()
+			return
+		}
+		// Everything after the plugin boundary uses this immutable server-owned
+		// tuple. A plugin may mutate req.Msg for resource resolution, but it must
+		// never be able to rewrite the AOP/ART/ACK identity or strand the original
+		// local and durable reservation during compensation.
+		sessionReserved = true
+		ackMsg.SessionId = reservedSessionID
+
 		authReq := &common.NhpAuthRequest{
 			Msg:            knkMsg,
 			Ack:            ackMsg,
@@ -244,11 +405,43 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 				Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 				Port: ppd.ConnData.RemoteAddr.Port,
 			},
-			OriginalPacket: ppd.BasePacketContent(), // For server-to-server forwarding
+			OriginalPacket:  ppd.BasePacketContent(), // For server-to-server forwarding
+			SessionId:       reservedSessionID,
+			SessionIssuedAt: reservedSessionIssuedAt,
+		}
+		immutableAgentPublicKey := authReq.PublicKey
+		immutableRunID := knkMsg.RunID
+		immutableRunAttempt := knkMsg.RunAttempt
+		helper := s.NewNhpServerHelper(ppd, aspData)
+		helper.AuthWithNhpCallbackFunc = func(callbackReq *common.NhpAuthRequest,
+			res *common.ResourceData,
+		) (*common.ServerKnockAckMsg, error) {
+			// A plugin may normalize resource fields before dispatch, but it may
+			// not rewrite or cross-swap the authenticated session authority.
+			requestCopy, bindErr := bindServerSessionAuthorityForPluginCallback(callbackReq,
+				reservedSessionID, reservedSessionIssuedAt, immutableAgentPublicKey, immutableRunID, immutableRunAttempt)
+			if bindErr != nil {
+				return nil, bindErr
+			}
+			return s.handleNhpOpenResource(requestCopy, res)
 		}
 
 		// perform knock auth and open ip rule from the agent src address and resource dst address
-		ackMsg, closureErr = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd, aspData))
+		ackMsg, closureErr = handler.AuthWithNHP(authReq, helper)
+		if ackMsg == nil {
+			// Plugin implementations are outside the server's trust boundary. A
+			// nil ACK must not panic this recovered handler or strand the reserved
+			// numeric session; convert both (nil,nil) and (nil,error) into the
+			// canonical denial envelope and let the final boundary release it.
+			ackMsg = &common.ServerKnockAckMsg{
+				ErrCode:   common.ErrServerACOpsFailed.ErrorCode(),
+				ErrMsg:    common.ErrServerACOpsFailed.Error(),
+				AgentAddr: addrStr,
+			}
+			if closureErr == nil {
+				closureErr = common.ErrServerACOpsFailed
+			}
+		}
 		if closureErr != nil {
 			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] failed: %+v", knkMsg.UserId, transactionId, addrStr, closureErr)
 			s.metrics.IncrCounter(MetricAuthFailure)
@@ -259,15 +452,105 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] succeed", knkMsg.UserId, transactionId, addrStr)
 		s.metrics.IncrCounter(MetricAuthSuccess)
 	}()
+	if closureErr != nil || (ppd.HeaderType != core.DHP_KNK && !common.IsSuccessErrCode(ackMsg.ErrCode)) {
+		failedOpenTime := ackMsg.OpenTime
+		if closureErr != nil && common.IsSuccessErrCode(ackMsg.ErrCode) {
+			// An auth plugin may return a partially populated success ACK together
+			// with an error. The error is authoritative: never serialize a success
+			// code after the final boundary has removed its session and lifetime.
+			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+			ackMsg.ErrMsg = common.ErrServerACOpsFailed.Error()
+		}
+		// Rejected access requests do not establish an NHP session. Keep the
+		// identifier absent rather than exposing a value that no AC admitted.
+		// NHP ACK denials also carry the required typed opnTime field with the
+		// canonical value zero; a plugin may have stamped a positive lifetime
+		// before a later AC/token failure, so normalize it at this final wire
+		// boundary rather than relying on every producer branch to unwind it.
+		ackMsg.SessionId = 0
+		ackMsg.CellId = ""
+		ackMsg.SessionIssuedAtMillis = 0
+		ackMsg.RunID = ""
+		ackMsg.RunAttempt = 0
+		ackMsg.OpenTime = 0
+		if sessionReserved {
+			s.compensateFailedNHPSessionFleet(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt, failedOpenTime)
+			s.sessionRegistry().release(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt)
+			if durableCandidate != nil {
+				durableCompensationErr = errors.Join(durableCompensationErr, s.compensateDurableAdmission(&sessionControlAdmissionReceipt{
+					Candidate: *durableCandidate, SessionID: reservedSessionID,
+					SessionIssuedAt: reservedSessionIssuedAt, OpenTime: failedOpenTime,
+				}))
+			}
+		}
+	} else if ppd.HeaderType != core.DHP_KNK {
+		if ackMsg.OpenTime == 0 {
+			// A successful NHP ACK must describe a live, bounded session. Do not
+			// serialize a success that consumers cannot schedule or expire.
+			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+			ackMsg.ErrMsg = common.ErrServerACOpsFailed.Error()
+			ackMsg.SessionId = 0
+			ackMsg.CellId = ""
+			ackMsg.SessionIssuedAtMillis = 0
+			ackMsg.RunID = ""
+			ackMsg.RunAttempt = 0
+			if sessionReserved {
+				s.compensateFailedNHPSessionFleet(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt, 0)
+				s.sessionRegistry().release(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt)
+				if durableCandidate != nil {
+					durableCompensationErr = errors.Join(durableCompensationErr, s.compensateDurableAdmission(&sessionControlAdmissionReceipt{
+						Candidate: *durableCandidate, SessionID: reservedSessionID, SessionIssuedAt: reservedSessionIssuedAt,
+					}))
+				}
+			}
+		} else {
+			// Auth plugins may mutate or replace the ACK object, but session
+			// assignment remains server-owned. Stamp the authoritative value after
+			// plugin return so a replacement cannot omit or rewrite it.
+			ackMsg.SessionId = reservedSessionID
+			if durableCandidate != nil {
+				ackMsg.CellId = durableCandidate.CellID
+				ackMsg.SessionIssuedAtMillis = durableCandidate.IssuedAtMillis
+				ackMsg.RunID = durableCandidate.RunID
+				ackMsg.RunAttempt = durableCandidate.RunAttempt
+			} else {
+				ackMsg.CellId = ""
+				ackMsg.SessionIssuedAtMillis = 0
+				ackMsg.RunID = ""
+				ackMsg.RunAttempt = 0
+			}
+		}
+	}
 
 	// Record knock processing latency
 	s.metrics.RecordLatency(MetricKnockLatency, float64(time.Since(knockStart).Milliseconds()))
 
-	// marshal the knock ack response; the caller sends it
-	ackBytes, marshalErr := json.Marshal(ackMsg)
+	// Marshal the knock ACK response; the caller sends it. Registered-agent
+	// replies use their strict receipt union, while every generic knock keeps
+	// the legacy envelope unchanged. AuthServiceId comes from the authenticated
+	// body and is sufficient to select the denial arm even when run validation
+	// rejected the request before a durable candidate was reserved.
+	var ackBytes []byte
+	var marshalErr error
+	if ppd.HeaderType != core.DHP_KNK && knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		ackBytes, marshalErr = common.MarshalRegisteredAgentKnockAckMsg(
+			ackMsg, knkMsg.RunID, knkMsg.RunAttempt, knkMsg.ResourceId,
+		)
+	} else {
+		ackBytes, marshalErr = json.Marshal(ackMsg)
+	}
 	if marshalErr != nil {
 		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
-		return nil, knkMsg.UserId, marshalErr
+		if sessionReserved {
+			s.compensateFailedNHPSessionFleet(ppd.RemotePubKey, reservedSessionID, reservedSessionIssuedAt, ackMsg.OpenTime)
+			if durableCandidate != nil {
+				durableCompensationErr = errors.Join(durableCompensationErr, s.compensateDurableAdmission(&sessionControlAdmissionReceipt{
+					Candidate: *durableCandidate, SessionID: reservedSessionID,
+					SessionIssuedAt: reservedSessionIssuedAt, OpenTime: ackMsg.OpenTime,
+				}))
+			}
+		}
+		return nil, knkMsg.UserId, nil, errors.Join(marshalErr, durableCompensationErr)
 	}
 
 	// DHP knock
@@ -275,11 +558,21 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		ackBytes, marshalErr = json.Marshal(dhpAckMsg)
 		if marshalErr != nil {
 			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal DHP ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
-			return nil, knkMsg.UserId, marshalErr
+			return nil, knkMsg.UserId, nil, marshalErr
 		}
 	}
-
-	return ackBytes, knkMsg.UserId, nil
+	var admission *sessionControlAdmissionReceipt
+	if durableCandidate != nil && ppd.HeaderType != core.DHP_KNK && common.IsSuccessErrCode(ackMsg.ErrCode) &&
+		ackMsg.SessionId == durableCandidate.SessionID && ackMsg.OpenTime > 0 {
+		admission = &sessionControlAdmissionReceipt{
+			Candidate: *durableCandidate, SessionID: reservedSessionID,
+			SessionIssuedAt: reservedSessionIssuedAt, OpenTime: ackMsg.OpenTime,
+		}
+	}
+	if durableCompensationErr != nil {
+		return nil, knkMsg.UserId, nil, durableCompensationErr
+	}
+	return ackBytes, knkMsg.UserId, admission, nil
 }
 
 const (

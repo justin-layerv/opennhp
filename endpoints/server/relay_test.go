@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -356,7 +357,7 @@ func TestHandleRelayForward_RoundTripDeliversAgentAckToRelay(t *testing.T) {
 		Type:         core.NHP_SERVER,
 	})
 
-	// Inner knock: wire NHP_KNK with a mismatched body header type (NHP_EXT) so
+	// Inner knock: wire NHP_KNK with a mismatched body header type (NHP_RKN) so
 	// the strict #1154 gate inside buildKnockAck rejects it — exercising the
 	// full relay round-trip without needing plugin/ASP wiring. Sent as a real
 	// agent transaction so the agent can decrypt the returned ack.
@@ -364,7 +365,7 @@ func TestHandleRelayForward_RoundTripDeliversAgentAckToRelay(t *testing.T) {
 	respCh := make(chan *core.PacketParserData, 1)
 	agentConn := newSpikeConn(agentDev, agentToServerAddr)
 	knockBody, err := json.Marshal(&common.AgentKnockMsg{
-		HeaderType: core.NHP_EXT, UserId: "relay-user", AuthServiceId: "asp", ResourceId: "res",
+		HeaderType: core.NHP_RKN, UserId: "relay-user", AuthServiceId: "asp", ResourceId: "res",
 	})
 	if err != nil {
 		t.Fatalf("marshal knock body: %v", err)
@@ -452,6 +453,149 @@ func TestHandleRelayForward_RoundTripDeliversAgentAckToRelay(t *testing.T) {
 	}
 	if got := counters[MetricRelayForwardReject]; got != 0 {
 		t.Errorf("MetricRelayForwardReject = %v, want 0 (auth reject is delivered as an ack, not a pre-auth drop)", got)
+	}
+}
+
+func TestHandleRelayForward_ExactSessionRetirementReturnsDurableReceipt(t *testing.T) {
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{
+		PubKeyBase64: serverDev.PublicKeyBase64(), Ip: agentToServerAddr.IP.String(),
+		Port: agentToServerAddr.Port, Type: core.NHP_SERVER,
+	})
+
+	candidate := sessionControlSessionCandidate{
+		CellID: "cell-01", AgentPublicKey: agentDev.PublicKeyBase64(), SessionID: 902,
+		IssuedAtMillis: 1_800_000_000_000, ReservationDeadlineMillis: 1_800_000_030_000,
+		RunID: "0123456789abcdef", RunAttempt: 3,
+	}
+	current, err := planSessionControlReservation(candidate, testSessionControlSessionSnapshot(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.RetainUntilMillis = candidate.ReservationDeadlineMillis + time.Minute.Milliseconds()
+	store := &exactRetirementTestStore{
+		memorySessionControlStore: newMemorySessionControlStore(time.UnixMilli(candidate.IssuedAtMillis)),
+		current:                   current,
+	}
+
+	const innerTrx = uint64(424244)
+	response := make(chan *core.PacketParserData, 1)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	closeBody, err := json.Marshal(&common.AgentExactSessionCloseMsg{
+		HeaderType: core.NHP_EXT, AuthServiceID: common.RegisteredAgentAuthServiceID,
+		CellID: candidate.CellID, SessionID: candidate.SessionID,
+		SessionIssuedAtMillis: candidate.IssuedAtMillis, RunID: candidate.RunID, RunAttempt: candidate.RunAttempt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData: agentConn, PeerPk: serverPk, HeaderType: core.NHP_EXT,
+		TransactionId: innerTrx, Message: closeBody, ResponseMsgCh: response,
+	})
+	innerClose := drainEncryptedPacket(t, agentConn)
+	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
+		InnerPacket: base64.StdEncoding.EncodeToString(innerClose), RequestID: testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(
+		t, serverDev, serverListen.LocalAddr().(*net.UDPAddr), relayAddr, rlyBytes,
+	)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
+	s := &UdpServer{
+		device: serverDev, metrics: metrics.NewPublisherForTest(t), listenConn: serverListen,
+		sessionControlCellID: candidate.CellID, sessionControlStore: store,
+		relayPeerMap: map[string]*core.UdpPeer{
+			relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY},
+		},
+	}
+
+	s.HandleRelayForward(outerPpd)
+	outerReturnBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerReturnBytes)
+	ackPacket, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeResponseToTransaction(t, agentDev, ackPacket)
+	select {
+	case serverPpd := <-response:
+		if serverPpd.Error != nil || serverPpd.HeaderType != core.NHP_ACK || serverPpd.SenderTrxId != innerTrx {
+			t.Fatalf("relayed exact-close ACK packet = %#v", serverPpd)
+		}
+		var ack common.ServerExactSessionCloseAckMsg
+		if err := json.Unmarshal(serverPpd.BodyMessage, &ack); err != nil {
+			t.Fatal(err)
+		}
+		if !common.IsSuccessErrCode(ack.ErrCode) || ack.CellID != candidate.CellID ||
+			ack.SessionID != candidate.SessionID || ack.SessionIssuedAtMillis != candidate.IssuedAtMillis ||
+			ack.RunID != candidate.RunID || ack.RunAttempt != candidate.RunAttempt ||
+			ack.CloseEventID != sessionControlExactCloseEventID(candidate) || ack.State != sessionControlSessionStateClosing {
+			t.Fatalf("relayed exact-close ACK = %#v", ack)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received the relayed exact-close ACK")
+	}
+	if store.resolveCalls != 1 || store.closeCalls != 1 {
+		t.Fatalf("relayed exact-close store calls = resolve %d close %d, want 1/1", store.resolveCalls, store.closeCalls)
+	}
+}
+
+func TestHandleRelayForward_BodylessExitIsRejectedOnCurrentEnvelope(t *testing.T) {
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	innerExit := encryptRawInnerForRelay(t, agentDev, serverPk, core.NHP_EXT, 424243, nil)
+
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	body, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
+		InnerPacket: base64.StdEncoding.EncodeToString(innerExit),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatalf("marshal RelayForwardMsg: %v", err)
+	}
+	outerPpd, _, _ := realOuterRelayRequest(t, serverDev, serverListen.LocalAddr().(*net.UDPAddr), relayAddr, body)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
+	mp := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		device:       serverDev,
+		metrics:      mp,
+		relayPeerMap: map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		listenConn:   serverListen,
+	}
+	s.running.Store(true)
+
+	s.HandleRelayForward(outerPpd)
+	s.agentSessionCloseWorkerWG.Wait()
+	counters, _ := mp.CountersForTest(t)
+	if got := counters[MetricAgentSessionCloseRequest]; got != 0 {
+		t.Fatalf("AgentSessionCloseRequest = %v, want 0 for rejected bodyless close", got)
+	}
+	if got := counters[MetricRelayForwardReject]; got != 1 {
+		t.Fatalf("MetricRelayForwardReject = %v, want 1", got)
+	}
+	if err := relayListen.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, core.RelayPacketBufferSize)
+	if n, _, readErr := relayListen.ReadFromUDP(buf); readErr == nil {
+		t.Fatalf("bodyless EXT produced an unexpected %d-byte NHP response", n)
+	} else if !errors.Is(readErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("waiting for absent EXT response: %v", readErr)
 	}
 }
 

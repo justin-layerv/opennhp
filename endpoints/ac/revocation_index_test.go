@@ -24,6 +24,7 @@ func newTestACWithScheduler(t *testing.T) (*UdpAC, *recordingFlusher) {
 	a := &UdpAC{
 		tokenStore:   common.NewTokenStore[*AccessEntry](),
 		revIndex:     newRevocationIndex(),
+		nhpSessions:  newNHPSessionIndex(),
 		expirySched:  sched,
 		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
 	}
@@ -39,7 +40,7 @@ func qurlV2Entry(qurlHash, resHash, sessionID, admissionID string) *AccessEntry 
 		OpenTime:              10,
 		QurlUserPublicKeyHash: qurlHash,
 		ResourcePublicKeyHash: resHash,
-		SessionId:             sessionID,
+		QurlSessionId:         sessionID,
 		AdmissionId:           admissionID,
 	}
 }

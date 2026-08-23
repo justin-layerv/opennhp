@@ -9,48 +9,14 @@ var (
 	dimNameCallerIP   = aws.String("CallerIP")
 	dimNameReason     = aws.String("Reason")
 	dimNameSource     = aws.String("Source")
-	dimNameOutcome    = aws.String("Outcome")
 	dimNameFanoutMode = aws.String("FanoutMode")
 )
 
 const revocationFanoutUnknown = "unknown"
 
-// recordKnockForwardOutcome emits the outcome of a single ForwardHttpKnock call
-// (qurl-service#976 Phase 0A) on BOTH success and failure, so the Outcome
-// dimension yields a success/fail ratio and a cause-split of failures. Only the
-// dimensioned series is emitted — the undimensioned total is already covered by
-// KnockForwardSuccess + KnockForwardFailure, so a base counter here would be a
-// redundant third overlapping series (dashboards should sum the Outcome
-// dimension, not add a base to KnockForwardFailure). nil-safe.
-//
-// Cardinality note for dashboards: this fires once per no-local-AC resource in
-// the handleHttpOpenResource loop (per-forward), whereas KnockFailReason fires
-// once per knock. They're 1:1 on the single-resource qURL path (the target
-// scenario) but diverge for a multi-resource knock, so sum(KnockForwardOutcome)
-// is NOT directly comparable to KnockFailReason there.
-func (s *UdpServer) recordKnockForwardOutcome(outcome ForwardOutcome) {
-	if s == nil {
-		return
-	}
-	s.metrics.IncrCounterWithDims(MetricKnockForwardOutcome, []types.Dimension{
-		{Name: dimNameOutcome, Value: aws.String(string(outcome))},
-	})
-}
-
-// recordKnockFailReason emits the top-level cause of a failed qURL knock
-// (qurl-service#976 Phase 0B). The "Reason" dimension is the bounded
-// KnockFailReason enum. nil-safe (Publisher guards a nil receiver).
-func (s *UdpServer) recordKnockFailReason(reason KnockFailReason) {
-	if s == nil {
-		return
-	}
-	// Base + dimensioned (mirrors recordInternalKnockRequest): base is the
-	// alarmable "total failed knocks" series, the Reason breakdown is attribution.
-	s.metrics.IncrCounter(MetricKnockFailReason)
-	s.metrics.IncrCounterWithDims(MetricKnockFailReason, []types.Dimension{
-		{Name: dimNameReason, Value: aws.String(string(reason))},
-	})
-}
+// MetricCounter emits a named counter without coupling HTTP pre-handlers to a
+// concrete metrics publisher.
+type MetricCounter func(name string)
 
 // The CallerIP breakdown stream assumes a bounded internal caller set
 // (qurl-service plus fleet members). Alarmable streams should use the base

@@ -44,7 +44,7 @@ const (
 // attach to its FRP login Metas as `qurl_knock_token`.
 //
 // AgentRunID is optional only while the live token entry has no stored RunID,
-// which is intentional for legacy auth services and the HTTP knock path. Once
+// which is intentional for legacy auth services. Once
 // an entry has a non-empty RunID, the request must supply the same value;
 // omission or inequality is rejected as run_id_mismatch. The response `run_id`
 // always echoes AgentRunID and carries `omitempty`, so a rejection for omission
@@ -102,11 +102,13 @@ const maxAgentRunIDBytes = 256
 //	                    body with this code.
 //
 // Consumer contract on omitempty: KnockSrcIP, KnockUser, and
-// ExpiresAt use `omitempty` so they're absent on negative results
-// (the no-metadata-leak property). On a Valid=true response
-// ExpiresAt is always populated (every construction path sets
-// ExpireTime, and a zero value is fail-closed to expired before
-// this branch). KnockSrcIP and KnockUser, however, may be absent
+// ResourceId, SessionId, SessionExpiresAt, and ExpiresAt use `omitempty`
+// so they are absent on negative results (the no-metadata-leak property).
+// Every Valid=true response requires all four: ResourceId binds the token to
+// one NHP resource; SessionId is the server-assigned AOP/ART/ACK identity;
+// SessionExpiresAt is the exact serving deadline; ExpiresAt is the later
+// token-resolution deadline that includes the late-packet buffer. Consumers
+// must never use ExpiresAt to extend serving. KnockSrcIP and KnockUser may be absent
 // even on Valid=true: TestInternalTokenValidate_HappyNoUserGuard
 // exercises the entry.User == nil branch (an ACK-path entry built
 // before the agent identity was captured) and tokenstore.go marks
@@ -120,9 +122,12 @@ const maxAgentRunIDBytes = 256
 // minimal on negative-result bodies that tunnel-server may cache
 // by hash.
 type internalTokenValidateResponse struct {
-	Valid      bool   `json:"valid"`
-	KnockSrcIP string `json:"knock_src_ip,omitempty"`
-	KnockUser  string `json:"knock_user,omitempty"`
+	Valid            bool   `json:"valid"`
+	ResourceId       string `json:"resource_id,omitempty"`
+	SessionId        uint64 `json:"session_id,omitempty"`
+	SessionExpiresAt int64  `json:"session_expires_at,omitempty"`
+	KnockSrcIP       string `json:"knock_src_ip,omitempty"`
+	KnockUser        string `json:"knock_user,omitempty"`
 	// OwnerId is the server-resolved tenant identity stamped at
 	// knock-validation time from the pubkey-bound agent registry
 	// (see `endpoints/server/agent_peer_lookup.go::CachedOwnerID`
@@ -138,9 +143,8 @@ type internalTokenValidateResponse struct {
 	// ACK-path lets downstream services trust it without re-
 	// validating client-supplied labels.
 	//
-	// omitempty: empty when the entry was created via a path that
-	// didn't have pubkey-resolved identity (the HTTP knock path
-	// today) OR when the agentPeerLookup cache was evicted between
+	// omitempty: empty for a legacy entry without pubkey-resolved identity OR
+	// when the agentPeerLookup cache was evicted between
 	// resolve and ACK-publish (best-effort surfacing). Consumers
 	// MUST treat empty as "identity not resolved at this hop" and
 	// either fall back to other identity signals or reject per
@@ -457,12 +461,12 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// both into a single nil return — fine for its own callers, but
 	// loses information this handler needs.
 	//
-	// Contract this endpoint advertises is "this server has a live
-	// token entry for X", not "this is specifically an AC-issued
-	// knock token" — tokenStore is a flat keyspace shared with
-	// server-issued tokens from GenerateAccessToken. The resource_id
-	// follow-up (see PR description) is the natural seam for any
-	// future tightening of the AC-only contract.
+	// Contract this endpoint advertises is "this server has a live,
+	// server-bound token entry for X". tokenStore remains a flat keyspace
+	// shared with server-issued tokens from GenerateAccessToken, but the
+	// positive path below requires an immutable protected-resource subject,
+	// nonzero NHP session identity, and exact serving deadline. Entries that do
+	// not carry those server-owned bindings fail closed.
 	entry, found := hs.udpServer.tokenStore.Load(req.Token)
 	sharedStoreHit := false
 	if !found {
@@ -532,10 +536,11 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// whether this validate request landed on the issuing process.
 		hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreHit)
 	}
-	// Intentional legacy/HTTP entries and pre-producer rows have an empty RunID,
-	// so request-only and empty/empty values stay compatible. Once a live entry
-	// carries a binding, however, the caller must assert the exact same value:
-	// omission is a mismatch, not a compatibility escape hatch.
+	// Generic/HTTP bookkeeping entries and pre-producer rows can have an empty
+	// RunID, so there is no stored value to compare at this step. They still fail
+	// the protected-resource/session gates below and can never produce a signed
+	// Valid=true serving response. A registered-agent entry always carries a
+	// binding, and the caller must assert its exact value: omission is a mismatch.
 	if entry.RunID != "" && entry.RunID != req.AgentRunID {
 		// Echo only the request value so every negative result remains
 		// correlatable without leaking the stored binding or any other
@@ -548,9 +553,34 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		})
 		return
 	}
+	if !validProtectedResourceID(entry.ProtectedResourceId) || entry.ProtectedResourceId == entry.ResourceId {
+		hs.recordInternalTokenValidateFailure(srcIP, "invalid_resource")
+		respond(http.StatusOK, internalTokenValidateResponse{Valid: false, RunID: req.AgentRunID, Error: "invalid_resource"})
+		return
+	}
+	if entry.SessionId == 0 || entry.SessionExpireTime.IsZero() {
+		hs.recordInternalTokenValidateFailure(srcIP, "invalid_session")
+		respond(http.StatusOK, internalTokenValidateResponse{Valid: false, RunID: req.AgentRunID, Error: "invalid_session"})
+		return
+	}
+	if !time.Now().Before(entry.SessionExpireTime) {
+		hs.recordInternalTokenValidateFailure(srcIP, "session_expired")
+		respond(http.StatusOK, internalTokenValidateResponse{Valid: false, RunID: req.AgentRunID, Error: "session_expired"})
+		return
+	}
 
 	// Happy path. Populate everything the tunnel-server's
 	// knock_validator expects:
+	//   - resource_id:  the canonical public P-256 resource subject copied from
+	//     the resolved catalog row. This is not the wire KnockResourceID or the
+	//     ACK-token catalog key stored as entry.ResourceId.
+	//     The tunnel server must match it against each FRP proxy resource;
+	//     owner identity alone is not resource authorization.
+	//   - session_id:   the nonzero server-assigned NHP session echoed through
+	//     AOP, ART, and ACK.
+	//   - session_expires_at: Unix seconds for the serving deadline derived
+	//     from the server issuance time plus OpenTime. It is deliberately
+	//     earlier than expires_at and does not include the late-packet buffer.
 	//   - knock_src_ip: the IP the agent knocked from. The
 	//     tunnel-server uses this response-authenticated source for
 	//     connector fairness; it must not compare it to FRP's
@@ -559,10 +589,8 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	//   - knock_user:   the AgentUser.UserId (omits DeviceId /
 	//     OrgId / AuthServiceId; the tunnel-server only uses the
 	//     UserId for audit-log annotation today).
-	//   - run_id:       echoes the caller-supplied agent_run_id after
-	//     the stored binding check above. If the caller omits it, a
-	//     valid response is possible only for an intentional legacy/HTTP entry
-	//     or pre-producer row whose stored RunID is also empty.
+	//   - run_id:       echoes the caller-supplied agent_run_id after the exact
+	//     registered-agent stored-binding check above.
 	//   - expires_at:   RFC3339Nano to keep the response self-
 	//     describing across language clients AND preserve the
 	//     sub-second precision the in-memory ExpireTime carries.
@@ -572,13 +600,6 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	//     earlier than truth, which would later bite a consumer
 	//     interleaving expires_at with its own monotonic clock.
 	//
-	// entry.ResourceId is intentionally omitted from the response.
-	// PR-2c's knock_validator does not consume it today, and
-	// adding it without a matching consumer would publish a
-	// half-bound contract. Adding resource_id later (so the
-	// tunnel-server can reject a token issued for resource A
-	// presented against an FRP login for resource B) is tracked
-	// as a follow-up — see PR description.
 	user := ""
 	ownerId := ""
 	if entry.User != nil {
@@ -586,11 +607,14 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		ownerId = entry.User.OwnerId
 	}
 	respond(http.StatusOK, internalTokenValidateResponse{
-		Valid:      true,
-		KnockSrcIP: entry.KnockSrcIP,
-		KnockUser:  user,
-		OwnerId:    ownerId,
-		RunID:      req.AgentRunID,
-		ExpiresAt:  entry.ExpireTime.UTC().Format(time.RFC3339Nano),
+		Valid:            true,
+		ResourceId:       entry.ProtectedResourceId,
+		SessionId:        entry.SessionId,
+		SessionExpiresAt: entry.SessionExpireTime.UTC().Unix(),
+		KnockSrcIP:       entry.KnockSrcIP,
+		KnockUser:        user,
+		OwnerId:          ownerId,
+		RunID:            req.AgentRunID,
+		ExpiresAt:        entry.ExpireTime.UTC().Format(time.RFC3339Nano),
 	})
 }

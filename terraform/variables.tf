@@ -179,13 +179,13 @@ variable "min_capacity" {
 }
 
 variable "max_capacity" {
-  description = "Maximum ASG capacity"
+  description = "Maximum server ASG capacity per color. Capped at 40 so blue+green Cloud Map registrations remain at most 80, preserving 20 entries of headroom below DiscoverInstances' non-pageable 100-result authority ceiling."
   type        = number
   default     = 10
 
   validation {
-    condition     = var.max_capacity >= 1 && var.max_capacity <= 100
-    error_message = "Max capacity must be between 1 and 100."
+    condition     = var.max_capacity >= 1 && var.max_capacity <= 40
+    error_message = "Max capacity must be between 1 and 40; two blue/green colors must remain below the Cloud Map DiscoverInstances 100-result ceiling with operational headroom."
   }
 }
 
@@ -478,6 +478,12 @@ variable "l3_flush_dry_run" {
   description = "Root passthrough for the AC module's l3_flush_dry_run. When true the scheduler logs intended flushes without invoking conntrack/BPF map deletion — the dry-run audit signal feeds an operator's call to flip to false. Default true; has no effect when enable_l3_flush_on_expiry=false. The Go-side first-load safety auto-defaults dry-run=true if the operator flips enable_l3_flush_on_expiry=true with dry-run unset/false, so a misconfiguration falls back to log-only."
   type        = bool
   default     = true
+}
+
+variable "l3_flush_real_mode_acknowledged" {
+  description = "Root passthrough for the durable operator acknowledgement that permits an AC restart directly into real L3 flush mode. Must remain false until dry-run rollout gates pass."
+  type        = bool
+  default     = false
 }
 
 variable "l3_flush_conntrack_backend" {

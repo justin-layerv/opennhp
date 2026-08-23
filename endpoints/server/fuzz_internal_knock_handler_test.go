@@ -23,12 +23,9 @@ func init() {
 // contract: a non-private TCP source must receive 403 regardless of
 // header content.
 //
-// Private-source inputs short-circuit before ServeHTTP — the fuzzer uses
-// a zero-value HttpServer (no underlying udpServer), and a body with a
-// non-empty resInfo would reach handleHttpOpenResource and nil-panic
-// inside acConnectionMapMutex.RLock. Skipping that branch keeps the
-// fence focused on the non-private path, which is the only branch the
-// gate contract speaks to.
+// Private-source inputs short-circuit before ServeHTTP so this fence stays
+// focused on the non-private path, which is the only branch the gate contract
+// speaks to. The terminal direct-admission handler itself is fail-closed.
 // Minimal well-formed body shared by seeds and the canary — empty request +
 // resource objects. Keeps the seed table scannable and makes diffs on new
 // seeds small.
@@ -61,8 +58,7 @@ func FuzzHandleInternalKnockBypass(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, remoteAddr, xff, body string) {
 		// Skip private-source inputs before ServeHTTP — the gate's contract
-		// only fences the non-private path, and reaching the real handler
-		// with a zero-value HttpServer is a harness bug, not a finding.
+		// only fences the non-private path.
 		// Check before the size cap so len() doesn't fire on inputs we'd
 		// drop anyway.
 		if isRemoteAddrPrivate(remoteAddr) {

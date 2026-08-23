@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	utils "github.com/OpenNHP/opennhp/nhp/utils"
 )
@@ -73,8 +74,8 @@ type ServerRegisterAckMsg struct {
 //
 // RunID is the caller-owned knock/Login cycle identifier: exactly 16 lowercase
 // hexadecimal characters. Generic legacy messages may omit it, but native UDP
-// knocks dispatched to the registered-agent auth service require it before any
-// registry, resource, or AC work.
+// knocks dispatched to the registered-agent auth service require it together
+// with a positive RunAttempt before any registry, resource, or AC work.
 type AgentKnockMsg struct {
 	HeaderType     int            `json:"headerType"`
 	UserId         string         `json:"usrId"`
@@ -83,8 +84,33 @@ type AgentKnockMsg struct {
 	AuthServiceId  string         `json:"aspId"`
 	ResourceId     string         `json:"resId"`
 	RunID          string         `json:"runId,omitempty"`
+	RunAttempt     uint64         `json:"runAttempt,omitempty"`
 	CheckResults   map[string]any `json:"results,omitempty"`
 	UserData       map[string]any `json:"usrData,omitempty"`
+
+	// NHPSessionId is assigned by the NHP-Server after the authenticated KNK
+	// body is decoded. It is server-internal state, never accepted from or
+	// serialized back into the agent's KNK body. The server carries this exact
+	// value through AOP, ART, ACK, and ACK-token validation.
+	NHPSessionId       uint64    `json:"-"`
+	NHPSessionIssuedAt time.Time `json:"-"`
+	// NHPAgentPublicKey is server-owned authenticated packet metadata. It is
+	// copied from PacketParserData.RemotePubKey and carried to the AOP Public Key
+	// field; a KNK body can never supply or override it.
+	NHPAgentPublicKey string `json:"-"`
+	// ProtectedResourceId is the server-resolved canonical public resource
+	// identity bound to a registered-agent ACK token. It is distinct from the
+	// wire ResourceId, which is only the knock/catalog routing key, and is never
+	// accepted from the application JSON body.
+	ProtectedResourceId string `json:"-"`
+	// InternalHTTPExit preserves the legacy internal HTTP operation's one-second
+	// resource close without reusing the bodyless, agent-global NHP_EXT wire
+	// type. It is server-owned application state and is never serialized.
+	InternalHTTPExit bool `json:"-"`
+	// InternalHTTP identifies the explicitly non-NHP HTTP application path. It
+	// permits that application operation to open an AC rule without pretending
+	// it has an authenticated NHP-Agent public key.
+	InternalHTTP bool `json:"-"`
 }
 
 func (knkMsg *AgentKnockMsg) Id() string {
@@ -100,15 +126,20 @@ type PreAccessInfo struct {
 }
 
 type ServerKnockAckMsg struct {
-	ErrCode           string                    `json:"errCode"`
-	ErrMsg            string                    `json:"errMsg,omitempty"`
-	ResourceHost      map[string]string         `json:"resHost"`
-	OpenTime          uint32                    `json:"opnTime"`
-	AuthProviderToken string                    `json:"aspToken,omitempty"` // optional for ac backend validation
-	AgentAddr         string                    `json:"agentAddr"`
-	ACTokens          map[string]string         `json:"acTokens"`
-	PreAccessActions  map[string]*PreAccessInfo `json:"preActions,omitempty"` // optional for pre-access
-	RedirectUrl       string                    `json:"redirectUrl,omitempty"`
+	SessionId             uint64                    `json:"sessId,omitempty"`
+	CellId                string                    `json:"cellId,omitempty"`
+	SessionIssuedAtMillis int64                     `json:"sessIssuedAtMillis,omitempty"`
+	RunID                 string                    `json:"runId,omitempty"`
+	RunAttempt            uint64                    `json:"runAttempt,omitempty"`
+	ErrCode               string                    `json:"errCode"`
+	ErrMsg                string                    `json:"errMsg,omitempty"`
+	ResourceHost          map[string]string         `json:"resHost"`
+	OpenTime              uint32                    `json:"opnTime"`
+	AuthProviderToken     string                    `json:"aspToken,omitempty"` // optional for ac backend validation
+	AgentAddr             string                    `json:"agentAddr"`
+	ACTokens              map[string]string         `json:"acTokens"`
+	PreAccessActions      map[string]*PreAccessInfo `json:"preActions,omitempty"` // optional for pre-access
+	RedirectUrl           string                    `json:"redirectUrl,omitempty"`
 }
 
 type AgentListMsg struct {
@@ -137,14 +168,20 @@ type AgentAccessMsg struct {
 
 // ac <-> server
 type ServerACOpsMsg struct {
-	UserId           string        `json:"usrId"`
-	DeviceId         string        `json:"devId"`
-	OrganizationId   string        `json:"orgId,omitempty"`
-	AuthServiceId    string        `json:"aspId"`
-	ResourceId       string        `json:"resId"`
-	SourceAddrs      []*NetAddress `json:"srcAddrs"`
-	DestinationAddrs []*NetAddress `json:"dstAddrs"`
-	OpenTime         uint32        `json:"opnTime"`
+	SessionId             uint64        `json:"sessId,omitempty"`
+	SessionOwnerId        string        `json:"sessOwnerId"`
+	AgentPublicKey        string        `json:"agentPubKey,omitempty"`
+	SessionIssuedAtMillis int64         `json:"sessIssuedAtMillis,omitempty"`
+	RunID                 string        `json:"runId,omitempty"`
+	RunAttempt            uint64        `json:"runAttempt,omitempty"`
+	UserId                string        `json:"usrId"`
+	DeviceId              string        `json:"devId"`
+	OrganizationId        string        `json:"orgId,omitempty"`
+	AuthServiceId         string        `json:"aspId"`
+	ResourceId            string        `json:"resId"`
+	SourceAddrs           []*NetAddress `json:"srcAddrs"`
+	DestinationAddrs      []*NetAddress `json:"dstAddrs"`
+	OpenTime              uint32        `json:"opnTime"`
 
 	// qURL v2 keyed-identity revocation metadata (additive; populated only by
 	// the v2 signed-claims admission path, omitted for every legacy admission).
@@ -154,13 +191,15 @@ type ServerACOpsMsg struct {
 	// See docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
 	QurlUserPublicKeyHash string `json:"qurlUsrPubKeyHash,omitempty"` // hash of the qURL user's keyed-identity public key
 	ResourcePublicKeyHash string `json:"resPubKeyHash,omitempty"`     // hash of the protected resource's public key
-	SessionId             string `json:"sessId,omitempty"`            // qURL v2 session identifier
+	QurlSessionId         string `json:"qurlSessId,omitempty"`        // qURL v2 application session identifier
 	AdmissionId           string `json:"admId,omitempty"`             // unique id of the admission decision that opened this access
 	RevocationEpoch       uint64 `json:"revEpoch,omitempty"`          // monotonic epoch used to invalidate access on revoke
 	Deadline              int64  `json:"deadline,omitempty"`          // unix seconds; admission validity deadline
 }
 
 type ACOpsResultMsg struct {
+	SessionId       uint64         `json:"sessId,omitempty"`
+	SessionOwnerId  string         `json:"sessOwnerId"`
 	ErrCode         string         `json:"errCode"`
 	ErrMsg          string         `json:"errMsg,omitempty"`
 	OpenTime        uint32         `json:"opnTime"`
@@ -176,6 +215,13 @@ type ACOnlineMsg struct {
 	// License key is globally unique and sufficient for lookup and validation
 	LicenseKey string `json:"licKey,omitempty"`  // License key for validation (globally unique)
 	ACVersion  string `json:"version,omitempty"` // AC software version
+
+	// Session-control readiness is process-scoped, not static-key-scoped. The
+	// AC changes BootID on every process start and advances FlushGeneration only
+	// after inherited/live NHP session rules have been synchronously flushed.
+	BootID                 string `json:"bootId,omitempty"`
+	SessionFlushGeneration uint64 `json:"sessFlushGen,omitempty"`
+	SessionFlushComplete   bool   `json:"sessFlushComplete,omitempty"`
 }
 
 type ServerACAckMsg struct {
@@ -183,6 +229,13 @@ type ServerACAckMsg struct {
 	ErrMsg     string `json:"errMsg,omitempty"`
 	ACAddr     string `json:"acAddr"`
 	Registered bool   `json:"registered"` // True if AC is registered with this server (Phase 2)
+
+	// The successful AAK echoes the exact process boot, completed flush
+	// generation, and AOL transaction it authorizes. The AC must not reopen its
+	// admission lease from an ACK for an older pre-flush AOL.
+	BootID                 string `json:"bootId,omitempty"`
+	SessionFlushGeneration uint64 `json:"sessFlushGen,omitempty"`
+	AOLTransactionID       uint64 `json:"aolTrxId,omitempty"`
 
 	// ServerAddr is the server's direct IP:Port for AC to establish direct connection.
 	// When AC connects through NLB, responses from the server's direct IP would be
@@ -413,7 +466,7 @@ type ServerDHPKnockAckMsg struct {
 type ForwardAdmissionRevocationData struct {
 	QurlUserPublicKeyHash string `json:"qurlUsrPubKeyHash,omitempty"`
 	ResourcePublicKeyHash string `json:"resPubKeyHash,omitempty"`
-	SessionId             string `json:"sessId,omitempty"`
+	QurlSessionId         string `json:"qurlSessId,omitempty"`
 	AdmissionId           string `json:"admId,omitempty"`
 	Deadline              int64  `json:"deadline,omitempty"`
 }
@@ -428,6 +481,7 @@ type ForwardResolvedResourceData struct {
 	ResourceId            string                   `json:"resId,omitempty"`
 	OpenTime              uint32                   `json:"opnTime,omitempty"`
 	Resources             map[string]*ResourceInfo `json:"resInfo,omitempty"`
+	ResourcePublicKeyB64  string                   `json:"resPubKeyB64,omitempty"`
 	ResourcePublicKeyHash string                   `json:"resPubKeyHash,omitempty"`
 }
 
@@ -435,11 +489,13 @@ type ForwardResolvedResourceData struct {
 // Used when a knock arrives at a non-assigned server and needs to be forwarded
 // to one of the AC's assigned servers.
 type ServerForwardMsg struct {
-	KnockData     []byte `json:"knockData"`    // Original encrypted knock packet
-	SourceServer  string `json:"sourceServer"` // Server ID that received the knock
-	UserAddr      string `json:"userAddr"`     // User's address for response routing
-	TransactionId uint64 `json:"txId"`         // For response correlation
-	Timestamp     int64  `json:"ts"`           // Unix timestamp - reject if >30s old (replay protection)
+	KnockData            []byte `json:"knockData"`                      // Original encrypted knock packet
+	SourceServer         string `json:"sourceServer"`                   // Server ID that received the knock
+	UserAddr             string `json:"userAddr"`                       // User's address for response routing
+	TransactionId        uint64 `json:"txId"`                           // For response correlation
+	Timestamp            int64  `json:"ts"`                             // Unix timestamp - reject if >30s old (replay protection)
+	SessionId            uint64 `json:"sessId,omitempty"`               // Origin server-assigned NHP access-session identifier
+	SessionIssuedAtNanos int64  `json:"sessionIssuedAtNanos,omitempty"` // Origin server issuance time; used only to derive the serving deadline.
 
 	// AdmissionRevocationData optionally carries qURL v2 revocation metadata
 	// produced by the origin server's admission decision. Local catalog

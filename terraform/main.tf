@@ -925,8 +925,9 @@ module "compute" {
   # storage tables above/below are genuinely cell-local runtime state
   # (assignments, ack tokens, licenses, resource catalog) and stay on this
   # cell's dynamodb module.
-  dynamodb_agent_keys_table = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
-  dynamodb_ack_tokens_table = module.dynamodb.ack_tokens_table_name
+  dynamodb_agent_keys_table      = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
+  dynamodb_ack_tokens_table      = module.dynamodb.ack_tokens_table_name
+  dynamodb_session_control_table = module.dynamodb.session_control_table_name
 
   # IAM + KMS for the Control-mode agent-keys read path (empty in cell
   # compatibility mode, which emits no grant at all). The cell dynamodb
@@ -1505,10 +1506,11 @@ module "ac" {
   server_nlb_security_group_id = module.compute.nlb_security_group_id
 
   # L3 flush-on-expiry (active session teardown).
-  enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry
-  l3_flush_dry_run             = var.l3_flush_dry_run
-  l3_flush_conntrack_backend   = var.l3_flush_conntrack_backend
-  l3_flush_conntrack_pool_size = var.l3_flush_conntrack_pool_size
+  enable_l3_flush_on_expiry       = var.enable_l3_flush_on_expiry
+  l3_flush_dry_run                = var.l3_flush_dry_run
+  l3_flush_real_mode_acknowledged = var.l3_flush_real_mode_acknowledged
+  l3_flush_conntrack_backend      = var.l3_flush_conntrack_backend
+  l3_flush_conntrack_pool_size    = var.l3_flush_conntrack_pool_size
 
   # License credentials for cloud mode registration
   # Default to empty strings to prevent null interpolation errors in user_data template

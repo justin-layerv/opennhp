@@ -81,6 +81,11 @@ func nhp_agent_knock_resource_with_run_id(aspId *C.char, resId *C.char, runID *C
 	return C.CString(sdk.KnockResourceWithRunID(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(runID), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort)))
 }
 
+//export nhp_agent_knock_resource_with_run_binding
+func nhp_agent_knock_resource_with_run_binding(aspId *C.char, resId *C.char, runID *C.char, runAttempt C.ulonglong, serverIp *C.char, serverHostname *C.char, serverPort C.int) *C.char {
+	return C.CString(sdk.KnockResourceWithRunBinding(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(runID), uint64(runAttempt), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort)))
+}
+
 //export nhp_agent_exit_resource
 func nhp_agent_exit_resource(aspId *C.char, resId *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) bool {
 	return sdk.ExitResource(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort))
@@ -89,6 +94,15 @@ func nhp_agent_exit_resource(aspId *C.char, resId *C.char, serverIp *C.char, ser
 //export nhp_agent_exit_resource_with_run_id
 func nhp_agent_exit_resource_with_run_id(aspId *C.char, resId *C.char, runID *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) bool {
 	return sdk.ExitResourceWithRunID(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(runID), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort))
+}
+
+//export nhp_agent_retire_session
+func nhp_agent_retire_session(knockAckJSON *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) *C.char {
+	return C.CString(retireSessionJSON(deepCopyCString(knockAckJSON), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort)))
+}
+
+func retireSessionJSON(knockAckJSON, serverIP, serverHostname string, serverPort int) string {
+	return sdk.RetireSession(knockAckJSON, serverIP, serverHostname, serverPort)
 }
 
 //export nhp_generate_keys

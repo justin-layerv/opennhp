@@ -36,6 +36,10 @@ if [[ "$dry_run" == "true" || "$prepare_result" != "success" ]]; then
   safe_to_release=true
 elif [[ "$deploy_server" != "true" && "$deploy_ac" != "true" ]]; then
   safe_to_release=true
+elif [[ "$action" == "prepare-only" && "$deploy_result" == "success" && "$switch_result" == "skipped" ]]; then
+  # Standby image/profile/capacity mutations are intentionally non-serving.
+  # A successful prepare-only run never moves a listener or active-color key.
+  safe_to_release=true
 # switch-traffic is the ONLY job that mutates the live boundary: every
 # `aws elbv2 modify-listener` and the authoritative active-color SSM write live
 # in blue-green-switch.sh, which nothing else invokes. Its guard is

@@ -125,11 +125,9 @@ func TestAuthWithAspPlugin_UnknownASPID_Returns404(t *testing.T) {
 	}
 }
 
-// TestRunPluginAuth_SetsKnockProcessingDeadline fences the wiring the AC-open
-// reknock retry short-circuit depends on: the HTTP knock path must bound req.Ctx
-// with HttpKnockProcessingBudget. c.Request.Context() carries no deadline of its
-// own, so without this wrap broadcastACOpenWithReknock's ctx.Deadline() check would
-// silently no-op on the HTTP path and the retry could overrun the caller's budget.
+// TestRunPluginAuth_SetsKnockProcessingDeadline fences the plugin compatibility
+// contract: req.Ctx remains bounded by HttpKnockProcessingBudget even though the
+// direct application-admission callback now terminates as unsupported.
 func TestRunPluginAuth_SetsKnockProcessingDeadline(t *testing.T) {
 	hs := newTestHttpServer()
 
@@ -150,7 +148,7 @@ func TestRunPluginAuth_SetsKnockProcessingDeadline(t *testing.T) {
 	hs.runPluginAuth(ctx, &common.HttpKnockRequest{}, handler)
 
 	if !hadDeadline {
-		t.Fatal("req.Ctx has no deadline; the HTTP knock path must bound it with HttpKnockProcessingBudget")
+		t.Fatal("req.Ctx has no deadline; the plugin path must apply HttpKnockProcessingBudget")
 	}
 	// The deadline should be ≈ HttpKnockProcessingBudget from just before the call
 	// (generous slack for scheduling jitter, tight enough to catch a wrong budget).

@@ -40,10 +40,6 @@ const (
 	// DefaultStorageTimeout is the default timeout for storage and Cloud Map operations.
 	DefaultStorageTimeout = 5 * time.Second
 
-	// DefaultForwardTimeout is the timeout for the full HTTP knock forward chain
-	// (DynamoDB lookup + Cloud Map health check + up to 3 HTTP round-trips at 2s each).
-	DefaultForwardTimeout = 10 * time.Second
-
 	// DefaultStaleACConnThreshold is the default duration after which an AC
 	// connection is considered dead for broadcast purposes. Set to the same
 	// window the AC itself uses to decide a server is down: KeepaliveInterval
@@ -110,42 +106,22 @@ const (
 	// reduce an AC's dialable assignment coverage. The handler keeps the
 	// existing healthy assignment instead of persisting a thinner one.
 	MetricACAssignmentColorMigrationSuppressed = "ACAssignmentColorMigrationSuppressed"
-	MetricKnockForwardSuccess                  = "KnockForwardSuccess"
-	MetricKnockForwardFailure                  = "KnockForwardFailure"
-	MetricKnockForwardSkippedDead              = "KnockForwardSkippedDead"
-	MetricKnockForwardFallback                 = "KnockForwardFallback"
 	// Knock-path AC-open re-knock retry (blue/green reassignment window,
 	// qurl-service#976). A broadcast whose every AC connection hit the transaction
-	// timeout re-snapshots the connection map after a short backoff; the four
-	// counters map the four outcomes (steady-state all ~0):
+	// timeout re-snapshots the connection map after a short backoff; the three
+	// counters map the three outcomes (steady-state all ~0):
 	//   - MetricKnockReknockNoFreshConns: the re-snapshot found NO fresh conn, so no
 	//     retry was issued; a distinct counter because this case increments NEITHER
 	//     Retry counter below (why it gets its own is at the increment site).
-	//   - MetricKnockReknockDeadlineSkipped: fresh conns existed, but less than one
-	//     transaction timeout of the caller's HttpKnockProcessingBudget remained, so
-	//     the retry was skipped (it could not finish before the caller gives up).
-	//   - MetricKnockReknockRetry: a retry WAS issued (fresh conns appeared and the
-	//     deadline allowed it).
+	//   - MetricKnockReknockRetry: a retry WAS issued after fresh conns appeared.
 	//   - MetricKnockReknockRetrySuccess: the issued retry then succeeded (an
 	//     ErrServerACOpsFailed/52005 converted into a success).
 	// The on-call decision tree (which combination means absorbed-flip vs ongoing
-	// thrash vs escalate-to-ops/forward vs budget-starved) lives in the qURL AC-open
+	// thrash vs escalate-to-ops/forward) lives in the qURL AC-open
 	// rollout-ledger entry so it stays single-sourced.
-	MetricKnockReknockRetry           = "KnockReknockRetry"
-	MetricKnockReknockRetrySuccess    = "KnockReknockRetrySuccess"
-	MetricKnockReknockNoFreshConns    = "KnockReknockNoFreshConns"
-	MetricKnockReknockDeadlineSkipped = "KnockReknockDeadlineSkipped"
-	// MetricKnockForwardOutcome is the cause-split of a ForwardHttpKnock call
-	// (qurl-service#976 Phase 0A). Emitted once per forward with an "outcome"
-	// dimension (the ForwardOutcome enum), so KnockForwardFailure — which stays
-	// for alarm continuity — can be broken down by why it failed (notably
-	// remote_no_ac, the 06:47 "peer alive, holds no AC" signature).
-	MetricKnockForwardOutcome = "KnockForwardOutcome"
-	// MetricKnockFailReason is the top-level cause of a FAILED qURL knock at
-	// handleHttpOpenResource (qurl-service#976 Phase 0B), with a "Reason"
-	// dimension (the KnockFailReason enum). Emitted once per failed knock;
-	// KnockNoAC and the ErrServerACOpsFailed path stay for alarm continuity.
-	MetricKnockFailReason = "KnockFailReason"
+	MetricKnockReknockRetry        = "KnockReknockRetry"
+	MetricKnockReknockRetrySuccess = "KnockReknockRetrySuccess"
+	MetricKnockReknockNoFreshConns = "KnockReknockNoFreshConns"
 	// MetricKnockForwardMissingPacket fires when a knock needs fan-out or
 	// no-local-AC forwarding but BasePacketContent() returned nil: a guard-drift
 	// canary for the IsForwardableKnockType clone guard in decryptBody. It covers
@@ -423,8 +399,12 @@ const (
 	MetricACRegistrationSuccess = "ACRegistrationSuccess"
 	MetricACRegistrationFailure = "ACRegistrationFailure"
 	MetricACRegistrationLatency = "ACRegistrationLatency"
-	MetricBroadcastPartialFail  = "BroadcastPartialFail"
-	MetricBroadcastDurationMs   = "BroadcastDurationMs"
+	// MetricACConnAuthorityNotReadyFiltered counts cloud AC connections kept
+	// for durable control recovery but excluded from AOP routing while their
+	// target is PREPARING or catch-up failed.
+	MetricACConnAuthorityNotReadyFiltered = "ACConnAuthorityNotReadyFiltered"
+	MetricBroadcastPartialFail            = "BroadcastPartialFail"
+	MetricBroadcastDurationMs             = "BroadcastDurationMs"
 	// qURL v2 revocation fanout telemetry (P4e). The server receives a
 	// revocation event from qurl-service on /nhp/internal/revocation and pushes
 	// NHP_REV to the matching connected ACs fire-and-forget.
@@ -1726,7 +1706,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	addrStr := ppd.ConnData.RemoteAddr.String()
 	aolMsg := &common.ACOnlineMsg{}
 
-	err = json.Unmarshal(ppd.BodyMessage, aolMsg)
+	err = common.DecodeACOnlineMsg(ppd.BodyMessage, aolMsg)
 	if err != nil {
 		log.Error("server-ac(#%d@%s)[HandleACOnline] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
 		s.metrics.IncrCounter(MetricACRegistrationFailure)
@@ -1742,6 +1722,14 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// Preserve non-empty ACId verbatim. Storage, acConnectionMap, and target
 	// lookups all key on the configured string; trimming here would be a live
 	// ungated identity change rather than a malformed-empty reject.
+
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
+	if cloudMode && (!common.ValidNHPACBootID(aolMsg.BootID) ||
+		aolMsg.SessionFlushGeneration == 0 || !aolMsg.SessionFlushComplete) {
+		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] rejecting cloud AC before boot flush readiness", acId, transactionId, addrStr)
+		s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-not-ready")
+		return common.ErrACSessionControlNotReady
+	}
 
 	// Check if AC should be redirected to its assigned servers (per-AC server assignment).
 	// This only applies when storage is configured and AC provides a license key.
@@ -1778,7 +1766,6 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// In cloud mode (storage_backend=dynamodb), AC peers are not pre-registered.
 	// We need to validate the AC via license check and create the peer dynamically.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
-	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 	// #1157 F3 pre-check. Authoritative F3 gate runs inside the
 	// acConnectionMapMutex.Lock() further below; pre-fix that path was
 	// only reached AFTER validateACLicense (bcrypt) and AddACPeer in
@@ -1931,27 +1918,148 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		// Without this, processACOperation fails with nil peer address.
 		acPeer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation; publishing after ACConn append", acId, transactionId, addrStr)
-	} else if acPeer != nil {
-		// Existing peer found - update its receive address to handle re-registration
-		// from a different source port (e.g., after socket recreation).
-		// In non-cloud mode, responder.go updates this, but in cloud mode with an
-		// existing peer, we must update it here to ensure processACOperation uses
-		// the correct address.
+	} else if acPeer != nil && cloudMode {
+		// Stage a replacement peer instead of mutating the already-published
+		// pointer. Durable target registration and every remaining admission gate
+		// below may still fail. Updating the shared peer here would let a rejected
+		// or stale AOL redirect live AOP traffic to an address that never became an
+		// authoritative ACConn. The staged peer is published only after the
+		// acConnectionMap replacement commits; non-cloud responder.go continues to
+		// own its existing peer-address update path.
 		oldRecvAddr := acPeer.RecvAddr()
+		acPeer = &core.UdpPeer{
+			Hostname:     acId,
+			Ip:           ppd.ConnData.RemoteAddr.IP.String(),
+			Port:         ppd.ConnData.RemoteAddr.Port,
+			PubKeyBase64: acPubkeyBase64,
+			ExpireTime:   0,
+			Type:         core.NHP_AC,
+		}
 		acPeer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
 		if oldRecvAddr != nil && oldRecvAddr.String() != ppd.ConnData.RemoteAddr.String() {
-			log.Info("server-ac(%s#%d@%s)[HandleACOnline] Updated peer recvAddr from %s",
+			log.Info("server-ac(%s#%d@%s)[HandleACOnline] Staged peer recvAddr replacement from %s",
 				acId, transactionId, addrStr, oldRecvAddr.String())
 		}
 	}
 
 	acConn := &ACConn{
-		ConnData:       ppd.ConnData,
-		ACPeer:         acPeer,
-		ACCipherScheme: ppd.CipherScheme,
-		ACId:           acId,
-		ServiceId:      aolMsg.AuthServiceId,
-		Apps:           aolMsg.ResourceIds,
+		ConnData:        ppd.ConnData,
+		ACPeer:          acPeer,
+		ACCipherScheme:  ppd.CipherScheme,
+		ACId:            acId,
+		ServiceId:       aolMsg.AuthServiceId,
+		Apps:            aolMsg.ResourceIds,
+		BootID:          aolMsg.BootID,
+		FlushGeneration: aolMsg.SessionFlushGeneration,
+	}
+
+	var aakMd *core.MsgData
+	if cloudMode {
+		// Marshal the complete success AAK before the first durable activation.
+		// After ActivateTarget commits, this admission must never be canceled:
+		// enqueue failure is recovered by the AC's idempotent AOL retry while the
+		// target remains ACTIVE.
+		var marshalErr error
+		aakMd, marshalErr = s.successfulACOnlineAckMsgData(ppd, aolMsg, assignedPeers)
+		if marshalErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK message: %v", acId, transactionId, addrStr, marshalErr)
+			s.metrics.IncrCounter(MetricACRegistrationFailure)
+			return marshalErr
+		}
+	}
+
+	var releaseAdmission func()
+	var targetCtx context.Context
+	var activation *acSessionControlTargetActivationResult
+	if cloudMode {
+		var targetCancel context.CancelFunc
+		targetBudget := DefaultStorageTimeout
+		if s.sessionControlAOLBudget > 0 {
+			targetBudget = s.sessionControlAOLBudget
+		}
+		targetCtx, targetCancel = udpCorrelationCtx(targetBudget, acId, transactionId)
+		defer targetCancel()
+		var admissionLockErr error
+		releaseAdmission, admissionLockErr = s.acquireACSessionControlAdmission(targetCtx, acId)
+		if admissionLockErr != nil {
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-serialization")
+			return common.ErrACSessionControlNotReady
+		}
+		defer releaseAdmission()
+
+		// The per-target write gate excludes an AOP's final ready-check/enqueue
+		// section across the complete authority transition. It nests after the
+		// per-AC admission serializer, and neither bookkeeping mutex is held while
+		// waiting or while store/network work runs.
+		releaseAuthority, authorityGateErr := s.acquireACSessionControlAuthorityWrite(targetCtx, acConn)
+		if authorityGateErr != nil {
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-authority-busy")
+			return common.ErrACSessionControlNotReady
+		}
+		defer releaseAuthority()
+
+		// Lock order is per-AC admission -> per-owner write -> cell read. The
+		// cell gate remains held through catch-up, activation, AAK enqueue, and
+		// durable readiness finalization so a same-process close preparation
+		// cannot advance CONTROL across this publication boundary.
+		releaseCell, cellGateErr := s.acquireSessionControlCellRead(targetCtx)
+		if cellGateErr != nil {
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-cell-busy")
+			return common.ErrACSessionControlNotReady
+		}
+		defer releaseCell()
+
+		// A same-process AOL must drain any already-pending task before
+		// PrepareTarget versions the exact target. Prepare itself refuses this
+		// mutation, but draining here lets the authenticated current process make
+		// progress without waiting for a disconnect/restart. A strictly newer
+		// process is handled after catch-up/activation through durable rebind.
+		currentTarget, currentTargetErr := s.sessionControlStore.GetTarget(targetCtx,
+			sessionControlTargetKey{ACID: acId, PublicKey: acPubkeyBase64})
+		if currentTargetErr == nil && currentTarget != nil && currentTarget.State == sessionControlTargetActive &&
+			currentTarget.BootID == acConn.BootID && currentTarget.FlushGeneration == acConn.FlushGeneration {
+			if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, *currentTarget, false); drainErr != nil {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] pre-Prepare close-task drain failed: %v",
+					acId, transactionId, addrStr, drainErr)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+					"session-control-task-drain")
+				return common.ErrACSessionControlNotReady
+			}
+			acConn.sessionControlTarget.Store(nil)
+		} else if currentTargetErr != nil && !errors.Is(currentTargetErr, errSessionControlTargetNotFound) {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] current target read before task drain failed: %v",
+				acId, transactionId, addrStr, currentTargetErr)
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+				"session-control-task-authority")
+			return common.ErrACSessionControlNotReady
+		}
+
+		var targetErr error
+		activation, targetErr = s.activateACSessionControlTargetWithSnapshotAfterPrepare(targetCtx, acConn, func(sessionControlTargetPreparation) {
+			// Only a successfully persisted PREPARING row revokes the current
+			// connection's serving authority. In particular, a delayed lower-generation
+			// AOL rejected by PrepareTarget cannot fence a newer ACTIVE connection.
+			s.markACSessionControlConnectionNotReady(acId, acPubkeyBase64)
+		})
+		if targetErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] session-control catch-up/activation failed: %v", acId, transactionId, addrStr, targetErr)
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-authority")
+			return common.ErrACSessionControlNotReady
+		}
+		// A strictly newer AC process inherits the old process's pending close
+		// tasks. Catch-up and Activate establish its durable target first; rebind,
+		// strict REV/RVA, and ACK must then drain owner pending_count before the
+		// success AAK can be published or FinalizeTargetReady can succeed.
+		if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, activation.Target, true); drainErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] activated close-task drain failed: %v",
+				acId, transactionId, addrStr, drainErr)
+			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+				"session-control-task-rebind")
+			return common.ErrACSessionControlNotReady
+		}
+		// Activation is durable, but this connection remains ineligible until its
+		// success AAK has entered the authenticated remote transaction below.
+		acConn.sessionControlAuthorityReady.Store(false)
 	}
 
 	// Register the AC connection. Admission policy (pubkey-keyed
@@ -1962,7 +2070,12 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.acConnectionMapMutex.Lock()
 	existingConns := s.acConnectionMap[acId]
 
-	// #1157 F3 distinct-pubkey cap. Snapshot the existing pubkeys
+	// #1157 F3 distinct-pubkey cap. In cloud mode the durable target
+	// authority already performed the cross-process cap transition before this
+	// publication point. The legacy map-local verdict remains only for non-cloud
+	// deployments; applying it after durable activation could strand an ACTIVE
+	// target without publishing its connection.
+	// Snapshot the existing pubkeys
 	// under the existing mutex so the gate's kernel stays
 	// lock-free. The kernel handles the in-place re-registration
 	// case (same pubkey → no new slot consumed). See
@@ -1971,7 +2084,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// mode rejects before any state mutation.
 	existingPubkeys := extractPubkeysFromConns(existingConns)
 	capVerdict, distinctCount := verifyACPubkeyCap(acPubkeyBase64, existingPubkeys, MaxACConnsPerID)
-	capProceed, capRejectErr := s.applyACPubkeyCapVerdict(capVerdict, acId, acPubkeyBase64, distinctCount, transactionId, addrStr)
+	capProceed := true
+	var capRejectErr *common.Error
+	if !cloudMode {
+		capProceed, capRejectErr = s.applyACPubkeyCapVerdict(capVerdict, acId, acPubkeyBase64, distinctCount, transactionId, addrStr)
+	}
 	if !capProceed {
 		// TOCTOU re-check rejection: the pre-check above let us
 		// through but a concurrent registration to this acId pushed
@@ -2100,38 +2217,60 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		}
 		s.remoteConnectionMapMutex.Unlock()
 	}
-
-	// Include server's direct address so AC can establish direct connection.
-	// When AC connects through NLB, the AC's connected UDP socket only accepts
-	// packets from the NLB IP. By providing the server's direct address, the AC
-	// can create a new connection directly to the server for subsequent traffic.
-	serverAddr := fmt.Sprintf("%s:%d", s.localIp, s.listenAddr.Port)
-
-	aakMsg := &common.ServerACAckMsg{
-		ErrCode:      common.ErrSuccess.ErrorCode(),
-		ACAddr:       ppd.ConnData.RemoteAddr.String(),
-		Registered:   true, // This server is handling the AC
-		ServerAddr:   serverAddr,
-		ServerPubKey: s.device.PublicKeyBase64(),
-		Peers:        assignedPeers, // All assigned servers so AC connects to each one
+	if aakMd == nil {
+		var marshalErr error
+		aakMd, marshalErr = s.successfulACOnlineAckMsgData(ppd, aolMsg, assignedPeers)
+		if marshalErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK message: %v", acId, transactionId, addrStr, marshalErr)
+			s.metrics.IncrCounter(MetricACRegistrationFailure)
+			return marshalErr
+		}
 	}
-	aakBytes, marshalErr := json.Marshal(aakMsg)
-	if marshalErr != nil {
-		log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK message: %v", acId, transactionId, addrStr, marshalErr)
-		s.metrics.IncrCounter(MetricACRegistrationFailure)
-		return marshalErr
-	}
-	aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 
-	// Emit server-side AC registration metrics (issue #239).
-	// Counted here because the server's registration work (validation,
-	// assignment, peer list) is complete. If forwardToTransaction fails
-	// to deliver the AAK, the AC will re-register via its retry loop;
-	// the AC-side metrics capture that perspective independently.
+	if err := s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr); err != nil {
+		return err
+	}
+	if cloudMode {
+		// Finalize the durable AAK publication boundary before exposing the local
+		// connection. The per-target write gate remains held, so no AOP reader can
+		// pass between this exact target/directory CAS and publication.
+		aakEnqueuedAtMillis := time.Now().UnixMilli()
+		if aakEnqueuedAtMillis < activation.Target.PreparedAtMillis {
+			aakEnqueuedAtMillis = activation.Target.PreparedAtMillis
+		}
+		readiness := activation.Target.fence().readiness(activation.Snapshot, aakEnqueuedAtMillis, transactionId)
+		// Catch-up and network delivery intentionally consume the original AOL
+		// budget. Once a success AAK is enqueued, durable finalization gets one
+		// fresh bounded store budget while the owner and cell gates remain held;
+		// reusing an expired catch-up context would strand every retry unready.
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(targetCtx), DynamoDBOperationTimeout)
+		finalized, finalizeErr := s.sessionControlStore.FinalizeTargetReady(finalizeCtx, readiness)
+		finalizeCancel()
+		if finalizeErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] AAK enqueued but durable ready finalization failed: %v",
+				acId, transactionId, addrStr, finalizeErr)
+			s.removePublishedACSessionControlConnection(acId, acConn)
+			s.metrics.IncrCounter(MetricACRegistrationFailure)
+			return common.ErrACSessionControlNotReady
+		}
+		if finalized == nil || !sessionControlTargetFinalizedExact(*finalized, readiness) {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] durable ready finalization returned malformed authority",
+				acId, transactionId, addrStr)
+			s.removePublishedACSessionControlConnection(acId, acConn)
+			s.metrics.IncrCounter(MetricACRegistrationFailure)
+			return common.ErrACSessionControlNotReady
+		}
+		finalizedCopy := *finalized
+		acConn.sessionControlTarget.Store(&finalizedCopy)
+		acConn.sessionControlAuthorityReady.Store(true)
+	}
+
+	// Emit success only after the AAK has entered the authenticated remote
+	// transaction. An enqueue failure is not a completed registration even though
+	// its already-ACTIVE durable target intentionally remains retryable.
 	s.metrics.IncrCounter(MetricACRegistrationSuccess)
 	s.metrics.RecordLatency(MetricACRegistrationLatency, float64(time.Since(regStart).Milliseconds()))
-
-	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
+	return nil
 }
 
 // sendACOnlineRejectAAK marshals and forwards an AAK reject to the
@@ -2384,8 +2523,7 @@ func (s *UdpServer) autoAssignAC(
 
 	// Filter to same-ASG servers to prevent blue/green cross-color assignment.
 	// Must happen before selectServersForAssignment but after DiscoverServerInstances
-	// because the CloudMap cache is also used by HTTP forwarding where cross-color
-	// forwarding is legitimate during transitions.
+	// so an AC is never assigned across a blue/green color boundary.
 	var asgFailOpen bool
 	allServers, asgFailOpen = filterServersByASG(allServers, s.ASGName())
 	if asgFailOpen && s.metrics != nil {

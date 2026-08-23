@@ -45,7 +45,7 @@ import (
 // regression fence — if it fails again, the cross-server-forward capture broke.
 //
 // The table-driven variant below covers the entire forwardable knock family
-// (NHP_KNK, NHP_RKN, NHP_EXT) to ensure the conditional clone guard in
+// (NHP_KNK, NHP_RKN) to ensure the conditional clone guard in
 // decryptBody covers all types that reach BasePacketContent() via buildKnockAck.
 // DHP_KNK is excluded — it returns early at nhpauth.go:109 before line 220.
 func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
@@ -55,7 +55,6 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 	}{
 		{"NHP_KNK", core.NHP_KNK},
 		{"NHP_RKN", core.NHP_RKN},
-		{"NHP_EXT", core.NHP_EXT},
 	}
 
 	for _, tc := range knockTypes {
@@ -69,7 +68,7 @@ func testForwardOriginalPacketForType(t *testing.T, headerType int) {
 	t.Helper()
 
 	if headerType == core.NHP_RKN {
-		t.Skip("NHP_RKN requires the cookie header-digest machinery (CookieStore or stateless cookie params) to construct a valid packet; the bytes.Clone guard tested here is the same code path for all three knock types — NHP_KNK and NHP_EXT cover it")
+		t.Skip("NHP_RKN requires cookie-bound configuration (CookieStore or stateless cookie params) to construct a valid packet; the bytes.Clone guard is covered by the NHP_KNK path")
 	}
 
 	// Two servers sharing one registration keypair — the production

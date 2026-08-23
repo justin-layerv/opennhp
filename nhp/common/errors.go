@@ -269,6 +269,15 @@ var (
 	// internal value-shape sentinel [ErrInvalidAgentKnockRunID] maps here at the
 	// direct and forwarded server boundaries.
 	ErrKnockRunIDInvalid = newError("52025", "registered-agent knock runId is missing or invalid")
+	// ErrKnockRunAttemptInvalid rejects a registered-agent knock that cannot be
+	// ordered within its authenticated RunID retry cycle. AC high-watermarks use
+	// the positive ordinal to reject delayed attempts after a newer retry.
+	ErrKnockRunAttemptInvalid = newError("52026", "registered-agent knock runAttempt is missing or invalid")
+	// ErrHTTPAccessOperationUnsupported is the hard-cut response for the retired
+	// internal HTTP pinhole-opening path. HTTP remains a transport for sealed NHP
+	// packets and durable control-plane operations, not an admission protocol.
+	ErrHTTPAccessOperationUnsupported = newError("52027", "HTTP access admission is not supported; use authenticated NHP")
+	ErrACSessionControlNotReady       = newError("52028", "AC session-control boot flush is not ready")
 
 	// server: agent registration (52100+). Reject vocabulary for NHP-native
 	// agent self-registration (NHP_OTP / NHP_REG / NHP_RAK). Reserved as its
@@ -387,7 +396,8 @@ var (
 	// failure) so an oncall reading artMsg.ErrCode gets the actual
 	// failure mode rather than being misdirected toward
 	// srcAddrs/dstAddrs validation. See PR #2209.
-	ErrACNilEntry = newError("53011", "ac HandleAccessControl called with nil entry (programmer error)")
+	ErrACNilEntry                  = newError("53011", "ac HandleAccessControl called with nil entry (programmer error)")
+	ErrACSessionControlLeaseClosed = newError("53012", "ac session-control lease is closed")
 
 	// api
 	ErrHttpRequestFailed           = newError("54001", "http request failed")

@@ -46,12 +46,21 @@ on:
         type: choice
         options:
           - deploy      # Deploy new image to standby, switch traffic
+          - prepare-only # Deploy and verify standby without moving a listener
           - rollback    # Switch traffic back to previous color
           - switch-only # Just switch traffic (no image update)
       image_tag:
         description: 'Image tag to deploy (required for deploy action)'
         required: false
         type: string
+      protocol_profile:
+        description: 'Application-operation profile carried by image_tag'
+        required: false
+        default: legacy-aop-v1
+        type: choice
+        options:
+          - legacy-aop-v1
+          - durable-aop-v1
       cell_id:
         description: 'Cell identifier for deploy-window markers and AC assignment cleanup'
         required: false
@@ -261,6 +270,9 @@ jobs:
       deploy_server: ${{ steps.reconcile.outputs.deploy_server }}
       deploy_ac: ${{ steps.reconcile.outputs.deploy_ac }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -537,7 +549,10 @@ jobs:
           STANDBY_HEALTH_TIMEOUT_MINUTES: ${{ inputs.standby_health_timeout_minutes }}
           PRE_SWITCH_KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.pre_switch_knock_ready_timeout_minutes }}
           POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.post_switch_knock_ready_timeout_minutes }}
+          PROTOCOL_PROFILE: ${{ inputs.protocol_profile }}
+          INFRA_ENVIRONMENT_NAME: ${{ env.INFRA_ENVIRONMENT }}
         run: |
+          set -euo pipefail
           # Validate timeout bounds. Env var names are upper-case of their
           # workflow input names so ::error:: messages can lower-case and
           # tell a dispatcher exactly which input to fix. Boot-budget
@@ -560,9 +575,9 @@ jobs:
           # convergence cost fits inside 3 min but not 2. See PR #1726.
           check_bounds POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 3 30
 
-          if [[ "$ACTION" == "deploy" ]]; then
+          if [[ "$ACTION" == "deploy" || "$ACTION" == "prepare-only" ]]; then
             if [[ -z "$IMAGE_TAG" ]]; then
-              echo "::error::image_tag is required for deploy action"
+              echo "::error::image_tag is required for $ACTION action"
               exit 1
             fi
             # Server validation
@@ -598,6 +613,66 @@ jobs:
               fi
               echo "ac_target_image_tag=$AC_STANDBY_TAG" >> "$GITHUB_OUTPUT"
             fi
+          fi
+
+          FLOOR=$(bash scripts/ssm-read-optional.sh "/sandbox/nhp/minimum-protocol-profile")
+          FLOOR=${FLOOR:-legacy-aop-v1}
+          CUTOVER_STATE=$(bash scripts/ssm-read-optional.sh "/sandbox/nhp/cutovers/durable-aop-v1/state")
+          if [[ -n "$CUTOVER_STATE" ]]; then
+            CUTOVER_PHASE=$(jq -er '
+              select(type == "object" and .schema == 2 and
+                (.image | type == "string" and test("^[0-9a-f]{40}$")) and
+                .orchestrator_sha == .image and
+                (.lock_owner | type == "string" and length > 0)) |
+              .phase |
+              select(. == "prepared" or . == "ac_terminating" or . == "ponr" or . == "ac_switched" or
+                . == "cell0_switched" or . == "cell1_switched" or
+                . == "old_servers_terminated" or . == "validated" or . == "complete")
+            ' <<<"$CUTOVER_STATE") || {
+              echo "::error::Durable AOP cutover state is malformed; refusing a generic blue/green mutation"
+              exit 1
+            }
+            if [[ "$CUTOVER_PHASE" != "complete" ]]; then
+              echo "::error::Durable AOP cutover is in phase '$CUTOVER_PHASE'; only the dedicated forward-retry workflow may mutate the fleet"
+              exit 1
+            fi
+            if [[ "$FLOOR" != "durable-aop-v1" ]]; then
+              echo "::error::Durable AOP cutover claims complete before its irreversible profile marker"
+              exit 1
+            fi
+          fi
+
+          validate_target_profile() {
+            local component=$1 color=$2 image_tag=$3 target_profile=$PROTOCOL_PROFILE
+            local record_param="/${INFRA_ENVIRONMENT_NAME}/nhp/${component}/${color}-protocol-profile"
+            if [[ "$ACTION" == "rollback" || "$ACTION" == "switch-only" ]]; then
+              local record
+              record=$(bash scripts/ssm-read-optional.sh "$record_param")
+              if [[ -z "$record" ]]; then
+                target_profile=legacy-aop-v1
+              else
+                target_profile=${record#v1|}
+                target_profile=${target_profile%%|*}
+                .github/scripts/nhp-profile-order.sh assert-record "$record" "$target_profile" "$image_tag"
+              fi
+            fi
+            .github/scripts/nhp-profile-order.sh assert-at-least "$target_profile" "$FLOOR"
+            target_order=$(.github/scripts/nhp-profile-order.sh order "$target_profile")
+            floor_order=$(.github/scripts/nhp-profile-order.sh order "$FLOOR")
+            if ((target_order > floor_order)) && [[ "$ACTION" != "prepare-only" ]]; then
+              echo "::error::A newer protocol profile may only be prewarmed here; the dedicated cutover workflow owns activation"
+              exit 1
+            fi
+            echo "$component target profile accepted: profile=$target_profile floor=$FLOOR image=$image_tag"
+          }
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            validate_target_profile server "${{ steps.server-state.outputs.standby_color }}" \
+              "$(grep '^server_target_image_tag=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2-)"
+          fi
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            validate_target_profile ac "${{ steps.ac-state.outputs.standby_color }}" \
+              "$(grep '^ac_target_image_tag=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2-)"
           fi
 
       - name: Summary
@@ -665,7 +740,7 @@ jobs:
   deploy-to-standby:
     name: Deploy to Standby
     needs: prepare
-    if: inputs.action == 'deploy'
+    if: inputs.action == 'deploy' || inputs.action == 'prepare-only'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     # Server and AC instance refreshes run in parallel when component=both.
@@ -748,7 +823,24 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[DRY RUN] Would update SSM parameter: $SSM_PARAM = $IMAGE_TAG"
           else
+            # Invalidate the prior success proof before changing desired state.
+            # A refresh failure after the image/profile writes must leave the
+            # manually-dispatchable durable cutover fail-closed.
+            PREPARED_ATTESTATION="/${ENVIRONMENT}/nhp/server/${STANDBY_COLOR}-prepared-slot-attestation"
+            DELETE_ERR=$(mktemp)
+            if ! aws ssm delete-parameter --name "$PREPARED_ATTESTATION" 2>"$DELETE_ERR"; then
+              if ! grep -q ParameterNotFound "$DELETE_ERR"; then
+                echo "::error::Failed to invalidate $PREPARED_ATTESTATION: $(cat "$DELETE_ERR")" >&2
+                rm -f "$DELETE_ERR"
+                exit 1
+              fi
+            fi
+            rm -f "$DELETE_ERR"
             aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
+            PROFILE_RECORD=$(./.github/scripts/nhp-profile-order.sh record "${{ inputs.protocol_profile }}" "$IMAGE_TAG")
+            aws ssm put-parameter \
+              --name "/${ENVIRONMENT}/nhp/server/${STANDBY_COLOR}-protocol-profile" \
+              --value "$PROFILE_RECORD" --type String --overwrite
           fi
 
       - name: "[Server] Prune Missing Standby Target Groups"
@@ -772,16 +864,25 @@ jobs:
           STANDBY_HEALTH_TIMEOUT_MINUTES: ${{ inputs.standby_health_timeout_minutes }}
         run: |
           set -euo pipefail
-          ACTIVE_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+          read -r ACTIVE_CAPACITY ACTIVE_MAX_SIZE <<<"$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ACTIVE_ASG" \
-            --query "AutoScalingGroups[0].DesiredCapacity" --output text)
-          echo "Server active ASG capacity: $ACTIVE_CAPACITY"
+            --query 'AutoScalingGroups[0].[DesiredCapacity,MaxSize]' --output text)"
+          if [[ ! "$ACTIVE_CAPACITY" =~ ^[1-9][0-9]*$ || ! "$ACTIVE_MAX_SIZE" =~ ^[1-9][0-9]*$ || "$ACTIVE_MAX_SIZE" -lt "$ACTIVE_CAPACITY" ]]; then
+            echo "::error::Server active ASG capacity is malformed: desired=$ACTIVE_CAPACITY max=$ACTIVE_MAX_SIZE"
+            exit 1
+          fi
+          echo "Server active ASG capacity: desired=$ACTIVE_CAPACITY max=$ACTIVE_MAX_SIZE"
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, desired=$ACTIVE_CAPACITY"
+            echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, max=$ACTIVE_MAX_SIZE, desired=$ACTIVE_CAPACITY"
           else
             aws autoscaling update-auto-scaling-group \
               --auto-scaling-group-name "$STANDBY_ASG" \
-              --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
+              --min-size "$ACTIVE_CAPACITY" --max-size "$ACTIVE_MAX_SIZE" \
+              --desired-capacity "$ACTIVE_CAPACITY"
+            # A one-time profile cut permanently suspends/zeros the legacy
+            # standby. Restore launch authority only after this run invalidated
+            # its old prepared proof and wrote the exact next image/profile.
+            aws autoscaling resume-processes --auto-scaling-group-name "$STANDBY_ASG"
 
             # Wait for the standby to actually reach capacity before the next
             # steps observe it.
@@ -887,7 +988,21 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[DRY RUN] Would update SSM parameter: $SSM_PARAM = $IMAGE_TAG"
           else
+            PREPARED_ATTESTATION="/${ENVIRONMENT}/nhp/ac/${STANDBY_COLOR}-prepared-slot-attestation"
+            DELETE_ERR=$(mktemp)
+            if ! aws ssm delete-parameter --name "$PREPARED_ATTESTATION" 2>"$DELETE_ERR"; then
+              if ! grep -q ParameterNotFound "$DELETE_ERR"; then
+                echo "::error::Failed to invalidate $PREPARED_ATTESTATION: $(cat "$DELETE_ERR")" >&2
+                rm -f "$DELETE_ERR"
+                exit 1
+              fi
+            fi
+            rm -f "$DELETE_ERR"
             aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
+            PROFILE_RECORD=$(./.github/scripts/nhp-profile-order.sh record "${{ inputs.protocol_profile }}" "$IMAGE_TAG")
+            aws ssm put-parameter \
+              --name "/${ENVIRONMENT}/nhp/ac/${STANDBY_COLOR}-protocol-profile" \
+              --value "$PROFILE_RECORD" --type String --overwrite
           fi
 
       - name: "[AC] Prune Missing Standby Target Groups"
@@ -907,16 +1022,22 @@ jobs:
           ACTIVE_ASG: ${{ needs.prepare.outputs.ac_active_asg }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          ACTIVE_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+          read -r ACTIVE_CAPACITY ACTIVE_MAX_SIZE <<<"$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ACTIVE_ASG" \
-            --query "AutoScalingGroups[0].DesiredCapacity" --output text)
-          echo "AC active ASG capacity: $ACTIVE_CAPACITY"
+            --query 'AutoScalingGroups[0].[DesiredCapacity,MaxSize]' --output text)"
+          if [[ ! "$ACTIVE_CAPACITY" =~ ^[1-9][0-9]*$ || ! "$ACTIVE_MAX_SIZE" =~ ^[1-9][0-9]*$ || "$ACTIVE_MAX_SIZE" -lt "$ACTIVE_CAPACITY" ]]; then
+            echo "::error::AC active ASG capacity is malformed: desired=$ACTIVE_CAPACITY max=$ACTIVE_MAX_SIZE"
+            exit 1
+          fi
+          echo "AC active ASG capacity: desired=$ACTIVE_CAPACITY max=$ACTIVE_MAX_SIZE"
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, desired=$ACTIVE_CAPACITY"
+            echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, max=$ACTIVE_MAX_SIZE, desired=$ACTIVE_CAPACITY"
           else
             aws autoscaling update-auto-scaling-group \
               --auto-scaling-group-name "$STANDBY_ASG" \
-              --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
+              --min-size "$ACTIVE_CAPACITY" --max-size "$ACTIVE_MAX_SIZE" \
+              --desired-capacity "$ACTIVE_CAPACITY"
+            aws autoscaling resume-processes --auto-scaling-group-name "$STANDBY_ASG"
           fi
 
       # ---- Parallel Instance Refresh ----
@@ -1089,6 +1210,44 @@ jobs:
           .github/scripts/verify-knock-ready.sh \
             "$SERVER_ACTIVE_ASG" "pre-switch" "$KNOCK_READY_TIMEOUT_MINUTES" "false"
 
+      - name: Record Exact Prepared Slot Attestations
+        if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
+          PROTOCOL_PROFILE: ${{ inputs.protocol_profile }}
+          SERVER_ENABLED: ${{ needs.prepare.outputs.deploy_server }}
+          SERVER_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          SERVER_IMAGE: ${{ needs.prepare.outputs.server_target_image_tag }}
+          SERVER_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          AC_ENABLED: ${{ needs.prepare.outputs.deploy_ac }}
+          AC_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          AC_IMAGE: ${{ needs.prepare.outputs.ac_target_image_tag }}
+          AC_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          SERVER_REPOSITORY: ${{ steps.server-image.outputs.repo_name }}
+          AC_REPOSITORY: ${{ steps.ac-image.outputs.repo_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          attest() {
+            local component=$1 color=$2 image=$3 asg=$4 repository=$5 provenance
+            local parameter="/${ENVIRONMENT}/nhp/${component}/${color}-prepared-slot-attestation"
+            local record
+            if [[ "$PROTOCOL_PROFILE" == durable-aop-v1 ]]; then
+              provenance=$(.github/scripts/verify-durable-aop-image-provenance.sh "$repository" "$image")
+              record="v2|${PROTOCOL_PROFILE}|${provenance#v1|}|${asg}"
+            else
+              record="v1|${PROTOCOL_PROFILE}|${image}|${asg}"
+            fi
+            aws ssm put-parameter --name "$parameter" --value "$record" --type String --overwrite
+            echo "Prepared-slot attestation published: $parameter"
+          }
+          if [[ "$SERVER_ENABLED" == true ]]; then
+            attest server "$SERVER_COLOR" "$SERVER_IMAGE" "$SERVER_ASG" "$SERVER_REPOSITORY"
+          fi
+          if [[ "$AC_ENABLED" == true ]]; then
+            attest ac "$AC_COLOR" "$AC_IMAGE" "$AC_ASG" "$AC_REPOSITORY"
+          fi
+
       - name: "[Server] Dry Run Notice"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true
         run: |
@@ -1108,7 +1267,7 @@ jobs:
   switch-traffic:
     name: Switch Traffic
     needs: [prepare, deploy-to-standby]
-    if: always() && needs.prepare.result == 'success' && (needs.deploy-to-standby.result == 'success' || needs.deploy-to-standby.result == 'skipped')
+    if: always() && inputs.action != 'prepare-only' && needs.prepare.result == 'success' && (needs.deploy-to-standby.result == 'success' || needs.deploy-to-standby.result == 'skipped')
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     timeout-minutes: 5
@@ -1153,22 +1312,12 @@ jobs:
         run: |
           ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" ac standby "$EXPECTED_TAG"
 
-      - name: "[Server] Switch NLB Listeners"
-        if: needs.prepare.outputs.deploy_server == 'true'
-        env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
-          ACTIVE_COLOR: ${{ needs.prepare.outputs.server_active_color }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
-          ACTION: ${{ inputs.action }}
-        run: |
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[DRY RUN] Would switch server traffic to $STANDBY_COLOR"
-            exit 0
-          fi
-          chmod +x .github/scripts/blue-green-switch.sh
-          .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" server
-
+      # AC becomes authoritative first. A server carrying durable session
+      # admission must never become live while the active AC fleet still lacks
+      # the matching exact-close/runtime teardown implementation. The new AC
+      # remains compatible with the still-active server during this short
+      # interval; the reconnect steps below bind it to the new server after the
+      # server listener moves.
       - name: "[AC] Switch NLB Listener"
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
@@ -1184,6 +1333,22 @@ jobs:
           fi
           chmod +x .github/scripts/blue-green-switch.sh
           .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" ac
+
+      - name: "[Server] Switch NLB Listeners"
+        if: needs.prepare.outputs.deploy_server == 'true'
+        env:
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          ACTIVE_COLOR: ${{ needs.prepare.outputs.server_active_color }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ENVIRONMENT: ${{ env.INFRA_ENVIRONMENT }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would switch server traffic to $STANDBY_COLOR"
+            exit 0
+          fi
+          chmod +x .github/scripts/blue-green-switch.sh
+          .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" server
 
       # Active-tag proof is deploy correctness, not optional post-switch smoke.
       # Keep it in switch-traffic so a dispatched blue/green run cannot report

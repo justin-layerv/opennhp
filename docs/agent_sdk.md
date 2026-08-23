@@ -32,33 +32,42 @@ OpenNHP provides sample SDK source code. The samples include methods that might 
 
 SDK Sample Source Code: ***opennhp/endpoints/agent/main/export.go***
 
-### 1.3 Registered-agent RunID contract
+### 1.3 Registered-agent session contract
 
 The registered-agent authentication service is selected by the exact
-`aspId` value `agent`. Its native UDP callers must own one RunID for each
-access lifecycle. A RunID is exactly 16 lowercase hexadecimal characters. The
-SDK validates the value but never generates or changes it; callers reuse the
-same value for the initial KNK, any cookie-triggered RKN, and the matching EXT.
+`aspId` value `agent`. Its native UDP callers must own one RunID and a positive
+run-attempt ordinal for each access lifecycle. A RunID is exactly 16 lowercase
+hexadecimal characters. The SDK validates these values but never generates or
+changes them; callers reuse both values for the initial KNK and any
+cookie-triggered RKN.
 
-Use the explicit RunID-bearing one-shot methods:
+Use the run-binding knock and receipt-retirement methods:
 
-- Go: `sdk.KnockResourceWithRunID` and `sdk.ExitResourceWithRunID`
-- C: `nhp_agent_knock_resource_with_run_id` and
-  `nhp_agent_exit_resource_with_run_id`
-- iOS/gomobile: `NhpAgentKnockResourceWithRunID` and
-  `NhpAgentExitResourceWithRunID`
+- Go: `sdk.KnockResourceWithRunBinding` and `sdk.RetireSession`
+- C: `nhp_agent_knock_resource_with_run_binding` and
+  `nhp_agent_retire_session`
+- iOS/gomobile: `NhpAgentKnockResourceWithRunBinding` and
+  `NhpAgentRetireSession`
 
-The legacy knock and exit methods carry no RunID and therefore fail closed for
-`aspId="agent"` (the knock result uses error code `52025`; exit returns
-`false`). The background resource loop also does not support registered-agent
-authentication: `AddResource`/`nhp_agent_add_resource`/
+A successful knock ACK contains the immutable session receipt (`cellId`,
+`sessId`, `sessIssuedAtMillis`, `runId`, and `runAttempt`). Pass that exact ACK
+to the retirement method with the original server endpoint. Retirement sends a
+receipt-shaped EXT to the server that issued the session and returns a dedicated
+close ACK; it never creates a one-second resource session.
+
+The legacy knock, runID-only knock, and resource-shaped exit methods lack the
+complete binding or receipt and therefore fail closed for `aspId="agent"`
+(missing RunID uses error code `52025`, missing/invalid runAttempt uses `52026`,
+and resource exit returns `false`). The background resource loop also does not
+support registered-agent authentication: `AddResource`/`nhp_agent_add_resource`/
 `NhpAgentAddResource` return `false`, and an `agent` entry in `resource.toml`
 causes agent startup to fail. Registered-agent integrations must use the
 one-shot methods so the application, rather than a periodic SDK loop, controls
 the lifecycle boundary.
 
 Maintainer contract: the released qurl-conformance agent-knock application-body
-vectors are the source of truth for the top-level `runId` field. The shared
+vectors are the source of truth for the top-level `runId` and `runAttempt`
+fields. The shared
 `AgentKnockMsg` decoder intentionally rejects duplicate `runId` fields plus
 case-folded/`run_id` aliases for every auth service before dispatch, while
 unrelated duplicate fields retain Go's historical last-value behavior. Keep

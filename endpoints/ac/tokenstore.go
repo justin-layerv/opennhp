@@ -2,6 +2,7 @@ package ac
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -31,9 +32,11 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // tracked in #1959.
 //
 // scheduledKeys tracks the L3-flush scheduler FlowKeys this entry has
-// successfully scheduled, populated by recordScheduledKey after a
-// Scheduler.Schedule succeeds. cancelAllScheduledFlows walks this set
-// directly instead of recomputing keys from SrcAddrs × DstAddrs ×
+// scheduled and the latest deadline submitted for each key. It is populated
+// before Scheduler.Schedule so sibling cleanup can preserve the exact deadline
+// even in the record-before-schedule admission window.
+// cancelAllScheduledFlows walks its keys directly instead of recomputing them
+// from SrcAddrs × DstAddrs ×
 // proto-variants — closes #2201 (multi-session races on shared
 // FlowKeys) and #2205 (NAT'd temp-access where kernel-observed IP
 // differs from AOL-declared IP) by making Cancel walk exactly what
@@ -89,6 +92,38 @@ type AccessEntry struct {
 	// the AC enforces; Deadline is carried for P4b indexing and is not an
 	// enforcement input until a later slice wires it.
 	ExpireTime time.Time
+	// NHPSessionId is the non-zero server-assigned base NHP session carried
+	// through AOP/ART/ACK. It is not the qURL application QurlSessionId. The AC
+	// indexes this value so an opnTime=0 AOP can tear down exactly the sessions
+	// selected by a bodyless, authenticated NHP_EXT.
+	NHPSessionId uint64 `json:"-"`
+	// NHPServerPublicKey is the canonical base64 Noise public key of the server
+	// that authenticated and sent the AOP. The base numeric identifier is scoped
+	// to this key so two servers independently choosing the same uint64 cannot
+	// close each other's AC entries.
+	NHPServerPublicKey string `json:"-"`
+	// NHPSessionOwnerId is the canonical per-process boot identity authenticated
+	// inside AOP/ART. Fleet members share the server Noise key, so this is the
+	// collision-isolation scope for the numeric session ID.
+	NHPSessionOwnerId string `json:"-"`
+	// NHPAgentPublicKey is the canonical authenticated NHP-Agent public key from
+	// the AOP Public Key field. Session teardown indexes use it instead of UserId
+	// or source address, neither of which is a cryptographic agent identity.
+	NHPAgentPublicKey string `json:"-"`
+	// NHPSessionIssuedAtMillis is the immutable server issuance time used to
+	// distinguish an exact logical session across delayed forwarding and retry.
+	NHPSessionIssuedAtMillis int64 `json:"-"`
+	// NHPRunID is the registered Connector's immutable knock/Login cycle ID.
+	// Repeating the same agent+RunID replaces a pre-ACK orphan; a fresh MBB cycle
+	// has a fresh RunID and remains a sibling.
+	NHPRunID      string `json:"-"`
+	NHPRunAttempt uint64 `json:"-"`
+	// sessionControlClosing is set before verified session-control teardown
+	// starts. The token and indexes remain present until every tracked kernel
+	// rule has been synchronously removed, so a retry can resume real work after
+	// a transient flusher error; token validation must nevertheless fail closed
+	// as soon as teardown begins.
+	sessionControlClosing atomic.Bool `json:"-"`
 
 	// qURL v2 keyed-identity revocation metadata (P4a), carried verbatim from
 	// the NHP-AOP (common.ServerACOpsMsg) onto the entry at admission. P4a only
@@ -114,7 +149,7 @@ type AccessEntry struct {
 	// these, switch to named ,omitempty tags rather than dropping json:"-".
 	QurlUserPublicKeyHash string `json:"-"`
 	ResourcePublicKeyHash string `json:"-"`
-	SessionId             string `json:"-"`
+	QurlSessionId         string `json:"-"`
 	AdmissionId           string `json:"-"`
 	RevocationEpoch       uint64 `json:"-"`
 	// Deadline is the signed-claim exp (unix seconds) carried from admission for
@@ -129,32 +164,61 @@ type AccessEntry struct {
 	// peer checks across cancels on different entries that share
 	// peers. recordScheduledKey + drainScheduledKeys take the write
 	// lock (Lock/Unlock); holdsScheduledKey takes RLock/RUnlock.
-	mu            sync.RWMutex         `json:"-"`
-	scheduledKeys map[FlowKey]struct{} `json:"-"`
+	mu            sync.RWMutex          `json:"-"`
+	scheduledKeys map[FlowKey]time.Time `json:"-"`
 }
 
-// recordScheduledKey adds key to the entry's tracked set. Idempotent:
-// re-Schedule of the same key (e.g. /refresh extension) is a no-op on
-// the tracking side; the scheduler's longest-wins semantics handle the
-// deadline side. Called by scheduleFlushIfEnabled BEFORE
-// Scheduler.Schedule (#2201 cross-entry race fix — see
-// scheduleFlushIfEnabled godoc for the rationale). On Schedule failure
-// (malformed FlowKey, breaker open, shutdown), the tracked key
-// remains; the next cancelAllScheduledFlows will issue Scheduler.Cancel
-// for a non-existent scheduler entry, which is idempotently a no-op.
-//
-// Production callers go through scheduleFlushIfEnabled. Tests call
-// this directly to stage the partial-completion state
+// inheritNHPSessionMetadata copies the immutable base-session identity used by
+// exact, agent, run, and all-session selection. PASS_PRE_ACCESS_IP creates
+// short-lived and derived AccessEntries for one logical parent session; those
+// records must remain in the same cleanup domain as the parent.
+func inheritNHPSessionMetadata(dst, parent *AccessEntry) {
+	if dst == nil || parent == nil {
+		return
+	}
+	dst.NHPSessionId = parent.NHPSessionId
+	dst.NHPServerPublicKey = parent.NHPServerPublicKey
+	dst.NHPSessionOwnerId = parent.NHPSessionOwnerId
+	dst.NHPAgentPublicKey = parent.NHPAgentPublicKey
+	dst.NHPSessionIssuedAtMillis = parent.NHPSessionIssuedAtMillis
+	dst.NHPRunID = parent.NHPRunID
+	dst.NHPRunAttempt = parent.NHPRunAttempt
+}
+
+func newTempAccessEntry(parent *AccessEntry, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) *AccessEntry {
+	entry := &AccessEntry{
+		User:     au,
+		SrcAddrs: srcAddrs,
+		DstAddrs: dstAddrs,
+		OpenTime: openTimeSec,
+	}
+	inheritNHPSessionMetadata(entry, parent)
+	return entry
+}
+
+// recordScheduledKey is the membership-only test seam. It is idempotent and
+// records a zero deadline; production callers use recordScheduledDeadline via
+// scheduleFlushIfEnabled. Tests call this directly to stage the partial-completion state
 // (record-done-but-Schedule-not-yet) that
 // TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace
 // uses to fence the cross-entry race.
 func (e *AccessEntry) recordScheduledKey(key FlowKey) {
+	e.recordScheduledDeadline(key, time.Time{})
+}
+
+// recordScheduledDeadline records key and the latest exact scheduler deadline
+// submitted by this entry. Tests that only need set membership use
+// recordScheduledKey; production scheduling uses this method.
+func (e *AccessEntry) recordScheduledDeadline(key FlowKey, deadline time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.scheduledKeys == nil {
-		e.scheduledKeys = make(map[FlowKey]struct{})
+		e.scheduledKeys = make(map[FlowKey]time.Time)
 	}
-	e.scheduledKeys[key] = struct{}{}
+	current, exists := e.scheduledKeys[key]
+	if !exists || current.IsZero() || deadline.After(current) {
+		e.scheduledKeys[key] = deadline
+	}
 }
 
 // holdsScheduledKey reports whether the entry currently has key in its
@@ -166,6 +230,16 @@ func (e *AccessEntry) holdsScheduledKey(key FlowKey) bool {
 	defer e.mu.RUnlock()
 	_, ok := e.scheduledKeys[key]
 	return ok
+}
+
+// scheduledDeadline returns the latest exact deadline recorded for key. A zero
+// deadline with ok=true denotes test-staged membership without a production
+// Schedule deadline.
+func (e *AccessEntry) scheduledDeadline(key FlowKey) (deadline time.Time, ok bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	deadline, ok = e.scheduledKeys[key]
+	return deadline, ok
 }
 
 // drainScheduledKeys returns the tracked set as a slice and resets the
@@ -189,6 +263,19 @@ func (e *AccessEntry) drainScheduledKeys() []FlowKey {
 	return keys
 }
 
+func (e *AccessEntry) snapshotScheduledKeys() []FlowKey {
+	if e == nil {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	keys := make([]FlowKey, 0, len(e.scheduledKeys))
+	for key := range e.scheduledKeys {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 // GetExpireTime implements the common.TokenEntry interface.
 func (e *AccessEntry) GetExpireTime() time.Time {
 	return e.ExpireTime
@@ -204,6 +291,7 @@ func (e *AccessEntry) GetExpireTime() time.Time {
 func (a *UdpAC) storeToken(token string, entry *AccessEntry) {
 	a.tokenStore.Store(token, entry)
 	a.revIndex.add(token, entry)
+	a.nhpSessions.add(token, entry)
 }
 
 // deleteToken removes token from tokenStore and the revocation index. Single
@@ -215,6 +303,7 @@ func (a *UdpAC) storeToken(token string, entry *AccessEntry) {
 func (a *UdpAC) deleteToken(token string, entry *AccessEntry) {
 	a.tokenStore.Delete(token)
 	a.revIndex.remove(token, entry)
+	a.nhpSessions.remove(token, entry)
 }
 
 // GenerateAccessToken creates a new access token for the given entry. The
@@ -393,7 +482,28 @@ func (a *UdpAC) emitOrCleanupPreMintedToken(artMsg *common.ACOpsResultMsg, token
 // security boundary, not the tokenStore retention.
 func (a *UdpAC) VerifyAccessToken(token string) *AccessEntry {
 	entry, found := a.tokenStore.Load(token)
-	if !found {
+	if !found || entry == nil || entry.sessionControlClosing.Load() {
+		return nil
+	}
+	if entry.NHPSessionId != 0 {
+		a.sessionControlFlushMu.Lock()
+		defer a.sessionControlFlushMu.Unlock()
+	}
+	return a.verifyAccessTokenCurrent(token, entry)
+}
+
+// verifyAccessTokenCurrent performs the current-token check and sliding expiry
+// update without acquiring sessionControlFlushMu. When it may validate an NHP
+// entry, the caller must hold sessionControlFlushMu; pointer equality prevents
+// VerifyAccessToken's legacy fast path from validating a replacement entry of
+// another class.
+func (a *UdpAC) verifyAccessTokenCurrent(token string, expected *AccessEntry) *AccessEntry {
+	entry, found := a.tokenStore.Load(token)
+	if !found || entry == nil || (expected != nil && entry != expected) || entry.sessionControlClosing.Load() {
+		return nil
+	}
+	if entry.NHPSessionId != 0 && (!a.sessionAdmissionReady() || a.nhpSessions == nil ||
+		!a.nhpSessions.containsExactToken(token, entry) || !a.nhpSessions.admitsSession(entry)) {
 		return nil
 	}
 	deadline := entry.absoluteTokenDeadline()

@@ -392,9 +392,8 @@ func (f *ServerForwarder) FanoutKnock(
 	}
 
 	// Native fanout counts duplicate AZ candidates on the raw assignment. This
-	// is a topology-drift signal: unlike the HTTP path's CloudMap-filtered
-	// count, the local failure cache below is stale by design and must not hide
-	// a duplicate-AZ assignment from rollout validation.
+	// is a topology-drift signal; the local failure cache below is stale by
+	// design and must not hide a duplicate-AZ assignment from rollout validation.
 	if duplicateAZBuckets := countDuplicateFanoutAZBuckets(assignment.AssignedServers, selfInternalIP); duplicateAZBuckets > 0 && f.deps != nil {
 		// Forwarder metrics are exposed as increment-only callbacks, so emit one
 		// sample per duplicate AZ bucket.
@@ -411,9 +410,6 @@ func (f *ServerForwarder) FanoutKnock(
 		// only because its selected peer is in the stale local failure cache.
 		// The selector prefers a non-failed peer within the AZ when one exists,
 		// but falls back to the failed peer if it is the AZ's only candidate.
-		// The HTTP fanout path intentionally uses CloudMap health instead; a
-		// CloudMap-unhealthy server is treated as absent rather than as a stale
-		// local-forward failure.
 		wg.Add(1)
 		go func(target ServerInfo) {
 			defer wg.Done()
@@ -559,6 +555,8 @@ func (f *ServerForwarder) forwardToServer(
 		UserAddr:                userAddr.String(),
 		TransactionId:           txID,
 		Timestamp:               time.Now().Unix(),
+		SessionId:               admissionResourceSessionID(admissionResource),
+		SessionIssuedAtNanos:    admissionResourceSessionIssuedAtNanos(admissionResource),
 		AdmissionRevocationData: nativeForwardAdmissionRevocationData(admissionResource),
 		ResolvedResourceData:    nativeForwardResolvedResourceData(admissionResource),
 	}
@@ -636,6 +634,20 @@ func (f *ServerForwarder) forwardToServer(
 	}
 }
 
+func admissionResourceSessionID(res *common.ResourceData) uint64 {
+	if res == nil {
+		return 0
+	}
+	return res.NHPSessionId
+}
+
+func admissionResourceSessionIssuedAtNanos(res *common.ResourceData) int64 {
+	if res == nil || res.NHPSessionIssuedAt.IsZero() {
+		return 0
+	}
+	return res.NHPSessionIssuedAt.UnixNano()
+}
+
 // Keep the copy, presence check, and overlay below in lockstep with
 // common.ForwardAdmissionRevocationData and stampQurlV2RevocationMetadata.
 func nativeForwardAdmissionRevocationData(res *common.ResourceData) *common.ForwardAdmissionRevocationData {
@@ -645,7 +657,7 @@ func nativeForwardAdmissionRevocationData(res *common.ResourceData) *common.Forw
 	data := &common.ForwardAdmissionRevocationData{
 		QurlUserPublicKeyHash: res.QurlUserPublicKeyHash,
 		ResourcePublicKeyHash: res.ResourcePublicKeyHash,
-		SessionId:             res.SessionId,
+		QurlSessionId:         res.QurlSessionId,
 		AdmissionId:           res.AdmissionId,
 		Deadline:              res.Deadline,
 	}
@@ -660,7 +672,7 @@ func hasForwardAdmissionRevocationData(data *common.ForwardAdmissionRevocationDa
 	// present, but a hash by itself is catalog metadata. Do not emit or accept a
 	// hash-only sidecar; the receiver's local catalog hash remains authoritative.
 	return data != nil && (data.QurlUserPublicKeyHash != "" ||
-		data.SessionId != "" ||
+		data.QurlSessionId != "" ||
 		data.AdmissionId != "" ||
 		data.Deadline != 0)
 }
@@ -691,8 +703,8 @@ func forwardedACOperationResourceData(catalog *common.ResourceData, admission *c
 	if res.ResourcePublicKeyHash == "" && admission.ResourcePublicKeyHash != "" {
 		res.ResourcePublicKeyHash = admission.ResourcePublicKeyHash
 	}
-	if admission.SessionId != "" {
-		res.SessionId = admission.SessionId
+	if admission.QurlSessionId != "" {
+		res.QurlSessionId = admission.QurlSessionId
 	}
 	if admission.AdmissionId != "" {
 		res.AdmissionId = admission.AdmissionId
@@ -728,6 +740,7 @@ func nativeForwardResolvedResourceData(res *common.ResourceData) *common.Forward
 		ResourceId:            res.ResourceId,
 		OpenTime:              res.OpenTime,
 		Resources:             cloneResourceInfoMap(res.Resources),
+		ResourcePublicKeyB64:  res.ResourcePublicKeyB64,
 		ResourcePublicKeyHash: res.ResourcePublicKeyHash,
 	}
 }
@@ -760,6 +773,7 @@ func forwardedResolvedResourceData(
 			OpenTime:      route.OpenTime,
 			Resources:     cloneResourceInfoMap(route.Resources),
 		},
+		ResourcePublicKeyB64:  route.ResourcePublicKeyB64,
 		ResourcePublicKeyHash: route.ResourcePublicKeyHash,
 	}
 	info := qurlplacement.OnlyResourceInfo(res)
@@ -815,14 +829,14 @@ func (f *ServerForwarder) HandleForwardRequest(
 	timeDiff := time.Since(msgTime)
 	if timeDiff > MaxTimestampAge {
 		log.Warning("Rejecting stale NHP_FWD from %s (timestamp %v, age %v)", fwdMsg.SourceServer, msgTime, timeDiff)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "STALE_TIMESTAMP", "Message too old")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "STALE_TIMESTAMP", "Message too old")
 		return
 	}
 	// Reject messages with future timestamps (clock skew tolerance: 5 seconds)
 	const maxFutureSkew = 5 * time.Second
 	if timeDiff < -maxFutureSkew {
 		log.Warning("Rejecting future NHP_FWD from %s (timestamp %v, skew %v)", fwdMsg.SourceServer, msgTime, -timeDiff)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "FUTURE_TIMESTAMP", "Message timestamp in future")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "FUTURE_TIMESTAMP", "Message timestamp in future")
 		return
 	}
 
@@ -830,7 +844,7 @@ func (f *ServerForwarder) HandleForwardRequest(
 	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
 	if err != nil {
 		log.Error("Invalid user address in NHP_FWD: %s", fwdMsg.UserAddr)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_USER_ADDR", err.Error())
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_USER_ADDR", err.Error())
 		return
 	}
 
@@ -841,7 +855,7 @@ func (f *ServerForwarder) HandleForwardRequest(
 	knockPpd, err := f.decryptForwardedKnock(fwdMsg.KnockData, userAddr)
 	if err != nil {
 		log.Error("Failed to decrypt forwarded knock from %s: %v", fwdMsg.SourceServer, err)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "DECRYPT_FAILED", err.Error())
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "DECRYPT_FAILED", err.Error())
 		return
 	}
 
@@ -862,22 +876,44 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		// parse failures before auth-service policy.
 		if errors.Is(err, common.ErrInvalidAgentKnockRunID) {
 			log.Warning("Rejected forwarded knock with malformed runId: tx=%d", fwdMsg.TransactionId)
-			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_RUN_ID", common.ErrKnockRunIDInvalid.Error())
+			f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_RUN_ID", common.ErrKnockRunIDInvalid.Error())
 			return
 		}
 		log.Error("Failed to parse forwarded knock message: %v", err)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "PARSE_FAILED", err.Error())
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "PARSE_FAILED", err.Error())
 		return
 	}
+	// The forwarding server is authenticated by NHP_FWD; the inner agent KNK
+	// cannot supply this value because the NHP-Server assigns it. Reuse the
+	// origin's session across every peer AOP rather than allocating divergent
+	// per-AZ sessions for one access request.
+	knkMsg.NHPSessionId = fwdMsg.SessionId
+	if knkMsg.NHPSessionId == 0 {
+		log.Warning("Rejected forwarded knock with missing NHP session id: tx=%d", fwdMsg.TransactionId)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_SESSION_ID", common.ErrACOperationFailed.Error())
+		return
+	}
+	if fwdMsg.SessionIssuedAtNanos <= 0 {
+		log.Warning("Rejected forwarded knock with missing NHP session issuance time: tx=%d", fwdMsg.TransactionId)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_SESSION_ISSUED_AT", common.ErrACOperationFailed.Error())
+		return
+	}
+	knkMsg.NHPSessionIssuedAt = time.Unix(0, fwdMsg.SessionIssuedAtNanos)
 	// Mirror buildKnockAck's native registered-agent boundary on the server
 	// that decrypts and executes a forwarded UDP knock. This must precede
 	// authenticated-pubkey, ASP/catalog, placement, and AC work; otherwise the
 	// forwarded path could mint an empty stored binding while the local path
 	// rejects the same packet.
 	if err := validateRegisteredAgentKnockRunID(knkMsg); err != nil {
-		log.Warning("Rejected forwarded registered-agent knock with missing or invalid runId: tx=%d resource=%s",
+		resultCode := "INVALID_RUN_ID"
+		resultErr := common.ErrKnockRunIDInvalid
+		if errors.Is(err, common.ErrKnockRunAttemptInvalid) {
+			resultCode = "INVALID_RUN_ATTEMPT"
+			resultErr = common.ErrKnockRunAttemptInvalid
+		}
+		log.Warning("Rejected forwarded registered-agent knock with missing or invalid retry binding: tx=%d resource=%s",
 			fwdMsg.TransactionId, knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_RUN_ID", common.ErrKnockRunIDInvalid.Error())
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, resultCode, resultErr.Error())
 		return
 	}
 
@@ -890,7 +926,26 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		// placement.
 		log.Error("Forwarded knock missing authenticated RemotePubKey: tx=%d resource=%s authSvc=%s",
 			fwdMsg.TransactionId, knkMsg.ResourceId, knkMsg.AuthServiceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_AGENT_PUBKEY", "Forwarded knock missing authenticated agent public key")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_AGENT_PUBKEY", "Forwarded knock missing authenticated agent public key")
+		return
+	}
+	knkMsg.NHPAgentPublicKey = agentPubKey
+	sessionDeps, ok := f.deps.(forwardedNHPSessionDeps)
+	if !ok {
+		log.Error("Forwarded knock receiver has no NHP session reservation authority: tx=%d", fwdMsg.TransactionId)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "SESSION_REGISTRY_UNAVAILABLE", common.ErrACOperationFailed.Error())
+		return
+	}
+	// Verify the origin's durable reservation immediately after reconstructing
+	// the authenticated session tuple. Rejection must precede catalog, placement,
+	// protected-resource, local-registry, and AC work.
+	verifyCtx, verifyCancel := context.WithTimeout(f.deps.LifecycleCtx(), DefaultStorageTimeout)
+	verifiedReceipt, verifyErr := sessionDeps.VerifyForwardedDurableNHPSession(verifyCtx, knkMsg)
+	verifyCancel()
+	if verifyErr != nil {
+		log.Warning("Rejected forwarded knock without durable NHP session authority: tx=%d session=%d err=%v",
+			fwdMsg.TransactionId, knkMsg.NHPSessionId, verifyErr)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_SESSION_AUTHORITY", common.ErrACOperationFailed.Error())
 		return
 	}
 	placementIdentity := qurlplacement.Identity{
@@ -909,7 +964,7 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		fmt.Sprintf("forward-receiver tx=%d resource=%s authSvc=%s", fwdMsg.TransactionId, knkMsg.ResourceId, knkMsg.AuthServiceId))
 	if aspData == nil {
 		log.Error("Auth service provider not found for forwarded knock: %s", knkMsg.AuthServiceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "ASP_NOT_FOUND", "Auth service provider not found")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "ASP_NOT_FOUND", "Auth service provider not found")
 		return
 	}
 
@@ -922,7 +977,7 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		resData, routeErr = forwardedResolvedResourceData(fwdMsg.ResolvedResourceData, fwdMsg.AdmissionRevocationData, knkMsg)
 		if routeErr != nil {
 			log.Error("Resource not found for forwarded knock: %s (origin routing unusable: %v)", knkMsg.ResourceId, routeErr)
-			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_NOT_FOUND", "Resource not found")
+			f.sendForwardFailure(ppd, fwdMsg.TransactionId, "RESOURCE_NOT_FOUND", "Resource not found")
 			return
 		}
 		f.deps.IncrForwarderMetric(MetricForwardResolvedResourceFallback)
@@ -933,13 +988,18 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	resInfo := qurlplacement.OnlyResourceInfo(resData)
 	if resInfo == nil || resInfo.Addr == nil {
 		log.Error("Resource info not found for forwarded knock: %s", knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_INFO_NOT_FOUND", "Resource info not found")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "RESOURCE_INFO_NOT_FOUND", "Resource info not found")
 		return
 	}
 	resourceHost := resInfo.DestHost()
 	if resourceHost == "" {
 		log.Error("Resource info incomplete for forwarded knock: %s", knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_INFO_INCOMPLETE", "Resource info missing usable destination host")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "RESOURCE_INFO_INCOMPLETE", "Resource info missing usable destination host")
+		return
+	}
+	if bindErr := bindRegisteredAgentProtectedResource(knkMsg, resData); bindErr != nil {
+		log.Warning("Rejected forwarded protected resource binding: tx=%d resource=%s err=%v", fwdMsg.TransactionId, knkMsg.ResourceId, bindErr)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_PROTECTED_RESOURCE", common.ErrResourceNotFound.Error())
 		return
 	}
 
@@ -949,7 +1009,7 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	if acConns == nil || len(acConns) == 0 {
 		log.Warning("No AC connection found for forwarded knock (resource=%s, authSvc=%s)",
 			knkMsg.ResourceId, knkMsg.AuthServiceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "AC_NOT_CONNECTED", "AC not connected to this server")
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "AC_NOT_CONNECTED", "AC not connected to this server")
 		return
 	}
 
@@ -972,8 +1032,7 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// knockPpd wire HeaderType. This is what makes it safe to skip
 	// the Knock HeaderType gate here (see knock_headertype_gate.go
 	// scope section). If you ever add a branch that consults
-	// HeaderType to alter openTime (e.g., porting the
-	// "NHP_EXT ⇒ openTime=1" short-circuit from the local path),
+	// HeaderType to alter openTime,
 	// you MUST re-apply verifyKnockHeaderType +
 	// applyKnockHeaderTypeVerdict against
 	// (knockPpd.HeaderType, knkMsg.HeaderType) —
@@ -982,6 +1041,18 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	if openTime == 0 {
 		openTime = 60 // Default open time
 	}
+	sessionExpiresAt := knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
+	if reserveErr := sessionDeps.ReserveForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt, sessionExpiresAt); reserveErr != nil {
+		log.Warning("Rejected forwarded knock NHP session reservation: tx=%d session=%d err=%v", fwdMsg.TransactionId, knkMsg.NHPSessionId, reserveErr)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "INVALID_SESSION_RESERVATION", common.ErrACOperationFailed.Error())
+		return
+	}
+	sessionOpened := false
+	defer func() {
+		if !sessionOpened {
+			sessionDeps.ReleaseForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)
+		}
+	}()
 	acOperationResData, resourceHashMismatch := forwardedACOperationResourceData(resData, fwdMsg.AdmissionRevocationData)
 	if resourceHashMismatch.mismatch {
 		f.deps.IncrForwarderMetric(MetricForwardAdmissionResourceHashMismatch)
@@ -1011,14 +1082,11 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	//
 	// DELIBERATELY the bare broadcast, NOT broadcastACOpenWithReknock: this is the
 	// UDP server-to-server forward RECEIVER, whose caller is a forwarding server
-	// bounded by the 2s ForwardTimeout (this file, NOT msghandler's unrelated 10s
-	// DefaultForwardTimeout). A reknock
+	// bounded by the 2s ForwardTimeout. A reknock
 	// retry adds ~one AC-open transaction timeout + backoff (~1.8s) on top of the
-	// first, so its ~3.3s worst case lands well after the forwarder has already given
-	// up at 2s — there is no in-flight forwarded transaction left to rescue, unlike
-	// the HTTP internal-knock receiver (handleHttpOpenResource), where qurl-service is
-	// still waiting its 7s knock timeout, so THAT path does wrap. The client recovers
-	// via its next re-knock against the by-then-settled topology (the first AOP already
+	// first, so its ~3.3s worst case lands well after the forwarder has already
+	// given up at 2s — there is no in-flight forwarded transaction left to rescue.
+	// The client recovers via its next re-knock against the by-then-settled topology (the first AOP already
 	// wrote the pinhole idempotently if the AC applied it); wrapping here would only
 	// burn a held goroutine per forwarded timeout during exactly the broad-flip window
 	// forwarding peaks in. If ForwardTimeout is ever raised past the reknock worst
@@ -1032,21 +1100,27 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 			errCode = artMsg.ErrCode
 			errMsg = artMsg.ErrMsg
 		}
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, errCode, errMsg)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, errCode, errMsg)
 		return
 	}
 
 	// Check if AC returned an error in the result message (even if no Go error)
 	if artMsg != nil && !common.IsSuccessErrCode(artMsg.ErrCode) {
 		log.Warning("AC returned error for forwarded knock: %s - %s", artMsg.ErrCode, artMsg.ErrMsg)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, artMsg.ErrCode, artMsg.ErrMsg)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, artMsg.ErrCode, artMsg.ErrMsg)
 		return
 	}
+	// The AC admitted the exact session. Retain it even if token publication or
+	// ACK serialization later fails so a concurrent/global EXT can still close
+	// the pinhole; natural expiry remains the final bound.
+	sessionOpened = true
 
 	// Step 6: Build ACK message to return to user
 	ackMsg := &common.ServerKnockAckMsg{
+		SessionId:        fwdMsg.SessionId,
 		ErrCode:          common.ErrSuccess.ErrorCode(),
 		AgentAddr:        userAddr.String(),
+		OpenTime:         openTime,
 		ResourceHost:     make(map[string]string),
 		ACTokens:         make(map[string]string),
 		PreAccessActions: make(map[string]*common.PreAccessInfo),
@@ -1061,7 +1135,7 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		// /nhp/internal/token/validate can resolve it. Route through
 		// PublishACKTokens so the empty-token guard, maps.Clone
 		// isolation, and the storeACToken chokepoint apply
-		// identically to the local UDP/HTTP knock paths.
+		// identically to the native UDP knock path.
 		//
 		// Resolve owner_id locally from the agent's pubkey (decrypted
 		// out of the inner knock packet by decryptForwardedKnock).
@@ -1086,22 +1160,45 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		)
 		if publishErr := f.deps.PublishACKTokens(f.deps.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
 			log.Error("Failed to persist ACK token metadata for forwarded knock: %v", publishErr)
-			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, common.ErrServerTokenPersistFailed.ErrorCode(), common.ErrServerTokenPersistFailed.Error())
+			sessionDeps.CompensateForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)
+			f.sendForwardFailure(ppd, fwdMsg.TransactionId, common.ErrServerTokenPersistFailed.ErrorCode(), common.ErrServerTokenPersistFailed.Error())
 			return
 		}
 	}
 
-	// Serialize ACK message
-	ackData, err := json.Marshal(ackMsg)
-	if err != nil {
-		log.Error("Failed to marshal ACK for forwarded knock: %v", err)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "MARSHAL_FAILED", err.Error())
+	// Serialize the ACK. The registered-agent receipt comes exclusively from
+	// the receiver's strong durable verification above; no NHP_FWD field or
+	// inner body can choose the cell. Generic knocks keep their legacy shape.
+	var ackData []byte
+	var marshalErr error
+	if knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		ackMsg.CellId = verifiedReceipt.CellID
+		ackMsg.SessionId = verifiedReceipt.SessionID
+		ackMsg.SessionIssuedAtMillis = verifiedReceipt.SessionIssuedAtMillis
+		ackMsg.RunID = verifiedReceipt.RunID
+		ackMsg.RunAttempt = verifiedReceipt.RunAttempt
+		ackData, marshalErr = common.MarshalRegisteredAgentKnockAckMsg(
+			ackMsg, knkMsg.RunID, knkMsg.RunAttempt, knkMsg.ResourceId,
+		)
+	} else {
+		ackData, marshalErr = json.Marshal(ackMsg)
+	}
+	if marshalErr != nil {
+		log.Error("Failed to marshal ACK for forwarded knock: %v", marshalErr)
+		sessionDeps.CompensateForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)
+		f.sendForwardFailure(ppd, fwdMsg.TransactionId, "MARSHAL_FAILED", marshalErr.Error())
 		return
 	}
 
-	// Step 7: Send success result with ACK data
+	// Step 7: Send success result with ACK data. A synchronous enqueue error is
+	// authoritative: the origin cannot receive a usable ACK, so close this exact
+	// local admission. Loss after a successful enqueue is not observable here and
+	// remains bounded by the retained session lifetime or a later global EXT.
 	log.Info("Successfully processed forwarded knock for user %s (resource=%s)", userAddr, knkMsg.ResourceId)
-	f.sendForwardResult(ppd, fwdMsg.TransactionId, true, ackData, "", "")
+	if sendErr := f.sendForwardResult(ppd, fwdMsg.TransactionId, true, ackData, "", ""); sendErr != nil {
+		log.Warning("failed to enqueue successful NHP_FRT for txID %d; compensating exact session: %v", fwdMsg.TransactionId, sendErr)
+		sessionDeps.CompensateForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)
+	}
 }
 
 // decryptForwardedKnock decrypts a knock packet that was forwarded from another server.
@@ -1182,7 +1279,9 @@ func (f *ServerForwarder) HandleForwardResult(
 	}
 }
 
-// sendForwardResult sends an NHP_FRT response.
+// sendForwardResult marshals and synchronously enqueues an NHP_FRT response.
+// A nil return means only that the server transport accepted the message; it
+// does not claim that the datagram reached the forwarding origin.
 func (f *ServerForwarder) sendForwardResult(
 	ppd *core.PacketParserData,
 	txID uint64,
@@ -1190,7 +1289,7 @@ func (f *ServerForwarder) sendForwardResult(
 	ackData []byte,
 	errCode string,
 	errMsg string,
-) {
+) error {
 	resultMsg := &common.ServerForwardResultMsg{
 		TransactionId: txID,
 		Success:       success,
@@ -1202,7 +1301,7 @@ func (f *ServerForwarder) sendForwardResult(
 	msgBytes, err := json.Marshal(resultMsg)
 	if err != nil {
 		log.Error("Failed to marshal NHP_FRT: %v", err)
-		return
+		return err
 	}
 
 	md := &core.MsgData{
@@ -1215,6 +1314,22 @@ func (f *ServerForwarder) sendForwardResult(
 
 	if err := f.deps.SendMessage(md); err != nil {
 		log.Warning("failed to send NHP_FRT for txID %d: %v", txID, err)
+		return err
+	}
+	return nil
+}
+
+// sendForwardFailure best-effort reports a forwarded-knock rejection. There is
+// no second transport available on this terminal error path, but send failures
+// remain operationally visible instead of being silently discarded.
+func (f *ServerForwarder) sendForwardFailure(
+	ppd *core.PacketParserData,
+	txID uint64,
+	errCode string,
+	errMsg string,
+) {
+	if err := f.sendForwardResult(ppd, txID, false, nil, errCode, errMsg); err != nil {
+		log.Warning("failed to enqueue NHP_FRT failure for txID %d code=%s: %v", txID, errCode, err)
 	}
 }
 

@@ -373,7 +373,7 @@ func TestHandlerPanicStackGateKeyDomainIsBounded(t *testing.T) {
 	s := newTestServerWithHandlerBudget(t, 1)
 
 	unknown := s.handlerPanicStackGateFor(-1)
-	for _, ht := range []int{-2, -9999, 1 << 20, 34, 99} {
+	for _, ht := range []int{-2, -9999, 1 << 20, 35, 99} {
 		if got := s.handlerPanicStackGateFor(ht); got != unknown {
 			t.Fatalf("header type %d got its own gate; out-of-registry values must fold to the shared unknown bucket", ht)
 		}

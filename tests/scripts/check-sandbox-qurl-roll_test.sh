@@ -192,6 +192,8 @@ run_lock_classifier_case true "lock classifier releases a read-only no-component
   deploy false success skipped skipped skipped skipped false false
 run_lock_classifier_case true "lock classifier releases a fully verified deploy" \
   deploy false success success success success success true true
+run_lock_classifier_case true "lock classifier releases successful prepare-only standby work" \
+  prepare-only false success success skipped skipped skipped true true
 run_lock_classifier_case false "lock classifier retains a deploy with skipped validation" \
   deploy false success success success skipped success true true
 run_lock_classifier_case false "lock classifier retains a deploy before scale-down convergence" \

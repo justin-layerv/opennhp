@@ -177,6 +177,12 @@ func (c *preCheckThreatCache) Clear(ip string) {
 	c.lru.Remove(ip)
 }
 
+// Count returns the current counter for ip. It is used by the real UDP receive
+// integration test to fence KPL's deliberate exclusion from the clear path.
+func (c *preCheckThreatCache) Count(ip string) (int32, bool) {
+	return c.lru.Get(ip)
+}
+
 // Len is the current entry count. Useful for tests asserting
 // cap behavior and for any future size-gauge metric.
 func (c *preCheckThreatCache) Len() int {

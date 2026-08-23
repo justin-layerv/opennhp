@@ -277,6 +277,12 @@ variable "l3_flush_dry_run" {
   default     = true
 }
 
+variable "l3_flush_real_mode_acknowledged" {
+  description = "Durable operator acknowledgement permitting a fresh AC process to boot directly with real L3 flushing. Keep false through dry-run soak; set true only together with enable_l3_flush_on_expiry=true and l3_flush_dry_run=false after rollout gates pass."
+  type        = bool
+  default     = false
+}
+
 variable "l3_flush_conntrack_backend" {
   description = "Conntrack teardown backend for FilterMode=IPTABLES L3 flush. `exec` preserves the fork+exec conntrack path; `netlink` opts into the direct ctnetlink backend and its event-index rollout gates. Ignored under FilterMode=EBPFXDP, where BpfFlusher owns conntrack teardown."
   type        = string

@@ -436,8 +436,9 @@ module "compute" {
   # registrations, so reading it rejects every registered agent's knock as
   # event="agent_unknown_pubkey". The other storage tables here are genuinely
   # cell-local runtime state and stay on this cell's dynamodb module.
-  dynamodb_agent_keys_table = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
-  dynamodb_ack_tokens_table = module.dynamodb.ack_tokens_table_name
+  dynamodb_agent_keys_table      = local.control_identity_agent_keys_table_name != "" ? local.control_identity_agent_keys_table_name : module.dynamodb.qurl_agent_keys_table_name
+  dynamodb_ack_tokens_table      = module.dynamodb.ack_tokens_table_name
+  dynamodb_session_control_table = module.dynamodb.session_control_table_name
 
   # IAM + KMS for the Control-mode agent-keys read path (empty in cell
   # compatibility mode, which emits no grant at all). The cell dynamodb

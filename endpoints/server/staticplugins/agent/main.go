@@ -156,8 +156,8 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 	// agent knows how long the IP rule will be open. The callback
 	// `handleNhpOpenResource` neither reads nor writes the field —
 	// it derives its own local `openTime` from `res.OpenTime` and
-	// `knkMsg.HeaderType` (see #2096 for the NHP_EXT exit-knock
-	// divergence). So we stamp it here for wire serialization.
+	// the resolved resource. Bodyless NHP_EXT is dispatched outside this
+	// callback. So we stamp it here for wire serialization.
 	//
 	// `ResourceHost` is NOT stamped here — the callback re-initializes
 	// that map and populates it from the per-resource AC ops, so any

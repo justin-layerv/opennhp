@@ -13,17 +13,20 @@ COMPUTE_BLUE_GREEN = ROOT / "terraform/modules/compute/blue_green.tf"
 
 
 class ComputeLifecycleContractTest(unittest.TestCase):
-    def test_asgs_preserve_operator_suspensions(self) -> None:
-        expected = "ignore_changes = [desired_capacity, min_size, suspended_processes]"
+    def test_asgs_preserve_cutover_capacity_and_suspensions(self) -> None:
+        expected = (
+            "ignore_changes = "
+            "[desired_capacity, min_size, max_size, suspended_processes]"
+        )
         self.assertEqual(
             COMPUTE_MAIN.read_text(encoding="utf-8").count(expected),
             1,
-            "the blue server ASG must leave suspended processes operator-owned",
+            "the blue server ASG must leave cutover capacity and suspensions operator-owned",
         )
         self.assertEqual(
             COMPUTE_BLUE_GREEN.read_text(encoding="utf-8").count(expected),
             1,
-            "the green server ASG must leave suspended processes operator-owned",
+            "the green server ASG must leave cutover capacity and suspensions operator-owned",
         )
 
     def test_nlb_replacement_is_scoped_to_server_vpc_change(self) -> None:

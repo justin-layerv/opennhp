@@ -13,5 +13,11 @@ func validateRegisteredAgentKnockRunID(knkMsg *common.AgentKnockMsg) error {
 	if knkMsg.AuthServiceId != common.RegisteredAgentAuthServiceID {
 		return nil
 	}
-	return common.ValidateAgentKnockRunID(knkMsg.RunID)
+	if err := common.ValidateAgentKnockRunID(knkMsg.RunID); err != nil {
+		return err
+	}
+	if knkMsg.RunAttempt == 0 {
+		return common.ErrKnockRunAttemptInvalid
+	}
+	return nil
 }

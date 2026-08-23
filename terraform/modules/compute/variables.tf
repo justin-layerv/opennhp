@@ -108,8 +108,13 @@ variable "min_capacity" {
 }
 
 variable "max_capacity" {
-  description = "Maximum ASG capacity"
+  description = "Maximum server ASG capacity per color. At most 40 keeps the two blue/green fleets at <=80 Cloud Map registrations, below the non-pageable 100-result discovery ceiling."
   type        = number
+
+  validation {
+    condition     = var.max_capacity >= 1 && var.max_capacity <= 40
+    error_message = "max_capacity must be between 1 and 40 so blue+green Cloud Map registrations retain at least 20 entries of headroom."
+  }
 }
 
 variable "vpc_id" {
@@ -448,6 +453,12 @@ variable "control_identity_home_region" {
 
 variable "dynamodb_ack_tokens_table" {
   description = "DynamoDB table name for short-lived ACK token metadata used by /nhp/internal/token/validate."
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_session_control_table" {
+  description = "DynamoDB table name for durable NHP session-control authority and recovery work."
   type        = string
   default     = null
 }

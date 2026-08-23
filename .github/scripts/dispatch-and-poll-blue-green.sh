@@ -27,6 +27,8 @@
 #   CELL_ID:                  Cell identifier to pass to blue-green-deploy.yml
 #                             for DeploymentWindow markers and AC assignment
 #                             cleanup (default: cell0).
+#   BLUE_GREEN_ACTION:         deploy (default) or prepare-only.
+#   PROTOCOL_PROFILE:          Declared image profile (default: legacy-aop-v1).
 #
 # Outputs (via GITHUB_OUTPUT, when set):
 #   run_id:   Numeric run ID of the dispatched workflow
@@ -50,6 +52,13 @@ ENVIRONMENT="$1"
 COMPONENT="$2"
 IMAGE_TAG="$3"
 CELL_ID="${CELL_ID:-cell0}"
+BLUE_GREEN_ACTION="${BLUE_GREEN_ACTION:-deploy}"
+PROTOCOL_PROFILE="${PROTOCOL_PROFILE:-legacy-aop-v1}"
+
+case "$BLUE_GREEN_ACTION" in
+  deploy|prepare-only) ;;
+  *) echo "::error::BLUE_GREEN_ACTION must be deploy or prepare-only" >&2; exit 2 ;;
+esac
 
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-2400}"  # 40 min default
@@ -65,6 +74,8 @@ echo "  environment: $ENVIRONMENT"
 echo "  component:   $COMPONENT"
 echo "  cell_id:     $CELL_ID"
 echo "  image_tag:   $IMAGE_TAG"
+echo "  action:      $BLUE_GREEN_ACTION"
+echo "  profile:     $PROTOCOL_PROFILE"
 echo "  timeout:     ${POLL_TIMEOUT}s"
 
 # --- Dispatch ---
@@ -91,8 +102,9 @@ gh workflow run blue-green-deploy.yml \
   --ref main \
   -f environment="$ENVIRONMENT" \
   -f component="$COMPONENT" \
-  -f action=deploy \
+  -f action="$BLUE_GREEN_ACTION" \
   -f image_tag="$IMAGE_TAG" \
+  -f protocol_profile="$PROTOCOL_PROFILE" \
   -f cell_id="$CELL_ID" \
   -f correlation_id="$CORRELATION_ID"
 

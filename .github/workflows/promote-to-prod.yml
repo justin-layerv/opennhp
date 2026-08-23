@@ -2372,7 +2372,7 @@ jobs:
   # =============================================================================
   deploy-server:
     name: Deploy NHP Server
-    needs: [manifest, preflight, terraform-plan, terraform-apply]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-ac]
     # When run_terraform=true a skipped terraform-apply (e.g., qurl-schema-
     # compat blocked it) must NOT release new binaries onto stale infra —
     # only honor a skipped apply when the operator explicitly opted out
@@ -2386,6 +2386,10 @@ jobs:
       (
         (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
+      (
+        (inputs.deploy_ac && needs.deploy-ac.result == 'success') ||
+        (!inputs.deploy_ac && needs.deploy-ac.result == 'skipped')
       ) &&
       inputs.deploy_server
     runs-on: ubuntu-latest
@@ -2487,13 +2491,10 @@ jobs:
   # push to running AC instances is intentionally not mirrored (the canary
   # below cycles AC, fresh instances pull from S3 on boot).
   #
-  # Sequenced AFTER deploy-server (not in parallel) so a server-deploy failure
-  # also blocks the plugin upload. Without that link, a failed server deploy
-  # would leave fresh plugins in s3://…/latest/ that no AC canary cycled
-  # against — and the next unscheduled ASG event (spot interruption, scale-
-  # out) would bring up an AC instance running unvalidated plugins. The
-  # ~30s of lost parallelism is cheap compared to that bucket-vs-running
-  # state asymmetry.
+  # Sequenced before deploy-ac so every refreshed AC boots with the exact
+  # plugin bytes validated by this release. deploy-server waits for deploy-ac:
+  # durable session authority must never become an admitting producer before
+  # the AC fleet can perform verified non-dry-run kernel teardown.
   deploy-traefik-plugins:
     name: Deploy Traefik Plugins
     # `manifest` is intentionally NOT in `needs:`: this job doesn't
@@ -2501,7 +2502,7 @@ jobs:
     # ordering wait. The other deploy-* jobs DO need manifest for
     # `effective_image_tag` etc.; this job's tag is the cross-repo
     # plugins SHA, captured locally below.
-    needs: [preflight, terraform-plan, terraform-apply, deploy-server]
+    needs: [preflight, terraform-plan, terraform-apply]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
@@ -2509,7 +2510,6 @@ jobs:
         (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
       ) &&
-      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       inputs.deploy_ac
     # Gated on `inputs.deploy_ac` (not a separate
     # `inputs.deploy_traefik_plugins` flag) by design: Traefik plugins
@@ -2960,10 +2960,8 @@ jobs:
   # =============================================================================
   deploy-ac:
     name: Deploy Access Controller
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-traefik-plugins]
     # Same terraform-apply rule as deploy-server (issue #1322). The
-    # deploy-server clause preserves the chained-deploy contract: AC can
-    # run when only AC was selected, but not when server failed mid-chain.
     # The deploy-traefik-plugins clause closes the silent-drift gap
     # SPECIFICALLY for the canary AC cycle initiated by THIS promote.
     # Unscheduled AC boots (spot interrupt, scale-out) after a
@@ -2983,8 +2981,7 @@ jobs:
         (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
       ) &&
-      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
-      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
+      needs.deploy-traefik-plugins.result == 'success' &&
       inputs.deploy_ac
     runs-on: ubuntu-latest
     timeout-minutes: 50

@@ -128,13 +128,17 @@ func TestDynamoDBACKTokenStore_StoreLoadRoundTripWithSDKClient(t *testing.T) {
 		config: DynamoDBConfig{AckTokensTable: tableName},
 	}
 	expire := time.Now().Add(60 * time.Second).UTC().Round(time.Nanosecond)
+	sessionExpire := expire.Add(-5 * time.Second)
 	entry := &ACTokenEntry{
-		User:       &common.AgentUser{},
-		ResourceId: "resource-sdk",
-		KnockSrcIP: "203.0.113.16",
-		RunID:      "run-sdk",
-		OpenTime:   55,
-		ExpireTime: expire,
+		User:                &common.AgentUser{},
+		ResourceId:          "q_catalog-sdk",
+		ProtectedResourceId: "public-resource-sdk",
+		KnockSrcIP:          "203.0.113.16",
+		RunID:               "run-sdk",
+		SessionId:           0x0123456789abcdef,
+		OpenTime:            55,
+		SessionExpireTime:   sessionExpire,
+		ExpireTime:          expire,
 	}
 
 	if err := storage.StoreACToken(context.Background(), rawToken, entry); err != nil {
@@ -150,7 +154,7 @@ func TestDynamoDBACKTokenStore_StoreLoadRoundTripWithSDKClient(t *testing.T) {
 	if got.User == nil {
 		t.Fatal("LoadACToken User=nil, want non-nil empty user")
 	}
-	if got.ResourceId != entry.ResourceId || got.KnockSrcIP != entry.KnockSrcIP || got.RunID != entry.RunID || got.OpenTime != entry.OpenTime || !got.ExpireTime.Equal(expire) {
+	if got.ResourceId != entry.ResourceId || got.ProtectedResourceId != entry.ProtectedResourceId || got.KnockSrcIP != entry.KnockSrcIP || got.RunID != entry.RunID || got.SessionId != entry.SessionId || got.OpenTime != entry.OpenTime || !got.SessionExpireTime.Equal(sessionExpire) || !got.ExpireTime.Equal(expire) {
 		t.Fatalf("LoadACToken entry = %+v, want fields from %+v", got, entry)
 	}
 }
@@ -191,13 +195,17 @@ func TestPublishACKTokens_PreservesRunIDInSharedAndLocalStores(t *testing.T) {
 		metrics:       metrics.NewPublisherForTest(t),
 	}
 	knkMsg := &common.AgentKnockMsg{
-		UserId:        "agent-1",
-		AuthServiceId: common.RegisteredAgentAuthServiceID,
-		ResourceId:    "resource-1",
-		RunID:         wantRunID,
+		UserId:              "agent-1",
+		AuthServiceId:       common.RegisteredAgentAuthServiceID,
+		ResourceId:          "resource-1",
+		ProtectedResourceId: testProtectedResourceID,
+		RunID:               wantRunID,
+		NHPSessionId:        1,
+		NHPSessionIssuedAt:  time.Now(),
 	}
 	ackMsg := &common.ServerKnockAckMsg{
-		ACTokens: map[string]string{"resource-1": "ac-token"},
+		SessionId: 1,
+		ACTokens:  map[string]string{"resource-1": "ac-token"},
 	}
 
 	if err := s.PublishACKTokens(context.Background(), knkMsg, ackMsg, "203.0.113.44", 60, "owner-1"); err != nil {
@@ -228,8 +236,9 @@ func TestPublishACKTokens_SharedStoreFailureFailsClosed(t *testing.T) {
 		ackTokenStore: shared,
 		metrics:       metrics.NewPublisherForTest(t),
 	}
-	knkMsg := &common.AgentKnockMsg{UserId: "user-1"}
+	knkMsg := &common.AgentKnockMsg{UserId: "user-1", ResourceId: "public-resource", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
 	ackMsg := &common.ServerKnockAckMsg{
+		SessionId: 1,
 		ACTokens: map[string]string{
 			"resource-1": "ac-token",
 			"resource-2": "ac-token-2",
@@ -271,8 +280,9 @@ func TestPublishACKTokens_SharedStoreSecondWriteFailureStillFailsClosed(t *testi
 		ackTokenStore: shared,
 		metrics:       metrics.NewPublisherForTest(t),
 	}
-	knkMsg := &common.AgentKnockMsg{UserId: "user-1"}
+	knkMsg := &common.AgentKnockMsg{UserId: "user-1", ResourceId: "public-resource", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
 	ackMsg := &common.ServerKnockAckMsg{
+		SessionId: 1,
 		ACTokens: map[string]string{
 			"resource-1": "ac-token",
 			"resource-2": "ac-token-2",

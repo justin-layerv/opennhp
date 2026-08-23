@@ -70,7 +70,7 @@ func TestNativeForwardAdmissionRevocationData_MetadataOnly(t *testing.T) {
 		RedirectUrl:           "https://origin.example/should-not-forward",
 		QurlUserPublicKeyHash: "qhash",
 		ResourcePublicKeyHash: "verified-rhash",
-		SessionId:             "sess-live",
+		QurlSessionId:         "sess-live",
 		AdmissionId:           "adm-123",
 		Deadline:              1781910300,
 		RedirectWithParams:    true,
@@ -94,7 +94,7 @@ func TestNativeForwardAdmissionRevocationData_MetadataOnly(t *testing.T) {
 	}
 	if got.QurlUserPublicKeyHash != "qhash" ||
 		got.ResourcePublicKeyHash != "verified-rhash" ||
-		got.SessionId != "sess-live" ||
+		got.QurlSessionId != "sess-live" ||
 		got.AdmissionId != "adm-123" ||
 		got.Deadline != 1781910300 {
 		t.Fatalf("forward metadata = %+v, want only qURL v2 revocation fields", got)
@@ -152,7 +152,7 @@ func TestForwardAdmissionRevocationData_FieldSetMatchesStampedMetadata(t *testin
 	overlay, resourceHashMismatch := forwardedACOperationResourceData(&common.ResourceData{}, &common.ForwardAdmissionRevocationData{
 		QurlUserPublicKeyHash: "qhash",
 		ResourcePublicKeyHash: "rhash",
-		SessionId:             "sess-live",
+		QurlSessionId:         "sess-live",
 		AdmissionId:           "adm-123",
 		Deadline:              1781910300,
 	})
@@ -164,7 +164,7 @@ func TestForwardAdmissionRevocationData_FieldSetMatchesStampedMetadata(t *testin
 
 	if aop.QurlUserPublicKeyHash != "qhash" ||
 		aop.ResourcePublicKeyHash != "rhash" ||
-		aop.SessionId != "sess-live" ||
+		aop.QurlSessionId != "sess-live" ||
 		aop.AdmissionId != "adm-123" ||
 		aop.Deadline != 1781910300 ||
 		aop.RevocationEpoch != 0 {
@@ -331,7 +331,7 @@ func TestForwardedACOperationResourceData_OverlaysAdmissionMetadata(t *testing.T
 	admission := &common.ForwardAdmissionRevocationData{
 		ResourcePublicKeyHash: "verified-rhash",
 		QurlUserPublicKeyHash: "qhash",
-		SessionId:             "sess-live",
+		QurlSessionId:         "sess-live",
 		AdmissionId:           "adm-123",
 		Deadline:              1781910300,
 	}
@@ -379,7 +379,7 @@ func TestForwardedACOperationResourceData_OverlaysAdmissionMetadata(t *testing.T
 	}
 	if got.QurlUserPublicKeyHash != "qhash" ||
 		got.ResourcePublicKeyHash != "catalog-rhash" ||
-		got.SessionId != "sess-live" ||
+		got.QurlSessionId != "sess-live" ||
 		got.AdmissionId != "adm-123" ||
 		got.Deadline != 1781910300 {
 		t.Fatalf("admission metadata was not overlaid: %+v", got)
@@ -396,7 +396,7 @@ func TestForwardedACOperationResourceData_OverlaysAdmissionMetadata(t *testing.T
 	}
 }
 
-func TestNativeForwardResolvedResourceData_RoutingOnly(t *testing.T) {
+func TestNativeForwardResolvedResourceData_RoutingAndProtectedSubjectOnly(t *testing.T) {
 	src := &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			AuthServiceId:     "qurl",
@@ -419,6 +419,7 @@ func TestNativeForwardResolvedResourceData_RoutingOnly(t *testing.T) {
 		SecretKey:             "must-not-cross",
 		ExInfo:                map[string]any{"jwt_secret": "must-not-cross"},
 		RedirectUrl:           "https://resource.example",
+		ResourcePublicKeyB64:  testProtectedResourceID,
 		ResourcePublicKeyHash: "rhash",
 		QurlUserPublicKeyHash: "qhash",
 		AdmissionId:           "adm-123",
@@ -428,8 +429,8 @@ func TestNativeForwardResolvedResourceData_RoutingOnly(t *testing.T) {
 	if got == nil {
 		t.Fatal("nativeForwardResolvedResourceData returned nil")
 	}
-	if got.AuthServiceId != "qurl" || got.ResourceId != "q_123456789ab" || got.OpenTime != 300 || got.ResourcePublicKeyHash != "rhash" {
-		t.Fatalf("resolved route = %+v, want routing scalars plus resource hash", got)
+	if got.AuthServiceId != "qurl" || got.ResourceId != "q_123456789ab" || got.OpenTime != 300 || got.ResourcePublicKeyB64 != testProtectedResourceID || got.ResourcePublicKeyHash != "rhash" {
+		t.Fatalf("resolved route = %+v, want routing scalars plus canonical public resource identity/hash", got)
 	}
 	if len(got.Resources) != 1 || got.Resources["ac-a"] == nil || got.Resources["ac-a"].Addr == nil {
 		t.Fatalf("resolved route resources not copied: %+v", got.Resources)
@@ -529,14 +530,16 @@ func TestHandleDecryptedForwardedKnock_CarriesAdmissionMetadata(t *testing.T) {
 		t.Fatalf("marshal knock: %v", err)
 	}
 	fwdMsg := &common.ServerForwardMsg{
-		SourceServer:  "srv-origin",
-		UserAddr:      "203.0.113.10:54321",
-		TransactionId: 77,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		SourceServer:         "srv-origin",
+		UserAddr:             "203.0.113.10:54321",
+		TransactionId:        77,
+		Timestamp:            time.Now().Unix(),
 		AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
 			QurlUserPublicKeyHash: "qhash",
 			ResourcePublicKeyHash: "verified-rhash",
-			SessionId:             "sess-live",
+			QurlSessionId:         "sess-live",
 			AdmissionId:           "adm-123",
 			Deadline:              1781910300,
 		},
@@ -564,7 +567,7 @@ func TestHandleDecryptedForwardedKnock_CarriesAdmissionMetadata(t *testing.T) {
 	}
 	if got.QurlUserPublicKeyHash != "qhash" ||
 		got.ResourcePublicKeyHash != "catalog-rhash" ||
-		got.SessionId != "sess-live" ||
+		got.QurlSessionId != "sess-live" ||
 		got.AdmissionId != "adm-123" ||
 		got.Deadline != 1781910300 {
 		t.Fatalf("forwarded admission metadata missing from AC operation ResourceData: %+v", got)
@@ -619,10 +622,12 @@ func TestHandleDecryptedForwardedKnock_UsesResolvedResourceFallbackForQurlV2(t *
 		t.Fatalf("marshal knock: %v", err)
 	}
 	fwdMsg := &common.ServerForwardMsg{
-		SourceServer:  "srv-origin",
-		UserAddr:      "203.0.113.10:54321",
-		TransactionId: 77,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		SourceServer:         "srv-origin",
+		UserAddr:             "203.0.113.10:54321",
+		TransactionId:        77,
+		Timestamp:            time.Now().Unix(),
 		AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
 			QurlUserPublicKeyHash: "qhash",
 			ResourcePublicKeyHash: resourceHash,
@@ -756,14 +761,16 @@ func TestHandleDecryptedForwardedKnock_ResourceHashMismatchMetricNegativeCases(t
 			forwarder := NewServerForwarder(deps)
 
 			fwdMsg := &common.ServerForwardMsg{
-				SourceServer:  "srv-origin",
-				UserAddr:      "203.0.113.10:54321",
-				TransactionId: 77,
-				Timestamp:     time.Now().Unix(),
+				SessionId:            1,
+				SessionIssuedAtNanos: time.Now().UnixNano(),
+				SourceServer:         "srv-origin",
+				UserAddr:             "203.0.113.10:54321",
+				TransactionId:        77,
+				Timestamp:            time.Now().Unix(),
 				AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
 					QurlUserPublicKeyHash: "qhash",
 					ResourcePublicKeyHash: tc.admissionHash,
-					SessionId:             "sess-live",
+					QurlSessionId:         "sess-live",
 					AdmissionId:           "adm-123",
 					Deadline:              1781910300,
 				},
@@ -1366,7 +1373,7 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 				},
 				QurlUserPublicKeyHash: "qhash",
 				ResourcePublicKeyHash: "verified-rhash",
-				SessionId:             "sess-live",
+				QurlSessionId:         "sess-live",
 				AdmissionId:           "adm-123",
 				Deadline:              1781910300,
 			},
@@ -1389,7 +1396,7 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 		}
 		if got.QurlUserPublicKeyHash != "qhash" ||
 			got.ResourcePublicKeyHash != "verified-rhash" ||
-			got.SessionId != "sess-live" ||
+			got.QurlSessionId != "sess-live" ||
 			got.AdmissionId != "adm-123" ||
 			got.Deadline != 1781910300 {
 			t.Fatalf("forward admission revocation data = %+v, want origin admission metadata", got)
@@ -1872,7 +1879,7 @@ func TestFanoutKnock_CarriesAdmissionRevocationData(t *testing.T) {
 			},
 			QurlUserPublicKeyHash: "qhash",
 			ResourcePublicKeyHash: "verified-rhash",
-			SessionId:             "sess-live",
+			QurlSessionId:         "sess-live",
 			AdmissionId:           "adm-123",
 			Deadline:              1781910300,
 		},
@@ -1896,7 +1903,7 @@ func TestFanoutKnock_CarriesAdmissionRevocationData(t *testing.T) {
 		}
 		if got.QurlUserPublicKeyHash != "qhash" ||
 			got.ResourcePublicKeyHash != "verified-rhash" ||
-			got.SessionId != "sess-live" ||
+			got.QurlSessionId != "sess-live" ||
 			got.AdmissionId != "adm-123" ||
 			got.Deadline != 1781910300 {
 			t.Fatalf("fanout admission revocation data = %+v, want origin admission metadata", got)
@@ -1977,11 +1984,13 @@ func TestHandleForwardRequest_StaleTimestamp(t *testing.T) {
 
 	// Create message with old timestamp
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock"),
-		SourceServer:  "srv-source",
-		UserAddr:      "1.2.3.4:12345",
-		TransactionId: 1234,
-		Timestamp:     time.Now().Add(-MaxTimestampAge - time.Minute).Unix(), // Very old
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock"),
+		SourceServer:         "srv-source",
+		UserAddr:             "1.2.3.4:12345",
+		TransactionId:        1234,
+		Timestamp:            time.Now().Add(-MaxTimestampAge - time.Minute).Unix(), // Very old
 	}
 
 	// Should reject with stale timestamp error
@@ -2020,11 +2029,13 @@ func TestHandleForwardRequest_FutureTimestamp(t *testing.T) {
 
 	// Create message with future timestamp (beyond clock skew tolerance)
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock"),
-		SourceServer:  "srv-source",
-		UserAddr:      "1.2.3.4:12345",
-		TransactionId: 1234,
-		Timestamp:     time.Now().Add(10 * time.Second).Unix(), // Too far in future
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock"),
+		SourceServer:         "srv-source",
+		UserAddr:             "1.2.3.4:12345",
+		TransactionId:        1234,
+		Timestamp:            time.Now().Add(10 * time.Second).Unix(), // Too far in future
 	}
 
 	go forwarder.HandleForwardRequest(nil, fwdMsg)
@@ -2057,11 +2068,13 @@ func TestHandleForwardRequest_ValidTimestamp_WithinSkew(t *testing.T) {
 
 	// Create message with timestamp slightly in future (within 5s tolerance)
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock"),
-		SourceServer:  "srv-source",
-		UserAddr:      "1.2.3.4:12345",
-		TransactionId: 1234,
-		Timestamp:     time.Now().Add(3 * time.Second).Unix(), // Within tolerance
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock"),
+		SourceServer:         "srv-source",
+		UserAddr:             "1.2.3.4:12345",
+		TransactionId:        1234,
+		Timestamp:            time.Now().Add(3 * time.Second).Unix(), // Within tolerance
 	}
 
 	go forwarder.HandleForwardRequest(nil, fwdMsg)
@@ -2093,11 +2106,13 @@ func TestHandleForwardRequest_InvalidUserAddr(t *testing.T) {
 
 	// Create message with invalid user address
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock"),
-		SourceServer:  "srv-source",
-		UserAddr:      "not-a-valid-address", // Invalid
-		TransactionId: 1234,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock"),
+		SourceServer:         "srv-source",
+		UserAddr:             "not-a-valid-address", // Invalid
+		TransactionId:        1234,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	go forwarder.HandleForwardRequest(nil, fwdMsg)
@@ -2150,16 +2165,19 @@ func TestHandleDecryptedForwardedKnock_RejectsEmptyResourceHost(t *testing.T) {
 		AuthServiceId: "agent",
 		ResourceId:    "qurl-tunnel-server",
 		RunID:         "0123456789abcdef",
+		RunAttempt:    1,
 	}
 	body, err := json.Marshal(knockMsg)
 	if err != nil {
 		t.Fatalf("marshal knock: %v", err)
 	}
 	fwdMsg := &common.ServerForwardMsg{
-		SourceServer:  "srv-source",
-		UserAddr:      "1.2.3.4:12345",
-		TransactionId: 1234,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		SourceServer:         "srv-source",
+		UserAddr:             "1.2.3.4:12345",
+		TransactionId:        1234,
+		Timestamp:            time.Now().Unix(),
 	}
 	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
 	if err != nil {
@@ -2198,7 +2216,7 @@ func TestHandleDecryptedForwardedKnock_RejectsMissingRegisteredAgentRunIDBeforeD
 	if err != nil {
 		t.Fatalf("marshal knock: %v", err)
 	}
-	fwdMsg := &common.ServerForwardMsg{TransactionId: 9876}
+	fwdMsg := &common.ServerForwardMsg{SessionId: 1, SessionIssuedAtNanos: time.Now().UnixNano(), TransactionId: 9876}
 	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}, &core.PacketParserData{
 		BodyMessage:  body,
 		RemotePubKey: make([]byte, 32),
@@ -2227,7 +2245,7 @@ func TestHandleDecryptedForwardedKnock_RejectsMissingRegisteredAgentRunIDBeforeD
 func TestHandleDecryptedForwardedKnock_RejectsMalformedRegisteredAgentRunIDWithStableError(t *testing.T) {
 	mockDeps := NewMockForwarderDeps()
 	forwarder := NewServerForwarder(mockDeps)
-	fwdMsg := &common.ServerForwardMsg{TransactionId: 9877}
+	fwdMsg := &common.ServerForwardMsg{SessionId: 1, SessionIssuedAtNanos: time.Now().UnixNano(), TransactionId: 9877}
 	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}, &core.PacketParserData{
 		BodyMessage:  []byte(`{"headerType":1,"usrId":"malformed-run-id","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789ABCDEF"}`),
 		RemotePubKey: make([]byte, 32),

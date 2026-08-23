@@ -46,7 +46,7 @@ func newHopVerifyingServer(t *testing.T, require bool, trustedPeers ...string) (
 	for _, p := range trustedPeers {
 		discovered = append(discovered, ServerInfo{PubKey: p})
 	}
-	hs := newForwardingTestServer(NewMemoryStorage())
+	hs := newInternalKnockTestServer()
 	hs.udpServer.device = bDevice
 	hs.forwardHopRequire = require
 	hs.fleetTrust = newFleetTrustAnchor(
@@ -78,6 +78,7 @@ func TestHandleInternalKnock_HopStrict_ValidAttestationProceeds(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("valid attestation should proceed, got %d: %s", w.Code, w.Body.String())
 	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 }
 
 // TestHandleInternalKnock_HopStrict_MissingRejected: strict mode rejects a
@@ -110,6 +111,7 @@ func TestHandleInternalKnock_HopPermit_MissingAllowed(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("permit missing attestation should proceed, got %d: %s", w.Code, w.Body.String())
 	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 	if counts[MetricForwardHopAttestPermit] != 1 {
 		t.Fatalf("expected one ForwardHopAttestPermit, got %d", counts[MetricForwardHopAttestPermit])
 	}
@@ -134,6 +136,7 @@ func TestHandleInternalKnock_HopAPIOriginNoAttestation(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("API origin without attestation should proceed, got %d: %s", w.Code, w.Body.String())
 	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 	if counts[MetricForwardHopAttestPermit] != 0 || counts[MetricForwardHopAttestReject] != 0 {
 		t.Fatalf("API origin should not emit permit/reject, got %+v", counts)
 	}
@@ -262,6 +265,7 @@ func TestHandleInternalKnock_HopPermit_InvalidAllowed(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("permit-mode invalid attestation should proceed, got %d: %s", w.Code, w.Body.String())
 	}
+	assertRetiredHTTPAdmissionResponse(t, w.Code, w.Body.Bytes())
 	if counts[MetricForwardHopAttestPermit] != 1 {
 		t.Fatalf("want one ForwardHopAttestPermit, got %d", counts[MetricForwardHopAttestPermit])
 	}
@@ -270,93 +274,44 @@ func TestHandleInternalKnock_HopPermit_InvalidAllowed(t *testing.T) {
 	}
 }
 
-// TestHandleInternalKnock_HopSenderCeilingGuard: a valid attestation already
-// at the hop ceiling, carried on an API origin (Source="api", so Forwarded
-// stays false), must NOT start an onward forward — the sender-side
-// forwardHopFromContext < maxForwardHops guard in handleHttpOpenResource
-// refuses to emit a forward the next server would 403. Asserted by the
-// forwarder's storage never being consulted.
-func TestHandleInternalKnock_HopSenderCeilingGuard(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	a := hopEcdh(t, 1)
-	hs, b := newHopVerifyingServer(t, false, a.PublicKeyBase64())
-	storage, ok := hs.httpForwarder.storage.(*MemoryStorage)
-	if !ok {
-		t.Fatalf("expected *MemoryStorage, got %T", hs.httpForwarder.storage)
-	}
-
-	fwdReq := buildKnockRequest(SourceAPI)
-	// Ceiling-hop attestation, bound to Source="api" (what this knock carries).
-	att, err := buildForwardHopAttestation(a, a.PublicKeyBase64(), b.PublicKeyBase64(), maxForwardHops, time.Now(), SourceAPI, fwdReq.Request)
-	if err != nil {
-		t.Fatalf("build attestation: %v", err)
-	}
-	fwdReq.Attestation = att
-
-	w := callHandleInternalKnock(t, hs, fwdReq)
-	if w.Code != http.StatusOK {
-		t.Fatalf("valid ceiling-hop knock should be processed (not forwarded), got %d: %s", w.Code, w.Body.String())
-	}
-	if n := storage.GetCallCount("GetACAssignment"); n != 0 {
-		t.Fatalf("sender at the hop ceiling must not start a forward, but GetACAssignment was called %d time(s)", n)
-	}
-}
-
-// TestInitForwardHopAttestation guards the Start()-time wiring: a regression
-// that dropped either side would silently disable the security gate (flat
-// metrics, no error). Cloud mode must wire BOTH the sender (forwarder signing)
-// and the receiver (trust anchor); no device must disable both.
+// TestInitForwardHopAttestation guards the receiver trust anchor retained for
+// rolling overlap with historical forwarding servers.
 func TestInitForwardHopAttestation(t *testing.T) {
 	dev := core.NewDevice(core.NHP_SERVER, hopKey(100), nil)
 	if dev == nil {
 		t.Fatal("core.NewDevice returned nil")
 	}
-	newHS := func(us *UdpServer) *HttpServer {
-		return &HttpServer{
-			udpServer:     us,
-			httpForwarder: NewHttpKnockForwarder(NewMemoryStorage(), nil, "10.0.0.1", 8888, nil, nil),
-		}
-	}
 
-	t.Run("cloud mode wires both sides", func(t *testing.T) {
+	t.Run("cloud mode wires receiver", func(t *testing.T) {
 		// A zero-value *CloudMapClient is enough — initForwardHopAttestation
 		// only takes a method value off it (DiscoverServerInstances), never
 		// calls it.
 		us := &UdpServer{device: dev, cloudMap: &CloudMapClient{}}
-		hs := newHS(us)
+		hs := &HttpServer{udpServer: us}
 		hs.initForwardHopAttestation(us)
 		if hs.fleetTrust == nil {
 			t.Error("receiver trust anchor not wired in cloud mode")
-		}
-		if hs.httpForwarder.selfEcdh == nil {
-			t.Error("sender attestation signing not enabled in cloud mode")
 		}
 		if hs.hopVerifyEcdh() == nil {
 			t.Error("hopVerifyEcdh nil after cloud-mode wiring")
 		}
 	})
 
-	t.Run("no device disables both", func(t *testing.T) {
+	t.Run("no device disables receiver", func(t *testing.T) {
 		us := &UdpServer{cloudMap: &CloudMapClient{}} // device nil
-		hs := newHS(us)
+		hs := &HttpServer{udpServer: us}
 		hs.initForwardHopAttestation(us)
 		if hs.fleetTrust != nil {
 			t.Error("trust anchor must stay nil without a device keypair")
 		}
-		if hs.httpForwarder.selfEcdh != nil {
-			t.Error("sender signing must stay disabled without a device keypair")
-		}
 	})
 
-	t.Run("no cloudMap leaves receiver disabled but sender signs", func(t *testing.T) {
+	t.Run("no cloudMap leaves receiver disabled", func(t *testing.T) {
 		us := &UdpServer{device: dev} // cloudMap nil
-		hs := newHS(us)
+		hs := &HttpServer{udpServer: us}
 		hs.initForwardHopAttestation(us)
 		if hs.fleetTrust != nil {
 			t.Error("trust anchor must stay nil without Cloud Map")
-		}
-		if hs.httpForwarder.selfEcdh == nil {
-			t.Error("sender signing should still be enabled with a device keypair")
 		}
 		if hs.hopVerifyEcdh() != nil {
 			t.Error("hopVerifyEcdh must be nil when fleetTrust is unset")

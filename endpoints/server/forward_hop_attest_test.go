@@ -1,13 +1,40 @@
 package server
 
 import (
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/layervai/nhp/internalauth"
 )
+
+// buildForwardHopAttestation constructs historical sender envelopes so the
+// still-live receiver verifier remains interoperable during rollout overlap.
+func buildForwardHopAttestation(selfEcdh core.Ecdh, selfPubB64, peerPubB64 string, hop int, now time.Time, source string, req *common.HttpKnockRequest) (*ForwardHopAttestation, error) {
+	if selfEcdh == nil {
+		return nil, fmt.Errorf("forward hop attest: nil self ecdh")
+	}
+	peerPub, err := base64.StdEncoding.DecodeString(peerPubB64)
+	if err != nil {
+		return nil, err
+	}
+	macKey := forwardHopMACKey(selfEcdh.SharedSecret(peerPub))
+	if macKey == nil {
+		return nil, errForwardHopECDHFailed
+	}
+	ts := now.Unix()
+	return &ForwardHopAttestation{
+		SenderPubKey: selfPubB64,
+		Hop:          hop,
+		Timestamp:    ts,
+		MAC: internalauth.ComputeHMACHex(macKey,
+			forwardHopSigningString(selfPubB64, hop, ts, source, forwardHopReqBind(req))),
+	}, nil
+}
 
 // hopTestPeer is a server identity (ECDH keypair + base64 pubkey) used to
 // exercise the per-pair MAC binding.
@@ -264,17 +291,5 @@ func TestForwardHop_StageClassification(t *testing.T) {
 		if got := forwardHopStage(err); got != want {
 			t.Errorf("forwardHopStage(%v) = %q, want %q", err, got, want)
 		}
-	}
-}
-
-// TestForwardHop_ContextRoundTrip pins the hop-propagation helper used to
-// keep the counter monotonic across handler → forwarder.
-func TestForwardHop_ContextRoundTrip(t *testing.T) {
-	if got := forwardHopFromContext(nil); got != 0 {
-		t.Fatalf("nil ctx must yield hop 0, got %d", got)
-	}
-	ctx := contextWithForwardHop(t.Context(), 1)
-	if got := forwardHopFromContext(ctx); got != 1 {
-		t.Fatalf("hop round-trip: got %d, want 1", got)
 	}
 }

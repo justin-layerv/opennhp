@@ -2,6 +2,7 @@ package ac
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,6 +275,28 @@ func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn
 	return
 }
 
+// admitOpenAOPWithSessionControlFence serializes registered-agent admission
+// against a control-gap flush. If admission owns the fence first, the later
+// flush waits and then closes the newly admitted entry; if flush owns it first,
+// the post-flush lease check rejects admission until a current AAK arrives.
+func (a *UdpAC) admitOpenAOPWithSessionControlFence(dopMsg *common.ServerACOpsMsg, entry *AccessEntry, openTimeSec int, artMsgIn *common.ACOpsResultMsg) (*common.ACOpsResultMsg, error) {
+	a.sessionControlFlushMu.Lock()
+	defer a.sessionControlFlushMu.Unlock()
+	if !a.sessionAdmissionReady() {
+		return artMsgIn, common.ErrACSessionControlLeaseClosed
+	}
+	if dopMsg.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		if a.nhpSessions == nil || !a.nhpSessions.admitsSession(entry) {
+			return artMsgIn, common.ErrACSessionControlNotReady
+		}
+		generation := a.sessionFlushGeneration.Load()
+		if barrierErr := a.runAttemptBarriers().requireExact(dopMsg.AgentPublicKey, dopMsg.RunID, dopMsg.RunAttempt, generation); barrierErr != nil {
+			return artMsgIn, common.ErrACSessionControlNotReady
+		}
+	}
+	return a.admitAndIssueToken(entry, openTimeSec, artMsgIn)
+}
+
 // accessEntryFromAOP maps a decoded NHP-AOP message onto the AccessEntry the AC
 // admits. Pure (no receiver, no side effects) so the field mapping — including
 // the qURL v2 revocation metadata carried by P4a — is unit-testable without the
@@ -287,7 +310,7 @@ func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn
 // dopMsg would inject a non-authoritative value into the AC-side AgentUser and
 // break the field's "server-resolved-only" invariant. If the AC ever needs
 // OwnerId, extend the NHP-AOP wire to carry it from the resolved server state.
-func accessEntryFromAOP(dopMsg *common.ServerACOpsMsg) *AccessEntry {
+func accessEntryFromAOP(dopMsg *common.ServerACOpsMsg, serverPublicKey string) *AccessEntry {
 	return &AccessEntry{
 		User: &common.AgentUser{
 			UserId:         dopMsg.UserId,
@@ -295,16 +318,23 @@ func accessEntryFromAOP(dopMsg *common.ServerACOpsMsg) *AccessEntry {
 			OrganizationId: dopMsg.OrganizationId,
 			AuthServiceId:  dopMsg.AuthServiceId,
 		},
-		SrcAddrs: dopMsg.SourceAddrs,
-		DstAddrs: dopMsg.DestinationAddrs,
-		OpenTime: int(dopMsg.OpenTime),
+		SrcAddrs:                 dopMsg.SourceAddrs,
+		DstAddrs:                 dopMsg.DestinationAddrs,
+		OpenTime:                 int(dopMsg.OpenTime),
+		NHPSessionId:             dopMsg.SessionId,
+		NHPServerPublicKey:       serverPublicKey,
+		NHPSessionOwnerId:        dopMsg.SessionOwnerId,
+		NHPAgentPublicKey:        dopMsg.AgentPublicKey,
+		NHPSessionIssuedAtMillis: dopMsg.SessionIssuedAtMillis,
+		NHPRunID:                 dopMsg.RunID,
+		NHPRunAttempt:            dopMsg.RunAttempt,
 		// qURL v2 keyed-identity revocation metadata (P4a): stored verbatim from
 		// the AOP onto the access entry so P4b can index live flows for immediate
 		// revocation. Stored as received — NOT recomputed AC-side (see AccessEntry
 		// godoc). Zero-valued for legacy admissions, where the AOP omits them.
 		QurlUserPublicKeyHash: dopMsg.QurlUserPublicKeyHash,
 		ResourcePublicKeyHash: dopMsg.ResourcePublicKeyHash,
-		SessionId:             dopMsg.SessionId,
+		QurlSessionId:         dopMsg.QurlSessionId,
 		AdmissionId:           dopMsg.AdmissionId,
 		RevocationEpoch:       dopMsg.RevocationEpoch,
 		Deadline:              dopMsg.Deadline,
@@ -372,19 +402,69 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		return common.ErrACDuplicateTransaction
 	}
 
-	err = json.Unmarshal(ppd.BodyMessage, dopMsg)
+	err = common.DecodeServerACOpsMsg(ppd.BodyMessage, dopMsg)
 	if err != nil {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] failed to parse %s message: %v", acId, transactionId, core.HeaderTypeToString(ppd.HeaderType), err)
 		artMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
 		artMsg.ErrMsg = err.Error()
 		return
 	}
+	// The base NHP session identifier is server-assigned on KNK and must make
+	// the complete AOP -> ART -> ACK round trip unchanged. Echo it before any
+	// admission work so both success and structured-error ARTs remain
+	// correlatable; the server still rejects a missing or mismatched echo.
+	artMsg.SessionId = dopMsg.SessionId
+	artMsg.SessionOwnerId = dopMsg.SessionOwnerId
 
-	openTimeSec := int(dopMsg.OpenTime)
-	entry := accessEntryFromAOP(dopMsg)
-	artMsg, err = a.admitAndIssueToken(entry, openTimeSec, artMsg)
-	if err != nil {
-		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
+	if dopMsg.SessionId == 0 {
+		err = common.ErrACOperationFailed
+		artMsg.ErrCode = common.ErrACOperationFailed.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		log.Warning("ac(%s#%d)[HandleUdpACOperations] rejected AOP with missing NHP session id", acId, transactionId)
+	} else if dopMsg.OpenTime == 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), bootEnumerationDeadline)
+		a.sessionControlFlushMu.Lock()
+		var (
+			closed   int
+			closeErr error
+		)
+		if !a.sessionFlushComplete.Load() {
+			closeErr = errors.New("session-control close rejected while AC flush is incomplete")
+		} else {
+			closed, closeErr = a.closeNHPExactSessionWithFenceVerified(ctx, dopMsg.AgentPublicKey, dopMsg.SessionId, dopMsg.SessionIssuedAtMillis)
+		}
+		a.sessionControlFlushMu.Unlock()
+		cancel()
+		if closeErr != nil {
+			artMsg.ErrCode = common.ErrACOperationFailed.ErrorCode()
+			artMsg.ErrMsg = closeErr.Error()
+			log.Error("ac(%s#%d)[HandleUdpACOperations] exact NHP session close did not converge: %v", acId, transactionId, closeErr)
+		} else {
+			artMsg.ErrCode = common.ErrSuccess.ErrorCode()
+			artMsg.ErrMsg = common.ErrSuccess.Error()
+			log.Info("ac(%s#%d)[HandleUdpACOperations] closed exact NHP session %d entries=%d", acId, transactionId, dopMsg.SessionId, closed)
+		}
+	} else {
+		openTimeSec := int(dopMsg.OpenTime)
+		entry := accessEntryFromAOP(dopMsg, base64.StdEncoding.EncodeToString(ppd.RemotePubKey))
+		artMsg, err = a.admitOpenAOPWithSessionControlFence(dopMsg, entry, openTimeSec, artMsg)
+		if err != nil {
+			artMsg.ErrCode = common.ErrACOperationFailed.ErrorCode()
+			artMsg.ErrMsg = err.Error()
+			if errors.Is(err, common.ErrACSessionControlLeaseClosed) {
+				artMsg.ErrCode = common.ErrACSessionControlLeaseClosed.ErrorCode()
+				log.Warning("ac(%s#%d)[HandleUdpACOperations] registered-agent admission fenced: %v", acId, transactionId, err)
+			} else if errors.Is(err, common.ErrACSessionControlNotReady) {
+				artMsg.ErrCode = common.ErrACSessionControlNotReady.ErrorCode()
+				log.Warning("ac(%s#%d)[HandleUdpACOperations] registered-agent admission fenced: %v", acId, transactionId, err)
+			} else {
+				log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
+			}
+		}
+		// admitAndIssueToken may replace the result object; stamp the exact
+		// server-assigned identifier after it returns so ART cannot omit it.
+		artMsg.SessionId = dopMsg.SessionId
+		artMsg.SessionOwnerId = dopMsg.SessionOwnerId
 	}
 
 	// send ac result
@@ -510,6 +590,15 @@ func bareScopeKey(scope revocationScope, scopeKey string) (bare string, err erro
 // NHP_ARD/NHP_AOP precedent.
 func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
 	acId := a.config.ACId
+	sessionClosePresent, dispatchErr := common.ACSessionCloseKindPresent(ppd.BodyMessage)
+	if dispatchErr != nil {
+		log.Error("ac(%s)[HandleUdpACRevocation] failed to inspect NHP_REV message: %v", acId, dispatchErr)
+		a.incrMetric(MetricRevocationRejected)
+		return dispatchErr
+	}
+	if sessionClosePresent {
+		return a.handleUdpACSessionClose(ppd)
+	}
 
 	revMsg := &common.ACRevocationMsg{}
 	if err := json.Unmarshal(ppd.BodyMessage, revMsg); err != nil {
@@ -593,6 +682,103 @@ func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
 	a.sendRevocationAck(ppd, revMsg)
 
 	return nil
+}
+
+func (a *UdpAC) handleUdpACSessionClose(ppd *core.PacketParserData) error {
+	if ppd == nil || len(ppd.RemotePubKey) != core.PublicKeySize {
+		return common.ErrACMissingPeerPubkey
+	}
+	var closeMsg common.ACSessionCloseMsg
+	if err := common.DecodeACSessionCloseMsg(ppd.BodyMessage, &closeMsg); err != nil {
+		a.incrMetric(MetricRevocationRejected)
+		return err
+	}
+	a.sessionControlFlushMu.Lock()
+	defer a.sessionControlFlushMu.Unlock()
+	if !a.sessionFlushComplete.Load() {
+		return errors.New("session-control close rejected while AC flush is incomplete")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bootEnumerationDeadline)
+	defer cancel()
+	var (
+		closed   int
+		closeErr error
+	)
+	switch closeMsg.Scope {
+	case common.ACSessionCloseScopeExact:
+		closed, closeErr = a.closeNHPExactSessionWithFenceVerified(ctx, closeMsg.AgentPublicKey, closeMsg.SessionID, closeMsg.SessionIssuedAtMillis)
+	case common.ACSessionCloseScopeAgent:
+		if err := a.nhpSessions.beginAgentCloseCutoff(closeMsg.AgentPublicKey, closeMsg.IssuedThroughMillis); err != nil {
+			return err
+		}
+		closed, closeErr = a.closeNHPAgentSessionsThroughVerified(ctx, closeMsg.AgentPublicKey, closeMsg.IssuedThroughMillis)
+		if closeErr == nil {
+			closeErr = a.nhpSessions.commitAgentCloseCutoff(closeMsg.AgentPublicKey, closeMsg.IssuedThroughMillis)
+		}
+	case common.ACSessionCloseScopeRun:
+		flushGeneration := a.sessionFlushGeneration.Load()
+		barriers := a.runAttemptBarriers()
+		if err := barriers.record(closeMsg.AgentPublicKey, closeMsg.RunID, closeMsg.RunAttempt, flushGeneration); err != nil {
+			return err
+		}
+		closed, closeErr = a.closeNHPRunBeforeAttemptVerified(ctx, closeMsg.AgentPublicKey, closeMsg.RunID, closeMsg.RunAttempt)
+		if closeErr == nil {
+			closeErr = barriers.commit(closeMsg.AgentPublicKey, closeMsg.RunID, closeMsg.RunAttempt, flushGeneration)
+		}
+	default:
+		return ErrRevocationUnsupportedScope
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return a.sendSessionControlAck(ppd, &closeMsg, uint64(closed))
+}
+
+func (a *UdpAC) sendSessionControlAck(ppd *core.PacketParserData, closeMsg *common.ACSessionCloseMsg, closed uint64) error {
+	if a == nil || a.device == nil || ppd == nil || ppd.ConnData == nil ||
+		len(ppd.RemotePubKey) != core.PublicKeySize || closeMsg == nil {
+		return errors.New("session-control acknowledgement envelope is incomplete")
+	}
+	if !common.ValidNHPACBootID(a.bootID) || a.sessionFlushGeneration.Load() == 0 ||
+		!a.sessionFlushComplete.Load() {
+		return errors.New("session-control acknowledgement target is not ready")
+	}
+	ack := common.ACSessionCloseAckMsg{
+		Kind:                  closeMsg.Kind,
+		Scope:                 closeMsg.Scope,
+		EventID:               closeMsg.EventID,
+		AgentPublicKey:        closeMsg.AgentPublicKey,
+		SessionID:             closeMsg.SessionID,
+		SessionIssuedAtMillis: closeMsg.SessionIssuedAtMillis,
+		IssuedThroughMillis:   closeMsg.IssuedThroughMillis,
+		RunID:                 closeMsg.RunID,
+		RunAttempt:            closeMsg.RunAttempt,
+		BootID:                a.bootID,
+		FlushGeneration:       a.sessionFlushGeneration.Load(),
+		Closed:                closed,
+	}
+	body, err := json.Marshal(&ack)
+	if err != nil {
+		return err
+	}
+	md := &core.MsgData{
+		ConnData:      ppd.ConnData,
+		HeaderType:    core.NHP_RVA,
+		CipherScheme:  ppd.CipherScheme,
+		TransactionId: a.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        ppd.RemotePubKey,
+		Message:       body,
+	}
+	if !a.IsRunning() {
+		return errors.New("AC is stopping before session-control acknowledgement")
+	}
+	select {
+	case a.sendMsgCh <- md:
+		return nil
+	default:
+		return errors.New("AC session-control acknowledgement queue is full")
+	}
 }
 
 // sendRevocationAck enqueues an NHP_RVA acknowledgement of revMsg back to the
@@ -1336,12 +1522,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 		}
 		log.Info("[HandleAccessControl] open temporary udp port on %s", tladdr.String())
 
-		tempEntry := &AccessEntry{
-			User:     au,
-			SrcAddrs: srcAddrs,
-			DstAddrs: dstAddrs,
-			OpenTime: tempOpenTimeSec,
-		}
+		tempEntry := newTempAccessEntry(entry, au, srcAddrs, dstAddrs, tempOpenTimeSec)
 		// INVARIANT: this token issuance is not gated by the
 		// emitOrCleanupPreMintedToken pattern HandleUdpACOperations uses,
 		// because PreAccessAction is reached only after every error return
@@ -1492,7 +1673,8 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 	// flush deadline is unchanged (computeFlushDeadline(openTimeSec)):
 	// only OWNERSHIP changed, not timing. See registerTempAccessFlushEntry
 	// godoc for the lifetime-mismatch analysis.
-	if a.VerifyAccessToken(accMsg.ACToken) != nil {
+	if parentEntry, admitted := a.lockAdmittedTempAccessParent(accMsg.ACToken); admitted {
+		defer a.sessionControlFlushMu.Unlock()
 		remoteAddr, _ := net.ResolveTCPAddr(conn.RemoteAddr().Network(), conn.RemoteAddr().String())
 		srcAddrIp := remoteAddr.IP.String()
 
@@ -1507,7 +1689,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		// HandleAccessControl's single-entry multi-tuple admission (hence
 		// hoisted out of the loop). Ownership/timing rationale: see the
 		// block comment above + registerTempAccessFlushEntry godoc.
-		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
+		flushEntry := a.registerTempAccessFlushEntry(parentEntry, au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at
@@ -1657,7 +1839,8 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 	// (#2172). See tcpTempAccessHandler's matching note +
 	// registerTempAccessFlushEntry godoc for the lifetime-mismatch
 	// analysis; timing is unchanged (only OWNERSHIP changed).
-	if a.VerifyAccessToken(accMsg.ACToken) != nil {
+	if parentEntry, admitted := a.lockAdmittedTempAccessParent(accMsg.ACToken); admitted {
+		defer a.sessionControlFlushMu.Unlock()
 		srcAddrIp := remoteAddr.IP.String()
 
 		// Detect IP type using proper parsing instead of string matching
@@ -1672,7 +1855,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 		// admission (hence hoisted out of the loop). Ownership/timing
 		// rationale: see the comment above + registerTempAccessFlushEntry
 		// godoc.
-		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
+		flushEntry := a.registerTempAccessFlushEntry(parentEntry, au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at

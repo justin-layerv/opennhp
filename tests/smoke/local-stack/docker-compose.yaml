@@ -44,6 +44,11 @@ services:
       AWS_ACCESS_KEY_ID: "dummy"
       AWS_SECRET_ACCESS_KEY: "dummy"
       AWS_REGION: "us-east-2"
+      # Durable session-control authority is cell-scoped even in the local
+      # cloud-storage smoke stack. Keep the identity explicit so this stack
+      # exercises the same mandatory startup boundary as deployed cells.
+      NHP_CELL_ID: "local-smoke"
+      NHP_ENVIRONMENT: "local"
       # The HTTP server requires session cookie keys or it refuses to start
       # (httpserver.go::parseCookieKeys). base64 of
       #   {"current":{"auth_key":"<32B>","encrypt_key":"<32B>"}}
@@ -68,6 +73,17 @@ services:
       - nhp-server
     cap_add:
       - NET_ADMIN
+    # Production user-data creates the kernel ipsets before starting nhp-acd.
+    # Reproduce that boot ordering here so session-control's synchronous
+    # inherited-rule enumeration proves an empty canonical set instead of
+    # mistaking an uninitialized local container for an AC runtime failure.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ipset -exist create defaultset hash:ip,port,ip counters maxelem 10000 timeout 120
+        ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 10000 timeout 121
+        ipset -exist create tempset hash:net,port counters maxelem 10000 timeout 5
+        exec /nhp-ac/nhp-acd run
     environment:
       AWS_ACCESS_KEY_ID: "dummy"
       AWS_SECRET_ACCESS_KEY: "dummy"

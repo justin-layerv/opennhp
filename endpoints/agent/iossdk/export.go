@@ -51,12 +51,27 @@ func NhpAgentKnockResourceWithRunID(aspId string, resId string, runID string, se
 	return sdk.KnockResourceWithRunID(aspId, resId, runID, serverIp, serverHostname, serverPort)
 }
 
+func NhpAgentKnockResourceWithRunBinding(aspId string, resId string, runID string, runAttempt int64, serverIp string, serverHostname string, serverPort int) string {
+	if runAttempt <= 0 {
+		return sdk.KnockResourceWithRunBinding(aspId, resId, runID, 0, serverIp, serverHostname, serverPort)
+	}
+	return sdk.KnockResourceWithRunBinding(aspId, resId, runID, uint64(runAttempt), serverIp, serverHostname, serverPort)
+}
+
 func NhpAgentExitResource(aspId string, resId string, serverIp string, serverHostname string, serverPort int) bool {
 	return sdk.ExitResource(aspId, resId, serverIp, serverHostname, serverPort)
 }
 
 func NhpAgentExitResourceWithRunID(aspId string, resId string, runID string, serverIp string, serverHostname string, serverPort int) bool {
 	return sdk.ExitResourceWithRunID(aspId, resId, runID, serverIp, serverHostname, serverPort)
+}
+
+func NhpAgentRetireSession(knockAckJSON string, serverIp string, serverHostname string, serverPort int) string {
+	return retireSessionJSON(knockAckJSON, serverIp, serverHostname, serverPort)
+}
+
+func retireSessionJSON(knockAckJSON, serverIP, serverHostname string, serverPort int) string {
+	return sdk.RetireSession(knockAckJSON, serverIP, serverHostname, serverPort)
 }
 
 //export NhpGenerateKeys

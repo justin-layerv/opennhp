@@ -613,6 +613,18 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
 # interface rename; the attached policy also carries bounded server writes.
 # Uses boolean variable because Terraform cannot evaluate count based on module outputs at plan time
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md
+resource "terraform_data" "session_control_storage_contract" {
+  lifecycle {
+    precondition {
+      condition = (
+        var.storage_backend != "dynamodb" ||
+        try(trimspace(var.dynamodb_session_control_table) != "", false)
+      )
+      error_message = "storage_backend=dynamodb requires a non-empty dynamodb_session_control_table; NHP session authority must fail before the server accepts AOL/knock traffic, never degrade to process-local close state."
+    }
+  }
+}
+
 resource "aws_iam_role_policy_attachment" "server_dynamodb" {
   count      = var.attach_storage_policies ? 1 : 0
   role       = aws_iam_role.server.name
@@ -1014,6 +1026,20 @@ resource "aws_vpc_security_group_ingress_rule" "server_http_plugins" {
   }
 }
 
+# Fleet-close discovery advertises HTTP_PORT only from this exact admitted set
+# (see endpoints/server/udpserver.go::fleetCloseHTTPPortIsVPCAdmitted). Keep the
+# assertion adjacent to the source ingress rules so a future listener change
+# cannot drift Cloud Map reachability from the server security group.
+check "server_fleet_close_http_ports_are_vpc_admitted" {
+  assert {
+    condition = toset([
+      aws_vpc_security_group_ingress_rule.server_http_traefik.from_port,
+      aws_vpc_security_group_ingress_rule.server_http_plugins.from_port,
+    ]) == toset([62206, 8888])
+    error_message = "Fleet-close HTTP_PORT contract requires VPC TCP ingress on exactly 62206 and 8888."
+  }
+}
+
 # QURL resolve endpoint: NLB TLS termination → Server HTTP on 8888.
 # Must allow all IPs because NLB preserve_client_ip=true forwards packets
 # with the original client IP (or CloudFront IP) as source. The endpoint
@@ -1082,13 +1108,14 @@ locals {
     server_plugins  = var.server_plugins
     auth_service_id = var.auth_service_id
     # Storage backend configuration (Phase 4)
-    storage_backend               = var.storage_backend
-    dynamodb_region               = coalesce(var.dynamodb_region, data.aws_region.current.id)
-    dynamodb_licenses_table       = var.dynamodb_licenses_table
-    dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
-    dynamodb_resources_table      = var.dynamodb_resources_table
-    dynamodb_agent_keys_table     = var.dynamodb_agent_keys_table
-    dynamodb_ack_tokens_table     = var.dynamodb_ack_tokens_table
+    storage_backend                = var.storage_backend
+    dynamodb_region                = coalesce(var.dynamodb_region, data.aws_region.current.id)
+    dynamodb_licenses_table        = var.dynamodb_licenses_table
+    dynamodb_ac_assignments_table  = var.dynamodb_ac_assignments_table
+    dynamodb_resources_table       = var.dynamodb_resources_table
+    dynamodb_agent_keys_table      = var.dynamodb_agent_keys_table
+    dynamodb_ack_tokens_table      = var.dynamodb_ack_tokens_table
+    dynamodb_session_control_table = var.dynamodb_session_control_table
     # Cloud Map configuration for server health discovery
     cloudmap_enabled        = var.cloudmap_enabled
     cloudmap_namespace_name = var.cloudmap_namespace_name
@@ -1598,7 +1625,7 @@ resource "aws_autoscaling_group" "server" {
     # apply; the operator who froze the group owns the explicit, post-health
     # resume. This is particularly load-bearing for cross-VPC moves, where the
     # old fleet is drained before its subnets are destroyed.
-    ignore_changes = [desired_capacity, min_size, suspended_processes]
+    ignore_changes = [desired_capacity, min_size, max_size, suspended_processes]
   }
 }
 

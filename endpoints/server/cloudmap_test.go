@@ -8,8 +8,76 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
+	sdtypes "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
+
+type cloudMapAPITestDouble struct {
+	discover func(*servicediscovery.DiscoverInstancesInput) (*servicediscovery.DiscoverInstancesOutput, error)
+}
+
+func (m *cloudMapAPITestDouble) DiscoverInstances(_ context.Context, in *servicediscovery.DiscoverInstancesInput, _ ...func(*servicediscovery.Options)) (*servicediscovery.DiscoverInstancesOutput, error) {
+	return m.discover(in)
+}
+
+func (*cloudMapAPITestDouble) RegisterInstance(context.Context, *servicediscovery.RegisterInstanceInput, ...func(*servicediscovery.Options)) (*servicediscovery.RegisterInstanceOutput, error) {
+	return &servicediscovery.RegisterInstanceOutput{}, nil
+}
+
+func (*cloudMapAPITestDouble) DeregisterInstance(context.Context, *servicediscovery.DeregisterInstanceInput, ...func(*servicediscovery.Options)) (*servicediscovery.DeregisterInstanceOutput, error) {
+	return &servicediscovery.DeregisterInstanceOutput{}, nil
+}
+
+func cloudMapTestInstance(id, ip string) sdtypes.HttpInstanceSummary {
+	return sdtypes.HttpInstanceSummary{
+		InstanceId: aws.String(id),
+		Attributes: map[string]string{CloudMapAttrIPv4: ip, CloudMapAttrHTTPPort: "8888"},
+	}
+}
+
+func TestRefreshInstancesCacheRejectsAmbiguousFullDiscoverPage(t *testing.T) {
+	for _, count := range []int{99, 100} {
+		t.Run(fmt.Sprintf("count-%d", count), func(t *testing.T) {
+			instances := make([]sdtypes.HttpInstanceSummary, 0, count)
+			for i := 0; i < count; i++ {
+				instances = append(instances, cloudMapTestInstance(fmt.Sprintf("i-%03d", i), fmt.Sprintf("10.0.0.%d", i+1)))
+			}
+			api := &cloudMapAPITestDouble{discover: func(in *servicediscovery.DiscoverInstancesInput) (*servicediscovery.DiscoverInstancesOutput, error) {
+				if got := aws.ToInt32(in.MaxResults); got != cloudMapDiscoverMaxResults {
+					t.Fatalf("DiscoverInstances MaxResults = %d, want %d", got, cloudMapDiscoverMaxResults)
+				}
+				return &servicediscovery.DiscoverInstancesOutput{Instances: instances}, nil
+			}}
+			client := &CloudMapClient{client: api, namespaceName: "test", serviceName: "server", cacheTTL: time.Minute, operationTimeout: time.Second}
+			got, err := client.refreshInstancesCache(context.Background(), true)
+			if count == 100 {
+				if err == nil || got != nil {
+					t.Fatalf("ambiguous full page = (%d rows, %v), want nil/error", len(got), err)
+				}
+				return
+			}
+			if err != nil || len(got) != count {
+				t.Fatalf("authoritative page = (%d rows, %v), want %d/nil", len(got), err, count)
+			}
+		})
+	}
+}
+
+func TestRefreshInstancesCacheRejectsConflictingDuplicateInstance(t *testing.T) {
+	api := &cloudMapAPITestDouble{discover: func(*servicediscovery.DiscoverInstancesInput) (*servicediscovery.DiscoverInstancesOutput, error) {
+		return &servicediscovery.DiscoverInstancesOutput{Instances: []sdtypes.HttpInstanceSummary{
+			cloudMapTestInstance("i-same", "10.0.0.1"),
+			cloudMapTestInstance("i-same", "10.0.0.2"),
+		}}, nil
+	}}
+	client := &CloudMapClient{client: api, namespaceName: "test", serviceName: "server", cacheTTL: time.Minute, operationTimeout: time.Second}
+	if got, err := client.refreshInstancesCache(context.Background(), true); err == nil || got != nil {
+		t.Fatalf("conflicting duplicate = (%v, %v), want nil/error", got, err)
+	}
+}
 
 // ============================================================================
 // Mock HealthChecker for Testing

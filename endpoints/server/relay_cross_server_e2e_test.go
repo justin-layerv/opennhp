@@ -83,6 +83,7 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		acID          = "ac-on-server-b"
 		serverBID     = "server-b"
 		innerKnockTrx = uint64(7654321)
+		runID         = "0123456789abcdef"
 	)
 
 	// ------------------------------------------------------------------ nodes
@@ -140,6 +141,19 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	// sender-owned packet and would transmit the knock over the
 	// wire to server A (which has no agent peer and fails the decrypt).
 	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+
+	// Both servers share the same durable session authority, just as production
+	// instances in one cell share the dedicated session-control table. Server A
+	// reserves the exact tuple before forwarding; server B must strong-verify
+	// that same tuple before catalog, placement, or AC work. Leaving either side
+	// on the old synthetic verifier would let this E2E fabricate a receipt that
+	// the strict registered-agent ACK encoder correctly refuses.
+	durableStore := newAdmissionSessionControlStore(time.Now())
+	durableVerifier := &UdpServer{
+		sessionControlCellID: testSessionControlCellID,
+		sessionControlStore:  durableStore,
+	}
+	verifiedReceiptCh := make(chan common.AgentSessionReceipt, 1)
 
 	// The relay stand-in: a plain UDP socket. server A's buildRelayInnerReply +
 	// sendRelayReturn path writes the final ack here; the test reads it back and
@@ -210,13 +224,15 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	// for an NHP_FRT that never arrives (#2654).
 	serverBDeps := &relayServerBForwarderDeps{
 		mockACForwarderDeps: &mockACForwarderDeps{
-			hostname:   serverBID,
-			device:     serverBNode.device,
-			serverNode: serverBNode,
-			mockACNode: mockAC,
-			t:          t,
-			aspData:    newForwardE2EQURLTunnelASP(aspID, acID),
+			hostname:        serverBID,
+			device:          serverBNode.device,
+			serverNode:      serverBNode,
+			mockACNode:      mockAC,
+			t:               t,
+			aspData:         newForwardE2EQURLTunnelASP(aspID, acID),
+			durableVerifier: durableVerifier,
 		},
+		verifiedReceiptCh: verifiedReceiptCh,
 	}
 	serverBForwarder := NewServerForwarder(serverBDeps)
 	serverBForwarder.Start()
@@ -292,9 +308,11 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	mp := metrics.NewPublisherForTest(t)
 
 	serverA := &UdpServer{
-		device:       serverANode.device,
-		metrics:      mp,
-		relayPeerMap: make(map[string]*core.UdpPeer),
+		device:               serverANode.device,
+		metrics:              mp,
+		relayPeerMap:         make(map[string]*core.UdpPeer),
+		sessionControlCellID: testSessionControlCellID,
+		sessionControlStore:  durableStore,
 		// A local plugin handler that mirrors the production agent plugin's core
 		// (resolve the qURL tunnel resource off helper.AspData via the real
 		// qurlplacement.ResolveResource, then dispatch through
@@ -332,7 +350,8 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		UserId:        "relay-cross-server-user",
 		AuthServiceId: aspID,
 		ResourceId:    qurlplacement.TunnelServerResourceID,
-		RunID:         "0123456789abcdef",
+		RunID:         runID,
+		RunAttempt:    1,
 	})
 	if err != nil {
 		t.Fatalf("marshal knock body: %v", err)
@@ -367,11 +386,38 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	// on the observable side effects (the AOP at the AC, the ack at the relay).
 	go serverA.HandleRelayForward(outerPpd)
 
+	// The remote server's production verifier must recover the exact receipt
+	// from the shared durable reservation. This is the authority later encoded
+	// into the forwarded registered-agent ACK; no forwarding field or test echo
+	// is allowed to mint it.
+	var verifiedReceipt common.AgentSessionReceipt
+	select {
+	case verifiedReceipt = <-verifiedReceiptCh:
+		if err := common.ValidateAgentSessionReceipt(verifiedReceipt); err != nil {
+			t.Fatalf("server B durable receipt = %+v: %v", verifiedReceipt, err)
+		}
+		if verifiedReceipt.CellID != testSessionControlCellID || verifiedReceipt.RunID != runID ||
+			verifiedReceipt.RunAttempt != 1 {
+			t.Fatalf("server B durable receipt = %+v, want cell=%q run=(%q,1)",
+				verifiedReceipt, testSessionControlCellID, runID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server B never strong-verified server A's durable session reservation")
+	}
+
 	// ---- Assertion 1 (the heart of #2546): the relay-reported CLIENT ip
 	// crossed NHP_FWD and opened the AC pinhole on server B — not the relay, not
 	// server A, not server B.
 	select {
 	case aopMsg := <-acReceivedOp:
+		if aopMsg.SessionId != verifiedReceipt.SessionID ||
+			aopMsg.SessionIssuedAtMillis != verifiedReceipt.SessionIssuedAtMillis ||
+			aopMsg.RunID != verifiedReceipt.RunID || aopMsg.RunAttempt != verifiedReceipt.RunAttempt {
+			t.Fatalf("AOP exact session = (%d,%d,%q,%d), want durable receipt (%d,%d,%q,%d)",
+				aopMsg.SessionId, aopMsg.SessionIssuedAtMillis, aopMsg.RunID, aopMsg.RunAttempt,
+				verifiedReceipt.SessionID, verifiedReceipt.SessionIssuedAtMillis,
+				verifiedReceipt.RunID, verifiedReceipt.RunAttempt)
+		}
 		if len(aopMsg.SourceAddrs) == 0 || aopMsg.SourceAddrs[0] == nil {
 			t.Fatalf("AOP carried no source address; want relay-reported client %s", relayClientAddr.IP)
 		}
@@ -420,8 +466,9 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 			t.Errorf("ack counter = %d, want inner knock counter %d", agentPpd.SenderTrxId, innerKnockTrx)
 		}
 		var ack common.ServerKnockAckMsg
-		if err := json.Unmarshal(agentPpd.BodyMessage, &ack); err != nil {
-			t.Fatalf("unmarshal decrypted ack: %v", err)
+		if err := common.DecodeRegisteredAgentKnockAckMsg(agentPpd.BodyMessage, &ack,
+			runID, 1, qurlplacement.TunnelServerResourceID); err != nil {
+			t.Fatalf("strict-decode decrypted registered-agent ack: %v", err)
 		}
 		if ack.ErrCode != common.ErrSuccess.ErrorCode() {
 			t.Errorf("ack.ErrCode = %q, want success %q (ErrMsg=%q); the forwarded knock should have been granted by the remote AC",
@@ -434,6 +481,12 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		if ack.AgentAddr != relayClientAddr.String() {
 			t.Errorf("ack.AgentAddr = %q, want relay-reported client %q (the ack must reflect the real client, never the relay)",
 				ack.AgentAddr, relayClientAddr.String())
+		}
+		if ack.CellId != verifiedReceipt.CellID || ack.SessionId != verifiedReceipt.SessionID ||
+			ack.SessionIssuedAtMillis != verifiedReceipt.SessionIssuedAtMillis ||
+			ack.RunID != verifiedReceipt.RunID || ack.RunAttempt != verifiedReceipt.RunAttempt {
+			t.Errorf("ACK exact receipt = (%q,%d,%d,%q,%d), want verified durable receipt %+v",
+				ack.CellId, ack.SessionId, ack.SessionIssuedAtMillis, ack.RunID, ack.RunAttempt, verifiedReceipt)
 		}
 		// The forwarded ack carries the remote AC's grant for the resolved qURL
 		// tunnel resource — proves the success rode all the way back from server
@@ -520,6 +573,20 @@ func (p *relayCrossServerPlugin) AuthWithNHP(req *common.NhpAuthRequest, helper 
 // receive the NHP_FRT to complete its ForwardKnock.
 type relayServerBForwarderDeps struct {
 	*mockACForwarderDeps
+	verifiedReceiptCh chan<- common.AgentSessionReceipt
+}
+
+func (d *relayServerBForwarderDeps) VerifyForwardedDurableNHPSession(ctx context.Context,
+	knkMsg *common.AgentKnockMsg,
+) (common.AgentSessionReceipt, error) {
+	receipt, err := d.mockACForwarderDeps.VerifyForwardedDurableNHPSession(ctx, knkMsg)
+	if err == nil && d.verifiedReceiptCh != nil {
+		select {
+		case d.verifiedReceiptCh <- receipt:
+		default:
+		}
+	}
+	return receipt, err
 }
 
 func (d *relayServerBForwarderDeps) SendMessage(md *core.MsgData) error {
@@ -540,6 +607,7 @@ func (d *relayServerBForwarderDeps) SendMessage(md *core.MsgData) error {
 // / ASP / token methods are never reached on the forwarding (originating) side,
 // so they are inert. Mirrors e2eForwarderDeps.SendMessage.
 type crossServerForwarderDeps struct {
+	testForwardedSessionDeps
 	node *E2ETestNode
 }
 

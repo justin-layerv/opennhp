@@ -6,6 +6,7 @@ package sdk
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -172,8 +173,9 @@ func RemoveServer(pubkey string) {
 //
 // Registered-agent authentication (aspId "agent") is intentionally unsupported
 // by the background loop because each access lifecycle requires a caller-owned
-// runID. Such callers must use [KnockResourceWithRunID] and
-// [ExitResourceWithRunID].
+// runID and positive runAttempt. Such callers must use
+// [KnockResourceWithRunBinding] and retire the returned receipt with
+// [RetireSession].
 //
 // Returns false if the agent is not initialized, inputs are invalid, or aspId
 // selects registered-agent authentication.
@@ -212,9 +214,40 @@ func errAckMsg(e *common.Error) *common.ServerKnockAckMsg {
 	return &common.ServerKnockAckMsg{ErrCode: e.ErrorCode(), ErrMsg: e.Error()}
 }
 
+func exactCloseErrJSON(e *common.Error) string {
+	bytes, err := json.Marshal(&common.ServerExactSessionCloseAckMsg{ErrCode: e.ErrorCode(), ErrMsg: e.Error()})
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
+}
+
+func exactCloseResultJSON(ack *common.ServerExactSessionCloseAckMsg, callErr error) string {
+	if ack != nil {
+		if raw, err := json.Marshal(ack); err == nil {
+			var strict common.ServerExactSessionCloseAckMsg
+			if common.DecodeServerExactSessionCloseAckMsg(raw, &strict) == nil {
+				return string(raw)
+			}
+		}
+	}
+	var nhpErr *common.Error
+	if errors.As(callErr, &nhpErr) && nhpErr != nil {
+		return exactCloseErrJSON(nhpErr)
+	}
+	if callErr != nil {
+		// The only nil-ACK operational path today is route resolution. Keep its
+		// public denial stable instead of serializing JSON null or remote error text.
+		return exactCloseErrJSON(common.ErrKnockServerNotFound)
+	}
+	return exactCloseErrJSON(common.ErrTransactionFailedByClosedConnection)
+}
+
 // buildTarget validates inputs, builds a KnockTarget, and returns it.
 // On failure, returns nil target and an ackMsg populated with the error.
-func buildTarget(current *agent.UdpAgent, aspId, resId, runID, serverIp, serverHostname string, serverPort int) (*agent.KnockTarget, *common.ServerKnockAckMsg) {
+func buildTarget(current *agent.UdpAgent, aspId, resId, runID string, runAttempt uint64,
+	serverIp, serverHostname string, serverPort int,
+) (*agent.KnockTarget, *common.ServerKnockAckMsg) {
 	if current == nil {
 		return nil, errAckMsg(common.ErrNoAgentInstance)
 	}
@@ -224,6 +257,9 @@ func buildTarget(current *agent.UdpAgent, aspId, resId, runID, serverIp, serverH
 	if err := common.ValidateAgentKnockRunIDForAuthService(aspId, runID); err != nil {
 		return nil, errAckMsg(common.ErrKnockRunIDInvalid)
 	}
+	if aspId == common.RegisteredAgentAuthServiceID && runAttempt == 0 {
+		return nil, errAckMsg(common.ErrKnockRunAttemptInvalid)
+	}
 	if serverIp == "" && serverHostname == "" {
 		return nil, errAckMsg(common.ErrInvalidInput)
 	}
@@ -232,6 +268,7 @@ func buildTarget(current *agent.UdpAgent, aspId, resId, runID, serverIp, serverH
 		AuthServiceId:  aspId,
 		ResourceId:     resId,
 		RunID:          runID,
+		RunAttempt:     runAttempt,
 		ServerIp:       serverIp,
 		ServerHostname: serverHostname,
 		ServerPort:     serverPort,
@@ -253,24 +290,33 @@ func buildTarget(current *agent.UdpAgent, aspId, resId, runID, serverIp, serverH
 //
 // This legacy wrapper carries no runID. Calls with aspId "agent" therefore
 // fail closed with [common.ErrKnockRunIDInvalid]; registered-agent callers must
-// use [KnockResourceWithRunID].
+// use [KnockResourceWithRunBinding].
 //
 // Returns a JSON string containing the server's ack message with fields:
 // errCode, errMsg, resHost, opnTime, aspToken, agentAddr, preActs,
 // redirectUrl.
 func KnockResource(aspId, resId, serverIp, serverHostname string, serverPort int) string {
-	return KnockResourceWithRunID(aspId, resId, "", serverIp, serverHostname, serverPort)
+	return KnockResourceWithRunBinding(aspId, resId, "", 0, serverIp, serverHostname, serverPort)
 }
 
-// KnockResourceWithRunID sends a single knock request carrying the exact
-// caller-owned cycle runID. The SDK validates but never generates runID.
-// Registered-agent callers (aspId "agent") must supply a canonical runID;
-// legacy auth services may pass an empty value.
+// KnockResourceWithRunID is the legacy runID-only wrapper. It cannot create a
+// registered-agent session because that contract also requires a positive
+// runAttempt; registered callers must use [KnockResourceWithRunBinding].
+// Legacy auth services may continue to use this wrapper.
 func KnockResourceWithRunID(aspId, resId, runID, serverIp, serverHostname string, serverPort int) string {
+	return KnockResourceWithRunBinding(aspId, resId, runID, 0, serverIp, serverHostname, serverPort)
+}
+
+// KnockResourceWithRunBinding sends one registered-agent knock carrying the
+// caller-owned immutable RunID and positive attempt. A successful JSON ACK
+// contains the server-issued exact-session receipt consumed by RetireSession.
+func KnockResourceWithRunBinding(aspId, resId, runID string, runAttempt uint64,
+	serverIp, serverHostname string, serverPort int,
+) string {
 	instanceMu.RLock()
 	current := instance
 	instanceMu.RUnlock()
-	target, ackMsg := buildTarget(current, aspId, resId, runID, serverIp, serverHostname, serverPort)
+	target, ackMsg := buildTarget(current, aspId, resId, runID, runAttempt, serverIp, serverHostname, serverPort)
 	if target != nil {
 		ackMsg, _ = current.Knock(target)
 	}
@@ -285,27 +331,52 @@ func KnockResourceWithRunID(aspId, resId, runID, serverIp, serverHostname string
 // ExitResource tells the NHP server to revoke the agent's access permission
 // for the specified resource.
 //
-// This legacy wrapper carries no runID. Calls with aspId "agent" therefore
-// fail closed; registered-agent callers must use [ExitResourceWithRunID].
+// This legacy resource-shaped exit has no exact session receipt. Calls with
+// aspId "agent" fail closed; registered callers must use [RetireSession].
 //
 // Returns true if the exit request succeeded.
 func ExitResource(aspId, resId, serverIp, serverHostname string, serverPort int) bool {
 	return ExitResourceWithRunID(aspId, resId, "", serverIp, serverHostname, serverPort)
 }
 
-// ExitResourceWithRunID revokes access while carrying the exact caller-owned
-// cycle runID. It follows the same validation rules as
-// [KnockResourceWithRunID] and never generates a value.
+// ExitResourceWithRunID is retained only as a fail-loud legacy API. A runID is
+// not sufficient authority to retire an exact registered-agent session, so
+// registered callers must use [RetireSession].
 func ExitResourceWithRunID(aspId, resId, runID, serverIp, serverHostname string, serverPort int) bool {
 	instanceMu.RLock()
 	current := instance
 	instanceMu.RUnlock()
-	target, _ := buildTarget(current, aspId, resId, runID, serverIp, serverHostname, serverPort)
+	target, _ := buildTarget(current, aspId, resId, runID, 0, serverIp, serverHostname, serverPort)
 	if target == nil {
 		return false
 	}
 	_, err := current.ExitKnockRequest(target)
 	return err == nil
+}
+
+// RetireSession sends the receipt-based exact-session EXT to the same server
+// route supplied for the original knock and returns the dedicated close ACK as
+// JSON. knockAckJSON must be the successful ACK returned by
+// KnockResourceWithRunBinding; resource-shaped exit input is not accepted.
+func RetireSession(knockAckJSON, serverIp, serverHostname string, serverPort int) string {
+	instanceMu.RLock()
+	current := instance
+	instanceMu.RUnlock()
+	if current == nil {
+		return exactCloseErrJSON(common.ErrNoAgentInstance)
+	}
+	receipt, err := common.DecodeAgentSessionReceiptFromKnockAckJSON([]byte(knockAckJSON))
+	if err != nil {
+		return exactCloseErrJSON(common.ErrInvalidInput)
+	}
+	route := &agent.KnockResource{ServerIp: serverIp, ServerHostname: serverHostname, ServerPort: serverPort}
+	peer := current.FindServerPeerFromResource(route)
+	target, err := agent.NewSessionRetirementTarget(receipt, peer)
+	if err != nil {
+		return exactCloseErrJSON(common.ErrKnockServerNotFound)
+	}
+	ack, exitErr := current.ExitKnockRequest(target)
+	return exactCloseResultJSON(ack, exitErr)
 }
 
 // GenerateKeys creates a new Curve25519 key pair and returns the result as

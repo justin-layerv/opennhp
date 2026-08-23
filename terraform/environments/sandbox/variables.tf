@@ -191,6 +191,12 @@ variable "l3_flush_dry_run" {
   default     = true
 }
 
+variable "l3_flush_real_mode_acknowledged" {
+  description = "Sandbox durable acknowledgement for direct real-flush boot after the dry-run soak gates have passed."
+  type        = bool
+  default     = false
+}
+
 variable "l3_flush_conntrack_backend" {
   description = "AC conntrack teardown backend for sandbox L3 flush: exec or netlink."
   type        = string

@@ -69,6 +69,17 @@ type UdpAC struct {
 	// revocation_index.go and docs/design/QURL_V2_KEYED_IDENTITY.md.
 	revIndex *revocationIndex
 
+	// nhpSessions indexes immutable base-protocol session selectors for strict
+	// exact/agent/run NHP_REV teardown and the legacy zero-open-time AOP close.
+	// It is intentionally independent of the qURL v2 application revocation
+	// dimensions in revIndex.
+	nhpSessions *nhpSessionIndex
+
+	// nhpRunBarriers is the strict run-attempt high watermark established by
+	// LayerV run-scoped NHP_REV before a registered-agent AOP may open.
+	nhpRunBarriersOnce sync.Once
+	nhpRunBarriers     *nhpRunAttemptBarriers
+
 	// aopReplay dedupes recently observed NHP_AOP packets by
 	// (sender_pubkey, txid, send_time) so a captured-and-replayed
 	// packet cannot re-open ipset entries on a fresh connection.
@@ -83,6 +94,23 @@ type UdpAC struct {
 	httpServer *HttpAC
 	wg         sync.WaitGroup
 	running    atomic.Bool
+
+	// Session-control flush completion and authority lease are deliberately
+	// separate. A completed flush may be advertised in AOL, but registered-agent
+	// admission stays closed until an exact current-generation AAK reacquires
+	// the server-control lease. bootID changes on every process start;
+	// flushGeneration advances after each boot/control-gap flush.
+	bootID                  string
+	sessionFlushGeneration  atomic.Uint64
+	sessionFlushComplete    atomic.Bool
+	sessionControlLeaseHeld atomic.Bool
+	bootSessionFlushFn      func(context.Context) error
+	sessionControlFlushMu   sync.Mutex
+	sessionControlStateDir  string
+	// sessionControlFlushBeforeGenerationFn is a deterministic test seam run
+	// while the admission/flush fence is held, after teardown convergence and
+	// before the durable generation advances. Production leaves it nil.
+	sessionControlFlushBeforeGenerationFn func()
 
 	signals struct {
 		stop             chan struct{}
@@ -250,6 +278,17 @@ type UdpAC struct {
 	surgicalConnFlushBatchV6 func(context.Context, FlowKey, []uint16) []error
 	surgicalConnFlushV6      func(context.Context, ConnFlowKey) error
 	enumerateConnSrcPortsV6  func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
+}
+
+func (a *UdpAC) runAttemptBarriers() *nhpRunAttemptBarriers {
+	a.nhpRunBarriersOnce.Do(func() {
+		a.nhpRunBarriers = newNHPRunAttemptBarriers()
+	})
+	return a.nhpRunBarriers
+}
+
+func (a *UdpAC) sessionAdmissionReady() bool {
+	return a != nil && a.sessionFlushComplete.Load() && a.sessionControlLeaseHeld.Load()
 }
 
 type ipsetWriter interface {
@@ -707,6 +746,18 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	if err != nil {
 		return err
 	}
+	a.bootID, err = common.NewNHPACBootID()
+	if err != nil {
+		return fmt.Errorf("generate AC boot identity: %w", err)
+	}
+	a.sessionFlushComplete.Store(false)
+	a.sessionControlLeaseHeld.Store(false)
+	a.sessionControlStateDir = dirPath
+	bootGeneration, err := reserveBootSessionControlGeneration(dirPath)
+	if err != nil {
+		return fmt.Errorf("reserve durable AC session-control generation: %w", err)
+	}
+	a.sessionFlushGeneration.Store(bootGeneration)
 
 	switch a.config.FilterMode {
 	case FilterMode_IPTABLES:
@@ -761,6 +812,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
 	a.revIndex = newRevocationIndex()
+	a.nhpSessions = newNHPSessionIndex()
 	// Registered BEFORE a.expirySched is constructed below. Safe
 	// for two reasons: (1) the hook closure captures `a` rather
 	// than the scheduler pointer, so it reads a.expirySched at
@@ -874,13 +926,9 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		log.Info("[L3FlushSched] started: filterMode=%d dryRun=%t breakerThresh=%d/%ds",
 			a.config.FilterMode, a.config.L3FlushDryRun,
 			a.config.L3FlushErrorThreshold, a.config.L3FlushErrorWindowSec)
-		// Synchronous boot-time enumeration: walk kernel allow-rules
-		// from a previous AC process and Schedule a flush for each
-		// at its remaining timeout. MUST complete before the AC
-		// begins accepting NHP-AOPs — otherwise an AC restart would
-		// leave existing kernel entries unmanaged by the scheduler
-		// and their flow-state would survive past session end. See
-		// expiry_enumerate.go for the fail-closed-on-error contract.
+		// Synchronously enumerate and tear down inherited session rules before
+		// registration/listen. A later AOL is an authority statement that this
+		// exact boot completed the flush, not merely that a timer was scheduled.
 		//
 		// If enumeration fails we must Shutdown the scheduler before
 		// returning — Start() already launched the tick + 64 worker
@@ -888,7 +936,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// caller that doesn't call Stop() on a failed Start() would
 		// leak permanently). Nil the pointer so the caller's
 		// post-Start cleanup is a no-op
-		if err = a.enumerateAndScheduleFlushes(); err != nil {
+		if err = a.flushInheritedNHPSessions(); err != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if shutdownErr := a.expirySched.Shutdown(shutdownCtx); shutdownErr != nil {
@@ -916,8 +964,12 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 				_ = cf.Close()
 			}
 			a.coarseConntrackHandlesV6.Store(false)
-			return fmt.Errorf("L3 flush boot enumeration: %w", err)
+			return fmt.Errorf("AC session-control boot flush: %w", err)
 		}
+		a.sessionFlushComplete.Store(true)
+	}
+	if !a.sessionFlushComplete.Load() {
+		return errors.New("AC session-control readiness requires synchronous inherited-rule teardown")
 	}
 
 	a.signals.stop = make(chan struct{})
@@ -1171,8 +1223,38 @@ func (a *UdpAC) scheduleFlushIfEnabled(entry *AccessEntry, srcIP, dstIP string, 
 	// no-ops idempotently. Acceptable degradation; the alternative
 	// (rollback the record on Schedule failure) would re-introduce
 	// the race window we just closed.
-	entry.recordScheduledKey(key)
+	entry.recordScheduledDeadline(key, deadline)
 	a.expirySched.Schedule(key, deadline)
+}
+
+// latestOtherScheduledDeadline returns the latest exact scheduler deadline
+// owned by a live sibling that tracks key. The firewall deadline remains the
+// liveness boundary; the recorded schedule deadline includes the safety margin
+// and the admission-time offset that cannot be reconstructed exactly from
+// FirstKnockTime. Zero deadlines exist only in tests that stage membership
+// directly, so they fall back to the legacy derived deadline.
+func (a *UdpAC) latestOtherScheduledDeadline(candidates []*AccessEntry, self *AccessEntry, key FlowKey, now time.Time) time.Time {
+	var latest time.Time
+	for _, other := range candidates {
+		if other == nil || other == self {
+			continue
+		}
+		deadline, holds := other.scheduledDeadline(key)
+		if !holds {
+			continue
+		}
+		firewallEnd := other.firewallDeadline()
+		if !firewallEnd.After(now) {
+			continue
+		}
+		if deadline.IsZero() {
+			deadline = firewallEnd.Add(flushSafetyMargin)
+		}
+		if deadline.After(latest) {
+			latest = deadline
+		}
+	}
+	return latest
 }
 
 // registerTempAccessFlushEntry constructs and stores a long-lived
@@ -1299,7 +1381,7 @@ func (a *UdpAC) scheduleFlushIfEnabled(entry *AccessEntry, srcIP, dstIP string, 
 // shape as the partial-schedule failure-cleanup divergence noted above
 // — not worth lazy-registration complexity that would split the
 // load-bearing Schedule-then-write (#2168) interleaving.
-func (a *UdpAC) registerTempAccessFlushEntry(au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) *AccessEntry {
+func (a *UdpAC) registerTempAccessFlushEntry(parent *AccessEntry, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) *AccessEntry {
 	// Feature-off short-circuit: with no scheduler there is no flush to
 	// own and no admin-Cancel target, so minting + storing an entry would
 	// be pure tokenStore occupancy with zero benefit — and a divergence
@@ -1310,17 +1392,27 @@ func (a *UdpAC) registerTempAccessFlushEntry(au *common.AgentUser, srcAddrs, dst
 	if a.expirySched == nil {
 		return nil
 	}
-	entry := &AccessEntry{
-		User:     au,
-		SrcAddrs: srcAddrs,
-		DstAddrs: dstAddrs,
-		OpenTime: openTimeSec,
-	}
+	entry := newTempAccessEntry(parent, au, srcAddrs, dstAddrs, openTimeSec)
 	// GenerateAccessToken stamps FirstKnockTime/ExpireTime and Stores
 	// the entry under a fresh opaque token. The token is intentionally
 	// discarded — see godoc (phantom token, never sent to the agent).
 	a.GenerateAccessToken(entry)
 	return entry
+}
+
+// lockAdmittedTempAccessParent revalidates a delayed NHP_ACC immediately before
+// it can create a derived owner or write kernel state. On success it returns
+// with sessionControlFlushMu held; the caller must defer Unlock through every
+// derived-entry and kernel-write operation. This serializes the complete
+// mutation with exact/agent/run/global cleanup.
+func (a *UdpAC) lockAdmittedTempAccessParent(token string) (*AccessEntry, bool) {
+	a.sessionControlFlushMu.Lock()
+	parent := a.verifyAccessTokenCurrent(token, nil)
+	if parent == nil {
+		a.sessionControlFlushMu.Unlock()
+		return nil, false
+	}
+	return parent, true
 }
 
 // installExpiryHook wires cancelAllScheduledFlows into TokenStore's
@@ -1337,6 +1429,7 @@ func (a *UdpAC) installExpiryHook() {
 		// token whose entry is already expiring. revIndex.remove is a no-op
 		// for legacy entries (no qURL v2 metadata) and nil-safe pre-Start.
 		a.revIndex.remove(token, entry)
+		a.nhpSessions.remove(token, entry)
 		a.cancelAllScheduledFlows(entry)
 	})
 }

@@ -104,6 +104,14 @@ type Config struct {
 	// without an explicit opt-out from dry-run.
 	L3FlushDryRun bool `json:"l3FlushDryRun"`
 
+	// L3FlushRealModeAcknowledged is the durable operator acknowledgement that
+	// permits a fresh process to boot directly into real-flush mode. Without it,
+	// the first-load safety still forces dry-run even when L3FlushDryRun=false.
+	// This separate bit is necessary because a bool cannot distinguish an
+	// omitted TOML field from an explicit false, and session-control readiness
+	// must complete inherited-rule teardown before the AC can register.
+	L3FlushRealModeAcknowledged bool `json:"l3FlushRealModeAcknowledged"`
+
 	// L3FlushErrorThreshold / L3FlushErrorWindowSec — circuit
 	// breaker. Latches the scheduler off when error rate exceeds
 	// Threshold for Window-Sec consecutive seconds. Defaults from
@@ -382,14 +390,12 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		// in-process or test caller must not be able to mutate
 		// a.config's slice out from under us.
 		conf.ServerPubKeyAllowlist = slices.Clone(conf.ServerPubKeyAllowlist)
-		// Symmetric to the reload-path safety: a fresh boot that already
-		// has the feature enabled with L3FlushDryRun unset/false lands
-		// directly in real-flush mode with no operator acknowledgement.
-		// Force dry-run on for the first boot and emit a loud warning so
-		// the operator must explicitly reload with the same setting to
-		// start real flushing
-		if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun {
-			log.Warning("L3 flush-on-expiry enabled at boot with L3FlushDryRun unset/false; forcing dry-run for the first boot as safety. Reload config.toml with the same explicit L3FlushDryRun=false to acknowledge and start real-flush mode.")
+		// Symmetric to the reload-path safety: a fresh boot that enables
+		// real flushing without the separate durable acknowledgement must
+		// land in dry-run. This keeps an omitted false-valued TOML field from
+		// being interpreted as rollout approval.
+		if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun && !conf.L3FlushRealModeAcknowledged {
+			log.Warning("L3 flush-on-expiry enabled at boot with L3FlushDryRun unset/false and no durable real-mode acknowledgement; forcing dry-run for the first boot. Set L3FlushRealModeAcknowledged=true only after the dry-run rollout gates pass.")
 			conf.L3FlushDryRun = true
 		}
 		// Normalize breaker tunables in the first-load path. Without
@@ -536,25 +542,20 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		log.Warning("[L3FlushSched] EnableL3FlushOnExpiry reload from %t → %t requires AC restart to fully take effect (the running scheduler is not re-instantiated on config reload; dry-run and breaker tunables ARE live-tunable via SetDryRun/SetBreakerParams).", prevEnabled, conf.EnableL3FlushOnExpiry)
 		a.config.EnableL3FlushOnExpiry = conf.EnableL3FlushOnExpiry
 	}
-	// Auto-enable dry-run when the feature is freshly enabled but
-	// dry-run is unset (zero value). Forces the operator to make an
-	// explicit decision to disable dry-run rather than landing in
-	// real-flush mode by omission. The "first reload after enable"
-	// framing is intentional: it forces operators who set both
-	// EnableL3FlushOnExpiry=true and L3FlushDryRun=false in a single
-	// TOML edit to reload twice — once to enable (lands in dry-run),
-	// once to acknowledge by reloading the same explicit false. The
-	// tri-state L3FlushMode enum that lifts this UX limitation is
-	// tracked in the deferred-followups issue.
+	// Auto-enable dry-run when the feature is freshly enabled with the
+	// false zero value but without the distinct durable acknowledgement.
+	// Operators may either stage the historical two-reload transition or
+	// set L3FlushRealModeAcknowledged only after the rollout gates pass.
 	effectiveDryRun := conf.L3FlushDryRun
-	if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun && !prevEnabled {
-		log.Warning("L3 flush-on-expiry was just enabled with L3FlushDryRun unset/false; forcing dry-run for the first reload as safety. Reload again with the same explicit L3FlushDryRun=false to acknowledge and start real-flush mode.")
+	if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun && !prevEnabled && !conf.L3FlushRealModeAcknowledged {
+		log.Warning("L3 flush-on-expiry was just enabled with L3FlushDryRun unset/false and no durable real-mode acknowledgement; forcing dry-run for the first reload. Set L3FlushRealModeAcknowledged=true only after the dry-run rollout gates pass.")
 		effectiveDryRun = true
 	}
 	if a.config.L3FlushDryRun != effectiveDryRun {
 		log.Info("set L3 flush dry-run to %t", effectiveDryRun)
 		a.config.L3FlushDryRun = effectiveDryRun
 	}
+	a.config.L3FlushRealModeAcknowledged = conf.L3FlushRealModeAcknowledged
 	breakerTunablesChanged := false
 	if newThreshold := intOrDefault(conf.L3FlushErrorThreshold, DefaultL3FlushErrorThreshold); a.config.L3FlushErrorThreshold != newThreshold {
 		log.Info("set L3 flush error threshold to %d", newThreshold)

@@ -632,8 +632,8 @@ func TestAuthWithNHPClaims_ConsumedReKnock_AuthorizeRefreshes_SessionSurvives(t 
 	if ack.OpenTime != 120 {
 		t.Errorf("ack.OpenTime = %d, want 120 (agent paces re-knock to the refreshed pinhole)", ack.OpenTime)
 	}
-	if captured.SessionId != "sess_live_1" {
-		t.Errorf("SessionId = %q, want sess_live_1 (authorize's matched session, stamped into the AOP)", captured.SessionId)
+	if captured.QurlSessionId != "sess_live_1" {
+		t.Errorf("QurlSessionId = %q, want sess_live_1 (authorize's matched session, stamped into the AOP)", captured.QurlSessionId)
 	}
 	// A re-knock refresh does not re-navigate the browser.
 	if ack.RedirectUrl != "" {
@@ -1288,11 +1288,11 @@ func TestAuthWithNHPClaims_PopulatesRevocationMetadata(t *testing.T) {
 	if captured.Deadline != exp {
 		t.Errorf("Deadline = %d, want claim exp %d", captured.Deadline, exp)
 	}
-	// SessionId MUST be empty on the FIRST-KNOCK (prepare) path: prepare returns no
+	// QurlSessionId MUST be empty on the FIRST-KNOCK (prepare) path: prepare returns no
 	// session id, and only the steady-state authorize/refresh path carries one.
 	// This locks in that a first knock never leaks a session id into the AOP.
-	if captured.SessionId != "" {
-		t.Errorf("SessionId = %q, want empty on the first-knock (prepare) path", captured.SessionId)
+	if captured.QurlSessionId != "" {
+		t.Errorf("QurlSessionId = %q, want empty on the first-knock (prepare) path", captured.QurlSessionId)
 	}
 	// revocation_epoch is deferred and has NO field on ResourceData by design (no
 	// admission response returns it), so the deferral is structurally enforced.

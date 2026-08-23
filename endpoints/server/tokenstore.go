@@ -2,9 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"time"
+
+	conformance "github.com/layervai/qurl-conformance"
 
 	"github.com/OpenNHP/opennhp/endpoints/internal/acktoken"
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -28,11 +31,6 @@ import (
 //     observed by the listener (trustworthy — an adversary cannot spoof
 //     without a UDP send-spoof primitive, which doesn't survive the
 //     return-path handshake).
-//   - HTTP knock (handleHttpOpenResource): ctx.ClientIP() under gin's
-//     SetTrustedProxies configuration (see httpserver.go). Production either
-//     trusts a CIDR list (NHP_TRUSTED_PROXY_CIDRS, e.g. CloudFront origin) or
-//     trusts nobody, in which case ClientIP returns the TCP RemoteAddr — both
-//     trustworthy. X-Forwarded-For from an untrusted hop is ignored.
 //   - Forward receiver (forward.go): forwarder-supplied via fwdMsg.UserAddr,
 //     trusted transitively through the forwarder's Noise authentication
 //     (forwarders are peers, not arbitrary clients), not from-the-wire
@@ -52,9 +50,8 @@ type ACTokenEntry = acktoken.ACTokenEntry
 // against.
 const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSeconds
 
-// NewACKTokenEntry builds an ACTokenEntry for the ACK-construction path
-// (UDP knock, HTTP knock, forward receiver). The three call sites differ
-// only in resource-id source (knkMsg.ResourceId vs the loop name) and
+// NewACKTokenEntry builds an ACTokenEntry for native UDP and forwarded-knock
+// ACK construction. The call sites differ only in catalog-token key source and
 // the src-IP shape (NetAddress.Ip vs the request's already-parsed string),
 // which the caller passes in directly.
 //
@@ -84,13 +81,12 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // AgentUser unchanged so downstream consumers that expected client-
 // supplied semantics keep working. OwnerId is the new server-stamped
 // identity field — see `common.AgentUser` docstring for the spec
-// rationale. Empty when the caller has no resolved identity (e.g., the
-// HTTP knock path, which authenticates via a different mechanism and
-// passes "" here).
+// rationale. Empty remains valid for legacy entries created before strict
+// pubkey-bound ownership was required.
 //
 // RunID is copied only when AuthServiceId is the registered-agent service.
-// Legacy and HTTP flows remain deliberately unbound even if a generic legacy
-// client supplies a syntactically valid runId extension.
+// Legacy flows remain deliberately unbound even if a generic client supplies
+// a syntactically valid runId extension.
 func NewACKTokenEntry(
 	knkMsg *common.AgentKnockMsg,
 	resourceId string,
@@ -98,7 +94,19 @@ func NewACKTokenEntry(
 	srcIp string,
 	openTime int,
 	ownerId string,
+	sessionId uint64,
+	sessionExpireTime time.Time,
 ) *ACTokenEntry {
+	if knkMsg == nil || knkMsg.ResourceId == "" || sessionId == 0 || openTime <= 0 || sessionExpireTime.IsZero() {
+		return nil
+	}
+	protectedResourceID := ""
+	if knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		protectedResourceID = knkMsg.ProtectedResourceId
+		if !validProtectedResourceID(protectedResourceID) || protectedResourceID == knkMsg.ResourceId {
+			return nil
+		}
+	}
 	// maps.Clone returns nil for a nil input; normalize to an empty map
 	// so PR-2b's reader (and any future caller) never has to handle a
 	// nil-vs-empty distinction on stored entries. The branch only fires
@@ -121,13 +129,46 @@ func NewACKTokenEntry(
 			AuthServiceId:  knkMsg.AuthServiceId,
 			OwnerId:        ownerId,
 		},
-		ResourceId: resourceId,
-		ACTokens:   clonedTokens,
-		KnockSrcIP: srcIp,
-		RunID:      runID,
-		OpenTime:   openTime,
-		ExpireTime: time.Now().Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second),
+		ResourceId:          resourceId,
+		ProtectedResourceId: protectedResourceID,
+		ACTokens:            clonedTokens,
+		KnockSrcIP:          srcIp,
+		RunID:               runID,
+		SessionId:           sessionId,
+		OpenTime:            openTime,
+		SessionExpireTime:   sessionExpireTime,
+		ExpireTime:          sessionExpireTime.Add(accessTokenLatePacketBufferSeconds * time.Second),
 	}
+}
+
+// validProtectedResourceID applies the Connector resource contract's canonical
+// P-256 DER SPKI/base64url grammar. A knock/catalog routing key or Connector
+// routing ID cannot pass this gate and therefore cannot be misrepresented as
+// the public resource subject signed into token-validation responses.
+func validProtectedResourceID(value string) bool {
+	return conformance.ValidateConnectorResourceLSTV1ResourceID(value) == nil
+}
+
+// bindRegisteredAgentProtectedResource copies the public resource identity
+// only from the already-resolved server catalog row. The client-authenticated
+// AgentKnockMsg.ResourceId remains the distinct KnockResourceID/catalog lookup
+// key and is never promoted into authorization metadata.
+func bindRegisteredAgentProtectedResource(knkMsg *common.AgentKnockMsg, res *common.ResourceData) error {
+	if knkMsg == nil {
+		return errors.New("bind protected resource: missing knock")
+	}
+	knkMsg.ProtectedResourceId = ""
+	if knkMsg.AuthServiceId != common.RegisteredAgentAuthServiceID {
+		return nil
+	}
+	if res == nil || !validProtectedResourceID(res.ResourcePublicKeyB64) {
+		return errors.New("bind protected resource: resolved catalog public resource id is missing or malformed")
+	}
+	if res.ResourcePublicKeyB64 == knkMsg.ResourceId {
+		return errors.New("bind protected resource: public resource id is cross-wired to knock resource id")
+	}
+	knkMsg.ProtectedResourceId = res.ResourcePublicKeyB64
+	return nil
 }
 
 // GenerateAccessToken issues an opaque random access token for the given
@@ -180,8 +221,8 @@ func (s *UdpServer) VerifyAccessToken(token string) *ACTokenEntry {
 
 // storeACToken persists the given ACTokenEntry under token in the server
 // tokenStore. Package-private chokepoint for the ACK-construction path
-// (PublishACKTokens, which the local UDP/HTTP knock handlers and the
-// forward receiver all flow through) so PR-2b's
+// (PublishACKTokens, which the native UDP handler and forward receiver flow
+// through) so PR-2b's
 // /nhp/internal/token/validate can resolve AC-issued tokens.
 //
 // Empty tokens are silently ignored at the top — guarded here rather
@@ -255,7 +296,7 @@ func (s *UdpServer) storeLocalACToken(token string, entry *ACTokenEntry) {
 // trusting client-supplied labels. Callers obtain ownerId from the
 // pubkey-bound lookup (e.g., agentPeerLookup.CachedOwnerID(pubKeyB64)
 // on the UDP knock path); pass "" when no pubkey-resolved identity is
-// available (e.g., the HTTP knock path, which authenticates differently).
+// available on a legacy path.
 //
 // When the shared ACK-token store is configured, publication is fail-closed
 // for the whole ACK: every non-empty token must persist to the fleet-visible
@@ -266,6 +307,26 @@ func (s *UdpServer) storeLocalACToken(token string, entry *ACTokenEntry) {
 // across the ACK, not one full timeout per token, so a degraded table cannot
 // add N*timeout latency to a multi-resource knock before failing closed.
 func (s *UdpServer) PublishACKTokens(ctx context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
+	if ackMsg == nil || ackMsg.SessionId == 0 {
+		return errors.New("persist ACK token metadata: missing NHP session id")
+	}
+	if openTime <= 0 {
+		return errors.New("persist ACK token metadata: invalid open time")
+	}
+	if knkMsg == nil || knkMsg.NHPSessionIssuedAt.IsZero() {
+		return errors.New("persist ACK token metadata: missing NHP session issuance time")
+	}
+	if knkMsg.NHPSessionId == 0 || ackMsg.SessionId != knkMsg.NHPSessionId {
+		return errors.New("persist ACK token metadata: NHP session id mismatch")
+	}
+	if knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID &&
+		(!validProtectedResourceID(knkMsg.ProtectedResourceId) || knkMsg.ProtectedResourceId == knkMsg.ResourceId) {
+		return errors.New("persist ACK token metadata: invalid protected resource binding")
+	}
+	sessionExpireTime := knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
+	if !time.Now().Before(sessionExpireTime) {
+		return errors.New("persist ACK token metadata: NHP session expired")
+	}
 	type ackTokenPublication struct {
 		token string
 		entry *ACTokenEntry
@@ -277,8 +338,13 @@ func (s *UdpServer) PublishACKTokens(ctx context.Context, knkMsg *common.AgentKn
 		}
 		publications = append(publications, ackTokenPublication{
 			token: token,
-			entry: NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId),
+			entry: NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId, ackMsg.SessionId, sessionExpireTime),
 		})
+	}
+	for _, publication := range publications {
+		if publication.entry == nil {
+			return errors.New("persist ACK token metadata: invalid token subject")
+		}
 	}
 	if s.ackTokenStore != nil {
 		publishCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)

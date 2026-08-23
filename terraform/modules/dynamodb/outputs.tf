@@ -27,6 +27,11 @@ output "ack_tokens_table_arn" {
   value       = aws_dynamodb_table.ack_tokens.arn
 }
 
+output "session_control_table_arn" {
+  description = "ARN of the durable NHP session-control authority table"
+  value       = aws_dynamodb_table.session_control.arn
+}
+
 # ==================== Table Names ====================
 
 output "licenses_table_name" {
@@ -54,6 +59,11 @@ output "ack_tokens_table_name" {
   value       = aws_dynamodb_table.ack_tokens.name
 }
 
+output "session_control_table_name" {
+  description = "Name of the durable NHP session-control authority table"
+  value       = aws_dynamodb_table.session_control.name
+}
+
 output "all_table_names" {
   description = "List of all DynamoDB table names (for monitoring)"
   value = [
@@ -62,6 +72,7 @@ output "all_table_names" {
     aws_dynamodb_table.server_ac_index.name,
     aws_dynamodb_table.resources.name,
     aws_dynamodb_table.ack_tokens.name,
+    aws_dynamodb_table.session_control.name,
   ]
 }
 
@@ -218,4 +229,3 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_resource_key_material[0].arn,
   ] : []
 }
-

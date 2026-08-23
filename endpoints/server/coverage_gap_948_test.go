@@ -2,10 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -16,7 +13,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
-// TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs is an EMPIRICAL
+// TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs is an integration
 // reproduction of the qurl-service #948 firewall-coverage gap, exercising the
 // real production code paths (snapshotLiveACConns + processACOperationBroadcast)
 // with no behavioral mocks.
@@ -38,12 +35,12 @@ import (
 // (snapshotLiveACConns + processACOperationBroadcast) structurally cannot see an
 // AC on another server, so the local broadcast alone writes a pinhole on every
 // locally-connected AC EXCEPT that one. That local-only scope is exactly why the
-// handlers add a cross-server fan-out under Config.EnableKnockACFanout (proven by
-// TestFanoutHttpKnock_* / TestFanoutKnock_*). The target-set characterization is
-// independent of that flag.
+// native UDP handler adds cross-server fan-out under Config.EnableKnockACFanout
+// (proven by TestFanoutKnock_*). The target-set characterization is independent
+// of that flag.
 func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	s, sendCh := newTestServerForBroadcast(t)
-	// Enable only the local wait-for-all timing so PROOF 2 can assert after
+	// Enable only the local wait-for-all timing so the second assertion runs after
 	// every local AC reports. This direct broadcast call does not exercise the
 	// cross-server fan-out half of the flag; gamma remains absent from this
 	// server's map either way.
@@ -83,17 +80,15 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 				bothObserved.Do(func() { close(bothLocalAOPs) })
 			}
 			mu.Unlock()
-			art := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-			body, _ := json.Marshal(art)
-			md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_ART, BodyMessage: body}
+			body, bodyErr := successARTBodyForAOP(md, 0)
+			md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_ART, BodyMessage: body, Error: bodyErr}
 		}
 	}()
 
-	// The exact call the knock handler makes to choose AOP targets
-	// (httpserver.go handleHttpOpenResource / udpserver.go handleNhpOpenResource).
+	// The exact call the native UDP knock handler makes to choose AOP targets.
 	conns, _ := s.snapshotLiveACConns(acId)
 
-	// PROOF 1 — the per-server snapshot structurally cannot see gamma. The
+	// Check 1 — the per-server snapshot structurally cannot see gamma. The
 	// handler has no cross-server view, so it will never address an AOP to it.
 	if len(conns) != 2 {
 		t.Fatalf("snapshotLiveACConns(%q) = %d conns, want 2: the per-server map cannot see an AC connected to another server", acId, len(conns))
@@ -101,7 +96,8 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 
 	// Drive the real broadcast the knock path uses (viewer src, qURL 0.0.0.0
 	// destination sentinel that each AC localizes to its own IP, 60s openTime).
-	knk := &common.AgentKnockMsg{UserId: "viewer", ResourceId: "r_wge3dw4z_t4"}
+	knk := &common.AgentKnockMsg{UserId: "viewer", ResourceId: "r_wge3dw4z_t4", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+	reserveTestNHPSession(t, s, knk, 60)
 	srcAddr := &common.NetAddress{Ip: "20.169.72.19", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "0.0.0.0", Port: 443}}
 	if _, err := s.processACOperationBroadcast(context.Background(), knk, conns, srcAddr, dstAddrs, 60, nil); err != nil {
@@ -145,12 +141,12 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	}
 	got := waitForAOPs(alphaAddr, betaAddr)
 
-	// PROOF 2 — the two locally-connected ACs got the pinhole AOP (GET1's AC).
+	// Check 2 — the two locally-connected ACs got the pinhole AOP (GET1's AC).
 	if !got[alphaAddr] || !got[betaAddr] {
 		t.Fatalf("expected pinhole AOP on both locally-connected ACs; got %v", got)
 	}
 
-	// PROOF 3 — gamma, a healthy AC NLB target the viewer GET can be hashed to,
+	// Check 3 — gamma, a healthy AC NLB target the viewer GET can be hashed to,
 	// received NO admission AOP and therefore has no pinhole. The GET the NLB
 	// routes to gamma is dropped for the full client timeout. This is the #948
 	// coverage gap, reproduced against real server code.
@@ -161,7 +157,7 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 		"gamma is an NLB-routable AC with NO pinhole -> viewer GET hashed to gamma drops (qurl-service #948)", len(conns))
 }
 
-// TestKnockACFanout_BroadcastWaitsForAllLocalACs proves the local half of the
+// TestKnockACFanout_BroadcastWaitsForAllLocalACs validates the local half of the
 // #948 fix: with EnableKnockACFanout the broadcast must not ack until every
 // selected local AC has written its pinhole (so the ack -> 302 -> GET cannot
 // race a still-in-flight sibling AC), whereas the legacy path acks on the first
@@ -193,9 +189,8 @@ func TestKnockACFanout_BroadcastWaitsForAllLocalACs(t *testing.T) {
 							time.Sleep(80 * time.Millisecond) // slow AC: pinhole written late
 							slowWritten.Store(true)
 						}
-						art := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-						body, _ := json.Marshal(art)
-						md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_ART, BodyMessage: body}
+						body, bodyErr := successARTBodyForAOP(md, 0)
+						md.ResponseMsgCh <- &core.PacketParserData{HeaderType: core.NHP_ART, BodyMessage: body, Error: bodyErr}
 					}(md)
 				}
 			}()
@@ -205,7 +200,8 @@ func TestKnockACFanout_BroadcastWaitsForAllLocalACs(t *testing.T) {
 				newTestACConn(t, "10.0.0.2", 62206, "sandbox-ac"),
 				newTestACConn(t, "10.0.0.3", 62206, "sandbox-ac"),
 			}
-			knk := &common.AgentKnockMsg{UserId: "viewer"}
+			knk := &common.AgentKnockMsg{UserId: "viewer", NHPSessionId: 1, NHPSessionIssuedAt: time.Now()}
+			reserveTestNHPSession(t, s, knk, 60)
 			srcAddr := &common.NetAddress{Ip: "20.169.72.19", Port: 443}
 			dstAddrs := []*common.NetAddress{{Ip: "0.0.0.0", Port: 443}}
 
@@ -225,102 +221,6 @@ func TestKnockACFanout_BroadcastWaitsForAllLocalACs(t *testing.T) {
 			}
 			allDone.Wait() // no goroutine/channel leak in either mode
 		})
-	}
-}
-
-// TestFanoutHttpKnock_ReachesOnePeerPerNonLocalAZ proves the cross-server half
-// of the #948 fix on the HTTP qURL path: FanoutHttpKnock forwards to one healthy
-// assigned peer per non-local AZ, versus the legacy ForwardHttpKnock which stops
-// at the first success. Each forward targets InternalIP:httpPort, so one
-// httptest peer on that port counts the bounded fan-out.
-func TestFanoutHttpKnock_ReachesOnePeerPerNonLocalAZ(t *testing.T) {
-	var hits atomic.Int32
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		_ = json.NewEncoder(w).Encode(HttpKnockForwardResponse{
-			AckMsg: &common.ServerKnockAckMsg{ErrCode: common.ErrSuccess.ErrorCode()},
-		})
-	}))
-	defer peer.Close()
-	_, portStr, _ := net.SplitHostPort(peer.Listener.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-
-	storage := newMockStorageBackend()
-	storage.assignments["sandbox-ac"] = &ACAssignment{
-		ACID: "sandbox-ac",
-		AssignedServers: []ServerInfo{
-			{ID: "self", InternalIP: "10.0.0.9", AZ: "us-east-2a", Port: port},
-			{ID: "peer-same-az", InternalIP: "127.0.0.1", AZ: "us-east-2a", Port: port},
-			{ID: "peer-b-1", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
-			{ID: "peer-b-2", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
-			{ID: "peer-c", InternalIP: "127.0.0.1", AZ: "us-east-2c", Port: port},
-		},
-	}
-	newF := func() *HttpKnockForwarder {
-		return &HttpKnockForwarder{
-			storage:       storage,
-			localIP:       "10.0.0.9",
-			httpPort:      port,
-			httpClient:    &http.Client{Timeout: 2 * time.Second},
-			failedServers: make(map[string]time.Time),
-		}
-	}
-
-	hits.Store(0)
-	if _, _, err := newF().ForwardHttpKnock(context.Background(), "sandbox-ac", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
-		t.Fatalf("ForwardHttpKnock error: %v", err)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("legacy forward must hit exactly one peer (first-success), hit %d", got)
-	}
-
-	hits.Store(0)
-	accepted, err := newF().FanoutHttpKnock(context.Background(), "sandbox-ac",
-		&common.HttpKnockRequest{Forwarded: true}, &common.ResourceData{})
-	if err != nil {
-		t.Fatalf("FanoutHttpKnock error: %v", err)
-	}
-	if got := hits.Load(); got != 2 {
-		t.Fatalf("fan-out hit %d peers, want 2 (one per non-local AZ)", got)
-	}
-	if accepted != 2 {
-		t.Fatalf("FanoutHttpKnock peersAccepted = %d, want 2", accepted)
-	}
-}
-
-func TestFilterFanoutTargets_SelectsOnePeerPerAZAndIgnoresRecentlyFailedPeers(t *testing.T) {
-	metrics := make(map[string]int)
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, func(name string) {
-		metrics[name]++
-	}, nil)
-	f.markFailed("10.0.0.2")
-
-	servers := []ServerInfo{
-		{ID: "self", InternalIP: "10.0.0.1", AZ: "us-east-2a"},
-		{ID: "peer-same-az", InternalIP: "10.0.0.9", AZ: "us-east-2a"},
-		{ID: "peer-stale-failed", InternalIP: "10.0.0.2", AZ: "us-east-2b"},
-		{ID: "peer-b-duplicate", InternalIP: "10.0.0.4", AZ: "us-east-2b"},
-		{ID: "peer-fresh", InternalIP: "10.0.0.3", AZ: "us-east-2c"},
-		{ID: "peer-unknown-1", InternalIP: "10.0.0.5"},
-		{ID: "peer-unknown-2", InternalIP: "10.0.0.6"},
-	}
-
-	result := f.filterFanoutTargets(context.Background(), servers)
-	if len(result) != 3 {
-		t.Fatalf("fanout targets = %d, want 3 (AZ b, AZ c, one unknown-AZ bucket)", len(result))
-	}
-	got := map[string]bool{}
-	for _, srv := range result {
-		got[srv.ID] = true
-	}
-	if !got["peer-stale-failed"] || !got["peer-fresh"] || !got["peer-unknown-1"] {
-		t.Fatalf("fanout targets omitted expected AZ bucket after stale failure cache: got %v", got)
-	}
-	if got["peer-same-az"] || got["peer-b-duplicate"] || got["peer-unknown-2"] {
-		t.Fatalf("fanout targets were not bounded to one per non-local AZ: got %v", got)
-	}
-	if metrics[MetricKnockFanoutDuplicateAZCandidate] != 2 {
-		t.Fatalf("%s metric = %d, want 2 duplicate non-local AZ buckets", MetricKnockFanoutDuplicateAZCandidate, metrics[MetricKnockFanoutDuplicateAZCandidate])
 	}
 }
 
@@ -433,92 +333,5 @@ func TestFanoutKnock_ReachesOnePeerPerNonLocalAZ(t *testing.T) {
 	}
 	if sent != 2 {
 		t.Fatalf("fan-out sent %d NHP_FWD messages, want 2 (one per non-local AZ, stale failure cache ignored)", sent)
-	}
-}
-
-// TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast is the handler-
-// level integration test for the #948 fix on the qURL path: with
-// EnableKnockACFanout on, an origin knock both runs its local broadcast AND fans
-// the knock out to one assigned peer server per non-local AZ, and the handler
-// blocks on the fan-out (defer fanoutWg.Wait) before acking. Runs under -race to
-// fence the concurrent fan-out + broadcast goroutines on the hot path.
-func TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast(t *testing.T) {
-	const acId, resName = "sandbox-ac", "r_fanout"
-
-	var fanoutHits atomic.Int32
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fanoutHits.Add(1)
-		_ = json.NewEncoder(w).Encode(HttpKnockForwardResponse{
-			AckMsg: &common.ServerKnockAckMsg{ErrCode: common.ErrSuccess.ErrorCode()},
-		})
-	}))
-	defer peer.Close()
-	_, portStr, _ := net.SplitHostPort(peer.Listener.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-
-	storage := newMockStorageBackend()
-	storage.assignments[acId] = &ACAssignment{
-		ACID: acId,
-		AssignedServers: []ServerInfo{
-			{ID: "self", InternalIP: "10.0.0.99", AZ: "us-east-2a", Port: port},
-			{ID: "peer-same-az", InternalIP: "127.0.0.1", AZ: "us-east-2a", Port: port},
-			{ID: "peer-b", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
-			{ID: "peer-b-duplicate", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
-			{ID: "peer-c", InternalIP: "127.0.0.1", AZ: "us-east-2c", Port: port},
-		},
-	}
-
-	var localBroadcast atomic.Bool
-	us := &UdpServer{
-		tokenStore: common.NewTokenStore[*ACTokenEntry](),
-		config:     &Config{EnableKnockACFanout: true},
-		storage:    storage,
-		acConnectionMap: map[string][]*ACConn{
-			acId: {newACConnWithLastRecv(time.Now().UnixNano())},
-		},
-		processACOperationBroadcastFn: func(_ context.Context, _ *common.AgentKnockMsg, _ []*ACConn, _ *common.NetAddress, _ []*common.NetAddress, openTime uint32, _ *common.ResourceData) (*common.ACOpsResultMsg, error) {
-			localBroadcast.Store(true)
-			return &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode(), ACToken: "tok", OpenTime: openTime}, nil
-		},
-	}
-	hs := &HttpServer{
-		udpServer: us,
-		httpForwarder: &HttpKnockForwarder{
-			storage:       storage,
-			localIP:       "10.0.0.99", // self — distinct from the 127.0.0.1 peer
-			httpPort:      port,
-			httpClient:    &http.Client{Timeout: 2 * time.Second},
-			failedServers: make(map[string]time.Time),
-		},
-	}
-
-	req := &common.HttpKnockRequest{
-		UserId: "u", DeviceId: "d", AuthServiceId: "asp", ResourceId: resName,
-		SrcIp: "203.0.113.77", Ctx: context.Background(),
-	}
-	res := &common.ResourceData{
-		ResourceGroup: common.ResourceGroup{
-			ResourceId: resName,
-			OpenTime:   60,
-			Resources: map[string]*common.ResourceInfo{
-				resName: {ACId: acId, Addr: &common.NetAddress{Ip: "10.0.0.7", Port: 443}},
-			},
-		},
-	}
-
-	ack, err := hs.handleHttpOpenResource(req, res)
-	if err != nil {
-		t.Fatalf("handleHttpOpenResource error: %v", err)
-	}
-	if ack.ErrCode != common.ErrSuccess.ErrorCode() {
-		t.Fatalf("ack ErrCode = %q, want success", ack.ErrCode)
-	}
-	if !localBroadcast.Load() {
-		t.Error("local broadcast did not fire (the origin must still open its own ACs)")
-	}
-	// The handler must have blocked on the fan-out before returning, so the
-	// bounded peer forwards are already counted.
-	if got := fanoutHits.Load(); got != 2 {
-		t.Fatalf("fan-out forwards = %d, want 2 (one peer per non-local AZ before ack)", got)
 	}
 }

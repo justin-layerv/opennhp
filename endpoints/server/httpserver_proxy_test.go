@@ -106,14 +106,9 @@ func TestTrustedProxyConfiguration(t *testing.T) {
 // knock with a hostile X-Forwarded-For header must NOT influence
 // ctx.ClientIP(). The returned ClientIP must be the TCP RemoteAddr.
 //
-// ctx.ClientIP() is the source of req.SrcIp on the HTTP knock path
-// (httpserver.go:~672 and ~704), which flows into
-// ACTokenEntry.KnockSrcIP. PR-2b's /nhp/internal/token/validate
-// cross-checks KnockSrcIP against the FRP login source IP. If gin's
-// default "trust all proxies" posture re-asserts here, an attacker
-// can spoof X-Forwarded-For: <accomplice_ip> on the knock and have
-// an accomplice at that IP make the FRP login — both sides of the
-// cross-check become attacker-chosen, hollowing the control.
+// Plugin and internal HTTP routes use ctx.ClientIP for source gates and audit
+// attribution. If Gin's default "trust all proxies" posture re-asserts here,
+// an attacker can spoof X-Forwarded-For and bypass those assumptions.
 func TestClientIP_IgnoresXForwardedFor_WhenNoTrustedProxies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

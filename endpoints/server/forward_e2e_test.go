@@ -504,11 +504,13 @@ func TestE2E_ServerToServer_DirectMessage(t *testing.T) {
 
 	// Create a test NHP_FWD message
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock-data"),
-		SourceServer:  "server-a",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 12345,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock-data"),
+		SourceServer:         "server-a",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        12345,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	msgBytes, err := json.Marshal(fwdMsg)
@@ -582,11 +584,13 @@ func TestE2E_ServerToServer_RoundTrip(t *testing.T) {
 
 	// Send NHP_FWD from A to B
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     []byte("test-knock"),
-		SourceServer:  "server-a",
-		UserAddr:      "10.0.0.1:54321",
-		TransactionId: txID,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            []byte("test-knock"),
+		SourceServer:         "server-a",
+		UserAddr:             "10.0.0.1:54321",
+		TransactionId:        txID,
+		Timestamp:            time.Now().Unix(),
 	}
 	fwdBytes, _ := json.Marshal(fwdMsg)
 
@@ -757,6 +761,7 @@ func TestE2E_ForwarderIntegration(t *testing.T) {
 
 // e2eForwarderDeps implements ForwarderDeps for E2E testing with real encryption.
 type e2eForwarderDeps struct {
+	testForwardedSessionDeps
 	hostname string
 	device   *core.Device
 	node     *E2ETestNode
@@ -942,11 +947,13 @@ func TestE2E_HandleForwardRequest_RealDecryption(t *testing.T) {
 
 	// Create a fake NHP_FWD message containing the encrypted knock
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedKnock,
-		SourceServer:  "other-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 99999,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedKnock,
+		SourceServer:         "other-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        99999,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	// Create a mock PacketParserData for the incoming NHP_FWD
@@ -1056,11 +1063,13 @@ func TestE2E_HandleForwardRequest_InvalidAgentPubKeyAfterDecrypt(t *testing.T) {
 	forwarder := NewServerForwarder(deps)
 
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedKnock,
-		SourceServer:  "other-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 100001,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedKnock,
+		SourceServer:         "other-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        100001,
+		Timestamp:            time.Now().Unix(),
 	}
 	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
 	if err != nil {
@@ -1100,6 +1109,7 @@ func TestE2E_HandleForwardRequest_InvalidAgentPubKeyAfterDecrypt(t *testing.T) {
 
 // capturingForwarderDeps wraps e2eForwarderDeps with a callback on SendMessage.
 type capturingForwarderDeps struct {
+	testForwardedSessionDeps
 	hostname string
 	device   *core.Device
 	node     *E2ETestNode
@@ -1242,15 +1252,17 @@ func captureEncryptedPacket(sender, receiver *E2ETestNode, headerType int, messa
 
 // mockACForwarderDeps implements ForwarderDeps with real AC communication.
 type mockACForwarderDeps struct {
-	hostname     string
-	device       *core.Device
-	serverNode   *E2ETestNode
-	mockACNode   *E2ETestNode
-	onSendResult func(*common.ServerForwardResultMsg)
-	aspData      *common.AuthServiceProviderData
-	t            *testing.T
-	tokensMu     sync.Mutex
-	storedTokens map[string]*ACTokenEntry
+	testForwardedSessionDeps
+	hostname        string
+	device          *core.Device
+	serverNode      *E2ETestNode
+	mockACNode      *E2ETestNode
+	onSendResult    func(*common.ServerForwardResultMsg)
+	aspData         *common.AuthServiceProviderData
+	durableVerifier *UdpServer
+	t               *testing.T
+	tokensMu        sync.Mutex
+	storedTokens    map[string]*ACTokenEntry
 	// resolvedOwnerIDs lets tests pre-install the pubkey→ownerID
 	// mapping that ResolveOwnerIDByPubKey returns. Used by the
 	// FullACFlow test to fence end-to-end OwnerId propagation from
@@ -1260,6 +1272,15 @@ type mockACForwarderDeps struct {
 	// exercised. Guarded by tokensMu (same lock-domain as the
 	// stored-tokens map so concurrent test goroutines stay safe).
 	resolvedOwnerIDs map[string]string
+}
+
+func (d *mockACForwarderDeps) VerifyForwardedDurableNHPSession(ctx context.Context,
+	knkMsg *common.AgentKnockMsg,
+) (common.AgentSessionReceipt, error) {
+	if d.durableVerifier != nil {
+		return d.durableVerifier.VerifyForwardedDurableNHPSession(ctx, knkMsg)
+	}
+	return d.testForwardedSessionDeps.VerifyForwardedDurableNHPSession(ctx, knkMsg)
 }
 
 func (d *mockACForwarderDeps) GetHostname() string {
@@ -1368,7 +1389,8 @@ func newForwardE2EQURLTunnelResource(authSvcID, resourceID, acID string, port in
 				},
 			},
 		},
-		SkipAuth: true,
+		SkipAuth:             true,
+		ResourcePublicKeyB64: testProtectedResourceID,
 	}
 }
 
@@ -1388,14 +1410,19 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 	// revocation metadata when res carries it. Calls the SAME production helper
 	// as processACOperation so the mock's stamp can't drift from prod.
 	aopMsg := &common.ServerACOpsMsg{
-		UserId:           knkMsg.UserId,
-		DeviceId:         knkMsg.DeviceId,
-		OrganizationId:   knkMsg.OrganizationId,
-		AuthServiceId:    knkMsg.AuthServiceId,
-		ResourceId:       knkMsg.ResourceId,
-		SourceAddrs:      []*common.NetAddress{srcAddr},
-		DestinationAddrs: dstAddrs,
-		OpenTime:         openTime,
+		SessionId:             knkMsg.NHPSessionId,
+		AgentPublicKey:        knkMsg.NHPAgentPublicKey,
+		SessionIssuedAtMillis: knkMsg.NHPSessionIssuedAt.UnixMilli(),
+		RunID:                 knkMsg.RunID,
+		RunAttempt:            knkMsg.RunAttempt,
+		UserId:                knkMsg.UserId,
+		DeviceId:              knkMsg.DeviceId,
+		OrganizationId:        knkMsg.OrganizationId,
+		AuthServiceId:         knkMsg.AuthServiceId,
+		ResourceId:            knkMsg.ResourceId,
+		SourceAddrs:           []*common.NetAddress{srcAddr},
+		DestinationAddrs:      dstAddrs,
+		OpenTime:              openTime,
 	}
 	stampQurlV2RevocationMetadata(aopMsg, res)
 	aopBytes, _ := json.Marshal(aopMsg)
@@ -1503,11 +1530,12 @@ func (d *mockACForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // forward fence: every non-empty ackMsg.ACTokens entry flows through
 // StoreACToken with the maps.Clone snapshot from NewACKTokenEntry.
 func (d *mockACForwarderDeps) PublishACKTokens(_ context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
+	sessionExpireTime := knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
+		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId, ackMsg.SessionId, sessionExpireTime))
 	}
 	return nil
 }
@@ -1537,10 +1565,13 @@ func (d *mockACForwarderDeps) SetResolvedOwnerID(pubKeyB64, ownerID string) {
 func TestForwardPublishACKTokens_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
 	deps := &mockACForwarderDeps{t: t}
 	err := deps.PublishACKTokens(context.Background(), &common.AgentKnockMsg{
-		AuthServiceId: "legacy",
-		RunID:         "0123456789abcdef",
+		AuthServiceId:      "legacy",
+		ResourceId:         "public-resource",
+		RunID:              "0123456789abcdef",
+		NHPSessionIssuedAt: time.Now(),
 	}, &common.ServerKnockAckMsg{
-		ACTokens: map[string]string{"resource": "forwarded-legacy-token"},
+		SessionId: 1,
+		ACTokens:  map[string]string{"resource": "forwarded-legacy-token"},
 	}, "192.0.2.10", 60, "")
 	if err != nil {
 		t.Fatalf("PublishACKTokens: %v", err)
@@ -1687,6 +1718,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 		AuthServiceId: common.RegisteredAgentAuthServiceID,
 		ResourceId:    qurlplacement.TunnelServerResourceID,
 		RunID:         "0123456789abcdef",
+		RunAttempt:    1,
 		UserData: map[string]any{
 			"passcode": "123456",
 		},
@@ -1705,11 +1737,31 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 	// ========================================================================
 
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedKnock,
-		SourceServer:  "forwarding-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 77777,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedKnock,
+		SourceServer:         "forwarding-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        77777,
+		Timestamp:            time.Now().Unix(),
+	}
+	issuedAtMillis := time.Unix(0, fwdMsg.SessionIssuedAtNanos).UnixMilli()
+	durableStore := newAdmissionSessionControlStore(time.UnixMilli(issuedAtMillis + 1))
+	durableCandidate := sessionControlSessionCandidate{
+		CellID: testSessionControlCellID, AgentPublicKey: clientNode.PublicKeyStr(),
+		SessionID: fwdMsg.SessionId, IssuedAtMillis: issuedAtMillis,
+		ReservationDeadlineMillis: issuedAtMillis + pendingSessionReservationTTL.Milliseconds(),
+		RunID:                     knockMsg.RunID, RunAttempt: knockMsg.RunAttempt,
+	}
+	durableSnapshot, err := durableStore.SnapshotActiveFences(context.Background(), durableCandidate.CellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durableStore.ReserveSession(context.Background(), durableCandidate, *durableSnapshot); err != nil {
+		t.Fatalf("seed forwarded durable session: %v", err)
+	}
+	deps.durableVerifier = &UdpServer{
+		sessionControlCellID: durableCandidate.CellID, sessionControlStore: durableStore,
 	}
 
 	t.Log("Calling HandleForwardRequest...")
@@ -1748,6 +1800,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 	// ========================================================================
 
 	t.Log("Waiting for NHP_FRT result...")
+	var forwardedACK common.ServerKnockAckMsg
 	select {
 	case result := <-resultCh:
 		t.Logf("✓ Got NHP_FRT: Success=%v, ErrCode=%s, TxId=%d",
@@ -1760,6 +1813,14 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 		if result.TransactionId != fwdMsg.TransactionId {
 			t.Errorf("TransactionId mismatch: got %d, want %d",
 				result.TransactionId, fwdMsg.TransactionId)
+		}
+		if err := common.DecodeRegisteredAgentKnockAckMsg(result.ACKData, &forwardedACK,
+			knockMsg.RunID, knockMsg.RunAttempt, knockMsg.ResourceId); err != nil {
+			t.Fatalf("strict decode forwarded registered-agent ACK: %v", err)
+		}
+		if forwardedACK.CellId != testSessionControlCellID || forwardedACK.SessionId != fwdMsg.SessionId ||
+			forwardedACK.SessionIssuedAtMillis != time.Unix(0, fwdMsg.SessionIssuedAtNanos).UnixMilli() {
+			t.Fatalf("forwarded ACK receipt = %#v, want strong verified cell/session/issuance", forwardedACK)
 		}
 
 	case <-time.After(10 * time.Second):
@@ -1848,6 +1909,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 
 // errorACForwarderDeps is like mockACForwarderDeps but returns an error from AC.
 type errorACForwarderDeps struct {
+	testForwardedSessionDeps
 	hostname     string
 	device       *core.Device
 	serverNode   *E2ETestNode
@@ -2015,11 +2077,13 @@ func TestE2E_HandleForwardRequest_ACReturnsError(t *testing.T) {
 
 	// Send forward request
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedKnock,
-		SourceServer:  "forwarding-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 88888,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedKnock,
+		SourceServer:         "forwarding-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        88888,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	forwarder.HandleForwardRequest(nil, fwdMsg)
@@ -2051,6 +2115,7 @@ func TestE2E_HandleForwardRequest_ACReturnsError(t *testing.T) {
 
 // timeoutACForwarderDeps simulates an AC that doesn't respond.
 type timeoutACForwarderDeps struct {
+	testForwardedSessionDeps
 	hostname     string
 	device       *core.Device
 	serverNode   *E2ETestNode
@@ -2218,11 +2283,13 @@ func TestE2E_HandleForwardRequest_ACTimeout(t *testing.T) {
 
 	// Send forward request
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedKnock,
-		SourceServer:  "forwarding-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 99999,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedKnock,
+		SourceServer:         "forwarding-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        99999,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	startTime := time.Now()
@@ -2356,11 +2423,13 @@ func TestE2E_HandleForwardRequest_MultipleClients(t *testing.T) {
 		}
 
 		fwdMsg := &common.ServerForwardMsg{
-			KnockData:     encryptedKnock,
-			SourceServer:  "forwarding-server",
-			UserAddr:      "192.168.1.10" + string(rune('0'+i)) + ":12345",
-			TransactionId: txID,
-			Timestamp:     time.Now().Unix(),
+			SessionId:            uint64(i + 1),
+			SessionIssuedAtNanos: time.Now().UnixNano(),
+			KnockData:            encryptedKnock,
+			SourceServer:         "forwarding-server",
+			UserAddr:             "192.168.1.10" + string(rune('0'+i)) + ":12345",
+			TransactionId:        txID,
+			Timestamp:            time.Now().Unix(),
 		}
 
 		forwarder.HandleForwardRequest(nil, fwdMsg)
@@ -2468,11 +2537,13 @@ func TestE2E_HandleForwardRequest_InvalidKnockJSON(t *testing.T) {
 
 	// Send forward request
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     encryptedInvalid,
-		SourceServer:  "forwarding-server",
-		UserAddr:      "192.168.1.100:12345",
-		TransactionId: 11111,
-		Timestamp:     time.Now().Unix(),
+		SessionId:            1,
+		SessionIssuedAtNanos: time.Now().UnixNano(),
+		KnockData:            encryptedInvalid,
+		SourceServer:         "forwarding-server",
+		UserAddr:             "192.168.1.100:12345",
+		TransactionId:        11111,
+		Timestamp:            time.Now().Unix(),
 	}
 
 	forwarder.HandleForwardRequest(nil, fwdMsg)

@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"net/url"
+	"time"
 )
 
 // an object contains represent knocking user information
@@ -48,6 +49,13 @@ type AgentUser struct {
 
 type ResourceData struct {
 	ResourceGroup `mapstructure:",squash"`
+
+	// NHPSessionId is transient server state used to carry the origin
+	// server-assigned access-session identifier through authenticated NHP_FWD
+	// fanout. It is never loaded from catalog data or serialized as resource
+	// metadata; ServerForwardMsg has the explicit wire field.
+	NHPSessionId       uint64    `json:"-" mapstructure:"-"`
+	NHPSessionIssuedAt time.Time `json:"-" mapstructure:"-"`
 	// optional extension data
 	AppKey             string         `json:"appKey,omitempty"`
 	AppSecret          string         `json:"appSecret,omitempty"`
@@ -92,7 +100,7 @@ type ResourceData struct {
 	// unlike the per-admission fields, can ride a catalog ResourceData for a
 	// v2-provisioned resource even on a non-v2 knock — see processACOperation.)
 	//
-	// SessionId is carried ONLY by the steady-state re-knock (authorize) path:
+	// QurlSessionId is carried ONLY by the steady-state re-knock (authorize) path:
 	// the authorize response returns the matched live session, so the refresh
 	// stamps it here for the AC's session_id secondary index. The first-knock
 	// (prepare) path leaves it empty — prepare does not return a session id — so a
@@ -103,11 +111,11 @@ type ResourceData struct {
 	// docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
 	//
 	//   QurlUserPublicKeyHash: lowercase hex SHA-256 of the DECODED qURL-user pubkey
-	//   SessionId:             qURL v2 session id (authorize/re-knock path only)
+	//   QurlSessionId:         qURL v2 application session id (authorize/re-knock path only)
 	//   AdmissionId:           id of the admission decision that opened this access
 	//   Deadline:              unix seconds; admission validity deadline (claim exp)
 	QurlUserPublicKeyHash string `json:"qurlUserPublicKeyHash,omitempty"`
-	SessionId             string `json:"sessionId,omitempty"`
+	QurlSessionId         string `json:"qurlSessionId,omitempty"`
 	AdmissionId           string `json:"admissionId,omitempty"`
 	Deadline              int64  `json:"deadline,omitempty"`
 }
@@ -179,12 +187,14 @@ type NhpRegisterRequest struct {
 }
 
 type NhpAuthRequest struct {
-	Msg            *AgentKnockMsg     `json:"msg"`
-	Ack            *ServerKnockAckMsg `json:"ack"`
-	PublicKey      string             `json:"pubKey"`
-	SrcAddr        *NetAddress        `json:"srcAddr"`
-	WireHeaderType int                `json:"-"` // Outer packet HeaderType; Msg.HeaderType is the authenticated body type.
-	OriginalPacket []byte             `json:"-"` // Original encrypted knock packet for server-to-server forwarding
+	Msg             *AgentKnockMsg     `json:"msg"`
+	Ack             *ServerKnockAckMsg `json:"ack"`
+	PublicKey       string             `json:"pubKey"`
+	SrcAddr         *NetAddress        `json:"srcAddr"`
+	WireHeaderType  int                `json:"-"` // Outer packet HeaderType; Msg.HeaderType is the authenticated body type.
+	OriginalPacket  []byte             `json:"-"` // Original encrypted knock packet for server-to-server forwarding
+	SessionId       uint64             `json:"-"` // Server-assigned NHP access-session identifier; never client supplied.
+	SessionIssuedAt time.Time          `json:"-"` // Server issuance time for the access-session lifetime.
 }
 
 type NhpListRequest struct {

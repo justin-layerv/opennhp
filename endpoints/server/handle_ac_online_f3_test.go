@@ -61,7 +61,7 @@ func TestHandleACOnline_F3StrictReject_NoPeerLeak(t *testing.T) {
 	}
 	attackerPubkeyB64 := base64.StdEncoding.EncodeToString(attackerPubkey)
 
-	body, err := json.Marshal(common.ACOnlineMsg{ACId: acId})
+	body, err := json.Marshal(readyACOnlineMsg(acId, ""))
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestHandleACOnline_F3StrictReject_DoesNotEvictPreexistingPeer(t *testing.T)
 	}
 	s.acConnectionMap[acId] = saturated
 
-	body, err := json.Marshal(common.ACOnlineMsg{ACId: acId})
+	body, err := json.Marshal(readyACOnlineMsg(acId, ""))
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestHandleACOnline_F3StrictReject_FeedsLicenseRateLimiter(t *testing.T) {
 	for i := range attackerPubkey {
 		attackerPubkey[i] = 0xAA
 	}
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, ""))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,
@@ -346,7 +346,7 @@ func TestHandleACOnline_F3StrictReject_InLockOnly_MetricFiresOnce(t *testing.T) 
 	}
 	s.acConnectionMap[acId] = saturated
 
-	body, _ := json.Marshal(common.ACOnlineMsg{ACId: acId})
+	body, _ := json.Marshal(readyACOnlineMsg(acId, ""))
 	ppd := &core.PacketParserData{
 		HeaderType:   core.NHP_AOL,
 		BodyMessage:  body,

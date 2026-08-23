@@ -54,27 +54,28 @@ override_resource {
 }
 
 variables {
-  environment                  = "sandbox"
-  cell_id                      = "cell0"
-  server_ami_id                = "ami-00000000000000001"
-  domain_name                  = "nhp.layerv.xyz"
-  multi_tenant                 = true
-  min_capacity                 = 1
-  max_capacity                 = 2
-  vpc_id                       = "vpc-00000000000000001"
-  vpc_cidr                     = "10.100.0.0/16"
-  public_subnet_ids            = ["subnet-public-a", "subnet-public-b"]
-  private_subnet_ids           = ["subnet-private-a", "subnet-private-b"]
-  server_repo_url              = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-server"
-  server_repo_arn              = "arn:aws:ecr:us-east-2:767397897469:repository/layerv/nhp-server"
-  namespace_id                 = "ns-fixture"
-  namespace_name               = "sandbox.internal"
-  name_prefix                  = "layerv-nhp-sandbox"
-  logs_kms_key_arn             = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
-  nhp_internal_auth_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:nhp-internal-auth-ABCDEF"
-  http_timeouts_ms             = { idle = 36000, read = 10000, write = 29000 }
-  plugin_bucket_name           = "layerv-sandbox-plugins"
-  plugin_download_policy_arn   = "arn:aws:iam::767397897469:policy/layerv-sandbox-plugin-download"
+  environment                    = "sandbox"
+  cell_id                        = "cell0"
+  server_ami_id                  = "ami-00000000000000001"
+  domain_name                    = "nhp.layerv.xyz"
+  multi_tenant                   = true
+  min_capacity                   = 1
+  max_capacity                   = 2
+  vpc_id                         = "vpc-00000000000000001"
+  vpc_cidr                       = "10.100.0.0/16"
+  public_subnet_ids              = ["subnet-public-a", "subnet-public-b"]
+  private_subnet_ids             = ["subnet-private-a", "subnet-private-b"]
+  server_repo_url                = "767397897469.dkr.ecr.us-east-2.amazonaws.com/layerv/nhp-server"
+  server_repo_arn                = "arn:aws:ecr:us-east-2:767397897469:repository/layerv/nhp-server"
+  namespace_id                   = "ns-fixture"
+  namespace_name                 = "sandbox.internal"
+  name_prefix                    = "layerv-nhp-sandbox"
+  logs_kms_key_arn               = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000001"
+  nhp_internal_auth_secret_arn   = "arn:aws:secretsmanager:us-east-2:767397897469:secret:nhp-internal-auth-ABCDEF"
+  http_timeouts_ms               = { idle = 36000, read = 10000, write = 29000 }
+  plugin_bucket_name             = "layerv-sandbox-plugins"
+  plugin_download_policy_arn     = "arn:aws:iam::767397897469:policy/layerv-sandbox-plugin-download"
+  dynamodb_session_control_table = "layerv-nhp-sandbox-cell0-nhp-session-control"
 
   connector_authority_cell_config = {
     environment                            = "sandbox"
@@ -159,6 +160,24 @@ run "complete_cell_graph_uses_one_exact_private_endpoint" {
     )
     error_message = "The complete graph must enable creso and the template must guard its environment on that exact alias."
   }
+
+  assert {
+    condition = strcontains(
+      file("${path.module}/user_data.sh.tpl"),
+      "SessionControlTable = \"$${dynamodb_session_control_table}\"",
+    )
+    error_message = "Cloud compute must render the mandatory durable session-control table into storage.toml."
+  }
+}
+
+run "cloud_storage_requires_session_control_authority" {
+  command = plan
+
+  variables {
+    dynamodb_session_control_table = null
+  }
+
+  expect_failures = [terraform_data.session_control_storage_contract]
 }
 
 run "four_operation_rollout_predecessor_is_byte_compatible" {

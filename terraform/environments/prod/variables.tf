@@ -227,6 +227,12 @@ variable "l3_flush_dry_run" {
   default     = true
 }
 
+variable "l3_flush_real_mode_acknowledged" {
+  description = "Prod durable acknowledgement for direct real-flush boot. Keep false until the explicit dry-run soak and operational approval are complete."
+  type        = bool
+  default     = false
+}
+
 variable "l3_flush_conntrack_backend" {
   description = "AC conntrack teardown backend for prod L3 flush: exec or netlink."
   type        = string

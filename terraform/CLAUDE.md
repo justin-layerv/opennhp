@@ -172,8 +172,8 @@ cell-level server identity and makes the relay target source active-color-aware
 behind that stable identity; see
 [`../docs/design/RELAY_ACTIVE_CELL_ROUTING.md`](../docs/design/RELAY_ACTIVE_CELL_ROUTING.md).
 
-**ASG capacity is co-owned with CI/CD.** Three ASGs use
-`lifecycle { ignore_changes = [desired_capacity, min_size] }` for
+**ASG capacity is co-owned with CI/CD.** The blue/green fleets use
+`lifecycle.ignore_changes` for deployment-owned capacity for
 the same reason as the SSM params above — CI/CD scales them during
 blue/green flips and canary rollouts, and the next `terraform apply`
 must not revert that. Operator-side `aws autoscaling
@@ -184,11 +184,12 @@ else flips it (no plan-time revert):
 - `aws_autoscaling_group.ac` (`modules/ac/main.tf`)
 - `aws_autoscaling_group.frps` blue + green (`modules/qurl-reverse-tunnel-server/main.tf`, `blue_green.tf`)
 
-The NHP server blue + green ASGs in `modules/compute` additionally ignore
-`suspended_processes`. Deploys and attended infrastructure maintenance freeze
-those process sets directly through the Auto Scaling API; Terraform must not
-silently resume them during an unrelated apply. This does not apply to the AC
-or FRPS ASGs.
+The NHP server and AC blue + green ASGs additionally ignore `max_size` and
+`suspended_processes`. The durable-profile cut retires a legacy color at
+min=max=desired=0 with scaling suspended; Terraform must not silently make it
+launchable again. Blue/green owns the exact-image/profile write, capacity
+restore, process resume, refresh, and health proof. This does not apply to the
+FRPS ASGs.
 
 This is a permanent ownership boundary, not a cell1-only exception. A
 2026-07-25 read-only production check found `layerv-nhp-prod-server` at
@@ -213,9 +214,9 @@ changes that alter qurl-reverse-tunnel-server user_data/env wiring will roll
 the tunnel fleet without waiting for a qurl-reverse-tunnel-server image
 publish.
 
-`max_size` is deliberately NOT in `ignore_changes` so a CI scale-up
-that exceeds the static cap fights the rehearsal — the cap is the
-safety net.
+For the NHP server/AC blue-green fleets, `max_size` is deployment-owned for the
+same one-way-cut safety reason as min/desired. Other ASGs retain their existing
+Terraform-owned caps.
 
 **qurl-reverse-tunnel-server NHP validator origin.** Keep
 `local.nhp_server_internal_url` on the VPC-internal Cloud Map origin

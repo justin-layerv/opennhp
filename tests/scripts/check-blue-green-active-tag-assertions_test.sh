@@ -155,6 +155,8 @@ assert_step_order "$SWITCH" "$SERVER_PRE_STEP" "$AC_PRE_STEP" \
   "all standby assertions complete before any switch can fail later"
 assert_step_order "$SWITCH" "$AC_PRE_STEP" "[Server] Switch NLB Listeners" \
   "AC standby assertion completes before server switch"
+assert_step_order "$SWITCH" "[AC] Switch NLB Listener" "[Server] Switch NLB Listeners" \
+  "AC traffic becomes authoritative before durable-session server traffic"
 
 assert_step_order "$SWITCH" "[Server] Switch NLB Listeners" "$SERVER_POST_STEP" \
   "server active-tag assertion runs after server switch"

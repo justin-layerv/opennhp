@@ -180,7 +180,7 @@ func assertRunIDMismatchResponse(t *testing.T, rec *httptest.ResponseRecorder, w
 	if got.Valid || got.Error != "run_id_mismatch" || got.RunID != wantRunID {
 		t.Fatalf("response = %+v, want invalid run_id_mismatch with run_id %q", got, wantRunID)
 	}
-	if got.KnockSrcIP != "" || got.KnockUser != "" || got.OwnerId != "" || got.ExpiresAt != "" {
+	if got.ResourceId != "" || got.SessionId != 0 || got.SessionExpiresAt != 0 || got.KnockSrcIP != "" || got.KnockUser != "" || got.OwnerId != "" || got.ExpiresAt != "" {
 		t.Fatalf("mismatch response leaked stored metadata: %+v", got)
 	}
 
@@ -188,7 +188,7 @@ func assertRunIDMismatchResponse(t *testing.T, rec *httptest.ResponseRecorder, w
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Fatalf("decode response fields: %v", err)
 	}
-	for _, key := range []string{"knock_src_ip", "knock_user", "owner_id", "expires_at"} {
+	for _, key := range []string{"resource_id", "session_id", "session_expires_at", "knock_src_ip", "knock_user", "owner_id", "expires_at"} {
 		if _, present := fields[key]; present {
 			t.Errorf("mismatch response contains %q: %s", key, rec.Body.String())
 		}
@@ -348,6 +348,15 @@ func (failingReadCloser) Close() error {
 
 func storeTestACToken(t *testing.T, us *UdpServer, token string, entry *ACTokenEntry) {
 	t.Helper()
+	if !validProtectedResourceID(entry.ProtectedResourceId) || entry.ProtectedResourceId == entry.ResourceId {
+		entry.ProtectedResourceId = testProtectedResourceID
+	}
+	if entry.SessionId == 0 {
+		entry.SessionId = 1
+	}
+	if entry.SessionExpireTime.IsZero() {
+		entry.SessionExpireTime = time.Now().Add(time.Minute)
+	}
 	if err := us.storeACToken(context.Background(), token, entry); err != nil {
 		t.Fatalf("storeACToken(%q): %v", token, err)
 	}
@@ -368,6 +377,7 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
 	expire := time.Now().Add(60 * time.Second).UTC()
+	sessionExpire := expire.Add(-5 * time.Second)
 	entry := &ACTokenEntry{
 		User: &common.AgentUser{
 			UserId:         "user-happy",
@@ -376,12 +386,15 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 			AuthServiceId:  "asp-1",
 			OwnerId:        "owner-from-pubkey-lookup",
 		},
-		ResourceId: "r-happy",
-		ACTokens:   map[string]string{"r-happy": "ac-token-happy"},
-		KnockSrcIP: "203.0.113.42",
-		RunID:      "run-happy",
-		OpenTime:   60,
-		ExpireTime: expire,
+		ResourceId:          "q_catalog-happy",
+		ProtectedResourceId: testProtectedResourceID,
+		ACTokens:            map[string]string{"r-happy": "ac-token-happy"},
+		KnockSrcIP:          "203.0.113.42",
+		RunID:               "run-happy",
+		SessionId:           0x0123456789abcdef,
+		OpenTime:            60,
+		SessionExpireTime:   sessionExpire,
+		ExpireTime:          expire,
 	}
 	storeTestACToken(t, us, "ac-token-happy", entry)
 
@@ -397,6 +410,15 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	}
 	if !got.Valid {
 		t.Errorf("Valid = false, want true (body=%s)", rec.Body.String())
+	}
+	if got.ResourceId != entry.ProtectedResourceId {
+		t.Errorf("ResourceId = %q, want protected subject %q (catalog key is %q)", got.ResourceId, entry.ProtectedResourceId, entry.ResourceId)
+	}
+	if got.SessionId != entry.SessionId {
+		t.Errorf("SessionId = %#x, want server-assigned %#x", got.SessionId, entry.SessionId)
+	}
+	if got.SessionExpiresAt != sessionExpire.Unix() {
+		t.Errorf("SessionExpiresAt = %d, want %d", got.SessionExpiresAt, sessionExpire.Unix())
 	}
 	if got.KnockSrcIP != "203.0.113.42" {
 		t.Errorf("KnockSrcIP = %q, want %q", got.KnockSrcIP, "203.0.113.42")
@@ -430,22 +452,11 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	} else if !parsedExp.Equal(expire) {
 		t.Errorf("ExpiresAt round-trip mismatch: got %v, want %v (RFC3339 would round to seconds)", parsedExp, expire)
 	}
-	// Belt-and-braces: resource_id is intentionally omitted from
-	// the response (entry.ResourceId is held server-side but the
-	// wire contract does not surface it today — see the handler's
-	// "entry.ResourceId is intentionally omitted" comment). A
-	// future change that adds the field without coordinating with
-	// the tunnel-server consumer would land silently. Fail loud
-	// if a regression reintroduces it.
-	//
-	// Check key absence at the JSON layer rather than substring,
-	// otherwise a future field whose value happens to contain
-	// "resource_id" (e.g., an Error string) would false-positive.
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Errorf("decode response into fields map: %v", err)
-	} else if _, present := fields["resource_id"]; present {
-		t.Errorf("response body contains resource_id key (expected omitted until paired tunnel-server change): %s", rec.Body.String())
+	} else if _, present := fields["resource_id"]; !present {
+		t.Errorf("response body omits resource_id: %s", rec.Body.String())
 	}
 }
 
@@ -1095,7 +1106,7 @@ func TestInternalTokenValidate_EmptyOwnerId(t *testing.T) {
 	storeTestACToken(t, us, "ac-token-no-owner", &ACTokenEntry{
 		User: &common.AgentUser{
 			UserId:  "u",
-			OwnerId: "", // explicit zero value: the HTTP/forward/legacy-non-cloud-mode shape
+			OwnerId: "", // explicit zero value: the legacy/non-cloud-mode shape
 		},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.6",
@@ -1268,6 +1279,63 @@ func TestInternalTokenValidate_ZeroExpireTime(t *testing.T) {
 	}
 }
 
+// TestInternalTokenValidate_SameTokenReturnsStableSessionBinding verifies that
+// validation time is never used to derive a fresh token/session deadline. FRP
+// reconnects for one immutable RunID must receive the exact persisted binding.
+func TestInternalTokenValidate_SameTokenReturnsStableSessionBinding(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	expire := time.Now().Add(2 * time.Minute).UTC().Round(0)
+	sessionExpire := expire.Add(-5 * time.Second)
+	entry := &ACTokenEntry{
+		User:                &common.AgentUser{UserId: "stable-user", OwnerId: "stable-owner"},
+		ResourceId:          "q_catalog-stable",
+		ProtectedResourceId: testProtectedResourceID,
+		RunID:               "stable-run",
+		SessionId:           0xfedcba9876543210,
+		SessionExpireTime:   sessionExpire,
+		ExpireTime:          expire,
+	}
+	storeTestACToken(t, us, "stable-token", entry)
+	body := `{"token":"stable-token","agent_run_id":"stable-run"}`
+
+	validate := func() internalTokenValidateResponse {
+		rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("validate status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var got internalTokenValidateResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode validation response: %v", err)
+		}
+		if !got.Valid {
+			t.Fatalf("validation returned invalid: %#v", got)
+		}
+		return got
+	}
+
+	first := validate()
+	time.Sleep(25 * time.Millisecond)
+	second := validate()
+	for name, values := range map[string][2]any{
+		"expires_at":         {first.ExpiresAt, second.ExpiresAt},
+		"session_id":         {first.SessionId, second.SessionId},
+		"session_expires_at": {first.SessionExpiresAt, second.SessionExpiresAt},
+		"resource_id":        {first.ResourceId, second.ResourceId},
+		"run_id":             {first.RunID, second.RunID},
+	} {
+		if values[0] != values[1] {
+			t.Errorf("%s changed between validation clocks: first=%v second=%v", name, values[0], values[1])
+		}
+	}
+	if first.ExpiresAt != expire.Format(time.RFC3339Nano) ||
+		first.SessionExpiresAt != sessionExpire.Unix() ||
+		first.SessionId != entry.SessionId ||
+		first.ResourceId != entry.ProtectedResourceId ||
+		first.RunID != entry.RunID {
+		t.Fatalf("stable response does not match persisted entry: %#v", first)
+	}
+}
+
 // TestInternalTokenValidate_NotFound locks the "valid=false +
 // error=not_found" branch for an unknown token.
 func TestInternalTokenValidate_NotFound(t *testing.T) {
@@ -1332,11 +1400,14 @@ func TestInternalTokenValidate_SharedStoreHitOnLocalMiss(t *testing.T) {
 			AuthServiceId:  "asp-shared",
 			OwnerId:        "owner-shared",
 		},
-		ResourceId: "r-shared",
-		KnockSrcIP: "203.0.113.77",
-		RunID:      "run-shared",
-		OpenTime:   60,
-		ExpireTime: expire,
+		ResourceId:          "q_catalog-shared",
+		ProtectedResourceId: testProtectedResourceID,
+		KnockSrcIP:          "203.0.113.77",
+		RunID:               "run-shared",
+		SessionId:           101,
+		OpenTime:            60,
+		SessionExpireTime:   expire.Add(-5 * time.Second),
+		ExpireTime:          expire,
 	}
 	store := &fakeACKTokenStore{entry: entry, found: true}
 	us.ackTokenStore = store
@@ -1438,16 +1509,20 @@ func TestInternalTokenValidate_SharedStoreRunIDMismatchRejects(t *testing.T) {
 func TestInternalTokenValidate_LocalHitDoesNotConsultSharedStore(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
+	expire := time.Now().Add(60 * time.Second).UTC()
 	entry := &ACTokenEntry{
 		User: &common.AgentUser{
 			UserId:  "user-local",
 			OwnerId: "owner-local",
 		},
-		ResourceId: "r-local",
-		KnockSrcIP: "203.0.113.78",
-		RunID:      "run-local",
-		OpenTime:   60,
-		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
+		ResourceId:          "q_catalog-local",
+		ProtectedResourceId: testProtectedResourceID,
+		KnockSrcIP:          "203.0.113.78",
+		RunID:               "run-local",
+		SessionId:           102,
+		OpenTime:            60,
+		SessionExpireTime:   expire.Add(-5 * time.Second),
+		ExpireTime:          expire,
 	}
 	us.tokenStore.Store("ac-token-local", entry)
 	store := &fakeACKTokenStore{err: errors.New("shared store should not be called on local hit")}
@@ -2324,13 +2399,14 @@ func TestInternalTokenValidate_ConcurrentValidates(t *testing.T) {
 // keyspaces, or adding an issuer discriminator) would silently flip
 // this row from valid=true to not_found and break the consumer
 // contract advertised in the response struct godoc.
-func TestInternalTokenValidate_ServerIssuedTokenResolves(t *testing.T) {
+func TestInternalTokenValidate_ServerIssuedTokenWithoutSessionRejected(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 	entry := &ACTokenEntry{
-		User:       &common.AgentUser{UserId: "u-server-issued"},
-		ResourceId: "r-server-issued",
-		KnockSrcIP: "10.0.0.88",
-		OpenTime:   60,
+		User:                &common.AgentUser{UserId: "u-server-issued"},
+		ResourceId:          "q_catalog-server-issued",
+		ProtectedResourceId: testProtectedResourceID,
+		KnockSrcIP:          "10.0.0.88",
+		OpenTime:            60,
 	}
 	token := us.GenerateAccessToken(entry)
 	body := `{"token":"` + token + `"}`
@@ -2342,11 +2418,76 @@ func TestInternalTokenValidate_ServerIssuedTokenResolves(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !got.Valid {
-		t.Errorf("Valid = false; server-issued token should validate the same as AC-issued (shared keyspace)")
+	if got.Valid || got.Error != "invalid_session" {
+		t.Errorf("response = %+v, want invalid_session for token without NHP session binding", got)
 	}
-	if got.KnockUser != "u-server-issued" {
-		t.Errorf("KnockUser = %q, want %q", got.KnockUser, "u-server-issued")
+	if got.KnockUser != "" || got.ResourceId != "" || got.SessionId != 0 || got.SessionExpiresAt != 0 {
+		t.Errorf("negative response leaked metadata: %+v", got)
+	}
+}
+
+func TestInternalTokenValidate_RejectsInvalidSessionBindingsWithoutMetadata(t *testing.T) {
+	tests := map[string]struct {
+		mutate    func(*ACTokenEntry)
+		wantError string
+	}{
+		"missing protected resource": {
+			mutate:    func(entry *ACTokenEntry) { entry.ProtectedResourceId = "" },
+			wantError: "invalid_resource",
+		},
+		"zero session id": {
+			mutate:    func(entry *ACTokenEntry) { entry.SessionId = 0 },
+			wantError: "invalid_session",
+		},
+		"missing session expiry": {
+			mutate:    func(entry *ACTokenEntry) { entry.SessionExpireTime = time.Time{} },
+			wantError: "invalid_session",
+		},
+		"expired session within token buffer": {
+			mutate:    func(entry *ACTokenEntry) { entry.SessionExpireTime = time.Now().Add(-time.Second) },
+			wantError: "session_expired",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			r, signer, us := newTokenValidateRouter(t, true)
+			entry := &ACTokenEntry{
+				User:                &common.AgentUser{UserId: "hidden-user", OwnerId: "hidden-owner"},
+				ResourceId:          "q_catalog-session-bound",
+				ProtectedResourceId: testProtectedResourceID,
+				KnockSrcIP:          "203.0.113.99",
+				RunID:               "run-session-bound",
+				SessionId:           123,
+				OpenTime:            60,
+				SessionExpireTime:   time.Now().Add(55 * time.Second),
+				ExpireTime:          time.Now().Add(time.Minute),
+			}
+			test.mutate(entry)
+			if err := us.storeACToken(context.Background(), "invalid-session-token", entry); err != nil {
+				t.Fatalf("store invalid entry: %v", err)
+			}
+			body := `{"token":"invalid-session-token","agent_run_id":"run-session-bound"}`
+			rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+			var got internalTokenValidateResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got.Valid || got.Error != test.wantError || got.RunID != "run-session-bound" {
+				t.Fatalf("response = %+v, want invalid %s", got, test.wantError)
+			}
+			if got.ResourceId != "" || got.SessionId != 0 || got.SessionExpiresAt != 0 || got.KnockSrcIP != "" || got.KnockUser != "" || got.OwnerId != "" || got.ExpiresAt != "" {
+				t.Fatalf("negative response leaked stored metadata: %+v", got)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
+				t.Fatalf("decode response fields: %v", err)
+			}
+			for _, key := range []string{"resource_id", "session_id", "session_expires_at", "knock_src_ip", "knock_user", "owner_id", "expires_at"} {
+				if _, present := fields[key]; present {
+					t.Errorf("negative response contains %q: %s", key, rec.Body.String())
+				}
+			}
+		})
 	}
 }
 

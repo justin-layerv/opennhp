@@ -3,8 +3,10 @@ package ac
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,36 @@ import (
 // public client-edge port the AC dials for registration, which the cell NLB
 // then forwards here.
 const testServerListenPort = common.DefaultNHPPort
+
+const (
+	testRefreshBootID          = "00112233445566778899aabbccddeeff"
+	testRefreshFlushGeneration = uint64(1)
+	testRefreshAOLTransaction  = uint64(7)
+)
+
+func prepareRefreshSessionControl(t *testing.T, ac *UdpAC) {
+	t.Helper()
+	ac.bootID = testRefreshBootID
+	if ac.nhpSessions == nil {
+		ac.nhpSessions = newNHPSessionIndex()
+	}
+	if ac.tokenStore == nil {
+		ac.tokenStore = common.NewTokenStore[*AccessEntry]()
+	}
+	if ac.expirySched == nil {
+		ac.expirySched = NewScheduler(&NoOpFlusher{})
+	}
+	ac.sessionControlStateDir = t.TempDir()
+	if err := persistSessionControlGeneration(
+		filepath.Join(ac.sessionControlStateDir, sessionControlGenerationRelativePath),
+		testRefreshFlushGeneration,
+	); err != nil {
+		t.Fatalf("persist session-control generation fixture: %v", err)
+	}
+	ac.sessionFlushGeneration.Store(testRefreshFlushGeneration)
+	ac.sessionFlushComplete.Store(true)
+	ac.sessionControlLeaseHeld.Store(true)
+}
 
 // mustNewACRegistration is a test helper that calls NewACRegistration and
 // fails the test if it returns an error.
@@ -37,6 +69,9 @@ const testServerListenPort = common.DefaultNHPPort
 // pointer to the Config sees the empty value it constructed.
 func mustNewACRegistration(t *testing.T, ac *UdpAC) *ACRegistration {
 	t.Helper()
+	if ac != nil && !common.ValidNHPACBootID(ac.bootID) {
+		prepareRefreshSessionControl(t, ac)
+	}
 	if ac != nil && ac.config != nil && ac.config.Environment == "" {
 		cfg := *ac.config
 		cfg.Environment = "test"
@@ -47,6 +82,76 @@ func mustNewACRegistration(t *testing.T, ac *UdpAC) *ACRegistration {
 		t.Fatalf("NewACRegistration failed: %v", err)
 	}
 	return reg
+}
+
+// handleTestRegistrationResponse upgrades legacy success fixtures to the
+// strict NHP 1.2 authority tuple. Individual tests remain focused on peer and
+// registration transitions; strict AAK grammar and mismatch behavior have
+// dedicated codec/lease tests and must not be weakened in production.
+func handleTestRegistrationResponse(reg *ACRegistration, ppd *core.PacketParserData, peer *core.UdpPeer) error {
+	if reg == nil {
+		return errors.New("nil AC registration fixture")
+	}
+	if reg.ac == nil || ppd == nil || ppd.HeaderType != core.NHP_AAK {
+		return reg.handleRegistrationResponse(ppd, peer)
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(ppd.BodyMessage, &object) != nil {
+		return reg.handleRegistrationResponse(ppd, peer)
+	}
+	if _, present := object["errCode"]; !present {
+		object["errCode"] = json.RawMessage(`"0"`)
+	}
+	var errCode string
+	var registered bool
+	if json.Unmarshal(object["errCode"], &errCode) != nil ||
+		json.Unmarshal(object["registered"], &registered) != nil ||
+		!common.IsSuccessErrCode(errCode) || !registered {
+		body, _ := json.Marshal(object)
+		copyPPD := *ppd
+		copyPPD.BodyMessage = body
+		return reg.handleRegistrationResponse(&copyPPD, peer)
+	}
+	object["bootId"] = mustJSONRaw(reg.ac.bootID)
+	object["sessFlushGen"] = mustJSONRaw(reg.ac.sessionFlushGeneration.Load())
+	object["aolTrxId"] = mustJSONRaw(testRefreshAOLTransaction)
+	body, _ := json.Marshal(object)
+	copyPPD := *ppd
+	copyPPD.BodyMessage = body
+	copyPPD.SenderTrxId = testRefreshAOLTransaction
+	return reg.handleRegistrationResponse(&copyPPD, peer)
+}
+
+func mustJSONRaw(value any) json.RawMessage {
+	body, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+// successfulTestAAKPacket constructs the exact successful wire response used
+// by mocked registration transactions. Callers supply only the fields relevant
+// to their test; this helper adds the required success and authority fields.
+func successfulTestAAKPacket(ac *UdpAC, body []byte) *core.PacketParserData {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(body, &object) != nil {
+		panic("successfulTestAAKPacket requires a JSON object")
+	}
+	object["errCode"] = json.RawMessage(`"0"`)
+	object["registered"] = json.RawMessage(`true`)
+	object["bootId"] = mustJSONRaw(ac.bootID)
+	object["sessFlushGen"] = mustJSONRaw(ac.sessionFlushGeneration.Load())
+	object["aolTrxId"] = mustJSONRaw(testRefreshAOLTransaction)
+	strictBody, err := json.Marshal(object)
+	if err != nil {
+		panic(err)
+	}
+	return &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: strictBody,
+		SenderTrxId: testRefreshAOLTransaction,
+	}
 }
 
 // TestNilMetricsPublisher tests that ACRegistration with nil metrics publisher doesn't panic.
@@ -1543,7 +1648,7 @@ func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 				BodyMessage: []byte(`{"registered":false}`),
 			},
 			expectError:   true,
-			errorContains: "Registered=false",
+			errorContains: "successful AAK must contain registered:true",
 		},
 		{
 			name: "NHP_AAK parse error",
@@ -1600,7 +1705,7 @@ func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := reg.handleRegistrationResponse(tt.ppd, mockPeer)
+			err := handleTestRegistrationResponse(reg, tt.ppd, mockPeer)
 
 			if tt.expectError && err == nil {
 				t.Error("expected error but got nil")
@@ -2047,7 +2152,7 @@ func TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer(t *testing.T)
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.100:62206"}`),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, newPeer)
+	err := handleTestRegistrationResponse(reg, ppd, newPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2113,7 +2218,7 @@ func TestACRegistration_NHP_AAK_AddsToAssignedServers(t *testing.T) {
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.1:62206"}`),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, testPeer)
+	err := handleTestRegistrationResponse(reg, ppd, testPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2203,7 +2308,7 @@ func TestACRegistration_NHP_AAK_KeepaliveEligibility(t *testing.T) {
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.2:62206"}`),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, testPeer)
+	err := handleTestRegistrationResponse(reg, ppd, testPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2268,7 +2373,7 @@ func TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer(t *testing
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.10:62206"}`),
 	}
 
-	err := reg.handleRegistrationResponse(ppd1, firstPeer)
+	err := handleTestRegistrationResponse(reg, ppd1, firstPeer)
 	if err != nil {
 		t.Fatalf("first registration failed: %v", err)
 	}
@@ -2295,7 +2400,7 @@ func TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer(t *testing
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.20:62206"}`),
 	}
 
-	err = reg.handleRegistrationResponse(ppd2, secondPeer)
+	err = handleTestRegistrationResponse(reg, ppd2, secondPeer)
 	if err != nil {
 		t.Fatalf("second registration failed: %v", err)
 	}
@@ -2361,7 +2466,7 @@ func TestACRegistration_NHP_AAK_AssignedServerFields(t *testing.T) {
 		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"192.168.1.100:12345"}`),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, testPeer)
+	err := handleTestRegistrationResponse(reg, ppd, testPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2464,7 +2569,7 @@ func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2557,7 +2662,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_Fallback(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2618,7 +2723,7 @@ func TestACRegistration_NHP_AAK_Legacy(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2694,7 +2799,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_RemovesOldPeer(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2763,7 +2868,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_IPv6(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2827,7 +2932,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerAddr(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2886,7 +2991,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerPubKey(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2947,7 +3052,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 		BodyMessage: []byte(firstAAK),
 	}
 
-	err := reg.handleRegistrationResponse(ppd1, firstPeer)
+	err := handleTestRegistrationResponse(reg, ppd1, firstPeer)
 	if err != nil {
 		t.Fatalf("first registration failed: %v", err)
 	}
@@ -2980,7 +3085,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 		BodyMessage: []byte(secondAAK),
 	}
 
-	err = reg.handleRegistrationResponse(ppd2, secondPeer)
+	err = handleTestRegistrationResponse(reg, ppd2, secondPeer)
 	if err != nil {
 		t.Fatalf("second registration failed: %v", err)
 	}
@@ -3055,7 +3160,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3139,7 +3244,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_SamePubKey(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3240,7 +3345,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_VariousPorts(t *testing.T) {
 				BodyMessage: []byte(aakJSON),
 			}
 
-			err := reg.handleRegistrationResponse(ppd, registrationPeer)
+			err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -3318,7 +3423,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats(t *testing.T) {
 				BodyMessage: []byte(aakJSON),
 			}
 
-			err := reg.handleRegistrationResponse(ppd, registrationPeer)
+			err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 			if err != nil {
 				t.Fatalf("should not error, but got: %v", err)
 			}
@@ -3393,7 +3498,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost(t *testing.T) {
 		BodyMessage: []byte(aakJSON),
 	}
 
-	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 	if err != nil {
 		t.Fatalf("should not error, but got: %v", err)
 	}
@@ -3499,7 +3604,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_PrivateIPBlocked(t *testing.T) {
 			BodyMessage: []byte(aakJSON),
 		}
 
-		err := reg.handleRegistrationResponse(ppd, registrationPeer)
+		err := handleTestRegistrationResponse(reg, ppd, registrationPeer)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -4046,15 +4151,15 @@ func TestACRegistration_TriggerReregistration_StopsOnShutdown(t *testing.T) {
 // This is the primary health signal — NHP_KPL is unidirectional and cannot confirm receipt.
 // Only validated NHP_AAK responses to NHP_AOL update LastSeen.
 func TestRegistrationRefreshInterval(t *testing.T) {
-	// Verify refresh happens every 20 seconds (2 * 10s keepalive interval)
-	expectedTicks := 2
+	// Authenticated AAK refresh is the 10-second session-control heartbeat.
+	expectedTicks := 1
 	if RegistrationRefreshInterval != expectedTicks {
 		t.Errorf("Expected RegistrationRefreshInterval to be %d, got %d", expectedTicks, RegistrationRefreshInterval)
 	}
 
-	// Verify the actual interval is 20 seconds
+	// Verify the actual interval is 10 seconds.
 	actualInterval := time.Duration(RegistrationRefreshInterval) * KeepaliveInterval
-	expectedInterval := 20 * time.Second
+	expectedInterval := 10 * time.Second
 	if actualInterval != expectedInterval {
 		t.Errorf("Expected actual refresh interval to be %v, got %v", expectedInterval, actualInterval)
 	}
@@ -4151,12 +4256,7 @@ func TestHandleRefreshResponse_Success(t *testing.T) {
 	aakMsg := common.ServerACAckMsg{
 		ErrCode: common.ErrSuccess.ErrorCode(),
 	}
-	aakBytes, _ := json.Marshal(aakMsg)
-
-	ppd := &core.PacketParserData{
-		HeaderType:  core.NHP_AAK,
-		BodyMessage: aakBytes,
-	}
+	ppd := newAAKPacket(t, ac, aakMsg)
 
 	oldLastSeen := server.GetLastSeen()
 
@@ -4361,11 +4461,7 @@ func TestACRegistration_KeepaliveResponseValidation(t *testing.T) {
 		aakMsg := common.ServerACAckMsg{
 			ErrCode: common.ErrSuccess.ErrorCode(),
 		}
-		aakBytes, _ := json.Marshal(aakMsg)
-		ppd := &core.PacketParserData{
-			HeaderType:  core.NHP_AAK,
-			BodyMessage: aakBytes,
-		}
+		ppd := newAAKPacket(t, ac, aakMsg)
 
 		reg.handleRefreshResponse(ppd, server, sendAddr)
 
@@ -4482,6 +4578,7 @@ func newRegWithServers(t *testing.T, acID string, servers []*AssignedServer) *AC
 		config:    &Config{ACId: acID, ServerEndpoint: "server.test"},
 		sendMsgCh: make(chan *core.MsgData, 10),
 	}
+	prepareRefreshSessionControl(t, ac)
 	reg := mustNewACRegistration(t, ac)
 	reg.mu.Lock()
 	reg.assignedServers = servers
@@ -4583,8 +4680,16 @@ func TestACRegistration_PeersChanged(t *testing.T) {
 }
 
 // newAAKPacket marshals a ServerACAckMsg into a PacketParserData for handleRefreshResponse tests.
-func newAAKPacket(t *testing.T, msg common.ServerACAckMsg) *core.PacketParserData {
+func newAAKPacket(t *testing.T, ac *UdpAC, msg common.ServerACAckMsg) *core.PacketParserData {
 	t.Helper()
+	senderTrxID := uint64(0)
+	if common.IsSuccessErrCode(msg.ErrCode) {
+		msg.Registered = true
+		msg.BootID = ac.bootID
+		msg.SessionFlushGeneration = ac.sessionFlushGeneration.Load()
+		msg.AOLTransactionID = testRefreshAOLTransaction
+		senderTrxID = testRefreshAOLTransaction
+	}
 	body, err := json.Marshal(msg)
 	if err != nil {
 		t.Fatalf("marshal ServerACAckMsg: %v", err)
@@ -4592,6 +4697,7 @@ func newAAKPacket(t *testing.T, msg common.ServerACAckMsg) *core.PacketParserDat
 	return &core.PacketParserData{
 		HeaderType:  core.NHP_AAK,
 		BodyMessage: body,
+		SenderTrxId: senderTrxID,
 	}
 }
 
@@ -4658,7 +4764,7 @@ func TestHandleRefreshResponse_PeerReconciliation(t *testing.T) {
 			server := &AssignedServer{Target: tt.assigned[0].Target}
 			sendAddr := &net.UDPAddr{IP: net.ParseIP(tt.assigned[0].Target.IP), Port: tt.assigned[0].Target.Port}
 
-			reg.handleRefreshResponse(newAAKPacket(t, tt.aak), server, sendAddr)
+			reg.handleRefreshResponse(newAAKPacket(t, reg.ac, tt.aak), server, sendAddr)
 
 			if got := reg.reregistering.Load(); got != tt.wantReregistered {
 				t.Errorf("reregistering = %v, want %v", got, tt.wantReregistered)
@@ -4794,7 +4900,7 @@ func TestHandleRefreshResponse_MixedValidInvalidPeers(t *testing.T) {
 	server := &AssignedServer{Target: assigned[0].Target}
 	sendAddr := &net.UDPAddr{IP: net.ParseIP(assigned[0].Target.IP), Port: assigned[0].Target.Port}
 
-	reg.handleRefreshResponse(newAAKPacket(t, aak), server, sendAddr)
+	reg.handleRefreshResponse(newAAKPacket(t, reg.ac, aak), server, sendAddr)
 
 	// 2 valid peers vs 3 assigned → count mismatch → re-registration
 	if !reg.reregistering.Load() {

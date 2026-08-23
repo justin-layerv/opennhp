@@ -2,14 +2,9 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -337,8 +332,8 @@ func TestNormalizeInternalKnockMetricSource(t *testing.T) {
 //
 // Test design: zero-value HttpServer{} (nil udpServer) is
 // deliberate. The current post-auth path resolves ResourceData from
-// the server-owned catalog before handleHttpOpenResource can dispatch
-// AC operations, so the zero-value fixture returns
+// the server-owned catalog before reaching the retired direct-admission
+// terminal, so the zero-value fixture returns
 // an internal server-not-ready error instead of trusting caller-supplied
 // ResourceData.
 func TestInternalKnock_LegacyMode_NoSignerSet(t *testing.T) {
@@ -692,109 +687,6 @@ func TestLoadInternalAuthConfig(t *testing.T) {
 				t.Errorf("want nil signer, got %v", signer)
 			}
 		})
-	}
-}
-
-// newForwarderAgainstEcho spins up an httptest receiver running
-// handler and returns a forwarder configured to route to it, along
-// with a cleanup that the caller must defer. Extracted so the two
-// forwarder tests below share the httptest + SplitHostPort + Atoi +
-// NewHttpKnockForwarder boilerplate; a third forwarder test should
-// reuse the helper rather than copy it.
-func newForwarderAgainstEcho(t *testing.T, signer *internalauth.Signer, handler http.HandlerFunc) (*HttpKnockForwarder, ServerInfo, func()) {
-	t.Helper()
-	srv := httptest.NewServer(handler)
-	host, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
-	if err != nil {
-		srv.Close()
-		t.Fatalf("SplitHostPort(%q): %v", srv.URL, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		srv.Close()
-		t.Fatalf("port parse %q: %v", portStr, err)
-	}
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", port, nil, signer)
-	return f, ServerInfo{InternalIP: host}, srv.Close
-}
-
-// TestForwarder_SignsOutgoing is an integration-shaped test: the
-// forwarder, given a signer, must attach a valid X-Nhp-Auth header
-// that the matching verifier accepts. Closes the "client side signs
-// but server side rejects" or vice-versa class of regression.
-func TestForwarder_SignsOutgoing(t *testing.T) {
-	signer, err := internalauth.New(testInternalKnockSecret)
-	if err != nil {
-		t.Fatalf("internalauth.New: %v", err)
-	}
-
-	// Receiver mirrors handleInternalKnock's verification using the
-	// same signer instance (shared-secret property).
-	var sawAuthOK bool
-	f, target, cleanup := newForwarderAgainstEcho(t, signer, func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		verr := signer.Verify(r.Header.Get(internalauth.Header), r.Method, r.URL.Path, body, 0)
-		if verr != nil {
-			t.Errorf("receiver rejected forwarder-signed request: %v", verr)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		sawAuthOK = true
-		resp := HttpKnockForwardResponse{AckMsg: &common.ServerKnockAckMsg{}}
-		b, _ := json.Marshal(resp)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(b)
-	})
-	defer cleanup()
-
-	req := &common.HttpKnockRequest{}
-	res := &common.ResourceData{}
-	_, ferr := f.forwardToServer(t.Context(), target, req, res)
-	if ferr != nil {
-		t.Fatalf("forwardToServer: %v", ferr)
-	}
-	if !sawAuthOK {
-		t.Error("receiver never observed a valid signature")
-	}
-}
-
-// TestForwarder_EmitsNoQueryOrFragment fences the contract between
-// the forwarder and verifier: the verifier rejects requests whose URL
-// carries a query string or fragment, so the forwarder must not emit
-// one. A future refactor that appends a query param would get a loud
-// 400 from the verifier, but catching it one layer earlier (here,
-// before hitting the wire) gives a clearer failure and avoids
-// polluting the signing-contract telemetry.
-func TestForwarder_EmitsNoQueryOrFragment(t *testing.T) {
-	signer, err := internalauth.New(testInternalKnockSecret)
-	if err != nil {
-		t.Fatalf("internalauth.New: %v", err)
-	}
-
-	var captured *url.URL
-	f, target, cleanup := newForwarderAgainstEcho(t, signer, func(w http.ResponseWriter, r *http.Request) {
-		captured = r.URL
-		resp := HttpKnockForwardResponse{AckMsg: &common.ServerKnockAckMsg{}}
-		b, _ := json.Marshal(resp)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(b)
-	})
-	defer cleanup()
-
-	req := &common.HttpKnockRequest{}
-	res := &common.ResourceData{}
-	if _, ferr := f.forwardToServer(t.Context(), target, req, res); ferr != nil {
-		t.Fatalf("forwardToServer: %v", ferr)
-	}
-
-	if captured == nil {
-		t.Fatal("receiver never saw the request")
-	}
-	if captured.RawQuery != "" {
-		t.Errorf("forwarder emitted a query string: %q (verifier would 400)", captured.RawQuery)
-	}
-	if captured.Fragment != "" {
-		t.Errorf("forwarder emitted a URL fragment: %q (verifier would 400)", captured.Fragment)
 	}
 }
 

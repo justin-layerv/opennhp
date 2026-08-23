@@ -50,9 +50,9 @@ func FuzzHttpKnockForwardRequest(f *testing.F) {
 	})
 }
 
-// FuzzHttpKnockRequest exercises the nested HttpKnockRequest type in
-// isolation. This is what the handler forwards to handleHttpOpenResource,
-// which reads UserId, DeviceId, Url, and SrcIp.
+// FuzzHttpKnockRequest exercises the nested HttpKnockRequest wire type in
+// isolation. The internal HTTP pre-handler parses this shape before reaching
+// the retired, fail-closed direct-admission terminal.
 //
 // Intentionally distinct from FuzzHttpKnockForwardRequest above: that
 // fuzzer mutates the inner type only as a sub-tree of the wrapper, so

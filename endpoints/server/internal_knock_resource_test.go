@@ -281,12 +281,11 @@ func TestResolveInternalKnockResourceQURLDynamicResourceUsesDirectLookup(t *test
 	}
 }
 
-func TestResolveInternalKnockResourceQURLDynamicResourceDrivesACOpenWithoutASPWarm(t *testing.T) {
+func TestResolveInternalKnockResourceQURLDynamicResourceResolvesWithoutASPWarmThenRejectsDirectHTTPAdmission(t *testing.T) {
 	const (
 		acID         = "dynamic-ac-cold"
 		resourceID   = "q_00000000022"
 		knockerIP    = "10.0.1.50"
-		acToken      = "dynamic-ac-token"
 		wantOpen     = uint32(60)
 		wantDestIP   = "dynamic.example"
 		wantDestPort = 8443
@@ -298,45 +297,10 @@ func TestResolveInternalKnockResourceQURLDynamicResourceDrivesACOpenWithoutASPWa
 	if err != nil {
 		t.Fatalf("NewResourceLookup: %v", err)
 	}
-
-	var (
-		gotASP      string
-		gotResource string
-		gotSrcIP    string
-		gotOpenTime uint32
-		gotDstAddrs []*common.NetAddress
-	)
 	us := &UdpServer{
 		metrics:        metrics.NewPublisherForTest(t),
-		tokenStore:     common.NewTokenStore[*ACTokenEntry](),
-		authServiceMap: common.AuthSvcProviderMap{
-			// Deliberately no qurl ASP: dynamic q_ knocks must not depend on
-			// the static ASP catalog being warmed before downstream dispatch.
-		},
+		authServiceMap: common.AuthSvcProviderMap{},
 		resourceLookup: lookup,
-		acConnectionMap: map[string][]*ACConn{
-			acID: {newACConnWithLastRecv(time.Now().UnixNano())},
-		},
-		processACOperationBroadcastFn: func(
-			_ context.Context,
-			knkMsg *common.AgentKnockMsg,
-			_ []*ACConn,
-			srcAddr *common.NetAddress,
-			dstAddrs []*common.NetAddress,
-			openTime uint32,
-			_ *common.ResourceData,
-		) (*common.ACOpsResultMsg, error) {
-			gotASP = knkMsg.AuthServiceId
-			gotResource = knkMsg.ResourceId
-			gotSrcIP = srcAddr.Ip
-			gotOpenTime = openTime
-			gotDstAddrs = append([]*common.NetAddress(nil), dstAddrs...)
-			return &common.ACOpsResultMsg{
-				ErrCode:  common.ErrSuccess.ErrorCode(),
-				ACToken:  acToken,
-				OpenTime: openTime,
-			}, nil
-		},
 	}
 	hs := &HttpServer{udpServer: us}
 	req := &common.HttpKnockRequest{
@@ -356,46 +320,27 @@ func TestResolveInternalKnockResourceQURLDynamicResourceDrivesACOpenWithoutASPWa
 	if err != nil {
 		t.Fatalf("resolveInternalKnockResource returned error: %v", err)
 	}
-	gotAck, err := hs.handleHttpOpenResource(req, resolved)
-	if err != nil {
-		t.Fatalf("handleHttpOpenResource returned error: %v", err)
+	info := resolved.Resources[resourceID]
+	if resolved.ResourceId != resourceID || resolved.OpenTime != wantOpen || info == nil || info.ACId != acID {
+		t.Fatalf("resolved dynamic resource = %#v", resolved)
 	}
-	if gotAck.ErrCode != common.ErrSuccess.ErrorCode() {
-		t.Fatalf("ack ErrCode = %q, want success", gotAck.ErrCode)
+	if req.SrcIp != knockerIP {
+		t.Fatalf("canonical request source = %q, want %q", req.SrcIp, knockerIP)
 	}
-	if gotASP != "qurl" || gotResource != resourceID {
-		t.Fatalf("AC knock identity = (%q, %q), want (qurl, %s)", gotASP, gotResource, resourceID)
+	if info.Addr == nil || info.Addr.Ip != "" || info.Addr.Port != wantDestPort || info.Addr.Protocol != "tcp" || info.DestHost() != wantDestIP {
+		t.Fatalf("resolved dynamic destination = %#v, want host %q port %d/tcp", info, wantDestIP, wantDestPort)
 	}
-	if gotSrcIP != knockerIP {
-		t.Fatalf("AC open src IP = %q, want canonical %q", gotSrcIP, knockerIP)
+	ack, err := hs.handleHttpOpenResource(req, resolved)
+	if !errors.Is(err, common.ErrHTTPAccessOperationUnsupported) {
+		t.Fatalf("terminal direct HTTP admission error = %v, want unsupported", err)
 	}
-	if gotOpenTime != wantOpen {
-		t.Fatalf("AC open time = %d, want caller cap %d", gotOpenTime, wantOpen)
-	}
-	if len(gotDstAddrs) != 1 || gotDstAddrs[0] == nil {
-		t.Fatalf("AC destination addrs = %#v, want one dynamic address", gotDstAddrs)
-	}
-	if gotDstAddrs[0].Ip != "" || gotDstAddrs[0].Port != wantDestPort || gotDstAddrs[0].Protocol != "tcp" {
-		t.Fatalf("AC destination = %#v, want storage-backed port/protocol :%d/tcp with empty Addr.Ip", gotDstAddrs[0], wantDestPort)
-	}
-	if gotAck.ResourceHost[resourceID] != wantDestIP {
-		t.Fatalf("ACK ResourceHost for %s = %q, want %q", resourceID, gotAck.ResourceHost[resourceID], wantDestIP)
-	}
-	if gotAck.ACTokens[resourceID] != acToken {
-		t.Fatalf("ACK token for %s = %q, want %q", resourceID, gotAck.ACTokens[resourceID], acToken)
-	}
-	entry := us.VerifyAccessToken(acToken)
-	if entry == nil {
-		t.Fatal("dynamic qURL AC token was not published for validate")
-	}
-	if entry.ResourceId != resourceID {
-		t.Fatalf("published token resource = %q, want %q", entry.ResourceId, resourceID)
+	if ack == nil || ack.ErrCode != common.ErrHTTPAccessOperationUnsupported.ErrorCode() {
+		t.Fatalf("terminal direct HTTP admission ACK = %#v", ack)
 	}
 	if _, warmed := us.authServiceMap["qurl"]; warmed {
-		t.Fatal("dynamic qURL dispatch unexpectedly warmed or required the qurl ASP cache")
+		t.Fatal("dynamic qURL resolution unexpectedly warmed or required the qurl ASP cache")
 	}
 }
-
 func TestResolveInternalKnockResourceQURLDynamicResourceEmptySrcIPFailsClosed(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, time.Now().Add(time.Hour).Unix())

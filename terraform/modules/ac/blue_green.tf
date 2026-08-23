@@ -309,7 +309,9 @@ resource "aws_autoscaling_group" "ac_green" {
   lifecycle {
     create_before_destroy = true
     # CI/CD manages capacity during blue/green switches
-    ignore_changes = [desired_capacity, min_size]
+    # Keep exact parity with the blue AC ASG: Terraform must not resurrect a
+    # retired legacy color before blue/green writes and proves its replacement.
+    ignore_changes = [desired_capacity, min_size, max_size, suspended_processes]
   }
 }
 

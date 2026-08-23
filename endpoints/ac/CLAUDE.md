@@ -99,6 +99,17 @@ must update this list and audit all existing call sites.
   subsystem. Future changes that hold `revocationIndex.mu` while invoking
   tokenStore, scheduler, flusher, metrics, or registration code must audit this
   table first.
+- **`sessionControlFlushMu` is outermost for NHP session admission and
+  teardown.** Once held, session-control paths may load/store `tokenStore`,
+  query or mutate `nhpSessionIndex`, touch `AccessEntry.mu`, and invoke the L3
+  scheduler in their normal documented order; none of those inner systems may
+  call back into code that acquires `sessionControlFlushMu`. Delayed
+  PASS_PRE_ACCESS_IP ACC handling takes this mutex before revalidating its
+  temporary token and holds it through derived-owner registration, scheduling,
+  and every kernel rule write. Exact/agent/run/global teardown uses the same
+  outer mutex, so cleanup cannot interleave between that final validation and
+  mutation. Do not acquire `sessionControlFlushMu` while holding tokenStore,
+  session-index, entry, scheduler, or firewall-backend locks.
 - **ConntrackFlusher netlink locks are leaf-most and internal.** `ctConn.mu`
   serializes request/response use of one pooled ctnetlink socket and may be held
   across dump/delete syscalls; `ctEventIndex.mu` guards the #2908 event-fed

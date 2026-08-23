@@ -73,6 +73,8 @@ log_info "AWS Region: $AWS_REGION"
 
 # SSM parameter base path
 SSM_BASE="/${ENVIRONMENT}/nhp/${COMPONENT}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROFILE_ORDER_SCRIPT="$SCRIPT_DIR/nhp-profile-order.sh"
 
 # Function to get SSM parameter
 get_ssm_param() {
@@ -145,6 +147,83 @@ if [[ -z "$CURRENT_COLOR" ]]; then
     exit 1
 fi
 log_info "Current active color: $CURRENT_COLOR"
+
+# A slot becomes permanently ineligible once the shared sandbox profile floor
+# advances beyond it. Slot records bind the operator-declared profile to the
+# exact image tag; legacy slots created before this mechanism have no record and
+# are treated as legacy-aop-v1. This guard lives in the mutation helper as well
+# as the workflow so rollback/switch-only callers cannot bypass it.
+MINIMUM_PROFILE=$(AWS_REGION="$AWS_REGION" bash "$SCRIPT_DIR/../../scripts/ssm-read-optional.sh" \
+    "/sandbox/nhp/minimum-protocol-profile")
+MINIMUM_PROFILE=${MINIMUM_PROFILE:-legacy-aop-v1}
+TARGET_RECORD=$(AWS_REGION="$AWS_REGION" bash "$SCRIPT_DIR/../../scripts/ssm-read-optional.sh" \
+    "${SSM_BASE}/${TARGET_COLOR}-protocol-profile")
+TARGET_PROFILE=legacy-aop-v1
+if [[ -n "$TARGET_RECORD" ]]; then
+    if [[ "$TARGET_COLOR" == "green" ]]; then
+        TARGET_IMAGE_PARAM="${SSM_BASE}/green-image-tag"
+    else
+        TARGET_IMAGE_PARAM="${SSM_BASE}/image-tag"
+    fi
+    TARGET_IMAGE=$(get_ssm_param "$TARGET_IMAGE_PARAM")
+    if [[ -z "$TARGET_IMAGE" ]]; then
+        log_error "Target slot has a profile record but no image tag: $TARGET_IMAGE_PARAM"
+        exit 1
+    fi
+    TARGET_PROFILE=${TARGET_RECORD#v1|}
+    TARGET_PROFILE=${TARGET_PROFILE%%|*}
+    if ! "$PROFILE_ORDER_SCRIPT" assert-record "$TARGET_RECORD" "$TARGET_PROFILE" "$TARGET_IMAGE"; then
+        log_error "Target slot profile record does not bind its current image"
+        exit 1
+    fi
+fi
+if ! "$PROFILE_ORDER_SCRIPT" assert-at-least "$TARGET_PROFILE" "$MINIMUM_PROFILE"; then
+    log_error "Refusing to activate $COMPONENT/$TARGET_COLOR profile=$TARGET_PROFILE below minimum=$MINIMUM_PROFILE"
+    exit 1
+fi
+
+# Before the global floor advances, a newer-profile slot is prewarm-only. Only
+# the dedicated durable cutover ledger can authorize its activation, and each
+# component has an exact predecessor phase. This closes the direct-helper and
+# switch-only seams without a caller-controlled bypass flag.
+TARGET_PROFILE_ORDER=$("$PROFILE_ORDER_SCRIPT" order "$TARGET_PROFILE")
+MINIMUM_PROFILE_ORDER=$("$PROFILE_ORDER_SCRIPT" order "$MINIMUM_PROFILE")
+if ((TARGET_PROFILE_ORDER > MINIMUM_PROFILE_ORDER)); then
+    CUTOVER_STATE=$(AWS_REGION="$AWS_REGION" bash "$SCRIPT_DIR/../../scripts/ssm-read-optional.sh" \
+        "/sandbox/nhp/cutovers/durable-aop-v1/state")
+    if [[ -z "$CUTOVER_STATE" ]]; then
+        log_error "Refusing to activate a newer protocol profile without the dedicated cutover ledger"
+        exit 1
+    fi
+    case "$ENVIRONMENT/$COMPONENT" in
+        sandbox/ac) REQUIRED_PHASE_ORDER=20 ;;
+        sandbox/server) REQUIRED_PHASE_ORDER=30 ;;
+        sandbox-cell1/server) REQUIRED_PHASE_ORDER=40 ;;
+        *) log_error "No durable cutover phase is defined for $ENVIRONMENT/$COMPONENT"; exit 1 ;;
+    esac
+    CUTOVER_PHASE_ORDER=$(jq -er --arg image "$TARGET_IMAGE" '
+        select(type == "object" and .schema == 2 and .image == $image and
+          .orchestrator_sha == $image and (.lock_owner | type == "string" and length > 0)) |
+        .phase |
+        if . == "ponr" then 20
+        elif . == "ac_switched" then 30
+        elif . == "cell0_switched" then 40
+        elif . == "cell1_switched" then 50
+        elif . == "old_servers_terminated" then 60
+        elif . == "validated" then 70
+        elif . == "complete" then 80
+        else empty
+        end
+    ' <<<"$CUTOVER_STATE") || {
+        log_error "Dedicated cutover ledger is malformed, has the wrong image, or is pre-PONR"
+        exit 1
+    }
+    if ((CUTOVER_PHASE_ORDER < REQUIRED_PHASE_ORDER)); then
+        log_error "Dedicated cutover ledger has not reached the required phase for $ENVIRONMENT/$COMPONENT"
+        exit 1
+    fi
+fi
+log_info "Protocol profile gate passed: target=$TARGET_PROFILE minimum=$MINIMUM_PROFILE"
 
 if [[ "$CURRENT_COLOR" == "$TARGET_COLOR" ]]; then
     if [[ "$RECONCILE_CURRENT" != "true" ]]; then

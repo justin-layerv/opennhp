@@ -19,14 +19,15 @@ func TestNativeKnockRunIDValidationPrecedesNetworkPaths(t *testing.T) {
 		name                string
 		authServiceID       string
 		runID               string
+		runAttempt          uint64
 		wantInvalid         bool
 		dnsLookupShouldFail bool
 	}{
-		{name: "registered agent missing", authServiceID: common.RegisteredAgentAuthServiceID, wantInvalid: true},
-		{name: "registered agent malformed", authServiceID: common.RegisteredAgentAuthServiceID, runID: "ABCDEF0123456789", wantInvalid: true},
-		{name: "registered agent malformed before DNS", authServiceID: common.RegisteredAgentAuthServiceID, runID: "bad", wantInvalid: true, dnsLookupShouldFail: true},
+		{name: "registered agent missing", authServiceID: common.RegisteredAgentAuthServiceID, runAttempt: 1, wantInvalid: true},
+		{name: "registered agent malformed", authServiceID: common.RegisteredAgentAuthServiceID, runID: "ABCDEF0123456789", runAttempt: 1, wantInvalid: true},
+		{name: "registered agent malformed before DNS", authServiceID: common.RegisteredAgentAuthServiceID, runID: "bad", runAttempt: 1, wantInvalid: true, dnsLookupShouldFail: true},
 		{name: "legacy malformed supplied", authServiceID: "legacy", runID: "short", wantInvalid: true},
-		{name: "registered agent canonical", authServiceID: common.RegisteredAgentAuthServiceID, runID: canonicalAgentRunID},
+		{name: "registered agent canonical", authServiceID: common.RegisteredAgentAuthServiceID, runID: canonicalAgentRunID, runAttempt: 1},
 		{name: "legacy missing", authServiceID: "legacy"},
 	}
 
@@ -37,6 +38,7 @@ func TestNativeKnockRunIDValidationPrecedesNetworkPaths(t *testing.T) {
 				AuthServiceId: tt.authServiceID,
 				ResourceId:    "resource",
 				RunID:         tt.runID,
+				RunAttempt:    tt.runAttempt,
 			}}
 			if tt.wantInvalid {
 				// Make the send boundary live and the destination resolvable. A
@@ -65,7 +67,7 @@ func TestNativeKnockRunIDValidationPrecedesNetworkPaths(t *testing.T) {
 			exitAck, exitErr := a.ExitKnockRequest(target)
 			if tt.wantInvalid {
 				assertRunIDInvalid(t, "Knock", knockAck, knockErr, tt.runID)
-				assertRunIDInvalid(t, "ExitKnockRequest", exitAck, exitErr, tt.runID)
+				assertExactRunIDInvalid(t, "ExitKnockRequest", exitAck, exitErr, tt.runID)
 				if got := len(a.sendMsgCh); got != 0 {
 					t.Fatalf("invalid RunID enqueued %d network message(s), want zero", got)
 				}
@@ -82,6 +84,16 @@ func TestNativeKnockRunIDValidationPrecedesNetworkPaths(t *testing.T) {
 				t.Fatalf("ExitKnockRequest rejected valid/legacy runID: %v", exitErr)
 			}
 		})
+	}
+}
+
+func assertExactRunIDInvalid(t *testing.T, operation string, ack *common.ServerExactSessionCloseAckMsg, err error, rejected string) {
+	t.Helper()
+	if !errors.Is(err, common.ErrKnockRunIDInvalid) {
+		t.Fatalf("%s error = %v, want ErrKnockRunIDInvalid (rejected value %q)", operation, err, rejected)
+	}
+	if ack == nil || ack.ErrCode != common.ErrKnockRunIDInvalid.ErrorCode() || ack.ErrMsg != common.ErrKnockRunIDInvalid.Error() {
+		t.Fatalf("%s ack = %#v, want stable ErrKnockRunIDInvalid response", operation, ack)
 	}
 }
 
@@ -109,6 +121,7 @@ func TestKnockCookieRetryReusesImmutableRunIDSnapshot(t *testing.T) {
 		AuthServiceId: common.RegisteredAgentAuthServiceID,
 		ResourceId:    "resource",
 		RunID:         canonicalAgentRunID,
+		RunAttempt:    1,
 	}}
 
 	var bodies [][]byte
@@ -129,13 +142,19 @@ func TestKnockCookieRetryReusesImmutableRunIDSnapshot(t *testing.T) {
 				AuthServiceId: common.RegisteredAgentAuthServiceID,
 				ResourceId:    "resource",
 				RunID:         "fedcba9876543210",
+				RunAttempt:    9,
 			})
 			return &common.ServerKnockAckMsg{
 				ErrCode: common.ErrKnockTerminatedByCookie.ErrorCode(),
 				ErrMsg:  common.ErrKnockTerminatedByCookie.Error(),
 			}, common.ErrKnockTerminatedByCookie
 		}
-		return &common.ServerKnockAckMsg{ErrCode: common.ErrSuccess.ErrorCode()}, nil
+		return &common.ServerKnockAckMsg{
+			ErrCode: common.ErrSuccess.ErrorCode(), SessionId: 77, CellId: "cell-01",
+			SessionIssuedAtMillis: 1_700_000_000_000, RunID: canonicalAgentRunID, RunAttempt: 1, OpenTime: 30,
+			AgentAddr: "198.51.100.8:44444", ResourceHost: map[string]string{"resource": "127.0.0.1:443"},
+			ACTokens: map[string]string{"resource": "token"},
+		}, nil
 	})
 	if err != nil {
 		t.Fatalf("Knock: %v", err)
@@ -147,8 +166,8 @@ func TestKnockCookieRetryReusesImmutableRunIDSnapshot(t *testing.T) {
 		t.Fatalf("application bodies = %d, want KNK and RKN", len(bodies))
 	}
 	wants := []string{
-		`{"headerType":1,"usrId":"caller","devId":"device","aspId":"agent","resId":"resource","runId":"0123456789abcdef"}`,
-		`{"headerType":8,"usrId":"caller","devId":"device","aspId":"agent","resId":"resource","runId":"0123456789abcdef"}`,
+		`{"headerType":1,"usrId":"caller","devId":"device","aspId":"agent","resId":"resource","runId":"0123456789abcdef","runAttempt":1}`,
+		`{"headerType":8,"usrId":"caller","devId":"device","aspId":"agent","resId":"resource","runId":"0123456789abcdef","runAttempt":1}`,
 	}
 	for i, want := range wants {
 		if string(bodies[i]) != want {
@@ -254,6 +273,7 @@ func TestBuildAgentKnockMsgCarriesExactRunIDForKnockReknockAndExit(t *testing.T)
 		AuthServiceId: common.RegisteredAgentAuthServiceID,
 		ResourceId:    "resource",
 		RunID:         canonicalAgentRunID,
+		RunAttempt:    1,
 	}}
 
 	tests := []struct {
@@ -264,17 +284,12 @@ func TestBuildAgentKnockMsgCarriesExactRunIDForKnockReknockAndExit(t *testing.T)
 		{
 			name:       "KNK",
 			headerType: core.NHP_KNK,
-			want:       `{"headerType":1,"usrId":"user","devId":"device","orgId":"org","aspId":"agent","resId":"resource","runId":"0123456789abcdef","results":{"posture":"ok"},"usrData":{"role":"connector"}}`,
+			want:       `{"headerType":1,"usrId":"user","devId":"device","orgId":"org","aspId":"agent","resId":"resource","runId":"0123456789abcdef","runAttempt":1,"results":{"posture":"ok"},"usrData":{"role":"connector"}}`,
 		},
 		{
 			name:       "RKN",
 			headerType: core.NHP_RKN,
-			want:       `{"headerType":8,"usrId":"user","devId":"device","orgId":"org","aspId":"agent","resId":"resource","runId":"0123456789abcdef","results":{"posture":"ok"},"usrData":{"role":"connector"}}`,
-		},
-		{
-			name:       "EXT",
-			headerType: core.NHP_EXT,
-			want:       `{"headerType":16,"usrId":"user","devId":"device","orgId":"org","aspId":"agent","resId":"resource","runId":"0123456789abcdef","results":{"posture":"ok"},"usrData":{"role":"connector"}}`,
+			want:       `{"headerType":8,"usrId":"user","devId":"device","orgId":"org","aspId":"agent","resId":"resource","runId":"0123456789abcdef","runAttempt":1,"results":{"posture":"ok"},"usrData":{"role":"connector"}}`,
 		},
 	}
 
@@ -300,13 +315,14 @@ func TestBuildAgentKnockMsgNilUserIsSafe(t *testing.T) {
 		AuthServiceId: common.RegisteredAgentAuthServiceID,
 		ResourceId:    "resource",
 		RunID:         canonicalAgentRunID,
+		RunAttempt:    1,
 	}}
 
 	msg := a.buildAgentKnockMsg(target, core.NHP_KNK)
 	if msg.UserId != "" || msg.OrganizationId != "" || msg.UserData != nil {
 		t.Fatalf("nil knock user produced user fields: %+v", msg)
 	}
-	if msg.DeviceId != "device" || msg.CheckResults["posture"] != "ok" || msg.RunID != canonicalAgentRunID {
+	if msg.DeviceId != "device" || msg.CheckResults["posture"] != "ok" || msg.RunID != canonicalAgentRunID || msg.RunAttempt != 1 {
 		t.Fatalf("nil knock user dropped independent message fields: %+v", msg)
 	}
 }

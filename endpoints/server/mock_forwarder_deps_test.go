@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -38,20 +39,59 @@ type MockForwarderDeps struct {
 	// convenience (one less field to manage); the two are never
 	// acquired together so a split into two mutexes would also be
 	// safe — no real lock-order hazard either way.
-	resolveCtxMu     sync.Mutex
-	lastResolveCtx   context.Context
-	resolvedOwnerIDs map[string]string
-	metricsMu        sync.Mutex
-	counters         map[string]int
+	resolveCtxMu      sync.Mutex
+	lastResolveCtx    context.Context
+	resolvedOwnerIDs  map[string]string
+	metricsMu         sync.Mutex
+	counters          map[string]int
+	forwardedSessions *liveNHPSessionRegistry
+}
+
+func (m *MockForwarderDeps) VerifyForwardedDurableNHPSession(_ context.Context,
+	knkMsg *common.AgentKnockMsg,
+) (common.AgentSessionReceipt, error) {
+	if knkMsg == nil || knkMsg.AuthServiceId != common.RegisteredAgentAuthServiceID {
+		return common.AgentSessionReceipt{}, nil
+	}
+	return common.AgentSessionReceipt{
+		CellID: testSessionControlCellID, SessionID: knkMsg.NHPSessionId,
+		SessionIssuedAtMillis: knkMsg.NHPSessionIssuedAt.UnixMilli(),
+		RunID:                 knkMsg.RunID, RunAttempt: knkMsg.RunAttempt,
+	}, nil
 }
 
 // NewMockForwarderDeps creates a new mock with sensible defaults.
 func NewMockForwarderDeps() *MockForwarderDeps {
 	return &MockForwarderDeps{
-		hostname:     "test-server",
-		sendCh:       make(chan *core.MsgData, 10),
-		storedTokens: make(map[string]*ACTokenEntry),
+		hostname:          "test-server",
+		sendCh:            make(chan *core.MsgData, 10),
+		storedTokens:      make(map[string]*ACTokenEntry),
+		forwardedSessions: newLiveNHPSessionRegistry(),
 	}
+}
+
+func (m *MockForwarderDeps) ReserveForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt, expiresAt time.Time) error {
+	agentPubKey, err := decodeAgentPublicKey(agentPubKeyB64)
+	if err != nil {
+		return err
+	}
+	return m.forwardedSessions.reserveExact(agentPubKey, sessionID, issuedAt, expiresAt)
+}
+
+func (m *MockForwarderDeps) ReleaseForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt time.Time) {
+	agentPubKey, err := decodeAgentPublicKey(agentPubKeyB64)
+	if err == nil {
+		m.forwardedSessions.release(agentPubKey, sessionID, issuedAt)
+	}
+}
+
+func (m *MockForwarderDeps) CompensateForwardedNHPSession(agentPubKeyB64 string, sessionID uint64, issuedAt time.Time) bool {
+	agentPubKey, err := decodeAgentPublicKey(agentPubKeyB64)
+	if err != nil {
+		return false
+	}
+	snapshot, ok := m.forwardedSessions.snapshotExactSessionForCompensation(agentPubKey, sessionID, issuedAt)
+	return !ok || m.forwardedSessions.completeExactSessionClose(agentPubKey, snapshot)
 }
 
 func (m *MockForwarderDeps) GetHostname() string {
@@ -229,11 +269,12 @@ func (m *MockForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // StoreACToken with the maps.Clone snapshot already taken in
 // NewACKTokenEntry.
 func (m *MockForwarderDeps) PublishACKTokens(_ context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
+	sessionExpireTime := knkMsg.NHPSessionIssuedAt.Add(time.Duration(openTime) * time.Second)
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		m.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
+		m.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId, ackMsg.SessionId, sessionExpireTime))
 	}
 	return nil
 }

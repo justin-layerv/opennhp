@@ -114,6 +114,28 @@ func TestNilInstanceGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("KnockResourceWithRunBinding", func(t *testing.T) {
+		result := KnockResourceWithRunBinding("asp", "res", "0123456789abcdef", 1, "1.2.3.4", "", common.DefaultNHPPort)
+		var ack common.ServerKnockAckMsg
+		if err := json.Unmarshal([]byte(result), &ack); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if ack.ErrCode != common.ErrNoAgentInstance.ErrorCode() {
+			t.Errorf("expected ErrNoAgentInstance code, got %s", ack.ErrCode)
+		}
+	})
+
+	t.Run("RetireSession", func(t *testing.T) {
+		result := RetireSession(`{}`, "1.2.3.4", "", common.DefaultNHPPort)
+		var ack common.ServerExactSessionCloseAckMsg
+		if err := json.Unmarshal([]byte(result), &ack); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if ack.ErrCode != common.ErrNoAgentInstance.ErrorCode() {
+			t.Errorf("expected ErrNoAgentInstance code, got %s", ack.ErrCode)
+		}
+	})
+
 	t.Run("ExitResource", func(t *testing.T) {
 		if ExitResource("asp", "res", "1.2.3.4", "", common.DefaultNHPPort) {
 			t.Error("expected false")
@@ -130,7 +152,7 @@ func TestNilInstanceGuards(t *testing.T) {
 // TestBuildTargetValidation verifies input validation in buildTarget.
 func TestBuildTargetValidation(t *testing.T) {
 	t.Run("nil instance", func(t *testing.T) {
-		target, ack := buildTarget(nil, "asp", "res", "", "1.2.3.4", "", common.DefaultNHPPort)
+		target, ack := buildTarget(nil, "asp", "res", "", 0, "1.2.3.4", "", common.DefaultNHPPort)
 		if target != nil {
 			t.Error("expected nil target")
 		}
@@ -140,7 +162,7 @@ func TestBuildTargetValidation(t *testing.T) {
 	})
 
 	t.Run("registered agent missing runID", func(t *testing.T) {
-		target, ack := buildTarget(&agent.UdpAgent{}, common.RegisteredAgentAuthServiceID, "res", "", "1.2.3.4", "", common.DefaultNHPPort)
+		target, ack := buildTarget(&agent.UdpAgent{}, common.RegisteredAgentAuthServiceID, "res", "", 0, "1.2.3.4", "", common.DefaultNHPPort)
 		if target != nil {
 			t.Error("expected nil target")
 		}
@@ -149,8 +171,18 @@ func TestBuildTargetValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("registered agent missing runAttempt", func(t *testing.T) {
+		target, ack := buildTarget(&agent.UdpAgent{}, common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", 0, "1.2.3.4", "", common.DefaultNHPPort)
+		if target != nil {
+			t.Error("expected nil target")
+		}
+		if ack.ErrCode != common.ErrKnockRunAttemptInvalid.ErrorCode() {
+			t.Errorf("expected ErrKnockRunAttemptInvalid, got %s", ack.ErrCode)
+		}
+	})
+
 	t.Run("noncanonical supplied runID", func(t *testing.T) {
-		target, ack := buildTarget(&agent.UdpAgent{}, "legacy", "res", "invalid", "1.2.3.4", "", common.DefaultNHPPort)
+		target, ack := buildTarget(&agent.UdpAgent{}, "legacy", "res", "invalid", 0, "1.2.3.4", "", common.DefaultNHPPort)
 		if target != nil {
 			t.Error("expected nil target")
 		}
@@ -204,6 +236,77 @@ func TestRegisteredAgentSDKRunIDGate(t *testing.T) {
 	}
 }
 
+func TestRetireSessionRejectsMalformedReceiptBeforeRouteLookup(t *testing.T) {
+	installTestInstance(t, &agent.UdpAgent{})
+	valid := `{"sessId":77,"cellId":"cell-01","sessIssuedAtMillis":1700000000000,"runId":"0123456789abcdef","runAttempt":3,"errCode":"0","resHost":{"resource":"127.0.0.1:443"},"opnTime":30,"agentAddr":"198.51.100.8:44444","acTokens":{"resource":"token"}}`
+	for name, body := range map[string]string{
+		"missing":   strings.Replace(valid, `"cellId":"cell-01",`, ``, 1),
+		"unknown":   strings.TrimSuffix(valid, `}`) + `,"future":1}`,
+		"duplicate": strings.Replace(valid, `"sessId":77`, `"sessId":77,"sessId":77`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var ack common.ServerExactSessionCloseAckMsg
+			if err := json.Unmarshal([]byte(RetireSession(body, "127.0.0.1", "", common.DefaultNHPPort)), &ack); err != nil {
+				t.Fatal(err)
+			}
+			if ack.ErrCode != common.ErrInvalidInput.ErrorCode() || ack.ErrMsg != common.ErrInvalidInput.Error() {
+				t.Fatalf("RetireSession malformed receipt ACK = %#v", ack)
+			}
+		})
+	}
+}
+
+func TestRetireSessionUnresolvableOriginalRouteReturnsStrictDenial(t *testing.T) {
+	dir := newSDKTestWorkingDir(t)
+	if !Init(dir, 0) {
+		t.Fatal("Init returned false")
+	}
+	t.Cleanup(Close)
+	keys := strings.Split(GenerateKeys(), "|")
+	if len(keys) != 2 || !AddServer(keys[1], "999.999.999.999", "", common.DefaultNHPPort, 0) {
+		t.Fatal("failed to install deliberately unresolvable original server route")
+	}
+	knockAck := `{"errCode":"0","sessId":77,"cellId":"cell-01","sessIssuedAtMillis":1700000000000,"runId":"0123456789abcdef","runAttempt":3,"resHost":{"resource":"127.0.0.1:443"},"opnTime":30,"agentAddr":"198.51.100.8:44444","acTokens":{"resource":"token"}}`
+	raw := RetireSession(knockAck, "999.999.999.999", "", common.DefaultNHPPort)
+	if raw == "null" || raw == "{}" {
+		t.Fatalf("RetireSession returned non-authoritative JSON %q", raw)
+	}
+	var ack common.ServerExactSessionCloseAckMsg
+	if err := common.DecodeServerExactSessionCloseAckMsg([]byte(raw), &ack); err != nil {
+		t.Fatalf("strict denial decode: %v (raw=%s)", err, raw)
+	}
+	if ack.ErrCode != common.ErrKnockServerNotFound.ErrorCode() || ack.ErrMsg != common.ErrKnockServerNotFound.Error() {
+		t.Fatalf("RetireSession denial = %#v", ack)
+	}
+}
+
+func TestExactCloseResultJSONNeverFabricatesNull(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ack  *common.ServerExactSessionCloseAckMsg
+		err  error
+		code string
+	}{
+		"nil with route failure": {err: common.ErrKnockServerNotFound, code: common.ErrKnockServerNotFound.ErrorCode()},
+		"nil without error":      {code: common.ErrTransactionFailedByClosedConnection.ErrorCode()},
+		"known local denial": {
+			ack:  &common.ServerExactSessionCloseAckMsg{ErrCode: common.ErrInvalidInput.ErrorCode(), ErrMsg: common.ErrInvalidInput.Error()},
+			err:  common.ErrInvalidInput,
+			code: common.ErrInvalidInput.ErrorCode(),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := exactCloseResultJSON(tc.ack, tc.err)
+			var got common.ServerExactSessionCloseAckMsg
+			if err := common.DecodeServerExactSessionCloseAckMsg([]byte(raw), &got); err != nil {
+				t.Fatalf("strict denial decode: %v (raw=%s)", err, raw)
+			}
+			if got.ErrCode != tc.code {
+				t.Fatalf("code=%q want=%q", got.ErrCode, tc.code)
+			}
+		})
+	}
+}
+
 func TestBuildTargetRetainsExactCallerRunID(t *testing.T) {
 	dir := newSDKTestWorkingDir(t)
 	if !Init(dir, 0) {
@@ -215,13 +318,13 @@ func TestBuildTargetRetainsExactCallerRunID(t *testing.T) {
 	}
 
 	instanceMu.RLock()
-	target, ack := buildTarget(instance, common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", "127.0.0.1", "", common.DefaultNHPPort)
+	target, ack := buildTarget(instance, common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", 1, "127.0.0.1", "", common.DefaultNHPPort)
 	instanceMu.RUnlock()
 	if target == nil {
 		t.Fatalf("buildTarget returned nil target: %#v", ack)
 	}
-	if target.RunID != "0123456789abcdef" {
-		t.Fatalf("target.RunID = %q, want exact caller value", target.RunID)
+	if target.RunID != "0123456789abcdef" || target.RunAttempt != 1 {
+		t.Fatalf("target run binding = (%q,%d), want exact caller value", target.RunID, target.RunAttempt)
 	}
 }
 
@@ -283,7 +386,7 @@ func TestCloseInterruptsInFlightRegisteredAgentKnock(t *testing.T) {
 	knockDone := make(chan struct{})
 	go func() {
 		defer close(knockDone)
-		_ = KnockResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", "127.0.0.1", "", unusedPort)
+		_ = KnockResourceWithRunBinding(common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", 1, "127.0.0.1", "", unusedPort)
 	}()
 	for i := range 1_000 {
 		_ = SetKnockUser("user", "device", "org", fmt.Sprintf(`{"iteration":%d}`, i))

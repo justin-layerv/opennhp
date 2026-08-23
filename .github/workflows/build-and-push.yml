@@ -2238,7 +2238,9 @@ jobs:
     # Includes rare ~15m SG recovery, the bounded 5m structural convergence
     # gate, and a final post-apply DMZ-boundary idempotency proof before outputs
     # unblock.
-    timeout-minutes: 55
+    # Includes the canonical two-hour shared live-env lock wait plus the prior
+    # 55-minute plan/apply/convergence budget.
+    timeout-minutes: 180
     concurrency:
       group: deploy-sandbox-infra
       cancel-in-progress: false  # Let current TF apply finish, queue the next
@@ -2274,7 +2276,25 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 10800
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deny ordinary mutation before infrastructure lock wait
+        run: .github/scripts/assert-durable-aop-mutation-allowed.sh
+
+      - name: Acquire sandbox infrastructure live-environment lock
+        id: acquire-sandbox-infra-live-env-lock
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: acquire
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-infra
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Revalidate durable AOP authority under infrastructure lock
+        run: .github/scripts/assert-durable-aop-mutation-allowed.sh
 
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
@@ -2665,6 +2685,10 @@ jobs:
           set -euo pipefail
           test -s tfplan
           echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
+          # This strong guard is intentionally adjacent to apply while the
+          # shared live-env mutex is held. No cutover can harden/PONR between
+          # this read and Terraform's first mutating API call.
+          ../../../.github/scripts/assert-durable-aop-mutation-allowed.sh
           terraform apply -auto-approve tfplan
 
 
@@ -2728,6 +2752,27 @@ jobs:
             echo "nlb_dns=$nlb_dns"
             echo "etcd_endpoint=$etcd_endpoint"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Release sandbox infrastructure live-environment lock
+        id: release-sandbox-infra-live-env-lock
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: release
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-infra
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Retain sandbox infrastructure lock after ambiguous failure
+        if: >-
+          always() &&
+          steps.acquire-sandbox-infra-live-env-lock.outcome == 'success' &&
+          steps.release-sandbox-infra-live-env-lock.outcome != 'success'
+        run: |
+          echo "::error title=Sandbox Terraform failure - lock retained::The infrastructure run did not reach verified post-apply convergence and exact-owner release. The shared live-env lock remains fail-closed; reconcile Terraform/AWS state before manual release or TTL recovery."
+          bash .github/scripts/emit-sandbox-lock-failure-metric.sh TerraformFailedRetained release
+          exit 1
 
   # =============================================================================
   # DEPLOY SANDBOX - QURL ECS task-def roll (#1634)
@@ -3189,6 +3234,7 @@ jobs:
       # would let the two cells drift at the moment the UDP proof producer
       # requires them equal.
       server_tag: ${{ steps.resolve-tag.outputs.server_tag }}
+      cutover_required: ${{ steps.resolve-tag.outputs.cutover_required }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3260,6 +3306,21 @@ jobs:
             echo "ac_tag=$AC_TAG"
           } >> "$GITHUB_OUTPUT"
 
+          MINIMUM_PROFILE=$(bash scripts/ssm-read-optional.sh /sandbox/nhp/minimum-protocol-profile)
+          MINIMUM_PROFILE=${MINIMUM_PROFILE:-legacy-aop-v1}
+          .github/scripts/nhp-profile-order.sh order "$MINIMUM_PROFILE" >/dev/null
+          if [[ "$MINIMUM_PROFILE" == "legacy-aop-v1" ]]; then
+            if [[ "$APP_IMAGE_BUILD_REQUIRED" != "true" || "$SERVER_TAG" != "$AC_TAG" ]]; then
+              echo "::error::The first durable-AOP cutover requires one freshly built exact image shared by server and AC (source=$APP_IMAGE_BUILD_REQUIRED server=$SERVER_TAG ac=$AC_TAG)"
+              exit 1
+            fi
+            echo "cutover_required=true" >> "$GITHUB_OUTPUT"
+            echo "Durable-AOP minimum is not installed; this run will prewarm both cells before the dedicated cutover."
+          else
+            .github/scripts/nhp-profile-order.sh assert-at-least "$MINIMUM_PROFILE" durable-aop-v1
+            echo "cutover_required=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Dispatch Blue/Green Deploy
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3267,12 +3328,14 @@ jobs:
           SERVER_TAG: ${{ steps.resolve-tag.outputs.server_tag }}
           AC_TAG: ${{ steps.resolve-tag.outputs.ac_tag }}
           IMAGE_TAG_SOURCE: ${{ steps.resolve-tag.outputs.source }}
+          CUTOVER_REQUIRED: ${{ steps.resolve-tag.outputs.cutover_required }}
           # Per-dispatch poll budget. MUST stay below the job timeout above so
           # the script exits cleanly with an error before GitHub kills the
           # runner. The drift path dispatches twice in sequence, so the 90m job
           # timeout covers 2x this 40m budget (plus each dispatch's find-run
           # window) + buffer (see timeout-minutes).
           POLL_TIMEOUT: "2400"
+          PROTOCOL_PROFILE: durable-aop-v1
         run: |
           set -euo pipefail
           echo "============================================"
@@ -3280,6 +3343,7 @@ jobs:
           echo "  server tag: $SERVER_TAG"
           echo "  ac tag:     $AC_TAG"
           echo "  source:     $IMAGE_TAG_SOURCE"
+          echo "  cutover:    $CUTOVER_REQUIRED"
           echo "============================================"
 
           # plan-blue-green-dispatch.sh emits one non-blank "<component> <tag>"
@@ -3299,6 +3363,11 @@ jobs:
           # stops the called script from consuming the here-string and skipping
           # the second component (gh doesn't read stdin today; the inner script
           # evolves independently).
+          if [[ "$CUTOVER_REQUIRED" == "true" ]]; then
+            export BLUE_GREEN_ACTION=prepare-only
+          else
+            export BLUE_GREEN_ACTION=deploy
+          fi
           while read -r COMPONENT TAG; do
             echo "--- Dispatching component=$COMPONENT tag=$TAG ---"
             ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox "$COMPONENT" "$TAG" </dev/null
@@ -3352,7 +3421,9 @@ jobs:
       needs.deploy-sandbox-infra.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 45
+    # Includes the canonical two-hour shared live-env lock wait plus cell1's
+    # bounded plan/apply/bootstrap proof.
+    timeout-minutes: 180
     concurrency:
       group: deploy-sandbox-cell1-infra
       cancel-in-progress: false  # Never cancel an in-flight terraform apply.
@@ -3372,7 +3443,25 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 10800
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deny ordinary mutation before cell1 infrastructure lock wait
+        run: .github/scripts/assert-durable-aop-mutation-allowed.sh
+
+      - name: Acquire sandbox cell1 infrastructure live-environment lock
+        id: acquire-sandbox-cell1-infra-live-env-lock
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: acquire
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-cell1-infra
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Revalidate durable AOP authority under cell1 infrastructure lock
+        run: .github/scripts/assert-durable-aop-mutation-allowed.sh
 
       - name: Terraform apply (sandbox-cell1)
         working-directory: terraform/environments/sandbox-cell1
@@ -3383,6 +3472,9 @@ jobs:
           # is what runs. A no-op plan applies cleanly and costs seconds.
           terraform plan -no-color -out=tfplan
           test -s tfplan
+          # Keep the final state/floor read inside the held cross-repo mutex
+          # and directly adjacent to Terraform's mutating boundary.
+          ../../../.github/scripts/assert-durable-aop-mutation-allowed.sh
           terraform apply -no-color -auto-approve tfplan
 
       - name: Prove the bootstrap script carries the agent-serving config
@@ -3413,6 +3505,27 @@ jobs:
           test "${missing}" -eq 0
           echo "cell1 bootstrap carries the agent-serving configuration"
 
+      - name: Release sandbox cell1 infrastructure live-environment lock
+        id: release-sandbox-cell1-infra-live-env-lock
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: release
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-cell1-infra
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Retain sandbox cell1 infrastructure lock after ambiguous failure
+        if: >-
+          always() &&
+          steps.acquire-sandbox-cell1-infra-live-env-lock.outcome == 'success' &&
+          steps.release-sandbox-cell1-infra-live-env-lock.outcome != 'success'
+        run: |
+          echo "::error title=Sandbox cell1 Terraform failure - lock retained::The cell1 infrastructure run did not reach its post-apply bootstrap proof and exact-owner release. The shared live-env lock remains fail-closed; reconcile Terraform/AWS state before manual release or TTL recovery."
+          bash .github/scripts/emit-sandbox-lock-failure-metric.sh TerraformFailedRetained release
+          exit 1
+
   deploy-sandbox-cell1-blue-green:
     name: Deploy Sandbox cell1 - Blue/Green
     # The image tag comes from cell0, but the refresh must also wait for
@@ -3425,21 +3538,24 @@ jobs:
       needs.deploy-sandbox-blue-green.outputs.server_tag != ''
     runs-on: ubuntu-latest
     environment: sandbox
-    # Single dispatch: one find-run window (FIND_RETRIES 24 x 5s = 120s) plus
-    # the 2400s poll budget is ~42m. 50m covers that plus checkout/AWS/SSM
-    # pre-steps with buffer. deploy-sandbox-blue-green needs 90m only because
-    # its drift path can dispatch twice; cell1 has one component.
-    timeout-minutes: 50
+    # Normal steady state is one ~42m blue/green dispatch. The one-time durable
+    # profile cut additionally waits for the dedicated two-cell cutover (up to
+    # 120m), so this parent must outlive both children with a small buffer.
+    timeout-minutes: 180
     # Job-level permissions REPLACE the workflow-level block, so re-list every
     # scope. actions: write for the workflow-dispatch REST call,
-    # id-token: write for the AWS OIDC role, contents: read for checkout.
+    # id-token: write for the AWS OIDC role, contents: read for checkout, and
+    # attestations: read for the exact image/source provenance revalidation.
     permissions:
       id-token: write
       contents: read
       actions: write
+      attestations: read
     concurrency:
       group: deploy-sandbox-cell1-blue-green
-      cancel-in-progress: true
+      # This job owns the one-time irreversible cut when required. A newer main
+      # push must queue, never cancel or replace its exact source checkout.
+      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3456,11 +3572,13 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           # The tag cell0 was dispatched with — convergence is the point.
           SERVER_TAG: ${{ needs.deploy-sandbox-blue-green.outputs.server_tag }}
+          CUTOVER_REQUIRED: ${{ needs.deploy-sandbox-blue-green.outputs.cutover_required }}
           # Read by dispatch-and-poll-blue-green.sh and passed through as
           # blue-green-deploy.yml's cell_id input, which now also selects the
           # /sandbox-cell1/nhp/... infrastructure namespace.
           CELL_ID: cell1
           POLL_TIMEOUT: "2400"
+          PROTOCOL_PROFILE: durable-aop-v1
         run: |
           set -euo pipefail
           echo "============================================"
@@ -3468,8 +3586,29 @@ jobs:
           echo "  cell:       cell1"
           echo "  component:  server (cell1 has no AC fleet)"
           echo "  server tag: $SERVER_TAG"
+          echo "  cutover:    $CUTOVER_REQUIRED"
           echo "============================================"
+          if [[ "$CUTOVER_REQUIRED" == "true" ]]; then
+            CUTOVER_OWNER="nhp:${GITHUB_RUN_ID}:durable-aop-cutover:${GITHUB_SHA}"
+            CUTOVER_STATE=$(bash scripts/ssm-read-optional.sh /sandbox/nhp/cutovers/durable-aop-v1/state)
+            CUTOVER_LOCK=$(bash scripts/ssm-read-optional.sh /layerv-nhp-sandbox/qurl-live-env-lock)
+            RESUME_CUTOVER=$(./.github/scripts/classify-durable-aop-cutover-resume.sh \
+              "$SERVER_TAG" "$GITHUB_SHA" "$CUTOVER_OWNER" "$CUTOVER_STATE" "$CUTOVER_LOCK")
+            if [[ "$RESUME_CUTOVER" == "true" ]]; then
+              echo "Exact durable cutover state already exists; skipping child prewarm and resuming the immutable parent run."
+              ./.github/scripts/run-durable-aop-cutover-under-lock.sh "$SERVER_TAG"
+              exit 0
+            fi
+            export BLUE_GREEN_ACTION=prepare-only
+          else
+            export BLUE_GREEN_ACTION=deploy
+          fi
           ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox server "$SERVER_TAG" </dev/null
+
+          if [[ "$CUTOVER_REQUIRED" == "true" ]]; then
+            echo "Both sandbox server cells and the central AC are prewarmed at $SERVER_TAG; executing the one-way cutover from immutable source $GITHUB_SHA."
+            ./.github/scripts/run-durable-aop-cutover-under-lock.sh "$SERVER_TAG"
+          fi
 
       # Same fail-closed posture as cell0's "Update Deployment Tracking": prove
       # the configured active tag before recording anything, and leave the

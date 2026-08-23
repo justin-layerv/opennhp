@@ -27,13 +27,10 @@ func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockReq
 // If the plugin aborted the context (e.g., NHP silent drop), no error
 // response is written — preserving NHP protocol silence.
 func (hs *HttpServer) runPluginAuth(c *gin.Context, req *common.HttpKnockRequest, handler plugins.PluginHandler) {
-	// Stamp the request context onto req.Ctx so handleHttpOpenResource can
-	// retrieve it later. The Ctx field is deprecated but retained for the
-	// fengyily/nhp-plugins-sdk callback (see HttpKnockRequest doc); since
-	// every HTTP path goes through here, downstream readers can rely on it
-	// being non-nil and skip nil-handling branches. The ASP-plugin path bounds it
-	// with the knock-processing budget (see withKnockProcessingBudget) so the
-	// AC-open reknock retry can short-circuit against the caller's budget.
+	// Stamp a bounded request context onto the deprecated Ctx compatibility
+	// field used by the fengyily/nhp-plugins-sdk callback. Direct HTTP admission
+	// is retired, but plugins may still inspect this request-scoped context before
+	// the callback returns ErrHTTPAccessOperationUnsupported.
 	if c.Request != nil {
 		knockCtx, cancel := withKnockProcessingBudget(c.Request.Context())
 		defer cancel()

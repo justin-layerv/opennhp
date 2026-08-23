@@ -2,7 +2,11 @@ package ac
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -164,7 +168,7 @@ func TestHandleUdpACOperations_WrongLengthPubkeyDistinct(t *testing.T) {
 // TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal is the
 // counterpart fence: a fresh (pubkey, txid, sendTime) triple must
 // NOT short-circuit at the dedupe gate. With a parseable but empty
-// BodyMessage, json.Unmarshal succeeds, HandleAccessControl logs
+// BodyMessage carrying the required 1.2 base fields, strict decode succeeds, HandleAccessControl logs
 // ErrACEmptyPassAddress (no src/dst addrs) but the function
 // continues and ART-forwarding fails on an empty
 // RemoteTransactionMap with ErrTransactionIdNotFound. The test
@@ -193,8 +197,11 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 		RemotePubKey:   pubkeyN('B'),
 		RemoteSendTime: testSendTime,
 		HeaderType:     core.NHP_AOP,
-		BodyMessage:    []byte("{}"),
-		ConnData:       &core.ConnectionData{},
+		BodyMessage: []byte(fmt.Sprintf(
+			`{"sessId":1,"sessOwnerId":"00112233445566778899aabbccddeeff","agentPubKey":%q,"sessIssuedAtMillis":1,"opnTime":1}`,
+			base64.StdEncoding.EncodeToString(pubkeyN('A')),
+		)),
+		ConnData: &core.ConnectionData{},
 	}
 
 	err := a.HandleUdpACOperations(ppd)
@@ -206,7 +213,227 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 		t.Fatal("first-seen triple must not be reported as duplicate (dedupe short-circuited incorrectly)")
 	}
 	if !errors.Is(err, common.ErrTransactionIdNotFound) {
-		t.Fatalf("got err=%v, want ErrTransactionIdNotFound (empty body reaches HandleAccessControl + ART forwarding; absence of a remote transaction is the deterministic downstream failure)", err)
+		t.Fatalf("got err=%v, want ErrTransactionIdNotFound (valid base fields reach HandleAccessControl + ART forwarding; absence of a remote transaction is the deterministic downstream failure)", err)
+	}
+}
+
+func TestHandleUdpACOperations_ZeroSessionDoesNotAdmit(t *testing.T) {
+	ipset := &recordingIPSet{}
+	a := &UdpAC{
+		config:     &Config{ACId: "test-ac", DefaultIp: "10.0.0.5", FilterMode: FilterMode_IPTABLES, IpPassMode: PASS_KNOCK_IP},
+		ipset:      ipset,
+		aopReplay:  newAOPReplayCache(),
+		tokenStore: common.NewTokenStore[*AccessEntry](),
+	}
+	body := []byte(`{"sessId":0,"usrId":"user","aspId":"agent","srcAddrs":[{"ip":"203.0.113.10"}],"dstAddrs":[{"ip":"10.0.0.5","port":443,"protocol":"tcp"}],"opnTime":60}`)
+	err := a.HandleUdpACOperations(&core.PacketParserData{
+		SenderTrxId:    201,
+		RemotePubKey:   pubkeyN('C'),
+		RemoteSendTime: testSendTime,
+		HeaderType:     core.NHP_AOP,
+		BodyMessage:    body,
+		ConnData:       &core.ConnectionData{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "canonical nonzero uint64") {
+		t.Fatalf("zero-session AOP terminal error = %v, want strict sessId rejection before ART", err)
+	}
+	if len(ipset.adds) != 0 {
+		t.Fatalf("zero-session AOP wrote access rules: %+v", ipset.adds)
+	}
+}
+
+func TestHandleUdpACOperations_ZeroOpenTimeClosesExactNHPSession(t *testing.T) {
+	scheduler := NewScheduler(&NoOpFlusher{}, WithTickInterval(time.Millisecond))
+	scheduler.Start()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = scheduler.Shutdown(ctx)
+	})
+	a := &UdpAC{
+		config:      &Config{ACId: "test-ac"},
+		aopReplay:   newAOPReplayCache(),
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		revIndex:    newRevocationIndex(),
+		nhpSessions: newNHPSessionIndex(),
+		expirySched: scheduler,
+	}
+	a.sessionFlushComplete.Store(true)
+	serverKey := base64.StdEncoding.EncodeToString(pubkeyN('D'))
+	agentKey := base64.StdEncoding.EncodeToString(pubkeyN('A'))
+	const owner = "00112233445566778899aabbccddeeff"
+	issuedAt := time.UnixMilli(1_700_000_000_000)
+	target := &AccessEntry{OpenTime: 60, NHPSessionId: 101, NHPServerPublicKey: serverKey, NHPSessionOwnerId: owner, NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: issuedAt.UnixMilli()}
+	sibling := &AccessEntry{OpenTime: 60, NHPSessionId: 202, NHPServerPublicKey: serverKey, NHPSessionOwnerId: owner, NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: issuedAt.UnixMilli()}
+	crossServerSibling := &AccessEntry{OpenTime: 60, NHPSessionId: 101, NHPServerPublicKey: base64.StdEncoding.EncodeToString(pubkeyN('E')), NHPSessionOwnerId: owner, NHPAgentPublicKey: agentKey, NHPSessionIssuedAtMillis: issuedAt.Add(time.Millisecond).UnixMilli()}
+	targetToken := a.GenerateAccessToken(target)
+	siblingToken := a.GenerateAccessToken(sibling)
+	crossServerToken := a.GenerateAccessToken(crossServerSibling)
+
+	body, err := json.Marshal(&common.ServerACOpsMsg{SessionId: 101, SessionOwnerId: owner, AgentPublicKey: agentKey, SessionIssuedAtMillis: issuedAt.UnixMilli(), OpenTime: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = a.HandleUdpACOperations(&core.PacketParserData{
+		SenderTrxId:    202,
+		RemotePubKey:   pubkeyN('D'),
+		RemoteSendTime: testSendTime,
+		HeaderType:     core.NHP_AOP,
+		BodyMessage:    body,
+		ConnData:       &core.ConnectionData{},
+	})
+	if !errors.Is(err, common.ErrTransactionIdNotFound) {
+		t.Fatalf("close-session AOP terminal error = %v, want ART forwarding failure after close", err)
+	}
+	if _, ok := a.tokenStore.Load(targetToken); ok {
+		t.Fatal("target numeric session remained live after opnTime=0 AOP")
+	}
+	if _, ok := a.tokenStore.Load(siblingToken); !ok {
+		t.Fatal("different numeric session was closed")
+	}
+	if _, ok := a.tokenStore.Load(crossServerToken); !ok {
+		t.Fatal("same numeric session from a different authenticated server was closed")
+	}
+	if got := a.CloseNHPSession(serverKey, owner, 101); got != 0 {
+		t.Fatalf("duplicate close count = %d, want idempotent 0", got)
+	}
+}
+
+func TestHandleUdpACOperations_ZeroOpenTimeRejectsBeforeBootFlushCompletes(t *testing.T) {
+	a := &UdpAC{
+		config:      &Config{ACId: "test-ac"},
+		aopReplay:   newAOPReplayCache(),
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		revIndex:    newRevocationIndex(),
+		nhpSessions: newNHPSessionIndex(),
+	}
+	agentKey := base64.StdEncoding.EncodeToString(pubkeyN('A'))
+	entry := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             101,
+		NHPServerPublicKey:       base64.StdEncoding.EncodeToString(pubkeyN('D')),
+		NHPSessionOwnerId:        "00112233445566778899aabbccddeeff",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 1_700_000_000_000,
+	}
+	token := a.GenerateAccessToken(entry)
+	body, err := json.Marshal(&common.ServerACOpsMsg{
+		SessionId:             entry.NHPSessionId,
+		SessionOwnerId:        entry.NHPSessionOwnerId,
+		AgentPublicKey:        entry.NHPAgentPublicKey,
+		SessionIssuedAtMillis: entry.NHPSessionIssuedAtMillis,
+		OpenTime:              0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = a.HandleUdpACOperations(&core.PacketParserData{
+		SenderTrxId:    203,
+		RemotePubKey:   pubkeyN('D'),
+		RemoteSendTime: testSendTime,
+		HeaderType:     core.NHP_AOP,
+		BodyMessage:    body,
+		ConnData:       &core.ConnectionData{},
+	})
+	if _, ok := a.tokenStore.Load(token); !ok {
+		t.Fatal("zero-open-time AOP removed a session before boot flush completed")
+	}
+	if !a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, entry.NHPSessionId, entry.NHPSessionIssuedAtMillis)) {
+		t.Fatal("zero-open-time AOP published a close fence before boot flush completed")
+	}
+}
+
+func TestHandleUdpACOperations_ZeroOpenTimeKeepsExactFencePendingUntilFlushRetry(t *testing.T) {
+	flusher := &failFirstSessionControlFlusher{}
+	scheduler := NewScheduler(flusher, WithTickInterval(time.Hour))
+	scheduler.Start()
+	t.Cleanup(func() { shutdownOrFail(t, scheduler) })
+	a := &UdpAC{
+		config:      &Config{ACId: "test-ac", FilterMode: FilterMode_IPTABLES},
+		aopReplay:   newAOPReplayCache(),
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		revIndex:    newRevocationIndex(),
+		nhpSessions: newNHPSessionIndex(),
+		expirySched: scheduler,
+	}
+	a.sessionFlushComplete.Store(true)
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	a.nhpSessions.now = func() time.Time { return now }
+	serverKey := base64.StdEncoding.EncodeToString(pubkeyN('D'))
+	agentKey := base64.StdEncoding.EncodeToString(pubkeyN('A'))
+	const owner = "00112233445566778899aabbccddeeff"
+	key, err := MakeFlowKey("192.0.2.70", "192.0.2.80", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             101,
+		NHPServerPublicKey:       serverKey,
+		NHPSessionOwnerId:        owner,
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 1000,
+	}
+	target.recordScheduledKey(key)
+	targetToken := a.GenerateAccessToken(target)
+	sibling := &AccessEntry{
+		OpenTime:                 60,
+		NHPSessionId:             101,
+		NHPServerPublicKey:       serverKey,
+		NHPSessionOwnerId:        "ffeeddccbbaa99887766554433221100",
+		NHPAgentPublicKey:        agentKey,
+		NHPSessionIssuedAtMillis: 1001,
+	}
+	siblingToken := a.GenerateAccessToken(sibling)
+	scheduler.Schedule(key, time.Now().Add(time.Hour))
+	body, err := json.Marshal(&common.ServerACOpsMsg{
+		SessionId:             101,
+		SessionOwnerId:        owner,
+		AgentPublicKey:        agentKey,
+		SessionIssuedAtMillis: 1000,
+		OpenTime:              0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := func(transactionID uint64, sendTime int64) {
+		t.Helper()
+		_ = a.HandleUdpACOperations(&core.PacketParserData{
+			SenderTrxId:    transactionID,
+			RemotePubKey:   pubkeyN('D'),
+			RemoteSendTime: sendTime,
+			HeaderType:     core.NHP_AOP,
+			BodyMessage:    body,
+			ConnData:       &core.ConnectionData{},
+		})
+	}
+
+	handle(300, testSendTime)
+	if _, ok := a.tokenStore.Load(targetToken); !ok {
+		t.Fatal("failed legacy exact close removed retry state")
+	}
+	now = base.Add(10 * nhpSessionCloseFenceTTL)
+	if a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, 101, 1000)) {
+		t.Fatal("failed legacy exact close fence expired before convergence")
+	}
+	if !a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, 101, 1001)) {
+		t.Fatal("failed legacy exact close rejected sibling issuance")
+	}
+
+	handle(301, testSendTime+1)
+	if got := flusher.count(); got != 2 {
+		t.Fatalf("flush calls = %d, want failed attempt plus retry", got)
+	}
+	if _, ok := a.tokenStore.Load(targetToken); ok {
+		t.Fatal("retried legacy exact close retained target")
+	}
+	if _, ok := a.tokenStore.Load(siblingToken); !ok {
+		t.Fatal("retried legacy exact close removed sibling")
+	}
+	now = now.Add(nhpSessionCloseFenceTTL)
+	if !a.nhpSessions.admitsSession(sessionFenceEntry(agentKey, 101, 1000)) {
+		t.Fatal("converged legacy exact fence did not expire at replay boundary")
 	}
 }
 
@@ -217,6 +444,7 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 // hashes as received and MUST NOT recompute them — this asserts pass-through.
 func TestAccessEntryFromAOP_StoresQurlV2Metadata(t *testing.T) {
 	dop := &common.ServerACOpsMsg{
+		SessionId:        0x0123456789abcdef,
 		UserId:           "u",
 		DeviceId:         "d",
 		OrganizationId:   "org",
@@ -227,13 +455,20 @@ func TestAccessEntryFromAOP_StoresQurlV2Metadata(t *testing.T) {
 
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
-		SessionId:             "sess_123",
+		QurlSessionId:         "sess_123",
 		AdmissionId:           "adm_test123",
 		RevocationEpoch:       42,
 		Deadline:              1781910300,
 	}
 
-	entry := accessEntryFromAOP(dop)
+	const serverKey = "server-public-key"
+	entry := accessEntryFromAOP(dop, serverKey)
+	if entry.NHPSessionId != dop.SessionId {
+		t.Errorf("NHPSessionId = %#x, want base session %#x", entry.NHPSessionId, dop.SessionId)
+	}
+	if entry.NHPServerPublicKey != serverKey {
+		t.Errorf("NHPServerPublicKey = %q, want %q", entry.NHPServerPublicKey, serverKey)
+	}
 
 	if entry.QurlUserPublicKeyHash != "a1b2c3" {
 		t.Errorf("QurlUserPublicKeyHash = %q, want %q (verbatim from AOP)", entry.QurlUserPublicKeyHash, "a1b2c3")
@@ -241,8 +476,8 @@ func TestAccessEntryFromAOP_StoresQurlV2Metadata(t *testing.T) {
 	if entry.ResourcePublicKeyHash != "d4e5f6" {
 		t.Errorf("ResourcePublicKeyHash = %q, want %q (verbatim from AOP)", entry.ResourcePublicKeyHash, "d4e5f6")
 	}
-	if entry.SessionId != "sess_123" {
-		t.Errorf("SessionId = %q, want %q", entry.SessionId, "sess_123")
+	if entry.QurlSessionId != "sess_123" {
+		t.Errorf("QurlSessionId = %q, want %q", entry.QurlSessionId, "sess_123")
 	}
 	if entry.AdmissionId != "adm_test123" {
 		t.Errorf("AdmissionId = %q, want %q", entry.AdmissionId, "adm_test123")
@@ -281,10 +516,10 @@ func TestAccessEntryFromAOP_LegacyAOP_NoMetadata(t *testing.T) {
 		// qURL v2 fields intentionally absent — legacy shape.
 	}
 
-	entry := accessEntryFromAOP(dop)
+	entry := accessEntryFromAOP(dop, "server-public-key")
 
 	if entry.QurlUserPublicKeyHash != "" || entry.ResourcePublicKeyHash != "" ||
-		entry.SessionId != "" || entry.AdmissionId != "" ||
+		entry.QurlSessionId != "" || entry.AdmissionId != "" ||
 		entry.RevocationEpoch != 0 || entry.Deadline != 0 {
 		t.Errorf("legacy AOP must yield zero revocation metadata, got %#v", entry)
 	}

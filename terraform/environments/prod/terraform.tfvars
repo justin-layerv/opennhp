@@ -53,13 +53,15 @@ ac_max_capacity = 10
 #     CloudWatch only at this flip.
 # Rollback is symmetric: set 0 and roll the ASG again.
 ac_filter_mode = 1
-# L3 flush-on-expiry rollout levers (docs/runbooks/l3-flush-*.md). Off by
-# default via the module; the prod flip is the higher-stakes one, so drive it
-# from here — uncomment, enable with dry-run first, soak, then set
-# l3_flush_dry_run = false to acknowledge real-flush.
-# enable_l3_flush_on_expiry = false
-# l3_flush_dry_run          = true
-enable_egress_eips = true
+# L3 flush-on-expiry is part of the coordinated durable-session release.
+# Production intentionally takes the reviewed single-release path: Terraform
+# creates the authority rows and renders real-flush boot acknowledgement, then
+# the promote workflow rolls the AC fleet before the server fleet can admit
+# durable sessions. Roll back all three values together with both binaries.
+enable_l3_flush_on_expiry       = true
+l3_flush_dry_run                = false
+l3_flush_real_mode_acknowledged = true
+enable_egress_eips              = true
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-235500187906"

@@ -193,9 +193,9 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		return
 	}
 
-	// Browser relay carries application KNK/RKN/EXT only. Native lifecycle
-	// messages use direct UDP; every other authenticated relay type falls
-	// through to the fixed drop below before plugin or Authority dispatch.
+	// Browser relay carries application KNK/RKN/EXT only. On the current 1.1
+	// envelope EXT remains a body-bearing request and uses the same strict
+	// knock/ACK path; a bodyless packet is rejected by buildKnockAck.
 	switch {
 	case core.IsForwardableKnockType(innerPpd.HeaderType):
 		if !isRoutablePublicIP(sourceAddr.IP) {
@@ -226,10 +226,12 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	// Run the exact knock pipeline. buildKnockAck reads ppd.ConnData.RemoteAddr
 	// (= sourceAddr) for the AC pinhole and AgentAddr, so the AC opens for the
 	// real client, never the relay.
-	ackBytes, userID, buildErr := s.buildKnockAck(innerPpd)
+	ackBytes, userID, admission, buildErr := s.buildKnockAckWithAdmission(innerPpd)
 	if buildErr != nil {
-		// Marshal failure only — an auth reject returns nil error with the
-		// verdict in ackBytes and is sent below.
+		// Auth rejects return nil error with the verdict in ackBytes and are sent
+		// below. Structural failures (including bodyless EXT on the current 1.1
+		// envelope) are pre-publication drops and must be observable.
+		s.metrics.IncrCounter(MetricRelayForwardReject)
 		log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to build knock ack: %v",
 			relayAddr, sourceAddr, userID, buildErr)
 		return
@@ -237,14 +239,30 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 
 	innerReply, err := s.buildRelayInnerReply(innerPpd, core.NHP_ACK, ackBytes)
 	if err != nil {
+		s.compensateSuccessfulACKBytes(innerPpd.RemotePubKey, ackBytes)
+		closeErr := s.compensateDurableAdmission(admission)
 		log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to encrypt relayed ack: %v",
-			relayAddr, sourceAddr, userID, err)
+			relayAddr, sourceAddr, userID, errors.Join(err, closeErr))
 		return
 	}
 	if err := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, innerReply); err != nil {
+		s.compensateSuccessfulACKBytes(innerPpd.RemotePubKey, ackBytes)
+		closeErr := s.compensateDurableAdmission(admission)
 		log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to send relayed ack: %v",
-			relayAddr, sourceAddr, userID, err)
+			relayAddr, sourceAddr, userID, errors.Join(err, closeErr))
 		return
+	}
+	if admission != nil {
+		markCtx, markCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		markErr := s.markDurableSessionAckEnqueued(markCtx, admission.Candidate)
+		markCancel()
+		if markErr != nil {
+			s.compensateSuccessfulACKBytes(innerPpd.RemotePubKey, ackBytes)
+			closeErr := s.compensateDurableAdmission(admission)
+			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to mark durable ACK boundary: %v",
+				relayAddr, sourceAddr, userID, errors.Join(markErr, closeErr))
+			return
+		}
 	}
 	log.Info("server-relay(@%s src=%s user=%s)[HandleRelayForward] delivered relayed ack", relayAddr, sourceAddr, userID)
 }

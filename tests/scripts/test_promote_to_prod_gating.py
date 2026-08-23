@@ -1489,6 +1489,76 @@ def _assert_image_deploys(jobs: dict, failures: list[str]) -> None:
             )
 
 
+def _job_needs(job: dict) -> set[str]:
+    needs = job.get("needs", [])
+    if isinstance(needs, str):
+        return {needs}
+    if isinstance(needs, list):
+        return {value for value in needs if isinstance(value, str)}
+    return set()
+
+
+def _assert_session_control_deploy_order(jobs: dict, failures: list[str]) -> None:
+    """Keep the one-shot production release AC-first."""
+
+    required = ("deploy-traefik-plugins", "deploy-ac", "deploy-server")
+    missing = [name for name in required if not isinstance(jobs.get(name), dict)]
+    if not _check(
+        "session-control deploy order has plugin, AC, and server jobs",
+        not missing,
+        f"missing: {missing}",
+    ):
+        failures.append(f"session-control deploy-order jobs missing: {missing}")
+        return
+
+    plugin_needs = _job_needs(jobs["deploy-traefik-plugins"])
+    ac_needs = _job_needs(jobs["deploy-ac"])
+    server_needs = _job_needs(jobs["deploy-server"])
+    ac_gate = _normalize(str(jobs["deploy-ac"].get("if", "")))
+    server_gate = _normalize(str(jobs["deploy-server"].get("if", "")))
+    checks = (
+        (
+            "plugin publication does not wait for server",
+            "deploy-server" not in plugin_needs,
+            f"needs: {sorted(plugin_needs)}",
+        ),
+        (
+            "AC waits for plugin publication",
+            "deploy-traefik-plugins" in ac_needs,
+            f"needs: {sorted(ac_needs)}",
+        ),
+        (
+            "AC does not wait for server",
+            "deploy-server" not in ac_needs,
+            f"needs: {sorted(ac_needs)}",
+        ),
+        (
+            "server waits for AC",
+            "deploy-ac" in server_needs,
+            f"needs: {sorted(server_needs)}",
+        ),
+        (
+            "AC requires successful plugin publication",
+            "needs.deploy-traefik-plugins.result == 'success'" in ac_gate
+            and "needs.deploy-traefik-plugins.result == 'skipped'" not in ac_gate,
+            f"if: {ac_gate}",
+        ),
+        (
+            "server requires successful AC when AC was selected",
+            "inputs.deploy_ac && needs.deploy-ac.result == 'success'" in server_gate,
+            f"if: {server_gate}",
+        ),
+        (
+            "server accepts skipped AC only when AC was deselected",
+            "!inputs.deploy_ac && needs.deploy-ac.result == 'skipped'" in server_gate,
+            f"if: {server_gate}",
+        ),
+    )
+    for label, ok, detail in checks:
+        if not _check(f"session-control deploy order: {label}", ok, detail):
+            failures.append(f"session-control deploy order: {label}")
+
+
 def _assert_sns_row_widths(jobs: dict, failures: list[str]) -> None:
     """Guard the SNS-row label width.
 
@@ -3792,6 +3862,32 @@ _BAD_FIXTURE_DEPLOY = textwrap.dedent(
 )
 
 
+_BAD_FIXTURE_SESSION_CONTROL_DEPLOY_ORDER = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      deploy-server:
+        needs: [terraform-apply]
+        if: inputs.deploy_server
+        runs-on: ubuntu-latest
+        steps:
+          - run: ":"
+      deploy-traefik-plugins:
+        needs: [terraform-apply, deploy-server]
+        if: inputs.deploy_ac
+        runs-on: ubuntu-latest
+        steps:
+          - run: ":"
+      deploy-ac:
+        needs: [terraform-apply, deploy-server, deploy-traefik-plugins]
+        if: inputs.deploy_ac
+        runs-on: ubuntu-latest
+        steps:
+          - run: ":"
+    """
+)
+
+
 # Tightening canary: a "simplification" that DROPPED the run_terraform
 # check entirely (just gates on terraform-apply.result == 'success') looks
 # tighter than the conditional form but silently breaks the
@@ -5179,6 +5275,11 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
     cases: tuple[tuple[str, Callable[[dict, list[str]], None], str], ...] = (
         ("image-deploys (permissive gate)", _assert_image_deploys, _BAD_FIXTURE_DEPLOY),
         (
+            "session-control deployment is not AC-first",
+            _assert_session_control_deploy_order,
+            _BAD_FIXTURE_SESSION_CONTROL_DEPLOY_ORDER,
+        ),
+        (
             "image-deploys (negated-success regression)",
             _assert_image_deploys,
             _BAD_FIXTURE_DEPLOY_NEGATED_SUCCESS,
@@ -5542,6 +5643,7 @@ def main() -> int:
     # paired bad fixture (which would defeat the self-test pattern).
     assertions: tuple[Callable[[dict, list[str]], None], ...] = (
         _assert_image_deploys,
+        _assert_session_control_deploy_order,
         _assert_manifest_rejects_no_op,
         _assert_terraform_apply_needs_schema_compat,
         _assert_deploy_qurl_needs_agent_key_inventory,
