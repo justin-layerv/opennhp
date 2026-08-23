@@ -201,8 +201,11 @@ func TestFlushNowAndWaitFailurePreservesNaturalRetry(t *testing.T) {
 	if got := flusher.calls.Load(); got != 2 {
 		t.Fatalf("flush calls = %d, want failed authoritative attempt plus one natural retry", got)
 	}
-	if got := scheduler.EntryCount(); got != 0 {
-		t.Fatalf("entries after successful natural retry = %d, want 0", got)
+	// failOnceAuthoritativeFlusher closes done from inside Flush. The scheduler
+	// worker removes the successfully flushed entry immediately afterward, so
+	// observe that distinct completion boundary instead of racing the defer.
+	if !waitUntil(func() bool { return scheduler.EntryCount() == 0 }, time.Second) {
+		t.Fatalf("entries after successful natural retry = %d, want 0", scheduler.EntryCount())
 	}
 }
 

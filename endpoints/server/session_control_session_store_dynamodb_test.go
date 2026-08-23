@@ -16,6 +16,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// The fake transaction deliberately consumes its operation budget before the
+// store performs a fresh ambiguity-classification bracket. One millisecond is
+// scheduler-sensitive under the full package race run and tests timing rather
+// than the detached result-context contract.
+const sessionControlDynamoAmbiguityTestTimeout = 100 * time.Millisecond
+
 type sessionControlSessionDynamoFake struct {
 	mu           sync.Mutex
 	items        map[string]map[string]types.AttributeValue
@@ -559,7 +565,7 @@ func TestSessionControlIntentTargetIdentityBindsStableProcess(t *testing.T) {
 
 func TestDynamoSessionControlReserveClassifiesCommitAfterOperationTimeout(t *testing.T) {
 	fake := newSessionControlSessionDynamoFake()
-	store := newSessionControlSessionDynamoStore(fake, time.Millisecond)
+	store := newSessionControlSessionDynamoStore(fake, sessionControlDynamoAmbiguityTestTimeout)
 	candidate := testSessionControlSessionCandidate(0x56, 203)
 	snapshot := testSessionControlSessionSnapshot(1)
 	planned, err := planSessionControlReservation(candidate, snapshot)
@@ -644,7 +650,7 @@ func TestDynamoSessionControlPrepareClassifiesCommitAfterOperationTimeout(t *tes
 	seedSessionControlReservation(t, fake, reserved)
 	seedSessionControlDirectory(t, fake, snapshot)
 	seedSessionControlTarget(t, fake, target)
-	store := newSessionControlSessionDynamoStore(fake, time.Millisecond)
+	store := newSessionControlSessionDynamoStore(fake, sessionControlDynamoAmbiguityTestTimeout)
 	fake.transactHook = func(ctx context.Context, _ *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)
@@ -668,7 +674,7 @@ func TestDynamoSessionControlPrepareAmbiguityRequiresUnchangedDirectory(t *testi
 	fake := newSessionControlSessionDynamoFake()
 	seedSessionControlReservation(t, fake, reserved)
 	seedSessionControlTarget(t, fake, target)
-	store := newSessionControlSessionDynamoStore(fake, time.Millisecond)
+	store := newSessionControlSessionDynamoStore(fake, sessionControlDynamoAmbiguityTestTimeout)
 	fake.transactHook = func(ctx context.Context, _ *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)
@@ -738,7 +744,7 @@ func TestDynamoSessionControlPrepareClassifiesExactReconnectedTargetCommit(t *te
 	seedSessionControlIntent(t, fake, first.Intent)
 	seedSessionControlDirectory(t, fake, snapshot)
 	seedSessionControlTarget(t, fake, reactivated)
-	store := newSessionControlSessionDynamoStore(fake, time.Millisecond)
+	store := newSessionControlSessionDynamoStore(fake, sessionControlDynamoAmbiguityTestTimeout)
 	fake.transactHook = func(ctx context.Context, _ *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)

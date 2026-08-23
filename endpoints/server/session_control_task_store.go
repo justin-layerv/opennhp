@@ -728,6 +728,45 @@ func sessionControlCloseTaskBoundToTarget(task sessionControlCloseTask,
 		task.BoundActivatedCursor == target.ActivatedControlVersion && task.BoundReadyCursor == target.ReadyControlVersion
 }
 
+// sessionControlCloseTaskPreparingActivationCreation validates the immutable
+// half of the one same-process PREPARING -> ACTIVE_UNREADY task lineage. Both
+// owner inventory and task rebind consume this helper so they cannot drift on
+// which task creation/binding is eligible for the narrow exception.
+func sessionControlCloseTaskPreparingActivationCreation(task sessionControlCloseTask) (
+	sessionControlTargetAuthority, bool,
+) {
+	creation := task.CreationTarget
+	return creation, task.State == sessionControlCloseTaskStatePending &&
+		creation.State == sessionControlTargetPreparing && creation.CountedActiveSlot &&
+		task.CellID == creation.ControlCellID && task.ACID == creation.ACID && task.PublicKey == creation.PublicKey &&
+		task.BoundBootID == creation.BootID && task.BoundFlushGeneration == creation.FlushGeneration &&
+		task.BoundTargetVersion == creation.Version && task.BoundAuthorityVersion == creation.AuthorityVersion &&
+		task.BoundActivatedCursor == 0 && task.BoundReadyCursor == 0
+}
+
+// sessionControlCloseTaskCanFollowPreparingActivation is the one same-physical-
+// AC-process activation exception to the normal strictly-higher-generation
+// rebind rule. A close task
+// can be materialized after a counted target entered PREPARING but before its
+// activation transaction. Activation advances that exact target and OWNER by
+// one lifecycle version while preserving the immutable boot/generation and all
+// task counters. The task must be rebound to that exact ACTIVE_UNREADY
+// successor before delivery; no other equal-generation drift is accepted.
+func sessionControlCloseTaskCanFollowPreparingActivation(task sessionControlCloseTask,
+	target sessionControlTargetAuthority) bool {
+	creation, validCreation := sessionControlCloseTaskPreparingActivationCreation(task)
+	return validCreation &&
+		target.State == sessionControlTargetActive && target.CountedActiveSlot && !target.ready() &&
+		target.ACID == creation.ACID && target.PublicKey == creation.PublicKey &&
+		target.ControlCellID == creation.ControlCellID && target.BootID == creation.BootID &&
+		target.FlushGeneration == creation.FlushGeneration && target.Version == creation.Version+1 &&
+		target.AuthorityVersion == creation.AuthorityVersion &&
+		target.CreatedAtMillis == creation.CreatedAtMillis && target.PreparedAtMillis == creation.PreparedAtMillis &&
+		target.UpdatedAtMillis == creation.PreparedAtMillis &&
+		target.ActivatedControlVersion > 0 && target.ReadyControlVersion == 0 &&
+		target.AAKEnqueuedAtMillis == 0 && target.AAKTransactionID == 0 && target.RetiredAtMillis == 0
+}
+
 func sessionControlCloseTaskOwnerTargetsCurrent(owner sessionControlOwnerAuthority,
 	target sessionControlTargetAuthority) bool {
 	if !target.required() || !target.CountedActiveSlot || owner.CellID != target.ControlCellID ||
@@ -1041,8 +1080,9 @@ func (s *dynamoSessionControlStore) RebindExactCloseTask(ctx context.Context,
 	if sessionControlCloseTaskRebindReplay(state.Task, request) {
 		return &state.Task, nil
 	}
-	if state.Task.State == sessionControlCloseTaskStateAcked ||
-		target.FlushGeneration <= state.Task.BoundFlushGeneration || state.Task.TaskVersion >= math.MaxUint64-1 {
+	if state.Task.State == sessionControlCloseTaskStateAcked || state.Task.TaskVersion >= math.MaxUint64-1 ||
+		(target.FlushGeneration <= state.Task.BoundFlushGeneration &&
+			!sessionControlCloseTaskCanFollowPreparingActivation(state.Task, *target)) {
 		return nil, errSessionControlCloseTaskConflict
 	}
 	updatedAt := now.UnixMilli()

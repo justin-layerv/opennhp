@@ -105,8 +105,11 @@ type sessionControlTargetDirectoryFence struct {
 }
 
 type sessionControlTargetReadiness struct {
-	Fence               sessionControlTargetFence
-	ControlDirectory    sessionControlTargetDirectoryFence
+	Fence            sessionControlTargetFence
+	ControlDirectory sessionControlTargetDirectoryFence
+	// AAKEnqueuedAtMillis retains the live DynamoDB schema name, but is the
+	// timestamp at which this exact AOL transaction was durably authorized for
+	// publication. HandleACOnline enqueues the AAK only after this transition.
 	AAKEnqueuedAtMillis int64
 	AAKTransactionID    uint64
 }
@@ -134,6 +137,11 @@ type sessionControlTargetAuthority struct {
 type sessionControlTargetPreparation struct {
 	Target             sessionControlTargetAuthority
 	RequiresActivation bool
+}
+
+type sessionControlTargetControlAdvance struct {
+	Target                 sessionControlTargetAuthority
+	ObservedControlVersion uint64
 }
 
 func (fence sessionControlTargetFence) key() sessionControlTargetKey {
@@ -597,9 +605,13 @@ func planSessionControlTargetPreparation(current *sessionControlTargetAuthority,
 				return sessionControlTargetPreparation{Target: *current, RequiresActivation: true}, false, nil
 			}
 		case sessionControlTargetActive:
-			// Every reconnect, including the same boot/generation tuple after an
-			// ambiguous AAK loss, must re-enter catch-up. Returning the active row
-			// would skip durable operations created while its control was absent.
+			// Ordinary Prepare is atomic-idempotent on an exact ACTIVE physical
+			// process. Otherwise a server that strongly read PREPARING can arrive
+			// after another server activated the row and spuriously re-version the
+			// shared target, fencing every concurrent finalizer. The caller must
+			// catch up current CONTROL and use ReprepareTargetForControlAdvance only
+			// for an exact ACTIVE_UNREADY row whose activated cursor is stale.
+			return sessionControlTargetPreparation{Target: *current, RequiresActivation: false}, false, nil
 		case sessionControlTargetCanceled:
 			// A rejected late gate is retryable. Incrementing the fence prevents
 			// any delayed activation from the canceled attempt from winning.
@@ -633,6 +645,62 @@ func planSessionControlTargetPreparation(current *sessionControlTargetAuthority,
 	next.UpdatedAtMillis = nowMillis
 	next.RetiredAtMillis = 0
 	return sessionControlTargetPreparation{Target: next, RequiresActivation: true}, true, nil
+}
+
+func validSessionControlTargetControlAdvance(advance sessionControlTargetControlAdvance) bool {
+	return validateSessionControlTargetAuthority(advance.Target) == nil &&
+		advance.Target.State == sessionControlTargetActive && advance.Target.CountedActiveSlot &&
+		advance.Target.ReadyControlVersion == 0 && advance.Target.AAKEnqueuedAtMillis == 0 &&
+		advance.Target.AAKTransactionID == 0 && advance.Target.RetiredAtMillis == 0 &&
+		advance.Target.ActivatedControlVersion > 0 &&
+		advance.ObservedControlVersion > advance.Target.ActivatedControlVersion
+}
+
+func sessionControlTargetAdvancedPreparation(current sessionControlTargetAuthority, authority sessionControlAuthority,
+	now time.Time,
+) (sessionControlTargetPreparation, error) {
+	if validateSessionControlTargetAuthority(current) != nil || validateSessionControlAuthority(authority) != nil ||
+		current.ACID != authority.ACID || current.State != sessionControlTargetActive || !current.CountedActiveSlot ||
+		current.ReadyControlVersion != 0 || current.AAKEnqueuedAtMillis != 0 || current.AAKTransactionID != 0 ||
+		current.RetiredAtMillis != 0 || authority.ControlCellID != current.ControlCellID ||
+		authority.ActiveTargetCount == 0 || now.IsZero() || now.UnixMilli() <= 0 {
+		return sessionControlTargetPreparation{}, errors.New("invalid advanced session-control target preparation")
+	}
+	if current.Version >= ^uint64(0)-3 {
+		return sessionControlTargetPreparation{}, errSessionControlTargetCorrupt
+	}
+	nowMillis := now.UTC().UnixMilli()
+	if nowMillis < current.UpdatedAtMillis {
+		nowMillis = current.UpdatedAtMillis
+	}
+	next := current
+	next.State = sessionControlTargetPreparing
+	next.Version++
+	next.AuthorityVersion = authority.Version
+	next.ActivatedControlVersion = 0
+	next.ReadyControlVersion = 0
+	next.AAKEnqueuedAtMillis = 0
+	next.AAKTransactionID = 0
+	next.PreparedAtMillis = nowMillis
+	next.UpdatedAtMillis = nowMillis
+	return sessionControlTargetPreparation{Target: next, RequiresActivation: true}, nil
+}
+
+func sessionControlTargetAdvancedPreparationCommitted(current sessionControlTargetAuthority,
+	advance sessionControlTargetControlAdvance, authority sessionControlAuthority,
+) bool {
+	previous := advance.Target
+	return validateSessionControlTargetAuthority(current) == nil && validateSessionControlAuthority(authority) == nil &&
+		authority.ACID == previous.ACID && authority.ControlCellID == previous.ControlCellID &&
+		authority.ActiveTargetCount > 0 && authority.Version >= previous.AuthorityVersion &&
+		current.State == sessionControlTargetPreparing &&
+		current.ACID == previous.ACID && current.PublicKey == previous.PublicKey && current.BootID == previous.BootID &&
+		current.FlushGeneration == previous.FlushGeneration && current.ControlCellID == previous.ControlCellID &&
+		current.Version == previous.Version+1 && current.AuthorityVersion == authority.Version &&
+		current.CountedActiveSlot == previous.CountedActiveSlot && current.CreatedAtMillis == previous.CreatedAtMillis &&
+		current.PreparedAtMillis >= previous.UpdatedAtMillis && current.UpdatedAtMillis == current.PreparedAtMillis &&
+		current.ActivatedControlVersion == 0 && current.ReadyControlVersion == 0 &&
+		current.AAKEnqueuedAtMillis == 0 && current.AAKTransactionID == 0 && current.RetiredAtMillis == 0
 }
 
 func (s *dynamoSessionControlStore) now() (time.Time, error) {
@@ -881,19 +949,36 @@ func (s *dynamoSessionControlStore) PrepareTarget(ctx context.Context, candidate
 			if stableErr != nil {
 				return nil, stableErr
 			}
-			if current == nil || *stable != *current {
+			stableOwner, stableOwnerErr := s.getOwner(ctx, candidate.ControlCellID, candidate.ACID, candidate.PublicKey)
+			if stableOwnerErr != nil {
+				return nil, stableOwnerErr
+			}
+			// TARGET and OWNER are separate rows changed atomically by lifecycle
+			// transitions, while task materialization can change OWNER alone. Bracket
+			// both rows before returning the no-write result so an owner-only task
+			// insertion cannot be missed between the first owner read and return.
+			if current == nil || *stable != *current || *stableOwner != *owner {
 				continue
 			}
-			if owner.TargetVersion != planned.Target.Version || owner.TargetAuthorityVersion != planned.Target.AuthorityVersion ||
-				owner.BootID != planned.Target.BootID || owner.FlushGeneration != planned.Target.FlushGeneration ||
-				owner.Phase != sessionControlOwnerPreparing {
+			expectedPhase := sessionControlOwnerPreparing
+			if planned.Target.State == sessionControlTargetActive {
+				expectedPhase = sessionControlOwnerActiveUnready
+				if planned.Target.ready() && owner.PendingCount == 0 {
+					expectedPhase = sessionControlOwnerReady
+				}
+			}
+			if !stableOwner.exactTarget(planned.Target, expectedPhase) {
 				return nil, errSessionControlOwnerCorrupt
 			}
-			pending, pendingErr := sessionControlTargetReconnectHasPendingWork(*current, candidate, *owner)
+			pending, pendingErr := sessionControlTargetReconnectHasPendingWork(*current, candidate, *stableOwner)
 			if pendingErr != nil {
 				return nil, pendingErr
 			}
-			if pending {
+			// A persisted PREPARING target with newly materialized work must still
+			// reach Activate. Activation carries the latest OWNER counters into
+			// ACTIVE_UNREADY, after which the authenticated AOL drains the tasks.
+			// ACTIVE pending work remains a caller-side drain requirement.
+			if pending && planned.Target.State != sessionControlTargetPreparing {
 				return nil, errSessionControlTargetPendingWork
 			}
 			return &planned, nil
@@ -936,6 +1021,95 @@ func (s *dynamoSessionControlStore) PrepareTarget(ctx context.Context, candidate
 		} else if !errors.Is(err, errSessionControlTargetConflict) {
 			return nil, err
 		}
+	}
+	return nil, errSessionControlTargetConflict
+}
+
+// ReprepareTargetForControlAdvance is the only transition allowed to version
+// an exact ACTIVE_UNREADY physical process. The caller supplies the exact row it
+// observed plus the distinct current CONTROL cursor; the target+owner CAS then
+// prevents a stale PREPARING pre-read on another server from fencing a
+// concurrent activation or readiness finalization.
+func (s *dynamoSessionControlStore) ReprepareTargetForControlAdvance(ctx context.Context,
+	advance sessionControlTargetControlAdvance,
+) (*sessionControlTargetPreparation, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if ctx == nil || !validSessionControlTargetControlAdvance(advance) {
+		return nil, errors.New("invalid advanced session-control target preparation")
+	}
+	now, err := s.now()
+	if err != nil {
+		return nil, err
+	}
+	key := advance.Target.key()
+	for range sessionControlPrepareAttempts {
+		authority, authorityErr := s.getAuthority(ctx, advance.Target.ACID)
+		if authorityErr != nil {
+			return nil, authorityErr
+		}
+		current, currentErr := s.getTarget(ctx, key)
+		if currentErr != nil {
+			return nil, currentErr
+		}
+		owner, ownerErr := s.getOwner(ctx, advance.Target.ControlCellID,
+			advance.Target.ACID, advance.Target.PublicKey)
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		stable, stableErr := s.getTarget(ctx, key)
+		if stableErr != nil {
+			return nil, stableErr
+		}
+		if *stable != *current {
+			continue
+		}
+		if sessionControlTargetAdvancedPreparationCommitted(*current, advance, *authority) {
+			if !owner.exactTarget(*current, sessionControlOwnerPreparing) {
+				return nil, errSessionControlOwnerConflict
+			}
+			return &sessionControlTargetPreparation{Target: *current, RequiresActivation: true}, nil
+		}
+		if *current != advance.Target {
+			return nil, errSessionControlTargetConflict
+		}
+		if !owner.exactTarget(*current, sessionControlOwnerActiveUnready) {
+			return nil, errSessionControlOwnerConflict
+		}
+		if owner.PendingCount != 0 {
+			return nil, errSessionControlTargetPendingWork
+		}
+		planned, planErr := sessionControlTargetAdvancedPreparation(*current, *authority, now)
+		if planErr != nil {
+			return nil, planErr
+		}
+		nextOwner, nextOwnerErr := sessionControlOwnerFromTarget(planned.Target, owner, sessionControlOwnerPreparing)
+		if nextOwnerErr != nil {
+			return nil, nextOwnerErr
+		}
+		writeErr := s.replacePreparedTarget(ctx, *current, planned.Target, *owner, nextOwner)
+		if writeErr == nil {
+			return &planned, nil
+		}
+		// A canceled CAS is retryable inside the bounded loop. A transport
+		// ambiguity is also classified by a fresh strong iteration; only the
+		// exact target+owner successor above is accepted as committed.
+		if errors.Is(writeErr, errSessionControlTargetConflict) {
+			continue
+		}
+		classifiedTarget, classifyErr := s.getTarget(ctx, key)
+		if classifyErr == nil {
+			classifiedAuthority, authorityReadErr := s.getAuthority(ctx, advance.Target.ACID)
+			classifiedOwner, ownerReadErr := s.getOwner(ctx, advance.Target.ControlCellID,
+				advance.Target.ACID, advance.Target.PublicKey)
+			if authorityReadErr == nil && ownerReadErr == nil &&
+				sessionControlTargetAdvancedPreparationCommitted(*classifiedTarget, advance, *classifiedAuthority) &&
+				classifiedOwner.exactTarget(*classifiedTarget, sessionControlOwnerPreparing) {
+				return &sessionControlTargetPreparation{Target: *classifiedTarget, RequiresActivation: true}, nil
+			}
+		}
+		return nil, writeErr
 	}
 	return nil, errSessionControlTargetConflict
 }
@@ -1160,8 +1334,8 @@ func sessionControlExpectedActivatedTarget(activation sessionControlTargetActiva
 }
 
 // ActivateTarget commits target membership and the exact catch-up cursor, but
-// deliberately leaves the target authority-unready until its success AAK has
-// been enqueued and FinalizeTargetReady commits that audit boundary.
+// deliberately leaves the target authority-unready until FinalizeTargetReady
+// authorizes publication of its exact success AAK.
 func (s *dynamoSessionControlStore) ActivateTarget(ctx context.Context, activation sessionControlTargetActivation) (*sessionControlTargetAuthority, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -1176,148 +1350,160 @@ func (s *dynamoSessionControlStore) ActivateTarget(ctx context.Context, activati
 	if !fence.CountedActiveSlot && fence.AuthorityVersion >= ^uint64(0)-1 {
 		return nil, errSessionControlTargetCorrupt
 	}
-	currentOwner, err := s.getOwner(ctx, fence.ControlCellID, fence.ACID, fence.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-	if currentOwner.Phase == sessionControlOwnerActiveUnready {
-		current, currentErr := s.getTarget(ctx, fence.key())
-		if currentErr != nil {
-			return nil, currentErr
+	for attempt := 0; attempt < sessionControlPrepareAttempts; attempt++ {
+		currentOwner, err := s.getOwner(ctx, fence.ControlCellID, fence.ACID, fence.PublicKey)
+		if err != nil {
+			return nil, err
 		}
-		expected := sessionControlExpectedActivatedTarget(activation)
-		if *current == expected && currentOwner.exactTarget(*current, sessionControlOwnerActiveUnready) {
-			return current, nil
+		if currentOwner.Phase == sessionControlOwnerActiveUnready {
+			current, currentErr := s.getTarget(ctx, fence.key())
+			if currentErr != nil {
+				return nil, currentErr
+			}
+			expected := sessionControlExpectedActivatedTarget(activation)
+			if *current == expected && currentOwner.exactTarget(*current, sessionControlOwnerActiveUnready) {
+				return current, nil
+			}
+			return nil, errSessionControlOwnerConflict
 		}
-		return nil, errSessionControlOwnerConflict
-	}
-	preparingTarget := sessionControlTargetAuthority{
-		ACID: fence.ACID, PublicKey: fence.PublicKey, BootID: fence.BootID,
-		FlushGeneration: fence.FlushGeneration, State: sessionControlTargetPreparing,
-		Version: fence.Version, AuthorityVersion: fence.AuthorityVersion,
-		CountedActiveSlot: fence.CountedActiveSlot, ControlCellID: fence.ControlCellID,
-		ActivatedControlVersion: fence.ActivatedControlVersion, ReadyControlVersion: fence.ReadyControlVersion,
-		AAKEnqueuedAtMillis: fence.AAKEnqueuedAtMillis, AAKTransactionID: fence.AAKTransactionID,
-		CreatedAtMillis: fence.CreatedAtMillis, PreparedAtMillis: fence.PreparedAtMillis,
-		UpdatedAtMillis: fence.PreparedAtMillis,
-	}
-	if !currentOwner.exactTarget(preparingTarget, sessionControlOwnerPreparing) {
-		return nil, errSessionControlOwnerConflict
-	}
-	// The activation request must be byte-for-byte stable for DynamoDB's
-	// ClientRequestToken idempotency window. PreparedAtMillis is the immutable
-	// start of this catch-up attempt and is therefore also its stable update
-	// timestamp; a retry cannot accidentally change the transaction parameters.
-	nowMillis := fence.PreparedAtMillis
-	nextAuthorityVersion := fence.AuthorityVersion
-	values := sessionControlTargetTransactionValues(fence)
-	values[":next_state"] = &types.AttributeValueMemberS{Value: string(sessionControlTargetActive)}
-	values[":next_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(fence.Version + 1)}
-	values[":counted"] = &types.AttributeValueMemberBOOL{Value: true}
-	values[":updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nowMillis)}
-	values[":caught_up_control_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(activation.CaughtUpControlVersion)}
-	values[":zero_control_version"] = &types.AttributeValueMemberN{Value: "0"}
-	values[":zero_time"] = &types.AttributeValueMemberN{Value: "0"}
-	values[":zero_transaction"] = &types.AttributeValueMemberN{Value: "0"}
+		preparingTarget := sessionControlTargetAuthority{
+			ACID: fence.ACID, PublicKey: fence.PublicKey, BootID: fence.BootID,
+			FlushGeneration: fence.FlushGeneration, State: sessionControlTargetPreparing,
+			Version: fence.Version, AuthorityVersion: fence.AuthorityVersion,
+			CountedActiveSlot: fence.CountedActiveSlot, ControlCellID: fence.ControlCellID,
+			ActivatedControlVersion: fence.ActivatedControlVersion, ReadyControlVersion: fence.ReadyControlVersion,
+			AAKEnqueuedAtMillis: fence.AAKEnqueuedAtMillis, AAKTransactionID: fence.AAKTransactionID,
+			CreatedAtMillis: fence.CreatedAtMillis, PreparedAtMillis: fence.PreparedAtMillis,
+			UpdatedAtMillis: fence.PreparedAtMillis,
+		}
+		if !currentOwner.exactTarget(preparingTarget, sessionControlOwnerPreparing) {
+			return nil, errSessionControlOwnerConflict
+		}
+		// The activation request must be byte-for-byte stable for DynamoDB's
+		// ClientRequestToken idempotency window. PreparedAtMillis is the immutable
+		// start of this catch-up attempt and is therefore also its stable update
+		// timestamp; a retry cannot accidentally change the transaction parameters.
+		nowMillis := fence.PreparedAtMillis
+		nextAuthorityVersion := fence.AuthorityVersion
+		values := sessionControlTargetTransactionValues(fence)
+		values[":next_state"] = &types.AttributeValueMemberS{Value: string(sessionControlTargetActive)}
+		values[":next_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(fence.Version + 1)}
+		values[":counted"] = &types.AttributeValueMemberBOOL{Value: true}
+		values[":updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nowMillis)}
+		values[":caught_up_control_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(activation.CaughtUpControlVersion)}
+		values[":zero_control_version"] = &types.AttributeValueMemberN{Value: "0"}
+		values[":zero_time"] = &types.AttributeValueMemberN{Value: "0"}
+		values[":zero_transaction"] = &types.AttributeValueMemberN{Value: "0"}
 
-	authorityValues := map[string]types.AttributeValue{
-		":authority_kind":    &types.AttributeValueMemberS{Value: sessionControlAuthorityKind},
-		":authority_schema":  &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlAuthoritySchema)},
-		":ac_id":             &types.AttributeValueMemberS{Value: fence.ACID},
-		":authority_version": &types.AttributeValueMemberN{Value: fmt.Sprint(fence.AuthorityVersion)},
-		":control_cell_id":   &types.AttributeValueMemberS{Value: activation.ControlCellID},
-	}
-	authorityCondition := "kind = :authority_kind AND schema_version = :authority_schema AND ac_id = :ac_id AND #version = :authority_version"
-	var authorityWrite types.TransactWriteItem
-	if fence.CountedActiveSlot {
-		authorityWrite.ConditionCheck = &types.ConditionCheck{
-			TableName:                 aws.String(s.tableName),
-			Key:                       sessionControlAuthorityDynamoKey(fence.ACID),
-			ConditionExpression:       aws.String(authorityCondition + " AND control_cell_id = :control_cell_id"),
-			ExpressionAttributeNames:  map[string]string{"#version": "version"},
-			ExpressionAttributeValues: authorityValues,
+		authorityValues := map[string]types.AttributeValue{
+			":authority_kind":    &types.AttributeValueMemberS{Value: sessionControlAuthorityKind},
+			":authority_schema":  &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlAuthoritySchema)},
+			":ac_id":             &types.AttributeValueMemberS{Value: fence.ACID},
+			":authority_version": &types.AttributeValueMemberN{Value: fmt.Sprint(fence.AuthorityVersion)},
+			":control_cell_id":   &types.AttributeValueMemberS{Value: activation.ControlCellID},
 		}
-	} else {
-		nextAuthorityVersion++
+		authorityCondition := "kind = :authority_kind AND schema_version = :authority_schema AND ac_id = :ac_id AND #version = :authority_version"
+		var authorityWrite types.TransactWriteItem
+		if fence.CountedActiveSlot {
+			authorityWrite.ConditionCheck = &types.ConditionCheck{
+				TableName:                 aws.String(s.tableName),
+				Key:                       sessionControlAuthorityDynamoKey(fence.ACID),
+				ConditionExpression:       aws.String(authorityCondition + " AND control_cell_id = :control_cell_id"),
+				ExpressionAttributeNames:  map[string]string{"#version": "version"},
+				ExpressionAttributeValues: authorityValues,
+			}
+		} else {
+			nextAuthorityVersion++
+			values[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextAuthorityVersion)}
+			authorityValues[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextAuthorityVersion)}
+			authorityValues[":capacity"] = &types.AttributeValueMemberN{Value: fmt.Sprint(MaxACConnsPerID)}
+			authorityValues[":next_count"] = &types.AttributeValueMemberN{Value: "1"}
+			authorityValues[":updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nowMillis)}
+			authorityValues[":zero"] = &types.AttributeValueMemberN{Value: "0"}
+			authorityWrite.Update = &types.Update{
+				TableName:                 aws.String(s.tableName),
+				Key:                       sessionControlAuthorityDynamoKey(fence.ACID),
+				UpdateExpression:          aws.String("SET #version = :next_authority_version, control_cell_id = :control_cell_id, active_target_count = active_target_count + :next_count, updated_at_ms = :updated_at"),
+				ConditionExpression:       aws.String(authorityCondition + " AND active_target_count < :capacity AND ((attribute_not_exists(control_cell_id) AND active_target_count = :zero) OR control_cell_id = :control_cell_id)"),
+				ExpressionAttributeNames:  map[string]string{"#version": "version"},
+				ExpressionAttributeValues: authorityValues,
+			}
+		}
 		values[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextAuthorityVersion)}
-		authorityValues[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextAuthorityVersion)}
-		authorityValues[":capacity"] = &types.AttributeValueMemberN{Value: fmt.Sprint(MaxACConnsPerID)}
-		authorityValues[":next_count"] = &types.AttributeValueMemberN{Value: "1"}
-		authorityValues[":updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nowMillis)}
-		authorityValues[":zero"] = &types.AttributeValueMemberN{Value: "0"}
-		authorityWrite.Update = &types.Update{
+		nextTarget := preparingTarget
+		nextTarget.State = sessionControlTargetActive
+		nextTarget.Version = fence.Version + 1
+		nextTarget.AuthorityVersion = nextAuthorityVersion
+		nextTarget.CountedActiveSlot = true
+		nextTarget.ActivatedControlVersion = activation.CaughtUpControlVersion
+		nextTarget.UpdatedAtMillis = nowMillis
+		nextOwner, ownerErr := sessionControlOwnerFromTarget(nextTarget, currentOwner, sessionControlOwnerActiveUnready)
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		ownerWrite, ownerErr := sessionControlOwnerReplace(s.tableName, *currentOwner, nextOwner)
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		targetWrite := types.TransactWriteItem{Update: &types.Update{
 			TableName:                 aws.String(s.tableName),
-			Key:                       sessionControlAuthorityDynamoKey(fence.ACID),
-			UpdateExpression:          aws.String("SET #version = :next_authority_version, control_cell_id = :control_cell_id, active_target_count = active_target_count + :next_count, updated_at_ms = :updated_at"),
-			ConditionExpression:       aws.String(authorityCondition + " AND active_target_count < :capacity AND ((attribute_not_exists(control_cell_id) AND active_target_count = :zero) OR control_cell_id = :control_cell_id)"),
-			ExpressionAttributeNames:  map[string]string{"#version": "version"},
-			ExpressionAttributeValues: authorityValues,
-		}
-	}
-	values[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextAuthorityVersion)}
-	nextTarget := preparingTarget
-	nextTarget.State = sessionControlTargetActive
-	nextTarget.Version = fence.Version + 1
-	nextTarget.AuthorityVersion = nextAuthorityVersion
-	nextTarget.CountedActiveSlot = true
-	nextTarget.ActivatedControlVersion = activation.CaughtUpControlVersion
-	nextTarget.UpdatedAtMillis = nowMillis
-	nextOwner, ownerErr := sessionControlOwnerFromTarget(nextTarget, currentOwner, sessionControlOwnerActiveUnready)
-	if ownerErr != nil {
-		return nil, ownerErr
-	}
-	ownerWrite, ownerErr := sessionControlOwnerReplace(s.tableName, *currentOwner, nextOwner)
-	if ownerErr != nil {
-		return nil, ownerErr
-	}
-	targetWrite := types.TransactWriteItem{Update: &types.Update{
-		TableName:                 aws.String(s.tableName),
-		Key:                       sessionControlTargetDynamoKey(sessionControlTargetKey{ACID: fence.ACID, PublicKey: fence.PublicKey}),
-		UpdateExpression:          aws.String("SET #state = :next_state, #version = :next_version, authority_version = :next_authority_version, counted_active_slot = :counted, activated_control_version = :caught_up_control_version, ready_control_version = :zero_control_version, aak_enqueued_at_ms = :zero_time, aak_transaction_id = :zero_transaction, updated_at_ms = :updated_at"),
-		ConditionExpression:       aws.String(sessionControlTargetTransactionCondition()),
-		ExpressionAttributeNames:  map[string]string{"#state": "state", "#version": "version"},
-		ExpressionAttributeValues: values,
-	}}
-	controlWrite := types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
-		TableName:           aws.String(s.tableName),
-		Key:                 sessionControlFenceDirectoryKey(activation.ControlCellID),
-		ConditionExpression: aws.String("kind = :control_kind AND schema_version = :control_schema AND cell_id = :control_cell_id AND #control_version = :caught_up_control_version AND admission_blocked = :admission_blocked AND overflow_close_count = :overflow_close_count AND overflow_leader_event_id = :leader_event_id AND overflow_leader_prepared_directory_version = :leader_prepared_version AND overflow_leader_selected_directory_version = :leader_selected_version AND attribute_not_exists(#ttl)"),
-		ExpressionAttributeNames: map[string]string{
-			"#control_version": "version", "#ttl": "ttl",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":control_kind":              &types.AttributeValueMemberS{Value: sessionControlFenceDirectoryKind},
-			":control_schema":            &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlFenceSchema)},
-			":control_cell_id":           &types.AttributeValueMemberS{Value: activation.ControlCellID},
-			":caught_up_control_version": &types.AttributeValueMemberN{Value: fmt.Sprint(activation.CaughtUpControlVersion)},
-			":admission_blocked":         &types.AttributeValueMemberBOOL{Value: false},
-			":overflow_close_count":      &types.AttributeValueMemberN{Value: "0"},
-			":leader_event_id":           &types.AttributeValueMemberS{Value: ""},
-			":leader_prepared_version":   &types.AttributeValueMemberN{Value: "0"},
-			":leader_selected_version":   &types.AttributeValueMemberN{Value: "0"},
-		},
-	}}
+			Key:                       sessionControlTargetDynamoKey(sessionControlTargetKey{ACID: fence.ACID, PublicKey: fence.PublicKey}),
+			UpdateExpression:          aws.String("SET #state = :next_state, #version = :next_version, authority_version = :next_authority_version, counted_active_slot = :counted, activated_control_version = :caught_up_control_version, ready_control_version = :zero_control_version, aak_enqueued_at_ms = :zero_time, aak_transaction_id = :zero_transaction, updated_at_ms = :updated_at"),
+			ConditionExpression:       aws.String(sessionControlTargetTransactionCondition()),
+			ExpressionAttributeNames:  map[string]string{"#state": "state", "#version": "version"},
+			ExpressionAttributeValues: values,
+		}}
+		controlWrite := types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName:           aws.String(s.tableName),
+			Key:                 sessionControlFenceDirectoryKey(activation.ControlCellID),
+			ConditionExpression: aws.String("kind = :control_kind AND schema_version = :control_schema AND cell_id = :control_cell_id AND #control_version = :caught_up_control_version AND admission_blocked = :admission_blocked AND overflow_close_count = :overflow_close_count AND overflow_leader_event_id = :leader_event_id AND overflow_leader_prepared_directory_version = :leader_prepared_version AND overflow_leader_selected_directory_version = :leader_selected_version AND attribute_not_exists(#ttl)"),
+			ExpressionAttributeNames: map[string]string{
+				"#control_version": "version", "#ttl": "ttl",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":control_kind":              &types.AttributeValueMemberS{Value: sessionControlFenceDirectoryKind},
+				":control_schema":            &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlFenceSchema)},
+				":control_cell_id":           &types.AttributeValueMemberS{Value: activation.ControlCellID},
+				":caught_up_control_version": &types.AttributeValueMemberN{Value: fmt.Sprint(activation.CaughtUpControlVersion)},
+				":admission_blocked":         &types.AttributeValueMemberBOOL{Value: false},
+				":overflow_close_count":      &types.AttributeValueMemberN{Value: "0"},
+				":leader_event_id":           &types.AttributeValueMemberS{Value: ""},
+				":leader_prepared_version":   &types.AttributeValueMemberN{Value: "0"},
+				":leader_selected_version":   &types.AttributeValueMemberN{Value: "0"},
+			},
+		}}
 
-	opCtx, cancel := context.WithTimeout(ctx, s.timeout())
-	_, err = s.client.TransactWriteItems(opCtx, &dynamodb.TransactWriteItemsInput{
-		ClientRequestToken: sessionControlOwnerTransitionToken("activate", currentOwner, nextOwner),
-		TransactItems:      []types.TransactWriteItem{targetWrite, authorityWrite, controlWrite, ownerWrite},
-	})
-	cancel()
-	if err != nil {
-		resultCtx, resultCancel := s.sessionResultContext(ctx)
-		classified, classifyErr := s.classifyActivationConflict(resultCtx, activation)
-		resultCancel()
-		if classifyErr == nil {
-			return classified, nil
+		opCtx, cancel := context.WithTimeout(ctx, s.timeout())
+		_, err = s.client.TransactWriteItems(opCtx, &dynamodb.TransactWriteItemsInput{
+			ClientRequestToken: sessionControlOwnerTransitionToken("activate", currentOwner, nextOwner),
+			TransactItems:      []types.TransactWriteItem{targetWrite, authorityWrite, controlWrite, ownerWrite},
+		})
+		cancel()
+		if err != nil {
+			resultCtx, resultCancel := s.sessionResultContext(ctx)
+			classified, classifyErr := s.classifyActivationConflict(resultCtx, activation)
+			resultCancel()
+			if classifyErr == nil {
+				return classified, nil
+			}
+			var canceled *types.TransactionCanceledException
+			if errors.As(err, &canceled) {
+				// A task can atomically advance only OWNER after our strong read.
+				// Retry the exact activation with a fresh PREPARING owner so its
+				// counters are preserved in ACTIVE_UNREADY. Other definitive
+				// conflicts retain their classified result at the retry bound.
+				if attempt+1 < sessionControlPrepareAttempts &&
+					(errors.Is(classifyErr, errSessionControlTargetConflict) ||
+						errors.Is(classifyErr, errSessionControlOwnerConflict)) {
+					continue
+				}
+				return nil, classifyErr
+			}
+			return nil, fmt.Errorf("activate session-control target: %w", err)
 		}
-		var canceled *types.TransactionCanceledException
-		if errors.As(err, &canceled) {
-			return nil, classifyErr
-		}
-		return nil, fmt.Errorf("activate session-control target: %w", err)
+		return &nextTarget, nil
 	}
-	return &nextTarget, nil
+	return nil, errSessionControlTargetConflict
 }
 
 func (s *dynamoSessionControlStore) classifyActivationConflict(ctx context.Context, activation sessionControlTargetActivation) (*sessionControlTargetAuthority, error) {
@@ -1433,8 +1619,9 @@ func sessionControlOwnerMatchesFinalizedTarget(owner sessionControlOwnerAuthorit
 }
 
 // FinalizeTargetReady is the only transition that makes an ACTIVE target
-// eligible for new AOP intent materialization. It orders the AAK enqueue audit
-// against the exact CONTROL directory observed by catch-up.
+// eligible for new AOP intent materialization. It durably authorizes the exact
+// AAK transaction against the CONTROL directory observed by catch-up; the AAK
+// is enqueued only after this transition returns an exact result.
 func (s *dynamoSessionControlStore) FinalizeTargetReady(ctx context.Context,
 	readiness sessionControlTargetReadiness) (*sessionControlTargetAuthority, error) {
 	if err := s.validate(); err != nil {

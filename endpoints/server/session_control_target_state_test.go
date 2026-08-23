@@ -135,7 +135,9 @@ func TestSessionControlTargetReadinessOrdersEventsAndReconnects(t *testing.T) {
 		t.Fatalf("event-first target = %#v, %v; want unchanged unready", current, err)
 	}
 
-	reconnect, err := store.PrepareTarget(context.Background(), candidate)
+	reconnect, err := store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+		Target: *current, ObservedControlVersion: 2,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +378,7 @@ func TestSessionControlTargetConcurrentSameCandidateIsIdempotent(t *testing.T) {
 	requireRequiredTargetCount(t, store, candidate.ACID, 1)
 }
 
-func TestSessionControlTargetSameTupleReconnectRequiresFreshCatchup(t *testing.T) {
+func TestSessionControlTargetSameTuplePrepareIsNoWriteAndExplicitAdvanceReprepares(t *testing.T) {
 	store := newMemorySessionControlStore(time.Unix(1_800_000_400, 0))
 	candidate := testSessionControlTargetCandidate(0x35, "55555555555555555555555555555555", 12)
 	first, err := store.PrepareTarget(context.Background(), candidate)
@@ -393,21 +395,27 @@ func TestSessionControlTargetSameTupleReconnectRequiresFreshCatchup(t *testing.T
 	if err != nil {
 		t.Fatalf("same-tuple reconnect PrepareTarget() error = %v", err)
 	}
-	if !reconnect.RequiresActivation || reconnect.Target.State != sessionControlTargetPreparing ||
-		reconnect.Target.Version != active.Version+1 || !reconnect.Target.CountedActiveSlot ||
-		reconnect.Target.AuthorityVersion != authorityBefore.Version || reconnect.Target.ActivatedControlVersion != 0 {
-		t.Fatalf("same-tuple reconnect = %#v", reconnect)
-	}
-	// A counted reconnect remains required while catch-up runs so an AOL
-	// failure cannot silently drop authority for rules owned by the old control.
-	requireRequiredTargetCount(t, store, candidate.ACID, 1)
-	if _, err := store.ActivateTarget(context.Background(), first.Target.fence().activation(1)); !errors.Is(err, errSessionControlTargetConflict) {
-		t.Fatalf("delayed first activation error = %v, want conflict", err)
+	if reconnect.RequiresActivation || reconnect.Target != *active {
+		t.Fatalf("same-tuple ordinary prepare = %#v, want no-write ACTIVE", reconnect)
 	}
 	directory := store.controlDirectories[candidate.ControlCellID]
 	directory.Version = 2
 	directory.UpdatedAtMillis++
 	store.controlDirectories[candidate.ControlCellID] = directory
+	reconnect, err = store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+		Target: *active, ObservedControlVersion: 2,
+	})
+	if err != nil || !reconnect.RequiresActivation || reconnect.Target.State != sessionControlTargetPreparing ||
+		reconnect.Target.Version != active.Version+1 || !reconnect.Target.CountedActiveSlot ||
+		reconnect.Target.AuthorityVersion != authorityBefore.Version || reconnect.Target.ActivatedControlVersion != 0 {
+		t.Fatalf("explicit control-advance preparation = %#v, %v", reconnect, err)
+	}
+	// A counted reconnect remains required while catch-up runs so an AOL
+	// failure cannot silently drop authority for rules owned by the old control.
+	requireRequiredTargetCount(t, store, candidate.ACID, 1)
+	if _, err := store.ActivateTarget(context.Background(), first.Target.fence().activation(1)); !errors.Is(err, errSessionControlTargetControlStale) {
+		t.Fatalf("delayed first activation error = %v, want stale control", err)
+	}
 	reactivated, err := store.ActivateTarget(context.Background(), reconnect.Target.fence().activation(2))
 	if err != nil {
 		t.Fatalf("same-tuple reactivation error = %v", err)
@@ -539,14 +547,16 @@ func TestSessionControlTargetGlobalCapacityIsAtomicAndSameKeyDoesNotIncrement(t 
 	if err != nil {
 		t.Fatalf("counted reconnect preparation error = %v", err)
 	}
-	if _, err := store.ActivateTarget(context.Background(), reconnect.Target.fence().activation(1)); err != nil {
-		t.Fatalf("counted reconnect activation at cap error = %v", err)
+	if reconnect.RequiresActivation || reconnect.Target.State != sessionControlTargetActive {
+		t.Fatalf("counted exact prepare at cap = %#v, want no-write ACTIVE", reconnect)
 	}
 	if got := store.authorities[first.ACID]; got != authorityAtCap {
 		t.Fatalf("counted reconnect changed header at cap: got %#v want %#v", got, authorityAtCap)
 	}
 
-	cancelPreparation, err := store.PrepareTarget(context.Background(), first)
+	cancelPreparation, err := store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+		Target: reconnect.Target, ObservedControlVersion: 2,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

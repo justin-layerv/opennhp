@@ -155,6 +155,7 @@ func TestHandleACOnlinePublishesStagedPeerOnlyAfterAuthorityAdmission(t *testing
 	s.localIp = "127.0.0.1"
 	s.sessionControlCellID = testSessionControlCellID
 	s.sessionControlStore = newAdmissionSessionControlStore(time.Now())
+	s.remoteConnectionMap = make(map[string]*UdpConn)
 
 	livePeer := &core.UdpPeer{
 		Hostname:     acID,
@@ -176,17 +177,36 @@ func TestHandleACOnlinePublishesStagedPeerOnlyAfterAuthorityAdmission(t *testing
 	if err != nil {
 		t.Fatalf("marshal AOL: %v", err)
 	}
+	connData := newClosableConnData(newAddr)
+	connData.RemoteTransactionMap = make(map[uint64]*core.RemoteTransaction)
+	aakMessages := make(chan *core.MsgData, 1)
+	connData.RemoteTransactionMap[8] = core.NewRemoteTransactionForTest(8, aakMessages)
 	ppd := &core.PacketParserData{
 		HeaderType:    core.NHP_AOL,
 		BodyMessage:   body,
 		SenderTrxId:   8,
 		LocalInitTime: 200,
 		RemotePubKey:  pubkey,
-		ConnData:      &core.ConnectionData{RemoteAddr: newAddr},
+		ConnData:      connData,
 	}
+	testInstallAdmissionRemoteConn(s, ppd)
 
-	if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrTransactionIdNotFound) {
-		t.Fatalf("HandleACOnline() error = %v, want terminal ErrTransactionIdNotFound", err)
+	if err := s.HandleACOnline(ppd); err != nil {
+		t.Fatalf("HandleACOnline() error = %v", err)
+	}
+	select {
+	case md := <-aakMessages:
+		if md == nil || md.HeaderType != core.NHP_AAK {
+			t.Fatalf("success response = %#v, want NHP_AAK", md)
+		}
+		var ack common.ServerACAckMsg
+		if err := common.DecodeServerACAckMsg(md.Message, &ack); err != nil ||
+			!common.IsSuccessErrCode(ack.ErrCode) || !ack.Registered || ack.BootID != bootID ||
+			ack.SessionFlushGeneration != 2 || ack.AOLTransactionID != 8 {
+			t.Fatalf("success AAK = %#v, decode error %v", ack, err)
+		}
+	default:
+		t.Fatal("successful staged peer admission did not enqueue AAK")
 	}
 	s.acPeerMapMutex.Lock()
 	gotPeer := s.acPeerMap[pubkeyB64]

@@ -18,6 +18,7 @@ func testACSessionControlPublicKey(seed byte) string {
 type memorySessionControlStore struct {
 	mu                 sync.Mutex
 	targets            map[sessionControlTargetKey]sessionControlTargetAuthority
+	owners             map[sessionControlTargetKey]sessionControlOwnerAuthority
 	authorities        map[string]sessionControlAuthority
 	controlDirectories map[string]sessionControlFenceDirectory
 	nowUTC             func() time.Time
@@ -48,6 +49,7 @@ func (s *memorySessionControlStore) SnapshotActiveFences(_ context.Context, cell
 func newMemorySessionControlStore(now time.Time) *memorySessionControlStore {
 	store := &memorySessionControlStore{
 		targets:            make(map[sessionControlTargetKey]sessionControlTargetAuthority),
+		owners:             make(map[sessionControlTargetKey]sessionControlOwnerAuthority),
 		authorities:        make(map[string]sessionControlAuthority),
 		controlDirectories: make(map[string]sessionControlFenceDirectory),
 		nowUTC:             func() time.Time { return now.UTC() },
@@ -70,6 +72,41 @@ func (s *memorySessionControlStore) GetTarget(_ context.Context, key sessionCont
 		return nil, errSessionControlTargetNotFound
 	}
 	copy := target
+	return &copy, nil
+}
+
+func (s *memorySessionControlStore) VerifyReadyTargetAttachment(_ context.Context,
+	attachment sessionControlTargetAttachment,
+) (*sessionControlTargetAuthority, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validSessionControlTargetAttachment(attachment) {
+		return nil, errors.New("invalid session-control target attachment")
+	}
+	current, ok := s.targets[sessionControlTargetKey{
+		ACID: attachment.Candidate.ACID, PublicKey: attachment.Candidate.PublicKey,
+	}]
+	if !ok {
+		return nil, errSessionControlTargetNotFound
+	}
+	directory, ok := s.controlDirectories[attachment.Candidate.ControlCellID]
+	if !ok || directory.Version != attachment.Snapshot.DirectoryVersion ||
+		directory.ActiveFenceCount != attachment.Snapshot.ActiveFenceCount ||
+		directory.AdmissionBlocked != attachment.Snapshot.AdmissionBlocked ||
+		directory.OverflowCloseCount != attachment.Snapshot.OverflowCloseCount ||
+		directory.OverflowLeaderEventID != attachment.Snapshot.OverflowLeaderEventID ||
+		directory.OverflowLeaderPreparedDirectoryVersion != attachment.Snapshot.OverflowLeaderPreparedDirectoryVersion ||
+		directory.OverflowLeaderSelectedDirectoryVersion != attachment.Snapshot.OverflowLeaderSelectedDirectoryVersion {
+		return nil, errSessionControlTargetControlStale
+	}
+	if current != attachment.Target || !current.exactCandidate(attachment.Candidate) || !current.ready() {
+		return nil, errSessionControlTargetConflict
+	}
+	owner, ok := s.owners[sessionControlTargetKey{ACID: attachment.Candidate.ACID, PublicKey: attachment.Candidate.PublicKey}]
+	if !ok || !sessionControlReadyAttachmentExact(current, owner, attachment) {
+		return nil, errSessionControlTargetConflict
+	}
+	copy := current
 	return &copy, nil
 }
 
@@ -136,8 +173,64 @@ func (s *memorySessionControlStore) PrepareTarget(_ context.Context, candidate s
 		return nil, err
 	}
 	if write {
+		var currentOwner *sessionControlOwnerAuthority
+		if owner, ok := s.owners[key]; ok {
+			currentOwner = &owner
+		}
+		nextOwner, ownerErr := sessionControlOwnerFromTarget(planned.Target, currentOwner, sessionControlOwnerPreparing)
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
 		s.targets[key] = planned.Target
+		s.owners[key] = nextOwner
 	}
+	return &planned, nil
+}
+
+func (s *memorySessionControlStore) ReprepareTargetForControlAdvance(_ context.Context,
+	advance sessionControlTargetControlAdvance,
+) (*sessionControlTargetPreparation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validSessionControlTargetControlAdvance(advance) {
+		return nil, errors.New("invalid advanced session-control target preparation")
+	}
+	key := advance.Target.key()
+	current, ok := s.targets[key]
+	if !ok {
+		return nil, errSessionControlTargetNotFound
+	}
+	authority, ok := s.authorities[current.ACID]
+	if !ok {
+		return nil, errSessionControlTargetCorrupt
+	}
+	if sessionControlTargetAdvancedPreparationCommitted(current, advance, authority) {
+		owner, ownerOK := s.owners[key]
+		if !ownerOK || !owner.exactTarget(current, sessionControlOwnerPreparing) {
+			return nil, errSessionControlOwnerConflict
+		}
+		return &sessionControlTargetPreparation{Target: current, RequiresActivation: true}, nil
+	}
+	if current != advance.Target {
+		return nil, errSessionControlTargetConflict
+	}
+	owner, ok := s.owners[key]
+	if !ok || !owner.exactTarget(current, sessionControlOwnerActiveUnready) {
+		return nil, errSessionControlOwnerConflict
+	}
+	if owner.PendingCount != 0 {
+		return nil, errSessionControlTargetPendingWork
+	}
+	planned, err := sessionControlTargetAdvancedPreparation(current, authority, s.nowUTC().UTC())
+	if err != nil {
+		return nil, err
+	}
+	nextOwner, err := sessionControlOwnerFromTarget(planned.Target, &owner, sessionControlOwnerPreparing)
+	if err != nil {
+		return nil, err
+	}
+	s.targets[key] = planned.Target
+	s.owners[key] = nextOwner
 	return &planned, nil
 }
 
@@ -246,6 +339,10 @@ func (s *memorySessionControlStore) ActivateTarget(_ context.Context, activation
 	if current.CountedActiveSlot && authority.ControlCellID != activation.ControlCellID {
 		return nil, errSessionControlTargetConflict
 	}
+	currentOwner, ok := s.owners[key]
+	if !ok || !currentOwner.exactTarget(current, sessionControlOwnerPreparing) {
+		return nil, errSessionControlOwnerConflict
+	}
 	if !current.CountedActiveSlot {
 		if authority.ActiveTargetCount >= uint64(MaxACConnsPerID) {
 			return nil, errSessionControlTargetCapacity
@@ -265,7 +362,12 @@ func (s *memorySessionControlStore) ActivateTarget(_ context.Context, activation
 	current.AAKEnqueuedAtMillis = 0
 	current.AAKTransactionID = 0
 	current.UpdatedAtMillis = fence.PreparedAtMillis
+	nextOwner, ownerErr := sessionControlOwnerFromTarget(current, &currentOwner, sessionControlOwnerActiveUnready)
+	if ownerErr != nil {
+		return nil, ownerErr
+	}
 	s.targets[key] = current
+	s.owners[key] = nextOwner
 	copy := current
 	return &copy, nil
 }
@@ -311,12 +413,21 @@ func (s *memorySessionControlStore) FinalizeTargetReady(_ context.Context,
 		current.AAKEnqueuedAtMillis != 0 || current.AAKTransactionID != 0 {
 		return nil, errSessionControlTargetConflict
 	}
+	currentOwner, ok := s.owners[key]
+	if !ok || !currentOwner.exactTarget(current, sessionControlOwnerActiveUnready) {
+		return nil, errSessionControlOwnerConflict
+	}
 	current.Version++
 	current.ReadyControlVersion = current.ActivatedControlVersion
 	current.AAKEnqueuedAtMillis = readiness.AAKEnqueuedAtMillis
 	current.AAKTransactionID = readiness.AAKTransactionID
 	current.UpdatedAtMillis = readiness.AAKEnqueuedAtMillis
+	nextOwner, ownerErr := sessionControlOwnerFromTarget(current, &currentOwner, sessionControlOwnerReady)
+	if ownerErr != nil {
+		return nil, ownerErr
+	}
 	s.targets[key] = current
+	s.owners[key] = nextOwner
 	copy := current
 	return &copy, nil
 }

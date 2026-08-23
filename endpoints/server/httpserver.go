@@ -1179,7 +1179,8 @@ func acConnTransportLiveAt(conn *ACConn, cutoffNanos int64) bool {
 
 // acConnAuthorityEligibleAt is the single live-serving predicate shared by
 // knock routing and critical AC health. Cloud authority additionally requires
-// the post-AAK ready bit; non-cloud topology retains transport-only behavior.
+// the local ready bit set only after durable authorization and success-AAK
+// enqueue; non-cloud topology retains transport-only behavior.
 func acConnAuthorityEligibleAt(conn *ACConn, cutoffNanos int64, authorityRequired bool) bool {
 	return acConnTransportLiveAt(conn, cutoffNanos) && conn.sessionControlReady(authorityRequired)
 }

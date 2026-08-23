@@ -430,7 +430,7 @@ func seedSessionControlSnapshotAuthority(t *testing.T, fake *sessionControlSessi
 	fake.setItem(marshalSessionControlSessionTestRow(t, row))
 }
 
-func TestDynamoSessionControlPrepareTargetRefusesPendingSameTupleAndFencesInsertionRace(t *testing.T) {
+func TestDynamoSessionControlReprepareTargetRefusesPendingSameTupleAndFencesInsertionRace(t *testing.T) {
 	newFixture := func(t *testing.T) (*sessionControlSessionDynamoFake, *dynamoSessionControlStore,
 		sessionControlTargetCandidate, sessionControlTargetAuthority, sessionControlOwnerAuthority) {
 		t.Helper()
@@ -438,9 +438,6 @@ func TestDynamoSessionControlPrepareTargetRefusesPendingSameTupleAndFencesInsert
 		store := newSessionControlSessionDynamoStore(fake, time.Second)
 		candidate := testSessionControlTargetCandidate(0xa2, "00112233445566778899aabbccddeeff", 12)
 		target := testSessionControlTargetAuthority(candidate, sessionControlTargetActive, 3)
-		target.ReadyControlVersion = target.ActivatedControlVersion
-		target.AAKEnqueuedAtMillis = target.PreparedAtMillis
-		target.AAKTransactionID = 101
 		owner := seedSessionControlTarget(t, fake, target)
 		seedSessionControlSnapshotAuthority(t, fake, sessionControlAuthority{ACID: candidate.ACID,
 			ControlCellID: candidate.ControlCellID, Version: target.AuthorityVersion, ActiveTargetCount: 1,
@@ -448,15 +445,17 @@ func TestDynamoSessionControlPrepareTargetRefusesPendingSameTupleAndFencesInsert
 		return fake, store, candidate, target, owner
 	}
 	t.Run("already_pending", func(t *testing.T) {
-		fake, store, candidate, target, owner := newFixture(t)
+		fake, store, _, target, owner := newFixture(t)
 		pending, err := planSessionControlOwnerTaskInsert(owner, owner.UpdatedAtMillis)
 		if err != nil {
 			t.Fatal(err)
 		}
 		seedSessionControlTaskOwner(t, fake, pending)
 		beforeTarget := target
-		if _, err = store.PrepareTarget(context.Background(), candidate); !errors.Is(err, errSessionControlTargetPendingWork) {
-			t.Fatalf("PrepareTarget() error = %v", err)
+		if _, err = store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+			Target: target, ObservedControlVersion: target.ActivatedControlVersion + 1,
+		}); !errors.Is(err, errSessionControlTargetPendingWork) {
+			t.Fatalf("ReprepareTargetForControlAdvance() error = %v", err)
 		}
 		got, err := store.getTarget(context.Background(), target.key())
 		if err != nil || *got != beforeTarget || len(fake.transactions) != 0 {
@@ -464,7 +463,7 @@ func TestDynamoSessionControlPrepareTargetRefusesPendingSameTupleAndFencesInsert
 		}
 	})
 	t.Run("insert_wins_owner_cas", func(t *testing.T) {
-		fake, store, candidate, target, owner := newFixture(t)
+		fake, store, _, target, owner := newFixture(t)
 		pending, err := planSessionControlOwnerTaskInsert(owner, owner.UpdatedAtMillis)
 		if err != nil {
 			t.Fatal(err)
@@ -482,8 +481,10 @@ func TestDynamoSessionControlPrepareTargetRefusesPendingSameTupleAndFencesInsert
 			seedSessionControlTaskOwner(t, fake, pending)
 			return nil, &types.TransactionCanceledException{Message: aws.String("owner changed")}
 		}
-		if _, err = store.PrepareTarget(context.Background(), candidate); !errors.Is(err, errSessionControlTargetPendingWork) {
-			t.Fatalf("raced PrepareTarget() error = %v", err)
+		if _, err = store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+			Target: target, ObservedControlVersion: target.ActivatedControlVersion + 1,
+		}); !errors.Is(err, errSessionControlTargetPendingWork) {
+			t.Fatalf("raced ReprepareTargetForControlAdvance() error = %v", err)
 		}
 		gotTarget, targetErr := store.getTarget(context.Background(), target.key())
 		gotOwner, ownerErr := store.getOwner(context.Background(), owner.CellID, owner.ACID, owner.PublicKey)

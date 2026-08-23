@@ -399,7 +399,8 @@ type UdpServer struct {
 	// without constructing encrypted UDP packets.
 	sendACSessionControlTaskFn func(context.Context, *ACConn, sessionControlExactCloseTaskAuthority) (common.ACSessionCloseAckMsg, error)
 	// sessionControlAOLBudget is a test-only seam for deterministically proving
-	// that post-AAK finalization does not inherit an exhausted catch-up budget.
+	// that the pre-AAK durable publication proof does not inherit an exhausted
+	// catch-up budget.
 	// Production leaves it zero and HandleACOnline uses DefaultStorageTimeout.
 	sessionControlAOLBudget time.Duration
 	sessionControlRecovery  sessionControlRecoveryRuntime

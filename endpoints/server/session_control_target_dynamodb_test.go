@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -405,7 +406,7 @@ func TestDynamoSessionControlTargetRejectsMissingReadinessAttributes(t *testing.
 	}
 }
 
-func TestDynamoSessionControlCountedReconnectClearsReadinessAudit(t *testing.T) {
+func TestDynamoSessionControlExactActivePrepareIsNoWrite(t *testing.T) {
 	fake := newSessionControlSessionDynamoFake()
 	store := newSessionControlSessionDynamoStore(fake, time.Second)
 	candidate := testSessionControlTargetCandidate(0x66, "00112233445566778899aabbccddeeff", 8)
@@ -427,29 +428,72 @@ func TestDynamoSessionControlCountedReconnectClearsReadinessAudit(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.Target.State != sessionControlTargetPreparing || !prepared.Target.CountedActiveSlot ||
-		prepared.Target.ReadyControlVersion != 0 || prepared.Target.AAKEnqueuedAtMillis != 0 ||
-		prepared.Target.AAKTransactionID != 0 || len(fake.transactions) != 1 {
-		t.Fatalf("counted reconnect preparation = %#v; transactions=%d", prepared, len(fake.transactions))
+	if prepared.RequiresActivation || prepared.Target != current || len(fake.transactions) != 0 {
+		t.Fatalf("exact ACTIVE prepare = %#v; transactions=%d, want no-write", prepared, len(fake.transactions))
 	}
-	if len(fake.transactions[0].TransactItems) != 2 {
-		t.Fatalf("counted reconnect transaction = %#v", fake.transactions[0])
+}
+
+func TestDynamoSessionControlReprepareForControlAdvanceExactWireAndAmbiguity(t *testing.T) {
+	for _, lostResponse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost_response_%t", lostResponse), func(t *testing.T) {
+			fake := newSessionControlSessionDynamoFake()
+			store := newSessionControlSessionDynamoStore(fake, time.Second)
+			candidate := testSessionControlTargetCandidate(0x65, "00112233445566778899aabbccddeeff", 8)
+			current := testSessionControlTargetAuthority(candidate, sessionControlTargetActive, 3)
+			owner := seedSessionControlTarget(t, fake, current)
+			authority := sessionControlAuthority{
+				ACID: candidate.ACID, ControlCellID: candidate.ControlCellID, Version: current.AuthorityVersion,
+				ActiveTargetCount: 1, CreatedAtMillis: current.CreatedAtMillis, UpdatedAtMillis: current.UpdatedAtMillis,
+			}
+			authorityRow, err := sessionControlAuthorityToRow(authority)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fake.setItem(marshalSessionControlSessionTestRow(t, authorityRow))
+			planned, err := sessionControlTargetAdvancedPreparation(current, authority, store.nowUTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextOwner, err := sessionControlOwnerFromTarget(planned.Target, &owner, sessionControlOwnerPreparing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lostResponse {
+				fake.transactHook = func(context.Context, *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+					targetRow, _ := sessionControlTargetToRow(planned.Target)
+					ownerRow, _ := sessionControlOwnerToRow(nextOwner)
+					fake.setItem(marshalSessionControlSessionTestRow(t, targetRow))
+					fake.setItem(marshalSessionControlSessionTestRow(t, ownerRow))
+					return nil, errors.New("lost reprepare response")
+				}
+			}
+			got, err := store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+				Target: current, ObservedControlVersion: current.ActivatedControlVersion + 1,
+			})
+			if err != nil || got == nil || got.Target != planned.Target || !got.RequiresActivation {
+				t.Fatalf("ReprepareTargetForControlAdvance() = %#v, %v", got, err)
+			}
+			if len(fake.transactions) != 1 || len(fake.transactions[0].TransactItems) != 2 ||
+				fake.transactions[0].TransactItems[0].Update == nil || fake.transactions[0].TransactItems[1].Put == nil ||
+				aws.ToString(fake.transactions[0].ClientRequestToken) == "" ||
+				len(aws.ToString(fake.transactions[0].ClientRequestToken)) > 36 {
+				t.Fatalf("reprepare transaction = %#v", fake.transactions)
+			}
+		})
 	}
-	update := fake.transactions[0].TransactItems[0].Update
-	for _, fragment := range []string{
-		"ready_control_version = :cleared_control_version", "aak_enqueued_at_ms = :zero_time",
-		"aak_transaction_id = :zero_transaction",
-	} {
-		if !strings.Contains(aws.ToString(update.UpdateExpression), fragment) {
-			t.Fatalf("reconnect update missing %q: %s", fragment, aws.ToString(update.UpdateExpression))
-		}
-	}
-	for _, fragment := range []string{
-		"ready_control_version = :ready_control_version", "aak_enqueued_at_ms = :aak_enqueued_at",
-		"aak_transaction_id = :aak_transaction_id",
-	} {
-		if !strings.Contains(aws.ToString(update.ConditionExpression), fragment) {
-			t.Fatalf("reconnect condition missing %q: %s", fragment, aws.ToString(update.ConditionExpression))
+}
+
+func TestSessionControlReprepareForControlAdvanceRejectsEqualOrLowerCursor(t *testing.T) {
+	current := testSessionControlTargetAuthority(
+		testSessionControlTargetCandidate(0x64, "00112233445566778899aabbccddeeff", 7),
+		sessionControlTargetActive, 3)
+	for _, observed := range []uint64{current.ActivatedControlVersion, current.ActivatedControlVersion - 1} {
+		fake := newSessionControlSessionDynamoFake()
+		store := newSessionControlSessionDynamoStore(fake, time.Second)
+		if _, err := store.ReprepareTargetForControlAdvance(context.Background(), sessionControlTargetControlAdvance{
+			Target: current, ObservedControlVersion: observed,
+		}); err == nil || len(fake.transactions) != 0 {
+			t.Fatalf("observed cursor %d reached write: err=%v transactions=%d", observed, err, len(fake.transactions))
 		}
 	}
 }
@@ -1075,6 +1119,118 @@ func TestDynamoSessionControlActivationLostResponseThenExactSecondCall(t *testin
 	got, err := store.ActivateTarget(context.Background(), activation)
 	if err != nil || *got != active || len(fake.transactions) != 1 {
 		t.Fatalf("second ActivateTarget() = %#v, %v; transactions=%d", got, err, len(fake.transactions))
+	}
+}
+
+func TestDynamoSessionControlPrepareNoWriteBracketsOwnerOnlyTaskInsertion(t *testing.T) {
+	fake := newSessionControlSessionDynamoFake()
+	store := newSessionControlSessionDynamoStore(fake, time.Second)
+	candidate := testSessionControlTargetCandidate(0x7d, "61616161616161616161616161616161", 29)
+	active := testSessionControlTargetAuthority(candidate, sessionControlTargetActive, 3)
+	active.ReadyControlVersion = active.ActivatedControlVersion
+	active.AAKEnqueuedAtMillis = active.PreparedAtMillis
+	active.AAKTransactionID = 700
+	owner := seedSessionControlTarget(t, fake, active)
+	seedSessionControlSnapshotAuthority(t, fake, sessionControlAuthority{
+		ACID: candidate.ACID, ControlCellID: candidate.ControlCellID,
+		Version: active.AuthorityVersion, ActiveTargetCount: 1,
+		CreatedAtMillis: active.CreatedAtMillis, UpdatedAtMillis: active.UpdatedAtMillis,
+	})
+	pendingOwner, err := planSessionControlOwnerTaskInsert(owner, owner.UpdatedAtMillis+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.getHook = func(ctx context.Context, input *dynamodb.GetItemInput, call int) (*dynamodb.GetItemOutput, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// authority, TARGET-before, OWNER-before, TARGET-after, OWNER-after.
+		// Insert one task after the final TARGET read so only the OWNER bracket
+		// can observe the authority change.
+		if call == 3 {
+			row, rowErr := sessionControlOwnerToRow(pendingOwner)
+			if rowErr != nil {
+				t.Fatal(rowErr)
+			}
+			fake.setItem(marshalSessionControlSessionTestRow(t, row))
+		}
+		fake.mu.Lock()
+		item := fake.items[sessionControlSessionDynamoMapKey(input.Key)]
+		fake.mu.Unlock()
+		return &dynamodb.GetItemOutput{Item: item}, nil
+	}
+	if _, err = store.PrepareTarget(context.Background(), candidate); !errors.Is(err, errSessionControlTargetPendingWork) {
+		t.Fatalf("PrepareTarget() owner-only insertion error = %v, want pending work", err)
+	}
+	if len(fake.transactions) != 0 {
+		t.Fatalf("no-write prepare emitted %d transactions", len(fake.transactions))
+	}
+	if len(fake.gets) < 10 {
+		t.Fatalf("no-write authority did not retry full TARGET/OWNER bracket: gets=%d", len(fake.gets))
+	}
+}
+
+func TestDynamoSessionControlPreparePendingActivationRetriesOwnerCASAndPreservesWork(t *testing.T) {
+	fake := newSessionControlSessionDynamoFake()
+	store := newSessionControlSessionDynamoStore(fake, time.Second)
+	candidate := testSessionControlTargetCandidate(0x7e, "62626262626262626262626262626262", 30)
+	preparing := testSessionControlTargetAuthority(candidate, sessionControlTargetPreparing, 3)
+	preparing.CountedActiveSlot = true
+	preparing.AuthorityVersion = 2
+	owner := seedSessionControlTarget(t, fake, preparing)
+	seedSessionControlSnapshotAuthority(t, fake, sessionControlAuthority{
+		ACID: candidate.ACID, ControlCellID: candidate.ControlCellID,
+		Version: preparing.AuthorityVersion, ActiveTargetCount: 1,
+		CreatedAtMillis: preparing.CreatedAtMillis, UpdatedAtMillis: preparing.UpdatedAtMillis,
+	})
+	seedSessionControlDirectory(t, fake, sessionControlFenceSnapshot{
+		CellID: candidate.ControlCellID, DirectoryVersion: 1,
+	})
+	preparation, err := store.PrepareTarget(context.Background(), candidate)
+	if err != nil || preparation == nil || !preparation.RequiresActivation || preparation.Target != preparing {
+		t.Fatalf("persisted PREPARING retry = %#v, %v", preparation, err)
+	}
+	pendingOwner, err := planSessionControlOwnerTaskInsert(owner, owner.UpdatedAtMillis+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionCalls := 0
+	fake.transactHook = func(_ context.Context, input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+		transactionCalls++
+		if transactionCalls == 1 {
+			// Materialization wins after Activate read OWNER but before its exact
+			// replacement. The transaction loses definitively and must retry.
+			row, rowErr := sessionControlOwnerToRow(pendingOwner)
+			if rowErr != nil {
+				t.Fatal(rowErr)
+			}
+			fake.setItem(marshalSessionControlSessionTestRow(t, row))
+			return nil, &types.TransactionCanceledException{Message: aws.String("owner changed")}
+		}
+		if len(input.TransactItems) != 4 || input.TransactItems[3].Put == nil {
+			t.Fatalf("activation retry transaction = %#v", input.TransactItems)
+		}
+		wire := sessionControlAttributeWireMap(t, input.TransactItems[3].Put.Item)
+		if got := sessionControlWireString(t, wire, "phase", "S"); got != string(sessionControlOwnerActiveUnready) {
+			t.Fatalf("activation owner phase = %q", got)
+		}
+		if got := sessionControlWireString(t, wire, "task_count", "N"); got != "1" {
+			t.Fatalf("activation owner task count = %q", got)
+		}
+		if got := sessionControlWireString(t, wire, "pending_count", "N"); got != "1" {
+			t.Fatalf("activation owner pending count = %q", got)
+		}
+		return &dynamodb.TransactWriteItemsOutput{}, nil
+	}
+	active, err := store.ActivateTarget(context.Background(), preparation.Target.fence().activation(1))
+	if err != nil || active == nil || active.State != sessionControlTargetActive || active.ReadyControlVersion != 0 {
+		t.Fatalf("ActivateTarget() raced task = %#v, %v", active, err)
+	}
+	if transactionCalls != 2 || len(fake.transactions) != 2 {
+		t.Fatalf("activation attempts = %d/%d, want 2", transactionCalls, len(fake.transactions))
+	}
+	if aws.ToString(fake.transactions[0].ClientRequestToken) == aws.ToString(fake.transactions[1].ClientRequestToken) {
+		t.Fatal("owner-changing activation retry reused its prior transaction token")
 	}
 }
 

@@ -238,7 +238,8 @@ func (s *UdpServer) drainACSessionControlTasksForTarget(ctx context.Context, con
 			continue
 		}
 		if !sessionControlCloseTaskBoundToTarget(task, target) {
-			if !allowRebind || target.FlushGeneration <= task.BoundFlushGeneration {
+			if !allowRebind || (target.FlushGeneration <= task.BoundFlushGeneration &&
+				!sessionControlCloseTaskCanFollowPreparingActivation(task, target)) {
 				return errSessionControlCloseTaskConflict
 			}
 			operationID, idErr := newAgentSessionCloseEventID()

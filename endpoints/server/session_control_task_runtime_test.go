@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -162,6 +164,120 @@ func TestSessionControlAOLRebindsAndDrainsTaskOnNewProcess(t *testing.T) {
 		next.ACID, next.PublicKey)
 	if err != nil || after.Owner.PendingCount != 0 || after.Owner.Phase != sessionControlOwnerActiveUnready {
 		t.Fatalf("post-rebind owner = %#v, %v", after, err)
+	}
+}
+
+func TestSessionControlAOLActivatesAndDrainsTaskMaterializedWhilePreparing(t *testing.T) {
+	fake := newSessionControlSessionDynamoFake()
+	store := newSessionControlSessionDynamoStore(fake, 10*time.Second)
+	installSessionControlMaterializationQuery(t, fake)
+	fake.transactHook = func(_ context.Context, input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+		applySessionControlMaterializationTransaction(fake, input)
+		return &dynamodb.TransactWriteItemsOutput{}, nil
+	}
+
+	sourceTarget := testSessionControlSessionTarget(0xd3)
+	snapshot := testSessionControlSessionSnapshot(1)
+	candidate := testSessionControlSessionCandidate(0xd4, 4_300)
+	reserved, err := planSessionControlReservation(candidate, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := candidate.IssuedAtMillis + time.Hour.Milliseconds()
+	intent, err := planSessionControlIntent(reserved.fence(), sourceTarget, expires,
+		expires+time.Hour.Milliseconds(), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSessionControlReservation(t, fake, intent.Session)
+	seedSessionControlIntent(t, fake, intent.Intent)
+
+	preparing := sourceTarget
+	preparing.BootID = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"
+	preparing.FlushGeneration++
+	preparing.State = sessionControlTargetPreparing
+	preparing.Version++
+	preparing.ActivatedControlVersion, preparing.ReadyControlVersion = 0, 0
+	preparing.AAKEnqueuedAtMillis, preparing.AAKTransactionID = 0, 0
+	preparing.PreparedAtMillis++
+	preparing.UpdatedAtMillis = preparing.PreparedAtMillis
+	seedSessionControlTarget(t, fake, preparing)
+
+	directory := sessionControlCloseTestDirectory(snapshot, store.nowUTC().UnixMilli()-1_000)
+	close := expectedSessionControlExactClose(t, intent.Session, directory, store.nowUTC().UnixMilli(),
+		intent.Session.RetainUntilMillis)
+	seedCommittedSessionControlExactClose(t, fake, directory, close)
+	if _, err = store.MaterializeNormalExactClose(context.Background(), candidate, close.EventID); err != nil {
+		t.Fatal(err)
+	}
+	ownerPK := sessionControlOwnerPK(preparing.ControlCellID, preparing.ACID, preparing.PublicKey)
+	task, err := store.getCloseTask(context.Background(), ownerPK, close.EventID)
+	if err != nil || task.CreationTarget != preparing || task.BoundFlushGeneration != preparing.FlushGeneration {
+		t.Fatalf("PREPARING-bound materialized task = %#v, %v", task, err)
+	}
+
+	active, err := store.ActivateTarget(context.Background(), preparing.fence().activation(close.Work.PreparedDirectoryVersion))
+	if err != nil || active == nil || active.State != sessionControlTargetActive || active.ReadyControlVersion != 0 {
+		t.Fatalf("ActivateTarget() = %#v, %v", active, err)
+	}
+	if !sessionControlCloseTaskCanFollowPreparingActivation(*task, *active) {
+		t.Fatalf("materialized task cannot follow exact activation: task=%#v active=%#v", task, active)
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*sessionControlTargetAuthority)
+	}{
+		{name: "version plus two", mutate: func(target *sessionControlTargetAuthority) { target.Version++ }},
+		{name: "ready", mutate: func(target *sessionControlTargetAuthority) {
+			target.ReadyControlVersion = target.ActivatedControlVersion
+			target.AAKEnqueuedAtMillis = target.PreparedAtMillis
+			target.AAKTransactionID = 1
+		}},
+		{name: "boot", mutate: func(target *sessionControlTargetAuthority) { target.BootID = sourceTarget.BootID }},
+		{name: "generation", mutate: func(target *sessionControlTargetAuthority) { target.FlushGeneration++ }},
+		{name: "authority", mutate: func(target *sessionControlTargetAuthority) { target.AuthorityVersion++ }},
+		{name: "prepared timestamp", mutate: func(target *sessionControlTargetAuthority) { target.PreparedAtMillis++ }},
+	}
+	for _, mutation := range mutations {
+		mutated := *active
+		mutation.mutate(&mutated)
+		if sessionControlCloseTaskCanFollowPreparingActivation(*task, mutated) {
+			t.Fatalf("same-generation activation accepted %s mutation: %#v", mutation.name, mutated)
+		}
+	}
+	activeRow, err := sessionControlTargetToRow(*active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.setItem(marshalSessionControlSessionTestRow(t, activeRow))
+	installSessionControlOwnerTaskQuery(fake)
+	preDrain, err := store.SnapshotOwnerExactCloseTasks(context.Background(), active.ControlCellID,
+		active.ACID, active.PublicKey)
+	if err != nil || preDrain.Owner.PendingCount != 1 || len(preDrain.Tasks) != 1 {
+		t.Fatalf("post-activation pending snapshot = %#v, %v", preDrain, err)
+	}
+
+	conn := testAdmissionACConn(active.ACID, 0xd3, active.BootID, active.FlushGeneration)
+	conn.ACPeer.PubKeyBase64 = active.PublicKey
+	s := &UdpServer{sessionControlCellID: active.ControlCellID, sessionControlStore: store}
+	s.sendACSessionControlTaskFn = func(_ context.Context, gotConn *ACConn,
+		authority sessionControlExactCloseTaskAuthority,
+	) (common.ACSessionCloseAckMsg, error) {
+		if gotConn != conn || authority.Task.BoundBootID != active.BootID ||
+			authority.Task.BoundFlushGeneration != active.FlushGeneration ||
+			authority.Task.BoundTargetVersion != active.Version || authority.Task.TaskVersion < 2 {
+			t.Fatalf("same-generation activation rebind = %#v conn=%p", authority, gotConn)
+		}
+		return sessionControlTaskRuntimeAck(authority), nil
+	}
+	if err = s.drainACSessionControlTasksForTarget(context.Background(), conn, *active, true); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.getCloseTask(context.Background(), ownerPK, close.EventID)
+	if err != nil || stored.State != sessionControlCloseTaskStateAcked ||
+		stored.BoundTargetVersion != active.Version || stored.BoundFlushGeneration != active.FlushGeneration ||
+		stored.CurrentOwnerPendingCount != 0 {
+		t.Fatalf("post-activation drained task = %#v, %v", stored, err)
 	}
 }
 

@@ -373,10 +373,10 @@ func (s *UdpServer) markACSessionControlConnectionNotReady(acID, publicKey strin
 }
 
 // removePublishedACSessionControlConnection removes exactly the connection
-// published by one AOL attempt after its success AAK was enqueued but the
-// durable readiness CAS failed. The durable target deliberately remains
-// ACTIVE_UNREADY for the AC's next idempotent AOL; only the contradictory
-// process-local publication and its UDP connection are removed.
+// staged by one AOL attempt when its success AAK cannot be enqueued. Durable
+// readiness authorization already succeeded, so the target deliberately
+// remains READY for the AC's next exact attachment AOL; only the unpublished
+// process-local projection and its UDP connection are removed.
 func (s *UdpServer) removePublishedACSessionControlConnection(acID string, target *ACConn) bool {
 	if s == nil || target == nil {
 		return false
@@ -568,8 +568,98 @@ func (s *UdpServer) sendACSessionControlSelector(ctx context.Context, conn *ACCo
 }
 
 type acSessionControlTargetActivationResult struct {
-	Target   sessionControlTargetAuthority
-	Snapshot sessionControlFenceSnapshot
+	Target         sessionControlTargetAuthority
+	Snapshot       sessionControlFenceSnapshot
+	ExistingActive bool
+	AlreadyReady   bool
+}
+
+func (s *UdpServer) catchUpReadyACSessionControlTarget(ctx context.Context, conn *ACConn,
+	target sessionControlTargetAuthority,
+) (*sessionControlTargetAttachment, error) {
+	snapshot, candidate, err := s.catchUpExistingACSessionControlTarget(ctx, conn, target)
+	if err != nil {
+		return nil, err
+	}
+	if !target.ready() {
+		return nil, errSessionControlTargetConflict
+	}
+	attachment := &sessionControlTargetAttachment{Candidate: candidate, Target: target, Snapshot: *snapshot}
+	if !validSessionControlTargetAttachment(*attachment) {
+		return nil, errSessionControlTargetCorrupt
+	}
+	return attachment, nil
+}
+
+func (s *UdpServer) catchUpExistingACSessionControlTarget(ctx context.Context, conn *ACConn,
+	target sessionControlTargetAuthority,
+) (*sessionControlFenceSnapshot, sessionControlTargetCandidate, error) {
+	snapshot, candidate, err := s.snapshotExistingACSessionControlTarget(ctx, conn, target)
+	if err != nil {
+		return nil, sessionControlTargetCandidate{}, err
+	}
+	for _, activeFence := range snapshot.Fences {
+		if err := s.sendACSessionControlFence(ctx, conn, activeFence); err != nil {
+			return nil, sessionControlTargetCandidate{}, err
+		}
+	}
+	return snapshot, candidate, nil
+}
+
+// snapshotExistingACSessionControlTarget validates one exact durable target and
+// obtains the current CONTROL authority without sending any fence. Callers must
+// compare the cursor before choosing the one catch-up path they will execute;
+// an advanced ACTIVE_UNREADY target is deliberately re-prepared and must not
+// spend the aggregate AOL deadline sending the same (up to 1024) fences twice.
+func (s *UdpServer) snapshotExistingACSessionControlTarget(ctx context.Context, conn *ACConn,
+	target sessionControlTargetAuthority,
+) (*sessionControlFenceSnapshot, sessionControlTargetCandidate, error) {
+	if s == nil || ctx == nil || s.sessionControlStore == nil || conn == nil || conn.ACPeer == nil {
+		return nil, sessionControlTargetCandidate{}, errors.New("session-control attachment is unavailable")
+	}
+	candidate := sessionControlTargetCandidate{
+		ACID: conn.ACId, PublicKey: conn.ACPeer.PubKeyBase64,
+		BootID: conn.BootID, FlushGeneration: conn.FlushGeneration,
+		ControlCellID: s.sessionControlCellID,
+	}
+	if validateSessionControlTargetAuthority(target) != nil || !target.exactCandidate(candidate) ||
+		target.State != sessionControlTargetActive || !target.CountedActiveSlot ||
+		target.ActivatedControlVersion == 0 || target.RetiredAtMillis != 0 {
+		return nil, sessionControlTargetCandidate{}, errSessionControlTargetConflict
+	}
+	snapshot, err := s.sessionControlStore.SnapshotActiveFences(ctx, s.sessionControlCellID)
+	if err != nil {
+		return nil, sessionControlTargetCandidate{}, err
+	}
+	if snapshot == nil || validateSessionControlFenceSnapshot(*snapshot, s.sessionControlCellID) != nil ||
+		snapshot.AdmissionBlocked {
+		return nil, sessionControlTargetCandidate{}, errSessionControlFenceCorrupt
+	}
+	return snapshot, candidate, nil
+}
+
+func (s *UdpServer) verifyConcurrentReadyACSessionControlTarget(ctx context.Context, conn *ACConn,
+	snapshot sessionControlFenceSnapshot,
+) (*sessionControlTargetAuthority, error) {
+	if s == nil || ctx == nil || conn == nil || conn.ACPeer == nil {
+		return nil, common.ErrACSessionControlNotReady
+	}
+	candidate := sessionControlTargetCandidate{
+		ACID: conn.ACId, PublicKey: conn.ACPeer.PubKeyBase64,
+		BootID: conn.BootID, FlushGeneration: conn.FlushGeneration,
+		ControlCellID: s.sessionControlCellID,
+	}
+	target, err := s.sessionControlStore.GetTarget(ctx, sessionControlTargetKey{
+		ACID: candidate.ACID, PublicKey: candidate.PublicKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	attachment := sessionControlTargetAttachment{Candidate: candidate, Target: *target, Snapshot: snapshot}
+	if !validSessionControlTargetAttachment(attachment) {
+		return nil, errSessionControlTargetConflict
+	}
+	return s.sessionControlStore.VerifyReadyTargetAttachment(ctx, attachment)
 }
 
 func (s *UdpServer) activateACSessionControlTarget(ctx context.Context, conn *ACConn) (result *sessionControlTargetAuthority, err error) {
@@ -611,8 +701,34 @@ func (s *UdpServer) activateACSessionControlTargetWithSnapshotAfterPrepare(
 	if err != nil {
 		return nil, err
 	}
-	if preparation == nil || !preparation.RequiresActivation {
+	if preparation == nil {
 		return nil, errSessionControlTargetCorrupt
+	}
+	if !preparation.RequiresActivation {
+		target := preparation.Target
+		snapshot, _, snapshotErr := s.snapshotExistingACSessionControlTarget(ctx, conn, target)
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		if !target.ready() && snapshot.DirectoryVersion != target.ActivatedControlVersion {
+			preparation, err = s.sessionControlStore.ReprepareTargetForControlAdvance(ctx,
+				sessionControlTargetControlAdvance{Target: target, ObservedControlVersion: snapshot.DirectoryVersion})
+			if err != nil {
+				return nil, err
+			}
+			if preparation == nil || !preparation.RequiresActivation {
+				return nil, errSessionControlTargetCorrupt
+			}
+		} else {
+			for _, activeFence := range snapshot.Fences {
+				if sendErr := s.sendACSessionControlFence(ctx, conn, activeFence); sendErr != nil {
+					return nil, sendErr
+				}
+			}
+			return &acSessionControlTargetActivationResult{
+				Target: target, Snapshot: *snapshot, ExistingActive: true, AlreadyReady: target.ready(),
+			}, nil
+		}
 	}
 	if afterPrepare != nil {
 		afterPrepare(*preparation)

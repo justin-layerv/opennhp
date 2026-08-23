@@ -22,8 +22,10 @@ type sessionControlStore interface {
 	PingSessionControl(context.Context) error
 	SnapshotActiveFences(context.Context, string) (*sessionControlFenceSnapshot, error)
 	GetTarget(context.Context, sessionControlTargetKey) (*sessionControlTargetAuthority, error)
+	VerifyReadyTargetAttachment(context.Context, sessionControlTargetAttachment) (*sessionControlTargetAuthority, error)
 	ListRequiredTargets(context.Context, string, string) ([]sessionControlTargetAuthority, error)
 	PrepareTarget(context.Context, sessionControlTargetCandidate) (*sessionControlTargetPreparation, error)
+	ReprepareTargetForControlAdvance(context.Context, sessionControlTargetControlAdvance) (*sessionControlTargetPreparation, error)
 	ActivateTarget(context.Context, sessionControlTargetActivation) (*sessionControlTargetAuthority, error)
 	FinalizeTargetReady(context.Context, sessionControlTargetReadiness) (*sessionControlTargetAuthority, error)
 	CancelTargetPreparation(context.Context, sessionControlTargetFence) (*sessionControlTargetAuthority, error)

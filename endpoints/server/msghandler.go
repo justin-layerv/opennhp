@@ -1971,6 +1971,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	var releaseAdmission func()
 	var targetCtx context.Context
 	var activation *acSessionControlTargetActivationResult
+	var attachment *sessionControlTargetAttachment
 	if cloudMode {
 		var targetCancel context.CancelFunc
 		targetBudget := DefaultStorageTimeout
@@ -1999,8 +2000,8 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		defer releaseAuthority()
 
 		// Lock order is per-AC admission -> per-owner write -> cell read. The
-		// cell gate remains held through catch-up, activation, AAK enqueue, and
-		// durable readiness finalization so a same-process close preparation
+		// cell gate remains held through catch-up, durable readiness authorization,
+		// AAK enqueue, and local publication so a same-process close preparation
 		// cannot advance CONTROL across this publication boundary.
 		releaseCell, cellGateErr := s.acquireSessionControlCellRead(targetCtx)
 		if cellGateErr != nil {
@@ -2009,23 +2010,93 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		}
 		defer releaseCell()
 
-		// A same-process AOL must drain any already-pending task before
-		// PrepareTarget versions the exact target. Prepare itself refuses this
-		// mutation, but draining here lets the authenticated current process make
-		// progress without waiting for a disconnect/restart. A strictly newer
-		// process is handled after catch-up/activation through durable rebind.
+		candidate := sessionControlTargetCandidate{
+			ACID: acId, PublicKey: acPubkeyBase64, BootID: acConn.BootID,
+			FlushGeneration: acConn.FlushGeneration, ControlCellID: s.sessionControlCellID,
+		}
+		// A READY exact physical AC process is global authority shared by all
+		// assigned servers. Another server attaches to that candidate without
+		// Prepare/version churn: drain any pending exact work, catch up CONTROL,
+		// enqueue AAK, then atomically condition-check TARGET+OWNER+DIRECTORY below.
+		// New boot/generation and non-ready recovery retain the ordinary
+		// Prepare->Activate->Finalize state machine.
+		existingTargetDrained := false
 		currentTarget, currentTargetErr := s.sessionControlStore.GetTarget(targetCtx,
 			sessionControlTargetKey{ACID: acId, PublicKey: acPubkeyBase64})
-		if currentTargetErr == nil && currentTarget != nil && currentTarget.State == sessionControlTargetActive &&
-			currentTarget.BootID == acConn.BootID && currentTarget.FlushGeneration == acConn.FlushGeneration {
+		if currentTargetErr == nil && currentTarget != nil && currentTarget.exactCandidate(candidate) &&
+			currentTarget.State == sessionControlTargetActive && currentTarget.CountedActiveSlot &&
+			currentTarget.ActivatedControlVersion > 0 && currentTarget.RetiredAtMillis == 0 {
 			if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, *currentTarget, false); drainErr != nil {
-				log.Error("server-ac(%s#%d@%s)[HandleACOnline] pre-Prepare close-task drain failed: %v",
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] existing-target attachment task drain failed: %v",
 					acId, transactionId, addrStr, drainErr)
 				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
 					"session-control-task-drain")
 				return common.ErrACSessionControlNotReady
 			}
+			existingTargetDrained = true
 			acConn.sessionControlTarget.Store(nil)
+			if currentTarget.ready() {
+				var attachErr error
+				attachment, attachErr = s.catchUpReadyACSessionControlTarget(targetCtx, acConn, *currentTarget)
+				if attachErr != nil {
+					log.Error("server-ac(%s#%d@%s)[HandleACOnline] ready-target attachment catch-up failed: %v",
+						acId, transactionId, addrStr, attachErr)
+					s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+						"session-control-attach")
+					return common.ErrACSessionControlNotReady
+				}
+			} else {
+				snapshot, _, catchUpErr := s.snapshotExistingACSessionControlTarget(targetCtx, acConn, *currentTarget)
+				if catchUpErr != nil {
+					log.Error("server-ac(%s#%d@%s)[HandleACOnline] active-unready target catch-up failed: %v",
+						acId, transactionId, addrStr, catchUpErr)
+					s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+						"session-control-active-recovery")
+					return common.ErrACSessionControlNotReady
+				}
+				if snapshot.DirectoryVersion == currentTarget.ActivatedControlVersion {
+					for _, activeFence := range snapshot.Fences {
+						if sendErr := s.sendACSessionControlFence(targetCtx, acConn, activeFence); sendErr != nil {
+							log.Error("server-ac(%s#%d@%s)[HandleACOnline] active-unready exact-cursor catch-up failed: %v",
+								acId, transactionId, addrStr, sendErr)
+							s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+								"session-control-active-recovery")
+							return common.ErrACSessionControlNotReady
+						}
+					}
+					// The existing ACTIVE_UNREADY transition already linearized against
+					// this exact CONTROL cursor. A same-candidate server can authorize
+					// publication through Finalize without Prepare/version churn; that
+					// durable proof still precedes the success AAK enqueue below.
+					activation = &acSessionControlTargetActivationResult{Target: *currentTarget, Snapshot: *snapshot}
+				} else {
+					// CONTROL advanced while the target was ACTIVE_UNREADY. The old
+					// activated cursor cannot be finalized as current. Leave activation
+					// unset so the ordinary Prepare->Activate path below owns the single
+					// fence send and deliberately advances the durable cursor before AAK
+					// publication.
+					log.Info("server-ac(%s#%d@%s)[HandleACOnline] active-unready CONTROL cursor advanced from %d to %d; re-preparing exact candidate",
+						acId, transactionId, addrStr, currentTarget.ActivatedControlVersion, snapshot.DirectoryVersion)
+					reprepared, reprepareErr := s.sessionControlStore.ReprepareTargetForControlAdvance(targetCtx,
+						sessionControlTargetControlAdvance{Target: *currentTarget, ObservedControlVersion: snapshot.DirectoryVersion})
+					if reprepareErr != nil || reprepared == nil || !reprepared.RequiresActivation {
+						log.Error("server-ac(%s#%d@%s)[HandleACOnline] active-unready CONTROL reprepare failed: %v",
+							acId, transactionId, addrStr, reprepareErr)
+						s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+							"session-control-active-reprepare")
+						return common.ErrACSessionControlNotReady
+					}
+					// Reprepare opens a new PREPARING interval. A task can be
+					// materialized after the earlier ACTIVE drain and before Activate;
+					// force the post-activation drain to snapshot/rebind that work.
+					existingTargetDrained = false
+					// The target is durably PREPARING now. Do not run the generic
+					// pre-Prepare drain below against the stale ACTIVE row we first
+					// observed; Activate carries any new OWNER counters forward and
+					// the required post-activation drain owns that interval.
+					currentTarget = nil
+				}
+			}
 		} else if currentTargetErr != nil && !errors.Is(currentTargetErr, errSessionControlTargetNotFound) {
 			log.Error("server-ac(%s#%d@%s)[HandleACOnline] current target read before task drain failed: %v",
 				acId, transactionId, addrStr, currentTargetErr)
@@ -2034,32 +2105,125 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 			return common.ErrACSessionControlNotReady
 		}
 
-		var targetErr error
-		activation, targetErr = s.activateACSessionControlTargetWithSnapshotAfterPrepare(targetCtx, acConn, func(sessionControlTargetPreparation) {
-			// Only a successfully persisted PREPARING row revokes the current
-			// connection's serving authority. In particular, a delayed lower-generation
-			// AOL rejected by PrepareTarget cannot fence a newer ACTIVE connection.
-			s.markACSessionControlConnectionNotReady(acId, acPubkeyBase64)
-		})
-		if targetErr != nil {
-			log.Error("server-ac(%s#%d@%s)[HandleACOnline] session-control catch-up/activation failed: %v", acId, transactionId, addrStr, targetErr)
-			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-authority")
-			return common.ErrACSessionControlNotReady
+		if attachment == nil && activation == nil {
+			// An ACTIVE_UNREADY exact retry may have pending work, and Prepare refuses
+			// to version it until the authenticated process drains that inventory.
+			if !existingTargetDrained && currentTargetErr == nil && currentTarget != nil && currentTarget.State == sessionControlTargetActive &&
+				currentTarget.exactCandidate(candidate) {
+				if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, *currentTarget, false); drainErr != nil {
+					log.Error("server-ac(%s#%d@%s)[HandleACOnline] pre-Prepare close-task drain failed: %v",
+						acId, transactionId, addrStr, drainErr)
+					s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+						"session-control-task-drain")
+					return common.ErrACSessionControlNotReady
+				}
+				acConn.sessionControlTarget.Store(nil)
+			}
+			var targetErr error
+			activation, targetErr = s.activateACSessionControlTargetWithSnapshotAfterPrepare(targetCtx, acConn, func(sessionControlTargetPreparation) {
+				// Only a successfully persisted PREPARING row revokes the current
+				// connection's serving authority. In particular, a delayed lower-generation
+				// AOL rejected by PrepareTarget cannot fence a newer ACTIVE connection.
+				s.markACSessionControlConnectionNotReady(acId, acPubkeyBase64)
+			})
+			if targetErr != nil {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] session-control catch-up/activation failed: %v", acId, transactionId, addrStr, targetErr)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr, "session-control-authority")
+				return common.ErrACSessionControlNotReady
+			}
+			if activation.AlreadyReady {
+				attachment = &sessionControlTargetAttachment{
+					Candidate: candidate, Target: activation.Target, Snapshot: activation.Snapshot,
+				}
+			}
+			// A strictly newer AC process inherits the old process's pending close
+			// tasks. Catch-up and Activate establish its durable target first; rebind,
+			// strict REV/RVA, and ACK must then drain owner pending_count before the
+			// success AAK can be published or FinalizeTargetReady can succeed.
+			if !existingTargetDrained {
+				if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, activation.Target,
+					!activation.ExistingActive); drainErr != nil {
+					log.Error("server-ac(%s#%d@%s)[HandleACOnline] activated close-task drain failed: %v",
+						acId, transactionId, addrStr, drainErr)
+					s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
+						"session-control-task-rebind")
+					return common.ErrACSessionControlNotReady
+				}
+			}
+			if attachment != nil {
+				activation = nil
+			}
 		}
-		// A strictly newer AC process inherits the old process's pending close
-		// tasks. Catch-up and Activate establish its durable target first; rebind,
-		// strict REV/RVA, and ACK must then drain owner pending_count before the
-		// success AAK can be published or FinalizeTargetReady can succeed.
-		if drainErr := s.drainACSessionControlTasksForTarget(targetCtx, acConn, activation.Target, true); drainErr != nil {
-			log.Error("server-ac(%s#%d@%s)[HandleACOnline] activated close-task drain failed: %v",
-				acId, transactionId, addrStr, drainErr)
-			s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady, acId, addrStr,
-				"session-control-task-rebind")
-			return common.ErrACSessionControlNotReady
-		}
-		// Activation is durable, but this connection remains ineligible until its
-		// success AAK has entered the authenticated remote transaction below.
+		// Activation is durable, but this connection remains ineligible until the
+		// exact durable publication proof below succeeds and the success AAK enters
+		// the authenticated remote transaction.
 		acConn.sessionControlAuthorityReady.Store(false)
+
+		// Prove durable readiness before publishing a success AAK. No fallible
+		// authority operation may follow the AAK: otherwise the AC can accept the
+		// success, renew its global session-control lease, and advertise ready even
+		// though this server subsequently removes the local connection. The live
+		// DynamoDB attribute names retain aak_enqueued_* for schema compatibility;
+		// in this ordering they audit authorization to publish this exact AAK.
+		if attachment != nil {
+			verifyCtx, verifyCancel := context.WithTimeout(context.WithoutCancel(targetCtx), DynamoDBOperationTimeout)
+			verified, verifyErr := s.sessionControlStore.VerifyReadyTargetAttachment(verifyCtx, *attachment)
+			verifyCancel()
+			if verifyErr != nil || verified == nil || *verified != attachment.Target {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] ready-target attachment authorization failed before AAK: %v",
+					acId, transactionId, addrStr, verifyErr)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady,
+					acId, addrStr, "session-control-attach-authority")
+				return common.ErrACSessionControlNotReady
+			}
+			verifiedCopy := *verified
+			acConn.sessionControlTarget.Store(&verifiedCopy)
+		} else {
+			publicationAuthorizedAtMillis := time.Now().UnixMilli()
+			if publicationAuthorizedAtMillis < activation.Target.PreparedAtMillis {
+				publicationAuthorizedAtMillis = activation.Target.PreparedAtMillis
+			}
+			readiness := activation.Target.fence().readiness(activation.Snapshot,
+				publicationAuthorizedAtMillis, transactionId)
+			finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(targetCtx), DynamoDBOperationTimeout)
+			finalized, finalizeErr := s.sessionControlStore.FinalizeTargetReady(finalizeCtx, readiness)
+			finalizeCancel()
+			recoveredConcurrentReady := false
+			if errors.Is(finalizeErr, errSessionControlOwnerConflict) ||
+				errors.Is(finalizeErr, errSessionControlTargetConflict) {
+				// Another assigned server may have finalized the same physical AC
+				// first. Authorize this attachment only through the same exact
+				// TARGET+OWNER+DIRECTORY condition transaction.
+				recoverCtx, recoverCancel := context.WithTimeout(context.WithoutCancel(targetCtx), DynamoDBOperationTimeout)
+				finalized, finalizeErr = s.verifyConcurrentReadyACSessionControlTarget(recoverCtx, acConn, activation.Snapshot)
+				recoverCancel()
+				recoveredConcurrentReady = finalizeErr == nil
+			}
+			if finalizeErr != nil {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] durable publication authorization failed before AAK: %v",
+					acId, transactionId, addrStr, finalizeErr)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady,
+					acId, addrStr, "session-control-ready-authority")
+				return common.ErrACSessionControlNotReady
+			}
+			finalizedExact := finalized != nil && sessionControlTargetFinalizedExact(*finalized, readiness)
+			if recoveredConcurrentReady {
+				finalizedExact = finalized != nil && finalized.ready() &&
+					finalized.exactCandidate(sessionControlTargetCandidate{
+						ACID: acId, PublicKey: acPubkeyBase64, BootID: acConn.BootID,
+						FlushGeneration: acConn.FlushGeneration, ControlCellID: s.sessionControlCellID,
+					})
+			}
+			if !finalizedExact {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] durable publication authorization returned malformed authority",
+					acId, transactionId, addrStr)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrACSessionControlNotReady,
+					acId, addrStr, "session-control-ready-result")
+				return common.ErrACSessionControlNotReady
+			}
+			finalizedCopy := *finalized
+			acConn.sessionControlTarget.Store(&finalizedCopy)
+		}
 	}
 
 	// Register the AC connection. Admission policy (pubkey-keyed
@@ -2228,40 +2392,18 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	}
 
 	if err := s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr); err != nil {
+		if cloudMode {
+			// Durable READY is recoverable by a subsequent AOL, but a success AAK
+			// that was never enqueued must leave no locally eligible/publicized
+			// connection or peer.
+			s.removePublishedACSessionControlConnection(acId, acConn)
+		}
 		return err
 	}
 	if cloudMode {
-		// Finalize the durable AAK publication boundary before exposing the local
-		// connection. The per-target write gate remains held, so no AOP reader can
-		// pass between this exact target/directory CAS and publication.
-		aakEnqueuedAtMillis := time.Now().UnixMilli()
-		if aakEnqueuedAtMillis < activation.Target.PreparedAtMillis {
-			aakEnqueuedAtMillis = activation.Target.PreparedAtMillis
-		}
-		readiness := activation.Target.fence().readiness(activation.Snapshot, aakEnqueuedAtMillis, transactionId)
-		// Catch-up and network delivery intentionally consume the original AOL
-		// budget. Once a success AAK is enqueued, durable finalization gets one
-		// fresh bounded store budget while the owner and cell gates remain held;
-		// reusing an expired catch-up context would strand every retry unready.
-		finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(targetCtx), DynamoDBOperationTimeout)
-		finalized, finalizeErr := s.sessionControlStore.FinalizeTargetReady(finalizeCtx, readiness)
-		finalizeCancel()
-		if finalizeErr != nil {
-			log.Error("server-ac(%s#%d@%s)[HandleACOnline] AAK enqueued but durable ready finalization failed: %v",
-				acId, transactionId, addrStr, finalizeErr)
-			s.removePublishedACSessionControlConnection(acId, acConn)
-			s.metrics.IncrCounter(MetricACRegistrationFailure)
-			return common.ErrACSessionControlNotReady
-		}
-		if finalized == nil || !sessionControlTargetFinalizedExact(*finalized, readiness) {
-			log.Error("server-ac(%s#%d@%s)[HandleACOnline] durable ready finalization returned malformed authority",
-				acId, transactionId, addrStr)
-			s.removePublishedACSessionControlConnection(acId, acConn)
-			s.metrics.IncrCounter(MetricACRegistrationFailure)
-			return common.ErrACSessionControlNotReady
-		}
-		finalizedCopy := *finalized
-		acConn.sessionControlTarget.Store(&finalizedCopy)
+		// The durable proof completed before enqueue. This in-memory projection is
+		// the only remaining step and cannot fail; fresh AOPs still perform their
+		// own durable intent CAS against TARGET/OWNER/CONTROL descendants.
 		acConn.sessionControlAuthorityReady.Store(true)
 	}
 

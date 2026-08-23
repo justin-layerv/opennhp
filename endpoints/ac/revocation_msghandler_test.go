@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"slices"
 	"sync"
 	"testing"
@@ -543,7 +544,7 @@ func serverPubKey32() []byte {
 func revPPDWithConn(t *testing.T, msg common.ACRevocationMsg) *core.PacketParserData {
 	t.Helper()
 	ppd := revPPD(t, msg)
-	ppd.ConnData = &core.ConnectionData{}
+	ppd.ConnData = &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46201}}
 	ppd.RemotePubKey = serverPubKey32()
 	return ppd
 }
@@ -587,9 +588,94 @@ func sessionClosePPD(t *testing.T, msg common.ACSessionCloseMsg) *core.PacketPar
 	}
 	return &core.PacketParserData{
 		BodyMessage:  body,
-		ConnData:     &core.ConnectionData{},
+		ConnData:     &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46202}},
 		RemotePubKey: serverPubKey32(),
 	}
+}
+
+func testRVAThroughACSendLoop(t *testing.T, enqueue func(*UdpAC, *core.PacketParserData) error) {
+	t.Helper()
+	serverKey := make([]byte, core.PrivateKeySize)
+	for i := range serverKey {
+		serverKey[i] = byte(255 - i)
+	}
+	serverDevice := core.NewDevice(core.NHP_SERVER, serverKey, nil)
+	if serverDevice == nil {
+		t.Fatal("NewDevice(server) returned nil")
+	}
+	acDevice := core.NewDevice(core.NHP_AC, testPrivateKey(), nil)
+	if acDevice == nil {
+		t.Fatal("NewDevice(AC) returned nil")
+	}
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46321}
+	serverPeer := &core.UdpPeer{
+		Ip: remoteAddr.IP.String(), Port: remoteAddr.Port,
+		PubKeyBase64: serverDevice.PublicKeyBase64(), Type: core.NHP_SERVER,
+	}
+	acDevice.AddPeer(serverPeer)
+	acDevice.Start()
+	t.Cleanup(acDevice.Stop)
+
+	connData := &core.ConnectionData{
+		Device: acDevice, RemoteAddr: remoteAddr,
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		SendQueue:            make(chan *core.Packet, 1), RecvQueue: make(chan *core.Packet, 1),
+		BlockSignal: make(chan struct{}), SetTimeoutSignal: make(chan struct{}, 1), StopSignal: make(chan struct{}),
+	}
+	a := &UdpAC{
+		config: &Config{ACId: "test-ac"}, device: acDevice,
+		sendMsgCh: make(chan *core.MsgData, 1), remoteConnectionMap: map[string]*UdpConn{
+			remoteAddr.String(): {ConnData: connData},
+		},
+	}
+	a.signals.stop = make(chan struct{})
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(7)
+	a.sessionFlushComplete.Store(true)
+	a.running.Store(true)
+	a.wg.Add(1)
+	go a.sendMessageRoutine()
+	t.Cleanup(func() {
+		close(a.signals.stop)
+		a.wg.Wait()
+	})
+	ppd := &core.PacketParserData{
+		ConnData: connData, RemotePubKey: serverPeer.PublicKey(), CipherScheme: common.CIPHER_SCHEME_CURVE,
+	}
+	if err := enqueue(a, ppd); err != nil {
+		t.Fatalf("enqueue RVA: %v", err)
+	}
+	select {
+	case pkt := <-connData.SendQueue:
+		if pkt == nil || pkt.HeaderType != core.NHP_RVA {
+			t.Fatalf("send-loop packet = %#v, want NHP_RVA", pkt)
+		}
+		acDevice.ReleasePoolPacket(pkt)
+	case <-time.After(2 * time.Second):
+		t.Fatal("RVA did not reach the authenticated inbound connection send queue")
+	}
+}
+
+func TestACAcknowledgementsTraverseRealSendLoopOnAuthenticatedInboundRoute(t *testing.T) {
+	t.Run("session control RVA", func(t *testing.T) {
+		testRVAThroughACSendLoop(t, func(a *UdpAC, ppd *core.PacketParserData) error {
+			return a.sendSessionControlAck(ppd, &common.ACSessionCloseMsg{
+				Kind: common.ACSessionCloseKind, Scope: common.ACSessionCloseScopeExact,
+				EventID:        "ffeeddccbbaa99887766554433221100",
+				AgentPublicKey: testNHPAgentKey('A'), SessionID: 1, SessionIssuedAtMillis: 2,
+			}, 0)
+		})
+	})
+	t.Run("generic revocation RVA", func(t *testing.T) {
+		testRVAThroughACSendLoop(t, func(a *UdpAC, ppd *core.PacketParserData) error {
+			a.registration = &ACRegistration{metrics: metrics.NewPublisherForTest(t)}
+			a.sendRevocationAck(ppd, &common.ACRevocationMsg{
+				Scope: "qurl", ScopeKey: "qurl:q1", RevocationEpoch: 1,
+				EventId: "ffeeddccbbaa99887766554433221100",
+			})
+			return nil
+		})
+	})
 }
 
 func TestHandleUdpACRevocationSessionControlScopesAndAck(t *testing.T) {

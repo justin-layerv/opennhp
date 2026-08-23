@@ -188,17 +188,22 @@ func (ha *HttpAC) initRouter() {
 	})
 }
 
-// handleReadiness backs the AC NLB health check. It intentionally proves only
-// admission readiness: Traefik can reach nhp-acd on the health-check entrypoint
-// and nhp-acd has a fresh assigned-server path for receiving AOP fanout. That
-// matches today's qURL fanout contract: handleHttpOpenResource fans the knock to
-// assigned peer servers, and processACOperationBroadcast sends the AOP to every
-// local AC connection before the origin ACK is released. If that delivery ever
-// becomes targeted to one AC, this target health check is no longer sufficient
-// to prove a specific admission can land on the selected AC.
+// handleReadiness backs the AC NLB health check. It proves both halves of
+// admission readiness: nhp-acd has a healthy assigned-server path for receiving
+// AOP fanout, and this AC boot has completed its durable session-control flush
+// while holding the admission lease. That matches today's qURL fanout contract:
+// handleHttpOpenResource fans the knock to assigned peer servers, and
+// processACOperationBroadcast sends the AOP to every local AC connection before
+// the origin ACK is released. If delivery ever becomes targeted to one AC, this
+// target health check is no longer sufficient to prove a specific admission can
+// land on the selected AC.
 func (ha *HttpAC) handleReadiness(c *gin.Context) {
 	if ha == nil || ha.ua == nil || !ha.ua.registration.hasHealthyServer() {
 		c.String(http.StatusServiceUnavailable, "no healthy assigned server\n")
+		return
+	}
+	if !ha.ua.sessionAdmissionReady() {
+		c.String(http.StatusServiceUnavailable, "session admission not ready\n")
 		return
 	}
 

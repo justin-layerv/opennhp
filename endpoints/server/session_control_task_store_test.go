@@ -139,6 +139,51 @@ func activateSessionControlTaskTargetUnready(t *testing.T, fixture *sessionContr
 	return active
 }
 
+func newSessionControlPreparingActivationTaskFixture(t *testing.T) (sessionControlTaskFixture,
+	sessionControlTargetAuthority) {
+	t.Helper()
+	materialization := newSessionControlMaterializationFixture(t, 1)
+	preparing := materialization.intents[0].Target
+	preparing.BootID = "abababababababababababababababab"
+	preparing.FlushGeneration++
+	preparing.State = sessionControlTargetPreparing
+	preparing.Version++
+	preparing.ActivatedControlVersion, preparing.ReadyControlVersion = 0, 0
+	preparing.AAKEnqueuedAtMillis, preparing.AAKTransactionID = 0, 0
+	preparing.PreparedAtMillis++
+	preparing.UpdatedAtMillis = preparing.PreparedAtMillis
+	seedSessionControlTarget(t, materialization.fake, preparing)
+
+	taskSet, err := materialization.store.MaterializeNormalExactClose(context.Background(),
+		materialization.candidate, materialization.close.EventID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerPK := sessionControlOwnerPK(preparing.ControlCellID, preparing.ACID, preparing.PublicKey)
+	task, err := materialization.store.getCloseTask(context.Background(), ownerPK, materialization.close.EventID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := sessionControlTaskFixture{
+		sessionControlMaterializationFixture: materialization,
+		taskSet:                              *taskSet, ownerPK: ownerPK, task: *task,
+	}
+	active, err := materialization.store.ActivateTarget(context.Background(),
+		preparing.fence().activation(materialization.close.Work.PreparedDirectoryVersion))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The materialization fake applies Put members; Activate writes TARGET with
+	// Update and OWNER with Put. Mirror the committed TARGET half so this fixture
+	// exercises the subsequent strong-read and five-item Rebind transaction.
+	activeRow, err := sessionControlTargetToRow(*active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialization.fake.setItem(marshalSessionControlSessionTestRow(t, activeRow))
+	return fixture, *active
+}
+
 func sessionControlTaskRebindRequest(fixture sessionControlTaskFixture,
 	target sessionControlTargetAuthority, seed uint64) sessionControlCloseTaskRebindRequest {
 	return sessionControlCloseTaskRebindRequest{CellID: fixture.task.CellID, EventID: fixture.task.EventID,
@@ -730,6 +775,70 @@ func TestDynamoSessionControlRebindExactCloseTaskHigherGenerationAndReplay(t *te
 			replay, err := fixture.store.RebindExactCloseTask(context.Background(), request)
 			if err != nil || *replay != *rebound || len(fixture.fake.transactions) != transactionCount {
 				t.Fatalf("rebind replay = %#v/%v txns=%d", replay, err, len(fixture.fake.transactions))
+			}
+		})
+	}
+}
+
+func TestDynamoSessionControlRebindExactCloseTaskPreparingActivationSuccessorIsNarrow(t *testing.T) {
+	fixture, active := newSessionControlPreparingActivationTaskFixture(t)
+	if !sessionControlCloseTaskCanFollowPreparingActivation(fixture.task, active) {
+		t.Fatalf("exact PREPARING activation successor was rejected: task=%#v target=%#v", fixture.task, active)
+	}
+	owner, ownerErr := fixture.store.getOwner(context.Background(), active.ControlCellID, active.ACID, active.PublicKey)
+	if ownerErr != nil || !sessionControlCloseTaskIsOwnerDescendant(fixture.task, *owner) ||
+		!sessionControlCloseTaskOwnerTargetsCurrent(*owner, active) {
+		t.Fatalf("exact PREPARING activation owner successor was rejected: owner=%#v err=%v descendant=%t current=%t",
+			owner, ownerErr, owner != nil && sessionControlCloseTaskIsOwnerDescendant(fixture.task, *owner),
+			owner != nil && sessionControlCloseTaskOwnerTargetsCurrent(*owner, active))
+	}
+	rebound, err := fixture.store.RebindExactCloseTask(context.Background(),
+		sessionControlTaskRebindRequest(fixture, active, 0xb21))
+	if err != nil || rebound.BoundTargetVersion != active.Version ||
+		rebound.BoundFlushGeneration != active.FlushGeneration {
+		t.Fatalf("same-generation activation rebind = %#v, %v", rebound, err)
+	}
+
+	mutations := []struct {
+		name       string
+		mutateTask func(*sessionControlCloseTask)
+		mutate     func(*sessionControlTargetAuthority)
+	}{
+		{name: "version plus two", mutate: func(target *sessionControlTargetAuthority) { target.Version++ }},
+		{name: "ready", mutate: func(target *sessionControlTargetAuthority) {
+			target.ReadyControlVersion = target.ActivatedControlVersion
+			target.AAKEnqueuedAtMillis = target.PreparedAtMillis
+			target.AAKTransactionID = 1
+		}},
+		{name: "boot", mutate: func(target *sessionControlTargetAuthority) {
+			target.BootID = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+		}},
+		{name: "generation", mutate: func(target *sessionControlTargetAuthority) { target.FlushGeneration++ }},
+		{name: "authority", mutate: func(target *sessionControlTargetAuthority) { target.AuthorityVersion++ }},
+		{name: "created timestamp", mutate: func(target *sessionControlTargetAuthority) { target.CreatedAtMillis++ }},
+		{name: "prepared timestamp", mutate: func(target *sessionControlTargetAuthority) { target.PreparedAtMillis++ }},
+		{name: "updated timestamp", mutate: func(target *sessionControlTargetAuthority) { target.UpdatedAtMillis++ }},
+		{name: "missing activated cursor", mutate: func(target *sessionControlTargetAuthority) {
+			target.ActivatedControlVersion = 0
+		}},
+		{name: "nonpending task", mutateTask: func(task *sessionControlCloseTask) {
+			task.State = sessionControlCloseTaskStateLeased
+		}},
+		{name: "changed creation", mutateTask: func(task *sessionControlCloseTask) {
+			task.CreationTarget.Version--
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			task, target := fixture.task, active
+			if mutation.mutateTask != nil {
+				mutation.mutateTask(&task)
+			}
+			if mutation.mutate != nil {
+				mutation.mutate(&target)
+			}
+			if sessionControlCloseTaskCanFollowPreparingActivation(task, target) {
+				t.Fatalf("accepted off-contract same-generation successor: task=%#v target=%#v", task, target)
 			}
 		})
 	}

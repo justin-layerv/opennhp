@@ -736,7 +736,7 @@ func (a *UdpAC) handleUdpACSessionClose(ppd *core.PacketParserData) error {
 
 func (a *UdpAC) sendSessionControlAck(ppd *core.PacketParserData, closeMsg *common.ACSessionCloseMsg, closed uint64) error {
 	if a == nil || a.device == nil || ppd == nil || ppd.ConnData == nil ||
-		len(ppd.RemotePubKey) != core.PublicKeySize || closeMsg == nil {
+		ppd.ConnData.RemoteAddr == nil || len(ppd.RemotePubKey) != core.PublicKeySize || closeMsg == nil {
 		return errors.New("session-control acknowledgement envelope is incomplete")
 	}
 	if !common.ValidNHPACBootID(a.bootID) || a.sessionFlushGeneration.Load() == 0 ||
@@ -762,6 +762,12 @@ func (a *UdpAC) sendSessionControlAck(ppd *core.PacketParserData, closeMsg *comm
 		return err
 	}
 	md := &core.MsgData{
+		// UdpAC.sendMessageRoutine selects or creates the outbound connection by
+		// RemoteAddr before it replaces ConnData with the live connection. The
+		// address is copied from the authenticated inbound connection; leaving it
+		// nil drops the RVA before encryption, while deriving it from message bytes
+		// would let an unauthenticated field redirect the acknowledgement.
+		RemoteAddr:    cloneACReplyAddr(ppd.ConnData.RemoteAddr),
 		ConnData:      ppd.ConnData,
 		HeaderType:    core.NHP_RVA,
 		CipherScheme:  ppd.CipherScheme,
@@ -779,6 +785,15 @@ func (a *UdpAC) sendSessionControlAck(ppd *core.PacketParserData, closeMsg *comm
 	default:
 		return errors.New("AC session-control acknowledgement queue is full")
 	}
+}
+
+func cloneACReplyAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	clone := *addr
+	clone.IP = append(net.IP(nil), addr.IP...)
+	return &clone
 }
 
 // sendRevocationAck enqueues an NHP_RVA acknowledgement of revMsg back to the
@@ -808,7 +823,7 @@ func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACR
 	// responder only after validatePeer authenticates it, so it is the trusted
 	// server identity to address the ack to. A missing ConnData/pubkey means the
 	// receive path handed us an envelope we cannot reply on — drop with a metric.
-	if ppd == nil || ppd.ConnData == nil || len(ppd.RemotePubKey) != core.PublicKeySize {
+	if ppd == nil || ppd.ConnData == nil || ppd.ConnData.RemoteAddr == nil || len(ppd.RemotePubKey) != core.PublicKeySize {
 		a.incrMetric(MetricRevocationAckSendFailed)
 		log.Error("ac(%s)[sendRevocationAck] cannot ack NHP_REV: missing connection or server pubkey (scope=%q key=%q epoch=%d eventId=%q)",
 			acId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
@@ -832,6 +847,9 @@ func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACR
 	}
 
 	md := &core.MsgData{
+		// Bind the return route to the authenticated inbound connection. The AC
+		// send loop requires RemoteAddr even when ConnData is already known.
+		RemoteAddr:    cloneACReplyAddr(ppd.ConnData.RemoteAddr),
 		ConnData:      ppd.ConnData,
 		HeaderType:    core.NHP_RVA,
 		CipherScheme:  ppd.CipherScheme,

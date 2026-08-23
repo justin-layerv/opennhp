@@ -107,11 +107,24 @@ func sessionControlCloseTaskIsOwnerDescendant(task sessionControlCloseTask,
 		return false
 	}
 	if owner.FlushGeneration == task.BoundFlushGeneration {
-		return owner.BootID == task.BoundBootID && owner.TargetVersion == task.BoundTargetVersion &&
+		if owner.BootID == task.BoundBootID && owner.TargetVersion == task.BoundTargetVersion &&
 			owner.TargetAuthorityVersion == task.BoundAuthorityVersion &&
 			owner.LifecycleVersion == task.BoundOwnerLifecycle &&
 			owner.ActivatedControlVersion == task.BoundActivatedCursor &&
-			owner.ReadyControlVersion == task.BoundReadyCursor
+			owner.ReadyControlVersion == task.BoundReadyCursor {
+			return true
+		}
+		creation, validCreation := sessionControlCloseTaskPreparingActivationCreation(task)
+		return validCreation &&
+			owner.Phase == sessionControlOwnerActiveUnready && owner.BootID == creation.BootID &&
+			owner.FlushGeneration == creation.FlushGeneration &&
+			owner.TargetVersion == creation.Version+1 && owner.TargetAuthorityVersion == creation.AuthorityVersion &&
+			owner.TargetCountedActiveSlot && owner.LifecycleVersion > task.BoundOwnerLifecycle &&
+			owner.ActivatedControlVersion > 0 && owner.ReadyControlVersion == 0 &&
+			owner.TargetCreatedAtMillis == creation.CreatedAtMillis &&
+			owner.TargetPreparedAtMillis == creation.PreparedAtMillis &&
+			owner.TargetUpdatedAtMillis == creation.PreparedAtMillis &&
+			owner.AAKEnqueuedAtMillis == 0 && owner.AAKTransactionID == 0
 	}
 	return owner.TargetVersion > task.BoundTargetVersion &&
 		owner.TargetAuthorityVersion >= task.BoundAuthorityVersion &&

@@ -22,19 +22,24 @@ import (
 
 type admissionSessionControlStore struct {
 	*memorySessionControlStore
-	requestModel   *memorySessionControlSessionModel
-	controlMu      sync.Mutex
-	snapshots      []*sessionControlFenceSnapshot
-	snapshotCalls  int
-	activateErrors []error
-	activateCalls  int
-	mutateActivate func(*sessionControlTargetAuthority)
-	finalizeCalls  int
-	beforeFinalize func(sessionControlTargetReadiness)
-	mutateFinalize func(*sessionControlTargetAuthority)
-	cancelCalls    int
-	cancelCtxErr   error
-	prepareErr     error
+	requestModel       *memorySessionControlSessionModel
+	controlMu          sync.Mutex
+	snapshots          []*sessionControlFenceSnapshot
+	snapshotCalls      int
+	activateErrors     []error
+	activateCalls      int
+	mutateActivate     func(*sessionControlTargetAuthority)
+	finalizeCalls      int
+	beforeFinalize     func(sessionControlTargetReadiness)
+	mutateFinalize     func(*sessionControlTargetAuthority)
+	verifyAttachCalls  int
+	beforeVerifyAttach func(sessionControlTargetAttachment)
+	mutateVerifyAttach func(*sessionControlTargetAuthority)
+	ownerSnapshotCalls int
+	cancelCalls        int
+	cancelCtxErr       error
+	prepareCalls       int
+	prepareErr         error
 }
 
 func (s *admissionSessionControlStore) ReserveSession(ctx context.Context, candidate sessionControlSessionCandidate,
@@ -74,6 +79,7 @@ func (s *admissionSessionControlStore) EnsureExactSessionClose(ctx context.Conte
 
 func (s *admissionSessionControlStore) PrepareTarget(ctx context.Context, candidate sessionControlTargetCandidate) (*sessionControlTargetPreparation, error) {
 	s.controlMu.Lock()
+	s.prepareCalls++
 	injected := s.prepareErr
 	s.controlMu.Unlock()
 	if injected != nil {
@@ -145,12 +151,34 @@ func (s *admissionSessionControlStore) FinalizeTargetReady(ctx context.Context,
 	return result, err
 }
 
+func (s *admissionSessionControlStore) VerifyReadyTargetAttachment(ctx context.Context,
+	attachment sessionControlTargetAttachment,
+) (*sessionControlTargetAuthority, error) {
+	s.controlMu.Lock()
+	s.verifyAttachCalls++
+	before := s.beforeVerifyAttach
+	s.controlMu.Unlock()
+	if before != nil {
+		before(attachment)
+	}
+	result, err := s.memorySessionControlStore.VerifyReadyTargetAttachment(ctx, attachment)
+	if err == nil && result != nil && s.mutateVerifyAttach != nil {
+		copy := *result
+		s.mutateVerifyAttach(&copy)
+		result = &copy
+	}
+	return result, err
+}
+
 // AOL fixtures without durable close work still implement the narrow delivery
 // capability so production HandleACOnline can exercise its mandatory empty
 // owner snapshot instead of bypassing the seam.
 func (s *admissionSessionControlStore) SnapshotOwnerExactCloseTasks(ctx context.Context,
 	cellID, acID, publicKey string,
 ) (*sessionControlOwnerTaskSnapshot, error) {
+	s.controlMu.Lock()
+	s.ownerSnapshotCalls++
+	s.controlMu.Unlock()
 	target, err := s.GetTarget(ctx, sessionControlTargetKey{ACID: acID, PublicKey: publicKey})
 	if err != nil {
 		return nil, err
@@ -223,6 +251,73 @@ func testAdmissionACConn(acID string, seed byte, bootID string, generation uint6
 	}
 }
 
+func testAdmissionAOLPacket(t *testing.T, acID, bootID string, generation uint64, seed byte,
+	port int, transactionID uint64,
+) (*core.PacketParserData, chan *core.MsgData) {
+	t.Helper()
+	body, err := json.Marshal(common.ACOnlineMsg{
+		ACId: acID, BootID: bootID, SessionFlushGeneration: generation, SessionFlushComplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+	connData := newClosableConnData(addr)
+	connData.LastLocalRecvTime = time.Now().UnixNano()
+	connData.RemoteTransactionMap = make(map[uint64]*core.RemoteTransaction)
+	aakMessages := make(chan *core.MsgData, 1)
+	connData.RemoteTransactionMap[transactionID] = core.NewRemoteTransactionForTest(transactionID, aakMessages)
+	return &core.PacketParserData{
+		HeaderType: core.NHP_AOL, BodyMessage: body, SenderTrxId: transactionID,
+		LocalInitTime: time.Now().UnixNano(), RemotePubKey: testPubkey(seed), ConnData: connData,
+	}, aakMessages
+}
+
+func requireSessionControlNotReadyAAK(t *testing.T, messages chan *core.MsgData) {
+	t.Helper()
+	select {
+	case md := <-messages:
+		if md == nil || md.HeaderType != core.NHP_AAK {
+			t.Fatalf("session-control rejection = %#v, want NHP_AAK", md)
+		}
+		var ack common.ServerACAckMsg
+		if err := common.DecodeServerACAckMsg(md.Message, &ack); err != nil {
+			t.Fatalf("decode session-control rejection: %v body=%s", err, md.Message)
+		}
+		if ack.ErrCode != common.ErrACSessionControlNotReady.ErrorCode() || ack.Registered ||
+			ack.BootID != "" || ack.SessionFlushGeneration != 0 || ack.AOLTransactionID != 0 {
+			t.Fatalf("session-control rejection authority = %#v", ack)
+		}
+	default:
+		t.Fatal("session-control rejection AAK was not enqueued")
+	}
+}
+
+func testAdmissionAOLServer(t *testing.T, storage StorageBackend, store sessionControlStore,
+	acID string, seed byte, port int,
+) *UdpServer {
+	t.Helper()
+	pubkeyB64 := testPubkeyB64(seed)
+	peer := &core.UdpPeer{Hostname: acID, PubKeyBase64: pubkeyB64, Type: core.NHP_AC}
+	peer.UpdateRecv(time.Now().UnixNano(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+	return &UdpServer{
+		metrics: metrics.NewPublisherForTest(t), storage: storage,
+		storageConfig:       &StorageConfig{Backend: StorageBackendDynamoDB},
+		sessionControlStore: store, sessionControlCellID: testSessionControlCellID,
+		device:     core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil),
+		listenAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 62206}, localIp: "127.0.0.1",
+		acPeerMap: map[string]*core.UdpPeer{pubkeyB64: peer}, acConnectionMap: map[string][]*ACConn{},
+		remoteConnectionMap: make(map[string]*UdpConn),
+	}
+}
+
+func testInstallAdmissionRemoteConn(s *UdpServer, ppd *core.PacketParserData) {
+	if s == nil || ppd == nil || ppd.ConnData == nil || ppd.ConnData.RemoteAddr == nil {
+		return
+	}
+	s.remoteConnectionMap[ppd.ConnData.RemoteAddr.String()] = &UdpConn{ConnData: ppd.ConnData}
+}
+
 func testMarkACSessionControlReady(t *testing.T, conn *ACConn) {
 	t.Helper()
 	if conn == nil || conn.ACPeer == nil {
@@ -253,6 +348,32 @@ func testAdmissionFenceSnapshot(t *testing.T, candidates ...sessionControlFenceC
 		t.Fatalf("SnapshotActiveFences() error = %v", err)
 	}
 	return snapshot
+}
+
+func testSetAdmissionFenceSnapshot(t *testing.T, store *admissionSessionControlStore,
+	snapshot sessionControlFenceSnapshot,
+) {
+	t.Helper()
+	if validateSessionControlFenceSnapshot(snapshot, testSessionControlCellID) != nil {
+		t.Fatalf("invalid admission snapshot fixture: %#v", snapshot)
+	}
+	store.controlMu.Lock()
+	copy := snapshot
+	copy.Fences = append([]sessionControlFenceAuthority(nil), snapshot.Fences...)
+	store.snapshots = []*sessionControlFenceSnapshot{&copy}
+	store.snapshotCalls = 0
+	store.controlMu.Unlock()
+	store.memorySessionControlStore.mu.Lock()
+	directory := store.memorySessionControlStore.controlDirectories[testSessionControlCellID]
+	directory.Version = snapshot.DirectoryVersion
+	directory.ActiveFenceCount = snapshot.ActiveFenceCount
+	directory.AdmissionBlocked = snapshot.AdmissionBlocked
+	directory.OverflowCloseCount = snapshot.OverflowCloseCount
+	directory.OverflowLeaderEventID = snapshot.OverflowLeaderEventID
+	directory.OverflowLeaderPreparedDirectoryVersion = snapshot.OverflowLeaderPreparedDirectoryVersion
+	directory.OverflowLeaderSelectedDirectoryVersion = snapshot.OverflowLeaderSelectedDirectoryVersion
+	store.memorySessionControlStore.controlDirectories[testSessionControlCellID] = directory
+	store.memorySessionControlStore.mu.Unlock()
 }
 
 func TestCloudSessionControlCellIdentityFailsClosedBeforeListener(t *testing.T) {
@@ -315,6 +436,355 @@ func TestACSessionControlAdmissionEmptyVersionOneHappyPath(t *testing.T) {
 	}
 	if store.cancelCalls != 0 {
 		t.Fatalf("cancel calls = %d, want 0", store.cancelCalls)
+	}
+}
+
+func TestHandleACOnlineThreeServersConvergeAndRefreshOneReadyCandidateWithoutVersionChurn(t *testing.T) {
+	const (
+		acID        = "ac-three-server-attach"
+		bootID      = "71717171717171717171717171717171"
+		generation  = uint64(71)
+		serverCount = 3
+	)
+	storage := NewMemoryStorage()
+	storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
+	store := newAdmissionSessionControlStore(time.Unix(1_800_001_150, 0).UTC())
+	snapshot := testAdmissionFenceSnapshot(t,
+		testSessionControlFenceCandidate("71717171717171717171717171717171", testSessionControlExactFenceSelector(0x71)),
+	)
+	testSetAdmissionFenceSnapshot(t, store, *snapshot)
+
+	finalizersEntered := make(chan struct{})
+	releaseFinalizers := make(chan struct{})
+	var finalizeEntrants atomic.Int32
+	store.beforeFinalize = func(sessionControlTargetReadiness) {
+		if finalizeEntrants.Add(1) == serverCount {
+			close(finalizersEntered)
+		}
+		<-releaseFinalizers
+	}
+
+	servers := make([]*UdpServer, serverCount)
+	packets := make([]*core.PacketParserData, serverCount)
+	aaks := make([]chan *core.MsgData, serverCount)
+	var fenceSends atomic.Int32
+	for i := range serverCount {
+		servers[i] = testAdmissionAOLServer(t, storage, store, acID, 0x71, 45100+i)
+		servers[i].sendACSessionControlFenceFn = func(_ context.Context, conn *ACConn, fence sessionControlFenceAuthority) error {
+			if conn.BootID != bootID || conn.FlushGeneration != generation || fence.EventID != snapshot.Fences[0].EventID {
+				return errors.New("mutated three-server catch-up authority")
+			}
+			fenceSends.Add(1)
+			return nil
+		}
+		packets[i], aaks[i] = testAdmissionAOLPacket(t, acID, bootID, generation, 0x71, 45100+i, uint64(710+i))
+		testInstallAdmissionRemoteConn(servers[i], packets[i])
+	}
+
+	initialErrs := make(chan error, serverCount)
+	for i := range serverCount {
+		go func(index int) { initialErrs <- servers[index].HandleACOnline(packets[index]) }(i)
+	}
+	select {
+	case <-finalizersEntered:
+	case <-time.After(2 * time.Second):
+		close(releaseFinalizers)
+		t.Fatalf("only %d/%d concurrent AOLs reached ACTIVE_UNREADY finalization", finalizeEntrants.Load(), serverCount)
+	}
+	close(releaseFinalizers)
+	for range serverCount {
+		if err := <-initialErrs; err != nil {
+			t.Fatalf("concurrent AOL error = %v", err)
+		}
+	}
+	for i := range serverCount {
+		if len(aaks[i]) != 1 || !servers[i].hasLiveACConn(acID) {
+			t.Fatalf("server %d AAK/live = %d/%t", i, len(aaks[i]), servers[i].hasLiveACConn(acID))
+		}
+	}
+	key := sessionControlTargetKey{ACID: acID, PublicKey: testPubkeyB64(0x71)}
+	target, err := store.GetTarget(context.Background(), key)
+	if err != nil || target == nil || !target.ready() || target.ActivatedControlVersion != snapshot.DirectoryVersion {
+		t.Fatalf("shared ready target = %#v, %v", target, err)
+	}
+	store.memorySessionControlStore.mu.Lock()
+	owner := store.memorySessionControlStore.owners[key]
+	store.memorySessionControlStore.mu.Unlock()
+	if !owner.exactTarget(*target, sessionControlOwnerReady) || owner.PendingCount != 0 {
+		t.Fatalf("shared ready owner = %#v", owner)
+	}
+	store.controlMu.Lock()
+	prepareBeforeRefresh := store.prepareCalls
+	finalizeBeforeRefresh := store.finalizeCalls
+	store.controlMu.Unlock()
+
+	// All assigned servers now refresh the same physical process concurrently.
+	// The durable target and owner must remain byte-identical: each server catches
+	// up the active fence and takes only the no-write ATTACH transaction.
+	refreshErrs := make(chan error, serverCount)
+	for i := range serverCount {
+		refresh, refreshAAK := testAdmissionAOLPacket(t, acID, bootID, generation, 0x71,
+			45200+i, uint64(720+i))
+		testInstallAdmissionRemoteConn(servers[i], refresh)
+		go func(index int, ppd *core.PacketParserData, aak chan *core.MsgData) {
+			err := servers[index].HandleACOnline(ppd)
+			if err == nil && len(aak) != 1 {
+				err = errors.New("refresh omitted success AAK")
+			}
+			refreshErrs <- err
+		}(i, refresh, refreshAAK)
+	}
+	for range serverCount {
+		if err := <-refreshErrs; err != nil {
+			t.Fatalf("concurrent refresh error = %v", err)
+		}
+	}
+	refreshed, err := store.GetTarget(context.Background(), key)
+	if err != nil || refreshed == nil || *refreshed != *target {
+		t.Fatalf("refresh churned target = %#v, %v; before %#v", refreshed, err, target)
+	}
+	store.memorySessionControlStore.mu.Lock()
+	refreshedOwner := store.memorySessionControlStore.owners[key]
+	store.memorySessionControlStore.mu.Unlock()
+	store.controlMu.Lock()
+	prepareAfterRefresh := store.prepareCalls
+	finalizeAfterRefresh := store.finalizeCalls
+	verifyAttachCalls := store.verifyAttachCalls
+	store.controlMu.Unlock()
+	if refreshedOwner != owner || prepareAfterRefresh != prepareBeforeRefresh ||
+		finalizeAfterRefresh != finalizeBeforeRefresh || verifyAttachCalls < serverCount ||
+		fenceSends.Load() != 2*serverCount {
+		t.Fatalf("refresh authority/calls/sends = ownerChanged:%t prepare:%d/%d finalize:%d/%d verify:%d sends:%d",
+			refreshedOwner != owner, prepareBeforeRefresh, prepareAfterRefresh,
+			finalizeBeforeRefresh, finalizeAfterRefresh, verifyAttachCalls, fenceSends.Load())
+	}
+}
+
+func TestHandleACOnlineActiveUnreadyAdvancedDirectoryRecatchesOnceAndAdvancesCursor(t *testing.T) {
+	const (
+		acID       = "ac-active-unready-advance"
+		bootID     = "72727272727272727272727272727272"
+		generation = uint64(72)
+	)
+	storage := NewMemoryStorage()
+	storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
+	store := newAdmissionSessionControlStore(time.Unix(1_800_001_160, 0).UTC())
+	seedConn := testAdmissionACConn(acID, 0x72, bootID, generation)
+	active, err := (&UdpServer{
+		sessionControlStore: store, sessionControlCellID: testSessionControlCellID,
+	}).activateACSessionControlTarget(context.Background(), seedConn)
+	if err != nil || active == nil || active.ready() || active.ActivatedControlVersion != 1 {
+		t.Fatalf("seed ACTIVE_UNREADY target = %#v, %v", active, err)
+	}
+	advanced := testAdmissionFenceSnapshot(t,
+		testSessionControlFenceCandidate("72727272727272727272727272727272", testSessionControlExactFenceSelector(0x72)),
+	)
+	if advanced.DirectoryVersion == active.ActivatedControlVersion {
+		t.Fatalf("advanced snapshot did not advance cursor: %#v / %#v", advanced, active)
+	}
+	testSetAdmissionFenceSnapshot(t, store, *advanced)
+	store.controlMu.Lock()
+	prepareBefore := store.prepareCalls
+	ownerSnapshotsBefore := store.ownerSnapshotCalls
+	store.controlMu.Unlock()
+
+	s := testAdmissionAOLServer(t, storage, store, acID, 0x72, 45300)
+	var sends atomic.Int32
+	s.sendACSessionControlFenceFn = func(_ context.Context, _ *ACConn, fence sessionControlFenceAuthority) error {
+		if fence.EventID != advanced.Fences[0].EventID {
+			return errors.New("unexpected advanced-directory fence")
+		}
+		sends.Add(1)
+		return nil
+	}
+	ppd, aak := testAdmissionAOLPacket(t, acID, bootID, generation, 0x72, 45300, 730)
+	testInstallAdmissionRemoteConn(s, ppd)
+	if err := s.HandleACOnline(ppd); err != nil {
+		t.Fatalf("advanced-directory AOL = %v", err)
+	}
+	if len(aak) != 1 || sends.Load() != 1 {
+		t.Fatalf("advanced-directory AAK/fence sends = %d/%d, want 1/1", len(aak), sends.Load())
+	}
+	refreshed, err := store.GetTarget(context.Background(), active.key())
+	if err != nil || refreshed == nil || !refreshed.ready() ||
+		refreshed.ActivatedControlVersion != advanced.DirectoryVersion ||
+		refreshed.ReadyControlVersion != advanced.DirectoryVersion {
+		t.Fatalf("advanced-directory ready target = %#v, %v", refreshed, err)
+	}
+	store.controlMu.Lock()
+	prepareAfter := store.prepareCalls
+	ownerSnapshotsAfter := store.ownerSnapshotCalls
+	store.controlMu.Unlock()
+	if prepareAfter != prepareBefore+1 || ownerSnapshotsAfter != ownerSnapshotsBefore+2 {
+		t.Fatalf("advanced-directory prepare/drain calls = %d/%d and %d/%d; want one prepare plus initial and post-activation owner snapshots",
+			prepareBefore, prepareAfter, ownerSnapshotsBefore, ownerSnapshotsAfter)
+	}
+}
+
+func TestHandleACOnlineReadyAttachmentFailsClosedOnDirectoryOrTaskDrift(t *testing.T) {
+	const (
+		acID       = "ac-ready-attach-drift"
+		bootID     = "73737373737373737373737373737373"
+		generation = uint64(73)
+	)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *admissionSessionControlStore, sessionControlTargetKey)
+	}{
+		{
+			name: "directory advance",
+			mutate: func(t *testing.T, store *admissionSessionControlStore, _ sessionControlTargetKey) {
+				t.Helper()
+				store.memorySessionControlStore.mu.Lock()
+				directory := store.memorySessionControlStore.controlDirectories[testSessionControlCellID]
+				directory.Version++
+				directory.UpdatedAtMillis++
+				store.memorySessionControlStore.controlDirectories[testSessionControlCellID] = directory
+				store.memorySessionControlStore.mu.Unlock()
+			},
+		},
+		{
+			name: "owner task insert",
+			mutate: func(t *testing.T, store *admissionSessionControlStore, key sessionControlTargetKey) {
+				t.Helper()
+				store.memorySessionControlStore.mu.Lock()
+				defer store.memorySessionControlStore.mu.Unlock()
+				owner := store.memorySessionControlStore.owners[key]
+				next, err := planSessionControlOwnerTaskInsert(owner, owner.UpdatedAtMillis+1)
+				if err != nil {
+					t.Fatalf("plan task insertion: %v", err)
+				}
+				store.memorySessionControlStore.owners[key] = next
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := NewMemoryStorage()
+			storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
+			store := newAdmissionSessionControlStore(time.Unix(1_800_001_170, 0).UTC())
+			seedConn := testAdmissionACConn(acID, 0x73, bootID, generation)
+			active, err := (&UdpServer{
+				sessionControlStore: store, sessionControlCellID: testSessionControlCellID,
+			}).activateACSessionControlTarget(context.Background(), seedConn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := store.SnapshotActiveFences(context.Background(), testSessionControlCellID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ready, err := store.FinalizeTargetReady(context.Background(), active.fence().readiness(*snapshot,
+				active.PreparedAtMillis, 731))
+			if err != nil || ready == nil || !ready.ready() {
+				t.Fatalf("seed READY target = %#v, %v", ready, err)
+			}
+			key := ready.key()
+			store.beforeVerifyAttach = func(sessionControlTargetAttachment) { tc.mutate(t, store, key) }
+			s := testAdmissionAOLServer(t, storage, store, acID, 0x73, 45400)
+			ppd, aak := testAdmissionAOLPacket(t, acID, bootID, generation, 0x73, 45400, 732)
+			testInstallAdmissionRemoteConn(s, ppd)
+			if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrACSessionControlNotReady) {
+				t.Fatalf("drifted ready attachment = %v, want not ready", err)
+			}
+			requireSessionControlNotReadyAAK(t, aak)
+			if s.hasLiveACConn(acID) {
+				t.Fatal("drifted attachment remained locally ready")
+			}
+		})
+	}
+}
+
+func TestHandleACOnlineThreeServersConvergeCountedPreparingNewGenerationAndRejectOld(t *testing.T) {
+	const (
+		acID        = "ac-three-server-preparing"
+		oldBootID   = "74747474747474747474747474747474"
+		newBootID   = "75757575757575757575757575757575"
+		oldGen      = uint64(74)
+		newGen      = uint64(75)
+		serverCount = 3
+	)
+	storage := NewMemoryStorage()
+	storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
+	store := newAdmissionSessionControlStore(time.Unix(1_800_001_180, 0).UTC())
+	seedConn := testAdmissionACConn(acID, 0x74, oldBootID, oldGen)
+	seedServer := &UdpServer{sessionControlStore: store, sessionControlCellID: testSessionControlCellID}
+	oldActive, err := seedServer.activateACSessionControlTarget(context.Background(), seedConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.SnapshotActiveFences(context.Background(), testSessionControlCellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldReady, err := store.FinalizeTargetReady(context.Background(), oldActive.fence().readiness(*snapshot,
+		oldActive.PreparedAtMillis, 740))
+	if err != nil || oldReady == nil || !oldReady.ready() {
+		t.Fatalf("seed old READY target = %#v, %v", oldReady, err)
+	}
+	prepared, err := store.PrepareTarget(context.Background(), sessionControlTargetCandidate{
+		ACID: acID, PublicKey: testPubkeyB64(0x74), BootID: newBootID,
+		FlushGeneration: newGen, ControlCellID: testSessionControlCellID,
+	})
+	if err != nil || prepared == nil || !prepared.RequiresActivation ||
+		prepared.Target.State != sessionControlTargetPreparing || !prepared.Target.CountedActiveSlot {
+		t.Fatalf("counted replacement preparation = %#v, %v", prepared, err)
+	}
+
+	finalizersEntered := make(chan struct{})
+	releaseFinalizers := make(chan struct{})
+	var entrants atomic.Int32
+	store.beforeFinalize = func(sessionControlTargetReadiness) {
+		if entrants.Add(1) == serverCount {
+			close(finalizersEntered)
+		}
+		<-releaseFinalizers
+	}
+	servers := make([]*UdpServer, serverCount)
+	packets := make([]*core.PacketParserData, serverCount)
+	aaks := make([]chan *core.MsgData, serverCount)
+	results := make(chan error, serverCount)
+	for i := range serverCount {
+		servers[i] = testAdmissionAOLServer(t, storage, store, acID, 0x74, 45500+i)
+		packets[i], aaks[i] = testAdmissionAOLPacket(t, acID, newBootID, newGen, 0x74,
+			45500+i, uint64(750+i))
+		testInstallAdmissionRemoteConn(servers[i], packets[i])
+		go func(index int) { results <- servers[index].HandleACOnline(packets[index]) }(i)
+	}
+	// A delayed old-generation AOL races the converging replacement. Its stale
+	// Prepare must not roll back or version the already PREPARING newer tuple.
+	oldServer := testAdmissionAOLServer(t, storage, store, acID, 0x74, 45550)
+	oldPacket, oldAAK := testAdmissionAOLPacket(t, acID, oldBootID, oldGen, 0x74, 45550, 759)
+	testInstallAdmissionRemoteConn(oldServer, oldPacket)
+	oldResult := make(chan error, 1)
+	go func() { oldResult <- oldServer.HandleACOnline(oldPacket) }()
+
+	select {
+	case <-finalizersEntered:
+	case <-time.After(2 * time.Second):
+		close(releaseFinalizers)
+		t.Fatalf("only %d/%d new-generation AOLs reached finalization", entrants.Load(), serverCount)
+	}
+	close(releaseFinalizers)
+	for range serverCount {
+		if err := <-results; err != nil {
+			t.Fatalf("new-generation AOL = %v", err)
+		}
+	}
+	if err := <-oldResult; !errors.Is(err, common.ErrACSessionControlNotReady) {
+		t.Fatalf("delayed old-generation AOL = %v, want not ready", err)
+	}
+	if len(oldAAK) != 1 {
+		t.Fatalf("old-generation rejection AAK count = %d, want 1", len(oldAAK))
+	}
+	for i := range serverCount {
+		if len(aaks[i]) != 1 || !servers[i].hasLiveACConn(acID) {
+			t.Fatalf("new server %d AAK/live = %d/%t", i, len(aaks[i]), servers[i].hasLiveACConn(acID))
+		}
+	}
+	current, err := store.GetTarget(context.Background(), prepared.Target.key())
+	if err != nil || current == nil || !current.ready() || current.BootID != newBootID ||
+		current.FlushGeneration != newGen || current.Version != prepared.Target.Version+2 {
+		t.Fatalf("converged new-generation target = %#v, %v; prepared %#v", current, err, prepared.Target)
 	}
 }
 
@@ -926,7 +1396,7 @@ func TestACSessionControlConcurrentAdmissionEnforcesDurableCap(t *testing.T) {
 	}
 }
 
-func TestHandleACOnlineAAKFailureLeavesActiveTargetForIdempotentRetry(t *testing.T) {
+func TestHandleACOnlineAAKFailureLeavesReadyTargetForIdempotentAttachRetry(t *testing.T) {
 	const (
 		acID   = "ac-admission-aak-retry"
 		bootID = "88888888888888888888888888888888"
@@ -958,18 +1428,26 @@ func TestHandleACOnlineAAKFailureLeavesActiveTargetForIdempotentRetry(t *testing
 		ConnData: &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45000}, RemoteTransactionMap: map[uint64]*core.RemoteTransaction{}},
 	}
 	ppd.ConnData.LastLocalRecvTime = time.Now().UnixNano()
+	store.beforeFinalize = func(readiness sessionControlTargetReadiness) {
+		if readiness.AAKTransactionID != ppd.SenderTrxId {
+			t.Errorf("FinalizeTargetReady transaction = %d, want %d", readiness.AAKTransactionID, ppd.SenderTrxId)
+		}
+		if _, ok := ppd.ConnData.RemoteTransactionMap[ppd.SenderTrxId]; ok {
+			t.Error("FinalizeTargetReady did not precede success-AAK transaction publication")
+		}
+	}
 	if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrTransactionIdNotFound) {
 		t.Fatalf("first AOL error = %v, want AAK transaction miss", err)
 	}
 	target, err := store.GetTarget(context.Background(), sessionControlTargetKey{ACID: acID, PublicKey: pubkeyB64})
-	if err != nil || target.State != sessionControlTargetActive {
-		t.Fatalf("post-AAK-failure target = %#v, %v", target, err)
+	if err != nil || !target.ready() {
+		t.Fatalf("post-enqueue-failure target = %#v, %v", target, err)
 	}
 	s.acConnectionMapMutex.RLock()
 	failedConns := append([]*ACConn(nil), s.acConnectionMap[acID]...)
 	s.acConnectionMapMutex.RUnlock()
-	if len(failedConns) != 1 || failedConns[0].sessionControlAuthorityReady.Load() || s.hasLiveACConn(acID) || s.ACPeerCount() != 0 {
-		t.Fatalf("post-AAK-failure conns/ready/live/health = %d/%t/%t/%d", len(failedConns), len(failedConns) == 1 && failedConns[0].sessionControlAuthorityReady.Load(), s.hasLiveACConn(acID), s.ACPeerCount())
+	if len(failedConns) != 0 || s.hasLiveACConn(acID) || s.ACPeerCount() != 0 {
+		t.Fatalf("post-enqueue-failure conns/ready/live/health = %d/%t/%t/%d", len(failedConns), len(failedConns) == 1 && failedConns[0].sessionControlAuthorityReady.Load(), s.hasLiveACConn(acID), s.ACPeerCount())
 	}
 	counters, _ := s.metrics.CountersForTest(t)
 	if counters[MetricACRegistrationSuccess] != 0 {
@@ -978,12 +1456,17 @@ func TestHandleACOnlineAAKFailureLeavesActiveTargetForIdempotentRetry(t *testing
 
 	aakMessages := make(chan *core.MsgData, 1)
 	ppd.ConnData.RemoteTransactionMap[ppd.SenderTrxId] = core.NewRemoteTransactionForTest(ppd.SenderTrxId, aakMessages)
-	store.beforeFinalize = func(readiness sessionControlTargetReadiness) {
-		if len(aakMessages) != 1 {
-			t.Errorf("FinalizeTargetReady ran before AAK enqueue: buffered=%d", len(aakMessages))
-		}
-		if readiness.AAKTransactionID != ppd.SenderTrxId {
-			t.Errorf("FinalizeTargetReady transaction = %d, want %d", readiness.AAKTransactionID, ppd.SenderTrxId)
+	// The failed first publication removes its exact peer. Production revalidates
+	// the licensed AC on retry; this focused fixture restores that already-validated
+	// peer without pulling license storage into the ordering test.
+	s.acPeerMapMutex.Lock()
+	s.acPeerMap[pubkeyB64] = peer
+	s.acPeerMapMutex.Unlock()
+	store.beforeVerifyAttach = func(sessionControlTargetAttachment) {
+		// The exact attachment condition transaction is the authorization
+		// proof and must run before the success response is queued.
+		if len(aakMessages) != 0 {
+			t.Errorf("VerifyReadyTargetAttachment ran after AAK enqueue: buffered=%d", len(aakMessages))
 		}
 	}
 	if err := s.HandleACOnline(ppd); err != nil {
@@ -1005,8 +1488,8 @@ func TestHandleACOnlineAAKFailureLeavesActiveTargetForIdempotentRetry(t *testing
 	readyConns := append([]*ACConn(nil), s.acConnectionMap[acID]...)
 	s.acConnectionMapMutex.RUnlock()
 	if len(readyConns) != 1 || readyConns[0].sessionControlTarget.Load() == nil ||
-		*readyConns[0].sessionControlTarget.Load() != *target || store.finalizeCalls != 1 {
-		t.Fatalf("published durable readiness conns/finalize = %#v/%d", readyConns, store.finalizeCalls)
+		*readyConns[0].sessionControlTarget.Load() != *target || store.finalizeCalls != 1 || store.verifyAttachCalls != 1 {
+		t.Fatalf("published durable readiness conns/finalize/attach = %#v/%d/%d", readyConns, store.finalizeCalls, store.verifyAttachCalls)
 	}
 	if !s.hasLiveACConn(acID) || s.ACPeerCount() != 1 {
 		t.Fatalf("retry did not publish authority-ready health: live=%t count=%d", s.hasLiveACConn(acID), s.ACPeerCount())
@@ -1017,7 +1500,7 @@ func TestHandleACOnlineAAKFailureLeavesActiveTargetForIdempotentRetry(t *testing
 	}
 }
 
-func TestHandleACOnlineDirectoryAdvanceAfterAAKKeepsDurableTargetUnready(t *testing.T) {
+func TestHandleACOnlineDirectoryAdvanceBeforeAAKLeavesNoSuccessOrPublication(t *testing.T) {
 	const (
 		acID   = "ac-admission-finalize-stale"
 		bootID = "98989898989898989898989898989898"
@@ -1062,16 +1545,9 @@ func TestHandleACOnlineDirectoryAdvanceAfterAAKKeepsDurableTargetUnready(t *test
 		store.memorySessionControlStore.mu.Unlock()
 	}
 	if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrACSessionControlNotReady) {
-		t.Fatalf("HandleACOnline() = %v, want post-AAK durable readiness rejection", err)
+		t.Fatalf("HandleACOnline() = %v, want pre-AAK durable readiness rejection", err)
 	}
-	select {
-	case md := <-aakMessages:
-		if md.HeaderType != core.NHP_AAK {
-			t.Fatalf("enqueued response type = %d", md.HeaderType)
-		}
-	default:
-		t.Fatal("success AAK was not enqueued before directory race")
-	}
+	requireSessionControlNotReadyAAK(t, aakMessages)
 	target, err := store.GetTarget(context.Background(), sessionControlTargetKey{ACID: acID, PublicKey: pubkeyB64})
 	if err != nil || target.ready() {
 		t.Fatalf("post-race target = %#v, %v; want durable ACTIVE_UNREADY", target, err)
@@ -1082,28 +1558,9 @@ func TestHandleACOnlineDirectoryAdvanceAfterAAKKeepsDurableTargetUnready(t *test
 	if len(conns) != 0 || s.hasLiveACConn(acID) || s.ACPeerCount() != 0 {
 		t.Fatalf("post-race local authority conns/live/count = %#v/%t/%d", conns, s.hasLiveACConn(acID), s.ACPeerCount())
 	}
-	s.acPeerMapMutex.Lock()
-	_, peerPublished := s.acPeerMap[pubkeyB64]
-	s.acPeerMapMutex.Unlock()
-	if peerPublished {
-		t.Fatal("post-race staged peer remained published after durable finalization failed")
-	}
-	if got := s.device.LookupPeer(pubkey); got != nil {
-		t.Fatalf("post-race staged peer remained in device registry: %#v", got)
-	}
-	deadline := time.Now().Add(time.Second)
-	for !connData.IsClosed() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if !connData.IsClosed() {
-		t.Fatal("post-race exact UDP connection was not closed")
-	}
-	s.remoteConnectionMapMutex.Lock()
-	_, udpPublished := s.remoteConnectionMap[addr.String()]
-	s.remoteConnectionMapMutex.Unlock()
-	if udpPublished {
-		t.Fatal("post-race exact UDP connection remained published")
-	}
+	// Authorization failed before the staged peer/connection publication point.
+	// The pre-existing peer fixture remains untouched, but it is not AOP-eligible
+	// without an authority-ready ACConn.
 	counters, _ := s.metrics.CountersForTest(t)
 	if counters[MetricACRegistrationSuccess] != 0 {
 		t.Fatalf("success metric after failed durable finalization = %v", counters[MetricACRegistrationSuccess])
@@ -1189,73 +1646,70 @@ func TestHandleACOnlineRejectsMismatchedFinalizedAudit(t *testing.T) {
 		acID   = "ac-finalize-result-exact"
 		bootID = "acacacacacacacacacacacacacacacac"
 	)
-	pubkey := testPubkey(0x7c)
-	pubkeyB64 := testPubkeyB64(0x7c)
-	storage := NewMemoryStorage()
-	storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
-	store := newAdmissionSessionControlStore(time.Unix(1_800_002_100, 0).UTC())
-	store.mutateFinalize = func(target *sessionControlTargetAuthority) {
-		// This remains superficially ready; only the exact readiness audit binds
-		// it to the AAK just enqueued by this AOL transaction.
-		target.AAKTransactionID++
-	}
-	s := &UdpServer{
-		metrics: metrics.NewPublisherForTest(t), storage: storage,
-		storageConfig:       &StorageConfig{Backend: StorageBackendDynamoDB},
-		sessionControlStore: store, sessionControlCellID: testSessionControlCellID,
-		device:     core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil),
-		listenAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 62206}, localIp: "127.0.0.1",
-		acPeerMap: map[string]*core.UdpPeer{}, acConnectionMap: map[string][]*ACConn{},
-	}
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45003}
-	peer := &core.UdpPeer{Hostname: acID, PubKeyBase64: pubkeyB64, Type: core.NHP_AC}
-	peer.UpdateRecv(time.Now().UnixNano(), addr)
-	s.acPeerMap[pubkeyB64] = peer
-	body, err := json.Marshal(common.ACOnlineMsg{
-		ACId: acID, BootID: bootID, SessionFlushGeneration: 11, SessionFlushComplete: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	aakMessages := make(chan *core.MsgData, 1)
-	connData := &core.ConnectionData{RemoteAddr: addr, RemoteTransactionMap: map[uint64]*core.RemoteTransaction{}}
-	connData.RemoteTransactionMap[101] = core.NewRemoteTransactionForTest(101, aakMessages)
-	ppd := &core.PacketParserData{HeaderType: core.NHP_AOL, BodyMessage: body, SenderTrxId: 101,
-		LocalInitTime: time.Now().UnixNano(), RemotePubKey: pubkey, ConnData: connData}
-	if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrACSessionControlNotReady) {
-		t.Fatalf("HandleACOnline() mismatched finalized audit = %v, want not ready", err)
-	}
-	if len(aakMessages) != 1 {
-		t.Fatalf("AAK enqueue count = %d, want 1 before malformed result", len(aakMessages))
-	}
-	s.acConnectionMapMutex.RLock()
-	remaining := len(s.acConnectionMap[acID])
-	s.acConnectionMapMutex.RUnlock()
-	if remaining != 0 || s.hasLiveACConn(acID) {
-		t.Fatalf("mismatched finalized result remained published: conns=%d live=%t", remaining, s.hasLiveACConn(acID))
-	}
-
-	// A contradictory retirement audit must also fail the runtime interface
-	// boundary even when every ordinary readiness field matches exactly.
-	store.mutateFinalize = func(target *sessionControlTargetAuthority) {
-		target.RetiredAtMillis = target.UpdatedAtMillis
-	}
-	// The first malformed-finalize path deliberately removes the staged peer
-	// along with the exact published connection. Restore the pre-existing peer
-	// so this retry reaches the same durable finalize boundary instead of the
-	// unrelated first-registration license gate.
-	peer.UpdateRecv(time.Now().UnixNano(), addr)
-	s.acPeerMapMutex.Lock()
-	s.acPeerMap[pubkeyB64] = peer
-	s.acPeerMapMutex.Unlock()
-	retiredAAK := make(chan *core.MsgData, 1)
-	ppd.SenderTrxId = 103
-	connData.RemoteTransactionMap[103] = core.NewRemoteTransactionForTest(103, retiredAAK)
-	if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrACSessionControlNotReady) {
-		t.Fatalf("HandleACOnline() contradictory retired audit = %v, want not ready", err)
-	}
-	if len(retiredAAK) != 1 || s.hasLiveACConn(acID) {
-		t.Fatalf("contradictory retired audit publication: aak=%d live=%t", len(retiredAAK), s.hasLiveACConn(acID))
+	for _, tc := range []struct {
+		name   string
+		mutate func(*sessionControlTargetAuthority)
+	}{
+		{
+			name: "AAK transaction",
+			mutate: func(target *sessionControlTargetAuthority) {
+				// This remains superficially ready; only the exact readiness audit
+				// binds it to the AAK authorized for this AOL transaction.
+				target.AAKTransactionID++
+			},
+		},
+		{
+			name: "retirement audit",
+			mutate: func(target *sessionControlTargetAuthority) {
+				target.RetiredAtMillis = target.UpdatedAtMillis
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each mutation starts from a fresh authority. Reusing the store after
+			// the first rejected result leaves a durably READY target, which now
+			// correctly takes the ATTACH path and would no longer exercise the
+			// malformed FinalizeTargetReady result under test.
+			pubkey := testPubkey(0x7c)
+			pubkeyB64 := testPubkeyB64(0x7c)
+			storage := NewMemoryStorage()
+			storage.PutACAssignment(&ACAssignment{ACID: acID, Version: 1})
+			store := newAdmissionSessionControlStore(time.Unix(1_800_002_100, 0).UTC())
+			store.mutateFinalize = tc.mutate
+			s := &UdpServer{
+				metrics: metrics.NewPublisherForTest(t), storage: storage,
+				storageConfig:       &StorageConfig{Backend: StorageBackendDynamoDB},
+				sessionControlStore: store, sessionControlCellID: testSessionControlCellID,
+				device:     core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil),
+				listenAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 62206}, localIp: "127.0.0.1",
+				acPeerMap: map[string]*core.UdpPeer{}, acConnectionMap: map[string][]*ACConn{},
+			}
+			addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45003}
+			peer := &core.UdpPeer{Hostname: acID, PubKeyBase64: pubkeyB64, Type: core.NHP_AC}
+			peer.UpdateRecv(time.Now().UnixNano(), addr)
+			s.acPeerMap[pubkeyB64] = peer
+			body, err := json.Marshal(common.ACOnlineMsg{
+				ACId: acID, BootID: bootID, SessionFlushGeneration: 11, SessionFlushComplete: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			aakMessages := make(chan *core.MsgData, 1)
+			connData := &core.ConnectionData{RemoteAddr: addr, RemoteTransactionMap: map[uint64]*core.RemoteTransaction{}}
+			connData.RemoteTransactionMap[101] = core.NewRemoteTransactionForTest(101, aakMessages)
+			ppd := &core.PacketParserData{HeaderType: core.NHP_AOL, BodyMessage: body, SenderTrxId: 101,
+				LocalInitTime: time.Now().UnixNano(), RemotePubKey: pubkey, ConnData: connData}
+			if err := s.HandleACOnline(ppd); !errors.Is(err, common.ErrACSessionControlNotReady) {
+				t.Fatalf("HandleACOnline() mismatched finalized audit = %v, want not ready", err)
+			}
+			requireSessionControlNotReadyAAK(t, aakMessages)
+			s.acConnectionMapMutex.RLock()
+			remaining := len(s.acConnectionMap[acID])
+			s.acConnectionMapMutex.RUnlock()
+			if remaining != 0 || s.hasLiveACConn(acID) {
+				t.Fatalf("mismatched finalized result remained published: conns=%d live=%t", remaining, s.hasLiveACConn(acID))
+			}
+		})
 	}
 }
 
