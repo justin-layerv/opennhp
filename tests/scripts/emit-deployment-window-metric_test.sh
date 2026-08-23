@@ -186,6 +186,29 @@ assert_file_equals() {
 
 echo "Running emit-deployment-window-metric tests..."
 
+# shellcheck disable=SC2016
+run_case double-source bash -c \
+  'set -euo pipefail; source "$1"; source "$1"; declare -p DEPLOYMENT_WINDOW_METRIC_NAMESPACE; [[ "$(declare -p DEPLOYMENT_WINDOW_METRIC_NAMESPACE)" == declare\ -*r* ]]; printf "namespace-readonly\n"' \
+  bash "$SCRIPT"
+assert_rc "metric helper can be sourced twice in one strict shell" 0
+assert_contains "double source preserves the exact namespace" 'DEPLOYMENT_WINDOW_METRIC_NAMESPACE="LayerV/NHP/Deploy"'
+assert_contains "double source leaves the namespace readonly" "namespace-readonly"
+assert_file_equals "double source performs no AWS operation" "$LAST_STATE_DIR/aws-count" ""
+
+# shellcheck disable=SC2016
+run_case exact-mutable-source env DEPLOYMENT_WINDOW_METRIC_NAMESPACE=LayerV/NHP/Deploy \
+  bash -c 'set -euo pipefail; source "$1"; declare -p DEPLOYMENT_WINDOW_METRIC_NAMESPACE; [[ "$(declare -p DEPLOYMENT_WINDOW_METRIC_NAMESPACE)" == declare\ -*r* ]]; printf "namespace-readonly\n"' bash "$SCRIPT"
+assert_rc "exact caller namespace is accepted" 0
+assert_contains "exact caller namespace is sealed readonly" "namespace-readonly"
+
+# shellcheck disable=SC2016
+run_case hostile-source env DEPLOYMENT_WINDOW_METRIC_NAMESPACE=Hostile/Namespace \
+  bash -c 'set -euo pipefail; source "$1"' bash "$SCRIPT"
+assert_rc "wrong preexisting namespace fails closed" 1
+assert_contains "wrong namespace reports authority mismatch" \
+  "ERROR: DEPLOYMENT_WINDOW_METRIC_NAMESPACE has unexpected authority 'Hostile/Namespace'"
+assert_file_equals "wrong namespace fails before AWS" "$LAST_STATE_DIR/aws-count" ""
+
 run_case success bash "$SCRIPT" prod cell0 server promote
 assert_rc "single emit succeeds" 0
 assert_contains "success message includes log-only breadcrumbs" "DeploymentWindow/DeploymentWindowRun metrics pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"

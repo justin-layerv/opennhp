@@ -6,7 +6,21 @@
 # Component and strategy are log-only breadcrumbs. Do not add them as dimensions:
 # the CloudWatch alarm must remain keyed only by {Environment, Cell}.
 
-readonly DEPLOYMENT_WINDOW_METRIC_NAMESPACE="LayerV/NHP/Deploy"
+if [[ -n "${DEPLOYMENT_WINDOW_METRIC_NAMESPACE+x}" &&
+      "$DEPLOYMENT_WINDOW_METRIC_NAMESPACE" != "LayerV/NHP/Deploy" ]]; then
+  echo "ERROR: DEPLOYMENT_WINDOW_METRIC_NAMESPACE has unexpected authority '$DEPLOYMENT_WINDOW_METRIC_NAMESPACE'" >&2
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 1
+  fi
+  exit 1
+fi
+if [[ -z "${DEPLOYMENT_WINDOW_METRIC_NAMESPACE+x}" ]]; then
+  DEPLOYMENT_WINDOW_METRIC_NAMESPACE="LayerV/NHP/Deploy"
+fi
+# The refresh helper is sourced once per fleet by attended recovery. Re-marking
+# an existing exact value readonly is idempotent; assigning to an existing
+# readonly variable is not. A caller-provided exact mutable value is sealed here.
+readonly DEPLOYMENT_WINDOW_METRIC_NAMESPACE
 
 emit_deployment_window_metric() {
   local environment="${1:?Usage: emit_deployment_window_metric <environment> <cell-id> <component> <strategy>}"

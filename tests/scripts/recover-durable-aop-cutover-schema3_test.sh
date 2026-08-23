@@ -482,6 +482,24 @@ wait_for_instance_refresh() {
   return 0
 }
 EOF
+cat >"$WORK/helpers/wait-with-production-metric-source" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Production wait-for-instance-refresh.sh sources this dependency. The schema-3
+# controller then sources the wait helper once for each of cell0, cell1, and AC
+# in the same strict shell. Keep this fixture fast while preserving that exact
+# repeated-source boundary.
+source "${FAKE_METRIC_HELPER:?}"
+printf 'metric-wait-source\n' >>"$FAKE_ACTIONS"
+wait_for_instance_refresh() {
+  printf 'metric-wait-call\t%s\n' "$1" >>"$FAKE_ACTIONS"
+  if [[ -n "${FAKE_METRIC_WAIT_FAIL_ASG:-}" && "$1" == "$FAKE_METRIC_WAIT_FAIL_ASG" &&
+        -n "${FAKE_METRIC_WAIT_FAIL_ONCE:-}" && ! -e "$FAKE_METRIC_WAIT_FAIL_ONCE" ]]; then
+    : >"$FAKE_METRIC_WAIT_FAIL_ONCE"
+    return 75
+  fi
+}
+EOF
 cat >"$WORK/helpers/owner" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -559,7 +577,8 @@ invoke() {
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify \
     CUTOVER_VERIFY_LIFECYCLE_SCRIPT=$WORK/helpers/verify CUTOVER_VERIFY_TOPOLOGY_SCRIPT=$WORK/helpers/verify \
     CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
-    CUTOVER_WAIT_REFRESH_SCRIPT=$WORK/helpers/wait CUTOVER_STABILITY_SECONDS=1 \
+    FAKE_METRIC_HELPER=$ROOT/.github/scripts/emit-deployment-window-metric.sh \
+    CUTOVER_WAIT_REFRESH_SCRIPT=${FAKE_WAIT_HELPER:-$WORK/helpers/wait} CUTOVER_STABILITY_SECONDS=1 \
     CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID=${LIFECYCLE_RUN_ID:-} CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT=${LIFECYCLE_RUN_ATTEMPT:-} \
     CUTOVER_CUSTOMER_LIFECYCLE_INFRA_SHA=${LIFECYCLE_INFRA_SHA:-} CUTOVER_CUSTOMER_LIFECYCLE_INTEGRATIONS_SHA=${LIFECYCLE_INTEGRATIONS_SHA:-} \
     CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID=${CONNECTOR_RUN_ID:-} CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT=${CONNECTOR_RUN_ATTEMPT:-} \
@@ -643,6 +662,35 @@ for selector_case in partial_customer missing_connector malformed_customer malfo
   [[ ! -s "$FAKE_ACTIONS" ]]
 done
 unset LIFECYCLE_RUN_ID LIFECYCLE_RUN_ATTEMPT CONNECTOR_RUN_ID CONNECTOR_RUN_ATTEMPT
+
+# The production controller sources its wait dependency once per repaired
+# fleet. Stop after the persisted cell1 refresh, then resume in a new shell and
+# prove its cell1 + AC repeated sources reach the repaired boundary.
+seed
+export FAKE_WAIT_HELPER=$WORK/helpers/wait-with-production-metric-source
+export FAKE_METRIC_WAIT_FAIL_ASG=layerv-nhp-sandbox-cell1-server-green
+export FAKE_METRIC_WAIT_FAIL_ONCE=$WORK/metric-cell1-wait-failed
+if invoke >/dev/null 2>&1; then
+  echo "injected cell1 wait failure unexpectedly completed" >&2
+  exit 1
+fi
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(jq -r .phase <<<"$state")" == cell1_refreshing ]]
+[[ -n "$(jq -r .repair.cell0_attestation <<<"$state")" ]]
+[[ -n "$(jq -r .repair.cell1_refresh_id <<<"$state")" ]]
+[[ "$(jq -r .repair.cell1_attestation <<<"$state")" == "" ]]
+unset FAKE_METRIC_WAIT_FAIL_ASG FAKE_METRIC_WAIT_FAIL_ONCE
+output=$(invoke)
+grep -q 'reached repaired+owner_ready' <<<"$output"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(jq -r .phase <<<"$state")" == repaired ]]
+[[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
+[[ "$(grep -c '^metric-wait-source$' "$FAKE_ACTIONS")" == 4 ]]
+[[ "$(grep -c $'^metric-wait-call\t' "$FAKE_ACTIONS")" == 4 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-cell1-server-green$' "$FAKE_ACTIONS")" == 2 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-ac-green$' "$FAKE_ACTIONS")" == 1 ]]
+unset FAKE_WAIT_HELPER
 
 # Crash after the durable owner intent but before a confirmed customer write
 # retains `repaired` + owner.preparing. The retry applies that same intent and
