@@ -60,6 +60,8 @@ jobs:
       attestations: read
       contents: read
       id-token: write
+    outputs:
+      recovery_outcome: ${{ steps.recovery.outputs.recovery_outcome }}
     steps:
       - name: Reject mutable or malformed recovery dispatch
         env:
@@ -67,6 +69,10 @@ jobs:
           REPAIR_SOURCE_SHA: ${{ inputs.repair_source_sha }}
           REPAIR_BUILD_RUN_ID: ${{ inputs.repair_build_run_id }}
           REPAIR_BUILD_RUN_ATTEMPT: ${{ inputs.repair_build_run_attempt }}
+          LIFECYCLE_RUN_ID: ${{ inputs.lifecycle_run_id }}
+          LIFECYCLE_RUN_ATTEMPT: ${{ inputs.lifecycle_run_attempt }}
+          CONNECTOR_LIFECYCLE_RUN_ID: ${{ inputs.connector_lifecycle_run_id }}
+          CONNECTOR_LIFECYCLE_RUN_ATTEMPT: ${{ inputs.connector_lifecycle_run_attempt }}
           CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
@@ -74,6 +80,14 @@ jobs:
           [[ "$EXPECTED_RECOVERY_SHA" =~ ^[0-9a-f]{40}$ && "$REPAIR_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$REPAIR_BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$REPAIR_BUILD_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          if [[ -z "$LIFECYCLE_RUN_ID$LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]; then
+            : # Initial repaired+owner_ready checkpoint.
+          else
+            [[ "$LIFECYCLE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$LIFECYCLE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+            [[ "$CONNECTOR_LIFECYCLE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          fi
           [[ "$CONFIRMATION" == ADOPT_EXACT_E9_DURABLE_AOP_REPAIR ]]
 
       - name: Checkout exact recovery controller
@@ -91,10 +105,11 @@ jobs:
 
       # github.token remains private to this NHP repository. Public repository
       # authority is read through bounded anonymous HTTPS. Each private
-      # lifecycle repository gets its own least-privilege token so installation
-      # drift fails before AWS credentials or schema adoption, without coupling
-      # unrelated repository selections.
+      # lifecycle repository gets its own least-privilege token on terminal
+      # attempts. Installation drift then fails before AWS credentials without
+      # blocking the initial fleet-repair and owner-ready checkpoint.
       - name: Mint customer lifecycle reader token
+        if: inputs.lifecycle_run_id != ''
         id: customer_lifecycle_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -107,6 +122,7 @@ jobs:
           permission-contents: read
 
       - name: Verify customer lifecycle reader access
+        if: inputs.lifecycle_run_id != ''
         env:
           GH_TOKEN: ${{ steps.customer_lifecycle_token.outputs.token }}
         run: |
@@ -116,6 +132,7 @@ jobs:
           gh api 'repos/layervai/qurl-integrations-infra/contents/.github/workflows/qurl-sharing-sandbox.yml?ref=main' >/dev/null
 
       - name: Mint connector lifecycle reader token
+        if: inputs.lifecycle_run_id != ''
         id: connector_lifecycle_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -128,6 +145,7 @@ jobs:
           permission-contents: read
 
       - name: Verify connector lifecycle reader access
+        if: inputs.lifecycle_run_id != ''
         env:
           GH_TOKEN: ${{ steps.connector_lifecycle_token.outputs.token }}
         run: |
@@ -145,6 +163,7 @@ jobs:
           aws-region: us-east-2
 
       - name: Adopt and advance exact schema-3 recovery
+        id: recovery
         env:
           AWS_REGION: us-east-2
           GH_TOKEN: ${{ github.token }}

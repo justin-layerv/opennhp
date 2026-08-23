@@ -22,6 +22,11 @@ PRODUCER_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
+OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
+OWNER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
+OWNER_SUBJECT=${OWNER_CLIENT_ID}@clients
+OWNER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
+OWNER_TABLE=layerv-nhp-sandbox-control-qurl-customers
 FLOOR_PARAM=/sandbox/nhp/minimum-protocol-profile
 PROFILE=durable-aop-v1
 APPROVED_RUNTIME_MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
@@ -78,7 +83,7 @@ jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
   (.repair | type == "object" and (keys | sort) ==
     ["ac_attestation","ac_provenance","ac_refresh_id","build_run_attempt","build_run_id",
      "cell0_attestation","cell0_refresh_id","cell1_attestation","cell1_refresh_id",
-     "connector_lifecycle","customer_lifecycle","orchestrator_sha","runtime_manifest",
+     "connector_lifecycle","customer_lifecycle","orchestrator_sha","owner","runtime_manifest",
      "server_provenance","source_sha"]) and
   .repair.runtime_manifest == $manifest and
   ([.repair.orchestrator_sha,.repair.source_sha] | all(type == "string" and test("^[0-9a-f]{40}$"))) and
@@ -86,11 +91,27 @@ jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
   ([.repair.cell0_attestation,.repair.cell1_attestation,.repair.ac_attestation,
     .repair.cell0_refresh_id,.repair.cell1_refresh_id,.repair.ac_refresh_id] |
     all(type == "string" and length > 0)) and
+  (.repair.owner | type == "object" and (keys | sort) == ["intent","status"] and .status == "ready") and
+  (.repair.owner.intent | type == "object" and length == 15) and
   .repair.customer_lifecycle == "" and .repair.connector_lifecycle == ""
 ' >/dev/null <<<"$STATE" || {
   echo "deployment producer requires the exact pre-lifecycle schema-3 REPAIRED authority" >&2
   exit 1
 }
+
+OWNER_INTENT=$(jq -cS .repair.owner.intent <<<"$STATE")
+jq -e --arg client "$OWNER_CLIENT_ID" --arg subject "$OWNER_SUBJECT" --arg email "$OWNER_EMAIL" \
+  --arg table "$OWNER_TABLE" --arg region "$AWS_REGION" --arg source "$(jq -r .repair.source_sha <<<"$STATE")" '
+  .schema == "layerv.durable-aop-customer-owner-intent.v1" and
+  .client_id == $client and .subject == $subject and .email == $email and
+  .table == $table and .region == $region and .source_sha == $source and
+  (.action == "create" or .action == "promote" or .action == "replay") and
+  (.expected_row_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+' >/dev/null <<<"$OWNER_INTENT" || {
+  echo "deployment producer owner-ready authority is malformed" >&2
+  exit 1
+}
+"$OWNER_PROJECTOR" verify --intent-json "$OWNER_INTENT" >/dev/null
 
 embedded_state=$(get_param "${STATE_PARAM}:${APPROVED_ORIGINAL_STATE_VERSION}")
 embedded_state=$(jq -cS . <<<"$embedded_state")
@@ -141,7 +162,7 @@ recovery_run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RECOVERY_RUN_ID
 jq -e --arg sha "$RECOVERY_SOURCE_SHA" --argjson attempt "$RECOVERY_RUN_ATTEMPT" '
   .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and
   .run_attempt == $attempt and .status == "completed" and
-  (.conclusion == "failure" or .conclusion == "timed_out") and
+  .conclusion == "success" and
   (.path == ".github/workflows/recover-sandbox-durable-aop-schema3.yml" or
    .path == "layervai/nhp/.github/workflows/recover-sandbox-durable-aop-schema3.yml@refs/heads/main")
 ' >/dev/null <<<"$recovery_run" || {

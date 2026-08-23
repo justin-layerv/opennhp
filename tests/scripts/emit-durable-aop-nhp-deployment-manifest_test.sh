@@ -18,6 +18,7 @@ ORIGINAL_OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 ORIGINAL_LOCK_DIGEST=6c7224d78837a4d56547409439d9bce30efa9b214367c4f19fd13cc3fe3b2ebd
 export REPAIR RECOVERY SERVER_DIGEST AC_DIGEST
+export FAKE_OWNER_ACTIONS=$WORK/owner-actions
 
 set_param() {
   local name=$1 value=$2
@@ -57,7 +58,7 @@ cat >"$WORK/bin/gh" <<'EOF'
 set -euo pipefail
 args="$*"
 if [[ "$args" == *'/actions/runs/700/attempts/2'* ]]; then
-  conclusion=failure; [[ "${FAKE_RECOVERY_SUCCESS:-}" != true ]] || conclusion=success
+  conclusion=${FAKE_RECOVERY_CONCLUSION:-success}
   jq -cn --arg sha "$RECOVERY" --arg conclusion "$conclusion" \
     '{head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,status:"completed",conclusion:$conclusion,path:".github/workflows/recover-sandbox-durable-aop-schema3.yml"}'
 elif [[ "$args" == *'/actions/runs/800/attempts/3/jobs'* ]]; then
@@ -95,6 +96,26 @@ if [[ "$1" == layerv/nhp-server ]]; then digest=$SERVER_DIGEST; else digest=$AC_
 printf 'v1|%s|%s|%s\n' "$2" "$1" "$digest"
 EOF
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$WORK/helpers/verify-asg"
+cat >"$WORK/helpers/owner" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${FAKE_OWNER_VERIFY_FAIL:-}" != true ]] || exit 1
+[[ "$1" == verify && "$2" == --intent-json ]]
+intent=$3
+jq -e --arg repair "$REPAIR" '
+  (keys | sort) == ["action","before_row_sha256","client_id","email","expected_assigned_cell_id",
+    "expected_created_at","expected_row_sha256","expected_updated_at","expected_usage","provisioned_at",
+    "region","schema","source_sha","subject","table"] and
+  .schema == "layerv.durable-aop-customer-owner-intent.v1" and
+  .client_id == "oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy" and
+  .subject == "oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy@clients" and
+  .email == "oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz" and
+  .table == "layerv-nhp-sandbox-control-qurl-customers" and .region == "us-east-2" and
+  .source_sha == $repair and .expected_row_sha256 == ("d" * 64)
+' >/dev/null <<<"$intent"
+printf 'verify\n' >>"$FAKE_OWNER_ACTIONS"
+jq -r .expected_row_sha256 <<<"$intent"
+EOF
 chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
 seed() {
@@ -122,7 +143,15 @@ seed() {
       cell1_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-server|"+($server|split("|")[-1])+"|layerv-nhp-sandbox-cell1-server-green"),
       ac_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-ac|"+($ac|split("|")[-1])+"|layerv-nhp-sandbox-ac-green"),
       cell0_refresh_id:"refresh-cell0",cell1_refresh_id:"refresh-cell1",ac_refresh_id:"refresh-ac",
-      customer_lifecycle:"",connector_lifecycle:""}}')
+      customer_lifecycle:"",connector_lifecycle:"",
+      owner:{status:"ready",intent:{schema:"layerv.durable-aop-customer-owner-intent.v1",
+        action:"create",before_row_sha256:"absent",client_id:"oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy",
+        subject:"oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy@clients",
+        email:"oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz",
+        table:"layerv-nhp-sandbox-control-qurl-customers",region:"us-east-2",source_sha:$repair,
+        provisioned_at:"2026-08-23T21:00:00Z",expected_created_at:"2026-08-23T21:00:00Z",
+        expected_updated_at:"2026-08-23T21:00:00Z",expected_usage:"0",expected_assigned_cell_id:"",
+        expected_row_sha256:("d"*64)}}}}')
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock "$lock"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state:7 "$original_state"
@@ -148,11 +177,14 @@ invoke() {
     GITHUB_SHA=$RECOVERY GITHUB_RUN_ID=900 GITHUB_RUN_ATTEMPT=4 \
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance \
     CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify-asg \
+    CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
     "$SCRIPT" 700 2 "$WORK/durable-aop-nhp-deployment.json"
 }
 
 seed
+: >"$FAKE_OWNER_ACTIONS"
 invoke >/dev/null
+[[ "$(cat "$FAKE_OWNER_ACTIONS")" == verify ]]
 jq -e --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
   (keys | sort) == ["build","deployments","environment","images","producer","profile","recovery_orchestrator_sha","repair_source_sha","repository","schema"] and
   .schema == "layerv.durable-aop-nhp-deployment.v1" and .repair_source_sha == $repair and
@@ -166,14 +198,20 @@ jq -e --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg server "$SERVER_DI
 ' >/dev/null "$WORK/durable-aop-nhp-deployment.json"
 [[ $(wc -c <"$WORK/durable-aop-nhp-deployment.json") -le 65536 ]]
 
-for mode in recovery_success build_drift refresh_failed asg_unhealthy equal_digest floor_present slot_drift \
+for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift refresh_failed asg_unhealthy \
+  equal_digest floor_present slot_drift owner_missing owner_preparing owner_client_drift owner_source_drift \
+  owner_digest_drift owner_live_verify_failed \
   state_validated historical_state_mutated embedded_lock_mutated ledger_state_digest_mutated \
   ledger_lock_digest_mutated; do
   seed
-  unset FAKE_RECOVERY_SUCCESS FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY
+  : >"$FAKE_OWNER_ACTIONS"
+  unset FAKE_RECOVERY_CONCLUSION FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY \
+    FAKE_OWNER_VERIFY_FAIL
   export AC_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
   case "$mode" in
-    recovery_success) export FAKE_RECOVERY_SUCCESS=true ;;
+    recovery_failure) export FAKE_RECOVERY_CONCLUSION=failure ;;
+    recovery_timed_out) export FAKE_RECOVERY_CONCLUSION=timed_out ;;
+    recovery_cancelled) export FAKE_RECOVERY_CONCLUSION=cancelled ;;
     build_drift) export FAKE_BUILD_DRIFT=true ;;
     refresh_failed) export FAKE_REFRESH_FAILED=true ;;
     asg_unhealthy) export FAKE_ASG_UNHEALTHY=true ;;
@@ -183,6 +221,29 @@ for mode in recovery_success build_drift refresh_failed asg_unhealthy equal_dige
     state_validated)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
       set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.phase="validated"' <<<"$value")"
+      ;;
+    owner_missing)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c 'del(.repair.owner)' <<<"$value")"
+      ;;
+    owner_preparing)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.repair.owner.status="preparing"' <<<"$value")"
+      ;;
+    owner_client_drift)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.repair.owner.intent.client_id="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' <<<"$value")"
+      ;;
+    owner_source_drift)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.repair.owner.intent.source_sha=("9"*40)' <<<"$value")"
+      ;;
+    owner_digest_drift)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.repair.owner.intent.expected_row_sha256=("9"*64)' <<<"$value")"
+      ;;
+    owner_live_verify_failed)
+      export FAKE_OWNER_VERIFY_FAIL=true
       ;;
     historical_state_mutated)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state:7" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")

@@ -56,6 +56,16 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertLess(customer_check, connector_mint)
         self.assertLess(connector_mint, connector_check)
         self.assertLess(connector_check, aws)
+        conditional_token_steps = re.findall(
+            r"(?m)^      - name: (?:Mint|Verify) (?:customer|connector) lifecycle reader (?:token|access)\n"
+            r"        if: inputs\.lifecycle_run_id != ''$",
+            text,
+        )
+        self.assertEqual(len(conditional_token_steps), 4)
+        aws_step = text[text.index("- name: Configure AWS credentials"):text.index("- name: Adopt and advance exact schema-3 recovery")]
+        recovery_step = text[text.index("- name: Adopt and advance exact schema-3 recovery"):]
+        self.assertNotIn("if: inputs.lifecycle_run_id", aws_step)
+        self.assertNotIn("if: inputs.lifecycle_run_id", recovery_step)
 
     def test_workflow_is_attended_exact_source_and_non_cancelable(self):
         text = WORKFLOW.read_text()
@@ -125,12 +135,21 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertIn("APPROVED_REPAIR_SOURCE_SHA=422b1d9acac53d50fe5602158fb02c8120ef108d", SCRIPT.read_text())
         self.assertNotIn("CUTOVER_VERIFY_CUSTOMER_LIFECYCLE_SCRIPT", text)
         self.assertNotIn("CUTOVER_VERIFY_CONNECTOR_LIFECYCLE_SCRIPT", text)
+        self.assertIn("recovery_outcome: ${{ steps.recovery.outputs.recovery_outcome }}", text)
+        reject = text[text.index("- name: Reject mutable or malformed recovery dispatch"):text.index("- name: Checkout exact recovery controller")]
+        self.assertIn('if [[ -z "$LIFECYCLE_RUN_ID$LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]', reject)
+        self.assertEqual(reject.count('=~ ^[1-9][0-9]*$'), 6)
 
     def test_script_orders_servers_before_ac_and_terminal_receipts_before_floor(self):
         text = SCRIPT.read_text()
         cell0 = text.index('write_state cell0_refreshed')
         cell1 = text.index('write_state cell1_refreshed')
         ac = text.index('write_state repaired')
+        owner_plan = text.index('OWNER_INTENT=$("$OWNER_PROJECTOR" plan')
+        owner_preparing = text.index('write_state repaired', owner_plan)
+        owner_apply = text.index('"$OWNER_PROJECTOR" apply --intent-json "$OWNER_INTENT"')
+        owner_ready = text.index('write_state repaired', owner_apply)
+        deferred = text.index('emit_recovery_outcome repaired_owner_ready_waiting_for_lifecycle')
         ready = text.index("schema3-ac-ready")
         lifecycle = text.index('candidate_lifecycle=$(CUTOVER_EXPECTED_REPAIR_SOURCE_SHA=')
         connector = text.index('candidate_connector_lifecycle=$(GH_TOKEN=$CUTOVER_CONNECTOR_GH_TOKEN')
@@ -138,18 +157,50 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         release = text.index('ssm-live-env-lock.sh" release')
         self.assertLess(cell0, cell1)
         self.assertLess(cell1, ac)
+        self.assertLess(ac, owner_plan)
+        self.assertLess(owner_plan, owner_preparing)
+        self.assertLess(owner_preparing, owner_apply)
+        self.assertLess(owner_apply, owner_ready)
+        self.assertLess(owner_ready, deferred)
         self.assertLess(ac, ready)
         self.assertLess(ready, lifecycle)
         self.assertLess(lifecycle, connector)
         self.assertLess(connector, floor)
         self.assertLess(lifecycle, floor)
         self.assertLess(floor, release)
+        current_verifies = [match.start() for match in re.finditer(
+            '"\\$OWNER_PROJECTOR" verify-current --intent-json "\\$OWNER_INTENT"', text
+        )]
+        self.assertEqual(len(current_verifies), 3)
+        self.assertLess(current_verifies[-2], floor)
+        self.assertLess(floor, current_verifies[-1])
+        self.assertLess(current_verifies[-1], text.rindex('write_state complete'))
         self.assertIn('--no-overwrite --region "$AWS_REGION"', text)
         self.assertNotIn('put_param "$FLOOR_PARAM"', text)
         self.assertIn("CUTOVER_EXPECTED_RECOVERY_ORCHESTRATOR_SHA", text)
         self.assertIn("CUTOVER_EXPECTED_REPAIR_BUILD_RUN_ATTEMPT", text)
         self.assertIn("CUTOVER_EXPECTED_AC_DIGEST", text)
         self.assertIn("sessionAdmissionReady", (ROOT / "endpoints/ac/httpac.go").read_text())
+
+    def test_owner_projection_is_fixed_and_deferred_success_retains_authority(self):
+        text = SCRIPT.read_text()
+        for authority in (
+            "oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy",
+            "oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz",
+            "layerv-nhp-sandbox-control-qurl-customers",
+            "layerv.durable-aop-customer-owner-intent.v1",
+        ):
+            self.assertIn(authority, text)
+        self.assertIn("OWNER_STATUS=preparing", text)
+        self.assertIn("OWNER_STATUS=ready", text)
+        deferred_start = text.index('if [[ "$LIFECYCLE_MODE" == deferred ]]')
+        deferred_end = text.index("\nrequire_hard_lock\nrefresh_active_component", deferred_start)
+        deferred = text[deferred_start:deferred_end]
+        self.assertIn("require_hard_lock", deferred)
+        self.assertIn("repaired_owner_ready_waiting_for_lifecycle", deferred)
+        self.assertIn("exit 0", deferred)
+        self.assertNotIn("ensure_exact_floor", deferred)
+        self.assertNotIn("ssm-live-env-lock.sh", deferred)
 
     def test_build_authority_is_exact_force_build_no_deploy(self):
         workflow = BUILD_WORKFLOW.read_text()

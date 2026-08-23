@@ -275,8 +275,56 @@ elif [[ "$args" == *'repos/layervai/qurl-go/'* || "$args" == *'repos/layervai/qu
 else
   [[ "${GH_TOKEN:-}" == x ]] || { echo "NHP API used a private lifecycle token" >&2; exit 98; }
 fi
-if [[ "$args" == *'/actions/runs/32635672597' ]]; then
-  jq -cn --arg sha "$FAKE_ORIGINAL" '{head_sha:$sha,head_branch:"main",event:"push",status:"completed",conclusion:"failure",path:".github/workflows/build-and-push.yml"}'
+if [[ "$args" == *'/actions/runs/32635672597/attempts/1/jobs?per_page=100'* ]]; then
+  [[ "${FAKE_ORIGINAL_JOBS_MUTATION:-}" != unavailable ]] || exit 97
+  jq -cn --arg sha "$FAKE_ORIGINAL" --arg mutation "${FAKE_ORIGINAL_JOBS_MUTATION:-}" '
+    def job($id;$name;$conclusion):
+      {id:$id,name:$name,run_id:32635672597,run_attempt:1,workflow_name:"Build and Deploy NHP",
+       head_sha:$sha,head_branch:"main",status:"completed",conclusion:$conclusion};
+    ([range(0;26) | job(97000000000+.;("Historical job "+(.|tostring));"success")] +
+     [job(97187875176;"Deploy Sandbox cell1 - Blue/Green";"failure"),
+      job(97191982507;"Deploy Sandbox - Validate";"cancelled")]) as $base |
+    ($base |
+      if $mutation == "cell1_missing" then .[26].name="Other cell1 job"
+      elif $mutation == "cell1_duplicate" then .[0]=.[26]
+      elif $mutation == "cell1_id_duplicate" then .[0].id=.[26].id
+      elif $mutation == "cell1_id" then .[26].id=97187875177
+      elif $mutation == "cell1_status" then .[26].status="in_progress"
+      elif $mutation == "cell1_conclusion" then .[26].conclusion="cancelled"
+      elif $mutation == "cell1_source" then .[26].head_sha="9999999999999999999999999999999999999999"
+      elif $mutation == "cell1_run" then .[26].run_id=32635672598
+      elif $mutation == "cell1_attempt" then .[26].run_attempt=2
+      elif $mutation == "cell1_workflow" then .[26].workflow_name="Other workflow"
+      elif $mutation == "validation_missing" then .[27].name="Other validation job"
+      elif $mutation == "validation_duplicate" then .[0]=.[27]
+      elif $mutation == "validation_id_duplicate" then .[0].id=.[27].id
+      elif $mutation == "validation_id" then .[27].id=97191982508
+      elif $mutation == "validation_status" then .[27].status="in_progress"
+      elif $mutation == "validation_conclusion" then .[27].conclusion="skipped"
+      elif $mutation == "validation_source" then .[27].head_sha="9999999999999999999999999999999999999999"
+      elif $mutation == "validation_run" then .[27].run_id=32635672598
+      elif $mutation == "validation_attempt" then .[27].run_attempt=2
+      elif $mutation == "validation_workflow" then .[27].workflow_name="Other workflow"
+      elif $mutation == "short_page" then .[0:27]
+      else . end) as $jobs |
+    {total_count:(if $mutation == "wrong_count" then 29 else 28 end),jobs:$jobs}'
+elif [[ "$args" == *'/actions/runs/32635672597' ]]; then
+  jq -cn --arg sha "$FAKE_ORIGINAL" --arg conclusion "${FAKE_ORIGINAL_CONCLUSION:-cancelled}" \
+    --arg mutation "${FAKE_ORIGINAL_RUN_MUTATION:-}" '
+    {id:32635672597,run_attempt:1,repository:{full_name:"layervai/nhp"},head_repository:{full_name:"layervai/nhp"},
+     head_sha:$sha,head_branch:"main",event:"push",status:"completed",conclusion:$conclusion,path:".github/workflows/build-and-push.yml"} |
+    if $mutation == "id" then .id=32635672598
+    elif $mutation == "attempt" then .run_attempt=2
+    elif $mutation == "repository" then .repository.full_name="other/nhp"
+    elif $mutation == "head_repository" then .head_repository.full_name="other/nhp"
+    elif $mutation == "source" then .head_sha="9999999999999999999999999999999999999999"
+    elif $mutation == "branch" then .head_branch="feature"
+    elif $mutation == "event" then .event="workflow_dispatch"
+    elif $mutation == "status" then .status="in_progress"
+    elif $mutation == "path" then .path=".github/workflows/other.yml"
+    elif $mutation == "conclusion" then .conclusion="success"
+    elif $mutation == "unrelated_cancelled" then .id=32635679999 | .head_sha="8888888888888888888888888888888888888888"
+    else . end'
 elif [[ "$args" == *'/actions/runs/900/attempts/2/jobs'* ]]; then
   steps='["Verify exact qurl-integrations source","Verify qurl-connector module selection","Verify qurl-integrations binary attestation","Verify exact repaired NHP deployment authority","Verify exact lifecycle integration-test authorities","Acquire customer Auth0 JWT through public API","Create ordinary customer API key","Run host customer-lifecycle smoke","Run host sibling-continuity journey","Run host CRID lifecycle journey","Run hardened customer-lifecycle smoke","Run hardened sibling-continuity journey","Revoke ordinary customer API key","Verify revoked key rejection after cache horizon","Build immutable durable AOP lifecycle receipt","Upload immutable durable AOP lifecycle receipt"]'
   jq -cn --argjson steps "$steps" '[{jobs:[{name:"Protected qURL sharing sandbox lifecycle",conclusion:"success",steps:[$steps[]|{name:.,conclusion:"success"}]}]}]'
@@ -434,6 +482,46 @@ wait_for_instance_refresh() {
   return 0
 }
 EOF
+cat >"$WORK/helpers/owner" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+digest=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+case "$1" in
+  plan)
+    printf 'owner-plan\n' >>"$FAKE_ACTIONS"
+    shift
+    source= client= table= region= timestamp=
+    while (( $# )); do
+      case "$1" in
+        --source-sha) source=$2; shift 2 ;;
+        --client-id) client=$2; shift 2 ;;
+        --table) table=$2; shift 2 ;;
+        --region) region=$2; shift 2 ;;
+        --provisioned-at) timestamp=$2; shift 2 ;;
+        *) exit 98 ;;
+      esac
+    done
+    jq -cn --arg client "$client" --arg subject "${client}@clients" \
+      --arg email "${client,,}-clients@machine.notify.layerv.xyz" --arg table "$table" \
+      --arg region "$region" --arg source "$source" --arg timestamp "$timestamp" --arg digest "$digest" \
+      '{schema:"layerv.durable-aop-customer-owner-intent.v1",action:"create",before_row_sha256:"absent",
+        client_id:$client,subject:$subject,email:$email,table:$table,region:$region,source_sha:$source,
+        provisioned_at:$timestamp,expected_row_sha256:$digest,expected_created_at:$timestamp,
+        expected_updated_at:$timestamp,expected_usage:"0",expected_assigned_cell_id:""}'
+    ;;
+  apply|verify|verify-current)
+    mode=$1; shift
+    printf 'owner-%s\n' "$mode" >>"$FAKE_ACTIONS"
+    [[ "$1" == --intent-json && -n "$2" ]]
+    if [[ "$mode" == apply && -n "${FAKE_OWNER_APPLY_FAIL_ONCE:-}" && ! -e "$FAKE_OWNER_APPLY_FAIL_ONCE" ]]; then
+      : >"$FAKE_OWNER_APPLY_FAIL_ONCE"
+      exit 75
+    fi
+    printf '%s\n' "$digest"
+    ;;
+  *) exit 98 ;;
+esac
+EOF
 chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
 seed() {
@@ -470,6 +558,7 @@ invoke() {
     CUTOVER_RECOVERY_ORCHESTRATOR_SHA=$RECOVERY \
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify \
     CUTOVER_VERIFY_LIFECYCLE_SCRIPT=$WORK/helpers/verify CUTOVER_VERIFY_TOPOLOGY_SCRIPT=$WORK/helpers/verify \
+    CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
     CUTOVER_WAIT_REFRESH_SCRIPT=$WORK/helpers/wait CUTOVER_STABILITY_SECONDS=1 \
     CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID=${LIFECYCLE_RUN_ID:-} CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT=${LIFECYCLE_RUN_ATTEMPT:-} \
     CUTOVER_CUSTOMER_LIFECYCLE_INFRA_SHA=${LIFECYCLE_INFRA_SHA:-} CUTOVER_CUSTOMER_LIFECYCLE_INTEGRATIONS_SHA=${LIFECYCLE_INTEGRATIONS_SHA:-} \
@@ -479,6 +568,99 @@ invoke() {
     CUTOVER_CONNECTOR_NHP_CONTROLLER_RUN_ATTEMPT=${CONNECTOR_CONTROLLER_RUN_ATTEMPT:-} \
     "$SCRIPT" "$REPAIR" 88 2 ADOPT_EXACT_E9_DURABLE_AOP_REPAIR
 }
+
+# The exact production incident ended as cancelled because one immutable cell1
+# deploy job failed and the downstream validation job was cancelled. Every
+# missing, ambiguous, or mutated field in that two-job authority fails before
+# the controller reads or writes AWS state.
+for mutation in id attempt repository head_repository source branch event status path conclusion unrelated_cancelled; do
+  seed
+  export FAKE_ORIGINAL_RUN_MUTATION=$mutation
+  if invoke >/dev/null 2>&1; then
+    echo "cancelled original run accepted mutated run authority: $mutation" >&2
+    exit 1
+  fi
+  if [[ -s "$FAKE_ACTIONS" ]]; then
+    echo "cancelled original run envelope mutation reached AWS: $mutation" >&2
+    exit 1
+  fi
+  unset FAKE_ORIGINAL_RUN_MUTATION
+done
+
+for mutation in \
+  cell1_missing cell1_duplicate cell1_id_duplicate cell1_id cell1_status cell1_conclusion cell1_source \
+  cell1_run cell1_attempt cell1_workflow validation_missing validation_duplicate \
+  validation_id_duplicate validation_id validation_status validation_conclusion validation_source validation_run \
+  validation_attempt validation_workflow short_page wrong_count unavailable; do
+  seed
+  export FAKE_ORIGINAL_JOBS_MUTATION=$mutation
+  if invoke >/dev/null 2>&1; then
+    echo "cancelled original run accepted mutated jobs authority: $mutation" >&2
+    exit 1
+  fi
+  if [[ -s "$FAKE_ACTIONS" ]]; then
+    echo "cancelled original run mutation reached AWS: $mutation" >&2
+    exit 1
+  fi
+  unset FAKE_ORIGINAL_JOBS_MUTATION
+done
+
+# The pre-existing exact failure and timeout classifications do not depend on
+# the cancelled-run jobs exception. Make that page unavailable and prove both
+# paths advance to the separate build-only authority check.
+for conclusion in failure timed_out; do
+  seed
+  export FAKE_ORIGINAL_CONCLUSION=$conclusion FAKE_ORIGINAL_JOBS_MUTATION=unavailable FAKE_BUILD_FAILURE=true
+  output=$(invoke 2>&1 || true)
+  grep -q 'repair build is not the exact successful attended main workflow attempt' <<<"$output" || {
+    echo "exact $conclusion original run did not retain its existing classification" >&2
+    exit 1
+  }
+  [[ ! -s "$FAKE_ACTIONS" ]]
+  unset FAKE_ORIGINAL_CONCLUSION FAKE_ORIGINAL_JOBS_MUTATION FAKE_BUILD_FAILURE
+done
+
+# Lifecycle selectors are classified before any GitHub or AWS read. All four
+# may be omitted for the repaired+owner_ready checkpoint; otherwise each pair
+# must be complete and every value must be a positive integer.
+for selector_case in partial_customer missing_connector malformed_customer malformed_connector zero_attempt; do
+  seed
+  unset LIFECYCLE_RUN_ID LIFECYCLE_RUN_ATTEMPT CONNECTOR_RUN_ID CONNECTOR_RUN_ATTEMPT
+  case "$selector_case" in
+    partial_customer) export LIFECYCLE_RUN_ID=900 ;;
+    missing_connector) export LIFECYCLE_RUN_ID=900 LIFECYCLE_RUN_ATTEMPT=2 ;;
+    malformed_customer)
+      export LIFECYCLE_RUN_ID=nope LIFECYCLE_RUN_ATTEMPT=2 CONNECTOR_RUN_ID=901 CONNECTOR_RUN_ATTEMPT=2 ;;
+    malformed_connector)
+      export LIFECYCLE_RUN_ID=900 LIFECYCLE_RUN_ATTEMPT=2 CONNECTOR_RUN_ID=x CONNECTOR_RUN_ATTEMPT=2 ;;
+    zero_attempt)
+      export LIFECYCLE_RUN_ID=900 LIFECYCLE_RUN_ATTEMPT=0 CONNECTOR_RUN_ID=901 CONNECTOR_RUN_ATTEMPT=2 ;;
+  esac
+  if invoke >/dev/null 2>&1; then
+    echo "malformed lifecycle selector tuple was accepted: $selector_case" >&2
+    exit 1
+  fi
+  [[ ! -s "$FAKE_ACTIONS" ]]
+done
+unset LIFECYCLE_RUN_ID LIFECYCLE_RUN_ATTEMPT CONNECTOR_RUN_ID CONNECTOR_RUN_ATTEMPT
+
+# Crash after the durable owner intent but before a confirmed customer write
+# retains `repaired` + owner.preparing. The retry applies that same intent and
+# cannot choose a new final digest or timestamp.
+seed
+export FAKE_OWNER_APPLY_FAIL_ONCE=$WORK/owner-apply-failed
+if invoke >/dev/null 2>&1; then echo "injected owner apply crash unexpectedly completed" >&2; exit 1; fi
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(jq -r .phase <<<"$state")" == repaired && "$(jq -r .repair.owner.status <<<"$state")" == preparing ]]
+intent_before=$(jq -cS .repair.owner.intent <<<"$state")
+grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
+if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
+unset FAKE_OWNER_APPLY_FAIL_ONCE
+invoke >/dev/null
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
+[[ "$(jq -cS .repair.owner.intent <<<"$state")" == "$intent_before" ]]
+[[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == 1 ]]
 
 seed
 # A crash/error after the schema-3 phase write and active image update retains
@@ -490,11 +672,17 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 [[ "$(jq -r .phase <<<"$state")" == cell0_refreshing ]]
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 unset FAKE_WAIT_FAIL_ONCE
-# First attempt performs all three forward refreshes but cannot invent a
-# customer lifecycle receipt.  The exact hard lock and schema-3 evidence remain.
-if invoke >/dev/null 2>&1; then echo "initial recovery completed without protected lifecycle receipts" >&2; exit 1; fi
+# The no-selector attempt performs all three forward refreshes, persists and
+# converges the exact owner intent, then returns deliberate partial success.
+# It cannot invent lifecycle receipts or release the hard lock.
+output=$(invoke)
+grep -q 'reached repaired+owner_ready' <<<"$output"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 [[ "$(jq -r .schema <<<"$state")" == 3 && "$(jq -r .phase <<<"$state")" == repaired ]]
+[[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
+[[ "$(jq -r .repair.owner.intent.client_id <<<"$state")" == oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy ]]
+[[ "$(jq -r .repair.owner.intent.subject <<<"$state")" == oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy@clients ]]
+[[ "$(jq -r .repair.owner.intent.source_sha <<<"$state")" == "$REPAIR" ]]
 [[ "$(jq -r .original.state_version <<<"$state")" == 7 ]]
 [[ "$(jq -r .original.state_sha256 <<<"$state")" == "$ORIGINAL_STATE_DIGEST" ]]
 [[ "$(jq -r .original.lock_version <<<"$state")" == 2 ]]
@@ -507,6 +695,46 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 [[ "$(awk -F '\t' '$1=="/sandbox/nhp/ac/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$REPAIR" ]]
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
+
+# Exact no-selector replay is successful and performs no additional fleet
+# refresh after the repaired+owner_ready boundary.
+refresh_count=$(grep -c $'^refresh\t' "$FAKE_ACTIONS")
+output=$(invoke)
+grep -q 'reached repaired+owner_ready' <<<"$output"
+[[ "$(grep -c $'^refresh\t' "$FAKE_ACTIONS")" == "$refresh_count" ]]
+
+# The repaired owner authority is closed and source-bound. A self-consistent
+# state edit cannot substitute another client/source/final digest.
+cp "$FAKE_PARAMS" "$WORK/params.owner-ready"
+for mutation in client source digest; do
+  cp "$WORK/params.owner-ready" "$FAKE_PARAMS"
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  case "$mutation" in
+    client) mutated=$(jq -c '.repair.owner.intent.client_id="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' <<<"$state") ;;
+    source) mutated=$(jq -c '.repair.owner.intent.source_sha="9999999999999999999999999999999999999999"' <<<"$state") ;;
+    digest) mutated=$(jq -c '.repair.owner.intent.expected_row_sha256="9999999999999999999999999999999999999999999999999999999999999999"' <<<"$state") ;;
+  esac
+  awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
+    "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+  if invoke >/dev/null 2>&1; then echo "mutated owner authority was accepted: $mutation" >&2; exit 1; fi
+done
+cp "$WORK/params.owner-ready" "$FAKE_PARAMS"
+
+# READY -> PREPARING with the same precommitted intent is the valid
+# crash-after-DynamoDB-commit/before-ready-ledger window. It must classify the
+# exact row, restore READY, and never plan a new timestamp or digest.
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+intent_before=$(jq -cS .repair.owner.intent <<<"$state")
+plan_count=$(grep -c '^owner-plan$' "$FAKE_ACTIONS")
+mutated=$(jq -c '.repair.owner.status="preparing"' <<<"$state")
+awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
+  "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+output=$(invoke)
+grep -q 'reached repaired+owner_ready' <<<"$output"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
+[[ "$(jq -cS .repair.owner.intent <<<"$state")" == "$intent_before" ]]
+[[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == "$plan_count" ]]
 
 # A self-consistent-looking phase jump cannot skip the three durable refresh
 # ids/attestations or the two protected receipts.

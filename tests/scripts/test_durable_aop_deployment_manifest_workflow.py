@@ -34,6 +34,12 @@ class DurableAOPDeploymentManifestWorkflowTest(unittest.TestCase):
         self.assertIn("ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}", text)
         self.assertIn("ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}", text)
         self.assertRegex(text, r"ARTIFACT_DIGEST.*sha256:\[0-9a-f\]\{64\}")
+        emitter = (ROOT / ".github/scripts/emit-durable-aop-nhp-deployment-manifest.sh").read_text()
+        self.assertIn('OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-', emitter)
+        self.assertIn('.repair.owner | type == "object"', emitter)
+        self.assertIn('"$OWNER_PROJECTOR" verify --intent-json "$OWNER_INTENT"', emitter)
+        self.assertIn('.run_attempt == $attempt and .status == "completed" and', emitter)
+        self.assertIn('.conclusion == "success" and', emitter)
 
 
 if __name__ == "__main__":

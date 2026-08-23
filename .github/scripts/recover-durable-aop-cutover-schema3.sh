@@ -20,6 +20,10 @@ REPAIR_BUILD_RUN_ATTEMPT=$3
 CONFIRMATION=$4
 ORIGINAL_SOURCE_SHA=${CUTOVER_ORIGINAL_SOURCE_SHA:-e9b11398a4cea98da6ae5b41cfe635562e1b7c72}
 ORIGINAL_RUN_ID=${CUTOVER_ORIGINAL_RUN_ID:-32635672597}
+ORIGINAL_RUN_ATTEMPT=1
+ORIGINAL_CANCELLED_JOB_COUNT=28
+ORIGINAL_CELL1_FAILURE_JOB_ID=97187875176
+ORIGINAL_VALIDATION_CANCELLED_JOB_ID=97191982507
 RECOVERY_ORCHESTRATOR_SHA=${CUTOVER_RECOVERY_ORCHESTRATOR_SHA:-${GITHUB_SHA:-}}
 # Exact admin-squash-merged #3935 authority. The fixed-path manifest is
 # recomputed from this Git tree and independently rechecked through GitHub's
@@ -29,6 +33,10 @@ APPROVED_REPAIR_RUNTIME_MANIFEST=2895963905453d61874858171529968efe8e18e5450d418
 APPROVED_CUSTOMER_INFRA_SHA=d30d3fce3a6c3cf15e1340a5106b6cc76bce7e82
 APPROVED_INTEGRATIONS_SHA=356ecd44bbf09fca392247d971bbc093b337d4e5
 APPROVED_CONNECTOR_PR_HEAD_SHA=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
+APPROVED_CUSTOMER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
+APPROVED_CUSTOMER_SUBJECT=${APPROVED_CUSTOMER_CLIENT_ID}@clients
+APPROVED_CUSTOMER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
+APPROVED_CUSTOMER_TABLE=layerv-nhp-sandbox-control-qurl-customers
 GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-layervai/nhp}
 AWS_REGION=${AWS_REGION:-us-east-2}
 export AWS_REGION GITHUB_REPOSITORY
@@ -43,6 +51,22 @@ export AWS_REGION GITHUB_REPOSITORY
 [[ "$RECOVERY_ORCHESTRATOR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "recovery orchestrator SHA must be exact lowercase 40-hex" >&2; exit 2; }
 [[ "$CONFIRMATION" == ADOPT_EXACT_E9_DURABLE_AOP_REPAIR ]] || { echo "recovery confirmation is not exact" >&2; exit 2; }
 : "${GH_TOKEN:?GH_TOKEN is required}"
+
+CUSTOMER_LIFECYCLE_RUN_ID=${CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID:-}
+CUSTOMER_LIFECYCLE_RUN_ATTEMPT=${CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT:-}
+CONNECTOR_LIFECYCLE_RUN_ID=${CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID:-}
+CONNECTOR_LIFECYCLE_RUN_ATTEMPT=${CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT:-}
+if [[ -z "$CUSTOMER_LIFECYCLE_RUN_ID$CUSTOMER_LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]; then
+  LIFECYCLE_MODE=deferred
+elif [[ "$CUSTOMER_LIFECYCLE_RUN_ID" =~ ^[1-9][0-9]*$ &&
+        "$CUSTOMER_LIFECYCLE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ &&
+        "$CONNECTOR_LIFECYCLE_RUN_ID" =~ ^[1-9][0-9]*$ &&
+        "$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+  LIFECYCLE_MODE=terminal
+else
+  echo "customer and connector lifecycle selectors must be four positive integers or all omitted" >&2
+  exit 2
+fi
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
@@ -64,9 +88,17 @@ VERIFY_LIFECYCLE=${CUTOVER_VERIFY_LIFECYCLE_SCRIPT:-$ROOT/.github/scripts/verify
 VERIFY_TOPOLOGY=${CUTOVER_VERIFY_TOPOLOGY_SCRIPT:-$ROOT/.github/scripts/verify-durable-aop-cutover-recovery-ready.sh}
 VERIFY_CUSTOMER_LIFECYCLE=$ROOT/.github/scripts/verify-durable-aop-customer-lifecycle-run.sh
 VERIFY_CONNECTOR_LIFECYCLE=$ROOT/.github/scripts/verify-durable-aop-connector-lifecycle-run.sh
+OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 WAIT_REFRESH=${CUTOVER_WAIT_REFRESH_SCRIPT:-$ROOT/.github/scripts/wait-for-instance-refresh.sh}
 ORIGINAL_ROOT=${CUTOVER_ORIGINAL_SOURCE_ROOT:-$ROOT}
 REFRESH_TIMEOUT_MINUTES=${CUTOVER_REPAIR_REFRESH_TIMEOUT_MINUTES:-30}
+
+emit_recovery_outcome() {
+  local outcome=$1
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf 'recovery_outcome=%s\n' "$outcome" >>"$GITHUB_OUTPUT"
+  fi
+}
 
 get_optional() { bash "$ROOT/scripts/ssm-read-optional.sh" "$1"; }
 get_param() { aws ssm get-parameter --name "$1" --query Parameter.Value --output text --region "$AWS_REGION"; }
@@ -254,15 +286,49 @@ validate_runtime_source() {
 }
 
 validate_original_run() {
-  local run
+  local run conclusion jobs
   run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}")
-  jq -e --arg sha "$ORIGINAL_SOURCE_SHA" '
-    .head_sha == $sha and .head_branch == "main" and .event == "push" and
-    .status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out") and
+  jq -e --arg sha "$ORIGINAL_SOURCE_SHA" --argjson run_id "$ORIGINAL_RUN_ID" \
+    --argjson run_attempt "$ORIGINAL_RUN_ATTEMPT" '
+    .id == $run_id and .run_attempt == $run_attempt and
+    .repository.full_name == "layervai/nhp" and .head_repository.full_name == "layervai/nhp" and
+    .head_sha == $sha and .head_branch == "main" and .event == "push" and .status == "completed" and
+    (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") and
     (.path == ".github/workflows/build-and-push.yml" or
      .path == "layervai/nhp/.github/workflows/build-and-push.yml@refs/heads/main")
   ' >/dev/null <<<"$run" || {
     echo "original cutover run is not the exact failed e9 main run" >&2
+    return 1
+  }
+
+  conclusion=$(jq -er '.conclusion' <<<"$run")
+  [[ "$conclusion" == cancelled ]] || return 0
+
+  # This immutable attempt has 28 jobs, so exact page count/length parity proves
+  # the per_page=100 response is complete. Cancellation is authoritative only when
+  # the exact cell1 deploy failure caused the exact downstream validation
+  # cancellation. This is not a general cancelled-run allowance.
+  jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGINAL_RUN_ID}/attempts/${ORIGINAL_RUN_ATTEMPT}/jobs?per_page=100")
+  jq -e --arg sha "$ORIGINAL_SOURCE_SHA" --argjson run_id "$ORIGINAL_RUN_ID" \
+    --argjson run_attempt "$ORIGINAL_RUN_ATTEMPT" --argjson expected_count "$ORIGINAL_CANCELLED_JOB_COUNT" \
+    --argjson cell1_id "$ORIGINAL_CELL1_FAILURE_JOB_ID" \
+    --argjson validation_id "$ORIGINAL_VALIDATION_CANCELLED_JOB_ID" '
+    .total_count == $expected_count and (.jobs | type == "array") and
+    (.jobs | length == $expected_count) and
+    ([.jobs[] | select(.name == "Deploy Sandbox cell1 - Blue/Green")] | length == 1) and
+    ([.jobs[] | select(.name == "Deploy Sandbox - Validate")] | length == 1) and
+    ([.jobs[] | select(.id == $cell1_id)] | length == 1) and
+    ([.jobs[] | select(.id == $validation_id)] | length == 1) and
+    ([.jobs[] | select(.name == "Deploy Sandbox cell1 - Blue/Green")][0] |
+      .id == $cell1_id and .run_id == $run_id and .run_attempt == $run_attempt and
+      .workflow_name == "Build and Deploy NHP" and .head_sha == $sha and .head_branch == "main" and
+      .status == "completed" and .conclusion == "failure") and
+    ([.jobs[] | select(.name == "Deploy Sandbox - Validate")][0] |
+      .id == $validation_id and .run_id == $run_id and .run_attempt == $run_attempt and
+      .workflow_name == "Build and Deploy NHP" and .head_sha == $sha and .head_branch == "main" and
+      .status == "completed" and .conclusion == "cancelled")
+  ' >/dev/null <<<"$jobs" || {
+    echo "cancelled original cutover run lacks the exact cell1-failure/validation-cancelled authority" >&2
     return 1
   }
 }
@@ -337,6 +403,46 @@ state_phase_order() {
   esac
 }
 
+validate_owner_intent() {
+  jq -e --arg client "$APPROVED_CUSTOMER_CLIENT_ID" --arg subject "$APPROVED_CUSTOMER_SUBJECT" \
+    --arg email "$APPROVED_CUSTOMER_EMAIL" --arg table "$APPROVED_CUSTOMER_TABLE" \
+    --arg region "$AWS_REGION" --arg source "$REPAIR_SOURCE_SHA" '
+    type == "object" and length == 15 and
+    .schema == "layerv.durable-aop-customer-owner-intent.v1" and
+    .client_id == $client and .subject == $subject and .email == $email and
+    .table == $table and .region == $region and .source_sha == $source and
+    (.provisioned_at | type == "string" and
+      test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.action == "create" or .action == "promote" or .action == "replay") and
+    (.expected_row_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    ([.expected_created_at,.expected_updated_at] |
+      all(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))) and
+    (.expected_usage | type == "string" and test("^(0|[1-9][0-9]*)$")) and
+    (.expected_assigned_cell_id | type == "string" and
+      (. == "" or test("^[a-z0-9]+(-[a-z0-9]+)*$"))) and
+    ((.action == "create" and .before_row_sha256 == "absent") or
+     (.action == "promote" and (.before_row_sha256 | test("^[0-9a-f]{64}$"))) or
+     (.action == "replay" and .before_row_sha256 == .expected_row_sha256))
+  ' >/dev/null <<<"$OWNER_INTENT" || {
+    echo "schema-3 customer-owner intent is malformed or cross-bound" >&2
+    return 1
+  }
+}
+
+validate_owner_authority() {
+  [[ -n "$OWNER_AUTHORITY" ]] || return 1
+  jq -e '
+    type == "object" and (keys | sort) == ["intent","status"] and
+    (.status == "preparing" or .status == "ready") and (.intent | type == "object")
+  ' >/dev/null <<<"$OWNER_AUTHORITY" || {
+    echo "schema-3 customer-owner authority is malformed" >&2
+    return 1
+  }
+  OWNER_STATUS=$(jq -r .status <<<"$OWNER_AUTHORITY")
+  OWNER_INTENT=$(jq -cS .intent <<<"$OWNER_AUTHORITY")
+  validate_owner_intent
+}
+
 validate_customer_lifecycle_receipt() {
   local version repository run attempt infra_sha integrations_sha artifact_id artifact_digest
   local producer_run producer_attempt nhp_artifact_id nhp_artifact_digest repair_sha recovery_sha
@@ -390,28 +496,38 @@ validate_phase_fields() {
   [[ -z "$CELL1_REPAIR_REFRESH_ID" || "$CELL1_REPAIR_REFRESH_ID" =~ ^[A-Za-z0-9-]+$ ]]
   [[ -z "$AC_REPAIR_REFRESH_ID" || "$AC_REPAIR_REFRESH_ID" =~ ^[A-Za-z0-9-]+$ ]]
   [[ -z "$REPAIR_REFRESH_INTENT" || "$REPAIR_REFRESH_INTENT" =~ ^v1\|[0-9a-f]{64}\|(-|[A-Za-z0-9-]+)$ ]]
+  if [[ -n "$OWNER_AUTHORITY" ]]; then
+    validate_owner_authority
+  else
+    OWNER_STATUS=
+    OWNER_INTENT=
+  fi
   case "$PHASE" in
     adopted)
       [[ -z "$CELL0_REPAIR_ATTESTATION$CELL1_REPAIR_ATTESTATION$AC_REPAIR_ATTESTATION" &&
          -z "$CELL0_REPAIR_REFRESH_ID$CELL1_REPAIR_REFRESH_ID$AC_REPAIR_REFRESH_ID" &&
          -z "$REPAIR_REFRESH_INTENT" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       ;;
     cell0_refreshing)
       [[ -z "$CELL0_REPAIR_ATTESTATION$CELL1_REPAIR_ATTESTATION$AC_REPAIR_ATTESTATION" &&
          -z "$CELL1_REPAIR_REFRESH_ID$AC_REPAIR_REFRESH_ID" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       [[ -z "$CELL0_REPAIR_REFRESH_ID" || -z "$REPAIR_REFRESH_INTENT" ]]
       ;;
     cell0_refreshed)
       [[ "$CELL0_REPAIR_ATTESTATION" == "$expected_server_c0" && -n "$CELL0_REPAIR_REFRESH_ID" &&
          -z "$REPAIR_REFRESH_INTENT" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$CELL1_REPAIR_ATTESTATION$AC_REPAIR_ATTESTATION$CELL1_REPAIR_REFRESH_ID$AC_REPAIR_REFRESH_ID" &&
          -z "$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       ;;
     cell1_refreshing)
       [[ "$CELL0_REPAIR_ATTESTATION" == "$expected_server_c0" && -z "$CELL1_REPAIR_ATTESTATION" &&
          -n "$CELL0_REPAIR_REFRESH_ID" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$AC_REPAIR_ATTESTATION$AC_REPAIR_REFRESH_ID" &&
          -z "$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       [[ -z "$CELL1_REPAIR_REFRESH_ID" || -z "$REPAIR_REFRESH_INTENT" ]]
@@ -419,11 +535,13 @@ validate_phase_fields() {
     cell1_refreshed)
       [[ "$CELL0_REPAIR_ATTESTATION" == "$expected_server_c0" && "$CELL1_REPAIR_ATTESTATION" == "$expected_server_c1" &&
          -n "$CELL0_REPAIR_REFRESH_ID" && -n "$CELL1_REPAIR_REFRESH_ID" && -z "$REPAIR_REFRESH_INTENT" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$AC_REPAIR_ATTESTATION$AC_REPAIR_REFRESH_ID$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       ;;
     ac_refreshing)
       [[ "$CELL0_REPAIR_ATTESTATION" == "$expected_server_c0" && "$CELL1_REPAIR_ATTESTATION" == "$expected_server_c1" &&
          -n "$CELL0_REPAIR_REFRESH_ID" && -n "$CELL1_REPAIR_REFRESH_ID" &&
+         -z "$OWNER_AUTHORITY" &&
          -z "$AC_REPAIR_ATTESTATION$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       [[ -z "$AC_REPAIR_REFRESH_ID" || -z "$REPAIR_REFRESH_INTENT" ]]
       ;;
@@ -433,12 +551,14 @@ validate_phase_fields() {
          -n "$CELL1_REPAIR_REFRESH_ID" && -n "$AC_REPAIR_REFRESH_ID" &&
          -z "$REPAIR_REFRESH_INTENT" &&
          -z "$CUSTOMER_LIFECYCLE_RECEIPT$CONNECTOR_LIFECYCLE_RECEIPT" ]]
+      [[ -z "$OWNER_AUTHORITY" || "$OWNER_STATUS" == preparing || "$OWNER_STATUS" == ready ]]
       ;;
     validated|complete)
       [[ "$CELL0_REPAIR_ATTESTATION" == "$expected_server_c0" && "$CELL1_REPAIR_ATTESTATION" == "$expected_server_c1" &&
          "$AC_REPAIR_ATTESTATION" == "$expected_ac" && -n "$CELL0_REPAIR_REFRESH_ID" &&
          -n "$CELL1_REPAIR_REFRESH_ID" && -n "$AC_REPAIR_REFRESH_ID" &&
          -z "$REPAIR_REFRESH_INTENT" &&
+         "$OWNER_STATUS" == ready &&
          -n "$CUSTOMER_LIFECYCLE_RECEIPT" && -n "$CONNECTOR_LIFECYCLE_RECEIPT" ]]
       validate_customer_lifecycle_receipt
       validate_connector_lifecycle_receipt
@@ -453,6 +573,7 @@ write_state() {
   local next=$1 c0=${CELL0_REPAIR_ATTESTATION:-} c1=${CELL1_REPAIR_ATTESTATION:-} ac=${AC_REPAIR_ATTESTATION:-}
   local c0_refresh=${CELL0_REPAIR_REFRESH_ID:-} c1_refresh=${CELL1_REPAIR_REFRESH_ID:-} ac_refresh=${AC_REPAIR_REFRESH_ID:-}
   local refresh_intent=${REPAIR_REFRESH_INTENT:-}
+  local owner_authority=${OWNER_AUTHORITY:-}
   local customer_lifecycle=${CUSTOMER_LIFECYCLE_RECEIPT:-} connector_lifecycle=${CONNECTOR_LIFECYCLE_RECEIPT:-}
   STATE=$(jq -cn --arg phase "$next" \
     --arg original_digest "$ORIGINAL_STATE_DIGEST" --argjson original_version "$ORIGINAL_STATE_VERSION" \
@@ -477,6 +598,10 @@ write_state() {
   if [[ -n "$refresh_intent" ]]; then
     STATE=$(jq -c --arg intent "$refresh_intent" '.repair.refresh_intent = $intent' <<<"$STATE")
   fi
+  if [[ -n "$owner_authority" ]]; then
+    [[ -z "$refresh_intent" ]] || { echo "owner authority and refresh intent cannot coexist" >&2; return 1; }
+    STATE=$(jq -c --argjson owner "$owner_authority" '.repair.owner = $owner' <<<"$STATE")
+  fi
   put_param "$STATE_PARAM" "$STATE"
   [[ "$(get_param "$STATE_PARAM")" == "$STATE" ]] || { echo "schema-3 state write did not strongly round trip" >&2; return 1; }
   PHASE=$next
@@ -497,8 +622,10 @@ load_schema3() {
     (.original.state_version | type == "number" and . > 0 and floor == .) and
     (.original.lock_version | type == "number" and . > 0 and floor == .) and
     (.repair | type == "object" and
-      ((length == 15 and (has("refresh_intent") | not)) or
-       (length == 16 and (.refresh_intent | type == "string")))) and
+      ((length == 15 and (has("refresh_intent") | not) and (has("owner") | not)) or
+       (length == 16 and
+         (((.refresh_intent | type == "string") and (has("owner") | not)) or
+          ((.owner | type == "object") and (has("refresh_intent") | not)))))) and
     .repair.orchestrator_sha == $recovery_sha and .repair.source_sha == $repair_sha and
     .repair.build_run_id == $build_run and .repair.build_run_attempt == $build_attempt and
     .repair.runtime_manifest == $runtime_manifest and
@@ -523,6 +650,7 @@ load_schema3() {
   CELL1_REPAIR_REFRESH_ID=$(jq -r .repair.cell1_refresh_id <<<"$STATE")
   AC_REPAIR_REFRESH_ID=$(jq -r .repair.ac_refresh_id <<<"$STATE")
   REPAIR_REFRESH_INTENT=$(jq -r '.repair.refresh_intent // ""' <<<"$STATE")
+  OWNER_AUTHORITY=$(jq -cS '.repair.owner // empty' <<<"$STATE")
   CUSTOMER_LIFECYCLE_RECEIPT=$(jq -r .repair.customer_lifecycle <<<"$STATE")
   CONNECTOR_LIFECYCLE_RECEIPT=$(jq -r .repair.connector_lifecycle <<<"$STATE")
   validate_phase_fields
@@ -768,6 +896,7 @@ if jq -e '.schema == 3 and .phase == "complete"' >/dev/null 2>&1 <<<"$RAW_STATE"
   assert_completed_repair_slot sandbox ac "$AC_COLOR" "$AC_ASG" "$AC_REPAIR_PROVENANCE"
   validate_customer_lifecycle_receipt
   validate_connector_lifecycle_receipt
+  "$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
   [[ "$(get_param "$FLOOR_PARAM")" == "$TARGET_PROFILE" ]] || { echo "completed durable profile floor is missing" >&2; exit 1; }
   echo "durable AOP schema-3 recovery is already complete at repair source $REPAIR_SOURCE_SHA"
   exit 0
@@ -796,6 +925,9 @@ if jq -e '.schema == 2' >/dev/null 2>&1 <<<"$RAW_STATE"; then
   CELL1_REPAIR_REFRESH_ID=
   AC_REPAIR_REFRESH_ID=
   REPAIR_REFRESH_INTENT=
+  OWNER_AUTHORITY=
+  OWNER_STATUS=
+  OWNER_INTENT=
   CUSTOMER_LIFECYCLE_RECEIPT=
   CONNECTOR_LIFECYCLE_RECEIPT=
   assert_adopted_topology
@@ -843,6 +975,47 @@ if (( $(state_phase_order "$PHASE") < $(state_phase_order repaired) )); then
     "$AC_REPAIR_REFRESH_ID" "$AC_REPAIR_PROVENANCE" 'systemctl is-active --quiet nhp-acd && systemctl is-active --quiet traefik && curl -sfS -o /dev/null http://127.0.0.1:8080/ping'
   AC_REPAIR_ATTESTATION=$LAST_REPAIR_ATTESTATION
   write_state repaired
+fi
+
+# Fleet repair is durable before customer-owner preparation. The exact owner
+# intent, including its expected final row digest, is then persisted under the
+# repaired state before the first DynamoDB mutation. A lost response can only
+# classify against that precommitted digest.
+if [[ "$PHASE" == repaired && -z "$OWNER_AUTHORITY" ]]; then
+  OWNER_INTENT=$("$OWNER_PROJECTOR" plan \
+    --table "$APPROVED_CUSTOMER_TABLE" \
+    --client-id "$APPROVED_CUSTOMER_CLIENT_ID" \
+    --region "$AWS_REGION" \
+    --provisioned-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --source-sha "$REPAIR_SOURCE_SHA")
+  OWNER_INTENT=$(jq -cS . <<<"$OWNER_INTENT")
+  validate_owner_intent
+  OWNER_STATUS=preparing
+  OWNER_AUTHORITY=$(jq -cn --argjson intent "$OWNER_INTENT" '{status:"preparing",intent:$intent}')
+  write_state repaired
+fi
+if [[ "$PHASE" == repaired && "$OWNER_STATUS" == preparing ]]; then
+  owner_digest=$("$OWNER_PROJECTOR" apply --intent-json "$OWNER_INTENT")
+  [[ "$owner_digest" == "$(jq -r .expected_row_sha256 <<<"$OWNER_INTENT")" ]] || {
+    echo "customer-owner projector did not return the precommitted final row digest" >&2
+    exit 1
+  }
+  OWNER_STATUS=ready
+  OWNER_AUTHORITY=$(jq -cn --argjson intent "$OWNER_INTENT" '{status:"ready",intent:$intent}')
+  write_state repaired
+elif [[ "$PHASE" == repaired && "$OWNER_STATUS" == ready ]]; then
+  owner_digest=$("$OWNER_PROJECTOR" verify --intent-json "$OWNER_INTENT")
+  [[ "$owner_digest" == "$(jq -r .expected_row_sha256 <<<"$OWNER_INTENT")" ]] || {
+    echo "ready customer owner differs from its precommitted final row digest" >&2
+    exit 1
+  }
+fi
+
+if [[ "$LIFECYCLE_MODE" == deferred ]]; then
+  require_hard_lock
+  emit_recovery_outcome repaired_owner_ready_waiting_for_lifecycle
+  echo "durable AOP schema-3 recovery reached repaired+owner_ready; lifecycle selectors are intentionally deferred and the hard lock remains held"
+  exit 0
 fi
 
 require_hard_lock
@@ -904,11 +1077,14 @@ require_hard_lock
 [[ "$(get_param /sandbox-cell1/nhp/server/active-color)" == "$CELL1_COLOR" ]] || {
   echo "active cell1 server color drifted before terminal recovery" >&2; exit 1;
 }
+"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
 ensure_exact_floor
+"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
 [[ "$PHASE" == complete ]] || write_state complete
 
 # The exact original owner remains the lock owner throughout adoption and all
 # partial refreshes.  Only an exact schema-3 COMPLETE is allowed to release it.
 require_hard_lock
 AWS_REGION=$AWS_REGION bash "$ROOT/.github/scripts/ssm-live-env-lock.sh" release "$LOCK_PARAM" "$ORIGINAL_OWNER" 14400 7200
+emit_recovery_outcome complete
 echo "durable AOP schema-3 recovery complete at repair source $REPAIR_SOURCE_SHA"
