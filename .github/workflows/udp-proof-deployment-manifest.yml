@@ -1,0 +1,105 @@
+name: Publish Exact Durable AOP NHP Deployment Authority
+
+on:
+  workflow_dispatch:
+    inputs:
+      schema3_recovery_run_id:
+        description: Exact completed schema-3 recovery controller run to correlate
+        required: true
+        type: string
+      schema3_recovery_run_attempt:
+        description: Exact completed schema-3 recovery controller attempt
+        required: true
+        type: string
+      confirmation:
+        description: Type PUBLISH_EXACT_SCHEMA3_REPAIRED_DEPLOYMENT
+        required: true
+        type: string
+
+# This proof reads the same active fleets protected by the non-expiring cutover
+# lock. Serialize with the cutover/recovery controllers so it cannot bracket a
+# forward refresh or terminal profile-floor write.
+concurrency:
+  group: deploy-sandbox-cell1-blue-green
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Reject malformed or mutable producer dispatch
+        env:
+          RECOVERY_RUN_ID: ${{ inputs.schema3_recovery_run_id }}
+          RECOVERY_RUN_ATTEMPT: ${{ inputs.schema3_recovery_run_attempt }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == layervai/nhp && "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]*$ && "$RECOVERY_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CONFIRMATION" == PUBLISH_EXACT_SCHEMA3_REPAIRED_DEPLOYMENT ]]
+
+      - name: Checkout exact protected producer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: durable-aop-deployment-proof-${{ github.run_id }}
+          aws-region: us-east-2
+
+      - name: Build exact repaired NHP deployment authority
+        id: authority
+        env:
+          AWS_REGION: us-east-2
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/durable-aop-nhp-deployment.json"
+          ./.github/scripts/emit-durable-aop-nhp-deployment-manifest.sh \
+            '${{ inputs.schema3_recovery_run_id }}' \
+            '${{ inputs.schema3_recovery_run_attempt }}' \
+            "$output"
+          repair_source_sha=$(jq -er '.repair_source_sha | select(test("^[0-9a-f]{40}$"))' "$output")
+          printf 'repair_source_sha=%s\n' "$repair_source_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Upload exact repaired NHP deployment authority
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: durable-aop-nhp-deployment-${{ steps.authority.outputs.repair_source_sha }}
+          path: ${{ runner.temp }}/durable-aop-nhp-deployment.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Require immutable producer receipt
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_URL" == https://github.com/layervai/nhp/actions/runs/*/artifacts/* ]]
+          {
+            echo '### Exact durable AOP NHP deployment authority'
+            echo "- producer run: ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}"
+            echo "- artifact id: ${ARTIFACT_ID}"
+            echo "- artifact digest: ${ARTIFACT_DIGEST}"
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1554,6 +1554,32 @@ jobs:
             fi
           fi
 
+      # The attended schema-3 repair build is stronger than an ordinary
+      # non-deploy build: its image provenance becomes irreversible recovery
+      # authority. Make the existing best-effort attestation steps fail closed
+      # only for that exact lane. The recovery verifier also requires this
+      # named step on the server and AC matrix legs and requires every deploy
+      # job to be skipped, so an arbitrary successful dispatch is insufficient.
+      - name: Require build-only recovery attestation
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.deploy == false &&
+          inputs.force_build == true &&
+          (matrix.image == 'server' || matrix.image == 'ac')
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PROVENANCE_OUTCOME: ${{ steps.provenance.outcome }}
+          SBOM_GEN_OUTCOME: ${{ steps.sbom.outcome }}
+          SBOM_ATTEST_OUTCOME: ${{ steps.attest-sbom.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$PROVENANCE_OUTCOME" == success ]]
+          [[ "$SBOM_GEN_OUTCOME" == success ]]
+          [[ "$SBOM_ATTEST_OUTCOME" == success ]]
+          echo "Exact build-only recovery attestation complete for $IMAGE at $DIGEST"
+
       # The builder used to also write /${env}/nhp/<component>/image-tag here.
       # That write was wrong on two independent axes:
       #

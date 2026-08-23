@@ -1,0 +1,143 @@
+name: Recover Sandbox Durable AOP Cutover (Schema 3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_recovery_sha:
+        description: Exact main SHA containing this reviewed recovery controller
+        required: true
+        type: string
+      repair_source_sha:
+        description: Exact future-main image/build SHA; its runtime tree must match the reviewed controller manifest
+        required: true
+        type: string
+      repair_build_run_id:
+        description: Successful attended force-build/no-deploy run that attested both repair images
+        required: true
+        type: string
+      repair_build_run_attempt:
+        description: Exact force-build/no-deploy run attempt that attested both repair images
+        required: true
+        type: string
+      lifecycle_run_id:
+        description: Successful protected qurl-sharing lifecycle run; leave empty on the initial repair refresh
+        required: false
+        type: string
+      lifecycle_run_attempt:
+        description: Exact protected lifecycle run attempt
+        required: false
+        type: string
+      connector_lifecycle_run_id:
+        description: Successful attended qurl-connector PR 609 strict lifecycle run
+        required: false
+        type: string
+      connector_lifecycle_run_attempt:
+        description: Exact attended qurl-connector strict lifecycle run attempt
+        required: false
+        type: string
+      confirmation:
+        description: Type ADOPT_EXACT_E9_DURABLE_AOP_REPAIR
+        required: true
+        type: string
+
+# The original e9 run owns the non-expiring SSM lock.  This concurrency group
+# excludes its ordinary parent job and every later recovery attempt while this
+# attended forward-only controller is reading or mutating the active fleets.
+concurrency:
+  group: deploy-sandbox-cell1-blue-green
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Reject mutable or malformed recovery dispatch
+        env:
+          EXPECTED_RECOVERY_SHA: ${{ inputs.expected_recovery_sha }}
+          REPAIR_SOURCE_SHA: ${{ inputs.repair_source_sha }}
+          REPAIR_BUILD_RUN_ID: ${{ inputs.repair_build_run_id }}
+          REPAIR_BUILD_RUN_ATTEMPT: ${{ inputs.repair_build_run_attempt }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$EXPECTED_RECOVERY_SHA" == "$GITHUB_SHA" ]]
+          [[ "$EXPECTED_RECOVERY_SHA" =~ ^[0-9a-f]{40}$ && "$REPAIR_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REPAIR_BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REPAIR_BUILD_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CONFIRMATION" == ADOPT_EXACT_E9_DURABLE_AOP_REPAIR ]]
+
+      - name: Checkout exact recovery controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_recovery_sha }}
+          persist-credentials: false
+
+      - name: Checkout immutable original e9 helper source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: e9b11398a4cea98da6ae5b41cfe635562e1b7c72
+          path: .cutover-original-e9
+          persist-credentials: false
+
+      # github.token is scoped to this NHP repository and is not authority to
+      # read the protected cross-repository customer/connector runs or their
+      # immutable artifacts.  Mint one least-privilege installation token over
+      # the exact reviewed repository set; absence of any installation grant
+      # fails this step rather than falling back to a PAT or the caller token.
+      - name: Mint exact recovery receipt reader token
+        id: recovery_receipt_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            nhp
+            qurl-integrations-infra
+            qurl-integrations
+            qurl-go
+            qurl-connector
+          permission-actions: read
+          permission-contents: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: durable-aop-schema3-${{ github.run_id }}
+          aws-region: us-east-2
+
+      - name: Adopt and advance exact schema-3 recovery
+        env:
+          AWS_REGION: us-east-2
+          GH_TOKEN: ${{ steps.recovery_receipt_token.outputs.token }}
+          CUTOVER_ORIGINAL_SOURCE_SHA: e9b11398a4cea98da6ae5b41cfe635562e1b7c72
+          CUTOVER_ORIGINAL_RUN_ID: '32635672597'
+          CUTOVER_ORIGINAL_SOURCE_ROOT: ${{ github.workspace }}/.cutover-original-e9
+          CUTOVER_RECOVERY_ORCHESTRATOR_SHA: ${{ inputs.expected_recovery_sha }}
+          CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID: ${{ inputs.lifecycle_run_id }}
+          CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT: ${{ inputs.lifecycle_run_attempt }}
+          CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID: ${{ inputs.connector_lifecycle_run_id }}
+          CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT: ${{ inputs.connector_lifecycle_run_attempt }}
+        run: |
+          set -euo pipefail
+          ./.github/scripts/recover-durable-aop-cutover-schema3.sh \
+            '${{ inputs.repair_source_sha }}' \
+            '${{ inputs.repair_build_run_id }}' \
+            '${{ inputs.repair_build_run_attempt }}' \
+            '${{ inputs.confirmation }}'
+
+      - name: Explain retained recovery authority on failure
+        if: failure()
+        run: |
+          echo '::error title=Durable AOP schema-3 recovery incomplete::The original non-expiring e9 lock and exact schema-3 phase remain authoritative. Resume this attended workflow with the same repair source/build. COMPLETE and the profile floor are deliberately unreachable until both protected consumer lifecycle receipts are supplied and all backend readiness gates pass.'

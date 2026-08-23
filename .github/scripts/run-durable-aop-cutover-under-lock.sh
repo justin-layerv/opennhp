@@ -32,7 +32,12 @@ for attempt in 1 2 3 4 5; do
     break
   fi
   state=$(bash "$ROOT/scripts/ssm-read-optional.sh" /sandbox/nhp/cutovers/durable-aop-v1/state)
-  phase=$(jq -r '.phase // empty' <<<"${state:-{}}")
+  # `${state:-{}}` is parsed by bash as the default word `{` plus a literal
+  # `}`, yielding `}}` when state is empty.  Materialize the canonical default
+  # separately so an absent state cannot turn a recoverable script failure
+  # into a jq parse error in the lock-retention path.
+  state_json=${state:-'{}'}
+  phase=$(jq -r '.phase // empty' <<<"$state_json")
   case "$phase" in
     ac_terminating|ponr|ac_switched|cell0_switched|cell1_switched|old_servers_terminated|validated)
       echo "Forward-only cutover attempt $attempt failed at phase=$phase; retrying exact source"
