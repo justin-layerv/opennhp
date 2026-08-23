@@ -37,6 +37,16 @@ APPROVED_CUSTOMER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
 APPROVED_CUSTOMER_SUBJECT=${APPROVED_CUSTOMER_CLIENT_ID}@clients
 APPROVED_CUSTOMER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
 APPROVED_CUSTOMER_TABLE=layerv-nhp-sandbox-control-qurl-customers
+# The first repaired controller stopped at the exact live SSM v15
+# cell1_refreshing boundary. One successor may adopt only those exact bytes and
+# rewrites the controller authority on its first state transition. This is not
+# a general source-compatibility list. The workflow establishes successor trust
+# before AWS credentials by requiring expected_recovery_sha == GITHUB_SHA and
+# checking out that exact live main commit; the future squash SHA therefore is
+# not a caller-controlled static allowlist entry here.
+APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA=c83dfec827b216cd23fb95f08c157318e1153087
+APPROVED_RECOVERY_HANDOFF_STATE_VERSION=15
+APPROVED_RECOVERY_HANDOFF_STATE_DIGEST=18cc92713387304aa319684fe4aea851ab1a3326ba53e4895e25a8be3f1d494d
 GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-layervai/nhp}
 AWS_REGION=${AWS_REGION:-us-east-2}
 export AWS_REGION GITHUB_REPOSITORY
@@ -602,16 +612,24 @@ write_state() {
     [[ -z "$refresh_intent" ]] || { echo "owner authority and refresh intent cannot coexist" >&2; return 1; }
     STATE=$(jq -c --argjson owner "$owner_authority" '.repair.owner = $owner' <<<"$STATE")
   fi
+  if [[ "${RECOVERY_HANDOFF_PENDING:-false}" == true ]]; then
+    [[ "$(jq -r .repair.orchestrator_sha <<<"$STATE")" == "$RECOVERY_ORCHESTRATOR_SHA" ]] || {
+      echo "schema-3 one-hop state transition did not install successor authority" >&2
+      return 1
+    }
+  fi
   put_param "$STATE_PARAM" "$STATE"
   [[ "$(get_param "$STATE_PARAM")" == "$STATE" ]] || { echo "schema-3 state write did not strongly round trip" >&2; return 1; }
+  RECOVERY_HANDOFF_PENDING=false
   PHASE=$next
   echo "durable AOP repair phase: $PHASE"
 }
 
 load_schema3() {
-  local raw=$1
+  local raw=$1 stored_recovery_sha state_version canonical digest
   jq -e --arg original_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" \
-    --arg recovery_sha "$RECOVERY_ORCHESTRATOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
+    --arg recovery_sha "$RECOVERY_ORCHESTRATOR_SHA" \
+    --arg predecessor_sha "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
     --arg build_run "$REPAIR_BUILD_RUN_ID" --arg build_attempt "$REPAIR_BUILD_RUN_ATTEMPT" \
     --arg runtime_manifest "$APPROVED_REPAIR_RUNTIME_MANIFEST" \
     --arg server_provenance "$SERVER_REPAIR_PROVENANCE" --arg ac_provenance "$AC_REPAIR_PROVENANCE" '
@@ -626,7 +644,8 @@ load_schema3() {
        (length == 16 and
          (((.refresh_intent | type == "string") and (has("owner") | not)) or
           ((.owner | type == "object") and (has("refresh_intent") | not)))))) and
-    .repair.orchestrator_sha == $recovery_sha and .repair.source_sha == $repair_sha and
+    (.repair.orchestrator_sha == $recovery_sha or .repair.orchestrator_sha == $predecessor_sha) and
+    .repair.source_sha == $repair_sha and
     .repair.build_run_id == $build_run and .repair.build_run_attempt == $build_attempt and
     .repair.runtime_manifest == $runtime_manifest and
     .repair.server_provenance == $server_provenance and .repair.ac_provenance == $ac_provenance and
@@ -634,6 +653,31 @@ load_schema3() {
       .repair.cell0_refresh_id,.repair.cell1_refresh_id,.repair.ac_refresh_id,
       .repair.customer_lifecycle,.repair.connector_lifecycle] | all(type == "string"))
   ' >/dev/null <<<"$raw" || { echo "schema-3 recovery state is malformed or belongs to another repair" >&2; return 1; }
+  stored_recovery_sha=$(jq -er '.repair.orchestrator_sha' <<<"$raw")
+  RECOVERY_HANDOFF_PENDING=false
+  state_version=$(get_param_version "$STATE_PARAM")
+  [[ "$state_version" =~ ^[1-9][0-9]*$ ]] || {
+    echo "schema-3 state version is not a canonical positive decimal" >&2
+    return 1
+  }
+  if [[ "$stored_recovery_sha" == "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" ]]; then
+    canonical=$(jq -cS . <<<"$raw")
+    digest=$(canonical_digest "$canonical")
+    [[ "$RECOVERY_ORCHESTRATOR_SHA" != "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" &&
+       "$state_version" == "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" &&
+       "$digest" == "$APPROVED_RECOVERY_HANDOFF_STATE_DIGEST" &&
+       "$(jq -r .phase <<<"$raw")" == cell1_refreshing &&
+       -n "${LIVE_LOCK:-}" && "$LOCK_JSON" == "$ORIGINAL_LOCK" ]] || {
+      echo "schema-3 predecessor authority is not the exact live one-hop handoff boundary" >&2
+      return 1
+    }
+    RECOVERY_HANDOFF_PENDING=true
+  else
+    [[ "$state_version" != "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" ]] || {
+      echo "schema-3 SSM v${APPROVED_RECOVERY_HANDOFF_STATE_VERSION} cannot self-assert successor authority" >&2
+      return 1
+    }
+  fi
   validate_original_state "$ORIGINAL_STATE"
   [[ "$ORIGINAL_LOCK" == "$APPROVED_ORIGINAL_LOCK" &&
      "$ORIGINAL_LOCK_DIGEST" == "$APPROVED_ORIGINAL_LOCK_DIGEST" &&
