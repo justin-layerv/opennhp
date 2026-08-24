@@ -1883,6 +1883,418 @@ def expression_refs(resource: dict[str, Any] | None, attribute: str) -> set[str]
     return references((resource.get("expressions") or {}).get(attribute))
 
 
+def validate_optional_matched_cohort_sg_configuration(
+    v: Validation,
+    ac_config: dict[str, Any] | None,
+    compute_config: dict[str, Any] | None,
+    relay_config: dict[str, Any] | None,
+) -> tuple[
+    set[tuple[str, str]], set[tuple[str, str]], set[tuple[str, str]]
+]:
+    """Admit either the pre-cohort graph or one exact dormant SG graph.
+
+    The secrets-bearing PR plan restores this checker from the trusted base.
+    This closed union lets the later matched-cohort PR introduce its count-zero
+    configuration without letting that PR rewrite the checker that reviews it.
+    Once any cohort SG rule is authored, every reviewed rule must be present and
+    every control/source/target edge must have the exact Terraform 1.14 shape.
+    """
+
+    count_refs = {"local.matched_cohort_count"}
+    enabled_smoke_refs = {
+        "var.enable_matched_cohort_canary",
+        "var.matched_cohort_smoke_ingress_cidrs",
+    }
+    enabled_frps_smoke_refs = {
+        "var.enable_matched_cohort_canary",
+        "local.matched_cohort_frps_smoke_sources",
+    }
+    enabled_frps_refs = {
+        "var.enable_matched_cohort_canary",
+        "local.matched_cohort_frps_controls",
+    }
+
+    # (module, type, name, control key/refs, source SG, destination SG,
+    #  protocol, from, to, cidr refs). Integer ports are literal constants;
+    #  sets are exact expression-reference sets.
+    specs: tuple[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            set[str],
+            str,
+            str | None,
+            str,
+            int | set[str],
+            int | set[str],
+            set[str] | None,
+        ],
+        ...,
+    ] = (
+        (
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "ac_candidate_nlb",
+            "for_each_expression",
+            enabled_smoke_refs,
+            "aws_security_group.ac_candidate_nlb",
+            None,
+            "tcp",
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            {"each.value"},
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "ac_candidate_nlb_frps",
+            "for_each_expression",
+            enabled_frps_smoke_refs,
+            "aws_security_group.ac_candidate_nlb",
+            None,
+            "tcp",
+            {"each.value.port"},
+            {"each.value.port"},
+            {"each.value.cidr"},
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_egress_rule",
+            "ac_candidate_nlb_https",
+            "count_expression",
+            count_refs,
+            "aws_security_group.ac_candidate_nlb",
+            "aws_security_group.ac",
+            "tcp",
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            None,
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_egress_rule",
+            "ac_candidate_nlb_frps",
+            "for_each_expression",
+            enabled_frps_refs,
+            "aws_security_group.ac_candidate_nlb",
+            "aws_security_group.ac",
+            "tcp",
+            {"each.value.listen_port"},
+            {"each.value.listen_port"},
+            None,
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_egress_rule",
+            "ac_candidate_nlb_health",
+            "count_expression",
+            count_refs,
+            "aws_security_group.ac_candidate_nlb",
+            "aws_security_group.ac",
+            "tcp",
+            {"local.ac_health_check_port"},
+            {"local.ac_health_check_port"},
+            None,
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "ac_candidate_target_https",
+            "count_expression",
+            count_refs,
+            "aws_security_group.ac",
+            "aws_security_group.ac_candidate_nlb",
+            "tcp",
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            None,
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "ac_candidate_target_frps",
+            "for_each_expression",
+            enabled_frps_refs,
+            "aws_security_group.ac",
+            "aws_security_group.ac_candidate_nlb",
+            "tcp",
+            {"each.value.listen_port"},
+            {"each.value.listen_port"},
+            None,
+        ),
+        (
+            "compute",
+            "aws_vpc_security_group_ingress_rule",
+            "server_candidate_nlb",
+            "for_each_expression",
+            enabled_smoke_refs,
+            "aws_security_group.server_candidate_nlb",
+            None,
+            "udp",
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            {"each.value"},
+        ),
+        (
+            "compute",
+            "aws_vpc_security_group_egress_rule",
+            "server_candidate_nlb_udp",
+            "count_expression",
+            count_refs,
+            "aws_security_group.server_candidate_nlb",
+            "aws_security_group.server",
+            "udp",
+            EXPECTED_NHP_SERVER_PORT,
+            EXPECTED_NHP_SERVER_PORT,
+            None,
+        ),
+        (
+            "compute",
+            "aws_vpc_security_group_egress_rule",
+            "server_candidate_nlb_health",
+            "count_expression",
+            count_refs,
+            "aws_security_group.server_candidate_nlb",
+            "aws_security_group.server",
+            "tcp",
+            EXPECTED_SERVER_HEALTH_PORT,
+            EXPECTED_SERVER_HEALTH_PORT,
+            None,
+        ),
+        (
+            "compute",
+            "aws_vpc_security_group_ingress_rule",
+            "server_candidate_target",
+            "count_expression",
+            count_refs,
+            "aws_security_group.server",
+            "aws_security_group.server_candidate_nlb",
+            "udp",
+            EXPECTED_NHP_SERVER_PORT,
+            EXPECTED_NHP_SERVER_PORT,
+            None,
+        ),
+        (
+            "compute",
+            "aws_vpc_security_group_ingress_rule",
+            "server_candidate_health",
+            "count_expression",
+            count_refs,
+            "aws_security_group.server",
+            "aws_security_group.server_candidate_nlb",
+            "tcp",
+            EXPECTED_SERVER_HEALTH_PORT,
+            EXPECTED_SERVER_HEALTH_PORT,
+            None,
+        ),
+        (
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "server_matched_cohort_internal",
+            "count_expression",
+            count_refs,
+            "var.server_security_group_id",
+            "aws_security_group.ac",
+            "udp",
+            EXPECTED_NHP_SERVER_PORT,
+            EXPECTED_NHP_SERVER_PORT,
+            None,
+        ),
+        (
+            "relay",
+            "aws_vpc_security_group_ingress_rule",
+            "alb_candidate_https",
+            "for_each_expression",
+            enabled_smoke_refs,
+            "aws_security_group.relay_candidate_alb",
+            None,
+            "tcp",
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            EXPECTED_NHP_CLIENT_EDGE_PORT,
+            {"each.value"},
+        ),
+        (
+            "relay",
+            "aws_vpc_security_group_egress_rule",
+            "relay_candidate_alb_to_relay",
+            "count_expression",
+            count_refs,
+            "aws_security_group.relay_candidate_alb",
+            "aws_security_group.relay",
+            "tcp",
+            {"var.listen_port"},
+            {"var.listen_port"},
+            None,
+        ),
+        (
+            "relay",
+            "aws_vpc_security_group_ingress_rule",
+            "relay_candidate_from_alb",
+            "count_expression",
+            count_refs,
+            "aws_security_group.relay",
+            "aws_security_group.relay_candidate_alb",
+            "tcp",
+            {"var.listen_port"},
+            {"var.listen_port"},
+            None,
+        ),
+    )
+
+    modules = {"ac": ac_config, "compute": compute_config, "relay": relay_config}
+    expected_by_module: dict[str, set[tuple[str, str]]] = {
+        "ac": set(),
+        "compute": set(),
+        "relay": set(),
+    }
+    configured_by_key: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+    for module_name, resource_type, name, *_ in specs:
+        expected_by_module[module_name].add((resource_type, name))
+        configured_by_key[(module_name, resource_type, name)] = config_resource(
+            v, modules[module_name], resource_type, name
+        )
+
+    sg_specs = (
+        ("ac", "ac_candidate_nlb"),
+        ("compute", "server_candidate_nlb"),
+        ("relay", "relay_candidate_alb"),
+    )
+    configured_sgs: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+    for module_name, name in sg_specs:
+        configured_sgs[(module_name, "aws_security_group", name)] = config_resource(
+            v, modules[module_name], "aws_security_group", name
+        )
+
+    authored = {
+        key for key, configured in configured_by_key.items() if configured is not None
+    }
+    authored.update(
+        key for key, configured in configured_sgs.items() if configured is not None
+    )
+    candidate_related: set[tuple[str, str, str]] = set()
+    for module_name, module in modules.items():
+        for configured in (module or {}).get("resources", []):
+            if str(configured.get("type", "")) not in SG_RULE_RESOURCE_TYPES:
+                if configured.get("type") != "aws_security_group":
+                    continue
+            refs = references(configured)
+            if (
+                "var.enable_matched_cohort_canary" in refs
+                or "local.matched_cohort_count" in refs
+                or any(
+                    ref_targets(ref, candidate_sg)
+                    for ref in refs
+                    for candidate_sg in (
+                        "aws_security_group.ac_candidate_nlb",
+                        "aws_security_group.server_candidate_nlb",
+                        "aws_security_group.relay_candidate_alb",
+                    )
+                )
+            ):
+                candidate_related.add(
+                    (
+                        module_name,
+                        str(configured.get("type", "")),
+                        str(configured.get("name", "")),
+                    )
+                )
+
+    if not authored and not candidate_related:
+        return set(), set(), set()
+
+    expected_keys = set(configured_by_key) | set(configured_sgs)
+    v.require(
+        authored == expected_keys and candidate_related == expected_keys,
+        "matched-cohort SG authored inventory must be the exact complete 16-rule and three-SG graph",
+    )
+
+    for (module_name, _, name), configured in configured_sgs.items():
+        expressions = (configured or {}).get("expressions") or {}
+        v.require(
+            configured is not None
+            and references((configured or {}).get("count_expression")) == count_refs
+            and "for_each_expression" not in (configured or {})
+            and expression_refs(configured, "vpc_id") == {"var.vpc_id"}
+            and (expressions.get("revoke_rules_on_delete") or {}).get(
+                "constant_value"
+            )
+            is True
+            and not ({"ingress", "egress"} & set(expressions)),
+            f"matched-cohort SG {module_name}.aws_security_group.{name} must retain exact count, VPC, revoke-on-delete, and standalone-rule authority",
+        )
+
+    def exact_port(
+        configured: dict[str, Any], attribute: str, expected: int | set[str]
+    ) -> bool:
+        expression = (configured.get("expressions") or {}).get(attribute) or {}
+        if isinstance(expected, int):
+            return (
+                expression.get("constant_value") == expected
+                and type(expression.get("constant_value")) is int
+                and not references(expression)
+            )
+        return references(expression) == expected and "constant_value" not in expression
+
+    for (
+        module_name,
+        resource_type,
+        name,
+        control_key,
+        control_refs,
+        security_group,
+        referenced_security_group,
+        protocol,
+        from_port,
+        to_port,
+        cidr_refs,
+    ) in specs:
+        configured = configured_by_key[(module_name, resource_type, name)]
+        expressions = (configured or {}).get("expressions") or {}
+        alternative_control = (
+            "for_each_expression"
+            if control_key == "count_expression"
+            else "count_expression"
+        )
+        source_ok = (
+            expression_refs(configured, "cidr_ipv4") == cidr_refs
+            and not expression_refs(configured, "referenced_security_group_id")
+            if cidr_refs is not None
+            else referenced_security_group is not None
+            and references_exact_resources(
+                expression_refs(configured, "referenced_security_group_id"),
+                {referenced_security_group},
+            )
+            and not expression_refs(configured, "cidr_ipv4")
+        )
+        v.require(
+            configured is not None
+            and references((configured or {}).get(control_key)) == control_refs
+            and alternative_control not in (configured or {})
+            and refs_match_expected(
+                expression_refs(configured, "security_group_id"), security_group
+            )
+            and source_ok
+            and not any(
+                field in expressions
+                for field in ("cidr_ipv6", "prefix_list_id", "source_security_group_id")
+            )
+            and (expressions.get("ip_protocol") or {}).get("constant_value")
+            == protocol
+            and not expression_refs(configured, "ip_protocol")
+            and exact_port(configured or {}, "from_port", from_port)
+            and exact_port(configured or {}, "to_port", to_port),
+            f"matched-cohort SG rule {module_name}.{resource_type}.{name} must retain its exact control, protocol, port, source, and SG graph",
+        )
+
+    return (
+        expected_by_module["ac"],
+        expected_by_module["compute"],
+        expected_by_module["relay"],
+    )
+
+
 def call_refs(call: dict[str, Any] | None, argument: str) -> set[str]:
     if not call:
         return set()
@@ -4825,6 +5237,15 @@ def validate_plan(
             else "module.ac"
         )
         ac_config = config_module(v, plan, ac_config_suffix)
+        (
+            matched_ac_sg_config,
+            matched_compute_sg_config,
+            _matched_relay_sg_config,
+        ) = (
+            validate_optional_matched_cohort_sg_configuration(
+                v, ac_config, compute_config, relay_config
+            )
+        )
         nlb_security_group = resources_named(compute, "aws_security_group", "server_nlb")
         v.require(
             len(nlb_security_group) == 1,
@@ -4953,6 +5374,11 @@ def validate_plan(
                     "aws_vpc_security_group_ingress_rule",
                     "server_nlb_registration",
                 )
+                or (
+                    str(configured.get("type", "")),
+                    str(configured.get("name", "")),
+                )
+                in matched_ac_sg_config
                 or references_exact_resources(
                     expression_refs(configured, "security_group_id"),
                     {"aws_security_group.ac"},
@@ -5267,6 +5693,21 @@ def validate_plan(
             vpc_ac_rule,
             ("aws_vpc_security_group_ingress_rule", "server_nlb_udp"),
         }
+        expected_compute_udp_ingress_config.update(
+            pair
+            for pair in matched_compute_sg_config
+            if pair
+            in {
+                (
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_candidate_nlb",
+                ),
+                (
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_candidate_target",
+                ),
+            }
+        )
         actual_compute_udp_ingress_config = {
             (str(configured.get("type", "")), str(configured.get("name", "")))
             for configured in (compute_config or {}).get("resources", [])
@@ -5285,6 +5726,15 @@ def validate_plan(
             ("aws_vpc_security_group_ingress_rule", "server_nhp_udp_nlb"),
             vpc_ac_rule,
         }
+        expected_server_udp_config.update(
+            pair
+            for pair in matched_compute_sg_config
+            if pair
+            == (
+                "aws_vpc_security_group_ingress_rule",
+                "server_candidate_target",
+            )
+        )
         actual_server_udp_config = {
             (str(configured.get("type", "")), str(configured.get("name", "")))
             for configured in (compute_config or {}).get("resources", [])

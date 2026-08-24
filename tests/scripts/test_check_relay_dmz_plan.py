@@ -2597,6 +2597,298 @@ def source_fenced_plan() -> dict[str, Any]:
     return plan
 
 
+def matched_cohort_sg_plan() -> dict[str, Any]:
+    """Add the exact dormant matched-cohort SG graph to the fenced fixture."""
+    plan = source_fenced_plan()
+    nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+        "module"
+    ]
+    modules = {
+        name: nhp_module["module_calls"][name]["module"]["resources"]
+        for name in ("ac", "compute", "relay")
+    }
+
+    def add_rule(
+        module: str,
+        resource_type: str,
+        name: str,
+        control: str,
+        control_refs: list[str],
+        security_group_refs: list[str],
+        protocol: str,
+        from_port: int | list[str],
+        to_port: int | list[str],
+        *,
+        cidr_refs: list[str] | None = None,
+        referenced_security_group_refs: list[str] | None = None,
+    ) -> None:
+        expressions: dict[str, Any] = {
+            control: {"references": control_refs},
+            "security_group_id": {"references": security_group_refs},
+            "ip_protocol": {"constant_value": protocol},
+            "from_port": (
+                {"constant_value": from_port}
+                if isinstance(from_port, int)
+                else {"references": from_port}
+            ),
+            "to_port": (
+                {"constant_value": to_port}
+                if isinstance(to_port, int)
+                else {"references": to_port}
+            ),
+        }
+        if cidr_refs is not None:
+            expressions["cidr_ipv4"] = {"references": cidr_refs}
+        if referenced_security_group_refs is not None:
+            expressions["referenced_security_group_id"] = {
+                "references": referenced_security_group_refs
+            }
+        modules[module].append(config_resource(resource_type, name, expressions))
+
+    count = ["local.matched_cohort_count"]
+    smoke = [
+        "var.enable_matched_cohort_canary",
+        "var.matched_cohort_smoke_ingress_cidrs",
+    ]
+    frps_smoke = [
+        "var.enable_matched_cohort_canary",
+        "local.matched_cohort_frps_smoke_sources",
+    ]
+    frps = [
+        "var.enable_matched_cohort_canary",
+        "local.matched_cohort_frps_controls",
+    ]
+    ac = ["aws_security_group.ac.id", "aws_security_group.ac"]
+    ac_candidate = [
+        "aws_security_group.ac_candidate_nlb[0].id",
+        "aws_security_group.ac_candidate_nlb[0]",
+        "aws_security_group.ac_candidate_nlb",
+    ]
+    server = ["aws_security_group.server.id", "aws_security_group.server"]
+    server_candidate = [
+        "aws_security_group.server_candidate_nlb[0].id",
+        "aws_security_group.server_candidate_nlb[0]",
+        "aws_security_group.server_candidate_nlb",
+    ]
+    relay = ["aws_security_group.relay.id", "aws_security_group.relay"]
+    relay_candidate = [
+        "aws_security_group.relay_candidate_alb[0].id",
+        "aws_security_group.relay_candidate_alb[0]",
+        "aws_security_group.relay_candidate_alb",
+    ]
+
+    for module_name, name in (
+        ("ac", "ac_candidate_nlb"),
+        ("compute", "server_candidate_nlb"),
+        ("relay", "relay_candidate_alb"),
+    ):
+        modules[module_name].append(
+            config_resource(
+                "aws_security_group",
+                name,
+                {
+                    "count": {"references": count},
+                    "vpc_id": {"references": ["var.vpc_id"]},
+                    "revoke_rules_on_delete": {"constant_value": True},
+                },
+            )
+        )
+
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_ingress_rule",
+        "ac_candidate_nlb",
+        "for_each",
+        smoke,
+        ac_candidate,
+        "tcp",
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        cidr_refs=["each.value"],
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_ingress_rule",
+        "ac_candidate_nlb_frps",
+        "for_each",
+        frps_smoke,
+        ac_candidate,
+        "tcp",
+        ["each.value.port"],
+        ["each.value.port"],
+        cidr_refs=["each.value.cidr"],
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_egress_rule",
+        "ac_candidate_nlb_https",
+        "count",
+        count,
+        ac_candidate,
+        "tcp",
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        referenced_security_group_refs=ac,
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_egress_rule",
+        "ac_candidate_nlb_frps",
+        "for_each",
+        frps,
+        ac_candidate,
+        "tcp",
+        ["each.value.listen_port"],
+        ["each.value.listen_port"],
+        referenced_security_group_refs=ac,
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_egress_rule",
+        "ac_candidate_nlb_health",
+        "count",
+        count,
+        ac_candidate,
+        "tcp",
+        ["local.ac_health_check_port"],
+        ["local.ac_health_check_port"],
+        referenced_security_group_refs=ac,
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_ingress_rule",
+        "ac_candidate_target_https",
+        "count",
+        count,
+        ac,
+        "tcp",
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        referenced_security_group_refs=ac_candidate,
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_ingress_rule",
+        "ac_candidate_target_frps",
+        "for_each",
+        frps,
+        ac,
+        "tcp",
+        ["each.value.listen_port"],
+        ["each.value.listen_port"],
+        referenced_security_group_refs=ac_candidate,
+    )
+    add_rule(
+        "ac",
+        "aws_vpc_security_group_ingress_rule",
+        "server_matched_cohort_internal",
+        "count",
+        count,
+        ["var.server_security_group_id"],
+        "udp",
+        checker.EXPECTED_NHP_SERVER_PORT,
+        checker.EXPECTED_NHP_SERVER_PORT,
+        referenced_security_group_refs=ac,
+    )
+    add_rule(
+        "compute",
+        "aws_vpc_security_group_ingress_rule",
+        "server_candidate_nlb",
+        "for_each",
+        smoke,
+        server_candidate,
+        "udp",
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        cidr_refs=["each.value"],
+    )
+    add_rule(
+        "compute",
+        "aws_vpc_security_group_egress_rule",
+        "server_candidate_nlb_udp",
+        "count",
+        count,
+        server_candidate,
+        "udp",
+        checker.EXPECTED_NHP_SERVER_PORT,
+        checker.EXPECTED_NHP_SERVER_PORT,
+        referenced_security_group_refs=server,
+    )
+    add_rule(
+        "compute",
+        "aws_vpc_security_group_egress_rule",
+        "server_candidate_nlb_health",
+        "count",
+        count,
+        server_candidate,
+        "tcp",
+        checker.EXPECTED_SERVER_HEALTH_PORT,
+        checker.EXPECTED_SERVER_HEALTH_PORT,
+        referenced_security_group_refs=server,
+    )
+    add_rule(
+        "compute",
+        "aws_vpc_security_group_ingress_rule",
+        "server_candidate_target",
+        "count",
+        count,
+        server,
+        "udp",
+        checker.EXPECTED_NHP_SERVER_PORT,
+        checker.EXPECTED_NHP_SERVER_PORT,
+        referenced_security_group_refs=server_candidate,
+    )
+    add_rule(
+        "compute",
+        "aws_vpc_security_group_ingress_rule",
+        "server_candidate_health",
+        "count",
+        count,
+        server,
+        "tcp",
+        checker.EXPECTED_SERVER_HEALTH_PORT,
+        checker.EXPECTED_SERVER_HEALTH_PORT,
+        referenced_security_group_refs=server_candidate,
+    )
+    add_rule(
+        "relay",
+        "aws_vpc_security_group_ingress_rule",
+        "alb_candidate_https",
+        "for_each",
+        smoke,
+        relay_candidate,
+        "tcp",
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        checker.EXPECTED_NHP_CLIENT_EDGE_PORT,
+        cidr_refs=["each.value"],
+    )
+    add_rule(
+        "relay",
+        "aws_vpc_security_group_egress_rule",
+        "relay_candidate_alb_to_relay",
+        "count",
+        count,
+        relay_candidate,
+        "tcp",
+        ["var.listen_port"],
+        ["var.listen_port"],
+        referenced_security_group_refs=relay,
+    )
+    add_rule(
+        "relay",
+        "aws_vpc_security_group_ingress_rule",
+        "relay_candidate_from_alb",
+        "count",
+        count,
+        relay,
+        "tcp",
+        ["var.listen_port"],
+        ["var.listen_port"],
+        referenced_security_group_refs=relay_candidate,
+    )
+    return plan
+
+
 def source_fence_migration_plan() -> dict[str, Any]:
     """Return the exact one-time legacy-to-fenced boundary transition."""
     plan = source_fenced_plan()
@@ -3458,6 +3750,280 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 fenced, require_udp_source_fenced_topology=True
             ),
         )
+
+    def test_exact_dormant_matched_cohort_sg_configuration_passes(self) -> None:
+        self.assertEqual(
+            [],
+            checker.validate_plan(
+                matched_cohort_sg_plan(),
+                require_udp_source_fenced_topology=True,
+            ),
+        )
+
+    def test_matched_cohort_sg_configuration_rejects_every_missing_rule(
+        self,
+    ) -> None:
+        baseline = matched_cohort_sg_plan()
+        for module_name in ("ac", "compute", "relay"):
+            resources = baseline["configuration"]["root_module"]["module_calls"][
+                "nhp"
+            ]["module"]["module_calls"][module_name]["module"]["resources"]
+            cohort_rules = [
+                (str(item.get("type")), str(item.get("name")))
+                for item in resources
+                if "matched_cohort_count" in checker.references(item)
+                or "enable_matched_cohort_canary" in checker.references(item)
+            ]
+            for resource_type, name in cohort_rules:
+                with self.subTest(module=module_name, resource=name):
+                    plan = copy.deepcopy(baseline)
+                    configured = plan["configuration"]["root_module"][
+                        "module_calls"
+                    ]["nhp"]["module"]["module_calls"][module_name]["module"]
+                    configured["resources"] = [
+                        item
+                        for item in configured["resources"]
+                        if not (
+                            item.get("type") == resource_type
+                            and item.get("name") == name
+                        )
+                    ]
+                    errors = checker.validate_plan(
+                        plan, require_udp_source_fenced_topology=True
+                    )
+                    self.assertTrue(
+                        any(
+                            "exact complete 16-rule and three-SG graph" in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+
+    def test_matched_cohort_sg_configuration_rejects_extra_rule(self) -> None:
+        plan = matched_cohort_sg_plan()
+        ac_resources = plan["configuration"]["root_module"]["module_calls"][
+            "nhp"
+        ]["module"]["module_calls"]["ac"]["module"]["resources"]
+        ac_resources.append(
+            config_resource(
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_backdoor",
+                {
+                    "count": {"references": ["local.matched_cohort_count"]},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.ac_candidate_nlb[0].id",
+                            "aws_security_group.ac_candidate_nlb[0]",
+                            "aws_security_group.ac_candidate_nlb",
+                        ]
+                    },
+                    "ip_protocol": {"constant_value": "tcp"},
+                    "from_port": {"constant_value": 1},
+                    "to_port": {"constant_value": 65535},
+                    "cidr_ipv4": {"constant_value": "0.0.0.0/0"},
+                },
+            )
+        )
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "exact complete 16-rule and three-SG graph" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        plan = matched_cohort_sg_plan()
+        relay_resources = plan["configuration"]["root_module"]["module_calls"][
+            "nhp"
+        ]["module"]["module_calls"]["relay"]["module"]["resources"]
+        relay_resources.append(
+            config_resource(
+                "aws_vpc_security_group_egress_rule",
+                "relay_candidate_shadow",
+                {
+                    "count": {"constant_value": 0},
+                    "security_group_id": {
+                        "references": [
+                            "aws_security_group.relay_candidate_alb[0].id",
+                            "aws_security_group.relay_candidate_alb[0]",
+                            "aws_security_group.relay_candidate_alb",
+                        ]
+                    },
+                    "ip_protocol": {"constant_value": "tcp"},
+                    "from_port": {"constant_value": 1},
+                    "to_port": {"constant_value": 65535},
+                    "cidr_ipv4": {"constant_value": "0.0.0.0/0"},
+                },
+            )
+        )
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "exact complete 16-rule and three-SG graph" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        plan = matched_cohort_sg_plan()
+        compute_resources = plan["configuration"]["root_module"]["module_calls"][
+            "nhp"
+        ]["module"]["module_calls"]["compute"]["module"]["resources"]
+        compute_resources.append(
+            config_resource(
+                "aws_security_group",
+                "server_candidate_shadow",
+                {
+                    "count": {"references": ["local.matched_cohort_count"]},
+                    "vpc_id": {"references": ["var.vpc_id"]},
+                    "revoke_rules_on_delete": {"constant_value": True},
+                },
+            )
+        )
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any(
+                "exact complete 16-rule and three-SG graph" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_matched_cohort_sg_configuration_rejects_each_boundary_mutation(
+        self,
+    ) -> None:
+        baseline = matched_cohort_sg_plan()
+        identities: list[tuple[str, str, str]] = []
+        for module_name in ("ac", "compute", "relay"):
+            resources = baseline["configuration"]["root_module"]["module_calls"][
+                "nhp"
+            ]["module"]["module_calls"][module_name]["module"]["resources"]
+            identities.extend(
+                (module_name, str(item.get("type")), str(item.get("name")))
+                for item in resources
+                if item.get("type") in checker.SG_RULE_RESOURCE_TYPES
+                and (
+                    "matched_cohort_count" in checker.references(item)
+                    or "enable_matched_cohort_canary" in checker.references(item)
+                )
+            )
+
+        def mutate_expression(
+            configured: dict[str, Any], field: str, value: dict[str, Any]
+        ) -> None:
+            configured.setdefault("expressions", {})[field] = value
+
+        for module_name, resource_type, name in identities:
+            mutations = {
+                "control": lambda item: item.update(
+                    {
+                        (
+                            "count_expression"
+                            if "count_expression" in item
+                            else "for_each_expression"
+                        ): {"references": ["var.unreviewed_enable"]}
+                    }
+                ),
+                "security_group": lambda item: mutate_expression(
+                    item,
+                    "security_group_id",
+                    {"references": ["aws_security_group.unreviewed.id"]},
+                ),
+                "protocol": lambda item: mutate_expression(
+                    item, "ip_protocol", {"constant_value": "-1"}
+                ),
+                "from_port": lambda item: mutate_expression(
+                    item, "from_port", {"constant_value": 1}
+                ),
+                "to_port": lambda item: mutate_expression(
+                    item, "to_port", {"constant_value": 65535}
+                ),
+                "source": lambda item: mutate_expression(
+                    item,
+                    (
+                        "cidr_ipv4"
+                        if "cidr_ipv4" in (item.get("expressions") or {})
+                        else "referenced_security_group_id"
+                    ),
+                    {"constant_value": "0.0.0.0/0"},
+                ),
+                "ipv6": lambda item: mutate_expression(
+                    item, "cidr_ipv6", {"constant_value": "::/0"}
+                ),
+            }
+            for label, mutation in mutations.items():
+                with self.subTest(module=module_name, resource=name, mutation=label):
+                    plan = copy.deepcopy(baseline)
+                    configured = configured_resource(
+                        plan, module_name, resource_type, name
+                    )
+                    mutation(configured)
+                    errors = checker.validate_plan(
+                        plan, require_udp_source_fenced_topology=True
+                    )
+                    self.assertTrue(
+                        any(
+                            "must retain its exact control" in error
+                            or "exact complete 16-rule and three-SG graph" in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+
+    def test_matched_cohort_candidate_sgs_reject_every_authority_mutation(
+        self,
+    ) -> None:
+        baseline = matched_cohort_sg_plan()
+        identities = (
+            ("ac", "ac_candidate_nlb"),
+            ("compute", "server_candidate_nlb"),
+            ("relay", "relay_candidate_alb"),
+        )
+        for module_name, name in identities:
+            mutations = {
+                "count": lambda item: item.update(
+                    {
+                        "count_expression": {
+                            "references": ["var.enable_matched_cohort_canary"]
+                        }
+                    }
+                ),
+                "vpc": lambda item: item["expressions"].update(
+                    {"vpc_id": {"references": ["var.unreviewed_vpc_id"]}}
+                ),
+                "revoke": lambda item: item["expressions"].update(
+                    {"revoke_rules_on_delete": {"constant_value": False}}
+                ),
+                "inline_ingress": lambda item: item["expressions"].update(
+                    {"ingress": {"constant_value": []}}
+                ),
+                "inline_egress": lambda item: item["expressions"].update(
+                    {"egress": {"constant_value": []}}
+                ),
+            }
+            for label, mutation in mutations.items():
+                with self.subTest(module=module_name, mutation=label):
+                    plan = copy.deepcopy(baseline)
+                    configured = configured_resource(
+                        plan, module_name, "aws_security_group", name
+                    )
+                    mutation(configured)
+                    errors = checker.validate_plan(
+                        plan, require_udp_source_fenced_topology=True
+                    )
+                    self.assertTrue(
+                        any(
+                            "standalone-rule authority" in error for error in errors
+                        ),
+                        errors,
+                    )
 
     def test_in_vpc_ac_rule_is_required_by_the_fenced_topology(self) -> None:
         """Dropping the rule reds the contract, so the AC path cannot silently go.
