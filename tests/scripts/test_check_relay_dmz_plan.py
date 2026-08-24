@@ -2714,9 +2714,9 @@ def matched_cohort_sg_plan() -> dict[str, Any]:
         frps_smoke,
         ac_candidate,
         "tcp",
-        ["each.value.port"],
-        ["each.value.port"],
-        cidr_refs=["each.value.cidr"],
+        ["each.value.port", "each.value"],
+        ["each.value.port", "each.value"],
+        cidr_refs=["each.value.cidr", "each.value"],
     )
     add_rule(
         "ac",
@@ -2738,8 +2738,8 @@ def matched_cohort_sg_plan() -> dict[str, Any]:
         frps,
         ac_candidate,
         "tcp",
-        ["each.value.listen_port"],
-        ["each.value.listen_port"],
+        ["each.value.listen_port", "each.value"],
+        ["each.value.listen_port", "each.value"],
         referenced_security_group_refs=ac,
     )
     add_rule(
@@ -2774,8 +2774,8 @@ def matched_cohort_sg_plan() -> dict[str, Any]:
         frps,
         ac,
         "tcp",
-        ["each.value.listen_port"],
-        ["each.value.listen_port"],
+        ["each.value.listen_port", "each.value"],
+        ["each.value.listen_port", "each.value"],
         referenced_security_group_refs=ac_candidate,
     )
     add_rule(
@@ -3758,6 +3758,113 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 matched_cohort_sg_plan(),
                 require_udp_source_fenced_topology=True,
             ),
+        )
+
+    def test_matched_cohort_frps_leaf_references_require_exact_terraform_traversal_closure(
+        self,
+    ) -> None:
+        baseline = matched_cohort_sg_plan()
+        expressions = (
+            (
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_nlb_frps",
+                "from_port",
+                "each.value.port",
+            ),
+            (
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_nlb_frps",
+                "to_port",
+                "each.value.port",
+            ),
+            (
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_nlb_frps",
+                "cidr_ipv4",
+                "each.value.cidr",
+            ),
+            (
+                "aws_vpc_security_group_egress_rule",
+                "ac_candidate_nlb_frps",
+                "from_port",
+                "each.value.listen_port",
+            ),
+            (
+                "aws_vpc_security_group_egress_rule",
+                "ac_candidate_nlb_frps",
+                "to_port",
+                "each.value.listen_port",
+            ),
+            (
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_target_frps",
+                "from_port",
+                "each.value.listen_port",
+            ),
+            (
+                "aws_vpc_security_group_ingress_rule",
+                "ac_candidate_target_frps",
+                "to_port",
+                "each.value.listen_port",
+            ),
+        )
+        mutations = {
+            "missing_parent": lambda leaf: [leaf],
+            "missing_leaf": lambda _leaf: ["each.value"],
+            "sibling_leaf": lambda _leaf: [
+                "each.value",
+                "each.value.unreviewed",
+            ],
+            "extra_sibling_leaf": lambda leaf: [
+                "each.value",
+                leaf,
+                "each.value.unreviewed",
+            ],
+            "generic_each": lambda leaf: ["each", "each.value", leaf],
+        }
+        for resource_type, name, field, leaf in expressions:
+            configured = configured_resource(baseline, "ac", resource_type, name)
+            self.assertEqual(
+                {"each.value", leaf},
+                checker.references(configured["expressions"][field]),
+            )
+            for mutation_name, mutation in mutations.items():
+                with self.subTest(
+                    resource=name, field=field, mutation=mutation_name
+                ):
+                    plan = copy.deepcopy(baseline)
+                    configured = configured_resource(
+                        plan, "ac", resource_type, name
+                    )
+                    configured["expressions"][field] = {
+                        "references": mutation(leaf)
+                    }
+                    errors = checker.validate_plan(
+                        plan, require_udp_source_fenced_topology=True
+                    )
+                    self.assertTrue(
+                        any("must retain its exact control" in error for error in errors),
+                        errors,
+                    )
+
+    def test_matched_cohort_traversal_parent_is_not_accepted_outside_frps_leaves(
+        self,
+    ) -> None:
+        plan = matched_cohort_sg_plan()
+        configured = configured_resource(
+            plan,
+            "ac",
+            "aws_vpc_security_group_ingress_rule",
+            "ac_candidate_nlb",
+        )
+        configured["expressions"]["cidr_ipv4"] = {
+            "references": ["each.value", "each.value.cidr"]
+        }
+        errors = checker.validate_plan(
+            plan, require_udp_source_fenced_topology=True
+        )
+        self.assertTrue(
+            any("must retain its exact control" in error for error in errors), errors
         )
 
     def test_matched_cohort_sg_configuration_rejects_every_missing_rule(
