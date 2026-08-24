@@ -22,6 +22,11 @@ variables {
 run "session_control_authority_is_durable_and_narrow" {
   command = apply
 
+  variables {
+    deploy_qurl_tables = true
+    kms_key_arn        = "arn:aws:kms:us-east-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+  }
+
   assert {
     condition = (
       aws_dynamodb_table.session_control.name == "layerv-nhp-sandbox-cell0-nhp-session-control" &&
@@ -129,7 +134,53 @@ run "session_control_authority_is_durable_and_narrow" {
       ]).Action,
       "dynamodb:DeleteItem",
     )
-    error_message = "Server authority must not delete durable rows; completion is an explicit state transition and TTL is post-convergence retention only."
+    error_message = "The general server authority statement must not delete durable rows; terminal-close delete authority is a separate partition-fenced statement."
+  }
+
+  assert {
+    condition = (
+      one([
+        for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+        if statement.Sid == "DynamoDBSessionControlTerminalCloseDelete"
+        ]) == {
+        Sid      = "DynamoDBSessionControlTerminalCloseDelete"
+        Effect   = "Allow"
+        Action   = ["dynamodb:DeleteItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = [
+              "ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153",
+              "EVENT#*",
+            ]
+          }
+          "ForAnyValue:StringEquals" = {
+            "dynamodb:EnclosingOperation" = ["TransactWriteItems"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      }
+    )
+    error_message = "Sandbox cell0 terminal close must receive DeleteItem only inside TransactWriteItems for its exact ACTIVE partition and EVENT work partitions on the exact session-control table."
+  }
+
+  assert {
+    condition = [
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement.Sid
+      ] == [
+      "DynamoDBReadAccess",
+      "DynamoDBWriteACAssignments",
+      "DynamoDBAckTokenReadWrite",
+      "DynamoDBSessionControlAuthority",
+      "DynamoDBSessionControlDueIndex",
+      "DynamoDBSessionControlTerminalCloseDelete",
+      "DynamoDBQurlAgentKeysGetItem",
+      "DynamoDBQurlAgentKeysPubkeyIndexQuery",
+      "KMSReadAndServerWrite",
+    ]
+    error_message = "The incident helper and Terraform must derive the same ordered managed-policy document so the next ordinary plan is a no-op."
   }
 }
 
@@ -146,5 +197,31 @@ run "production_protects_session_control_from_delete" {
       aws_dynamodb_table.session_control.point_in_time_recovery[0].enabled
     )
     error_message = "Production session-control authority requires deletion protection and point-in-time recovery."
+  }
+
+  assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DynamoDBSessionControlTerminalCloseDelete"
+    ]) == 0
+    error_message = "The attended sandbox incident permission must never appear in the production server policy."
+  }
+}
+
+run "other_cells_do_not_receive_incident_delete_authority" {
+  command = apply
+
+  variables {
+    environment = "sandbox-cell1"
+    name_prefix = "layerv-nhp-sandbox-cell1"
+    cell_id     = "cell1"
+  }
+
+  assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DynamoDBSessionControlTerminalCloseDelete"
+    ]) == 0
+    error_message = "The attended sandbox cell0 incident permission must not widen to another cell."
   }
 }

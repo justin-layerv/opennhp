@@ -42,6 +42,13 @@ const (
 	sandboxStaleTargetRuntimeBuildAttempt   = "1"
 	sandboxStaleTargetRuntimeServerDigest   = "sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9"
 	sandboxStaleTargetRuntimeACDigest       = "sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e"
+	sandboxIAMHandoffPredecessorSHA         = "e668a60b81f14b55278c83d0c79e4f760adeac29"
+	sandboxIAMHandoffCell0PriorRefreshID    = "ea9dae3d-22f8-478e-a9ec-91eb9b9f53fb"
+	sandboxIAMHandoffCell0RefreshID         = "771e74d1-3299-4c03-b7f4-6fdb3b11e6bd"
+	sandboxIAMHandoffCell0IntentSHA256      = "f8d70d3357b301c55f806d34e3d70d0f1f7706999fc2d08d8e5c87fe627b5d50"
+	sandboxIAMHandoffCell1PriorRefreshID    = "dc5ab358-ef4e-45a8-bf81-d18112a2ce9c"
+	sandboxIAMHandoffCell1RefreshID         = "8f88f6af-4f02-4f03-8ac9-c6c62fdcb051"
+	sandboxIAMHandoffCell1IntentSHA256      = "0765d6c4bdb0940be956b253156d192b9761c90e2fec175d4300b167912174d0"
 	sandboxStaleTargetSourceStateVersion    = "22"
 	sandboxStaleTargetSourceStateSHA256     = "b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5d19e75f45ef348"
 	sandboxStaleTargetJournalDecodedLimit   = 64 * 1024
@@ -572,6 +579,48 @@ type sandboxStaleTargetRuntimeComponent struct {
 	RefreshID      string `json:"refresh_id"`
 }
 
+type sandboxSessionControlDeleteIAMIntent struct {
+	Action                string   `json:"action"`
+	AttachedRole          string   `json:"attached_role"`
+	AttachedRoleID        string   `json:"attached_role_id"`
+	BeforeDefaultVersion  string   `json:"before_default_version"`
+	BeforePolicySHA256    string   `json:"before_policy_sha256"`
+	BeforeVersions        []string `json:"before_versions"`
+	DesiredDefaultVersion string   `json:"desired_default_version"`
+	DesiredPolicySHA256   string   `json:"desired_policy_sha256"`
+	DesiredVersions       []string `json:"desired_versions"`
+	EnclosingOperation    string   `json:"enclosing_operation"`
+	LeadingKeys           []string `json:"leading_keys"`
+	PolicyARN             string   `json:"policy_arn"`
+	PolicyID              string   `json:"policy_id"`
+	PolicyName            string   `json:"policy_name"`
+	PolicyPath            string   `json:"policy_path"`
+	PruneVersion          string   `json:"prune_version"`
+	Schema                string   `json:"schema"`
+	TableARN              string   `json:"table_arn"`
+}
+
+type sandboxSessionControlDeleteIAMReceipt struct {
+	Action             string   `json:"action"`
+	AttachedRole       string   `json:"attached_role"`
+	AttachedRoleID     string   `json:"attached_role_id"`
+	DefaultVersion     string   `json:"default_version"`
+	EnclosingOperation string   `json:"enclosing_operation"`
+	LeadingKeys        []string `json:"leading_keys"`
+	PolicyARN          string   `json:"policy_arn"`
+	PolicyID           string   `json:"policy_id"`
+	PolicySHA256       string   `json:"policy_sha256"`
+	Schema             string   `json:"schema"`
+	TableARN           string   `json:"table_arn"`
+	Versions           []string `json:"versions"`
+}
+
+type sandboxSessionControlDeleteIAMAuthority struct {
+	Intent  sandboxSessionControlDeleteIAMIntent   `json:"intent"`
+	Receipt *sandboxSessionControlDeleteIAMReceipt `json:"receipt"`
+	Status  string                                 `json:"status"`
+}
+
 type sandboxStaleTargetJournalTarget struct {
 	FenceSHA256 string                               `json:"fence_sha256"`
 	ID          string                               `json:"id"`
@@ -580,21 +629,23 @@ type sandboxStaleTargetJournalTarget struct {
 }
 
 type sandboxStaleTargetJournalRuntime struct {
-	AC                    sandboxStaleTargetRuntimeComponent   `json:"ac"`
-	ACProvenance          string                               `json:"ac_provenance"`
-	BuildRunAttempt       string                               `json:"build_run_attempt"`
-	BuildRunID            string                               `json:"build_run_id"`
-	Cell0                 sandboxStaleTargetRuntimeComponent   `json:"cell0"`
-	Cell1                 sandboxStaleTargetRuntimeComponent   `json:"cell1"`
-	FenceDrain            SandboxFenceDirectoryRecoveryReceipt `json:"fence_drain"`
-	FenceStart            SandboxFenceDirectoryRecoveryReceipt `json:"fence_start"`
-	PredecessorPlan       SandboxStaleTargetRetirementPlan     `json:"predecessor_plan"`
-	PredecessorPlanSHA256 string                               `json:"predecessor_plan_sha256"`
-	PredecessorTargets    []sandboxStaleTargetJournalTarget    `json:"predecessor_targets"`
-	Preferences           sandboxStaleTargetRefreshPreferences `json:"preferences"`
-	RuntimeManifest       string                               `json:"runtime_manifest"`
-	ServerProvenance      string                               `json:"server_provenance"`
-	SourceSHA             string                               `json:"source_sha"`
+	AC                           sandboxStaleTargetRuntimeComponent       `json:"ac"`
+	ACProvenance                 string                                   `json:"ac_provenance"`
+	BuildRunAttempt              string                                   `json:"build_run_attempt"`
+	BuildRunID                   string                                   `json:"build_run_id"`
+	Cell0                        sandboxStaleTargetRuntimeComponent       `json:"cell0"`
+	Cell1                        sandboxStaleTargetRuntimeComponent       `json:"cell1"`
+	FenceDrain                   SandboxFenceDirectoryRecoveryReceipt     `json:"fence_drain"`
+	FenceStart                   SandboxFenceDirectoryRecoveryReceipt     `json:"fence_start"`
+	PredecessorPlan              SandboxStaleTargetRetirementPlan         `json:"predecessor_plan"`
+	PredecessorPlanSHA256        string                                   `json:"predecessor_plan_sha256"`
+	PredecessorTargets           []sandboxStaleTargetJournalTarget        `json:"predecessor_targets"`
+	Preferences                  sandboxStaleTargetRefreshPreferences     `json:"preferences"`
+	RuntimeManifest              string                                   `json:"runtime_manifest"`
+	ServerProvenance             string                                   `json:"server_provenance"`
+	ServerRefreshOrchestratorSHA string                                   `json:"server_refresh_orchestrator_sha"`
+	SessionControlIAM            *sandboxSessionControlDeleteIAMAuthority `json:"session_control_delete_iam"`
+	SourceSHA                    string                                   `json:"source_sha"`
 }
 
 type sandboxStaleTargetJournal struct {
@@ -792,15 +843,79 @@ func sandboxStaleTargetLedgerObjectIsClosed(value any) bool {
 	return true
 }
 
+func sandboxStringsEqual(actual []string, expected ...string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sandboxSessionControlDeleteIAMObjectIsClosed(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok || !sandboxExactObjectKeys(object, "intent", "receipt", "status") ||
+		!sandboxExactObjectKeys(object["intent"], "action", "attached_role", "attached_role_id",
+			"before_default_version", "before_policy_sha256", "before_versions", "desired_default_version",
+			"desired_policy_sha256", "desired_versions", "enclosing_operation", "leading_keys", "policy_arn", "policy_id",
+			"policy_name", "policy_path", "prune_version", "schema", "table_arn") ||
+		!sandboxExactObjectKeys(object["receipt"], "action", "attached_role", "attached_role_id",
+			"default_version", "enclosing_operation", "leading_keys", "policy_arn", "policy_id", "policy_sha256", "schema",
+			"table_arn", "versions") {
+		return false
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return false
+	}
+	var authority sandboxSessionControlDeleteIAMAuthority
+	if err := json.Unmarshal(encoded, &authority); err != nil || authority.Status != "ready" || authority.Receipt == nil {
+		return false
+	}
+	intent := authority.Intent
+	receipt := authority.Receipt
+	if intent.Schema != "layerv.durable-aop-session-control-delete-iam-intent.v1" ||
+		intent.PolicyARN != "arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read" ||
+		intent.PolicyID != "ANPA3FLD2UT65P2XBQDPY" || intent.PolicyName != "layerv-nhp-sandbox-dynamodb-read" ||
+		intent.PolicyPath != "/" || intent.AttachedRole != "layerv-nhp-sandbox-server" ||
+		intent.AttachedRoleID != "AROA3FLD2UT64E3ZXY7UH" ||
+		intent.TableARN != "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control" ||
+		intent.Action != "dynamodb:DeleteItem" || intent.EnclosingOperation != "TransactWriteItems" ||
+		!sandboxStringsEqual(intent.LeadingKeys,
+			"ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153", "EVENT#*") ||
+		intent.BeforeDefaultVersion != "v8" ||
+		!sandboxStringsEqual(intent.BeforeVersions, "v4", "v5", "v6", "v7", "v8") ||
+		intent.BeforePolicySHA256 != "5c7a320579ae3651861e16014816358eca255e42159e6bcfbe9ea181a29c4073" ||
+		intent.PruneVersion != "v4" || intent.DesiredDefaultVersion != "v9" ||
+		!sandboxStringsEqual(intent.DesiredVersions, "v5", "v6", "v7", "v8", "v9") ||
+		intent.DesiredPolicySHA256 != "c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1" {
+		return false
+	}
+	return receipt.Schema == "layerv.durable-aop-session-control-delete-iam-receipt.v1" &&
+		receipt.PolicyARN == intent.PolicyARN && receipt.PolicyID == intent.PolicyID &&
+		receipt.AttachedRole == intent.AttachedRole && receipt.AttachedRoleID == intent.AttachedRoleID &&
+		receipt.TableARN == intent.TableARN && receipt.Action == intent.Action &&
+		receipt.EnclosingOperation == intent.EnclosingOperation &&
+		sandboxStringsEqual(receipt.LeadingKeys, intent.LeadingKeys...) &&
+		receipt.DefaultVersion == intent.DesiredDefaultVersion &&
+		sandboxStringsEqual(receipt.Versions, intent.DesiredVersions...) &&
+		receipt.PolicySHA256 == intent.DesiredPolicySHA256
+}
+
 func sandboxStaleTargetJournalObjectIsClosed(root map[string]any) bool {
 	runtime, ok := root["runtime"].(map[string]any)
 	if !ok || !sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
 		"cell0", "cell1", "fence_drain", "fence_start", "predecessor_plan", "predecessor_plan_sha256",
-		"predecessor_targets", "preferences", "runtime_manifest", "server_provenance", "source_sha") ||
+		"predecessor_targets", "preferences", "runtime_manifest", "server_provenance",
+		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha") ||
 		!sandboxStaleTargetPlanObjectIsClosed(root["incident_plan"]) ||
 		!sandboxStaleTargetLedgerObjectIsClosed(root["incident_targets"]) ||
 		!sandboxStaleTargetPlanObjectIsClosed(runtime["predecessor_plan"]) ||
 		!sandboxStaleTargetLedgerObjectIsClosed(runtime["predecessor_targets"]) ||
+		!sandboxSessionControlDeleteIAMObjectIsClosed(runtime["session_control_delete_iam"]) ||
 		!sandboxExactObjectKeys(runtime["preferences"], "InstanceWarmup", "MaxHealthyPercentage",
 			"MinHealthyPercentage", "SkipMatching") {
 		return false
@@ -907,6 +1022,19 @@ func sandboxValidateRuntimeComponent(component sandboxStaleTargetRuntimeComponen
 	return hex.EncodeToString(hasher.Sum(nil)) == component.IntentSHA256
 }
 
+func sandboxValidateServerRefreshOrchestrator(runtime sandboxStaleTargetJournalRuntime, current string) bool {
+	if runtime.ServerRefreshOrchestratorSHA == current {
+		return sandboxExactHex(current, 20)
+	}
+	return runtime.ServerRefreshOrchestratorSHA == sandboxIAMHandoffPredecessorSHA &&
+		runtime.Cell0.PriorRefreshID == sandboxIAMHandoffCell0PriorRefreshID &&
+		runtime.Cell0.RefreshID == sandboxIAMHandoffCell0RefreshID &&
+		runtime.Cell0.IntentSHA256 == sandboxIAMHandoffCell0IntentSHA256 &&
+		runtime.Cell1.PriorRefreshID == sandboxIAMHandoffCell1PriorRefreshID &&
+		runtime.Cell1.RefreshID == sandboxIAMHandoffCell1RefreshID &&
+		runtime.Cell1.IntentSHA256 == sandboxIAMHandoffCell1IntentSHA256
+}
+
 func sandboxValidateRetirementReceipt(receipt *SandboxStaleTargetRetirementReceipt, targetID string,
 	fence sessionControlTargetFence,
 ) bool {
@@ -1004,11 +1132,12 @@ func sandboxResolveJournaledPredecessorFence(stateSnapshot, currentJournalSnapsh
 		runtime.ACProvenance != "v1|"+sandboxStaleTargetRuntimeSourceSHA+"|layerv/nhp-ac|"+sandboxStaleTargetRuntimeACDigest ||
 		runtime.Preferences != (sandboxStaleTargetRefreshPreferences{InstanceWarmup: 60, MaxHealthyPercentage: 200,
 			MinHealthyPercentage: 100, SkipMatching: false}) ||
+		!sandboxValidateServerRefreshOrchestrator(runtime, state.Repair.OrchestratorSHA) ||
 		!sandboxValidateStartingDirectoryReceipt(runtime.FenceStart) || !sandboxValidateDirectoryReceipt(runtime.FenceDrain, "0") ||
 		!sandboxValidateRuntimeComponent(runtime.Cell0, "cell0", "layerv-nhp-sandbox-server", runtime.ServerProvenance,
-			state.Repair.OrchestratorSHA, "-") ||
+			runtime.ServerRefreshOrchestratorSHA, "-") ||
 		!sandboxValidateRuntimeComponent(runtime.Cell1, "cell1", "layerv-nhp-sandbox-cell1-server-green", runtime.ServerProvenance,
-			state.Repair.OrchestratorSHA, "-") ||
+			runtime.ServerRefreshOrchestratorSHA, "-") ||
 		!sandboxValidateRuntimeComponent(runtime.AC, "ac", "layerv-nhp-sandbox-ac-green", runtime.ACProvenance,
 			state.Repair.OrchestratorSHA, runtime.PredecessorPlanSHA256) {
 		return sessionControlTargetFence{}, errors.New("stale-target journal runtime authority drifted")

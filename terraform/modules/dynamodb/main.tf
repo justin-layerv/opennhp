@@ -555,7 +555,40 @@ resource "aws_iam_policy" "dynamodb_read" {
         Action   = ["dynamodb:Query"]
         Resource = "${aws_dynamodb_table.session_control.arn}/index/due-index"
       }
-      ], var.deploy_qurl_tables ? [
+      ], var.environment == "sandbox" && var.cell_id == "cell0" ? [
+      {
+        # Terminal exact close deletes the cell-scoped ACTIVE row and, for a
+        # normal close, the completed EVENT#<event-hash>/WORK row in one
+        # transaction. AWS documents that each TransactWriteItems Delete is
+        # authorized as its underlying DeleteItem, and LeadingKeys is that
+        # item's first partition key. Non-delete CONTROL/SESSION/EVENT members
+        # are therefore evaluated under their own Put/Update/ConditionCheck
+        # actions, not added to this DeleteItem key set:
+        # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
+        # https://docs.aws.amazon.com/service-authorization/latest/reference/list_dynamodb.html
+        # IAM cannot require both delete keys or constrain the EVENT sort key,
+        # but this excludes direct DeleteItem, every other partition namespace,
+        # and every other cell's ACTIVE partition.
+        Sid      = "DynamoDBSessionControlTerminalCloseDelete"
+        Effect   = "Allow"
+        Action   = ["dynamodb:DeleteItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = [
+              "ACTIVE#${sha256(var.cell_id)}",
+              "EVENT#*",
+            ]
+          }
+          "ForAnyValue:StringEquals" = {
+            "dynamodb:EnclosingOperation" = ["TransactWriteItems"]
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      }
+      ] : [], var.deploy_qurl_tables ? [
       {
         Sid      = "DynamoDBQurlAgentKeysGetItem"
         Effect   = "Allow"

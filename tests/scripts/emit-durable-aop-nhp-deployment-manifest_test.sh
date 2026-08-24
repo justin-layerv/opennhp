@@ -26,6 +26,7 @@ export REPAIR RECOVERY LIVE_SOURCE SERVER_DIGEST AC_DIGEST
 export LIVE_SERVER_SELECTOR=${LIVE_SOURCE}@${SERVER_DIGEST}
 export LIVE_AC_SELECTOR=${LIVE_SOURCE}@${AC_DIGEST}
 export FAKE_OWNER_ACTIONS=$WORK/owner-actions
+export FAKE_IAM_ACTIONS=$WORK/iam-actions
 (cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 \
   go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/incident-plan.json"
 [[ "$(printf '%s' "$(jq -cS . "$WORK/incident-plan.json")" | sha256sum | awk '{print $1}')" == \
@@ -135,6 +136,43 @@ jq -e --arg repair "$REPAIR" '
 printf 'verify\n' >>"$FAKE_OWNER_ACTIONS"
 jq -r .expected_row_sha256 <<<"$intent"
 EOF
+cat >"$WORK/helpers/delete-iam" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${FAKE_IAM_VERIFY_FAIL:-}" != true ]] || exit 1
+[[ "$1" == verify && "$2" == --intent-json ]]
+intent=$3
+jq -e '
+  (keys | sort) == ["action","attached_role","attached_role_id","before_default_version","before_policy_sha256",
+    "before_versions","desired_default_version","desired_policy_sha256","desired_versions","enclosing_operation","leading_keys",
+    "policy_arn","policy_id","policy_name","policy_path","prune_version","schema","table_arn"] and
+  .schema == "layerv.durable-aop-session-control-delete-iam-intent.v1" and
+  .policy_arn == "arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read" and
+  .policy_id == "ANPA3FLD2UT65P2XBQDPY" and .policy_name == "layerv-nhp-sandbox-dynamodb-read" and
+  .policy_path == "/" and .attached_role == "layerv-nhp-sandbox-server" and
+  .attached_role_id == "AROA3FLD2UT64E3ZXY7UH" and
+  .table_arn == "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control" and
+  .action == "dynamodb:DeleteItem" and .enclosing_operation == "TransactWriteItems" and
+  .leading_keys == ["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"] and
+  .before_default_version == "v8" and .before_versions == ["v4","v5","v6","v7","v8"] and
+  .before_policy_sha256 == "5c7a320579ae3651861e16014816358eca255e42159e6bcfbe9ea181a29c4073" and
+  .prune_version == "v4" and .desired_default_version == "v9" and
+  .desired_versions == ["v5","v6","v7","v8","v9"] and
+  .desired_policy_sha256 == "c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"
+' >/dev/null <<<"$intent"
+printf 'verify\n' >>"$FAKE_IAM_ACTIONS"
+jq -cn '
+  {schema:"layerv.durable-aop-session-control-delete-iam-receipt.v1",
+   policy_arn:"arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read",
+   policy_id:"ANPA3FLD2UT65P2XBQDPY",attached_role:"layerv-nhp-sandbox-server",
+   attached_role_id:"AROA3FLD2UT64E3ZXY7UH",
+   table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+   action:"dynamodb:DeleteItem",enclosing_operation:"TransactWriteItems",
+   leading_keys:["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"],
+   default_version:"v9",versions:["v5","v6","v7","v8","v9"],
+   policy_sha256:"c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"}
+'
+EOF
 chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
 fixture_fence_digest() {
@@ -203,6 +241,7 @@ seed() {
   local live_ac_provenance="v1|${LIVE_SOURCE}|layerv/nhp-ac|${AC_DIGEST}"
   local lock original_state state journal envelope journal_digest incident_plan predecessor_fence predecessor_plan predecessor_plan_digest
   local incident_ledger predecessor_ledger fence_start fence_drain preferences c0_intent c1_intent ac_intent
+  local iam_intent iam_receipt
   original_state=$(jq -cn --arg image "$ORIGINAL" --arg owner "$ORIGINAL_OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
      ac:{old_color:"blue",new_color:"green",old_asg:"layerv-nhp-sandbox-ac",new_asg:"layerv-nhp-sandbox-ac-green",old_min:3,old_max:3,old_desired:3,new_attestation:("v2|durable-aop-v1|"+$image+"|layerv/nhp-ac|sha256:2e38672ef7680c60521694c3f2a59e9a74ed8f2d56bfe1fb41a97f3040b4e279|layerv-nhp-sandbox-ac-green")},
@@ -242,6 +281,28 @@ seed() {
   ac_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     ac layerv-nhp-sandbox-ac-green "$LIVE_SOURCE" 32682520698 1 "$live_ac_provenance" "$RECOVERY" \
     "$preferences" prior-ac "$predecessor_plan_digest" | sha256sum | awk '{print $1}')
+  iam_intent=$(jq -cn '
+    {schema:"layerv.durable-aop-session-control-delete-iam-intent.v1",
+     policy_arn:"arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read",
+     policy_id:"ANPA3FLD2UT65P2XBQDPY",policy_name:"layerv-nhp-sandbox-dynamodb-read",policy_path:"/",
+     attached_role:"layerv-nhp-sandbox-server",attached_role_id:"AROA3FLD2UT64E3ZXY7UH",
+     table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+     action:"dynamodb:DeleteItem",enclosing_operation:"TransactWriteItems",
+     leading_keys:["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"],
+     before_default_version:"v8",before_versions:["v4","v5","v6","v7","v8"],
+     before_policy_sha256:"5c7a320579ae3651861e16014816358eca255e42159e6bcfbe9ea181a29c4073",
+     prune_version:"v4",desired_default_version:"v9",desired_versions:["v5","v6","v7","v8","v9"],
+     desired_policy_sha256:"c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"}')
+  iam_receipt=$(jq -cn '
+    {schema:"layerv.durable-aop-session-control-delete-iam-receipt.v1",
+     policy_arn:"arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read",
+     policy_id:"ANPA3FLD2UT65P2XBQDPY",attached_role:"layerv-nhp-sandbox-server",
+     attached_role_id:"AROA3FLD2UT64E3ZXY7UH",
+     table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+     action:"dynamodb:DeleteItem",enclosing_operation:"TransactWriteItems",
+     leading_keys:["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"],
+     default_version:"v9",versions:["v5","v6","v7","v8","v9"],
+     policy_sha256:"c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"}')
   state=$(jq -cn --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg runtime "$RUNTIME" \
     --arg live_source "$LIVE_SOURCE" --arg live_runtime "$LIVE_RUNTIME" \
     --arg server "$server_provenance" --arg ac "$ac_provenance" \
@@ -251,6 +312,7 @@ seed() {
     --argjson predecessor_ledger "$predecessor_ledger" --argjson fence_start "$fence_start" \
     --argjson fence_drain "$fence_drain" --argjson preferences "$preferences" \
     --arg c0_intent "$c0_intent" --arg c1_intent "$c1_intent" --arg ac_intent "$ac_intent" \
+    --argjson iam_intent "$iam_intent" --argjson iam_receipt "$iam_receipt" \
     --argjson lock "$lock" --arg state_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" '
     {schema:3,phase:"repaired",original:{state_version:7,state_sha256:$state_digest,
       lock:$lock,lock_version:2,lock_sha256:$lock_digest},
@@ -278,6 +340,8 @@ seed() {
           cell0:{asg:"layerv-nhp-sandbox-server",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-server|"+($live_server|split("|")[-1])+"|layerv-nhp-sandbox-server"),prior_refresh_id:"prior-cell0",intent_sha256:$c0_intent,refresh_id:"runtime-cell0"},
           cell1:{asg:"layerv-nhp-sandbox-cell1-server-green",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-server|"+($live_server|split("|")[-1])+"|layerv-nhp-sandbox-cell1-server-green"),prior_refresh_id:"prior-cell1",intent_sha256:$c1_intent,refresh_id:"runtime-cell1"},
           ac:{asg:"layerv-nhp-sandbox-ac-green",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-ac|"+($live_ac|split("|")[-1])+"|layerv-nhp-sandbox-ac-green"),prior_refresh_id:"prior-ac",intent_sha256:$ac_intent,refresh_id:"runtime-ac"},
+          server_refresh_orchestrator_sha:$recovery,
+          session_control_delete_iam:{status:"ready",intent:$iam_intent,receipt:$iam_receipt},
           fence_start:$fence_start,fence_drain:$fence_drain,
           predecessor_plan:$predecessor_plan,predecessor_plan_sha256:$predecessor_digest,
           predecessor_targets:$predecessor_ledger}}}}')
@@ -318,13 +382,16 @@ invoke() {
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance \
     CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify-asg \
     CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
+    CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT=$WORK/helpers/delete-iam \
     "$SCRIPT" 700 2 "$WORK/durable-aop-nhp-deployment.json"
 }
 
 seed
 : >"$FAKE_OWNER_ACTIONS"
+: >"$FAKE_IAM_ACTIONS"
 invoke >/dev/null
 [[ "$(cat "$FAKE_OWNER_ACTIONS")" == verify ]]
+[[ "$(cat "$FAKE_IAM_ACTIONS")" == verify ]]
 jq -e --arg repair "$LIVE_SOURCE" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
   (keys | sort) == ["build","deployments","environment","images","producer","profile","recovery_orchestrator_sha","repair_source_sha","repository","schema"] and
   .schema == "layerv.durable-aop-nhp-deployment.v1" and .repair_source_sha == $repair and
@@ -345,6 +412,7 @@ for count in 1 1024; do
   export FAKE_FENCE_START_COUNT=$count
   seed
   : >"$FAKE_OWNER_ACTIONS"
+  : >"$FAKE_IAM_ACTIONS"
   invoke >/dev/null
 done
 unset FAKE_FENCE_START_COUNT
@@ -378,6 +446,9 @@ unset FAKE_FENCE_START_COUNT FAKE_FENCE_START_BLOCKED FAKE_FENCE_START_OVERFLOW 
 for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift refresh_failed asg_unhealthy \
   equal_digest floor_present slot_drift owner_missing owner_preparing owner_client_drift owner_source_drift \
   owner_digest_drift owner_live_verify_failed \
+  server_orchestrator_missing server_orchestrator_drift server_predecessor_nonlive \
+  iam_missing iam_preparing iam_policy_drift iam_role_drift iam_table_drift iam_action_drift iam_enclosing_operation_drift \
+  iam_leading_key_drift iam_default_drift iam_version_drift iam_digest_drift iam_live_verify_failed \
   journal_missing journal_status journal_source journal_build journal_manifest journal_source_digest \
   incident_plan_digest incident_fence_digest incident_receipt fence_start_malformed fence_drain_count fence_drain_digest \
   component_intent predecessor_plan_digest predecessor_receipt \
@@ -385,8 +456,9 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
   ledger_lock_digest_mutated; do
   seed
   : >"$FAKE_OWNER_ACTIONS"
+  : >"$FAKE_IAM_ACTIONS"
   unset FAKE_RECOVERY_CONCLUSION FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY \
-    FAKE_OWNER_VERIFY_FAIL
+    FAKE_OWNER_VERIFY_FAIL FAKE_IAM_VERIFY_FAIL
   export AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
   case "$mode" in
     recovery_failure) export FAKE_RECOVERY_CONCLUSION=failure ;;
@@ -424,6 +496,51 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
       ;;
     owner_live_verify_failed)
       export FAKE_OWNER_VERIFY_FAIL=true
+      ;;
+    server_orchestrator_missing)
+      mutate_fixture_journal 'del(.runtime.server_refresh_orchestrator_sha)'
+      ;;
+    server_orchestrator_drift)
+      mutate_fixture_journal '.runtime.server_refresh_orchestrator_sha=("9"*40)'
+      ;;
+    server_predecessor_nonlive)
+      mutate_fixture_journal '.runtime.server_refresh_orchestrator_sha="e668a60b81f14b55278c83d0c79e4f760adeac29"'
+      ;;
+    iam_missing)
+      mutate_fixture_journal 'del(.runtime.session_control_delete_iam)'
+      ;;
+    iam_preparing)
+      mutate_fixture_journal '.runtime.session_control_delete_iam={status:"preparing",intent:.runtime.session_control_delete_iam.intent,receipt:null}'
+      ;;
+    iam_policy_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.policy_id="OTHER"'
+      ;;
+    iam_role_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.attached_role="other-role"'
+      ;;
+    iam_table_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.table_arn="arn:aws:dynamodb:us-east-2:767397897469:table/other"'
+      ;;
+    iam_action_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.action="dynamodb:PutItem"'
+      ;;
+    iam_enclosing_operation_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.enclosing_operation="DeleteItem"'
+      ;;
+    iam_leading_key_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.intent.leading_keys=["EVENT#*"]'
+      ;;
+    iam_default_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.receipt.default_version="v10"'
+      ;;
+    iam_version_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.receipt.versions=["v6","v7","v8","v9","v10"]'
+      ;;
+    iam_digest_drift)
+      mutate_fixture_journal '.runtime.session_control_delete_iam.receipt.policy_sha256=("9"*64)'
+      ;;
+    iam_live_verify_failed)
+      export FAKE_IAM_VERIFY_FAIL=true
       ;;
     journal_missing)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")

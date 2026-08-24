@@ -63,6 +63,35 @@ func sandboxRecoveryRetirementReceipt(targetID string, fence sessionControlTarge
 	}
 }
 
+func sandboxRecoverySessionControlIAMAuthority() *sandboxSessionControlDeleteIAMAuthority {
+	intent := sandboxSessionControlDeleteIAMIntent{
+		Schema:    "layerv.durable-aop-session-control-delete-iam-intent.v1",
+		PolicyARN: "arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read",
+		PolicyID:  "ANPA3FLD2UT65P2XBQDPY", PolicyName: "layerv-nhp-sandbox-dynamodb-read", PolicyPath: "/",
+		AttachedRole: "layerv-nhp-sandbox-server", AttachedRoleID: "AROA3FLD2UT64E3ZXY7UH",
+		TableARN: "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+		Action:   "dynamodb:DeleteItem", EnclosingOperation: "TransactWriteItems",
+		LeadingKeys: []string{
+			"ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153", "EVENT#*",
+		},
+		BeforeDefaultVersion: "v8", BeforeVersions: []string{"v4", "v5", "v6", "v7", "v8"},
+		BeforePolicySHA256: "5c7a320579ae3651861e16014816358eca255e42159e6bcfbe9ea181a29c4073",
+		PruneVersion:       "v4", DesiredDefaultVersion: "v9",
+		DesiredVersions:     []string{"v5", "v6", "v7", "v8", "v9"},
+		DesiredPolicySHA256: "c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1",
+	}
+	receipt := &sandboxSessionControlDeleteIAMReceipt{
+		Schema:    "layerv.durable-aop-session-control-delete-iam-receipt.v1",
+		PolicyARN: intent.PolicyARN, PolicyID: intent.PolicyID,
+		AttachedRole: intent.AttachedRole, AttachedRoleID: intent.AttachedRoleID,
+		TableARN: intent.TableARN, Action: intent.Action, EnclosingOperation: intent.EnclosingOperation,
+		LeadingKeys:    append([]string(nil), intent.LeadingKeys...),
+		DefaultVersion: intent.DesiredDefaultVersion, Versions: append([]string(nil), intent.DesiredVersions...),
+		PolicySHA256: intent.DesiredPolicySHA256,
+	}
+	return &sandboxSessionControlDeleteIAMAuthority{Status: "ready", Intent: intent, Receipt: receipt}
+}
+
 func sandboxRecoveryJournalAuthority(t *testing.T, targetStatus, journalStatus string) (
 	SandboxRecoveryParameterSnapshot, SandboxRecoveryParameterSnapshot, SandboxRecoveryParameterSnapshot,
 	sessionControlTargetFence,
@@ -134,8 +163,10 @@ func sandboxRecoveryJournalAuthorityWithTargets(t *testing.T, targetStatuses []s
 			AC: sandboxRecoveryRuntimeComponent(t, "ac", "layerv-nhp-sandbox-ac-green", acProvenance, orchestrator,
 				sandboxCanonicalDigest(predecessorPlanJSON)),
 			FenceStart: startDirectory, FenceDrain: drainedDirectory, PredecessorPlan: predecessorPlan,
-			PredecessorPlanSHA256: sandboxCanonicalDigest(predecessorPlanJSON),
-			PredecessorTargets:    predecessorTargets,
+			PredecessorPlanSHA256:        sandboxCanonicalDigest(predecessorPlanJSON),
+			PredecessorTargets:           predecessorTargets,
+			ServerRefreshOrchestratorSHA: orchestrator,
+			SessionControlIAM:            sandboxRecoverySessionControlIAMAuthority(),
 		},
 	}
 	journalJSON := canonicalSandboxRecoveryJSON(t, journal)
@@ -726,6 +757,107 @@ func TestSandboxJournaledPredecessorRejectsValidLookingSuccessorReceiptThatDiffe
 			}
 			if len(fake.gets) == 0 || len(fake.transactions) != 0 {
 				t.Fatalf("receipt drift classification gets=%d transactions=%d", len(fake.gets), len(fake.transactions))
+			}
+		})
+	}
+}
+
+func TestSandboxJournaledPredecessorRequiresExactReadySessionControlIAMAuthority(t *testing.T) {
+	baseState, _, baseHistorical, _ := sandboxRecoveryJournalAuthority(t, "pending", "predecessor_retiring")
+	intent := func(value map[string]any) map[string]any {
+		return value["runtime"].(map[string]any)["session_control_delete_iam"].(map[string]any)["intent"].(map[string]any)
+	}
+	receipt := func(value map[string]any) map[string]any {
+		return value["runtime"].(map[string]any)["session_control_delete_iam"].(map[string]any)["receipt"].(map[string]any)
+	}
+	tests := map[string]func(map[string]any){
+		"server refresh orchestrator missing": func(value map[string]any) {
+			delete(value["runtime"].(map[string]any), "server_refresh_orchestrator_sha")
+		},
+		"server refresh orchestrator arbitrary": func(value map[string]any) {
+			value["runtime"].(map[string]any)["server_refresh_orchestrator_sha"] = strings.Repeat("9", 40)
+		},
+		"predecessor orchestrator with non-live refreshes": func(value map[string]any) {
+			value["runtime"].(map[string]any)["server_refresh_orchestrator_sha"] = sandboxIAMHandoffPredecessorSHA
+		},
+		"authority missing": func(value map[string]any) {
+			delete(value["runtime"].(map[string]any), "session_control_delete_iam")
+		},
+		"authority extra field": func(value map[string]any) {
+			value["runtime"].(map[string]any)["session_control_delete_iam"].(map[string]any)["extra"] = true
+		},
+		"preparing has nil receipt": func(value map[string]any) {
+			authority := value["runtime"].(map[string]any)["session_control_delete_iam"].(map[string]any)
+			authority["status"] = "preparing"
+			authority["receipt"] = nil
+		},
+		"intent missing field": func(value map[string]any) { delete(intent(value), "action") },
+		"intent extra field":   func(value map[string]any) { intent(value)["extra"] = true },
+		"intent policy": func(value map[string]any) {
+			intent(value)["policy_arn"] = "arn:aws:iam::767397897469:policy/other"
+		},
+		"intent role": func(value map[string]any) { intent(value)["attached_role_id"] = "OTHER" },
+		"intent table": func(value map[string]any) {
+			intent(value)["table_arn"] = "arn:aws:dynamodb:us-east-2:767397897469:table/other"
+		},
+		"intent action": func(value map[string]any) { intent(value)["action"] = "dynamodb:PutItem" },
+		"intent enclosing operation": func(value map[string]any) {
+			intent(value)["enclosing_operation"] = "DeleteItem"
+		},
+		"intent leading key": func(value map[string]any) { intent(value)["leading_keys"] = []any{"EVENT#*"} },
+		"intent before default": func(value map[string]any) {
+			intent(value)["before_default_version"] = "v7"
+		},
+		"intent before versions": func(value map[string]any) {
+			intent(value)["before_versions"] = []any{"v5", "v6", "v7", "v8"}
+		},
+		"intent before digest": func(value map[string]any) {
+			intent(value)["before_policy_sha256"] = strings.Repeat("f", 64)
+		},
+		"intent prune version": func(value map[string]any) { intent(value)["prune_version"] = "v5" },
+		"intent desired default": func(value map[string]any) {
+			intent(value)["desired_default_version"] = "v10"
+		},
+		"intent desired versions": func(value map[string]any) {
+			intent(value)["desired_versions"] = []any{"v6", "v7", "v8", "v9", "v10"}
+		},
+		"intent desired digest": func(value map[string]any) {
+			intent(value)["desired_policy_sha256"] = strings.Repeat("f", 64)
+		},
+		"receipt missing field": func(value map[string]any) { delete(receipt(value), "action") },
+		"receipt extra field":   func(value map[string]any) { receipt(value)["extra"] = true },
+		"receipt policy":        func(value map[string]any) { receipt(value)["policy_id"] = "OTHER" },
+		"receipt role":          func(value map[string]any) { receipt(value)["attached_role"] = "other-role" },
+		"receipt table": func(value map[string]any) {
+			receipt(value)["table_arn"] = "arn:aws:dynamodb:us-east-2:767397897469:table/other"
+		},
+		"receipt action": func(value map[string]any) { receipt(value)["action"] = "dynamodb:PutItem" },
+		"receipt enclosing operation": func(value map[string]any) {
+			receipt(value)["enclosing_operation"] = "DeleteItem"
+		},
+		"receipt leading key": func(value map[string]any) { receipt(value)["leading_keys"] = []any{"EVENT#*"} },
+		"receipt default":     func(value map[string]any) { receipt(value)["default_version"] = "v10" },
+		"receipt versions": func(value map[string]any) {
+			receipt(value)["versions"] = []any{"v6", "v7", "v8", "v9", "v10"}
+		},
+		"receipt digest": func(value map[string]any) {
+			receipt(value)["policy_sha256"] = strings.Repeat("f", 64)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			historical := mutateSandboxRecoveryJournal(t, baseHistorical, mutate)
+			state := baseState
+			state.Value = mutateSandboxRecoveryJSON(t, state.Value, func(value map[string]any) {
+				value["repair"].(map[string]any)["stale_target_retirement_ref"].(map[string]any)["sha256"] = sandboxCanonicalDigest(historical.Value)
+			})
+			fake := newSessionControlSessionDynamoFake()
+			if _, err := retireSandboxJournaledPredecessorWithClient(context.Background(), fake, "predecessor-1",
+				state, historical, historical, time.Now); err == nil {
+				t.Fatal("non-exact session-control IAM authority was accepted")
+			}
+			if len(fake.gets) != 0 || len(fake.transactions) != 0 {
+				t.Fatalf("IAM authority rejection reached DynamoDB: gets=%d transactions=%d", len(fake.gets), len(fake.transactions))
 			}
 		})
 	}

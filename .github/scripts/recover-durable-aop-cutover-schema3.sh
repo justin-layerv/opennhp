@@ -60,6 +60,22 @@ APPROVED_STALE_RETIREMENT_STATE_VERSION=22
 APPROVED_STALE_RETIREMENT_STATE_DIGEST=b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5d19e75f45ef348
 APPROVED_STALE_RETIREMENT_PHASE=repaired
 APPROVED_STALE_RETIREMENT_PLAN_DIGEST=f434ce1e13c69f8749e9004be26304002e7e8da28939815d062f643124abcfc6
+# The digest-bound server refresh stopped safely after journal v6/state v28.
+# Its workers then proved the source bug: terminal exact close needs DeleteItem
+# on the exact ACTIVE cell partition and completed EVENT work partition. One
+# reviewed successor may add only the journaled IAM repair at this boundary.
+APPROVED_IAM_HANDOFF_PREDECESSOR_SHA=e668a60b81f14b55278c83d0c79e4f760adeac29
+APPROVED_IAM_HANDOFF_STATE_VERSION=28
+APPROVED_IAM_HANDOFF_STATE_DIGEST=1ffd68a2259e78a96363c884d2436f9106935363595f41569e117073bb2773f7
+APPROVED_IAM_HANDOFF_JOURNAL_VERSION=6
+APPROVED_IAM_HANDOFF_JOURNAL_DIGEST=52525f4c3e23cd6e68ce43852c1a1dcd1d25eb309a595066678c9aa93bb380b8
+APPROVED_IAM_HANDOFF_PHASE=repaired
+APPROVED_IAM_HANDOFF_CELL0_PRIOR_REFRESH_ID=ea9dae3d-22f8-478e-a9ec-91eb9b9f53fb
+APPROVED_IAM_HANDOFF_CELL0_REFRESH_ID=771e74d1-3299-4c03-b7f4-6fdb3b11e6bd
+APPROVED_IAM_HANDOFF_CELL0_INTENT_SHA256=f8d70d3357b301c55f806d34e3d70d0f1f7706999fc2d08d8e5c87fe627b5d50
+APPROVED_IAM_HANDOFF_CELL1_PRIOR_REFRESH_ID=dc5ab358-ef4e-45a8-bf81-d18112a2ce9c
+APPROVED_IAM_HANDOFF_CELL1_REFRESH_ID=8f88f6af-4f02-4f03-8ac9-c6c62fdcb051
+APPROVED_IAM_HANDOFF_CELL1_INTENT_SHA256=0765d6c4bdb0940be956b253156d192b9761c90e2fec175d4300b167912174d0
 # Exact reviewed runtime repair containing both server close-drain and AC
 # transport fixes, plus its successful claim-free build-only authority.
 APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
@@ -135,6 +151,7 @@ VERIFY_CUSTOMER_LIFECYCLE=$ROOT/.github/scripts/verify-durable-aop-customer-life
 VERIFY_CONNECTOR_LIFECYCLE=$ROOT/.github/scripts/verify-durable-aop-connector-lifecycle-run.sh
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 STALE_TARGET_RETIRER=${CUTOVER_STALE_TARGET_RETIRE_SCRIPT:-$ROOT/.bin/session-control-stale-target-retirement}
+SESSION_CONTROL_DELETE_IAM=${CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-delete-iam.py}
 WAIT_REFRESH=${CUTOVER_WAIT_REFRESH_SCRIPT:-$ROOT/.github/scripts/wait-for-instance-refresh.sh}
 ORIGINAL_ROOT=${CUTOVER_ORIGINAL_SOURCE_ROOT:-$ROOT}
 REFRESH_TIMEOUT_MINUTES=${CUTOVER_REPAIR_REFRESH_TIMEOUT_MINUTES:-30}
@@ -247,6 +264,9 @@ load_stale_journal_ref() {
   if [[ "$current_version" == "$version" ]]; then
     [[ "$current" == "$historical" ]] || { echo "current stale-target journal differs from its referenced version" >&2; return 1; }
   else
+    [[ "$current" != "$historical" ]] || {
+      echo "unreferenced stale-target journal successor repeats its referenced bytes" >&2; return 1;
+    }
     pending=$(decode_stale_journal "$current")
     saved=$STALE_TARGET_RETIREMENT
     STALE_TARGET_RETIREMENT=$pending
@@ -723,7 +743,7 @@ validate_retirement_receipt() {
 }
 
 validate_runtime_component() {
-  local label=$1 asg=$2 provenance=$3 component expected intent prior plan_digest='-'
+  local label=$1 asg=$2 provenance=$3 intent_orchestrator=$4 component expected intent prior plan_digest='-'
   component=$(jq -c --arg label "$label" '.runtime[$label]' <<<"$STALE_TARGET_RETIREMENT")
   expected=$(expected_repair_attestation "$provenance" "$asg")
   jq -e --arg asg "$asg" --arg attestation "$expected" '
@@ -741,9 +761,96 @@ validate_runtime_component() {
   [[ "$label" != ac ]] || plan_digest=$(jq -r .runtime.predecessor_plan_sha256 <<<"$STALE_TARGET_RETIREMENT")
   intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$label" "$asg" "$STALE_RUNTIME_SOURCE_SHA" "$STALE_RUNTIME_BUILD_RUN_ID" \
-    "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$RECOVERY_ORCHESTRATOR_SHA" \
+    "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$intent_orchestrator" \
     "$REFRESH_PREFERENCES" "$prior" "$plan_digest" | sha256sum | awk '{print $1}')
   [[ "$intent" == "$(jq -r .intent_sha256 <<<"$component")" ]]
+}
+
+validate_server_refresh_orchestrator() {
+  local status=$1 orchestrator
+  orchestrator=$(jq -r '.runtime.server_refresh_orchestrator_sha // ""' <<<"$STALE_TARGET_RETIREMENT")
+  if [[ -z "$orchestrator" ]]; then
+    [[ "$status" == servers_refreshed && "${RECOVERY_HANDOFF_PENDING:-false}" == true &&
+       "$(jq -r .version <<<"$STALE_TARGET_RETIREMENT_REF")" == "$APPROVED_IAM_HANDOFF_JOURNAL_VERSION" &&
+       "$(jq -r .sha256 <<<"$STALE_TARGET_RETIREMENT_REF")" == "$APPROVED_IAM_HANDOFF_JOURNAL_DIGEST" ]] || return 1
+    SERVER_REFRESH_ORCHESTRATOR_SHA=$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA
+    return
+  fi
+  [[ "$orchestrator" =~ ^[0-9a-f]{40}$ ]] || return 1
+  if [[ "$orchestrator" == "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" ]]; then
+    jq -e --arg c0_prior "$APPROVED_IAM_HANDOFF_CELL0_PRIOR_REFRESH_ID" \
+      --arg c0_refresh "$APPROVED_IAM_HANDOFF_CELL0_REFRESH_ID" \
+      --arg c0_intent "$APPROVED_IAM_HANDOFF_CELL0_INTENT_SHA256" \
+      --arg c1_prior "$APPROVED_IAM_HANDOFF_CELL1_PRIOR_REFRESH_ID" \
+      --arg c1_refresh "$APPROVED_IAM_HANDOFF_CELL1_REFRESH_ID" \
+      --arg c1_intent "$APPROVED_IAM_HANDOFF_CELL1_INTENT_SHA256" '
+      .runtime.cell0.prior_refresh_id == $c0_prior and .runtime.cell0.refresh_id == $c0_refresh and
+      .runtime.cell0.intent_sha256 == $c0_intent and .runtime.cell1.prior_refresh_id == $c1_prior and
+      .runtime.cell1.refresh_id == $c1_refresh and .runtime.cell1.intent_sha256 == $c1_intent
+    ' >/dev/null <<<"$STALE_TARGET_RETIREMENT" || return 1
+  else
+    [[ "$orchestrator" == "$RECOVERY_ORCHESTRATOR_SHA" ]] || return 1
+  fi
+  SERVER_REFRESH_ORCHESTRATOR_SHA=$orchestrator
+}
+
+validate_session_control_delete_iam() {
+  local status=$1 present iam
+  present=$(jq -r '.runtime | has("session_control_delete_iam")' <<<"$STALE_TARGET_RETIREMENT")
+  if [[ "$present" == false ]]; then
+    [[ "$status" == servers_refreshed && "${RECOVERY_HANDOFF_PENDING:-false}" == true &&
+       "$(jq -r .version <<<"$STALE_TARGET_RETIREMENT_REF")" == "$APPROVED_IAM_HANDOFF_JOURNAL_VERSION" &&
+       "$(jq -r .sha256 <<<"$STALE_TARGET_RETIREMENT_REF")" == "$APPROVED_IAM_HANDOFF_JOURNAL_DIGEST" ]] || return 1
+    return
+  fi
+  iam=$(jq -cS .runtime.session_control_delete_iam <<<"$STALE_TARGET_RETIREMENT")
+  if [[ "$iam" == null ]]; then
+    [[ "$status" == cell0_intent || "$status" == cell0_refreshing || "$status" == cell0_refreshed ||
+       "$status" == cell1_intent || "$status" == cell1_refreshing || "$status" == servers_refreshed ]]
+    return
+  fi
+  jq -e '
+    type == "object" and (keys | sort) == ["intent","receipt","status"] and
+    (.intent | type == "object" and (keys | sort) ==
+      ["action","attached_role","attached_role_id","before_default_version","before_policy_sha256",
+       "before_versions","desired_default_version","desired_policy_sha256","desired_versions","enclosing_operation","leading_keys",
+       "policy_arn","policy_id","policy_name","policy_path","prune_version","schema","table_arn"]) and
+    .intent.schema == "layerv.durable-aop-session-control-delete-iam-intent.v1" and
+    .intent.policy_arn == "arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read" and
+    .intent.policy_id == "ANPA3FLD2UT65P2XBQDPY" and
+    .intent.policy_name == "layerv-nhp-sandbox-dynamodb-read" and .intent.policy_path == "/" and
+    .intent.attached_role == "layerv-nhp-sandbox-server" and .intent.attached_role_id == "AROA3FLD2UT64E3ZXY7UH" and
+    .intent.table_arn == "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control" and
+    .intent.action == "dynamodb:DeleteItem" and .intent.enclosing_operation == "TransactWriteItems" and
+    .intent.leading_keys == ["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"] and
+    .intent.before_default_version == "v8" and .intent.before_versions == ["v4","v5","v6","v7","v8"] and
+    .intent.before_policy_sha256 == "5c7a320579ae3651861e16014816358eca255e42159e6bcfbe9ea181a29c4073" and
+    .intent.prune_version == "v4" and .intent.desired_default_version == "v9" and
+    .intent.desired_versions == ["v5","v6","v7","v8","v9"] and
+    .intent.desired_policy_sha256 == "c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1" and
+    (.status == "preparing" or .status == "ready") and
+    ((.status == "preparing" and .receipt == null) or
+     (.status == "ready" and
+      (.receipt | type == "object" and (keys | sort) ==
+        ["action","attached_role","attached_role_id","default_version","enclosing_operation","leading_keys","policy_arn","policy_id",
+         "policy_sha256","schema","table_arn","versions"]) and
+      .receipt.schema == "layerv.durable-aop-session-control-delete-iam-receipt.v1" and
+      .receipt.policy_arn == .intent.policy_arn and .receipt.policy_id == .intent.policy_id and
+      .receipt.attached_role == .intent.attached_role and .receipt.attached_role_id == .intent.attached_role_id and
+      .receipt.table_arn == .intent.table_arn and .receipt.action == .intent.action and
+      .receipt.enclosing_operation == .intent.enclosing_operation and
+      .receipt.leading_keys == .intent.leading_keys and .receipt.default_version == .intent.desired_default_version and
+      .receipt.versions == .intent.desired_versions and .receipt.policy_sha256 == .intent.desired_policy_sha256))
+  ' >/dev/null <<<"$iam" || return 1
+  if [[ "$status" == iam_preparing ]]; then
+    [[ "$(jq -r .status <<<"$iam")" == preparing ]]
+  elif [[ "$status" == iam_ready || "$status" == fence_drained || "$status" == incident_preparing ||
+    "$status" == incident_complete || "$status" == ac_intent || "$status" == ac_refreshing ||
+    "$status" == predecessor_retiring || "$status" == complete ]]; then
+    [[ "$(jq -r .status <<<"$iam")" == ready ]]
+  else
+    return 1
+  fi
 }
 
 validate_stale_target_retirement() {
@@ -768,10 +875,15 @@ validate_stale_target_retirement() {
     (.incident_targets | type == "array" and length == 3) and
     ([.incident_targets[].id] == ["stale-ac-target-1","stale-ac-target-2","stale-ac-target-3"]) and
     ([.incident_targets[].fence_sha256] == [.incident_plan.targets[].fence_sha256]) and
-    (.runtime | type == "object" and (keys | sort) ==
-      ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
-       "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
-       "server_provenance","source_sha"]) and
+    (.runtime | type == "object" and
+      ((keys | sort) ==
+        ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+         "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
+         "server_provenance","source_sha"] or
+       (keys | sort) ==
+        ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+         "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
+         "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"])) and
     .runtime.source_sha == $source and .runtime.build_run_id == $build and .runtime.build_run_attempt == $attempt and
     .runtime.runtime_manifest == $manifest and .runtime.server_provenance == $server and .runtime.ac_provenance == $ac and
     .runtime.preferences == $preferences and
@@ -787,6 +899,7 @@ validate_stale_target_retirement() {
       (.runtime.predecessor_targets | length) == (.runtime.predecessor_plan.targets | length))) and
     (.status == "cell0_intent" or .status == "cell0_refreshing" or .status == "cell0_refreshed" or
      .status == "cell1_intent" or .status == "cell1_refreshing" or .status == "servers_refreshed" or
+     .status == "iam_preparing" or .status == "iam_ready" or
      .status == "fence_drained" or .status == "incident_preparing" or .status == "incident_complete" or
      .status == "ac_intent" or .status == "ac_refreshing" or .status == "predecessor_retiring" or .status == "complete")
   ' >/dev/null <<<"$STALE_TARGET_RETIREMENT" || {
@@ -799,10 +912,19 @@ validate_stale_target_retirement() {
   validate_starting_directory_receipt "$start" || {
     echo "schema-3 starting fence authority is malformed or outside capacity" >&2; return 1;
   }
-  validate_runtime_component cell0 layerv-nhp-sandbox-server "$STALE_RUNTIME_SERVER_PROVENANCE" || return 1
-  validate_runtime_component cell1 layerv-nhp-sandbox-cell1-server-green "$STALE_RUNTIME_SERVER_PROVENANCE" || return 1
-  validate_runtime_component ac layerv-nhp-sandbox-ac-green "$STALE_RUNTIME_AC_PROVENANCE" || return 1
   status=$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")
+  validate_server_refresh_orchestrator "$status" || {
+    echo "schema-3 completed server-refresh controller authority is malformed" >&2; return 1;
+  }
+  validate_runtime_component cell0 layerv-nhp-sandbox-server "$STALE_RUNTIME_SERVER_PROVENANCE" \
+    "$SERVER_REFRESH_ORCHESTRATOR_SHA" || return 1
+  validate_runtime_component cell1 layerv-nhp-sandbox-cell1-server-green "$STALE_RUNTIME_SERVER_PROVENANCE" \
+    "$SERVER_REFRESH_ORCHESTRATOR_SHA" || return 1
+  validate_runtime_component ac layerv-nhp-sandbox-ac-green "$STALE_RUNTIME_AC_PROVENANCE" \
+    "$RECOVERY_ORCHESTRATOR_SHA" || return 1
+  validate_session_control_delete_iam "$status" || {
+    echo "schema-3 session-control DeleteItem authority is malformed or out of order" >&2; return 1;
+  }
   if [[ "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null ]]; then
     drain=$(jq -cS .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")
     validate_directory_receipt "$drain" 0 || { echo "schema-3 drained fence authority is malformed" >&2; return 1; }
@@ -894,6 +1016,7 @@ validate_stale_recovery_status() {
     cell1_intent) [[ -n "$c0_refresh$c1_prior" && -z "$c1_refresh$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
     cell1_refreshing) [[ -n "$c0_refresh$c1_prior$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
     servers_refreshed) [[ -n "$c0_refresh$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
+    iam_preparing|iam_ready) [[ -n "$c0_refresh$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
     fence_drained) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 0 ]] ;;
     incident_preparing) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" -le 3 ]] ;;
     incident_complete) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 3 && "$predecessor_count" == 0 ]] ;;
@@ -946,14 +1069,17 @@ initialize_stale_target_recovery() {
     --arg attempt "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" --arg manifest "$APPROVED_STALE_RUNTIME_MANIFEST" \
     --arg server "$STALE_RUNTIME_SERVER_PROVENANCE" --arg ac "$STALE_RUNTIME_AC_PROVENANCE" \
     --argjson preferences "$REFRESH_PREFERENCES" --argjson cell0 "$cell0" --argjson cell1 "$empty_cell1" \
-    --argjson ac_component "$empty_ac" --argjson fence_start "$fence_start" '
+    --argjson ac_component "$empty_ac" --argjson fence_start "$fence_start" \
+    --arg recovery "$RECOVERY_ORCHESTRATOR_SHA" '
     {schema:"layerv.durable-aop-stale-target-retirement-journal.v1",status:"cell0_intent",
      source_state_version:$source_version,source_state_sha256:$source_digest,
      incident_plan_sha256:$plan_digest,incident_plan:$plan,
      incident_targets:[$plan.targets[] | {id,fence_sha256,status:"pending"}],
      runtime:{source_sha:$source,build_run_id:$build,build_run_attempt:$attempt,runtime_manifest:$manifest,
-       server_provenance:$server,ac_provenance:$ac,preferences:$preferences,cell0:$cell0,cell1:$cell1,ac:$ac_component,
-       fence_start:$fence_start,fence_drain:null,predecessor_plan:null,predecessor_plan_sha256:"",predecessor_targets:[]}}
+       server_provenance:$server,ac_provenance:$ac,server_refresh_orchestrator_sha:$recovery,
+       preferences:$preferences,cell0:$cell0,cell1:$cell1,ac:$ac_component,
+       fence_start:$fence_start,fence_drain:null,session_control_delete_iam:null,
+       predecessor_plan:null,predecessor_plan_sha256:"",predecessor_targets:[]}}
   ')
   validate_stale_target_retirement
   write_state repaired
@@ -1064,8 +1190,69 @@ initialize_next_runtime_component() {
   write_state repaired
 }
 
+initialize_session_control_delete_iam() {
+  local intent server_orchestrator
+  [[ -x "$SESSION_CONTROL_DELETE_IAM" ]] || {
+    echo "exact session-control IAM recovery helper is unavailable" >&2; return 1;
+  }
+  require_hard_lock
+  [[ -z "$(get_optional "$FLOOR_PARAM")" ]] || {
+    echo "durable profile floor exists before session-control IAM recovery" >&2; return 1;
+  }
+  intent=$($SESSION_CONTROL_DELETE_IAM plan)
+  intent=$(jq -cS . <<<"$intent")
+  server_orchestrator=$(jq -r '.runtime.server_refresh_orchestrator_sha // ""' <<<"$STALE_TARGET_RETIREMENT")
+  [[ -n "$server_orchestrator" ]] || server_orchestrator=$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA
+  STALE_TARGET_RETIREMENT=$(jq -c --argjson intent "$intent" --arg server_orchestrator "$server_orchestrator" '
+    .status="iam_preparing" |
+    .runtime.server_refresh_orchestrator_sha=$server_orchestrator |
+    .runtime.session_control_delete_iam={status:"preparing",intent:$intent,receipt:null}
+  ' <<<"$STALE_TARGET_RETIREMENT")
+  validate_stale_target_retirement
+  # The journal and its state reference commit before DeletePolicyVersion or
+  # CreatePolicyVersion. A retry therefore reuses one exact precommitted IAM
+  # intent and can classify either mutation's lost response.
+  write_state repaired
+}
+
+advance_session_control_delete_iam() {
+  local intent receipt expected
+  require_hard_lock
+  [[ -z "$(get_optional "$FLOOR_PARAM")" ]] || {
+    echo "durable profile floor exists during session-control IAM recovery" >&2; return 1;
+  }
+  intent=$(jq -cS .runtime.session_control_delete_iam.intent <<<"$STALE_TARGET_RETIREMENT")
+  receipt=$($SESSION_CONTROL_DELETE_IAM apply --intent-json "$intent")
+  receipt=$(jq -cS . <<<"$receipt")
+  expected=$($SESSION_CONTROL_DELETE_IAM verify --intent-json "$intent")
+  expected=$(jq -cS . <<<"$expected")
+  [[ "$receipt" == "$expected" ]] || {
+    echo "session-control IAM apply receipt differs from its strong verification" >&2; return 1;
+  }
+  STALE_TARGET_RETIREMENT=$(jq -c --argjson receipt "$receipt" '
+    .status="iam_ready" |
+    .runtime.session_control_delete_iam.status="ready" |
+    .runtime.session_control_delete_iam.receipt=$receipt
+  ' <<<"$STALE_TARGET_RETIREMENT")
+  validate_stale_target_retirement
+  write_state repaired
+}
+
+verify_session_control_delete_iam() {
+  local intent expected actual
+  [[ "$(jq -r .runtime.session_control_delete_iam.status <<<"$STALE_TARGET_RETIREMENT")" == ready ]] || return 1
+  intent=$(jq -cS .runtime.session_control_delete_iam.intent <<<"$STALE_TARGET_RETIREMENT")
+  expected=$(jq -cS .runtime.session_control_delete_iam.receipt <<<"$STALE_TARGET_RETIREMENT")
+  actual=$($SESSION_CONTROL_DELETE_IAM verify --intent-json "$intent")
+  actual=$(jq -cS . <<<"$actual")
+  [[ "$actual" == "$expected" ]] || {
+    echo "live session-control IAM authority differs from its durable receipt" >&2; return 1;
+  }
+}
+
 record_fence_drain() {
   local receipt
+  verify_session_control_delete_iam
   receipt=$($STALE_TARGET_RETIRER verify-fence-drain --table layerv-nhp-sandbox-cell0-nhp-session-control \
     --cell-id cell0 --region "$AWS_REGION")
   receipt=$(jq -cS . <<<"$receipt")
@@ -1079,6 +1266,7 @@ record_fence_drain() {
 advance_stale_target_retirement() {
   local index id receipt
   validate_stale_target_retirement
+  verify_session_control_delete_iam
   if [[ "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == fence_drained ]]; then
     STALE_TARGET_RETIREMENT=$(jq -c '.status="incident_preparing"' <<<"$STALE_TARGET_RETIREMENT")
     write_state repaired
@@ -1101,6 +1289,7 @@ advance_stale_target_retirement() {
 
 initialize_ac_runtime_refresh() {
   local plan plan_digest component
+  verify_session_control_delete_iam
   plan=$($STALE_TARGET_RETIRER snapshot-predecessors --table layerv-nhp-sandbox-cell0-nhp-session-control --region "$AWS_REGION")
   plan=$(jq -cS . <<<"$plan")
   plan_digest=$(canonical_digest "$plan")
@@ -1117,16 +1306,20 @@ initialize_ac_runtime_refresh() {
 }
 
 advance_predecessor_retirement() {
-	local count index id fence fence_digest receipt
+		local count index id fence fence_digest receipt
 	# The recovery command independently loads this state's current exact SSM
 	# journal reference and derives the fence for this target ID. The controller
 	# sends no table, region, cell, AC, journal version, or fence authority.
 	validate_predecessor_plan
 	validate_target_ledger .runtime.predecessor_targets .runtime.predecessor_plan.targets
   count=$(jq -r '.runtime.predecessor_targets | length' <<<"$STALE_TARGET_RETIREMENT")
-  for ((index=0; index<count; index++)); do
-    [[ "$(jq -r --argjson i "$index" '.runtime.predecessor_targets[$i].status' <<<"$STALE_TARGET_RETIREMENT")" == pending ]] || continue
-    require_hard_lock
+	  for ((index=0; index<count; index++)); do
+	    [[ "$(jq -r --argjson i "$index" '.runtime.predecessor_targets[$i].status' <<<"$STALE_TARGET_RETIREMENT")" == pending ]] || continue
+	    # A crash may resume at predecessor_retiring long after the AC refresh.
+	    # Reprove the exact live IAM grant immediately before every DDB retire
+	    # attempt; the durable receipt alone is not current mutation authority.
+	    require_hard_lock
+	    verify_session_control_delete_iam
     id=$(jq -r --argjson i "$index" '.runtime.predecessor_targets[$i].id' <<<"$STALE_TARGET_RETIREMENT")
     fence=$(jq -cS --argjson i "$index" '.runtime.predecessor_plan.targets[$i].fence' <<<"$STALE_TARGET_RETIREMENT")
 		fence_digest=$(jq -r --argjson i "$index" '.runtime.predecessor_plan.targets[$i].fence_sha256' <<<"$STALE_TARGET_RETIREMENT")
@@ -1144,7 +1337,10 @@ advance_predecessor_retirement() {
     validate_stale_target_retirement
     write_state repaired
   done
-  STALE_TARGET_RETIREMENT=$(jq -c '.status="complete"' <<<"$STALE_TARGET_RETIREMENT")
+	  # Also cover a retry after the last target receipt was durably recorded but
+	  # before the predecessor ledger advanced to complete.
+	  verify_session_control_delete_iam
+	  STALE_TARGET_RETIREMENT=$(jq -c '.status="complete"' <<<"$STALE_TARGET_RETIREMENT")
   validate_stale_target_retirement
   write_state repaired
 }
@@ -1348,7 +1544,8 @@ load_schema3() {
   jq -e --arg original_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" \
     --arg recovery_sha "$RECOVERY_ORCHESTRATOR_SHA" \
     --arg predecessor_sha "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" \
-    --arg stale_predecessor_sha "$APPROVED_STALE_RETIREMENT_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
+    --arg stale_predecessor_sha "$APPROVED_STALE_RETIREMENT_PREDECESSOR_SHA" \
+    --arg iam_predecessor_sha "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
     --arg build_run "$REPAIR_BUILD_RUN_ID" --arg build_attempt "$REPAIR_BUILD_RUN_ATTEMPT" \
     --arg runtime_manifest "$APPROVED_REPAIR_RUNTIME_MANIFEST" \
     --arg server_provenance "$SERVER_REPAIR_PROVENANCE" --arg ac_provenance "$AC_REPAIR_PROVENANCE" '
@@ -1366,7 +1563,7 @@ load_schema3() {
        (length == 17 and (.owner | type == "object") and (.stale_target_retirement_ref | type == "object") and
          (has("refresh_intent") | not)))) and
     (.repair.orchestrator_sha == $recovery_sha or .repair.orchestrator_sha == $predecessor_sha or
-     .repair.orchestrator_sha == $stale_predecessor_sha) and
+     .repair.orchestrator_sha == $stale_predecessor_sha or .repair.orchestrator_sha == $iam_predecessor_sha) and
     .repair.source_sha == $repair_sha and
     .repair.build_run_id == $build_run and .repair.build_run_attempt == $build_attempt and
     .repair.runtime_manifest == $runtime_manifest and
@@ -1408,9 +1605,26 @@ load_schema3() {
       return 1
     }
     RECOVERY_HANDOFF_PENDING=true
+  elif [[ "$stored_recovery_sha" == "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" ]]; then
+    canonical=$(jq -cS . <<<"$raw")
+    digest=$(canonical_digest "$canonical")
+    [[ "$RECOVERY_ORCHESTRATOR_SHA" != "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" &&
+       "$state_version" == "$APPROVED_IAM_HANDOFF_STATE_VERSION" &&
+       "$digest" == "$APPROVED_IAM_HANDOFF_STATE_DIGEST" &&
+       "$(jq -r .phase <<<"$raw")" == "$APPROVED_IAM_HANDOFF_PHASE" &&
+       "$(jq -r '.repair.owner.status // ""' <<<"$raw")" == ready &&
+       "$(jq -r '.repair.stale_target_retirement_ref.version // 0' <<<"$raw")" == "$APPROVED_IAM_HANDOFF_JOURNAL_VERSION" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.sha256 // ""' <<<"$raw")" == "$APPROVED_IAM_HANDOFF_JOURNAL_DIGEST" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.parameter // ""' <<<"$raw")" == "$STALE_JOURNAL_PARAM" &&
+       -n "${LIVE_LOCK:-}" && "$LOCK_JSON" == "$ORIGINAL_LOCK" && -z "$(get_optional "$FLOOR_PARAM")" ]] || {
+      echo "schema-3 IAM predecessor is not the exact live v28/journal-v6 handoff boundary" >&2
+      return 1
+    }
+    RECOVERY_HANDOFF_PENDING=true
   else
     [[ "$state_version" != "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" &&
-       "$state_version" != "$APPROVED_STALE_RETIREMENT_STATE_VERSION" ]] || {
+       "$state_version" != "$APPROVED_STALE_RETIREMENT_STATE_VERSION" &&
+       "$state_version" != "$APPROVED_IAM_HANDOFF_STATE_VERSION" ]] || {
       echo "schema-3 pinned handoff SSM version cannot self-assert successor authority" >&2
       return 1
     }
@@ -1860,9 +2074,16 @@ if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" 
     'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live' servers_refreshed
 fi
 if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == servers_refreshed ]]; then
-  # This is a single, bounded, strong double read. If lifecycle recovery has
-  # not finished the eight closes, this attended recovery attempt stops now;
-  # it does not add a seconds-long application or healthy-path poll.
+  initialize_session_control_delete_iam
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == iam_preparing ]]; then
+  advance_session_control_delete_iam
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == iam_ready ]]; then
+  # This is a single, bounded, strong double read after the exact IAM grant is
+  # durably ready. If evaluator propagation or worker replay has not completed,
+  # this attended recovery attempt stops and the same journaled retry resumes;
+  # there is no seconds-long request or healthy-runtime wait.
   record_fence_drain
 fi
 if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == fence_drained ||
@@ -1873,8 +2094,11 @@ if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" =
   initialize_ac_runtime_refresh
 fi
 if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ac_intent ||
-  "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ac_refreshing) ]]; then
-  advance_runtime_component_refresh ac sandbox ac green layerv-nhp-sandbox-ac-green \
+	  "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ac_refreshing) ]]; then
+	  # ac_intent/ac_refreshing are durable crash boundaries. Reprove the IAM
+	  # grant before StartInstanceRefresh or any resumed refresh mutation.
+	  verify_session_control_delete_iam
+	  advance_runtime_component_refresh ac sandbox ac green layerv-nhp-sandbox-ac-green \
     'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready' \
     predecessor_retiring
 fi
@@ -1906,9 +2130,13 @@ assert_completed_runtime_slot sandbox ac "$AC_COLOR" "$AC_ASG" ac "$STALE_RUNTIM
   'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
 
 if [[ "$PHASE" != complete ]]; then
-  "$VERIFY_ASG" "$AC_ASG" schema3-ac-ready 15 \
-    'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
-  CUTOVER_EXPECTED_CELL0_ASG=$CELL0_ASG CUTOVER_STABILITY_SECONDS=${CUTOVER_STABILITY_SECONDS:-30} \
+	  "$VERIFY_ASG" "$AC_ASG" schema3-ac-ready 15 \
+	    'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
+	  # Terminal execution can resume from a durable validated boundary. Reprove
+	  # live IAM immediately before the real lifecycle gate, not only when the
+	  # earlier journal receipt was written.
+	  verify_session_control_delete_iam
+	  CUTOVER_EXPECTED_CELL0_ASG=$CELL0_ASG CUTOVER_STABILITY_SECONDS=${CUTOVER_STABILITY_SECONDS:-30} \
     "$VERIFY_LIFECYCLE"
   CUTOVER_ORIGINAL_SOURCE_ROOT=$ORIGINAL_ROOT CUTOVER_EXPECTED_CELL1_ASG=$CELL1_ASG \
     CUTOVER_EXPECTED_CELL1_COLOR=$CELL1_COLOR "$VERIFY_TOPOLOGY" "$CELL1_ASG" cutover-cell1 15 true
@@ -1953,14 +2181,19 @@ require_hard_lock
 [[ "$(get_param /sandbox-cell1/nhp/server/active-color)" == "$CELL1_COLOR" ]] || {
   echo "active cell1 server color drifted before terminal recovery" >&2; exit 1;
 }
-"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
-ensure_exact_floor
-"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
-[[ "$PHASE" == complete ]] || write_state complete
+	"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
+	verify_session_control_delete_iam
+	ensure_exact_floor
+	"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
+	if [[ "$PHASE" != complete ]]; then
+	  verify_session_control_delete_iam
+	  write_state complete
+	fi
 
 # The exact original owner remains the lock owner throughout adoption and all
 # partial refreshes.  Only an exact schema-3 COMPLETE is allowed to release it.
-require_hard_lock
-AWS_REGION=$AWS_REGION bash "$ROOT/.github/scripts/ssm-live-env-lock.sh" release "$LOCK_PARAM" "$ORIGINAL_OWNER" 14400 7200
+	require_hard_lock
+	verify_session_control_delete_iam
+	AWS_REGION=$AWS_REGION bash "$ROOT/.github/scripts/ssm-live-env-lock.sh" release "$LOCK_PARAM" "$ORIGINAL_OWNER" 14400 7200
 emit_recovery_outcome complete
 echo "durable AOP schema-3 recovery complete at repair source $REPAIR_SOURCE_SHA"

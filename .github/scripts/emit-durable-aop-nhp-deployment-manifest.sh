@@ -24,6 +24,7 @@ STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
+SESSION_CONTROL_DELETE_IAM=${CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-delete-iam.py}
 OWNER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
 OWNER_SUBJECT=${OWNER_CLIENT_ID}@clients
 OWNER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
@@ -43,6 +44,13 @@ APPROVED_STALE_RUNTIME_BUILD_RUN_ID=32682520698
 APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT=1
 APPROVED_STALE_RUNTIME_SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
 APPROVED_STALE_RUNTIME_AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
+APPROVED_IAM_HANDOFF_PREDECESSOR_SHA=e668a60b81f14b55278c83d0c79e4f760adeac29
+APPROVED_IAM_HANDOFF_CELL0_PRIOR_REFRESH_ID=ea9dae3d-22f8-478e-a9ec-91eb9b9f53fb
+APPROVED_IAM_HANDOFF_CELL0_REFRESH_ID=771e74d1-3299-4c03-b7f4-6fdb3b11e6bd
+APPROVED_IAM_HANDOFF_CELL0_INTENT_SHA256=f8d70d3357b301c55f806d34e3d70d0f1f7706999fc2d08d8e5c87fe627b5d50
+APPROVED_IAM_HANDOFF_CELL1_PRIOR_REFRESH_ID=dc5ab358-ef4e-45a8-bf81-d18112a2ce9c
+APPROVED_IAM_HANDOFF_CELL1_REFRESH_ID=8f88f6af-4f02-4f03-8ac9-c6c62fdcb051
+APPROVED_IAM_HANDOFF_CELL1_INTENT_SHA256=0765d6c4bdb0940be956b253156d192b9761c90e2fec175d4300b167912174d0
 APPROVED_ORIGINAL_STATE_VERSION=7
 APPROVED_ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 APPROVED_ORIGINAL_LOCK_VERSION=2
@@ -285,7 +293,7 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
     ($j.runtime | type == "object" and (keys | sort) ==
       ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
        "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
-       "server_provenance","source_sha"]) and
+       "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"]) and
     $j.runtime.source_sha == $runtime_source and $j.runtime.runtime_manifest == $runtime_manifest and
     $j.runtime.build_run_id == $runtime_build and $j.runtime.build_run_attempt == $runtime_attempt and
     ($j.runtime.server_provenance | type == "string") and ($j.runtime.ac_provenance | type == "string") and
@@ -301,6 +309,13 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
       ([.asg,.attestation,.prior_refresh_id,.refresh_id] | all(type == "string" and length > 0))))
 ' >/dev/null <<<"$JOURNAL" || {
   echo "deployment producer requires the completed exact stale-target journal" >&2
+  exit 1
+}
+IAM_INTENT=$(jq -cS .runtime.session_control_delete_iam.intent <<<"$JOURNAL")
+IAM_RECEIPT=$(jq -cS .runtime.session_control_delete_iam.receipt <<<"$JOURNAL")
+[[ "$(jq -r .runtime.session_control_delete_iam.status <<<"$JOURNAL")" == ready &&
+   "$($SESSION_CONTROL_DELETE_IAM verify --intent-json "$IAM_INTENT" | jq -cS .)" == "$IAM_RECEIPT" ]] || {
+  echo "deployment producer session-control IAM authority is not live and exact" >&2
   exit 1
 }
 RUNTIME=$(jq -cS .runtime <<<"$JOURNAL")
@@ -330,23 +345,51 @@ validate_starting_directory_receipt "$FENCE_START" && validate_directory_receipt
 
 REFRESH_PREFERENCES='{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"SkipMatching":false}'
 validate_runtime_intent() {
-  local label=$1 asg=$2 provenance=$3 plan_digest=${4:--} component prior expected_attestation expected_intent
+  local label=$1 asg=$2 provenance=$3 intent_orchestrator=$4 plan_digest=${5:--}
+  local component prior expected_attestation expected_intent
   component=$(jq -c --arg label "$label" '.[$label]' <<<"$RUNTIME")
   expected_attestation="v2|${PROFILE}|${provenance#v1|}|${asg}"
   prior=$(jq -r .prior_refresh_id <<<"$component")
   expected_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$label" "$asg" "$APPROVED_STALE_RUNTIME_SOURCE_SHA" "$APPROVED_STALE_RUNTIME_BUILD_RUN_ID" \
-    "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$(jq -r .repair.orchestrator_sha <<<"$STATE")" \
+    "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$intent_orchestrator" \
     "$REFRESH_PREFERENCES" "$prior" "$plan_digest" | sha256sum | awk '{print $1}')
   [[ "$(jq -r .asg <<<"$component")" == "$asg" &&
      "$(jq -r .attestation <<<"$component")" == "$expected_attestation" &&
      "$prior" =~ ^(-|[A-Za-z0-9-]+)$ && "$(jq -r .refresh_id <<<"$component")" =~ ^[A-Za-z0-9-]+$ &&
      "$(jq -r .intent_sha256 <<<"$component")" == "$expected_intent" ]]
 }
-if ! validate_runtime_intent cell0 layerv-nhp-sandbox-server "$(jq -r .server_provenance <<<"$RUNTIME")" ||
-   ! validate_runtime_intent cell1 layerv-nhp-sandbox-cell1-server-green "$(jq -r .server_provenance <<<"$RUNTIME")" ||
+SERVER_REFRESH_ORCHESTRATOR_SHA=$(jq -r .server_refresh_orchestrator_sha <<<"$RUNTIME")
+[[ "$SERVER_REFRESH_ORCHESTRATOR_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "deployment producer server-refresh controller authority is malformed" >&2
+  exit 1
+}
+if [[ "$SERVER_REFRESH_ORCHESTRATOR_SHA" == "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" ]]; then
+  jq -e --arg c0_prior "$APPROVED_IAM_HANDOFF_CELL0_PRIOR_REFRESH_ID" \
+    --arg c0_refresh "$APPROVED_IAM_HANDOFF_CELL0_REFRESH_ID" \
+    --arg c0_intent "$APPROVED_IAM_HANDOFF_CELL0_INTENT_SHA256" \
+    --arg c1_prior "$APPROVED_IAM_HANDOFF_CELL1_PRIOR_REFRESH_ID" \
+    --arg c1_refresh "$APPROVED_IAM_HANDOFF_CELL1_REFRESH_ID" \
+    --arg c1_intent "$APPROVED_IAM_HANDOFF_CELL1_INTENT_SHA256" '
+    .cell0.prior_refresh_id == $c0_prior and .cell0.refresh_id == $c0_refresh and
+    .cell0.intent_sha256 == $c0_intent and .cell1.prior_refresh_id == $c1_prior and
+    .cell1.refresh_id == $c1_refresh and .cell1.intent_sha256 == $c1_intent
+  ' >/dev/null <<<"$RUNTIME" || {
+    echo "deployment producer predecessor server-refresh authority is not the exact live pair" >&2
+    exit 1
+  }
+else
+  [[ "$SERVER_REFRESH_ORCHESTRATOR_SHA" == "$(jq -r .repair.orchestrator_sha <<<"$STATE")" ]] || {
+    echo "deployment producer server-refresh controller differs from the recovery authority" >&2
+    exit 1
+  }
+fi
+if ! validate_runtime_intent cell0 layerv-nhp-sandbox-server "$(jq -r .server_provenance <<<"$RUNTIME")" \
+     "$SERVER_REFRESH_ORCHESTRATOR_SHA" ||
+   ! validate_runtime_intent cell1 layerv-nhp-sandbox-cell1-server-green "$(jq -r .server_provenance <<<"$RUNTIME")" \
+     "$SERVER_REFRESH_ORCHESTRATOR_SHA" ||
    ! validate_runtime_intent ac layerv-nhp-sandbox-ac-green "$(jq -r .ac_provenance <<<"$RUNTIME")" \
-     "$(jq -r .predecessor_plan_sha256 <<<"$RUNTIME")"; then
+     "$(jq -r .repair.orchestrator_sha <<<"$STATE")" "$(jq -r .predecessor_plan_sha256 <<<"$RUNTIME")"; then
   echo "deployment producer runtime-refresh intent authority is malformed" >&2
   exit 1
 fi
