@@ -60,8 +60,9 @@ func seedSandboxActiveReadyFixture(t *testing.T) *sandboxActiveReadyFixture {
 		Fake: newSessionControlSessionDynamoFake(), Targets: targets, Owners: owners,
 		Authority: sessionControlAuthority{
 			ACID: sandboxStaleTargetRetirementACID, ControlCellID: sandboxStaleTargetRetirementCellID,
-			Version: 7, ActiveTargetCount: sandboxActiveReadyPredecessorCount,
-			CreatedAtMillis: 1_800_000_000_000, UpdatedAtMillis: 1_800_000_000_250,
+			Version: sandboxActiveReadyAuthorityVersion, ActiveTargetCount: sandboxActiveReadyPredecessorCount,
+			CreatedAtMillis: sandboxActiveReadyAuthorityCreatedAtMillis,
+			UpdatedAtMillis: sandboxActiveReadyAuthorityUpdatedAtMillis,
 		},
 		Directory: sessionControlFenceDirectory{
 			CellID: sandboxStaleTargetRetirementCellID, Version: sandboxActiveReadyDirectoryVersion,
@@ -189,8 +190,16 @@ func TestSandboxActiveReadySnapshotRejectsEveryAuthorityDrift(t *testing.T) {
 			key := sessionControlSessionDynamoMapKey(sessionControlTargetDynamoKey(f.Targets[0].key()))
 			delete(f.Fake.items[key], "ready_control_version")
 		},
-		"authority version": func(t *testing.T, f *sandboxActiveReadyFixture) {
-			f.Authority.Version++
+		"authority predecessor version 7": func(t *testing.T, f *sandboxActiveReadyFixture) {
+			f.Authority.Version = 7
+			f.setAuthority(t, f.Authority)
+		},
+		"authority adjacent version 9": func(t *testing.T, f *sandboxActiveReadyFixture) {
+			f.Authority.Version = 9
+			f.setAuthority(t, f.Authority)
+		},
+		"authority adjacent version 11": func(t *testing.T, f *sandboxActiveReadyFixture) {
+			f.Authority.Version = 11
 			f.setAuthority(t, f.Authority)
 		},
 		"authority count": func(t *testing.T, f *sandboxActiveReadyFixture) {
@@ -199,6 +208,14 @@ func TestSandboxActiveReadySnapshotRejectsEveryAuthorityDrift(t *testing.T) {
 		},
 		"authority cell": func(t *testing.T, f *sandboxActiveReadyFixture) {
 			f.Authority.ControlCellID = "cell1"
+			f.setAuthority(t, f.Authority)
+		},
+		"authority created timestamp": func(t *testing.T, f *sandboxActiveReadyFixture) {
+			f.Authority.CreatedAtMillis++
+			f.setAuthority(t, f.Authority)
+		},
+		"authority updated timestamp": func(t *testing.T, f *sandboxActiveReadyFixture) {
+			f.Authority.UpdatedAtMillis++
 			f.setAuthority(t, f.Authority)
 		},
 		"directory version": func(t *testing.T, f *sandboxActiveReadyFixture) {
@@ -437,6 +454,22 @@ func TestSandboxActiveReadyLatchClassifiesLostResponseAndReplays(t *testing.T) {
 	fixture := seedSandboxActiveReadyFixture(t)
 	target, ready := fixture.Targets[0], fixture.Owners[0]
 	fixture.Fake.transactHook = func(_ context.Context, input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+		if len(input.TransactItems) != 4 || input.TransactItems[1].ConditionCheck == nil {
+			t.Fatalf("latch transaction = %#v", input)
+		}
+		authorityCheck := input.TransactItems[1].ConditionCheck
+		values := authorityCheck.ExpressionAttributeValues
+		version, versionOK := values[":version"].(*types.AttributeValueMemberN)
+		created, createdOK := values[":created_at"].(*types.AttributeValueMemberN)
+		updated, updatedOK := values[":updated_at"].(*types.AttributeValueMemberN)
+		if !versionOK || version.Value != fmt.Sprint(sandboxActiveReadyAuthorityVersion) ||
+			!createdOK || created.Value != fmt.Sprint(sandboxActiveReadyAuthorityCreatedAtMillis) ||
+			!updatedOK || updated.Value != fmt.Sprint(sandboxActiveReadyAuthorityUpdatedAtMillis) ||
+			authorityCheck.ConditionExpression == nil ||
+			!strings.Contains(*authorityCheck.ConditionExpression, "created_at_ms = :created_at") ||
+			!strings.Contains(*authorityCheck.ConditionExpression, "updated_at_ms = :updated_at") {
+			t.Fatalf("latch AUTHORITY condition = %#v", authorityCheck)
+		}
 		commitSandboxActiveReadyOwnerPut(t, fixture.Fake, input)
 		return nil, context.DeadlineExceeded
 	}
@@ -1095,6 +1128,104 @@ func TestSandboxJournaledActiveReadyRetireClassifiesCommittedNAndNPlusOneBeforeP
 	}
 }
 
+func TestSandboxJournaledActiveReadyRetireRequiresExactPreAuthorityAtEveryIndex(t *testing.T) {
+	for index := 0; index < sandboxActiveReadyPredecessorCount; index++ {
+		statuses := []string{"quiescent", "quiescent", "quiescent"}
+		for prior := 0; prior < index; prior++ {
+			statuses[prior] = "retired"
+		}
+		state, currentMain, historicalMain, _, historicalReady, _, _, _ := sandboxActiveReadyJournalFixture(t,
+			statuses, "ready_predecessor_retiring")
+		referenced, _, err := sandboxDecodeActiveReadyJournal(historicalReady)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, err := sandboxActiveReadyAuthorityBeforeRetirement(referenced, index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutations := map[string]func(*sessionControlAuthority){
+			"version before": func(value *sessionControlAuthority) { value.Version-- },
+			"version after":  func(value *sessionControlAuthority) { value.Version++ },
+			"count":          func(value *sessionControlAuthority) { value.ActiveTargetCount++ },
+			"cell":           func(value *sessionControlAuthority) { value.ControlCellID = "cell1" },
+			"created":        func(value *sessionControlAuthority) { value.CreatedAtMillis++ },
+			"updated":        func(value *sessionControlAuthority) { value.UpdatedAtMillis++ },
+		}
+		if index == 0 {
+			mutations["pre-incident v7"] = func(value *sessionControlAuthority) { value.Version = 7 }
+		}
+		for name, mutate := range mutations {
+			t.Run(fmt.Sprintf("index-%d/%s", index, name), func(t *testing.T) {
+				fixture := seedSandboxActiveReadyFixture(t)
+				fixture.Authority = expected
+				mutate(&fixture.Authority)
+				fixture.setAuthority(t, fixture.Authority)
+				decommissioning, planErr := planSessionControlOwnerDecommission(fixture.Owners[index])
+				if planErr != nil {
+					t.Fatal(planErr)
+				}
+				seedSessionControlOwnerAuthority(t, fixture.Fake, decommissioning)
+				if _, retireErr := retireSandboxJournaledActiveReadyWithClient(context.Background(), fixture.Fake,
+					fmt.Sprintf("active-ready-predecessor-%d", index+1), state, currentMain, historicalMain,
+					historicalReady, historicalReady, func() time.Time { return time.UnixMilli(1_800_000_020_000).UTC() }); retireErr == nil || len(fixture.Fake.transactions) != 0 {
+					t.Fatalf("pre-authority mutation = %v; transactions=%d", retireErr, len(fixture.Fake.transactions))
+				}
+			})
+		}
+	}
+}
+
+func TestSandboxJournaledActiveReadyRetireAuthorityConditionClosesTOCTOUAndTTL(t *testing.T) {
+	state, currentMain, historicalMain, _, historicalReady, _, _, _ := sandboxActiveReadyJournalFixture(t,
+		[]string{"quiescent", "quiescent", "quiescent"}, "ready_predecessor_retiring")
+	for _, test := range []struct {
+		name   string
+		mutate func(*sandboxActiveReadyFixture)
+	}{
+		{name: "version drift", mutate: func(fixture *sandboxActiveReadyFixture) {
+			fixture.Authority.Version++
+			fixture.setAuthority(t, fixture.Authority)
+		}},
+		{name: "TTL present", mutate: func(fixture *sandboxActiveReadyFixture) {
+			key := sessionControlSessionDynamoMapKey(sessionControlAuthorityDynamoKey(fixture.Authority.ACID))
+			fixture.Fake.items[key]["ttl"] = &types.AttributeValueMemberN{Value: "253402300799"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedSandboxActiveReadyFixture(t)
+			decommissioning, err := planSessionControlOwnerDecommission(fixture.Owners[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedSessionControlOwnerAuthority(t, fixture.Fake, decommissioning)
+			fixture.Fake.transactHook = func(_ context.Context, input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+				if len(input.TransactItems) != 4 || input.TransactItems[1].Update == nil ||
+					input.TransactItems[1].Update.ConditionExpression == nil ||
+					!strings.Contains(*input.TransactItems[1].Update.ConditionExpression, "active_target_count = :expected_count") ||
+					!strings.Contains(*input.TransactItems[1].Update.ConditionExpression, "created_at_ms = :created_at") ||
+					!strings.Contains(*input.TransactItems[1].Update.ConditionExpression, "updated_at_ms = :expected_updated_at") ||
+					!strings.Contains(*input.TransactItems[1].Update.ConditionExpression, "attribute_not_exists(#ttl)") {
+					t.Fatalf("exact retirement AUTHORITY condition = %#v", input)
+				}
+				test.mutate(fixture)
+				return nil, &types.TransactionCanceledException{}
+			}
+			if _, retireErr := retireSandboxJournaledActiveReadyWithClient(context.Background(), fixture.Fake,
+				"active-ready-predecessor-1", state, currentMain, historicalMain, historicalReady, historicalReady,
+				func() time.Time { return time.UnixMilli(1_800_000_020_000).UTC() }); retireErr == nil ||
+				len(fixture.Fake.transactions) != 1 {
+				t.Fatalf("TOCTOU mutation = %v; transactions=%d", retireErr, len(fixture.Fake.transactions))
+			}
+			current, getErr := (&dynamoSessionControlStore{client: fixture.Fake,
+				tableName: SandboxStaleTargetRetirementTable}).getTarget(context.Background(), fixture.Targets[0].key())
+			if getErr != nil || current.State != sessionControlTargetActive {
+				t.Fatalf("TOCTOU mutation retired target = %#v, %v", current, getErr)
+			}
+		})
+	}
+}
+
 func TestSandboxActiveReadyFinalRetireRequiresDecommissioningDirectoryAndDecrementsOnce(t *testing.T) {
 	fixture := seedSandboxActiveReadyFixture(t)
 	target, ready := fixture.Targets[0], fixture.Owners[0]
@@ -1130,13 +1261,13 @@ func TestSandboxActiveReadyFinalRetireRequiresDecommissioningDirectoryAndDecreme
 	}
 	retired, err := store.retireDecommissioningTarget(context.Background(), target.fence(), directory)
 	if err != nil || retired.State != sessionControlTargetRetired || fixture.Authority.ActiveTargetCount != 2 ||
-		fixture.Authority.Version != 8 {
+		fixture.Authority.Version != sandboxActiveReadyAuthorityVersion+1 {
 		t.Fatalf("final retirement = %#v, %v; authority=%#v", retired, err, fixture.Authority)
 	}
 	fixture.Fake.transactHook = nil
 	replayed, err := store.retireDecommissioningTarget(context.Background(), target.fence(), directory)
 	if err != nil || *replayed != *retired || len(fixture.Fake.transactions) != 1 ||
-		fixture.Authority.ActiveTargetCount != 2 || fixture.Authority.Version != 8 {
+		fixture.Authority.ActiveTargetCount != 2 || fixture.Authority.Version != sandboxActiveReadyAuthorityVersion+1 {
 		t.Fatalf("final retirement replay = %#v, %v; transactions=%d authority=%#v",
 			replayed, err, len(fixture.Fake.transactions), fixture.Authority)
 	}

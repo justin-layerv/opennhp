@@ -1820,7 +1820,7 @@ func (s *dynamoSessionControlStore) CancelTargetPreparation(ctx context.Context,
 // interface. Permanent key retirement requires a separately authenticated and
 // audited operator path; ordinary AOL/runtime code must not acquire that power.
 func (s *dynamoSessionControlStore) retireTarget(ctx context.Context, fence sessionControlTargetFence) (*sessionControlTargetAuthority, error) {
-	return s.retireTargetForOwnerPhase(ctx, fence, "", nil)
+	return s.retireTargetForOwnerPhase(ctx, fence, "", nil, nil)
 }
 
 // retireDecommissioningTarget is narrower than retireTarget. The recovery can
@@ -1829,11 +1829,18 @@ func (s *dynamoSessionControlStore) retireTarget(ctx context.Context, fence sess
 func (s *dynamoSessionControlStore) retireDecommissioningTarget(ctx context.Context, fence sessionControlTargetFence,
 	directory sessionControlFenceDirectory,
 ) (*sessionControlTargetAuthority, error) {
-	return s.retireTargetForOwnerPhase(ctx, fence, sessionControlOwnerDecommissioning, &directory)
+	return s.retireTargetForOwnerPhase(ctx, fence, sessionControlOwnerDecommissioning, &directory, nil)
+}
+
+func (s *dynamoSessionControlStore) retireDecommissioningTargetWithAuthority(ctx context.Context,
+	fence sessionControlTargetFence, directory sessionControlFenceDirectory, authority sessionControlAuthority,
+) (*sessionControlTargetAuthority, error) {
+	return s.retireTargetForOwnerPhase(ctx, fence, sessionControlOwnerDecommissioning, &directory, &authority)
 }
 
 func (s *dynamoSessionControlStore) retireTargetForOwnerPhase(ctx context.Context, fence sessionControlTargetFence,
 	requiredOwnerPhase sessionControlOwnerPhase, requiredDirectory *sessionControlFenceDirectory,
+	requiredAuthority *sessionControlAuthority,
 ) (*sessionControlTargetAuthority, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -1880,6 +1887,9 @@ func (s *dynamoSessionControlStore) retireTargetForOwnerPhase(ctx context.Contex
 	authority, err := s.getAuthority(ctx, fence.ACID)
 	if err != nil {
 		return nil, err
+	}
+	if requiredAuthority != nil && *authority != *requiredAuthority {
+		return nil, errSessionControlTargetConflict
 	}
 	if current.CountedActiveSlot && authority.ActiveTargetCount == 0 {
 		return nil, errSessionControlTargetCorrupt
@@ -1965,12 +1975,20 @@ func (s *dynamoSessionControlStore) retireTargetForOwnerPhase(ctx context.Contex
 		authorityValues[":next_authority_version"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nextHeaderVersion)}
 		authorityValues[":one"] = &types.AttributeValueMemberN{Value: "1"}
 		authorityValues[":updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(nowMillis)}
+		authorityNames := map[string]string{"#version": "version"}
+		if requiredAuthority != nil {
+			authorityCondition += " AND active_target_count = :expected_count AND created_at_ms = :created_at AND updated_at_ms = :expected_updated_at AND attribute_not_exists(#ttl)"
+			authorityValues[":expected_count"] = &types.AttributeValueMemberN{Value: fmt.Sprint(requiredAuthority.ActiveTargetCount)}
+			authorityValues[":created_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(requiredAuthority.CreatedAtMillis)}
+			authorityValues[":expected_updated_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(requiredAuthority.UpdatedAtMillis)}
+			authorityNames["#ttl"] = "ttl"
+		}
 		authorityWrite.Update = &types.Update{
 			TableName:                 aws.String(s.tableName),
 			Key:                       sessionControlAuthorityDynamoKey(fence.ACID),
 			UpdateExpression:          aws.String("SET #version = :next_authority_version, active_target_count = active_target_count - :one, updated_at_ms = :updated_at"),
 			ConditionExpression:       aws.String(authorityCondition + " AND active_target_count >= :one"),
-			ExpressionAttributeNames:  map[string]string{"#version": "version"},
+			ExpressionAttributeNames:  authorityNames,
 			ExpressionAttributeValues: authorityValues,
 		}
 	} else {

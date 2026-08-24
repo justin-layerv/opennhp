@@ -15,6 +15,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+const (
+	// Retiring the three journaled v4 predecessors advanced the exact live
+	// AUTHORITY header from v7 to v10 without changing its creation lineage.
+	sandboxActiveReadyAuthorityVersion         = 10
+	sandboxActiveReadyAuthorityCreatedAtMillis = 1787485637722
+	sandboxActiveReadyAuthorityUpdatedAtMillis = 1787590756221
+)
+
+func sandboxActiveReadyAuthorityIsExact(authority sessionControlAuthority) bool {
+	return authority.ACID == sandboxStaleTargetRetirementACID &&
+		authority.ControlCellID == sandboxStaleTargetRetirementCellID &&
+		authority.Version == sandboxActiveReadyAuthorityVersion &&
+		authority.ActiveTargetCount == sandboxActiveReadyPredecessorCount &&
+		authority.CreatedAtMillis == sandboxActiveReadyAuthorityCreatedAtMillis &&
+		authority.UpdatedAtMillis == sandboxActiveReadyAuthorityUpdatedAtMillis
+}
+
 // SandboxStaleTargetOwnerFence is the complete immutable OWNER authority that
 // the recovery journals before it closes admission for one ACTIVE/READY
 // predecessor. Decimal strings prevent JSON number rounding.
@@ -177,8 +194,7 @@ func snapshotSandboxActiveReadyPredecessors(ctx context.Context, client sessionC
 			return SandboxStaleTargetRetirementPlan{}, errSessionControlTargetConflict
 		}
 		authority, authorityErr := store.getAuthority(ctx, sandboxStaleTargetRetirementACID)
-		if authorityErr != nil || authority.Version != 7 || authority.ActiveTargetCount != sandboxActiveReadyPredecessorCount ||
-			authority.ControlCellID != sandboxStaleTargetRetirementCellID {
+		if authorityErr != nil || !sandboxActiveReadyAuthorityIsExact(*authority) {
 			return SandboxStaleTargetRetirementPlan{}, errSessionControlTargetConflict
 		}
 		sort.Slice(targets, func(i, j int) bool { return targets[i].PublicKey < targets[j].PublicKey })
@@ -357,9 +373,8 @@ func classifySandboxActiveReadyDecommissionWithClient(ctx context.Context, clien
 	currentAuthority, authorityErr := store.getAuthority(ctx, target.ACID)
 	currentDirectory, directoryErr := store.getFenceDirectory(ctx, target.ControlCellID)
 	if targetErr != nil || ownerErr != nil || authorityErr != nil || directoryErr != nil ||
-		*currentTarget != target || *currentOwner != expectedOwner || currentAuthority.Version != 7 ||
-		currentAuthority.ActiveTargetCount != sandboxActiveReadyPredecessorCount ||
-		currentAuthority.ControlCellID != target.ControlCellID || *currentDirectory != directory {
+		*currentTarget != target || *currentOwner != expectedOwner ||
+		!sandboxActiveReadyAuthorityIsExact(*currentAuthority) || *currentDirectory != directory {
 		return nil, errSessionControlOwnerConflict
 	}
 	return sandboxLatchReceipt(targetID, fence, expectedOwner, directoryReceipt), nil
@@ -406,8 +421,7 @@ func beginSandboxActiveReadyDecommissionWithClient(ctx context.Context, client s
 		return nil, errSessionControlTargetConflict
 	}
 	authority, err := store.getAuthority(ctx, target.ACID)
-	if err != nil || authority.Version != 7 || authority.ActiveTargetCount != sandboxActiveReadyPredecessorCount ||
-		authority.ControlCellID != target.ControlCellID {
+	if err != nil || !sandboxActiveReadyAuthorityIsExact(*authority) {
 		return nil, errSessionControlTargetConflict
 	}
 	ownerWrite, err := sessionControlOwnerReplace(store.tableName, readyOwner, nextOwner)
@@ -424,13 +438,17 @@ func beginSandboxActiveReadyDecommissionWithClient(ctx context.Context, client s
 	}}
 	authorityCheck := types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 		TableName: aws.String(store.tableName), Key: sessionControlAuthorityDynamoKey(target.ACID),
-		ConditionExpression:      aws.String("kind = :kind AND schema_version = :schema AND ac_id = :ac_id AND #version = :version AND active_target_count = :count AND control_cell_id = :cell AND attribute_not_exists(#ttl)"),
+		ConditionExpression:      aws.String("kind = :kind AND schema_version = :schema AND ac_id = :ac_id AND #version = :version AND active_target_count = :count AND control_cell_id = :cell AND created_at_ms = :created_at AND updated_at_ms = :updated_at AND attribute_not_exists(#ttl)"),
 		ExpressionAttributeNames: map[string]string{"#version": "version", "#ttl": "ttl"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":kind":   &types.AttributeValueMemberS{Value: sessionControlAuthorityKind},
-			":schema": &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlAuthoritySchema)},
-			":ac_id":  &types.AttributeValueMemberS{Value: target.ACID}, ":version": &types.AttributeValueMemberN{Value: "7"},
-			":count": &types.AttributeValueMemberN{Value: "3"}, ":cell": &types.AttributeValueMemberS{Value: target.ControlCellID},
+			":kind":       &types.AttributeValueMemberS{Value: sessionControlAuthorityKind},
+			":schema":     &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlAuthoritySchema)},
+			":ac_id":      &types.AttributeValueMemberS{Value: target.ACID},
+			":version":    &types.AttributeValueMemberN{Value: fmt.Sprint(sandboxActiveReadyAuthorityVersion)},
+			":count":      &types.AttributeValueMemberN{Value: fmt.Sprint(sandboxActiveReadyPredecessorCount)},
+			":cell":       &types.AttributeValueMemberS{Value: target.ControlCellID},
+			":created_at": &types.AttributeValueMemberN{Value: fmt.Sprint(sandboxActiveReadyAuthorityCreatedAtMillis)},
+			":updated_at": &types.AttributeValueMemberN{Value: fmt.Sprint(sandboxActiveReadyAuthorityUpdatedAtMillis)},
 		},
 	}}
 	directoryValues := sessionControlFenceDirectoryConditionValues(directory)
@@ -896,6 +914,32 @@ func VerifySandboxJournaledActiveReadyPredecessorQuiescenceForRecovery(ctx conte
 		currentJournalSnapshot, referencedJournalSnapshot, currentReadySnapshot, referencedReadySnapshot)
 }
 
+func sandboxActiveReadyAuthorityBeforeRetirement(journal sandboxActiveReadyRecoveryJournal,
+	index int,
+) (sessionControlAuthority, error) {
+	if index < 0 || index >= sandboxActiveReadyPredecessorCount || len(journal.Targets) != sandboxActiveReadyPredecessorCount {
+		return sessionControlAuthority{}, errors.New("invalid ACTIVE/READY retirement authority index")
+	}
+	updatedAt := int64(sandboxActiveReadyAuthorityUpdatedAtMillis)
+	if index > 0 {
+		previous := journal.Targets[index-1]
+		if previous.Status != "retired" || previous.Receipt == nil {
+			return sessionControlAuthority{}, errors.New("prior ACTIVE/READY retirement receipt is absent")
+		}
+		parsed, err := strconv.ParseInt(previous.Receipt.RetiredAtMillis, 10, 64)
+		if err != nil || parsed <= 0 || strconv.FormatInt(parsed, 10) != previous.Receipt.RetiredAtMillis {
+			return sessionControlAuthority{}, errors.New("prior ACTIVE/READY retirement timestamp is malformed")
+		}
+		updatedAt = parsed
+	}
+	return sessionControlAuthority{
+		ACID: sandboxStaleTargetRetirementACID, ControlCellID: sandboxStaleTargetRetirementCellID,
+		Version:           uint64(sandboxActiveReadyAuthorityVersion + index),
+		ActiveTargetCount: uint64(sandboxActiveReadyPredecessorCount - index),
+		CreatedAtMillis:   sandboxActiveReadyAuthorityCreatedAtMillis, UpdatedAtMillis: updatedAt,
+	}, nil
+}
+
 func retireSandboxJournaledActiveReadyWithClient(ctx context.Context, client sessionControlDynamoAPI,
 	targetID string, stateSnapshot, currentJournalSnapshot, referencedJournalSnapshot,
 	currentReadySnapshot, referencedReadySnapshot SandboxRecoveryParameterSnapshot,
@@ -909,6 +953,14 @@ func retireSandboxJournaledActiveReadyWithClient(ctx context.Context, client ses
 	if err != nil {
 		return nil, err
 	}
+	referenced, _, err := sandboxDecodeActiveReadyJournal(referencedReadySnapshot)
+	if err != nil {
+		return nil, err
+	}
+	expectedPreAuthority, err := sandboxActiveReadyAuthorityBeforeRetirement(referenced, authority.Index)
+	if err != nil {
+		return nil, err
+	}
 	store := &dynamoSessionControlStore{client: client, tableName: SandboxStaleTargetRetirementTable, nowUTC: nowUTC}
 	current, err := store.getTarget(ctx, authority.Fence.key())
 	if err != nil {
@@ -917,22 +969,6 @@ func retireSandboxJournaledActiveReadyWithClient(ctx context.Context, client ses
 	var retired *sessionControlTargetAuthority
 	if current.State == sessionControlTargetRetired {
 		retired, err = store.classifyRetiredTarget(ctx, authority.Fence)
-		if err == nil {
-			retiredOwner, ownerErr := store.getOwner(ctx, authority.Fence.ControlCellID, authority.Fence.ACID,
-				authority.Fence.PublicKey)
-			expectedRetiredOwner, expectedOwnerErr := sessionControlOwnerFromTarget(*retired,
-				&authority.DecommissionOwner, sessionControlOwnerRetired)
-			currentAuthority, authorityErr := store.getAuthority(ctx, authority.Fence.ACID)
-			expectedAuthorityVersion := uint64(8 + authority.Index)
-			expectedCount := uint64(sandboxActiveReadyPredecessorCount - authority.Index - 1)
-			if ownerErr != nil || expectedOwnerErr != nil || *retiredOwner != expectedRetiredOwner ||
-				authorityErr != nil || currentAuthority.Version != expectedAuthorityVersion ||
-				currentAuthority.ActiveTargetCount != expectedCount ||
-				currentAuthority.ControlCellID != authority.Fence.ControlCellID ||
-				currentAuthority.UpdatedAtMillis != retired.RetiredAtMillis {
-				return nil, errSessionControlTargetConflict
-			}
-		}
 	} else if authority.CurrentIsSuccessor {
 		return nil, errors.New("journal successor exists before the exact DDB retirement")
 	} else {
@@ -941,8 +977,7 @@ func retireSandboxJournaledActiveReadyWithClient(ctx context.Context, client ses
 		if verifyErr != nil {
 			return nil, verifyErr
 		}
-		referenced, _, decodeErr := sandboxDecodeActiveReadyJournal(referencedReadySnapshot)
-		if decodeErr != nil || referenced.Targets[authority.Index].QuiescenceReceipt == nil ||
+		if referenced.Targets[authority.Index].QuiescenceReceipt == nil ||
 			*referenced.Targets[authority.Index].QuiescenceReceipt != *quiescence {
 			return nil, errors.New("live quiescence differs from the precommitted receipt")
 		}
@@ -953,9 +988,23 @@ func retireSandboxJournaledActiveReadyWithClient(ctx context.Context, client ses
 		if directory.Version != sandboxActiveReadyDirectoryVersion {
 			return nil, errSessionControlFenceCorrupt
 		}
-		retired, err = store.retireDecommissioningTarget(ctx, authority.Fence, directory)
+		retired, err = store.retireDecommissioningTargetWithAuthority(ctx, authority.Fence, directory,
+			expectedPreAuthority)
 	}
 	if err != nil || retired == nil || !sessionControlRetiredTargetMatchesFence(*retired, authority.Fence) {
+		return nil, errSessionControlTargetConflict
+	}
+	retiredOwner, ownerErr := store.getOwner(ctx, authority.Fence.ControlCellID, authority.Fence.ACID,
+		authority.Fence.PublicKey)
+	expectedRetiredOwner, expectedOwnerErr := sessionControlOwnerFromTarget(*retired,
+		&authority.DecommissionOwner, sessionControlOwnerRetired)
+	currentAuthority, authorityErr := store.getAuthority(ctx, authority.Fence.ACID)
+	expectedPostAuthority := expectedPreAuthority
+	expectedPostAuthority.Version++
+	expectedPostAuthority.ActiveTargetCount--
+	expectedPostAuthority.UpdatedAtMillis = retired.RetiredAtMillis
+	if ownerErr != nil || expectedOwnerErr != nil || *retiredOwner != expectedRetiredOwner ||
+		authorityErr != nil || *currentAuthority != expectedPostAuthority {
 		return nil, errSessionControlTargetConflict
 	}
 	receipt := &SandboxStaleTargetRetirementReceipt{
