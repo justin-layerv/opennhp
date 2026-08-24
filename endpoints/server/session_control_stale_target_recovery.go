@@ -23,6 +23,7 @@ const (
 	SandboxStaleTargetRetirementPlanSchema     = "layerv.durable-aop-stale-target-retirement-plan.v1"
 	SandboxStaleTargetRetirementReceiptSchema  = "layerv.durable-aop-stale-target-retirement-receipt.v1"
 	SandboxStaleTargetPredecessorPlanSchema    = "layerv.durable-aop-predecessor-target-plan.v1"
+	SandboxActiveReadyPredecessorPlanSchema    = "layerv.durable-aop-active-ready-predecessor-plan.v1"
 	SandboxStaleTargetRetirementTable          = "layerv-nhp-sandbox-cell0-nhp-session-control"
 	SandboxStaleTargetRetirementRegion         = "us-east-2"
 	SandboxStaleTargetFenceDrainCellID         = "cell0"
@@ -31,6 +32,9 @@ const (
 
 	sandboxStaleTargetRetirementACID   = "layerv-ac-tf"
 	sandboxStaleTargetRetirementCellID = "cell0"
+	sandboxActiveReadyPredecessorCount = 3
+	// This is the exact fence_drain receipt already persisted in live journal v8.
+	sandboxActiveReadyDirectoryVersion = 250
 )
 
 const (
@@ -173,7 +177,7 @@ func SnapshotSandboxPreparingPredecessorsForRecovery(ctx context.Context, client
 	return snapshotSandboxPreparingPredecessors(ctx, client, tableName)
 }
 
-func sandboxStaleTargetFenceFromPublic(value SandboxStaleTargetFence) (sessionControlTargetFence, error) {
+func sandboxStaleTargetFenceFromPublicForSchema(value SandboxStaleTargetFence, expectedSchema string) (sessionControlTargetFence, error) {
 	parseUint := func(name, raw string) (uint64, error) {
 		parsed, err := strconv.ParseUint(raw, 10, 64)
 		if err != nil || strconv.FormatUint(parsed, 10) != raw {
@@ -233,18 +237,37 @@ func sandboxStaleTargetFenceFromPublic(value SandboxStaleTargetFence) (sessionCo
 		CreatedAtMillis: created, PreparedAtMillis: prepared,
 	}
 	if !validSessionControlTargetFence(fence) || fence.ACID != sandboxStaleTargetRetirementACID ||
-		fence.ControlCellID != sandboxStaleTargetRetirementCellID || !fence.CountedActiveSlot ||
-		fence.ActivatedControlVersion != 0 || fence.ReadyControlVersion != 0 ||
-		fence.AAKEnqueuedAtMillis != 0 || fence.AAKTransactionID != 0 {
-		return sessionControlTargetFence{}, errors.New("predecessor fence is not an exact counted PREPARING authority")
+		fence.ControlCellID != sandboxStaleTargetRetirementCellID || !fence.CountedActiveSlot {
+		return sessionControlTargetFence{}, errors.New("predecessor fence is not an exact counted authority")
+	}
+	switch expectedSchema {
+	case SandboxStaleTargetRetirementPlanSchema, SandboxStaleTargetPredecessorPlanSchema:
+		if fence.ActivatedControlVersion != 0 || fence.ReadyControlVersion != 0 ||
+			fence.AAKEnqueuedAtMillis != 0 || fence.AAKTransactionID != 0 {
+			return sessionControlTargetFence{}, errors.New("predecessor fence is not an exact counted PREPARING authority")
+		}
+	case SandboxActiveReadyPredecessorPlanSchema:
+		if fence.AuthorityVersion != 7 || fence.ActivatedControlVersion != sandboxActiveReadyDirectoryVersion ||
+			fence.ReadyControlVersion != fence.ActivatedControlVersion || fence.AAKEnqueuedAtMillis <= 0 ||
+			fence.AAKTransactionID == 0 {
+			return sessionControlTargetFence{}, errors.New("predecessor fence is not the exact v7 ACTIVE/READY authority")
+		}
+	default:
+		return sessionControlTargetFence{}, errors.New("predecessor fence schema is not supported")
 	}
 	return fence, nil
 }
 
+func sandboxStaleTargetFenceFromPublic(value SandboxStaleTargetFence) (sessionControlTargetFence, error) {
+	return sandboxStaleTargetFenceFromPublicForSchema(value, SandboxStaleTargetPredecessorPlanSchema)
+}
+
 type SandboxStaleTargetRetirementPlanTarget struct {
-	ID          string                  `json:"id"`
-	Fence       SandboxStaleTargetFence `json:"fence"`
-	FenceSHA256 string                  `json:"fence_sha256"`
+	ID          string                        `json:"id"`
+	Fence       SandboxStaleTargetFence       `json:"fence"`
+	FenceSHA256 string                        `json:"fence_sha256"`
+	Owner       *SandboxStaleTargetOwnerFence `json:"owner,omitempty"`
+	OwnerSHA256 string                        `json:"owner_sha256,omitempty"`
 }
 
 type SandboxStaleTargetRetirementPlan struct {
@@ -640,6 +663,7 @@ type sandboxStaleTargetJournalRuntime struct {
 	PredecessorPlan              SandboxStaleTargetRetirementPlan         `json:"predecessor_plan"`
 	PredecessorPlanSHA256        string                                   `json:"predecessor_plan_sha256"`
 	PredecessorTargets           []sandboxStaleTargetJournalTarget        `json:"predecessor_targets"`
+	ReadyPredecessorRef          *sandboxStaleTargetJournalRef            `json:"ready_predecessor_ref,omitempty"`
 	Preferences                  sandboxStaleTargetRefreshPreferences     `json:"preferences"`
 	RuntimeManifest              string                                   `json:"runtime_manifest"`
 	ServerProvenance             string                                   `json:"server_provenance"`
@@ -807,10 +831,19 @@ func sandboxStaleTargetPlanObjectIsClosed(value any) bool {
 	}
 	for _, rawTarget := range targets {
 		target, ok := rawTarget.(map[string]any)
-		if !ok || !sandboxExactObjectKeys(target, "fence", "fence_sha256", "id") ||
+		activeReady := object["schema"] == SandboxActiveReadyPredecessorPlanSchema
+		if !ok || ((!activeReady || !sandboxExactObjectKeys(target, "fence", "fence_sha256", "id", "owner", "owner_sha256")) &&
+			(activeReady || !sandboxExactObjectKeys(target, "fence", "fence_sha256", "id"))) ||
 			!sandboxExactObjectKeys(target["fence"], "aak_enqueued_at_ms", "aak_transaction_id", "ac_id",
 				"activated_control_version", "authority_version", "boot_id", "control_cell_id", "counted_active_slot",
 				"created_at_ms", "flush_generation", "prepared_at_ms", "public_key", "ready_control_version", "version") {
+			return false
+		}
+		if activeReady && !sandboxExactObjectKeys(target["owner"], "aak_enqueued_at_ms", "aak_transaction_id", "ac_id",
+			"activated_control_version", "boot_id", "cell_id", "created_at_ms", "flush_generation", "lifecycle_version",
+			"pending_count", "phase", "public_key", "ready_control_version", "retired_at_ms", "target_authority_version",
+			"target_counted_active_slot", "target_created_at_ms", "target_prepared_at_ms", "target_updated_at_ms",
+			"target_version", "task_count", "updated_at_ms", "work_version") {
 			return false
 		}
 	}
@@ -907,18 +940,32 @@ func sandboxSessionControlDeleteIAMObjectIsClosed(value any) bool {
 
 func sandboxStaleTargetJournalObjectIsClosed(root map[string]any) bool {
 	runtime, ok := root["runtime"].(map[string]any)
-	if !ok || !sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
+	oldRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
 		"cell0", "cell1", "fence_drain", "fence_start", "predecessor_plan", "predecessor_plan_sha256",
 		"predecessor_targets", "preferences", "runtime_manifest", "server_provenance",
-		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha") ||
+		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha")
+	newRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
+		"cell0", "cell1", "fence_drain", "fence_start", "predecessor_plan", "predecessor_plan_sha256",
+		"predecessor_targets", "preferences", "ready_predecessor_ref", "runtime_manifest", "server_provenance",
+		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha")
+	predecessorPlanClosed := runtime["predecessor_plan"] != nil &&
+		sandboxStaleTargetPlanObjectIsClosed(runtime["predecessor_plan"]) &&
+		sandboxStaleTargetLedgerObjectIsClosed(runtime["predecessor_targets"])
+	predecessorTargets, predecessorTargetsOK := runtime["predecessor_targets"].([]any)
+	activeReadyPlanClosed := newRuntime && runtime["predecessor_plan"] == nil &&
+		runtime["predecessor_plan_sha256"] == "" && predecessorTargetsOK && len(predecessorTargets) == 0
+	if !ok || (!oldRuntime && !newRuntime) || (!predecessorPlanClosed && !activeReadyPlanClosed) ||
 		!sandboxStaleTargetPlanObjectIsClosed(root["incident_plan"]) ||
 		!sandboxStaleTargetLedgerObjectIsClosed(root["incident_targets"]) ||
-		!sandboxStaleTargetPlanObjectIsClosed(runtime["predecessor_plan"]) ||
-		!sandboxStaleTargetLedgerObjectIsClosed(runtime["predecessor_targets"]) ||
 		!sandboxSessionControlDeleteIAMObjectIsClosed(runtime["session_control_delete_iam"]) ||
 		!sandboxExactObjectKeys(runtime["preferences"], "InstanceWarmup", "MaxHealthyPercentage",
 			"MinHealthyPercentage", "SkipMatching") {
 		return false
+	}
+	if newRuntime {
+		if !sandboxExactObjectKeys(runtime["ready_predecessor_ref"], "parameter", "sha256", "version") {
+			return false
+		}
 	}
 	for _, key := range []string{"cell0", "cell1", "ac"} {
 		if !sandboxExactObjectKeys(runtime[key], "asg", "attestation", "intent_sha256", "prior_refresh_id", "refresh_id") {
@@ -967,7 +1014,52 @@ func sandboxDecodeStaleTargetJournal(snapshot SandboxRecoveryParameterSnapshot) 
 	return journal, journalObject, nil
 }
 
-func sandboxValidateDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceipt, active string) bool {
+type sandboxResolvedJournalSnapshots struct {
+	State              sandboxStaleTargetRecoveryState
+	Referenced         sandboxStaleTargetJournal
+	ReferencedObject   map[string]any
+	CurrentIsSuccessor bool
+}
+
+// sandboxResolveJournalSnapshots is the shared fail-closed SSM state/journal
+// bracket. Incident-specific resolvers validate only their own phase, plan,
+// ledger, and one-successor transition after this common authority is fixed.
+func sandboxResolveJournalSnapshots(stateSnapshot, currentJournalSnapshot,
+	referencedJournalSnapshot SandboxRecoveryParameterSnapshot,
+) (sandboxResolvedJournalSnapshots, error) {
+	var resolved sandboxResolvedJournalSnapshots
+	state, err := sandboxValidateRecoveryState(stateSnapshot)
+	if err != nil {
+		return resolved, err
+	}
+	ref := state.Repair.StaleTargetRetirementRef
+	if ref.Parameter != SandboxStaleTargetRecoveryJournalParameter || ref.Version <= 0 || !sandboxExactHex(ref.SHA256, 32) ||
+		referencedJournalSnapshot.Version != ref.Version || sandboxCanonicalDigest(referencedJournalSnapshot.Value) != ref.SHA256 {
+		return resolved, errors.New("schema-3 state and referenced stale-target journal differ")
+	}
+	currentIsReference := currentJournalSnapshot.Version == ref.Version &&
+		currentJournalSnapshot.Value == referencedJournalSnapshot.Value
+	currentIsSuccessor := currentJournalSnapshot.Version == ref.Version+1
+	if !currentIsReference && !currentIsSuccessor {
+		return resolved, errors.New("current stale-target journal is neither the reference nor one successor")
+	}
+	j, object, err := sandboxDecodeStaleTargetJournal(referencedJournalSnapshot)
+	if err != nil || !sandboxExactObjectKeys(object, "incident_plan", "incident_plan_sha256", "incident_targets", "runtime",
+		"schema", "source_state_sha256", "source_state_version", "status") ||
+		!sandboxStaleTargetJournalObjectIsClosed(object) || j.Schema != sandboxStaleTargetJournalSchema ||
+		j.SourceStateVersion != sandboxStaleTargetSourceStateVersion || j.SourceStateSHA256 != sandboxStaleTargetSourceStateSHA256 {
+		return resolved, errors.New("referenced stale-target journal is malformed")
+	}
+	resolved.State = state
+	resolved.Referenced = j
+	resolved.ReferencedObject = object
+	resolved.CurrentIsSuccessor = currentIsSuccessor
+	return resolved, nil
+}
+
+func sandboxDirectoryFromRecoveryReceipt(receipt SandboxFenceDirectoryRecoveryReceipt,
+	active string,
+) (sessionControlFenceDirectory, error) {
 	parseUint := func(raw string) (uint64, bool) {
 		value, err := strconv.ParseUint(raw, 10, 64)
 		return value, err == nil && strconv.FormatUint(value, 10) == raw
@@ -991,11 +1083,19 @@ func sandboxValidateDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceip
 		OverflowLeaderSelectedDirectoryVersion: overflowSelected,
 		CreatedAtMillis:                        created, UpdatedAtMillis: updated,
 	}
-	return versionOK && activeOK && overflowOK && overflowPreparedOK && overflowSelectedOK && createdOK && updatedOK &&
-		receipt.Schema == sandboxFenceDirectoryRecoveryReceiptSchema && receipt.CellID == SandboxStaleTargetFenceDrainCellID &&
-		receipt.ActiveFenceCount == active && !receipt.AdmissionBlocked && receipt.OverflowCloseCount == "0" &&
-		receipt.OverflowLeaderEventID == "" && receipt.OverflowLeaderPreparedDirectoryVersion == "0" &&
-		receipt.OverflowLeaderSelectedDirectoryVersion == "0" && receipt.DirectorySHA256 == sandboxFenceDirectoryDigest(directory)
+	if !versionOK || !activeOK || !overflowOK || !overflowPreparedOK || !overflowSelectedOK || !createdOK || !updatedOK ||
+		receipt.Schema != sandboxFenceDirectoryRecoveryReceiptSchema || receipt.CellID != SandboxStaleTargetFenceDrainCellID ||
+		receipt.ActiveFenceCount != active || receipt.AdmissionBlocked || receipt.OverflowCloseCount != "0" ||
+		receipt.OverflowLeaderEventID != "" || receipt.OverflowLeaderPreparedDirectoryVersion != "0" ||
+		receipt.OverflowLeaderSelectedDirectoryVersion != "0" || receipt.DirectorySHA256 != sandboxFenceDirectoryDigest(directory) {
+		return sessionControlFenceDirectory{}, errSessionControlFenceCorrupt
+	}
+	return directory, nil
+}
+
+func sandboxValidateDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceipt, active string) bool {
+	_, err := sandboxDirectoryFromRecoveryReceipt(receipt, active)
+	return err == nil
 }
 
 func sandboxValidateStartingDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceipt) bool {
@@ -1055,11 +1155,19 @@ func sandboxValidatePlan(plan SandboxStaleTargetRetirementPlan, expectedSchema s
 		plan.ControlCellID != sandboxStaleTargetRetirementCellID || len(plan.Targets) == 0 || len(plan.Targets) > 3 {
 		return nil, errors.New("stale-target plan is not the exact sandbox authority")
 	}
+	if expectedSchema == SandboxActiveReadyPredecessorPlanSchema && len(plan.Targets) != sandboxActiveReadyPredecessorCount {
+		return nil, errors.New("ACTIVE/READY predecessor plan is not the exact incident trio")
+	}
 	fences := make([]sessionControlTargetFence, len(plan.Targets))
 	seen := make(map[string]bool, len(plan.Targets))
 	seenPublicKeys := make(map[string]bool, len(plan.Targets))
 	for index, target := range plan.Targets {
-		if target.ID != fmt.Sprintf("predecessor-%d", index+1) && expectedSchema == SandboxStaleTargetPredecessorPlanSchema {
+		expectedID := fmt.Sprintf("predecessor-%d", index+1)
+		if expectedSchema == SandboxActiveReadyPredecessorPlanSchema {
+			expectedID = fmt.Sprintf("active-ready-predecessor-%d", index+1)
+		}
+		if target.ID != expectedID && (expectedSchema == SandboxStaleTargetPredecessorPlanSchema ||
+			expectedSchema == SandboxActiveReadyPredecessorPlanSchema) {
 			return nil, errors.New("predecessor target ID is not canonical")
 		}
 		if target.ID == "" || seen[target.ID] || seenPublicKeys[target.Fence.PublicKey] {
@@ -1067,9 +1175,29 @@ func sandboxValidatePlan(plan SandboxStaleTargetRetirementPlan, expectedSchema s
 		}
 		seen[target.ID] = true
 		seenPublicKeys[target.Fence.PublicKey] = true
-		fence, err := sandboxStaleTargetFenceFromPublic(target.Fence)
+		fence, err := sandboxStaleTargetFenceFromPublicForSchema(target.Fence, expectedSchema)
 		if err != nil || target.FenceSHA256 != sandboxStaleTargetFenceDigest(fence) {
 			return nil, errors.New("stale-target plan fence or digest is malformed")
+		}
+		if expectedSchema == SandboxActiveReadyPredecessorPlanSchema {
+			if target.Owner == nil || !sandboxExactHex(target.OwnerSHA256, 32) {
+				return nil, errors.New("ACTIVE/READY predecessor plan lacks its exact owner fence")
+			}
+			owner, ownerErr := sandboxStaleTargetOwnerFromPublic(*target.Owner)
+			if ownerErr != nil || !owner.exactTarget(sessionControlTargetAuthority{
+				ACID: fence.ACID, PublicKey: fence.PublicKey, BootID: fence.BootID,
+				FlushGeneration: fence.FlushGeneration, State: sessionControlTargetActive,
+				Version: fence.Version, AuthorityVersion: fence.AuthorityVersion, CountedActiveSlot: fence.CountedActiveSlot,
+				ControlCellID: fence.ControlCellID, ActivatedControlVersion: fence.ActivatedControlVersion,
+				ReadyControlVersion: fence.ReadyControlVersion, AAKEnqueuedAtMillis: fence.AAKEnqueuedAtMillis,
+				AAKTransactionID: fence.AAKTransactionID, CreatedAtMillis: fence.CreatedAtMillis,
+				PreparedAtMillis: fence.PreparedAtMillis, UpdatedAtMillis: owner.TargetUpdatedAtMillis,
+			}, sessionControlOwnerReady) || owner.TaskCount != 0 || owner.PendingCount != 0 ||
+				target.OwnerSHA256 != sandboxStaleTargetOwnerDigest(owner) {
+				return nil, errors.New("ACTIVE/READY predecessor owner fence or digest is malformed")
+			}
+		} else if target.Owner != nil || target.OwnerSHA256 != "" {
+			return nil, errors.New("PREPARING predecessor plan contains an owner extension")
 		}
 		fences[index] = fence
 	}
@@ -1079,33 +1207,13 @@ func sandboxValidatePlan(plan SandboxStaleTargetRetirementPlan, expectedSchema s
 func sandboxResolveJournaledPredecessorFence(stateSnapshot, currentJournalSnapshot,
 	referencedJournalSnapshot SandboxRecoveryParameterSnapshot, targetID string,
 ) (sessionControlTargetFence, error) {
-	state, err := sandboxValidateRecoveryState(stateSnapshot)
+	resolved, err := sandboxResolveJournalSnapshots(stateSnapshot, currentJournalSnapshot, referencedJournalSnapshot)
 	if err != nil {
 		return sessionControlTargetFence{}, err
 	}
-	ref := state.Repair.StaleTargetRetirementRef
-	if ref.Parameter != SandboxStaleTargetRecoveryJournalParameter || ref.Version <= 0 || !sandboxExactHex(ref.SHA256, 32) ||
-		referencedJournalSnapshot.Version != ref.Version ||
-		sandboxCanonicalDigest(referencedJournalSnapshot.Value) != ref.SHA256 {
-		return sessionControlTargetFence{}, errors.New("schema-3 state and referenced stale-target journal differ")
-	}
-	currentIsReference := currentJournalSnapshot.Version == ref.Version &&
-		currentJournalSnapshot.Value == referencedJournalSnapshot.Value
-	currentIsOneSuccessor := currentJournalSnapshot.Version == ref.Version+1
-	if !currentIsReference && !currentIsOneSuccessor {
-		return sessionControlTargetFence{}, errors.New("current stale-target journal is neither the reference nor one successor")
-	}
-	journal, journalObject, err := sandboxDecodeStaleTargetJournal(referencedJournalSnapshot)
-	if err != nil {
-		return sessionControlTargetFence{}, err
-	}
-	if !sandboxExactObjectKeys(journalObject, "incident_plan", "incident_plan_sha256", "incident_targets", "runtime",
-		"schema", "source_state_sha256", "source_state_version", "status") ||
-		!sandboxStaleTargetJournalObjectIsClosed(journalObject) ||
-		journal.Schema != sandboxStaleTargetJournalSchema ||
-		(journal.Status != "predecessor_retiring" && journal.Status != "complete") ||
-		journal.SourceStateVersion != sandboxStaleTargetSourceStateVersion ||
-		journal.SourceStateSHA256 != sandboxStaleTargetSourceStateSHA256 {
+	state := resolved.State
+	journal := resolved.Referenced
+	if journal.Status != "predecessor_retiring" && journal.Status != "complete" {
 		return sessionControlTargetFence{}, errors.New("stale-target journal is not at the exact predecessor retirement boundary")
 	}
 	incidentPlanValue, _ := sandboxCanonicalValue(journal.IncidentPlan)
@@ -1179,7 +1287,7 @@ func sandboxResolveJournaledPredecessorFence(stateSnapshot, currentJournalSnapsh
 	if journal.Status == "complete" && seenPending {
 		return sessionControlTargetFence{}, errors.New("complete predecessor journal contains pending targets")
 	}
-	if currentIsOneSuccessor {
+	if resolved.CurrentIsSuccessor {
 		if journal.Status != "predecessor_retiring" || journal.Runtime.PredecessorTargets[selected].Status != "pending" {
 			return sessionControlTargetFence{}, errors.New("only one selected pending predecessor can produce a journal successor")
 		}

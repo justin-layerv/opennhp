@@ -218,12 +218,19 @@ func seedSessionControlOwner(t *testing.T, fake *sessionControlSessionDynamoFake
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedSessionControlOwnerAuthority(t, fake, owner)
+	return owner
+}
+
+func seedSessionControlOwnerAuthority(t *testing.T, fake *sessionControlSessionDynamoFake,
+	owner sessionControlOwnerAuthority,
+) {
+	t.Helper()
 	row, err := sessionControlOwnerToRow(owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.setItem(marshalSessionControlSessionTestRow(t, row))
-	return owner
 }
 
 func seedSessionControlIntent(t *testing.T, fake *sessionControlSessionDynamoFake, intent sessionControlSessionIntent) {
@@ -364,11 +371,20 @@ func TestDynamoSessionControlPrepareIntentExactWireAndExtensionCountOnce(t *test
 			t.Fatalf("target condition %q lacks %q", aws.ToString(targetCheck.ConditionExpression), fragment)
 		}
 	}
-	ownerCheck := txn.TransactItems[2].ConditionCheck
-	if ownerCheck == nil || !strings.Contains(aws.ToString(ownerCheck.ConditionExpression), "work_version = :owner_work_version") ||
-		!strings.Contains(aws.ToString(ownerCheck.ConditionExpression), "pending_count = :owner_pending_count") ||
-		!strings.Contains(aws.ToString(ownerCheck.ConditionExpression), "attribute_not_exists(#ttl)") || ownerCheck.ExpressionAttributeNames["#ttl"] != "ttl" {
-		t.Fatalf("owner condition = %#v", ownerCheck)
+	ownerPut := txn.TransactItems[2].Put
+	if ownerPut == nil || !strings.Contains(aws.ToString(ownerPut.ConditionExpression), "work_version = :owner_work_version") ||
+		!strings.Contains(aws.ToString(ownerPut.ConditionExpression), "pending_count = :owner_pending_count") ||
+		!strings.Contains(aws.ToString(ownerPut.ConditionExpression), "attribute_not_exists(#ttl)") || ownerPut.ExpressionAttributeNames["#ttl"] != "ttl" {
+		t.Fatalf("owner admission CAS = %#v", ownerPut)
+	}
+	var admittedOwnerRow sessionControlOwnerRow
+	if err := attributevalue.UnmarshalMap(ownerPut.Item, &admittedOwnerRow); err != nil {
+		t.Fatal(err)
+	}
+	admittedOwner, err := sessionControlOwnerFromItem(ownerPut.Item, owner.CellID, owner.ACID, owner.PublicKey)
+	if err != nil || admittedOwner.WorkVersion != owner.WorkVersion+1 || admittedOwner.TaskCount != owner.TaskCount ||
+		admittedOwner.PendingCount != owner.PendingCount || admittedOwner.Phase != sessionControlOwnerReady {
+		t.Fatalf("admitted owner = %#v, %v; row=%#v", admittedOwner, err, admittedOwnerRow)
 	}
 	update := txn.TransactItems[3].Update
 	if update == nil || !strings.Contains(aws.ToString(update.ConditionExpression), "target_count < :capacity") ||
@@ -655,6 +671,11 @@ func TestDynamoSessionControlPrepareClassifiesCommitAfterOperationTimeout(t *tes
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)
 		seedSessionControlIntent(t, fake, planned.Intent)
+		owner, ownerErr := planSessionControlOwnerAdmission(planned.Intent.Owner, 1_800_000_010_000)
+		if ownerErr != nil {
+			t.Fatal(ownerErr)
+		}
+		seedSessionControlOwnerAuthority(t, fake, owner)
 		return nil, ctx.Err()
 	}
 	got, err := store.PrepareSessionIntent(context.Background(), reserved.fence(), target,
@@ -679,6 +700,11 @@ func TestDynamoSessionControlPrepareAmbiguityRequiresUnchangedDirectory(t *testi
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)
 		seedSessionControlIntent(t, fake, planned.Intent)
+		owner, ownerErr := planSessionControlOwnerAdmission(planned.Intent.Owner, 1_800_000_010_000)
+		if ownerErr != nil {
+			t.Fatal(ownerErr)
+		}
+		seedSessionControlOwnerAuthority(t, fake, owner)
 		seedSessionControlDirectory(t, fake, testSessionControlSessionSnapshot(2))
 		return nil, ctx.Err()
 	}
@@ -749,6 +775,11 @@ func TestDynamoSessionControlPrepareClassifiesExactReconnectedTargetCommit(t *te
 		<-ctx.Done()
 		seedSessionControlReservation(t, fake, planned.Session)
 		seedSessionControlIntent(t, fake, planned.Intent)
+		owner, ownerErr := planSessionControlOwnerAdmission(planned.Intent.Owner, 1_800_000_010_000)
+		if ownerErr != nil {
+			t.Fatal(ownerErr)
+		}
+		seedSessionControlOwnerAuthority(t, fake, owner)
 		return nil, ctx.Err()
 	}
 	got, err := store.PrepareSessionIntent(context.Background(), first.Session.fence(), reactivated,

@@ -879,15 +879,6 @@ func sessionControlIntentToken(fence sessionControlSessionFence, target sessionC
 	return sessionControlIntentTokenWithOwner(fence, target, owner, sessionExpiresAtMillis, retainUntilMillis, snapshot)
 }
 
-func sessionControlReadyOwnerCondition(owner sessionControlOwnerAuthority) types.TransactWriteItem {
-	condition, names, values := sessionControlOwnerCondition(owner)
-	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
-		Key:                 sessionControlOwnerKey(owner.CellID, owner.ACID, owner.PublicKey),
-		ConditionExpression: aws.String(condition), ExpressionAttributeNames: names,
-		ExpressionAttributeValues: values,
-	}}
-}
-
 func sessionControlDirectoryCondition(snapshot sessionControlFenceSnapshot) types.TransactWriteItem {
 	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 		Key:                      sessionControlFenceDirectoryKey(snapshot.CellID),
@@ -1446,6 +1437,10 @@ func (s *dynamoSessionControlStore) PrepareSessionIntent(ctx context.Context, fe
 		!owner.exactTarget(target, sessionControlOwnerReady) {
 		return nil, errSessionControlSessionTargetConflict
 	}
+	admittedOwner, err := planSessionControlOwnerAdmission(*owner, now.UnixMilli())
+	if err != nil {
+		return nil, errSessionControlSessionTargetConflict
+	}
 	request := sessionControlSessionIntent{
 		Session: fence.Candidate, Target: target, Owner: *owner, State: sessionControlSessionIntentMayBeAdmitted,
 		SessionVersion: fence.Version + 1, SessionExpiresAtMillis: sessionExpiresAtMillis,
@@ -1504,8 +1499,10 @@ func (s *dynamoSessionControlStore) PrepareSessionIntent(ctx context.Context, fe
 	directoryWrite.ConditionCheck.TableName = aws.String(s.tableName)
 	targetWrite := sessionControlActiveTargetCondition(target)
 	targetWrite.ConditionCheck.TableName = aws.String(s.tableName)
-	ownerWrite := sessionControlReadyOwnerCondition(*owner)
-	ownerWrite.ConditionCheck.TableName = aws.String(s.tableName)
+	ownerWrite, err := sessionControlOwnerReplace(s.tableName, *owner, admittedOwner)
+	if err != nil {
+		return nil, err
+	}
 	sessionWrite := sessionControlSessionUpdate(fence, planned.Session, !extension)
 	sessionWrite.Update.TableName = aws.String(s.tableName)
 	var forwardWrite, reverseWrite types.TransactWriteItem
@@ -1578,8 +1575,14 @@ func (s *dynamoSessionControlStore) PrepareSessionIntent(ctx context.Context, fe
 	if ownerErr != nil {
 		return nil, ownerErr
 	}
-	if *currentOwner != *owner || currentOwner.Phase != sessionControlOwnerReady || currentOwner.PendingCount != 0 ||
-		!currentOwner.exactTarget(target, sessionControlOwnerReady) {
+	if *currentOwner != admittedOwner {
+		if currentOwner.Phase == sessionControlOwnerReady && currentOwner.PendingCount == 0 &&
+			currentOwner.exactTarget(target, sessionControlOwnerReady) {
+			if *currentOwner == *owner && operationErr != nil {
+				return nil, fmt.Errorf("prepare session-control intent: %w", operationErr)
+			}
+			return nil, errSessionControlSessionConflict
+		}
 		return nil, errSessionControlSessionTargetConflict
 	}
 	if currentSession.State != sessionControlSessionStateReserved {

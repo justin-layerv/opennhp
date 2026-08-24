@@ -26,10 +26,11 @@ const (
 type sessionControlOwnerPhase string
 
 const (
-	sessionControlOwnerPreparing     sessionControlOwnerPhase = "preparing"
-	sessionControlOwnerActiveUnready sessionControlOwnerPhase = "active_unready"
-	sessionControlOwnerReady         sessionControlOwnerPhase = "ready"
-	sessionControlOwnerRetired       sessionControlOwnerPhase = "retired"
+	sessionControlOwnerPreparing       sessionControlOwnerPhase = "preparing"
+	sessionControlOwnerActiveUnready   sessionControlOwnerPhase = "active_unready"
+	sessionControlOwnerReady           sessionControlOwnerPhase = "ready"
+	sessionControlOwnerDecommissioning sessionControlOwnerPhase = "decommissioning"
+	sessionControlOwnerRetired         sessionControlOwnerPhase = "retired"
 )
 
 var (
@@ -41,8 +42,10 @@ var (
 
 // sessionControlOwnerAuthority is the stable, public-key-scoped bridge between
 // target lifecycle and close-task inventory. LifecycleVersion changes only
-// with target lifecycle; WorkVersion changes with every physical task mutation.
-// Counts are exact physical authority and are bracket-verified before readiness.
+// with target lifecycle. WorkVersion changes with every physical task mutation
+// and every admitted session intent, serializing recovery decommission against
+// admission without adding a second authority row. Counts remain exact physical
+// task authority and are bracket-verified before readiness.
 type sessionControlOwnerAuthority struct {
 	CellID                  string
 	ACID                    string
@@ -146,7 +149,8 @@ func sessionControlOwnerAttributesPresent(item map[string]types.AttributeValue) 
 
 func validSessionControlOwnerPhase(phase sessionControlOwnerPhase) bool {
 	switch phase {
-	case sessionControlOwnerPreparing, sessionControlOwnerActiveUnready, sessionControlOwnerReady, sessionControlOwnerRetired:
+	case sessionControlOwnerPreparing, sessionControlOwnerActiveUnready, sessionControlOwnerReady,
+		sessionControlOwnerDecommissioning, sessionControlOwnerRetired:
 		return true
 	default:
 		return false
@@ -183,6 +187,12 @@ func validateSessionControlOwnerAuthority(owner sessionControlOwnerAuthority) er
 			owner.ReadyControlVersion != owner.ActivatedControlVersion || owner.RetiredAtMillis != 0 {
 			return errSessionControlOwnerCorrupt
 		}
+	case sessionControlOwnerDecommissioning:
+		if !owner.TargetCountedActiveSlot || owner.TaskCount != 0 || owner.PendingCount != 0 ||
+			owner.ReadyControlVersion == 0 || owner.ReadyControlVersion != owner.ActivatedControlVersion ||
+			owner.RetiredAtMillis != 0 {
+			return errSessionControlOwnerCorrupt
+		}
 	case sessionControlOwnerRetired:
 		if owner.TaskCount != 0 || owner.PendingCount != 0 || owner.TargetCountedActiveSlot ||
 			owner.RetiredAtMillis != owner.UpdatedAtMillis {
@@ -193,7 +203,9 @@ func validateSessionControlOwnerAuthority(owner sessionControlOwnerAuthority) er
 }
 
 func planSessionControlOwnerTaskInsert(current sessionControlOwnerAuthority, updatedAtMillis int64) (sessionControlOwnerAuthority, error) {
-	if validateSessionControlOwnerAuthority(current) != nil || current.Phase == sessionControlOwnerRetired ||
+	if validateSessionControlOwnerAuthority(current) != nil ||
+		(current.Phase != sessionControlOwnerPreparing && current.Phase != sessionControlOwnerActiveUnready &&
+			current.Phase != sessionControlOwnerReady) ||
 		current.TaskCount >= sessionControlOwnerTaskLimit || current.WorkVersion >= ^uint64(0)-1 {
 		if current.TaskCount >= sessionControlOwnerTaskLimit {
 			return sessionControlOwnerAuthority{}, errSessionControlOwnerCapacity
@@ -207,6 +219,38 @@ func planSessionControlOwnerTaskInsert(current sessionControlOwnerAuthority, upd
 	if next.Phase == sessionControlOwnerReady {
 		next.Phase = sessionControlOwnerActiveUnready
 	}
+	if updatedAtMillis > next.UpdatedAtMillis {
+		next.UpdatedAtMillis = updatedAtMillis
+	}
+	if validateSessionControlOwnerAuthority(next) != nil {
+		return sessionControlOwnerAuthority{}, errSessionControlOwnerCorrupt
+	}
+	return next, nil
+}
+
+func planSessionControlOwnerDecommission(current sessionControlOwnerAuthority) (sessionControlOwnerAuthority, error) {
+	if validateSessionControlOwnerAuthority(current) != nil || current.Phase != sessionControlOwnerReady ||
+		current.TaskCount != 0 || current.PendingCount != 0 || current.LifecycleVersion >= ^uint64(0)-1 {
+		return sessionControlOwnerAuthority{}, errSessionControlOwnerCorrupt
+	}
+	next := current
+	next.LifecycleVersion++
+	next.Phase = sessionControlOwnerDecommissioning
+	if validateSessionControlOwnerAuthority(next) != nil {
+		return sessionControlOwnerAuthority{}, errSessionControlOwnerCorrupt
+	}
+	return next, nil
+}
+
+func planSessionControlOwnerAdmission(current sessionControlOwnerAuthority,
+	updatedAtMillis int64,
+) (sessionControlOwnerAuthority, error) {
+	if validateSessionControlOwnerAuthority(current) != nil || current.Phase != sessionControlOwnerReady ||
+		current.PendingCount != 0 || current.WorkVersion >= ^uint64(0)-1 {
+		return sessionControlOwnerAuthority{}, errSessionControlOwnerCorrupt
+	}
+	next := current
+	next.WorkVersion++
 	if updatedAtMillis > next.UpdatedAtMillis {
 		next.UpdatedAtMillis = updatedAtMillis
 	}

@@ -46,6 +46,7 @@ export FAKE_PROVENANCE_CALLS=$WORK/provenance-calls
 export FAKE_ORIGINAL_STATE_RECORD=$WORK/original-state FAKE_ORIGINAL_LOCK_RECORD=$WORK/original-lock
 export FAKE_STATE_VERSION_FILE=$WORK/state-version
 export FAKE_JOURNAL_VERSION_FILE=$WORK/journal-version
+export FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE=$WORK/active-ready-journal-version
 export FAKE_PREDECESSOR_ORPHAN_VERSION_FILE=$WORK/predecessor-orphan-version
 export FAKE_ORIGINAL=$ORIGINAL FAKE_REPAIR=$REPAIR FAKE_SERVER_DIGEST=$SERVER_DIGEST FAKE_AC_DIGEST=$AC_DIGEST
 export RUNTIME_SERVER_DIGEST RUNTIME_AC_DIGEST
@@ -89,6 +90,34 @@ directory_receipt() {
 decode_journal() {
   printf '%s' "$1" | python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
 }
+fence_sha() {
+  local value=$1 field
+  {
+    printf '\0%s' v1
+    for field in ac_id public_key boot_id flush_generation version authority_version counted_active_slot \
+      control_cell_id activated_control_version ready_control_version aak_enqueued_at_ms aak_transaction_id \
+      created_at_ms prepared_at_ms; do printf '\0%s' "$(jq -r ".${field}" <<<"$value")"; done
+  } | sha256sum | awk '{print $1}'
+}
+owner_sha() {
+  local value=$1 field
+  {
+    for field in cell_id ac_id public_key lifecycle_version work_version task_count pending_count phase boot_id \
+      flush_generation target_version target_authority_version target_counted_active_slot activated_control_version \
+      ready_control_version target_created_at_ms target_prepared_at_ms target_updated_at_ms aak_enqueued_at_ms \
+      aak_transaction_id created_at_ms updated_at_ms retired_at_ms; do
+      printf '\0%s' "$(jq -r ".${field}" <<<"$value")"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+current_active_journal() {
+  awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" {print substr($0,index($0,"\t")+1)}' \
+    "$FAKE_PARAMS" | while IFS= read -r envelope; do decode_journal "$envelope"; done
+}
+current_main_journal() {
+  awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' \
+    "$FAKE_PARAMS" | while IFS= read -r envelope; do decode_journal "$envelope"; done
+}
 case ${1:-} in
   plan) cat "$FAKE_STALE_TARGET_PLAN" ;;
   snapshot-fence-directory)
@@ -112,6 +141,67 @@ case ${1:-} in
 		printf 'snapshot-predecessors\n' >>"$FAKE_ACTIONS"
     jq -cn '{schema:"layerv.durable-aop-predecessor-target-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",targets:[
       {id:"predecessor-1",fence_sha256:"ac8512dc6d0cac5a9ddfe5b471458418bab6c55d1b9df6aa49a26abb748c9967",fence:{ac_id:"layerv-ac-tf",public_key:"current-predecessor",boot_id:"boot-current",flush_generation:"3",version:"49",authority_version:"5",counted_active_slot:true,control_cell_id:"cell0",activated_control_version:"0",ready_control_version:"0",aak_enqueued_at_ms:"0",aak_transaction_id:"0",created_at_ms:"1787529555693",prepared_at_ms:"1787533540595"}}]}'
+    ;;
+  snapshot-active-ready-predecessors)
+    printf 'snapshot-active-ready-predecessors\n' >>"$FAKE_ACTIONS"
+    plan=$(jq -cn '
+      def fence($i): {ac_id:"layerv-ac-tf",public_key:("ready-key-"+($i|tostring)),boot_id:("ready-boot-"+($i|tostring)),
+        flush_generation:"4",version:"46",authority_version:"7",counted_active_slot:true,control_cell_id:"cell0",
+        activated_control_version:"250",ready_control_version:"250",aak_enqueued_at_ms:"1787550000000",
+        aak_transaction_id:"1",created_at_ms:"1787540000000",prepared_at_ms:"1787545000000"};
+      def owner($i): {cell_id:"cell0",ac_id:"layerv-ac-tf",public_key:("ready-key-"+($i|tostring)),
+        lifecycle_version:"9",work_version:"7",task_count:"0",pending_count:"0",phase:"READY",
+        boot_id:("ready-boot-"+($i|tostring)),flush_generation:"4",target_version:"46",target_authority_version:"7",
+        target_counted_active_slot:true,activated_control_version:"250",ready_control_version:"250",
+        target_created_at_ms:"1787540000000",target_prepared_at_ms:"1787545000000",target_updated_at_ms:"1787550000000",
+        aak_enqueued_at_ms:"1787550000000",aak_transaction_id:"1",created_at_ms:"1787540000000",
+        updated_at_ms:"1787550000000",retired_at_ms:"0"};
+      {schema:"layerv.durable-aop-active-ready-predecessor-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",
+       region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",
+       targets:[range(1;4) | {id:("active-ready-predecessor-"+(.|tostring)),fence:(fence(.)),
+         fence_sha256:"",owner:(owner(.)),owner_sha256:""}]}')
+    for index in 0 1 2; do
+      fence=$(jq -c --argjson i "$index" '.targets[$i].fence' <<<"$plan")
+      owner=$(jq -c --argjson i "$index" '.targets[$i].owner' <<<"$plan")
+      plan=$(jq -c --argjson i "$index" --arg fence_sha "$(fence_sha "$fence")" \
+        --arg owner_sha "$(owner_sha "$owner")" '.targets[$i].fence_sha256=$fence_sha | .targets[$i].owner_sha256=$owner_sha' <<<"$plan")
+    done
+    jq -cS . <<<"$plan"
+    ;;
+  latch-active-ready-predecessor)
+    id=$3; printf 'latch-active-ready-predecessor\t%s\n' "$id" >>"$FAKE_ACTIONS"
+    active=$(current_active_journal); planned=$(jq -c --arg id "$id" '.plan.targets[]|select(.id==$id)' <<<"$active")
+    owner=$(jq -cS '.owner | .phase="DECOMMISSIONING" | .lifecycle_version=((.lifecycle_version|tonumber)+1|tostring)' <<<"$planned")
+    directory=$(current_main_journal | jq -r .runtime.fence_drain.directory_sha256)
+    jq -cn --arg id "$id" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" --argjson owner "$owner" \
+      --arg owner_sha "$(owner_sha "$owner")" --arg directory "$directory" \
+      '{schema:"layerv.durable-aop-active-ready-latch-receipt.v1",target_id:$id,
+       fence_sha256:$fence,owner:$owner,owner_sha256:$owner_sha,directory_sha256:$directory}'
+    ;;
+  verify-active-ready-predecessor-quiescence)
+    id=$3; printf 'verify-active-ready-predecessor-quiescence\t%s\n' "$id" >>"$FAKE_ACTIONS"
+    active=$(current_active_journal); planned=$(jq -c --arg id "$id" '.plan.targets[]|select(.id==$id)' <<<"$active")
+    fence=$(jq -cS .fence <<<"$planned")
+    owner=$(jq -cS '.owner | .phase="DECOMMISSIONING" | .lifecycle_version=((.lifecycle_version|tonumber)+1|tostring)' <<<"$planned")
+    session=$(printf 'v1\0%s\0%s\0%s\0%s\0%s' "$(jq -r .control_cell_id <<<"$fence")" \
+      "$(jq -r .ac_id <<<"$fence")" "$(jq -r .public_key <<<"$fence")" "$(jq -r .boot_id <<<"$fence")" \
+      "$(jq -r .flush_generation <<<"$fence")" | sha256sum | awk '{print "TARGET#"$1}')
+    directory=$(current_main_journal | jq -r .runtime.fence_drain.directory_sha256)
+    jq -cn --arg id "$id" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" --arg owner_sha "$(owner_sha "$owner")" \
+      --arg session "$session" --arg directory "$directory" \
+      '{schema:"layerv.durable-aop-active-ready-quiescence-receipt.v1",target_id:$id,
+       fence_sha256:$fence,owner_sha256:$owner_sha,owner_task_count:"0",owner_pending_count:"0",
+       target_session_pk:$session,target_session_count:"0",directory_sha256:$directory}'
+    ;;
+  retire-active-ready-predecessor)
+    id=$3; printf 'retire-active-ready-predecessor\t%s\n' "$id" >>"$FAKE_ACTIONS"
+    active=$(current_active_journal); planned=$(jq -c --arg id "$id" '.plan.targets[]|select(.id==$id)' <<<"$active")
+    jq -cn --arg id "$id" --arg key "$(jq -r .fence.public_key <<<"$planned")" \
+      --arg version "$(( $(jq -r .fence.version <<<"$planned") + 1 ))" \
+      --arg authority "$(( $(jq -r .fence.authority_version <<<"$planned") + 1 ))" \
+      '{schema:"layerv.durable-aop-stale-target-retirement-receipt.v1",target_id:$id,
+       public_key:$key,version:$version,authority_version:$authority,counted_active_slot:false,
+       retired_at_ms:"1787560000000",retired_target_sha256:("d"*64)}'
     ;;
   retire)
     shift
@@ -354,10 +444,18 @@ decode_journal() {
 case "$svc/$op" in
   ssm/get-parameter)
     name=$(opt --name "$@"); query=$(opt --query "$@")
+    if [[ "$name" == */active-ready-predecessors* ]]; then
+      [[ $# == 9 && $1 == --name && $2 == "$name" && $3 == --with-decryption &&
+         $4 == --query && $5 == "$query" && $6 == --output && $7 == text &&
+         $8 == --region && $9 == us-east-2 ]] || exit 99
+    fi
     if [[ "$query" == Parameter.Version ]]; then
       if [[ "$name" == */stale-target-retirement ]]; then
 			[[ -s "$FAKE_JOURNAL_VERSION_FILE" ]] || { echo ParameterNotFound >&2; exit 254; }
 			cat "$FAKE_JOURNAL_VERSION_FILE"
+			elif [[ "$name" == */active-ready-predecessors ]]; then
+				[[ -s "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" ]] || { echo ParameterNotFound >&2; exit 254; }
+				cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
 		elif [[ "$name" == */state ]]; then
         if [[ "${FAKE_STATE_VERSION_READ_ERROR:-}" == true ]]; then
           echo "injected state version read failure" >&2
@@ -375,6 +473,12 @@ case "$svc/$op" in
     ;;
   ssm/put-parameter)
     name=$(opt --name "$@"); value=$(opt --value "$@")
+    if [[ "$name" == */active-ready-predecessors ]]; then
+      [[ $# == 11 && $1 == --name && $2 == "$name" && $3 == --value && $4 == "$value" &&
+         $5 == --type && $6 == SecureString && $7 == --key-id && $8 == alias/aws/ssm &&
+         ( $9 == --overwrite || $9 == --no-overwrite ) && ${10} == --region && ${11} == us-east-2 &&
+         ${#value} -le 4096 ]] || exit 99
+    fi
     if [[ " $* " == *' --no-overwrite '* ]] && awk -F '\t' -v n="$name" '$1==n {found=1} END {exit !found}' "$FAKE_PARAMS"; then
       echo ParameterAlreadyExists >&2
       exit 254
@@ -392,10 +496,24 @@ case "$svc/$op" in
 				exit 75
 			fi
 		fi
-		if [[ "$name" == */stale-target-retirement ]]; then
-			version=0; [[ ! -s "$FAKE_JOURNAL_VERSION_FILE" ]] || read -r version <"$FAKE_JOURNAL_VERSION_FILE"
-			version=$((version + 1))
-			printf '%s\n' "$version" >"$FAKE_JOURNAL_VERSION_FILE"
+		if [[ "$name" == */stale-target-retirement &&
+		      -n "${FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE:-}" &&
+		      -s "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" ]]; then
+			active_version=$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")
+			decoded=$(decode_journal "$value")
+			if [[ "$(jq -r '.runtime.ready_predecessor_ref.version // empty' <<<"$decoded")" == "$active_version" ]] &&
+			   ! grep -Fxq "$active_version" "$FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE" 2>/dev/null; then
+				# The ACTIVE successor is durable and classified, but the slim-main
+				# reference has not committed. Retry must adopt only that exact N+1.
+				printf '%s\n' "$active_version" >>"$FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE"
+				exit 75
+			fi
+		fi
+		if [[ "$name" == */stale-target-retirement || "$name" == */active-ready-predecessors ]]; then
+				if [[ "$name" == */active-ready-predecessors ]]; then version_file=$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE; else version_file=$FAKE_JOURNAL_VERSION_FILE; fi
+			version=0; [[ ! -s "$version_file" ]] || read -r version <"$version_file"
+				version=$((version + 1))
+				printf '%s\n' "$version" >"$version_file"
 			awk -F '\t' -v n="$name" -v historical="${name}:${version}" '$1!=n && $1!=historical' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
 			printf '%s\t%s\n%s:%s\t%s\n' "$name" "$value" "$name" "$version" "$value" >>"$FAKE_PARAMS.tmp"
 		else
@@ -406,8 +524,12 @@ case "$svc/$op" in
     if [[ "$name" == */state && -s "${FAKE_STATE_VERSION_FILE:-}" ]]; then
       read -r version <"$FAKE_STATE_VERSION_FILE"
       next_version=$((version + 1))
-      if [[ "${FAKE_SKIP_IAM_HANDOFF_VERSION:-}" == true && "$next_version" == 28 ]]; then
-        next_version=29
+      # This synthetic all-journal-version crash walk does not model either
+      # later live handoff. Do not let a successor-authored fixture state land
+      # on a version reserved for the exact v28 or v30 predecessor boundary.
+      if [[ "${FAKE_SKIP_PINNED_HANDOFF_VERSIONS:-}" == true &&
+            ("$next_version" == 28 || "$next_version" == 30) ]]; then
+		next_version=$((next_version + 1))
       fi
       printf '%s\n' "$next_version" >"$FAKE_STATE_VERSION_FILE"
     fi
@@ -421,12 +543,25 @@ case "$svc/$op" in
 			status=$(jq -r .status <<<"$decoded")
 			incident_retired=$(jq -r '[.incident_targets[] | select(.status=="retired")] | length' <<<"$decoded")
 			predecessor_retired=$(jq -r '[.runtime.predecessor_targets[] | select(.status=="retired")] | length' <<<"$decoded")
-			key="${status}-i${incident_retired}-p${predecessor_retired}"
+			active_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$decoded")
+			active_retired=0
+			if [[ -n "$active_ref" ]]; then
+				active_version=$(jq -r .version <<<"$active_ref")
+				active_envelope=$(awk -F '\t' -v n="/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:${active_version}" \
+					'$1==n {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+				active_decoded=$(decode_journal "$active_envelope")
+				active_retired=$(jq -r '[.targets[] | select(.status=="retired")] | length' <<<"$active_decoded")
+			fi
+			key="${status}-i${incident_retired}-p${predecessor_retired}-r${active_retired}"
 			mkdir -p "$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR"
 			printf '%s\n' "$value" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.state"
 			printf '%s\n' "$envelope" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.journal"
 			printf '%s\n' "$ref" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.journal-version"
 			cat "$FAKE_STATE_VERSION_FILE" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.state-version"
+			if [[ -n "$active_ref" ]]; then
+				printf '%s\n' "$active_envelope" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.active-ready-journal"
+				printf '%s\n' "$active_version" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.active-ready-journal-version"
+			fi
 		fi
 			if [[ "$name" == */state && -s "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE" ]]; then
 			read -r orphan_version <"$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
@@ -444,6 +579,29 @@ case "$svc/$op" in
       : >"$FAKE_FAIL_AFTER_STATE_WRITE_ONCE"
       exit 75
     fi
+    ;;
+  ssm/describe-parameters)
+    [[ $# == 8 && $1 == --parameter-filters &&
+       $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors' &&
+       $3 == --query && $4 == 'Parameters[].{Name:Name,Type:Type,KeyId:KeyId,Tier:Tier,DataType:DataType,Version:Version}' &&
+       $5 == --output && $6 == json && $7 == --region && $8 == us-east-2 ]] || exit 99
+    [[ -s "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" ]] || exit 254
+    version=$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")
+    type=SecureString key=alias/aws/ssm tier=Standard data_type=text
+    case ${FAKE_ACTIVE_METADATA_MODE:-exact} in
+      exact) ;;
+      wrong_type) type=String ;;
+      wrong_key) key=alias/other ;;
+      wrong_tier) tier=Advanced ;;
+      wrong_data_type) data_type=other ;;
+      wrong_version) version=$((version + 1)) ;;
+      missing) printf '[]\n'; exit 0 ;;
+      extra) jq -cn --arg version "$version" '[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]'; exit 0 ;;
+      *) exit 98 ;;
+    esac
+    jq -cn --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
+      '[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:$type,
+        KeyId:$key,Tier:$tier,DataType:$data,Version:($version|tonumber)}]'
     ;;
   ssm/delete-parameter)
     name=$(opt --name "$@")
@@ -837,7 +995,8 @@ chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 seed() {
   : >"$FAKE_ACTIONS"
   : >"$FAKE_PROVENANCE_CALLS"
-  rm -f "$FAKE_STATE_VERSION_FILE" "$FAKE_JOURNAL_VERSION_FILE" "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
+  rm -f "$FAKE_STATE_VERSION_FILE" "$FAKE_JOURNAL_VERSION_FILE" "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" \
+    "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
   jq -cn --arg image "$ORIGINAL" --arg owner "$OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
      ac:{old_color:"blue",new_color:"green",old_asg:"layerv-nhp-sandbox-ac",new_asg:"layerv-nhp-sandbox-ac-green",old_min:3,old_max:3,old_desired:3,new_attestation:("v2|durable-aop-v1|"+$image+"|layerv/nhp-ac|sha256:2e38672ef7680c60521694c3f2a59e9a74ed8f2d56bfe1fb41a97f3040b4e279|layerv-nhp-sandbox-ac-green")},
@@ -998,7 +1157,7 @@ seed_live_iam_handoff() {
 }
 
 restore_iam_boundary() {
-	local key=$1 state envelope journal_version state_version
+	local key=$1 state envelope journal_version state_version active_envelope active_version
 	state=$(cat "$WORK/iam-boundaries/$key.state")
 	envelope=$(cat "$WORK/iam-boundaries/$key.journal")
 	journal_version=$(cat "$WORK/iam-boundaries/$key.journal-version")
@@ -1007,6 +1166,19 @@ restore_iam_boundary() {
 	set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
 	set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
 	set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${journal_version}" "$envelope"
+	if [[ -s "$WORK/iam-boundaries/$key.active-ready-journal" ]]; then
+		active_envelope=$(cat "$WORK/iam-boundaries/$key.active-ready-journal")
+		active_version=$(cat "$WORK/iam-boundaries/$key.active-ready-journal-version")
+		set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors "$active_envelope"
+		set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:${active_version}" "$active_envelope"
+		printf '%s\n' "$active_version" >"$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+	else
+		awk -F '\t' '$1!="/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" &&
+			$1 !~ /^\/sandbox\/nhp\/cutovers\/durable-aop-v1\/active-ready-predecessors:[0-9]+$/' \
+			"$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
+		mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+		rm -f "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+	fi
 	set_fixture_param /sandbox/nhp/ac/green-image-tag "$RUNTIME_AC_SELECTOR"
 	set_fixture_param /sandbox/nhp/ac/green-protocol-profile "v1|durable-aop-v1|${RUNTIME}"
 	set_fixture_param /sandbox/nhp/ac/green-prepared-slot-attestation \
@@ -1153,11 +1325,13 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 journal=$(read_fixture_journal)
 [[ "$(jq -r .status <<<"$journal")" == complete ]]
 [[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == 1 ]]
-[[ "$(grep -c '^snapshot-predecessors$' "$FAKE_ACTIONS")" == 1 ]]
-[[ "$(grep -c $'^retire-predecessor\t' "$FAKE_ACTIONS")" == 1 ]]
-journal_line=$(grep -n $'^put-predecessor-journal\t' "$FAKE_ACTIONS" | cut -d: -f1)
+[[ "$(grep -c '^snapshot-active-ready-predecessors$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^latch-active-ready-predecessor\t' "$FAKE_ACTIONS")" == 3 ]]
+[[ "$(grep -c $'^verify-active-ready-predecessor-quiescence\t' "$FAKE_ACTIONS")" == 3 ]]
+[[ "$(grep -c $'^retire-active-ready-predecessor\t' "$FAKE_ACTIONS")" == 3 ]]
+journal_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors$' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
 ac_refresh_line=$(grep -n $'^refresh\tlayerv-nhp-sandbox-ac-green\t' "$FAKE_ACTIONS" | cut -d: -f1)
-predecessor_retire_line=$(grep -n $'^retire-predecessor\t' "$FAKE_ACTIONS" | cut -d: -f1)
+predecessor_retire_line=$(grep -n $'^retire-active-ready-predecessor\t' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
 [[ -n "$journal_line" && "$journal_line" -lt "$ac_refresh_line" && "$ac_refresh_line" -lt "$predecessor_retire_line" ]] || {
 	echo "predecessor retirement was not ordered after its durable plan and AC refresh" >&2
 	exit 1
@@ -1167,54 +1341,43 @@ if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; 
 cp "$FAKE_PARAMS" "$WORK/params.handoff-current"
 cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.handoff-current"
 cp "$FAKE_JOURNAL_VERSION_FILE" "$WORK/journal-version.handoff-current"
+cp "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" "$WORK/active-ready-journal-version.handoff-current"
 
 # Exact successor replay is allowed. A changed predecessor ledger, a v20 state
 # that self-asserts the successor, or any third controller source fails before
 # a state write, fleet action, or owner mutation.
 : >"$FAKE_ACTIONS"
 invoke >/dev/null
-if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply|snapshot-predecessors|retire-predecessor)\t?' "$FAKE_ACTIONS"; then
+if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply|snapshot-active-ready-predecessors|latch-active-ready|verify-active-ready|retire-active-ready)\t?' "$FAKE_ACTIONS"; then
   echo "exact successor replay performed a mutation" >&2
   exit 1
 fi
 
-# The AC intent commits the canonical predecessor-plan digest before the AC
-# refresh. A caller-selected extra fence cannot be added later even if its
-# plan, per-fence digest, and pending ledger entry are made self-consistent:
-# the precommitted AC intent no longer matches and rejection occurs before any
-# resnapshot or retirement call.
+# The recovery reader accepts only the fixed encrypted standard parameter at
+# the exact current version. Metadata drift is read-only and fails before any
+# DDB, ASG, IAM, SSM write, floor, or lock-release action.
+for metadata_mode in wrong_type wrong_key wrong_tier wrong_data_type wrong_version missing extra; do
+  cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
+  cp "$WORK/state-version.handoff-current" "$FAKE_STATE_VERSION_FILE"
+  cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
+  cp "$WORK/active-ready-journal-version.handoff-current" "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+  export FAKE_ACTIVE_METADATA_MODE=$metadata_mode
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "ACTIVE/READY parameter metadata drift was accepted: $metadata_mode" >&2
+    exit 1
+  fi
+  if [[ -s "$FAKE_ACTIONS" ]]; then
+    echo "ACTIVE/READY metadata drift reached a write-capable action: $metadata_mode" >&2
+    exit 1
+  fi
+done
+unset FAKE_ACTIVE_METADATA_MODE
+
+# The caller cannot rewrite the three-layer state/main/subjournal references.
 cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
 cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
-state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-journal=$(read_fixture_journal)
-mutated=$(jq -c '
-  (.incident_plan.targets[0] |
-    .id="predecessor-2") as $extra |
-  .runtime.predecessor_plan.targets += [$extra] |
-  .runtime.predecessor_targets +=
-    [{id:$extra.id,fence_sha256:$extra.fence_sha256,status:"pending"}]
-' <<<"$journal")
-plan=$(jq -cS .runtime.predecessor_plan <<<"$mutated")
-mutated=$(jq -cS --arg digest "$(printf '%s' "$plan" | sha256sum | awk '{print $1}')" \
-  '.runtime.predecessor_plan_sha256=$digest' <<<"$mutated")
-envelope=$(printf '%s' "$mutated" | encode_fixture_journal)
-version=$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")
-set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
-set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${version}" "$envelope"
-state=$(jq -c --arg digest "$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')" \
-	'.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")
-set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
-: >"$FAKE_ACTIONS"
-if invoke >/dev/null 2>&1; then
-	echo "caller-selected predecessor fence was accepted after plan precommit" >&2
-	exit 1
-fi
-if grep -Eq '^(snapshot-predecessors|retire-predecessor)' "$FAKE_ACTIONS"; then
-	echo "mutated predecessor plan reached snapshot or retirement" >&2
-	exit 1
-fi
-cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
-cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
+cp "$WORK/active-ready-journal-version.handoff-current" "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
 for mutation in \
   predecessor_bytes wrong_phase owner_present wrong_state_version missing_lock changed_lock \
   successor_at_v20 third_stored predecessor_as_current; do
@@ -1478,7 +1641,7 @@ first_iam_verify_line=$(grep -n '^iam-verify$' "$FAKE_ACTIONS" | sed -n '1p' | c
 ready_journal_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
 ready_state_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/state$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
 second_iam_verify_line=$(grep -n '^iam-verify$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
-fence_drain_line=$(grep -n '^verify-fence-drain$' "$FAKE_ACTIONS" | cut -d: -f1)
+fence_drain_line=$(grep -n '^verify-fence-drain$' "$FAKE_ACTIONS" | sed -n '1p' | cut -d: -f1)
 [[ "$first_iam_verify_line" -lt "$ready_journal_line" && "$ready_journal_line" -lt "$ready_state_line" &&
    "$ready_state_line" -lt "$second_iam_verify_line" && "$second_iam_verify_line" -lt "$fence_drain_line" ]] || {
   echo "IAM ready authority was not durable and reverified before fence drain" >&2
@@ -1492,8 +1655,9 @@ if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; 
 # to schema-3 state. Drift at any boundary may perform the read-only IAM verify,
 # but cannot start/resume AC refresh, retire a predecessor, advance journal/state,
 # create the floor, or release the hard lock.
-for boundary in ac_intent-i3-p0 ac_refreshing-i3-p0 predecessor_retiring-i3-p0 predecessor_retiring-i3-p1; do
-  for suffix in state journal journal-version state-version; do
+for boundary in ac_intent-i3-p0-r0 ac_refreshing-i3-p0-r0 ready_predecessor_retiring-i3-p0-r0 \
+  ready_predecessor_retiring-i3-p0-r1 ready_predecessor_retiring-i3-p0-r2; do
+  for suffix in state journal journal-version state-version active-ready-journal active-ready-journal-version; do
     [[ -s "$WORK/iam-boundaries/$boundary.$suffix" ]] || {
       echo "missing production-shaped IAM crash-boundary snapshot: $boundary.$suffix" >&2
       exit 1
@@ -1579,11 +1743,13 @@ unset INVOKE_RECOVERY_SHA
 seed_live_stale_retirement_handoff
 : >"$FAKE_ACTIONS"
 export FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE=$WORK/journal-state-crash-versions
-export FAKE_SKIP_IAM_HANDOFF_VERSION=true
-rm -f "$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE"
+export FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE=$WORK/active-journal-main-ref-crash-versions
+export FAKE_SKIP_PINNED_HANDOFF_VERSIONS=true
+rm -f "$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE" \
+  "$FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE"
 journal_crash_attempts=0
 journal_crash_complete=false
-while (( journal_crash_attempts < 40 )); do
+while (( journal_crash_attempts < 80 )); do
 	if journal_crash_output=$(invoke 2>&1); then
 		journal_crash_complete=true
 		break
@@ -1599,16 +1765,19 @@ while (( journal_crash_attempts < 40 )); do
 	fi
 done
 unset FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE
-unset FAKE_SKIP_IAM_HANDOFF_VERSION
-[[ "$journal_crash_complete" == true ]] || {
-	echo "journal-put-before-state crash sequence did not converge: $journal_crash_output" >&2; exit 1;
-}
+unset FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE
+unset FAKE_SKIP_PINNED_HANDOFF_VERSIONS
+	[[ "$journal_crash_complete" == true ]] || {
+		echo "journal-put-before-state crash sequence did not converge after $journal_crash_attempts attempts at state $(cat "$FAKE_STATE_VERSION_FILE" 2>/dev/null || true), main journal $(cat "$FAKE_JOURNAL_VERSION_FILE" 2>/dev/null || true), ACTIVE journal $(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" 2>/dev/null || true): $journal_crash_output" >&2; exit 1;
+	}
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 journal_version=$(cat "$FAKE_JOURNAL_VERSION_FILE")
 journal=$(read_fixture_journal)
 [[ "$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")" == "$journal_version" &&
    "$(jq -r .status <<<"$journal")" == complete &&
-   "$(wc -l <"$WORK/journal-state-crash-versions" | tr -d ' ')" == "$journal_version" ]] || {
+   "$(wc -l <"$WORK/journal-state-crash-versions" | tr -d ' ')" == "$journal_version" &&
+   "$(wc -l <"$WORK/active-journal-main-ref-crash-versions" | tr -d ' ')" == \
+     "$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")" ]] || {
 	echo "not every journal update was recovered through its exact state-reference crash boundary" >&2; exit 1;
 }
 [[ "$(jq -r .runtime.fence_start.active_fence_count <<<"$journal")" == 82 &&
@@ -1628,14 +1797,6 @@ incident_retire_line=$(grep -n $'^retire\t' "$FAKE_ACTIONS" | head -1 | cut -d: 
   exit 1
 }
 awk 'NR != $1 {exit 1}' "$WORK/journal-state-crash-versions"
-grep -Eq $'^retire-predecessor-orphan\tpredecessor-1\t[1-9][0-9]*$' "$FAKE_ACTIONS" || {
-	echo "predecessor DDB replay did not consume the exact journal N+1 orphan before state-reference adoption" >&2
-	exit 1
-}
-grep -Eq $'^predecessor-orphan-state-adopt\t[1-9][0-9]*$' "$FAKE_ACTIONS" || {
-	echo "exact predecessor journal N+1 orphan did not become the same schema-3 state reference" >&2
-	exit 1
-}
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 

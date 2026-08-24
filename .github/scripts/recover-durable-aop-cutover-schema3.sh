@@ -76,6 +76,15 @@ APPROVED_IAM_HANDOFF_CELL0_INTENT_SHA256=f8d70d3357b301c55f806d34e3d70d0f1f77069
 APPROVED_IAM_HANDOFF_CELL1_PRIOR_REFRESH_ID=dc5ab358-ef4e-45a8-bf81-d18112a2ce9c
 APPROVED_IAM_HANDOFF_CELL1_REFRESH_ID=8f88f6af-4f02-4f03-8ac9-c6c62fdcb051
 APPROVED_IAM_HANDOFF_CELL1_INTENT_SHA256=0765d6c4bdb0940be956b253156d192b9761c90e2fec175d4300b167912174d0
+# The exact live v30/journal-v8 failure boundary has completed the fixed v4
+# incident retirement and has not created the ACTIVE/READY audit sub-journal.
+# One reviewed successor may install only the closed three-layer journal union.
+APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA=5b4b538b3ae6c0218c25bbc60587737496fa03ae
+APPROVED_ACTIVE_READY_HANDOFF_STATE_VERSION=30
+APPROVED_ACTIVE_READY_HANDOFF_STATE_DIGEST=4268c108fe2685c5a475d05f2ec98d5d58c54618dc3934289b97bc0da855dca6
+APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_VERSION=8
+APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_DIGEST=49a0da6ea26c551ed99f51ad1e1a4608aa89ab7d1f97a40f22c2c12ce99b1a5c
+APPROVED_ACTIVE_READY_HANDOFF_PHASE=repaired
 # Exact reviewed runtime repair containing both server close-drain and AC
 # transport fixes, plus its successful claim-free build-only authority.
 APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
@@ -129,8 +138,12 @@ else
 fi
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=.github/scripts/lib/durable-aop-active-ready-journal.sh
+source "$ROOT/.github/scripts/lib/durable-aop-active-ready-journal.sh"
 STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
+ACTIVE_READY_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors
+ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 FLOOR_PARAM=/sandbox/nhp/minimum-protocol-profile
 TARGET_PROFILE=durable-aop-v1
@@ -232,6 +245,85 @@ sys.stdout.buffer.write(decoded)
 '
 }
 
+encode_active_ready_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read()
+if len(raw) > 65536:
+    raise SystemExit("ACTIVE/READY journal exceeds decoded bound")
+value = json.loads(raw)
+canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+if canonical != raw:
+    raise SystemExit("ACTIVE/READY journal is not canonical JSON")
+envelope = {"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw, compresslevel=9, mtime=0)).decode(),"schema":"layerv.durable-aop-active-ready-predecessor-journal-envelope.v1"}
+sys.stdout.write(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+'
+}
+
+decode_active_ready_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read()
+value = json.loads(raw)
+if set(value) != {"encoding", "payload", "schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-active-ready-predecessor-journal-envelope.v1":
+    raise SystemExit("ACTIVE/READY journal envelope is malformed")
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw:
+    raise SystemExit("ACTIVE/READY journal envelope is not canonical")
+compressed = base64.b64decode(value["payload"], validate=True)
+decoded = gzip.decompress(compressed)
+if len(decoded) > 65536:
+    raise SystemExit("ACTIVE/READY journal exceeds decoded bound")
+parsed = json.loads(decoded)
+if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded:
+    raise SystemExit("decoded ACTIVE/READY journal is not canonical")
+sys.stdout.buffer.write(decoded)
+'
+}
+
+get_active_ready_param() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION"
+}
+
+get_active_ready_param_version() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Version --output text --region "$AWS_REGION"
+}
+
+get_active_ready_optional() {
+  local name=$1 value rc
+  set +e
+  value=$(get_active_ready_param "$name" 2>&1)
+  rc=$?
+  set -e
+  if (( rc == 0 )); then
+    printf '%s\n' "$value"
+  elif grep -q 'ParameterNotFound' <<<"$value"; then
+    printf '\n'
+  else
+    printf 'reading encrypted ACTIVE/READY parameter %s failed: %s\n' "$name" "$value" >&2
+    return "$rc"
+  fi
+}
+
+require_active_ready_parameter_metadata() {
+  local expected_version=$1 metadata
+  [[ "$expected_version" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'ACTIVE/READY audit parameter expected version is not canonical: %q\n' "$expected_version" >&2
+    return 1
+  }
+  metadata=$(aws ssm describe-parameters --parameter-filters "Key=Name,Option=Equals,Values=${ACTIVE_READY_JOURNAL_PARAM}" \
+    --query 'Parameters[].{Name:Name,Type:Type,KeyId:KeyId,Tier:Tier,DataType:DataType,Version:Version}' \
+    --output json --region "$AWS_REGION")
+  jq -e --arg name "$ACTIVE_READY_JOURNAL_PARAM" --arg key "$ACTIVE_READY_JOURNAL_KMS_KEY" \
+    --argjson version "$expected_version" '
+    type == "array" and length == 1 and .[0] ==
+      {Name:$name,Type:"SecureString",KeyId:$key,Tier:"Standard",DataType:"text",Version:$version}
+  ' >/dev/null <<<"$metadata" || {
+    printf 'ACTIVE/READY audit parameter metadata is not the exact encrypted standard authority at version %s: %s\n' \
+      "$expected_version" "$(jq -cS . <<<"$metadata" 2>/dev/null || printf '<malformed>')" >&2
+    return 1
+  }
+}
+
 validate_stale_journal_ref() {
   local ref=$1
   jq -e --arg parameter "$STALE_JOURNAL_PARAM" '
@@ -241,19 +333,59 @@ validate_stale_journal_ref() {
   ' >/dev/null <<<"$ref"
 }
 
+is_exact_active_ready_main_successor() {
+	local before=$1 after=$2 before_ref after_ref expected before_status after_status
+	before_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$before")
+	after_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$after")
+	[[ -n "$after_ref" && "$after_ref" == "${ACTIVE_READY_JOURNAL_REF:-}" ]] || return 1
+	before_status=$(jq -r .status <<<"$before")
+	after_status=$(jq -r .status <<<"$after")
+	if [[ -n "$before_ref" && "$after_ref" == "$before_ref" &&
+	      "$before_status" == ready_predecessor_retiring && "$after_status" == complete &&
+	      "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == complete ]]; then
+		expected=$(jq -cS '.status="complete"' <<<"$before")
+		[[ "$after" == "$expected" ]]
+		return
+	fi
+	if [[ -z "$before_ref" ]]; then
+		[[ "$before_status" == incident_complete && "$after_status" == ready_predecessor_latching &&
+		   "$(jq -r .version <<<"$after_ref")" == 1 ]] || return 1
+		expected=$(jq -cS --argjson ref "$after_ref" '
+			.status="ready_predecessor_latching" | .runtime.predecessor_plan=null |
+			.runtime.predecessor_plan_sha256="" | .runtime.predecessor_targets=[] |
+			.runtime.ready_predecessor_ref=$ref
+		' <<<"$before")
+	else
+		[[ "$before_status" == "$after_status" &&
+		   ( "$before_status" == ready_predecessor_latching || "$before_status" == ready_predecessor_retiring ) &&
+		   "$(jq -r .version <<<"$after_ref")" == "$(( $(jq -r .version <<<"$before_ref") + 1 ))" ]] || return 1
+		expected=$(jq -cS --argjson ref "$after_ref" '.runtime.ready_predecessor_ref=$ref' <<<"$before")
+	fi
+	[[ "$after" == "$expected" ]]
+}
+
 load_stale_journal_ref() {
-  local ref=$1 version expected_digest historical current_version current pending saved
+  local ref=$1 version expected_digest historical current_version current pending saved pending_active_ref historical_active_ref
+	local saved_active saved_active_ref saved_active_envelope exact_active_successor=false
   validate_stale_journal_ref "$ref" || { echo "schema-3 stale-target journal reference is malformed" >&2; return 1; }
   version=$(jq -r .version <<<"$ref")
   expected_digest=$(jq -r .sha256 <<<"$ref")
   historical=$(get_param "${STALE_JOURNAL_PARAM}:${version}")
   historical=$(jq -cS . <<<"$historical")
-  [[ ${#historical} -lt 4096 && "$(canonical_digest "$historical")" == "$expected_digest" ]] || {
+  [[ ${#historical} -le 4096 && "$(canonical_digest "$historical")" == "$expected_digest" ]] || {
     echo "referenced stale-target journal version does not match schema-3 authority" >&2; return 1;
   }
   STALE_TARGET_RETIREMENT=$(decode_stale_journal "$historical")
   STALE_JOURNAL_REFERENCED_ENVELOPE=$historical
   STALE_TARGET_RETIREMENT_REF=$(jq -cS . <<<"$ref")
+	STALE_JOURNAL_UNREFERENCED_ENVELOPE=
+	STALE_JOURNAL_STATE_REF_PENDING=false
+  ACTIVE_READY_JOURNAL=
+  ACTIVE_READY_JOURNAL_REF=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$STALE_TARGET_RETIREMENT")
+  ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=
+  if [[ -n "$ACTIVE_READY_JOURNAL_REF" ]]; then
+    load_active_ready_journal_ref "$ACTIVE_READY_JOURNAL_REF"
+  fi
   validate_stale_target_retirement
   current_version=$(get_param_version "$STALE_JOURNAL_PARAM")
   [[ "$current_version" =~ ^[1-9][0-9]*$ &&
@@ -269,9 +401,37 @@ load_stale_journal_ref() {
     }
     pending=$(decode_stale_journal "$current")
     saved=$STALE_TARGET_RETIREMENT
+		saved_active=${ACTIVE_READY_JOURNAL:-}
+		saved_active_ref=${ACTIVE_READY_JOURNAL_REF:-}
+		saved_active_envelope=${ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE:-}
     STALE_TARGET_RETIREMENT=$pending
+		pending_active_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$pending")
+		historical_active_ref=${ACTIVE_READY_JOURNAL_REF:-}
+		if [[ -n "$pending_active_ref" && "$pending_active_ref" != "$historical_active_ref" ]]; then
+			# The subjournal commits before the main-journal ref. Loading this
+			# exact referenced version is read-only; the operation-specific main
+			# successor is still derived and byte-compared before state can adopt it.
+			load_active_ready_journal_ref "$pending_active_ref" || {
+				STALE_TARGET_RETIREMENT=$saved
+				return 1
+			}
+		fi
     validate_stale_target_retirement || { STALE_TARGET_RETIREMENT=$saved; return 1; }
-    STALE_TARGET_RETIREMENT=$saved
+		if is_exact_active_ready_main_successor "$saved" "$pending"; then
+			exact_active_successor=true
+			STALE_JOURNAL_UNREFERENCED_ENVELOPE=$current
+			STALE_JOURNAL_REFERENCED_ENVELOPE=$current
+			STALE_TARGET_RETIREMENT_REF=$(jq -cn --arg parameter "$STALE_JOURNAL_PARAM" \
+				--arg digest "$(canonical_digest "$current")" --argjson version "$current_version" \
+				'{parameter:$parameter,version:$version,sha256:$digest}')
+			STALE_JOURNAL_STATE_REF_PENDING=true
+		fi
+		if [[ "$exact_active_successor" != true ]]; then
+			STALE_TARGET_RETIREMENT=$saved
+			ACTIVE_READY_JOURNAL=$saved_active
+			ACTIVE_READY_JOURNAL_REF=$saved_active_ref
+			ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=$saved_active_envelope
+		fi
   fi
 }
 
@@ -332,6 +492,191 @@ require_stale_journal_current_exact() {
   [[ "$(get_param_version "$STALE_JOURNAL_PARAM")" == "$version" ]] || return 1
   current=$(get_param "$STALE_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
   [[ "$current" == "$STALE_JOURNAL_REFERENCED_ENVELOPE" ]]
+}
+
+validate_active_ready_journal_ref() {
+  local ref=$1
+  jq -e --arg parameter "$ACTIVE_READY_JOURNAL_PARAM" '
+    type == "object" and (keys | sort) == ["parameter","sha256","version"] and
+    .parameter == $parameter and (.version | type == "number" and . > 0 and floor == .) and
+    (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+  ' >/dev/null <<<"$ref"
+}
+
+active_ready_quiescence_digest() {
+  jq -cS '[.targets[] | .status="quiescent" | del(.receipt)]' <<<"$1" | sha256sum | awk '{print $1}'
+}
+
+validate_active_ready_journal() {
+  [[ -n "${ACTIVE_READY_JOURNAL:-}" ]] || return 1
+  validate_active_ready_journal_authority "$ACTIVE_READY_JOURNAL" "$RECOVERY_ORCHESTRATOR_SHA" \
+    "$APPROVED_ACTIVE_READY_HANDOFF_STATE_DIGEST" "$APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_DIGEST" \
+    "$(jq -r .runtime.fence_drain.directory_sha256 <<<"$STALE_TARGET_RETIREMENT")" || {
+    echo "ACTIVE/READY audit journal is malformed or cross-bound" >&2
+    return 1
+  }
+}
+
+load_active_ready_journal_ref() {
+  local ref=$1 version expected_digest historical current_version current pending saved
+  validate_active_ready_journal_ref "$ref" || return 1
+  version=$(jq -r .version <<<"$ref")
+  expected_digest=$(jq -r .sha256 <<<"$ref")
+  historical=$(get_active_ready_param "${ACTIVE_READY_JOURNAL_PARAM}:${version}"); historical=$(jq -cS . <<<"$historical")
+  [[ ${#historical} -le 4096 && "$(canonical_digest "$historical")" == "$expected_digest" ]] || {
+    echo "referenced ACTIVE/READY journal version differs from schema-3 authority" >&2; return 1;
+  }
+  ACTIVE_READY_JOURNAL=$(decode_active_ready_journal "$historical")
+  ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=$historical
+  ACTIVE_READY_JOURNAL_REF=$(jq -cS . <<<"$ref")
+  validate_active_ready_journal
+  current_version=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+  [[ "$current_version" =~ ^[1-9][0-9]*$ &&
+     ( "$current_version" == "$version" || "$current_version" == "$((version + 1))" ) ]] || {
+    echo "ACTIVE/READY journal has more than one unreferenced successor" >&2; return 1;
+  }
+  require_active_ready_parameter_metadata "$current_version"
+  current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+  if [[ "$current_version" == "$version" ]]; then
+    [[ "$current" == "$historical" ]] || return 1
+  else
+    pending=$(decode_active_ready_journal "$current")
+    saved=$ACTIVE_READY_JOURNAL
+    ACTIVE_READY_JOURNAL=$pending
+    validate_active_ready_journal || { ACTIVE_READY_JOURNAL=$saved; return 1; }
+    ACTIVE_READY_JOURNAL=$saved
+  fi
+}
+
+write_active_ready_journal_if_changed() {
+  [[ -n "${ACTIVE_READY_JOURNAL:-}" ]] || return 1
+  local desired desired_digest ref_version ref_digest current current_version expected_version err=
+  ACTIVE_READY_JOURNAL=$(jq -cS . <<<"$ACTIVE_READY_JOURNAL")
+  validate_active_ready_journal
+  desired=$(encode_active_ready_journal "$ACTIVE_READY_JOURNAL")
+  [[ ${#desired} -le 4096 ]] || { echo "ACTIVE/READY journal envelope exceeds the SSM standard-parameter limit" >&2; return 1; }
+  desired_digest=$(canonical_digest "$desired")
+  if [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]]; then
+    validate_active_ready_journal_ref "$ACTIVE_READY_JOURNAL_REF" || return 1
+    ref_version=$(jq -r .version <<<"$ACTIVE_READY_JOURNAL_REF")
+    ref_digest=$(jq -r .sha256 <<<"$ACTIVE_READY_JOURNAL_REF")
+    current_version=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+    current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    if [[ "$desired_digest" == "$ref_digest" ]]; then
+      [[ "$current_version" == "$ref_version" && "$current" == "$ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE" ]] || return 1
+      return 0
+    fi
+    expected_version=$((ref_version + 1))
+    if [[ "$current_version" == "$ref_version" && "$current" == "$ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE" ]]; then
+      if ! err=$(aws ssm put-parameter --name "$ACTIVE_READY_JOURNAL_PARAM" --value "$desired" --type SecureString \
+        --key-id "$ACTIVE_READY_JOURNAL_KMS_KEY" --overwrite --region "$AWS_REGION" 2>&1 >/dev/null); then :; fi
+      current_version=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+      current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    fi
+    [[ "$current_version" == "$expected_version" && "$current" == "$desired" ]] || {
+      [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+      echo "ACTIVE/READY journal update was ambiguous or cross-written" >&2; return 1;
+    }
+  else
+    expected_version=1
+    if [[ -z "$(get_active_ready_optional "$ACTIVE_READY_JOURNAL_PARAM")" ]]; then
+      if ! err=$(aws ssm put-parameter --name "$ACTIVE_READY_JOURNAL_PARAM" --value "$desired" --type SecureString \
+        --key-id "$ACTIVE_READY_JOURNAL_KMS_KEY" --no-overwrite --region "$AWS_REGION" 2>&1 >/dev/null); then :; fi
+    fi
+    current_version=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+    current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    [[ "$current_version" == 1 && "$current" == "$desired" ]] || {
+      [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+      echo "initial ACTIVE/READY journal orphan is not the exact derived authority" >&2; return 1;
+    }
+  fi
+  require_active_ready_parameter_metadata "$expected_version"
+  ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=$desired
+  ACTIVE_READY_JOURNAL_REF=$(jq -cn --arg parameter "$ACTIVE_READY_JOURNAL_PARAM" --arg digest "$desired_digest" \
+    --argjson version "$expected_version" '{parameter:$parameter,version:$version,sha256:$digest}')
+}
+
+require_active_ready_journal_current_exact() {
+  [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]] || return 1
+  local version current
+  version=$(jq -r .version <<<"$ACTIVE_READY_JOURNAL_REF")
+  require_active_ready_parameter_metadata "$version"
+  [[ "$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")" == "$version" ]] || return 1
+  current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+  [[ "$current" == "$ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE" ]]
+}
+
+is_exact_active_ready_operation_successor() {
+  local before=$1 after=$2 index before_row after_row before_status after_status changed=0
+  local before_authority after_authority
+  before_authority=$(jq -cS 'del(.status,.quiescence_sha256,.targets)' <<<"$before")
+  after_authority=$(jq -cS 'del(.status,.quiescence_sha256,.targets)' <<<"$after")
+  [[ "$after_authority" == "$before_authority" ]] || return 1
+  for index in 0 1 2; do
+    before_row=$(jq -cS --argjson i "$index" '.targets[$i]' <<<"$before")
+    after_row=$(jq -cS --argjson i "$index" '.targets[$i]' <<<"$after")
+    [[ "$before_row" != "$after_row" ]] || continue
+    changed=$((changed + 1))
+    before_status=$(jq -r .status <<<"$before_row")
+    after_status=$(jq -r .status <<<"$after_row")
+    case "$before_status:$after_status" in
+      pending:latched)
+        [[ "$(jq -cS 'del(.latch_receipt) | .status="pending"' <<<"$after_row")" == "$before_row" &&
+           "$(jq -r .status <<<"$before")" == latching && "$(jq -r .status <<<"$after")" == latching &&
+           "$(jq -r .quiescence_sha256 <<<"$before")" == "$(jq -r .quiescence_sha256 <<<"$after")" ]] || return 1
+        ;;
+      latched:quiescent)
+        [[ "$(jq -cS 'del(.quiescence_receipt) | .status="latched"' <<<"$after_row")" == "$before_row" ]] || return 1
+        if [[ "$index" == 2 ]]; then
+          [[ "$(jq -r .status <<<"$before")" == latching && "$(jq -r .status <<<"$after")" == quiescent &&
+             -z "$(jq -r .quiescence_sha256 <<<"$before")" &&
+             "$(jq -r .quiescence_sha256 <<<"$after")" =~ ^[0-9a-f]{64}$ ]] || return 1
+        else
+          [[ "$(jq -r .status <<<"$before")" == latching && "$(jq -r .status <<<"$after")" == latching &&
+             "$(jq -r .quiescence_sha256 <<<"$before")" == "$(jq -r .quiescence_sha256 <<<"$after")" ]] || return 1
+        fi
+        ;;
+      quiescent:retired)
+        [[ "$(jq -cS 'del(.receipt) | .status="quiescent"' <<<"$after_row")" == "$before_row" &&
+           "$(jq -r .quiescence_sha256 <<<"$before")" == "$(jq -r .quiescence_sha256 <<<"$after")" ]] || return 1
+        case "$index:$(jq -r .status <<<"$before"):$(jq -r .status <<<"$after")" in
+          0:quiescent:retiring|1:retiring:retiring|2:retiring:complete) ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ "$changed" == 1 ]]
+}
+
+require_active_ready_journal_current_or_classifiable_successor() {
+  [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]] || return 1
+  local version current_version current current_version_after current_after pending saved
+  version=$(jq -r .version <<<"$ACTIVE_READY_JOURNAL_REF")
+  current_version=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+  [[ "$current_version" == "$version" || "$current_version" == "$((version + 1))" ]] || return 1
+  require_active_ready_parameter_metadata "$current_version"
+  current=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+  current_version_after=$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")
+  current_after=$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM"); current_after=$(jq -cS . <<<"$current_after")
+  [[ "$current_version_after" == "$current_version" && "$current_after" == "$current" ]] || {
+    echo "ACTIVE/READY audit parameter changed during the pre-command read bracket" >&2
+    return 1
+  }
+  if [[ "$current_version" == "$version" ]]; then
+    [[ "$current" == "$ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE" ]]
+    return
+  fi
+  pending=$(decode_active_ready_journal "$current")
+  saved=$ACTIVE_READY_JOURNAL
+  ACTIVE_READY_JOURNAL=$pending
+  validate_active_ready_journal || { ACTIVE_READY_JOURNAL=$saved; return 1; }
+  ACTIVE_READY_JOURNAL=$saved
+  is_exact_active_ready_operation_successor "$saved" "$pending" || {
+    echo "unreferenced ACTIVE/READY journal is not one exact operation-derived successor" >&2
+    return 1
+  }
 }
 
 require_hard_lock() {
@@ -758,7 +1103,14 @@ validate_runtime_component() {
     [[ -z "$(jq -r .intent_sha256 <<<"$component")" && -z "$(jq -r .refresh_id <<<"$component")" ]]
     return
   fi
-  [[ "$label" != ac ]] || plan_digest=$(jq -r .runtime.predecessor_plan_sha256 <<<"$STALE_TARGET_RETIREMENT")
+  if [[ "$label" == ac ]]; then
+    if [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]]; then
+      plan_digest=$(printf 'v1\n%s\n%s\n' "$(jq -r .plan_sha256 <<<"$ACTIVE_READY_JOURNAL")" \
+        "$(jq -r .quiescence_sha256 <<<"$ACTIVE_READY_JOURNAL")" | sha256sum | awk '{print $1}')
+    else
+      plan_digest=$(jq -r .runtime.predecessor_plan_sha256 <<<"$STALE_TARGET_RETIREMENT")
+    fi
+  fi
   intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$label" "$asg" "$STALE_RUNTIME_SOURCE_SHA" "$STALE_RUNTIME_BUILD_RUN_ID" \
     "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$intent_orchestrator" \
@@ -846,7 +1198,8 @@ validate_session_control_delete_iam() {
     [[ "$(jq -r .status <<<"$iam")" == preparing ]]
   elif [[ "$status" == iam_ready || "$status" == fence_drained || "$status" == incident_preparing ||
     "$status" == incident_complete || "$status" == ac_intent || "$status" == ac_refreshing ||
-    "$status" == predecessor_retiring || "$status" == complete ]]; then
+    "$status" == predecessor_retiring || "$status" == ready_predecessor_latching ||
+    "$status" == ready_predecessor_retiring || "$status" == complete ]]; then
     [[ "$(jq -r .status <<<"$iam")" == ready ]]
   else
     return 1
@@ -883,7 +1236,11 @@ validate_stale_target_retirement() {
        (keys | sort) ==
         ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
          "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
-         "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"])) and
+         "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"] or
+       (keys | sort) ==
+        ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+         "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","ready_predecessor_ref",
+         "runtime_manifest","server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"])) and
     .runtime.source_sha == $source and .runtime.build_run_id == $build and .runtime.build_run_attempt == $attempt and
     .runtime.runtime_manifest == $manifest and .runtime.server_provenance == $server and .runtime.ac_provenance == $ac and
     .runtime.preferences == $preferences and
@@ -897,11 +1254,19 @@ validate_stale_target_retirement() {
       (.runtime.predecessor_plan_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
       (.runtime.predecessor_targets | type == "array") and
       (.runtime.predecessor_targets | length) == (.runtime.predecessor_plan.targets | length))) and
+    ((.runtime | has("ready_predecessor_ref") | not) or
+      ((.runtime.ready_predecessor_ref | type == "object" and (keys | sort) == ["parameter","sha256","version"]) and
+       .runtime.ready_predecessor_ref.parameter == "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" and
+       (.runtime.ready_predecessor_ref.version | type == "number" and . > 0 and floor == .) and
+       (.runtime.ready_predecessor_ref.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+       .runtime.predecessor_plan == null and .runtime.predecessor_plan_sha256 == "" and
+       (.runtime.predecessor_targets | type == "array" and length == 0))) and
     (.status == "cell0_intent" or .status == "cell0_refreshing" or .status == "cell0_refreshed" or
      .status == "cell1_intent" or .status == "cell1_refreshing" or .status == "servers_refreshed" or
      .status == "iam_preparing" or .status == "iam_ready" or
      .status == "fence_drained" or .status == "incident_preparing" or .status == "incident_complete" or
-     .status == "ac_intent" or .status == "ac_refreshing" or .status == "predecessor_retiring" or .status == "complete")
+     .status == "ac_intent" or .status == "ac_refreshing" or .status == "predecessor_retiring" or
+     .status == "ready_predecessor_latching" or .status == "ready_predecessor_retiring" or .status == "complete")
   ' >/dev/null <<<"$STALE_TARGET_RETIREMENT" || {
     echo "schema-3 stale-target recovery journal is malformed or cross-bound" >&2; return 1;
   }
@@ -1000,6 +1365,7 @@ validate_predecessor_plan() {
 
 validate_stale_recovery_status() {
   local status=$1 c0_prior c0_refresh c1_prior c1_refresh ac_prior ac_refresh incident_retired predecessor_count predecessor_retired
+  local has_ready_ref ready_status
   c0_prior=$(jq -r .runtime.cell0.prior_refresh_id <<<"$STALE_TARGET_RETIREMENT")
   c0_refresh=$(jq -r .runtime.cell0.refresh_id <<<"$STALE_TARGET_RETIREMENT")
   c1_prior=$(jq -r .runtime.cell1.prior_refresh_id <<<"$STALE_TARGET_RETIREMENT")
@@ -1009,6 +1375,8 @@ validate_stale_recovery_status() {
   incident_retired=$(jq '[.incident_targets[] | select(.status=="retired")]|length' <<<"$STALE_TARGET_RETIREMENT")
   predecessor_count=$(jq '.runtime.predecessor_targets|length' <<<"$STALE_TARGET_RETIREMENT")
   predecessor_retired=$(jq '[.runtime.predecessor_targets[] | select(.status=="retired")]|length' <<<"$STALE_TARGET_RETIREMENT")
+  has_ready_ref=$(jq -r '.runtime | has("ready_predecessor_ref")' <<<"$STALE_TARGET_RETIREMENT")
+  ready_status=${ACTIVE_READY_JOURNAL:+$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")}
   case "$status" in
     cell0_intent) [[ -n "$c0_prior" && -z "$c0_refresh$c1_prior$c1_refresh$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
     cell0_refreshing) [[ -n "$c0_prior$c0_refresh" && -z "$c1_prior$c1_refresh$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
@@ -1020,10 +1388,21 @@ validate_stale_recovery_status() {
     fence_drained) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 0 ]] ;;
     incident_preparing) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" -le 3 ]] ;;
     incident_complete) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 3 && "$predecessor_count" == 0 ]] ;;
-    ac_intent) [[ -n "$c0_refresh$c1_refresh$ac_prior" && "$incident_retired" == 3 && -z "$ac_refresh" && "$predecessor_count" -ge 1 ]] ;;
-    ac_refreshing) [[ -n "$c0_refresh$c1_refresh$ac_prior$ac_refresh" && "$incident_retired" == 3 && "$predecessor_count" -ge 1 ]] ;;
+    ready_predecessor_latching) [[ -n "$c0_refresh$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 3 &&
+      "$predecessor_count" == 0 && "$has_ready_ref" == true && ( "$ready_status" == latching || "$ready_status" == quiescent ) ]] ;;
+    ac_intent) [[ -n "$c0_refresh$c1_refresh$ac_prior" && "$incident_retired" == 3 && -z "$ac_refresh" &&
+      (( "$predecessor_count" -ge 1 && "$has_ready_ref" == false ) ||
+       ( "$predecessor_count" == 0 && "$has_ready_ref" == true && "$ready_status" == quiescent )) ]] ;;
+    ac_refreshing) [[ -n "$c0_refresh$c1_refresh$ac_prior$ac_refresh" && "$incident_retired" == 3 &&
+      (( "$predecessor_count" -ge 1 && "$has_ready_ref" == false ) ||
+       ( "$predecessor_count" == 0 && "$has_ready_ref" == true && "$ready_status" == quiescent )) ]] ;;
     predecessor_retiring) [[ -n "$c0_refresh$c1_refresh$ac_refresh" && "$incident_retired" == 3 && "$predecessor_count" -ge 1 ]] ;;
-    complete) [[ -n "$c0_refresh$c1_refresh$ac_refresh" && "$incident_retired" == 3 && "$predecessor_count" -ge 1 && "$predecessor_retired" == "$predecessor_count" ]] ;;
+    ready_predecessor_retiring) [[ -n "$c0_refresh$c1_refresh$ac_refresh" && "$incident_retired" == 3 &&
+      "$predecessor_count" == 0 && "$has_ready_ref" == true &&
+      ( "$ready_status" == quiescent || "$ready_status" == retiring || "$ready_status" == complete ) ]] ;;
+    complete) [[ -n "$c0_refresh$c1_refresh$ac_refresh" && "$incident_retired" == 3 &&
+      (( "$predecessor_count" -ge 1 && "$predecessor_retired" == "$predecessor_count" ) ||
+       ( "$predecessor_count" == 0 && "$has_ready_ref" == true && "$ready_status" == complete )) ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1290,6 +1669,19 @@ advance_stale_target_retirement() {
 initialize_ac_runtime_refresh() {
   local plan plan_digest component
   verify_session_control_delete_iam
+  if [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]]; then
+    [[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == quiescent ]] || {
+      echo "ACTIVE/READY predecessors are not latched and quiescent before AC refresh" >&2; return 1;
+    }
+    plan_digest=$(printf 'v1\n%s\n%s\n' "$(jq -r .plan_sha256 <<<"$ACTIVE_READY_JOURNAL")" \
+      "$(jq -r .quiescence_sha256 <<<"$ACTIVE_READY_JOURNAL")" | sha256sum | awk '{print $1}')
+    component=$(runtime_component_intent ac layerv-nhp-sandbox-ac-green "$STALE_RUNTIME_AC_PROVENANCE" "$plan_digest")
+    STALE_TARGET_RETIREMENT=$(jq -c --argjson component "$component" '.status="ac_intent" | .runtime.ac=$component' \
+      <<<"$STALE_TARGET_RETIREMENT")
+    validate_stale_target_retirement
+    write_state repaired
+    return
+  fi
   plan=$($STALE_TARGET_RETIRER snapshot-predecessors --table layerv-nhp-sandbox-cell0-nhp-session-control --region "$AWS_REGION")
   plan=$(jq -cS . <<<"$plan")
   plan_digest=$(canonical_digest "$plan")
@@ -1302,6 +1694,145 @@ initialize_ac_runtime_refresh() {
     .runtime.predecessor_targets=[.runtime.predecessor_plan.targets[] | {id,fence_sha256,status:"pending"}]
   ' <<<"$STALE_TARGET_RETIREMENT")
   validate_stale_target_retirement
+  write_state repaired
+}
+
+require_exact_zero_directory() {
+  local current expected
+  current=$($STALE_TARGET_RETIRER verify-fence-drain --table layerv-nhp-sandbox-cell0-nhp-session-control \
+    --cell-id cell0 --region "$AWS_REGION")
+  current=$(jq -cS . <<<"$current")
+  expected=$(jq -cS .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")
+  validate_directory_receipt "$current" 0 && [[ "$current" == "$expected" ]] || {
+    echo "live zero-directory authority differs from the exact journaled v250 receipt" >&2
+    return 1
+  }
+}
+
+initialize_active_ready_recovery() {
+  local plan plan_digest fence_digest
+  require_hard_lock
+  verify_session_control_delete_iam
+	if [[ -z "${STALE_JOURNAL_UNREFERENCED_ENVELOPE:-}" ]]; then
+		require_stale_journal_current_exact
+	else
+		[[ -n "${ACTIVE_READY_JOURNAL:-}" ]] || {
+			echo "unreferenced main-journal successor lacks its ACTIVE/READY journal" >&2
+			return 1
+		}
+	fi
+  require_exact_zero_directory
+	if [[ -z "${ACTIVE_READY_JOURNAL:-}" ]]; then
+		plan=$($STALE_TARGET_RETIRER snapshot-active-ready-predecessors)
+		plan=$(jq -cS . <<<"$plan")
+		plan_digest=$(canonical_digest "$plan")
+		fence_digest=$(jq -r .runtime.fence_drain.directory_sha256 <<<"$STALE_TARGET_RETIREMENT")
+		ACTIVE_READY_JOURNAL=$(jq -cn --arg state_digest "$APPROVED_ACTIVE_READY_HANDOFF_STATE_DIGEST" \
+			--arg main_parameter "$STALE_JOURNAL_PARAM" --arg main_digest "$APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_DIGEST" \
+			--arg orchestrator "$RECOVERY_ORCHESTRATOR_SHA" --arg fence_digest "$fence_digest" \
+			--arg plan_digest "$plan_digest" --argjson plan "$plan" '
+			{fence_drain_sha256:$fence_digest,orchestrator_sha:$orchestrator,plan:$plan,plan_sha256:$plan_digest,
+			 quiescence_sha256:"",schema:"layerv.durable-aop-active-ready-predecessor-journal.v1",
+			 source_main_journal_parameter:$main_parameter,source_main_journal_sha256:$main_digest,
+			 source_main_journal_version:8,source_state_sha256:$state_digest,source_state_version:30,status:"latching",
+			 targets:[$plan.targets[] | {fence_sha256,id,status:"pending"}]}
+		')
+		ACTIVE_READY_JOURNAL_REF=
+		ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=
+	else
+		# A crash may leave the exact initial subjournal and its exact main-ref
+		# successor committed while schema-3 still references incident_complete.
+		# Reuse those durable bytes; never replace them with a fresh plan.
+		validate_active_ready_journal
+		[[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == latching &&
+		   "$(jq -c '[.targets[].status]' <<<"$ACTIVE_READY_JOURNAL")" == '["pending","pending","pending"]' ]] || {
+			echo "initial ACTIVE/READY orphan is not the exact pending plan" >&2
+			return 1
+		}
+	fi
+  validate_active_ready_journal
+  STALE_TARGET_RETIREMENT=$(jq -c '
+    .status="ready_predecessor_latching" | .runtime.predecessor_plan=null |
+    .runtime.predecessor_plan_sha256="" | .runtime.predecessor_targets=[]
+  ' <<<"$STALE_TARGET_RETIREMENT")
+  # write_state commits the sub-journal, then the main-journal ref, then the
+  # state ref. An exact orphan at either boundary is classified on retry.
+  write_state repaired
+}
+
+advance_active_ready_quiescence() {
+  local index id receipt quiescence_digest status
+  for index in 0 1 2; do
+    status=$(jq -r --argjson i "$index" '.targets[$i].status' <<<"$ACTIVE_READY_JOURNAL")
+    if [[ "$status" == pending ]]; then
+      require_hard_lock
+      verify_session_control_delete_iam
+      require_exact_zero_directory
+      id=$(jq -r --argjson i "$index" '.targets[$i].id' <<<"$ACTIVE_READY_JOURNAL")
+      receipt=$($STALE_TARGET_RETIRER latch-active-ready-predecessor --target-id "$id")
+      receipt=$(jq -cS . <<<"$receipt")
+      ACTIVE_READY_JOURNAL=$(jq -c --argjson i "$index" --argjson receipt "$receipt" \
+        '.targets[$i] += {status:"latched",latch_receipt:$receipt}' <<<"$ACTIVE_READY_JOURNAL")
+      write_state repaired
+      status=latched
+    fi
+    if [[ "$status" == latched ]]; then
+      require_hard_lock
+      verify_session_control_delete_iam
+      require_exact_zero_directory
+      id=$(jq -r --argjson i "$index" '.targets[$i].id' <<<"$ACTIVE_READY_JOURNAL")
+      receipt=$($STALE_TARGET_RETIRER verify-active-ready-predecessor-quiescence --target-id "$id")
+      receipt=$(jq -cS . <<<"$receipt")
+      ACTIVE_READY_JOURNAL=$(jq -c --argjson i "$index" --argjson receipt "$receipt" \
+        '.targets[$i] += {status:"quiescent",quiescence_receipt:$receipt}' <<<"$ACTIVE_READY_JOURNAL")
+      if [[ "$index" == 2 ]]; then
+        quiescence_digest=$(active_ready_quiescence_digest "$ACTIVE_READY_JOURNAL")
+        ACTIVE_READY_JOURNAL=$(jq -c --arg digest "$quiescence_digest" \
+          '.status="quiescent" | .quiescence_sha256=$digest' <<<"$ACTIVE_READY_JOURNAL")
+      fi
+      write_state repaired
+    fi
+  done
+  [[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == quiescent ]]
+}
+
+reprove_active_ready_post_refresh_authority() {
+  require_hard_lock
+  verify_session_control_delete_iam
+  require_stale_journal_current_exact
+  # A prior command may have committed DDB and the one exact ACTIVE N+1 while
+  # the slim-main reference write was lost. This read-only bracket admits only
+  # that closed single-operation shape. The journal-derived command still must
+  # classify the exact receipt against DDB before the controller can adopt it.
+  require_active_ready_journal_current_or_classifiable_successor
+  require_exact_zero_directory
+  assert_completed_runtime_slot sandbox server "$CELL0_COLOR" "$CELL0_ASG" cell0 "$STALE_RUNTIME_SERVER_PROVENANCE" \
+    'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
+  assert_completed_runtime_slot sandbox-cell1 server "$CELL1_COLOR" "$CELL1_ASG" cell1 "$STALE_RUNTIME_SERVER_PROVENANCE" \
+    'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
+  assert_completed_runtime_slot sandbox ac "$AC_COLOR" "$AC_ASG" ac "$STALE_RUNTIME_AC_PROVENANCE" \
+    'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
+}
+
+advance_active_ready_retirement() {
+  local index id receipt status
+  for index in 0 1 2; do
+    status=$(jq -r --argjson i "$index" '.targets[$i].status' <<<"$ACTIVE_READY_JOURNAL")
+    [[ "$status" == quiescent ]] || continue
+    reprove_active_ready_post_refresh_authority
+    id=$(jq -r --argjson i "$index" '.targets[$i].id' <<<"$ACTIVE_READY_JOURNAL")
+    receipt=$($STALE_TARGET_RETIRER retire-active-ready-predecessor --target-id "$id")
+    receipt=$(jq -cS . <<<"$receipt")
+    ACTIVE_READY_JOURNAL=$(jq -c --argjson i "$index" --argjson receipt "$receipt" \
+      '.targets[$i] += {status:"retired",receipt:$receipt} | .status="retiring"' <<<"$ACTIVE_READY_JOURNAL")
+    if [[ "$index" == 2 ]]; then
+      ACTIVE_READY_JOURNAL=$(jq -c '.status="complete"' <<<"$ACTIVE_READY_JOURNAL")
+    fi
+    write_state repaired
+  done
+  [[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == complete ]] || return 1
+  reprove_active_ready_post_refresh_authority
+  STALE_TARGET_RETIREMENT=$(jq -c '.status="complete"' <<<"$STALE_TARGET_RETIREMENT")
   write_state repaired
 }
 
@@ -1521,6 +2052,23 @@ write_state() {
       echo "stale-target retirement requires durable owner authority and no refresh intent" >&2
       return 1
     }
+    if [[ "${STALE_JOURNAL_STATE_REF_PENDING:-false}" == true ]]; then
+		# The exact main-journal successor is already committed and validated.
+		# This write changes only schema-3's main-journal reference; it must not
+		# advance the ACTIVE subjournal or derive another main successor first.
+		:
+	elif [[ -n "${ACTIVE_READY_JOURNAL:-}" ]]; then
+      # The full fence/receipt successor commits first. The main journal then
+      # commits only its exact ref, and the state commits the main-journal ref.
+      # Each layer can therefore adopt only one operation-derived orphan.
+      write_active_ready_journal_if_changed
+      STALE_TARGET_RETIREMENT=$(jq -c --argjson ref "$ACTIVE_READY_JOURNAL_REF" \
+        '.runtime.ready_predecessor_ref=$ref' <<<"$STALE_TARGET_RETIREMENT")
+      validate_stale_target_retirement || {
+        echo "main recovery journal rejected the exact ACTIVE/READY subjournal reference" >&2
+        return 1
+      }
+    fi
     write_stale_journal_if_changed
     STATE=$(jq -c --argjson retirement_ref "$STALE_TARGET_RETIREMENT_REF" \
       '.repair.stale_target_retirement_ref = $retirement_ref' <<<"$STATE")
@@ -1535,6 +2083,7 @@ write_state() {
   put_param "$STATE_PARAM" "$STATE"
   [[ "$(get_param "$STATE_PARAM")" == "$STATE" ]] || { echo "schema-3 state write did not strongly round trip" >&2; return 1; }
   RECOVERY_HANDOFF_PENDING=false
+	STALE_JOURNAL_STATE_REF_PENDING=false
   PHASE=$next
   echo "durable AOP repair phase: $PHASE"
 }
@@ -1545,7 +2094,8 @@ load_schema3() {
     --arg recovery_sha "$RECOVERY_ORCHESTRATOR_SHA" \
     --arg predecessor_sha "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" \
     --arg stale_predecessor_sha "$APPROVED_STALE_RETIREMENT_PREDECESSOR_SHA" \
-    --arg iam_predecessor_sha "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
+    --arg iam_predecessor_sha "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" \
+    --arg active_predecessor_sha "$APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
     --arg build_run "$REPAIR_BUILD_RUN_ID" --arg build_attempt "$REPAIR_BUILD_RUN_ATTEMPT" \
     --arg runtime_manifest "$APPROVED_REPAIR_RUNTIME_MANIFEST" \
     --arg server_provenance "$SERVER_REPAIR_PROVENANCE" --arg ac_provenance "$AC_REPAIR_PROVENANCE" '
@@ -1563,7 +2113,8 @@ load_schema3() {
        (length == 17 and (.owner | type == "object") and (.stale_target_retirement_ref | type == "object") and
          (has("refresh_intent") | not)))) and
     (.repair.orchestrator_sha == $recovery_sha or .repair.orchestrator_sha == $predecessor_sha or
-     .repair.orchestrator_sha == $stale_predecessor_sha or .repair.orchestrator_sha == $iam_predecessor_sha) and
+     .repair.orchestrator_sha == $stale_predecessor_sha or .repair.orchestrator_sha == $iam_predecessor_sha or
+     .repair.orchestrator_sha == $active_predecessor_sha) and
     .repair.source_sha == $repair_sha and
     .repair.build_run_id == $build_run and .repair.build_run_attempt == $build_attempt and
     .repair.runtime_manifest == $runtime_manifest and
@@ -1621,10 +2172,27 @@ load_schema3() {
       return 1
     }
     RECOVERY_HANDOFF_PENDING=true
+  elif [[ "$stored_recovery_sha" == "$APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA" ]]; then
+    canonical=$(jq -cS . <<<"$raw")
+    digest=$(canonical_digest "$canonical")
+    [[ "$RECOVERY_ORCHESTRATOR_SHA" != "$APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA" &&
+       "$state_version" == "$APPROVED_ACTIVE_READY_HANDOFF_STATE_VERSION" &&
+       "$digest" == "$APPROVED_ACTIVE_READY_HANDOFF_STATE_DIGEST" &&
+       "$(jq -r .phase <<<"$raw")" == "$APPROVED_ACTIVE_READY_HANDOFF_PHASE" &&
+       "$(jq -r '.repair.owner.status // ""' <<<"$raw")" == ready &&
+       "$(jq -r '.repair.stale_target_retirement_ref.version // 0' <<<"$raw")" == "$APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_VERSION" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.sha256 // ""' <<<"$raw")" == "$APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_DIGEST" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.parameter // ""' <<<"$raw")" == "$STALE_JOURNAL_PARAM" &&
+       -n "${LIVE_LOCK:-}" && "$LOCK_JSON" == "$ORIGINAL_LOCK" && -z "$(get_optional "$FLOOR_PARAM")" ]] || {
+      echo "schema-3 ACTIVE/READY predecessor is not the exact live v30/journal-v8 handoff boundary" >&2
+      return 1
+    }
+    RECOVERY_HANDOFF_PENDING=true
   else
     [[ "$state_version" != "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" &&
        "$state_version" != "$APPROVED_STALE_RETIREMENT_STATE_VERSION" &&
-       "$state_version" != "$APPROVED_IAM_HANDOFF_STATE_VERSION" ]] || {
+       "$state_version" != "$APPROVED_IAM_HANDOFF_STATE_VERSION" &&
+       "$state_version" != "$APPROVED_ACTIVE_READY_HANDOFF_STATE_VERSION" ]] || {
       echo "schema-3 pinned handoff SSM version cannot self-assert successor authority" >&2
       return 1
     }
@@ -1647,6 +2215,11 @@ load_schema3() {
   REPAIR_REFRESH_INTENT=$(jq -r '.repair.refresh_intent // ""' <<<"$STATE")
   OWNER_AUTHORITY=$(jq -cS '.repair.owner // empty' <<<"$STATE")
 	STALE_TARGET_RETIREMENT=
+	STALE_JOURNAL_UNREFERENCED_ENVELOPE=
+	STALE_JOURNAL_STATE_REF_PENDING=false
+	ACTIVE_READY_JOURNAL=
+	ACTIVE_READY_JOURNAL_REF=
+	ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=
 	STALE_TARGET_RETIREMENT_REF=$(jq -cS '.repair.stale_target_retirement_ref // empty' <<<"$STATE")
 	STALE_JOURNAL_REFERENCED_ENVELOPE=
 	if [[ -n "$STALE_TARGET_RETIREMENT_REF" ]]; then
@@ -1991,6 +2564,13 @@ fi
 assert_original_fleet_authority sandbox server "$CELL0_COLOR" "$CELL0_ASG" "$(jq -r .cell0.new_attestation <<<"$ORIGINAL_STATE")"
 assert_original_fleet_authority sandbox-cell1 server "$CELL1_COLOR" "$CELL1_ASG" "$(jq -r .cell1.new_attestation <<<"$ORIGINAL_STATE")"
 
+if [[ "${STALE_JOURNAL_STATE_REF_PENDING:-false}" == true ]]; then
+	# A prior attempt committed the one exact validated main-journal successor
+	# after its ACTIVE subjournal successor but stopped before schema-3. Adopt
+	# that reference before any later DDB, ASG, IAM, or lifecycle operation.
+	write_state "$PHASE"
+fi
+
 if (( $(state_phase_order "$PHASE") < $(state_phase_order cell0_refreshed) )); then
   [[ "$PHASE" == cell0_refreshing ]] || write_state cell0_refreshing
   refresh_active_component sandbox server "$CELL0_COLOR" "$CELL0_ASG" cell0 "$CELL0_REPAIR_ATTESTATION" \
@@ -2052,8 +2632,9 @@ fi
 # starting directory, refresh both active server fleets first, and require a
 # stable zero-fence directory before the first retirement. The three fixed
 # incident targets are then retired one at a time. Only after that capacity is
-# free do we precommit every currently counted PREPARING predecessor, refresh
-# AC, and retire those exact decommissioned identities. Every AWS refresh
+# free do we precommit the exact three ACTIVE/READY v7 predecessors, latch their
+# owners and prove task/session quiescence, refresh AC, and retire those exact
+# decommissioned identities. Every AWS refresh
 # intent and target fence is durable before its mutation; no ordinary runtime
 # interface can invoke target retirement.
 if [[ "$PHASE" == repaired && "$OWNER_STATUS" == ready && -z "$STALE_TARGET_RETIREMENT" ]]; then
@@ -2091,6 +2672,13 @@ if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" 
   advance_stale_target_retirement
 fi
 if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == incident_complete ]]; then
+  initialize_active_ready_recovery
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ready_predecessor_latching ]]; then
+  advance_active_ready_quiescence
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ready_predecessor_latching &&
+  "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == quiescent ]]; then
   initialize_ac_runtime_refresh
 fi
 if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ac_intent ||
@@ -2100,10 +2688,10 @@ if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" 
 	  verify_session_control_delete_iam
 	  advance_runtime_component_refresh ac sandbox ac green layerv-nhp-sandbox-ac-green \
     'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready' \
-    predecessor_retiring
+    ready_predecessor_retiring
 fi
-if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == predecessor_retiring ]]; then
-  advance_predecessor_retirement
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ready_predecessor_retiring ]]; then
+  advance_active_ready_retirement
 fi
 
 if [[ "$LIFECYCLE_MODE" == deferred ]]; then
@@ -2112,6 +2700,7 @@ if [[ "$LIFECYCLE_MODE" == deferred ]]; then
     echo "runtime repair and stale-target retirement are incomplete" >&2; exit 1;
   }
 	require_stale_journal_current_exact || { echo "deferred recovery journal is not current and exact" >&2; exit 1; }
+  require_active_ready_journal_current_exact || { echo "deferred ACTIVE/READY journal is not current and exact" >&2; exit 1; }
   emit_recovery_outcome repaired_owner_ready_waiting_for_lifecycle
   echo "durable AOP schema-3 recovery reached repaired+owner_ready; lifecycle selectors are intentionally deferred and the hard lock remains held"
   exit 0
@@ -2122,12 +2711,14 @@ require_hard_lock
   echo "terminal recovery requires completed runtime refresh and target retirement" >&2; exit 1;
 }
 require_stale_journal_current_exact || { echo "terminal recovery journal is not current and exact" >&2; exit 1; }
+require_active_ready_journal_current_exact || { echo "terminal ACTIVE/READY journal is not current and exact" >&2; exit 1; }
 assert_completed_runtime_slot sandbox server "$CELL0_COLOR" "$CELL0_ASG" cell0 "$STALE_RUNTIME_SERVER_PROVENANCE" \
   'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
 assert_completed_runtime_slot sandbox-cell1 server "$CELL1_COLOR" "$CELL1_ASG" cell1 "$STALE_RUNTIME_SERVER_PROVENANCE" \
   'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
 assert_completed_runtime_slot sandbox ac "$AC_COLOR" "$AC_ASG" ac "$STALE_RUNTIME_AC_PROVENANCE" \
   'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
+reprove_active_ready_post_refresh_authority
 
 if [[ "$PHASE" != complete ]]; then
 	  "$VERIFY_ASG" "$AC_ASG" schema3-ac-ready 15 \
@@ -2183,6 +2774,7 @@ require_hard_lock
 }
 	"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
 	verify_session_control_delete_iam
+	reprove_active_ready_post_refresh_authority
 	ensure_exact_floor
 	"$OWNER_PROJECTOR" verify-current --intent-json "$OWNER_INTENT" >/dev/null
 	if [[ "$PHASE" != complete ]]; then
@@ -2194,6 +2786,7 @@ require_hard_lock
 # partial refreshes.  Only an exact schema-3 COMPLETE is allowed to release it.
 	require_hard_lock
 	verify_session_control_delete_iam
+	reprove_active_ready_post_refresh_authority
 	AWS_REGION=$AWS_REGION bash "$ROOT/.github/scripts/ssm-live-env-lock.sh" release "$LOCK_PARAM" "$ORIGINAL_OWNER" 14400 7200
 emit_recovery_outcome complete
 echo "durable AOP schema-3 recovery complete at repair source $REPAIR_SOURCE_SHA"

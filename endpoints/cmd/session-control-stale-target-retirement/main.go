@@ -31,9 +31,12 @@ func emitJSON(out io.Writer, value any) error {
 }
 
 func readRecoveryParameter(ctx context.Context, name string) (server.SandboxRecoveryParameterSnapshot, error) {
-	command := exec.CommandContext(ctx, "aws", "ssm", "get-parameter", "--name", name,
-		"--region", server.SandboxStaleTargetRetirementRegion, "--query",
-		"{Value:Parameter.Value,Version:Parameter.Version}", "--output", "json", "--no-cli-pager")
+	args := []string{"ssm", "get-parameter", "--name", name, "--region", server.SandboxStaleTargetRetirementRegion,
+		"--query", "{Value:Parameter.Value,Version:Parameter.Version}", "--output", "json", "--no-cli-pager"}
+	if strings.HasPrefix(name, server.SandboxActiveReadyRecoveryJournalParameter) {
+		args = append(args, "--with-decryption")
+	}
+	command := exec.CommandContext(ctx, "aws", args...)
 	command.Env = append(os.Environ(), "AWS_PAGER=")
 	output, err := command.Output()
 	if err != nil {
@@ -121,6 +124,13 @@ type recoveryParameterReader func(context.Context, string) (server.SandboxRecove
 type journaledPredecessorRetirer func(context.Context, string, server.SandboxRecoveryParameterSnapshot,
 	server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot) (*server.SandboxStaleTargetRetirementReceipt, error)
 
+type journaledActiveReadyOperation func(context.Context, string, server.SandboxRecoveryParameterSnapshot,
+	server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot,
+	server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot) (any, error)
+
+type activeReadyVersionSelector func(server.SandboxRecoveryParameterSnapshot,
+	server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot) (int64, error)
+
 func runJournaledPredecessor(ctx context.Context, targetID string, out io.Writer, read recoveryParameterReader,
 	retire journaledPredecessorRetirer,
 ) error {
@@ -158,6 +168,60 @@ func runJournaledPredecessor(ctx context.Context, targetID string, out io.Writer
 	return emitJSON(out, receipt)
 }
 
+func runJournaledActiveReady(ctx context.Context, targetID string, out io.Writer, read recoveryParameterReader,
+	selectVersion activeReadyVersionSelector, operation journaledActiveReadyOperation,
+) error {
+	stateBefore, err := read(ctx, server.SandboxStaleTargetRecoveryStateParameter)
+	if err != nil {
+		return err
+	}
+	mainVersion, err := referencedJournalVersion(stateBefore.Value)
+	if err != nil {
+		return err
+	}
+	mainCurrentBefore, err := read(ctx, server.SandboxStaleTargetRecoveryJournalParameter)
+	if err != nil {
+		return err
+	}
+	mainHistorical, err := read(ctx, server.SandboxStaleTargetRecoveryJournalParameter+":"+strconv.FormatInt(mainVersion, 10))
+	if err != nil {
+		return err
+	}
+	readyVersion, err := selectVersion(stateBefore, mainCurrentBefore, mainHistorical)
+	if err != nil {
+		return err
+	}
+	readyCurrentBefore, err := read(ctx, server.SandboxActiveReadyRecoveryJournalParameter)
+	if err != nil {
+		return err
+	}
+	readyHistorical, err := read(ctx, server.SandboxActiveReadyRecoveryJournalParameter+":"+strconv.FormatInt(readyVersion, 10))
+	if err != nil {
+		return err
+	}
+	stateAfter, err := read(ctx, server.SandboxStaleTargetRecoveryStateParameter)
+	if err != nil {
+		return err
+	}
+	mainCurrentAfter, err := read(ctx, server.SandboxStaleTargetRecoveryJournalParameter)
+	if err != nil {
+		return err
+	}
+	readyCurrentAfter, err := read(ctx, server.SandboxActiveReadyRecoveryJournalParameter)
+	if err != nil {
+		return err
+	}
+	if stateBefore != stateAfter || mainCurrentBefore != mainCurrentAfter || readyCurrentBefore != readyCurrentAfter {
+		return errors.New("schema-3 state, main journal, or ACTIVE/READY journal changed during the operation read bracket")
+	}
+	receipt, err := operation(ctx, targetID, stateBefore, mainCurrentBefore, mainHistorical,
+		readyCurrentBefore, readyHistorical)
+	if err != nil {
+		return fmt.Errorf("apply exact sandbox ACTIVE/READY recovery operation: %w", err)
+	}
+	return emitJSON(out, receipt)
+}
+
 func run(ctx context.Context, args []string, out io.Writer) error {
 	if len(args) == 1 && args[0] == "plan" {
 		return emitJSON(out, server.SandboxStaleTargetRetirementPlanForIncident())
@@ -171,17 +235,25 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	flags.StringVar(&cellID, "cell-id", "", "exact control cell")
 	if len(args) == 0 || (args[0] != "retire" && args[0] != "snapshot-predecessors" &&
 		args[0] != "retire-predecessor" && args[0] != "snapshot-fence-directory" &&
-		args[0] != "verify-fence-drain") || flags.Parse(args[1:]) != nil || flags.NArg() != 0 {
-		return errors.New("usage: session-control-stale-target-retirement plan | snapshot-predecessors --table TABLE --region REGION | snapshot-fence-directory --table TABLE --cell-id cell0 --region REGION | verify-fence-drain --table TABLE --cell-id cell0 --region REGION | retire --table TABLE --target-id ID --region REGION | retire-predecessor --target-id ID")
+		args[0] != "verify-fence-drain" && args[0] != "snapshot-active-ready-predecessors" &&
+		args[0] != "latch-active-ready-predecessor" && args[0] != "verify-active-ready-predecessor-quiescence" &&
+		args[0] != "retire-active-ready-predecessor") || flags.Parse(args[1:]) != nil || flags.NArg() != 0 {
+		return errors.New("usage: session-control-stale-target-retirement plan | snapshot-predecessors --table TABLE --region REGION | snapshot-fence-directory --table TABLE --cell-id cell0 --region REGION | verify-fence-drain --table TABLE --cell-id cell0 --region REGION | retire --table TABLE --target-id ID --region REGION | retire-predecessor --target-id ID | snapshot-active-ready-predecessors | latch-active-ready-predecessor --target-id ID | verify-active-ready-predecessor-quiescence --target-id ID | retire-active-ready-predecessor --target-id ID")
 	}
 	directoryMode := args[0] == "snapshot-fence-directory" || args[0] == "verify-fence-drain"
 	predecessorMode := args[0] == "retire-predecessor"
-	if (!predecessorMode && (tableName != server.SandboxStaleTargetRetirementTable || region != server.SandboxStaleTargetRetirementRegion)) ||
+	activeReadySnapshotMode := args[0] == "snapshot-active-ready-predecessors"
+	activeReadyTargetMode := args[0] == "latch-active-ready-predecessor" ||
+		args[0] == "verify-active-ready-predecessor-quiescence" || args[0] == "retire-active-ready-predecessor"
+	fixedMode := predecessorMode || activeReadySnapshotMode || activeReadyTargetMode
+	if (!fixedMode && (tableName != server.SandboxStaleTargetRetirementTable || region != server.SandboxStaleTargetRetirementRegion)) ||
 		(predecessorMode && (tableName != "" || region != "" || cellID != "")) ||
-		((args[0] == "retire" || args[0] == "retire-predecessor") && targetID == "") ||
+		((activeReadySnapshotMode || activeReadyTargetMode) && (tableName != "" || region != "" || cellID != "")) ||
+		((args[0] == "retire" || args[0] == "retire-predecessor" || activeReadyTargetMode) && targetID == "") ||
 		((args[0] == "snapshot-predecessors" || directoryMode) && targetID != "") ||
+		(activeReadySnapshotMode && targetID != "") ||
 		(directoryMode && cellID != server.SandboxStaleTargetFenceDrainCellID) ||
-		(!directoryMode && !predecessorMode && cellID != "") {
+		(!directoryMode && !fixedMode && cellID != "") {
 		return errors.New("retirement table, region, or target ID is not the exact incident authority")
 	}
 	if predecessorMode {
@@ -195,11 +267,43 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 					selectedID, state, current, historical)
 			})
 	}
+	if activeReadyTargetMode {
+		return runJournaledActiveReady(ctx, targetID, out, readRecoveryParameter,
+			server.ReferencedSandboxActiveReadyJournalVersionForRecovery,
+			func(callCtx context.Context, selectedID string, state, currentMain, historicalMain,
+				currentReady, historicalReady server.SandboxRecoveryParameterSnapshot,
+			) (any, error) {
+				awsConfig, err := config.LoadDefaultConfig(callCtx, config.WithRegion(server.SandboxStaleTargetRetirementRegion))
+				if err != nil {
+					return nil, fmt.Errorf("load AWS configuration: %w", err)
+				}
+				client := dynamodb.NewFromConfig(awsConfig)
+				switch args[0] {
+				case "latch-active-ready-predecessor":
+					return server.LatchSandboxJournaledActiveReadyPredecessorForRecovery(callCtx, client, selectedID,
+						state, currentMain, historicalMain, currentReady, historicalReady)
+				case "verify-active-ready-predecessor-quiescence":
+					return server.VerifySandboxJournaledActiveReadyPredecessorQuiescenceForRecovery(callCtx, client,
+						selectedID, state, currentMain, historicalMain, currentReady, historicalReady)
+				default:
+					return server.RetireSandboxJournaledActiveReadyPredecessorForRecovery(callCtx, client, selectedID,
+						state, currentMain, historicalMain, currentReady, historicalReady)
+				}
+			})
+	}
 	awsConfig, err := config.LoadDefaultConfig(ctx, config.WithRegion(server.SandboxStaleTargetRetirementRegion))
 	if err != nil {
 		return fmt.Errorf("load AWS configuration: %w", err)
 	}
 	client := dynamodb.NewFromConfig(awsConfig)
+	if activeReadySnapshotMode {
+		plan, snapshotErr := server.SnapshotSandboxActiveReadyPredecessorsForRecovery(ctx, client,
+			server.SandboxStaleTargetRetirementTable)
+		if snapshotErr != nil {
+			return fmt.Errorf("snapshot exact sandbox ACTIVE/READY predecessors: %w", snapshotErr)
+		}
+		return emitJSON(out, plan)
+	}
 	if directoryMode {
 		var receipt *server.SandboxFenceDirectoryRecoveryReceipt
 		if args[0] == "snapshot-fence-directory" {

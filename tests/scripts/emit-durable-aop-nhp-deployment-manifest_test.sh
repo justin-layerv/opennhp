@@ -27,6 +27,12 @@ export LIVE_SERVER_SELECTOR=${LIVE_SOURCE}@${SERVER_DIGEST}
 export LIVE_AC_SELECTOR=${LIVE_SOURCE}@${AC_DIGEST}
 export FAKE_OWNER_ACTIONS=$WORK/owner-actions
 export FAKE_IAM_ACTIONS=$WORK/iam-actions
+export FAKE_AWS_ACTIONS=$WORK/aws-actions
+export FAKE_READ_COUNTS=$WORK/read-counts
+STATE_VERSION=31
+MAIN_JOURNAL_VERSION=19
+ACTIVE_READY_JOURNAL_VERSION=10
+export STATE_VERSION MAIN_JOURNAL_VERSION ACTIVE_READY_JOURNAL_VERSION
 (cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 \
   go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/incident-plan.json"
 [[ "$(printf '%s' "$(jq -cS . "$WORK/incident-plan.json")" | sha256sum | awk '{print $1}')" == \
@@ -48,14 +54,58 @@ case "$service/$operation" in
   ssm/get-parameter)
     name=$(opt --name "$@")
     query=$(opt --query "$@")
+    if [[ "$name" == */active-ready-predecessors* ]]; then
+      [[ $# == 9 && $1 == --name && $2 == "$name" && $3 == --with-decryption &&
+         $4 == --query && $5 == "$query" && $6 == --output && $7 == text &&
+         $8 == --region && $9 == us-east-2 ]] || exit 99
+      printf 'active-read\t%s\t%s\n' "$name" "$query" >>"$FAKE_AWS_ACTIONS"
+    else
+      [[ $# == 8 && $1 == --name && $2 == "$name" && $3 == --query && $4 == "$query" &&
+         $5 == --output && $6 == text && $7 == --region && $8 == us-east-2 ]] || exit 99
+    fi
     if [[ "$query" == Parameter.Version ]]; then
-      [[ "$name" == */stale-target-retirement ]] || { echo "unexpected version authority $name" >&2; exit 99; }
-      printf '1\n'
+      case "$name" in
+        */state) printf '%s\n' "$STATE_VERSION" ;;
+        */stale-target-retirement) printf '%s\n' "$MAIN_JOURNAL_VERSION" ;;
+        */active-ready-predecessors) printf '%s\n' "$ACTIVE_READY_JOURNAL_VERSION" ;;
+        *) echo "unexpected version authority $name" >&2; exit 99 ;;
+      esac
       exit 0
     fi
-    awk -F '\t' -v name="$name" '$1 == name {print substr($0,index($0,"\t")+1); found=1} END {exit !found}' "$FAKE_PARAMS" || {
+    value=$(awk -F '\t' -v name="$name" '$1 == name {print substr($0,index($0,"\t")+1); found=1} END {exit !found}' "$FAKE_PARAMS") || {
       echo ParameterNotFound >&2; exit 254;
     }
+    if [[ "${FAKE_DRIFT_PARAM:-}" == "$name" ]]; then
+      key=$(printf '%s' "$name" | sha256sum | awk '{print $1}')
+      count=0; [[ ! -f "$FAKE_READ_COUNTS/$key" ]] || count=$(cat "$FAKE_READ_COUNTS/$key")
+      count=$((count + 1)); printf '%s\n' "$count" >"$FAKE_READ_COUNTS/$key"
+      if [[ "$count" == 2 ]]; then
+        if [[ "$name" == */state ]]; then value=$(jq -cS '.phase="validated"' <<<"$value")
+        else value=$(jq -cS '.payload += "A"' <<<"$value")
+        fi
+      fi
+    fi
+    printf '%s\n' "$value"
+    ;;
+  ssm/describe-parameters)
+    [[ $# == 6 && $1 == --parameter-filters &&
+       $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors' &&
+       $3 == --output && $4 == json && $5 == --region && $6 == us-east-2 ]] || exit 99
+    printf 'active-metadata\n' >>"$FAKE_AWS_ACTIONS"
+    type=SecureString key=alias/aws/ssm tier=Standard data_type=text version=$ACTIVE_READY_JOURNAL_VERSION
+    case ${FAKE_ACTIVE_METADATA_MODE:-exact} in
+      exact) ;;
+      wrong_type) type=String ;;
+      wrong_key) key=alias/other ;;
+      wrong_tier) tier=Advanced ;;
+      wrong_data_type) data_type=aws:ec2:image ;;
+      wrong_version) version=$((ACTIVE_READY_JOURNAL_VERSION + 1)) ;;
+      missing) printf '{"Parameters":[]}\n'; exit 0 ;;
+      extra) jq -cn --arg version "$version" '{Parameters:[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]}'; exit 0 ;;
+      *) exit 98 ;;
+    esac
+    jq -cn --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
+      '{Parameters:[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:$type,KeyId:$key,Tier:$tier,DataType:$data,Version:($version|tonumber)}]}'
     ;;
   autoscaling/describe-instance-refreshes)
     [[ "${FAKE_REFRESH_FAILED:-}" != true ]] && printf 'Successful\n' || printf 'Failed\n'
@@ -187,6 +237,98 @@ fixture_fence_digest() {
   } | sha256sum | awk '{print $1}'
 }
 
+fixture_owner_digest() {
+  local owner=$1 field
+  {
+    for field in cell_id ac_id public_key lifecycle_version work_version task_count pending_count phase boot_id \
+      flush_generation target_version target_authority_version target_counted_active_slot activated_control_version \
+      ready_control_version target_created_at_ms target_prepared_at_ms target_updated_at_ms aak_enqueued_at_ms \
+      aak_transaction_id created_at_ms updated_at_ms retired_at_ms; do
+      printf '\0%s' "$(jq -r ".${field}" <<<"$owner")"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+
+fixture_target_session_pk() {
+  local fence=$1
+  printf 'v1\0%s\0%s\0%s\0%s\0%s' \
+    "$(jq -r .control_cell_id <<<"$fence")" "$(jq -r .ac_id <<<"$fence")" \
+    "$(jq -r .public_key <<<"$fence")" "$(jq -r .boot_id <<<"$fence")" \
+    "$(jq -r .flush_generation <<<"$fence")" | sha256sum | awk '{print "TARGET#" $1}'
+}
+
+fixture_active_ready_plan() {
+  local plan index fence owner
+  plan=$(jq -cn '
+    def fence($i): {ac_id:"layerv-ac-tf",public_key:("ready-key-"+($i|tostring)),boot_id:("ready-boot-"+($i|tostring)),
+      flush_generation:"4",version:"46",authority_version:"7",counted_active_slot:true,control_cell_id:"cell0",
+      activated_control_version:"250",ready_control_version:"250",aak_enqueued_at_ms:"1787550000000",
+      aak_transaction_id:"1",created_at_ms:"1787540000000",prepared_at_ms:"1787545000000"};
+    def owner($i): {cell_id:"cell0",ac_id:"layerv-ac-tf",public_key:("ready-key-"+($i|tostring)),
+      lifecycle_version:"9",work_version:"7",task_count:"0",pending_count:"0",phase:"READY",
+      boot_id:("ready-boot-"+($i|tostring)),flush_generation:"4",target_version:"46",target_authority_version:"7",
+      target_counted_active_slot:true,activated_control_version:"250",ready_control_version:"250",
+      target_created_at_ms:"1787540000000",target_prepared_at_ms:"1787545000000",target_updated_at_ms:"1787550000000",
+      aak_enqueued_at_ms:"1787550000000",aak_transaction_id:"1",created_at_ms:"1787540000000",
+      updated_at_ms:"1787550000000",retired_at_ms:"0"};
+    {schema:"layerv.durable-aop-active-ready-predecessor-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",
+     region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",
+     targets:[range(1;4) | {id:("active-ready-predecessor-"+(.|tostring)),fence:(fence(.)),
+       fence_sha256:"",owner:(owner(.)),owner_sha256:""}]}')
+  for index in 0 1 2; do
+    fence=$(jq -c --argjson index "$index" '.targets[$index].fence' <<<"$plan")
+    owner=$(jq -c --argjson index "$index" '.targets[$index].owner' <<<"$plan")
+    plan=$(jq -c --argjson index "$index" --arg fence_sha "$(fixture_fence_digest "$fence")" \
+      --arg owner_sha "$(fixture_owner_digest "$owner")" \
+      '.targets[$index].fence_sha256=$fence_sha | .targets[$index].owner_sha256=$owner_sha' <<<"$plan")
+  done
+  jq -cS . <<<"$plan"
+}
+
+fixture_active_ready_complete() {
+  local plan=$1 directory_sha=$2 targets='[]' index planned id fence owner decommission latch quiescence receipt row
+  local plan_sha quiescence_sha
+  plan_sha=$(printf '%s' "$plan" | sha256sum | awk '{print $1}')
+  for index in 0 1 2; do
+    planned=$(jq -c --argjson index "$index" '.targets[$index]' <<<"$plan")
+    id=$(jq -r .id <<<"$planned")
+    fence=$(jq -cS .fence <<<"$planned")
+    owner=$(jq -cS .owner <<<"$planned")
+    decommission=$(jq -cS '.phase="DECOMMISSIONING" | .lifecycle_version=((.lifecycle_version|tonumber)+1|tostring)' <<<"$owner")
+    latch=$(jq -cn --arg id "$id" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" \
+      --argjson owner "$decommission" --arg owner_sha "$(fixture_owner_digest "$decommission")" \
+      --arg directory "$directory_sha" \
+      '{schema:"layerv.durable-aop-active-ready-latch-receipt.v1",target_id:$id,
+       fence_sha256:$fence,owner:$owner,owner_sha256:$owner_sha,directory_sha256:$directory}')
+    quiescence=$(jq -cn --arg id "$id" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" \
+      --arg owner_sha "$(fixture_owner_digest "$decommission")" --arg session "$(fixture_target_session_pk "$fence")" \
+      --arg directory "$directory_sha" \
+      '{schema:"layerv.durable-aop-active-ready-quiescence-receipt.v1",target_id:$id,
+       fence_sha256:$fence,owner_sha256:$owner_sha,owner_task_count:"0",owner_pending_count:"0",
+       target_session_pk:$session,target_session_count:"0",directory_sha256:$directory}')
+    receipt=$(jq -cn --arg id "$id" --arg key "$(jq -r .public_key <<<"$fence")" \
+      --arg version "$(( $(jq -r .version <<<"$fence") + 1 ))" \
+      --arg authority "$(( $(jq -r .authority_version <<<"$fence") + 1 ))" \
+      '{schema:"layerv.durable-aop-stale-target-retirement-receipt.v1",target_id:$id,
+       public_key:$key,version:$version,authority_version:$authority,counted_active_slot:false,
+       retired_at_ms:"1787560000000",retired_target_sha256:("d"*64)}')
+    row=$(jq -cn --arg id "$id" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" \
+      --argjson latch "$latch" --argjson quiescence "$quiescence" --argjson receipt "$receipt" \
+      '{id:$id,fence_sha256:$fence,status:"retired",latch_receipt:$latch,
+       quiescence_receipt:$quiescence,receipt:$receipt}')
+    targets=$(jq -c --argjson row "$row" '. + [$row]' <<<"$targets")
+  done
+  quiescence_sha=$(jq -cS '[.[] | .status="quiescent" | del(.receipt)]' <<<"$targets" | sha256sum | awk '{print $1}')
+  jq -cS -n --arg recovery "$RECOVERY" --arg plan_sha "$plan_sha" --arg quiescence_sha "$quiescence_sha" \
+    --arg directory "$directory_sha" --argjson plan "$plan" --argjson targets "$targets" '
+    {schema:"layerv.durable-aop-active-ready-predecessor-journal.v1",status:"complete",
+     source_state_version:30,source_state_sha256:"4268c108fe2685c5a475d05f2ec98d5d58c54618dc3934289b97bc0da855dca6",
+     source_main_journal_parameter:"/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement",
+     source_main_journal_version:8,source_main_journal_sha256:"49a0da6ea26c551ed99f51ad1e1a4608aa89ab7d1f97a40f22c2c12ce99b1a5c",
+     orchestrator_sha:$recovery,fence_drain_sha256:$directory,plan:$plan,plan_sha256:$plan_sha,
+     quiescence_sha256:$quiescence_sha,targets:$targets}'
+}
+
 fixture_directory_receipt() {
   local count=$1 version=$2 updated=$3 blocked=${4:-false} overflow=${5:-0}
   local event=${6:-} prepared=${7:-0} selected=${8:-0} digest
@@ -216,7 +358,15 @@ encode_fixture_journal() {
   python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-stale-target-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
 }
 
+encode_active_ready_journal() {
+  python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-active-ready-predecessor-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
+}
+
 decode_fixture_journal() {
+  python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
+
+decode_active_ready_journal() {
   python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
 }
 
@@ -227,20 +377,48 @@ mutate_fixture_journal() {
   envelope=$(printf '%s' "$journal" | encode_fixture_journal)
   digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
   set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
-  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:1 "$envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${MAIN_JOURNAL_VERSION}" "$envelope"
   state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state \
     "$(jq -c --arg digest "$digest" '.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")"
 }
 
+mutate_active_ready_journal() {
+  local filter=$1 envelope journal
+  envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  journal=$(printf '%s' "$envelope" | decode_active_ready_journal | jq -cS "$filter")
+  envelope=$(printf '%s' "$journal" | encode_active_ready_journal)
+  install_active_ready_envelope "$envelope"
+}
+
+install_active_ready_envelope() {
+  local envelope=$1 digest main main_envelope main_digest state
+  digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors "$envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:${ACTIVE_READY_JOURNAL_VERSION}" "$envelope"
+  main_envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  main=$(printf '%s' "$main_envelope" | decode_fixture_journal | \
+    jq -cS --arg digest "$digest" '.runtime.ready_predecessor_ref.sha256=$digest')
+  main_envelope=$(printf '%s' "$main" | encode_fixture_journal)
+  main_digest=$(printf '%s' "$main_envelope" | sha256sum | awk '{print $1}')
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$main_envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${MAIN_JOURNAL_VERSION}" "$main_envelope"
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/state \
+    "$(jq -c --arg digest "$main_digest" '.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")"
+}
+
 seed() {
   : >"$FAKE_PARAMS"
+  rm -rf "$FAKE_READ_COUNTS"
+  mkdir -p "$FAKE_READ_COUNTS"
   local server_provenance="v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}"
   local ac_provenance="v1|${REPAIR}|layerv/nhp-ac|${AC_DIGEST}"
   local live_server_provenance="v1|${LIVE_SOURCE}|layerv/nhp-server|${SERVER_DIGEST}"
   local live_ac_provenance="v1|${LIVE_SOURCE}|layerv/nhp-ac|${AC_DIGEST}"
-  local lock original_state state journal envelope journal_digest incident_plan predecessor_fence predecessor_plan predecessor_plan_digest
-  local incident_ledger predecessor_ledger fence_start fence_drain preferences c0_intent c1_intent ac_intent
+  local lock original_state state journal envelope journal_digest incident_plan incident_ledger fence_start fence_drain
+  local active_plan active_journal active_envelope active_digest active_plan_digest active_quiescence_digest ac_plan_digest
+  local preferences c0_intent c1_intent ac_intent
   local iam_intent iam_receipt
   original_state=$(jq -cn --arg image "$ORIGINAL" --arg owner "$ORIGINAL_OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
@@ -252,25 +430,21 @@ seed() {
   [[ "$(printf '%s' "$(jq -cS . <<<"$original_state")" | sha256sum | awk '{print $1}')" == "$ORIGINAL_STATE_DIGEST" ]]
   [[ "$(printf '%s' "$(jq -cS . <<<"$lock")" | sha256sum | awk '{print $1}')" == "$ORIGINAL_LOCK_DIGEST" ]]
   incident_plan=$(jq -cS . "$WORK/incident-plan.json")
-  predecessor_fence=$(jq -cn '{ac_id:"layerv-ac-tf",public_key:"current-predecessor",boot_id:"boot-current",
-    flush_generation:"3",version:"49",authority_version:"5",counted_active_slot:true,control_cell_id:"cell0",
-    activated_control_version:"0",ready_control_version:"0",aak_enqueued_at_ms:"0",aak_transaction_id:"0",
-    created_at_ms:"1787529555693",prepared_at_ms:"1787533540595"}')
-  predecessor_plan=$(jq -cn --arg digest "$(fixture_fence_digest "$predecessor_fence")" \
-    --argjson fence "$predecessor_fence" '
-    {schema:"layerv.durable-aop-predecessor-target-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",
-     region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",
-     targets:[{id:"predecessor-1",fence:$fence,fence_sha256:$digest}]}')
-  predecessor_plan=$(jq -cS . <<<"$predecessor_plan")
-  predecessor_plan_digest=$(printf '%s' "$predecessor_plan" | sha256sum | awk '{print $1}')
   incident_ledger=$(fixture_retired_ledger "$incident_plan")
-  predecessor_ledger=$(fixture_retired_ledger "$predecessor_plan")
   fence_start=$(fixture_directory_receipt "${FAKE_FENCE_START_COUNT:-82}" 83 1787553983425 \
     "${FAKE_FENCE_START_BLOCKED:-false}" "${FAKE_FENCE_START_OVERFLOW:-0}" \
     "${FAKE_FENCE_START_EVENT:-}" "${FAKE_FENCE_START_PREPARED:-0}" "${FAKE_FENCE_START_SELECTED:-0}")
   # The later version pins that zero-target closes may arrive after the exact
   # starting snapshot; terminal publication still requires stable zero.
   fence_drain=$(fixture_directory_receipt 0 106 1787555000000)
+  active_plan=$(fixture_active_ready_plan)
+  active_journal=$(fixture_active_ready_complete "$active_plan" "$(jq -r .directory_sha256 <<<"$fence_drain")")
+  active_envelope=$(printf '%s' "$active_journal" | encode_active_ready_journal)
+  active_digest=$(printf '%s' "$active_envelope" | sha256sum | awk '{print $1}')
+  active_plan_digest=$(jq -r .plan_sha256 <<<"$active_journal")
+  active_quiescence_digest=$(jq -r .quiescence_sha256 <<<"$active_journal")
+  ac_plan_digest=$(printf 'v1\n%s\n%s\n' "$active_plan_digest" "$active_quiescence_digest" | \
+    sha256sum | awk '{print $1}')
   preferences='{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"SkipMatching":false}'
   c0_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     cell0 layerv-nhp-sandbox-server "$LIVE_SOURCE" 32682520698 1 "$live_server_provenance" "$RECOVERY" \
@@ -280,7 +454,7 @@ seed() {
     "$preferences" prior-cell1 - | sha256sum | awk '{print $1}')
   ac_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     ac layerv-nhp-sandbox-ac-green "$LIVE_SOURCE" 32682520698 1 "$live_ac_provenance" "$RECOVERY" \
-    "$preferences" prior-ac "$predecessor_plan_digest" | sha256sum | awk '{print $1}')
+    "$preferences" prior-ac "$ac_plan_digest" | sha256sum | awk '{print $1}')
   iam_intent=$(jq -cn '
     {schema:"layerv.durable-aop-session-control-delete-iam-intent.v1",
      policy_arn:"arn:aws:iam::767397897469:policy/layerv-nhp-sandbox-dynamodb-read",
@@ -308,8 +482,9 @@ seed() {
     --arg server "$server_provenance" --arg ac "$ac_provenance" \
     --arg live_server "$live_server_provenance" --arg live_ac "$live_ac_provenance" \
     --argjson incident_plan "$incident_plan" --argjson incident_ledger "$incident_ledger" \
-    --argjson predecessor_plan "$predecessor_plan" --arg predecessor_digest "$predecessor_plan_digest" \
-    --argjson predecessor_ledger "$predecessor_ledger" --argjson fence_start "$fence_start" \
+    --arg active_parameter /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors \
+    --argjson active_version "$ACTIVE_READY_JOURNAL_VERSION" --arg active_digest "$active_digest" \
+    --argjson fence_start "$fence_start" \
     --argjson fence_drain "$fence_drain" --argjson preferences "$preferences" \
     --arg c0_intent "$c0_intent" --arg c1_intent "$c1_intent" --arg ac_intent "$ac_intent" \
     --argjson iam_intent "$iam_intent" --argjson iam_receipt "$iam_receipt" \
@@ -343,19 +518,21 @@ seed() {
           server_refresh_orchestrator_sha:$recovery,
           session_control_delete_iam:{status:"ready",intent:$iam_intent,receipt:$iam_receipt},
           fence_start:$fence_start,fence_drain:$fence_drain,
-          predecessor_plan:$predecessor_plan,predecessor_plan_sha256:$predecessor_digest,
-          predecessor_targets:$predecessor_ledger}}}}')
+          predecessor_plan:null,predecessor_plan_sha256:"",predecessor_targets:[],
+          ready_predecessor_ref:{parameter:$active_parameter,version:$active_version,sha256:$active_digest}}}}}')
   journal=$(jq -cS .repair.stale_target_retirement <<<"$state")
   envelope=$(printf '%s' "$journal" | encode_fixture_journal)
   journal_digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
   state=$(jq -c --arg parameter /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement \
-    --arg digest "$journal_digest" '
+    --argjson version "$MAIN_JOURNAL_VERSION" --arg digest "$journal_digest" '
       del(.repair.stale_target_retirement) |
-      .repair.stale_target_retirement_ref={parameter:$parameter,version:1,sha256:$digest}
+      .repair.stale_target_retirement_ref={parameter:$parameter,version:$version,sha256:$digest}
     ' <<<"$state")
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
-  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:1 "$envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${MAIN_JOURNAL_VERSION}" "$envelope"
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors "$active_envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:${ACTIVE_READY_JOURNAL_VERSION}" "$active_envelope"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock "$lock"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state:7 "$original_state"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock:2 "$lock"
@@ -389,9 +566,14 @@ invoke() {
 seed
 : >"$FAKE_OWNER_ACTIONS"
 : >"$FAKE_IAM_ACTIONS"
+: >"$FAKE_AWS_ACTIONS"
 invoke >/dev/null
 [[ "$(cat "$FAKE_OWNER_ACTIONS")" == verify ]]
 [[ "$(cat "$FAKE_IAM_ACTIONS")" == verify ]]
+[[ "$(grep -c '^active-metadata$' "$FAKE_AWS_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:10\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors\tParameter.Version$' "$FAKE_AWS_ACTIONS")" == 2 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 2 ]]
 jq -e --arg repair "$LIVE_SOURCE" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
   (keys | sort) == ["build","deployments","environment","images","producer","profile","recovery_orchestrator_sha","repair_source_sha","repository","schema"] and
   .schema == "layerv.durable-aop-nhp-deployment.v1" and .repair_source_sha == $repair and
@@ -451,14 +633,18 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
   iam_leading_key_drift iam_default_drift iam_version_drift iam_digest_drift iam_live_verify_failed \
   journal_missing journal_status journal_source journal_build journal_manifest journal_source_digest \
   incident_plan_digest incident_fence_digest incident_receipt fence_start_malformed fence_drain_count fence_drain_digest \
-  component_intent predecessor_plan_digest predecessor_receipt \
+  component_intent predecessor_plan_digest predecessor_receipt active_ref_missing active_ref_parameter \
+  active_ref_version active_ref_digest active_status active_plan_digest active_fence_digest active_owner_digest \
+  active_latch_receipt active_quiescence_receipt active_retirement_receipt active_target_order active_extra \
+  active_oversize active_metadata_type active_metadata_key active_metadata_tier active_metadata_data \
+  active_metadata_version active_metadata_missing active_metadata_extra state_torn main_torn active_torn \
   state_validated historical_state_mutated embedded_lock_mutated ledger_state_digest_mutated \
   ledger_lock_digest_mutated; do
   seed
   : >"$FAKE_OWNER_ACTIONS"
   : >"$FAKE_IAM_ACTIONS"
   unset FAKE_RECOVERY_CONCLUSION FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY \
-    FAKE_OWNER_VERIFY_FAIL FAKE_IAM_VERIFY_FAIL
+    FAKE_OWNER_VERIFY_FAIL FAKE_IAM_VERIFY_FAIL FAKE_ACTIVE_METADATA_MODE FAKE_DRIFT_PARAM
   export AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
   case "$mode" in
     recovery_failure) export FAKE_RECOVERY_CONCLUSION=failure ;;
@@ -588,6 +774,60 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
     predecessor_receipt)
       mutate_fixture_journal '.runtime.predecessor_targets[0].receipt.authority_version="99"'
       ;;
+    active_ref_missing)
+      mutate_fixture_journal 'del(.runtime.ready_predecessor_ref)'
+      ;;
+    active_ref_parameter)
+      mutate_fixture_journal '.runtime.ready_predecessor_ref.parameter="/sandbox/nhp/cutovers/durable-aop-v1/other"'
+      ;;
+    active_ref_version)
+      mutate_fixture_journal '.runtime.ready_predecessor_ref.version += 1'
+      ;;
+    active_ref_digest)
+      mutate_fixture_journal '.runtime.ready_predecessor_ref.sha256=("9"*64)'
+      ;;
+    active_status)
+      mutate_active_ready_journal '.status="retiring"'
+      ;;
+    active_plan_digest)
+      mutate_active_ready_journal '.plan_sha256=("9"*64)'
+      ;;
+    active_fence_digest)
+      mutate_active_ready_journal '.plan.targets[0].fence_sha256=("9"*64)'
+      ;;
+    active_owner_digest)
+      mutate_active_ready_journal '.plan.targets[0].owner_sha256=("9"*64)'
+      ;;
+    active_latch_receipt)
+      mutate_active_ready_journal '.targets[0].latch_receipt.owner_sha256=("9"*64)'
+      ;;
+    active_quiescence_receipt)
+      mutate_active_ready_journal '.targets[1].quiescence_receipt.target_session_count="1"'
+      ;;
+    active_retirement_receipt)
+      mutate_active_ready_journal '.targets[2].receipt.authority_version="99"'
+      ;;
+    active_target_order)
+      mutate_active_ready_journal '.targets |= reverse'
+      ;;
+    active_extra)
+      mutate_active_ready_journal '.unexpected=true'
+      ;;
+    active_oversize)
+      payload=$(printf 'A%.0s' {1..4100})
+      install_active_ready_envelope "$(jq -cS -n --arg payload "$payload" \
+        '{encoding:"gzip-base64",payload:$payload,schema:"layerv.durable-aop-active-ready-predecessor-journal-envelope.v1"}')"
+      ;;
+    active_metadata_type) export FAKE_ACTIVE_METADATA_MODE=wrong_type ;;
+    active_metadata_key) export FAKE_ACTIVE_METADATA_MODE=wrong_key ;;
+    active_metadata_tier) export FAKE_ACTIVE_METADATA_MODE=wrong_tier ;;
+    active_metadata_data) export FAKE_ACTIVE_METADATA_MODE=wrong_data_type ;;
+    active_metadata_version) export FAKE_ACTIVE_METADATA_MODE=wrong_version ;;
+    active_metadata_missing) export FAKE_ACTIVE_METADATA_MODE=missing ;;
+    active_metadata_extra) export FAKE_ACTIVE_METADATA_MODE=extra ;;
+    state_torn) export FAKE_DRIFT_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state ;;
+    main_torn) export FAKE_DRIFT_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement ;;
+    active_torn) export FAKE_DRIFT_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors ;;
     historical_state_mutated)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state:7" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
       set_param /sandbox/nhp/cutovers/durable-aop-v1/state:7 "$(jq -c '.cell0.new_asg="mutated"' <<<"$value")"

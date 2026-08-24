@@ -30,18 +30,128 @@ func TestRunPrintsOnlyExactIncidentPlanWithoutAWS(t *testing.T) {
 
 func TestRunRejectsMalformedOrCallerSelectedRetirementBeforeAWS(t *testing.T) {
 	for name, args := range map[string][]string{
-		"missing command":   nil,
-		"arbitrary command": {"delete"},
-		"wrong table":       {"retire", "--table", "other", "--target-id", "stale-ac-target-1", "--region", server.SandboxStaleTargetRetirementRegion},
-		"wrong region":      {"retire", "--table", server.SandboxStaleTargetRetirementTable, "--target-id", "stale-ac-target-1", "--region", "us-west-1"},
-		"extra input":       {"retire", "--table", server.SandboxStaleTargetRetirementTable, "--target-id", "stale-ac-target-1", "--region", server.SandboxStaleTargetRetirementRegion, "extra"},
-		"caller fence":      {"retire-predecessor", "--target-id", "predecessor-1", "--fence-json", `{}`},
-		"caller table":      {"retire-predecessor", "--target-id", "predecessor-1", "--table", server.SandboxStaleTargetRetirementTable},
-		"caller region":     {"retire-predecessor", "--target-id", "predecessor-1", "--region", server.SandboxStaleTargetRetirementRegion},
+		"missing command":       nil,
+		"arbitrary command":     {"delete"},
+		"wrong table":           {"retire", "--table", "other", "--target-id", "stale-ac-target-1", "--region", server.SandboxStaleTargetRetirementRegion},
+		"wrong region":          {"retire", "--table", server.SandboxStaleTargetRetirementTable, "--target-id", "stale-ac-target-1", "--region", "us-west-1"},
+		"extra input":           {"retire", "--table", server.SandboxStaleTargetRetirementTable, "--target-id", "stale-ac-target-1", "--region", server.SandboxStaleTargetRetirementRegion, "extra"},
+		"caller fence":          {"retire-predecessor", "--target-id", "predecessor-1", "--fence-json", `{}`},
+		"caller table":          {"retire-predecessor", "--target-id", "predecessor-1", "--table", server.SandboxStaleTargetRetirementTable},
+		"caller region":         {"retire-predecessor", "--target-id", "predecessor-1", "--region", server.SandboxStaleTargetRetirementRegion},
+		"ready caller fence":    {"latch-active-ready-predecessor", "--target-id", "active-ready-predecessor-1", "--fence-json", `{}`},
+		"ready caller table":    {"retire-active-ready-predecessor", "--target-id", "active-ready-predecessor-1", "--table", server.SandboxStaleTargetRetirementTable},
+		"ready caller region":   {"verify-active-ready-predecessor-quiescence", "--target-id", "active-ready-predecessor-1", "--region", server.SandboxStaleTargetRetirementRegion},
+		"ready snapshot target": {"snapshot-active-ready-predecessors", "--target-id", "active-ready-predecessor-1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := run(context.Background(), args, &bytes.Buffer{}); err == nil {
 				t.Fatal("malformed retirement command was accepted")
+			}
+		})
+	}
+}
+
+func TestRunJournaledActiveReadyBracketsAllThreeAuthoritiesBeforeOperation(t *testing.T) {
+	state := server.SandboxRecoveryParameterSnapshot{Value: `{"repair":{"stale_target_retirement_ref":{"parameter":"/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":8}}}`, Version: 30}
+	mainCurrent := server.SandboxRecoveryParameterSnapshot{Value: `{"main":"current"}`, Version: 9}
+	mainHistorical := server.SandboxRecoveryParameterSnapshot{Value: `{"main":"historical"}`, Version: 8}
+	readyCurrent := server.SandboxRecoveryParameterSnapshot{Value: `{"ready":"current"}`, Version: 12}
+	readyHistorical := server.SandboxRecoveryParameterSnapshot{Value: `{"ready":"historical"}`, Version: 11}
+	expectedReads := []string{
+		server.SandboxStaleTargetRecoveryStateParameter,
+		server.SandboxStaleTargetRecoveryJournalParameter,
+		server.SandboxStaleTargetRecoveryJournalParameter + ":8",
+		server.SandboxActiveReadyRecoveryJournalParameter,
+		server.SandboxActiveReadyRecoveryJournalParameter + ":11",
+		server.SandboxStaleTargetRecoveryStateParameter,
+		server.SandboxStaleTargetRecoveryJournalParameter,
+		server.SandboxActiveReadyRecoveryJournalParameter,
+	}
+	reads := 0
+	reader := func(_ context.Context, name string) (server.SandboxRecoveryParameterSnapshot, error) {
+		if reads >= len(expectedReads) || name != expectedReads[reads] {
+			t.Fatalf("parameter read %d = %q", reads, name)
+		}
+		reads++
+		switch name {
+		case server.SandboxStaleTargetRecoveryStateParameter:
+			return state, nil
+		case server.SandboxStaleTargetRecoveryJournalParameter:
+			return mainCurrent, nil
+		case server.SandboxStaleTargetRecoveryJournalParameter + ":8":
+			return mainHistorical, nil
+		case server.SandboxActiveReadyRecoveryJournalParameter:
+			return readyCurrent, nil
+		default:
+			return readyHistorical, nil
+		}
+	}
+	selector := func(gotState, gotCurrent, gotHistorical server.SandboxRecoveryParameterSnapshot) (int64, error) {
+		if gotState != state || gotCurrent != mainCurrent || gotHistorical != mainHistorical {
+			t.Fatalf("version selector authority = %#v %#v %#v", gotState, gotCurrent, gotHistorical)
+		}
+		return 11, nil
+	}
+	operations := 0
+	operation := func(_ context.Context, targetID string, gotState, gotMainCurrent, gotMainHistorical,
+		gotReadyCurrent, gotReadyHistorical server.SandboxRecoveryParameterSnapshot,
+	) (any, error) {
+		if targetID != "active-ready-predecessor-1" || gotState != state || gotMainCurrent != mainCurrent ||
+			gotMainHistorical != mainHistorical || gotReadyCurrent != readyCurrent || gotReadyHistorical != readyHistorical {
+			t.Fatalf("ACTIVE/READY operation authority = %q %#v %#v %#v %#v %#v", targetID, gotState,
+				gotMainCurrent, gotMainHistorical, gotReadyCurrent, gotReadyHistorical)
+		}
+		operations++
+		return map[string]string{"status": "exact"}, nil
+	}
+	var output bytes.Buffer
+	if err := runJournaledActiveReady(context.Background(), "active-ready-predecessor-1", &output,
+		reader, selector, operation); err != nil {
+		t.Fatal(err)
+	}
+	if reads != len(expectedReads) || operations != 1 || !bytes.Contains(output.Bytes(), []byte(`"status":"exact"`)) {
+		t.Fatalf("reads=%d operations=%d output=%s", reads, operations, output.String())
+	}
+}
+
+func TestRunJournaledActiveReadyRejectsEveryBracketDriftBeforeOperation(t *testing.T) {
+	base := map[string]server.SandboxRecoveryParameterSnapshot{
+		server.SandboxStaleTargetRecoveryStateParameter:           {Value: `{"repair":{"stale_target_retirement_ref":{"parameter":"/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":8}}}`, Version: 30},
+		server.SandboxStaleTargetRecoveryJournalParameter:         {Value: `{"main":true}`, Version: 8},
+		server.SandboxActiveReadyRecoveryJournalParameter:         {Value: `{"ready":true}`, Version: 11},
+		server.SandboxStaleTargetRecoveryJournalParameter + ":8":  {Value: `{"main":true}`, Version: 8},
+		server.SandboxActiveReadyRecoveryJournalParameter + ":11": {Value: `{"ready":true}`, Version: 11},
+	}
+	for name, driftRead := range map[string]int{"state": 5, "main journal": 6, "ACTIVE/READY journal": 7} {
+		t.Run(name, func(t *testing.T) {
+			reads := 0
+			reader := func(_ context.Context, parameter string) (server.SandboxRecoveryParameterSnapshot, error) {
+				value, ok := base[parameter]
+				if !ok {
+					return value, fmt.Errorf("unexpected parameter %s", parameter)
+				}
+				if reads == driftRead {
+					value.Version++
+				}
+				reads++
+				return value, nil
+			}
+			operations := 0
+			err := runJournaledActiveReady(context.Background(), "active-ready-predecessor-1", &bytes.Buffer{},
+				reader, func(server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot,
+					server.SandboxRecoveryParameterSnapshot,
+				) (int64, error) {
+					return 11, nil
+				},
+				func(context.Context, string, server.SandboxRecoveryParameterSnapshot,
+					server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot,
+					server.SandboxRecoveryParameterSnapshot, server.SandboxRecoveryParameterSnapshot,
+				) (any, error) {
+					operations++
+					return nil, nil
+				})
+			if err == nil || operations != 0 {
+				t.Fatalf("%s bracket drift = %v; operations=%d", name, err, operations)
 			}
 		})
 	}

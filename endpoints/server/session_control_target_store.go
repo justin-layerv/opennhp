@@ -1820,6 +1820,21 @@ func (s *dynamoSessionControlStore) CancelTargetPreparation(ctx context.Context,
 // interface. Permanent key retirement requires a separately authenticated and
 // audited operator path; ordinary AOL/runtime code must not acquire that power.
 func (s *dynamoSessionControlStore) retireTarget(ctx context.Context, fence sessionControlTargetFence) (*sessionControlTargetAuthority, error) {
+	return s.retireTargetForOwnerPhase(ctx, fence, "", nil)
+}
+
+// retireDecommissioningTarget is narrower than retireTarget. The recovery can
+// use it only after its OWNER latch has made new admission impossible and an
+// exact zero-fence DIRECTORY receipt is still current.
+func (s *dynamoSessionControlStore) retireDecommissioningTarget(ctx context.Context, fence sessionControlTargetFence,
+	directory sessionControlFenceDirectory,
+) (*sessionControlTargetAuthority, error) {
+	return s.retireTargetForOwnerPhase(ctx, fence, sessionControlOwnerDecommissioning, &directory)
+}
+
+func (s *dynamoSessionControlStore) retireTargetForOwnerPhase(ctx context.Context, fence sessionControlTargetFence,
+	requiredOwnerPhase sessionControlOwnerPhase, requiredDirectory *sessionControlFenceDirectory,
+) (*sessionControlTargetAuthority, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -1852,6 +1867,9 @@ func (s *dynamoSessionControlStore) retireTarget(ctx context.Context, fence sess
 		expectedOwnerPhase = sessionControlOwnerReady
 	} else if current.State == sessionControlTargetActive {
 		expectedOwnerPhase = sessionControlOwnerActiveUnready
+	}
+	if requiredOwnerPhase != "" {
+		expectedOwnerPhase = requiredOwnerPhase
 	}
 	if !currentOwner.exactTarget(*current, expectedOwnerPhase) {
 		return nil, errSessionControlOwnerCorrupt
@@ -1965,10 +1983,29 @@ func (s *dynamoSessionControlStore) retireTarget(ctx context.Context, fence sess
 			ExpressionAttributeValues: authorityValues,
 		}
 	}
+	transactItems := []types.TransactWriteItem{targetWrite, authorityWrite, ownerWrite}
+	if requiredDirectory != nil {
+		if requiredDirectory.CellID != fence.ControlCellID || requiredDirectory.Version == 0 ||
+			requiredDirectory.ActiveFenceCount != 0 || requiredDirectory.AdmissionBlocked ||
+			requiredDirectory.OverflowCloseCount != 0 || requiredDirectory.OverflowLeaderEventID != "" ||
+			requiredDirectory.OverflowLeaderPreparedDirectoryVersion != 0 ||
+			requiredDirectory.OverflowLeaderSelectedDirectoryVersion != 0 ||
+			validateSessionControlFenceDirectory(*requiredDirectory) != nil {
+			return nil, errSessionControlFenceConflict
+		}
+		values := sessionControlFenceDirectoryConditionValues(*requiredDirectory)
+		delete(values, ":next_version")
+		transactItems = append(transactItems, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: aws.String(s.tableName), Key: sessionControlFenceDirectoryKey(requiredDirectory.CellID),
+			ConditionExpression:       aws.String(sessionControlFenceDirectoryCondition()),
+			ExpressionAttributeNames:  map[string]string{"#version": "version", "#ttl": "ttl"},
+			ExpressionAttributeValues: values,
+		}})
+	}
 	opCtx, cancel := context.WithTimeout(ctx, s.timeout())
 	_, err = s.client.TransactWriteItems(opCtx, &dynamodb.TransactWriteItemsInput{
 		ClientRequestToken: sessionControlOwnerTransitionToken("retire", currentOwner, retiredOwner),
-		TransactItems:      []types.TransactWriteItem{targetWrite, authorityWrite, ownerWrite},
+		TransactItems:      transactItems,
 	})
 	cancel()
 	if err != nil {

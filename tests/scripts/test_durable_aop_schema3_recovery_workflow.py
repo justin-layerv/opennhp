@@ -152,6 +152,44 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertIn('if [[ -z "$LIFECYCLE_RUN_ID$LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]', reject)
         self.assertEqual(reject.count('=~ ^[1-9][0-9]*$'), 6)
 
+    def test_active_ready_subjournal_has_no_caller_parameter_or_kms_authority(self):
+        workflow = WORKFLOW.read_text()
+        script = SCRIPT.read_text()
+        self.assertIn(
+            "ACTIVE_READY_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",
+            script,
+        )
+        self.assertIn("ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm", script)
+        self.assertNotIn("CUTOVER_ACTIVE_READY_JOURNAL_PARAM", workflow + script)
+        self.assertNotIn("CUTOVER_ACTIVE_READY_JOURNAL_KMS_KEY", workflow + script)
+        self.assertEqual(
+            script.count(
+                'aws ssm get-parameter --name "$1" --with-decryption '
+                '--query Parameter.Value --output text --region "$AWS_REGION"'
+            ),
+            1,
+        )
+        self.assertEqual(
+            script.count(
+                'aws ssm get-parameter --name "$1" --with-decryption '
+                '--query Parameter.Version --output text --region "$AWS_REGION"'
+            ),
+            1,
+        )
+        self.assertEqual(
+            script.count('aws ssm put-parameter --name "$ACTIVE_READY_JOURNAL_PARAM"'),
+            2,
+        )
+        self.assertEqual(script.count('--type SecureString \\\n        --key-id "$ACTIVE_READY_JOURNAL_KMS_KEY"'), 2)
+        self.assertIn('--no-overwrite --region "$AWS_REGION"', script)
+        self.assertIn('--overwrite --region "$AWS_REGION"', script)
+        self.assertIn("Tier:Tier,DataType:DataType,Version:Version", script)
+        self.assertIn('[[ ${#desired} -le 4096 ]]', script)
+        self.assertNotRegex(
+            workflow,
+            re.compile(r"(?m)^      (?:active_ready_.*|kms_.*):$"),
+        )
+
     def test_script_orders_servers_before_ac_and_terminal_receipts_before_floor(self):
         text = SCRIPT.read_text()
         cell0 = text.index('write_state cell0_refreshed')
@@ -178,13 +216,18 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         runtime_cell1 = text.index("advance_runtime_component_refresh cell1", runtime_flow)
         fence_drain = text.index("record_fence_drain", runtime_cell1)
         incident_retirement = text.index("advance_stale_target_retirement", fence_drain)
-        ac_intent = text.index("initialize_ac_runtime_refresh", incident_retirement)
+        ready_plan = text.index("initialize_active_ready_recovery", incident_retirement)
+        ready_quiescence = text.index("advance_active_ready_quiescence", ready_plan)
+        ac_intent = text.index("initialize_ac_runtime_refresh", ready_quiescence)
         runtime_ac = text.index("advance_runtime_component_refresh ac", ac_intent)
-        predecessor_retirement = text.index("advance_predecessor_retirement", runtime_ac)
+        predecessor_retirement = text.index("advance_active_ready_retirement", runtime_ac)
         self.assertLess(owner_ready, runtime_cell0)
         self.assertLess(runtime_cell0, runtime_cell1)
         self.assertLess(runtime_cell1, fence_drain)
         self.assertLess(fence_drain, incident_retirement)
+        self.assertLess(incident_retirement, ready_plan)
+        self.assertLess(ready_plan, ready_quiescence)
+        self.assertLess(ready_quiescence, ac_intent)
         self.assertLess(incident_retirement, ac_intent)
         self.assertLess(ac_intent, runtime_ac)
         self.assertLess(runtime_ac, predecessor_retirement)

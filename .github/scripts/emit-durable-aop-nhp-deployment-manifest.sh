@@ -20,8 +20,12 @@ PRODUCER_SHA=${GITHUB_SHA:-}
 PRODUCER_RUN_ID=${GITHUB_RUN_ID:-}
 PRODUCER_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=.github/scripts/lib/durable-aop-active-ready-journal.sh
+source "$ROOT/.github/scripts/lib/durable-aop-active-ready-journal.sh"
 STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
+ACTIVE_READY_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors
+ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 SESSION_CONTROL_DELETE_IAM=${CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-delete-iam.py}
@@ -87,6 +91,26 @@ get_param() {
 get_param_version() {
   aws ssm get-parameter --name "$1" --query Parameter.Version --output text --region "$AWS_REGION"
 }
+get_active_ready_param() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION"
+}
+get_active_ready_param_version() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Version --output text --region "$AWS_REGION"
+}
+require_active_ready_parameter_metadata() {
+  local expected_version=$1 metadata
+  metadata=$(aws ssm describe-parameters --parameter-filters \
+    "Key=Name,Option=Equals,Values=${ACTIVE_READY_JOURNAL_PARAM}" --output json --region "$AWS_REGION")
+  jq -e --arg name "$ACTIVE_READY_JOURNAL_PARAM" --arg key "$ACTIVE_READY_JOURNAL_KMS_KEY" \
+    --argjson version "$expected_version" '
+    type == "object" and (keys | sort) == ["Parameters"] and (.Parameters | type == "array" and length == 1) and
+    (.Parameters[0] | type == "object" and
+      ((keys - ["ARN","LastModifiedDate","LastModifiedUser","Policies","Version"]) | sort) ==
+        ["DataType","KeyId","Name","Tier","Type"] and
+      .Name == $name and .Type == "SecureString" and .KeyId == $key and .Tier == "Standard" and
+      .DataType == "text" and .Version == $version)
+  ' >/dev/null <<<"$metadata"
+}
 get_optional() { bash "$ROOT/scripts/ssm-read-optional.sh" "$1"; }
 slot_image_param() { [[ "$3" == green ]] && printf '/%s/nhp/%s/green-image-tag\n' "$1" "$2" || printf '/%s/nhp/%s/image-tag\n' "$1" "$2"; }
 slot_asg_param() { [[ "$3" == green ]] && printf '/%s/nhp/%s/green-asg-name\n' "$1" "$2" || printf '/%s/nhp/%s/asg-name\n' "$1" "$2"; }
@@ -119,6 +143,19 @@ if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded
 sys.stdout.buffer.write(decoded)
 '
 }
+decode_active_ready_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read(); value = json.loads(raw)
+if set(value) != {"encoding", "payload", "schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-active-ready-predecessor-journal-envelope.v1": raise SystemExit(1)
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw: raise SystemExit(1)
+decoded = gzip.decompress(base64.b64decode(value["payload"], validate=True))
+if len(decoded) > 65536: raise SystemExit(1)
+parsed = json.loads(decoded)
+if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded: raise SystemExit(1)
+sys.stdout.buffer.write(decoded)
+'
+}
 fence_digest() {
   local fence=$1
   {
@@ -130,6 +167,7 @@ fence_digest() {
     done
   } | sha256sum | awk '{print $1}'
 }
+target_fence_digest() { fence_digest "$1"; }
 directory_digest() {
   local receipt=$1
   {
@@ -223,6 +261,8 @@ validate_retired_ledger() {
   done
 }
 
+STATE_VERSION=$(get_param_version "$STATE_PARAM")
+[[ "$STATE_VERSION" =~ ^[1-9][0-9]*$ ]] || { echo "deployment producer state version is malformed" >&2; exit 1; }
 STATE=$(get_param "$STATE_PARAM")
 STATE=$(jq -cS . <<<"$STATE")
 jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
@@ -292,17 +332,19 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
     ([ $j.incident_targets[].status ] | all(. == "retired")) and
     ($j.runtime | type == "object" and (keys | sort) ==
       ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
-       "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
+       "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","ready_predecessor_ref","runtime_manifest",
        "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"]) and
     $j.runtime.source_sha == $runtime_source and $j.runtime.runtime_manifest == $runtime_manifest and
     $j.runtime.build_run_id == $runtime_build and $j.runtime.build_run_attempt == $runtime_attempt and
     ($j.runtime.server_provenance | type == "string") and ($j.runtime.ac_provenance | type == "string") and
     ($j.runtime.fence_start | type == "object") and
     ($j.runtime.fence_drain | type == "object" and .active_fence_count == "0") and
-    ($j.runtime.predecessor_plan | type == "object") and
-    ($j.runtime.predecessor_plan_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-    ($j.runtime.predecessor_targets | type == "array" and length >= 1 and length <= 3) and
-    ([ $j.runtime.predecessor_targets[].status ] | all(. == "retired")) and
+    $j.runtime.predecessor_plan == null and $j.runtime.predecessor_plan_sha256 == "" and
+    ($j.runtime.predecessor_targets | type == "array" and length == 0) and
+    ($j.runtime.ready_predecessor_ref | type == "object" and (keys | sort) == ["parameter","sha256","version"] and
+      .parameter == "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" and
+      (.version | type == "number" and . > 0 and floor == .) and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
     ([ $j.runtime.cell0, $j.runtime.cell1, $j.runtime.ac ] | all(
       type == "object" and (keys | sort) == ["asg","attestation","intent_sha256","prior_refresh_id","refresh_id"] and
       (.intent_sha256 | test("^[0-9a-f]{64}$")) and
@@ -320,16 +362,13 @@ IAM_RECEIPT=$(jq -cS .runtime.session_control_delete_iam.receipt <<<"$JOURNAL")
 }
 RUNTIME=$(jq -cS .runtime <<<"$JOURNAL")
 INCIDENT_PLAN=$(jq -cS .incident_plan <<<"$JOURNAL")
-PREDECESSOR_PLAN=$(jq -cS .runtime.predecessor_plan <<<"$JOURNAL")
 [[ "$(canonical_digest "$INCIDENT_PLAN")" == "$APPROVED_STALE_INCIDENT_PLAN_DIGEST" &&
-   "$(canonical_digest "$PREDECESSOR_PLAN")" == "$(jq -r .runtime.predecessor_plan_sha256 <<<"$JOURNAL")" ]] || {
+   "$(jq -r .runtime.predecessor_plan_sha256 <<<"$JOURNAL")" == "" ]] || {
   echo "deployment producer retirement plan bytes differ from their durable digests" >&2
   exit 1
 }
 if ! validate_retirement_plan "$INCIDENT_PLAN" layerv.durable-aop-stale-target-retirement-plan.v1 stale-ac-target- 3 3 ||
-   ! validate_retirement_plan "$PREDECESSOR_PLAN" layerv.durable-aop-predecessor-target-plan.v1 predecessor- 1 3 ||
-   ! validate_retired_ledger "$INCIDENT_PLAN" "$(jq -c .incident_targets <<<"$JOURNAL")" ||
-   ! validate_retired_ledger "$PREDECESSOR_PLAN" "$(jq -c .runtime.predecessor_targets <<<"$JOURNAL")"; then
+   ! validate_retired_ledger "$INCIDENT_PLAN" "$(jq -c .incident_targets <<<"$JOURNAL")"; then
   echo "deployment producer target-retirement ledger is malformed or torn" >&2
   exit 1
 fi
@@ -340,6 +379,48 @@ validate_starting_directory_receipt "$FENCE_START" && validate_directory_receipt
      "$(jq -r .version <<<"$FENCE_DRAIN")" -ge "$(jq -r .version <<<"$FENCE_START")" &&
      "$(jq -r .updated_at_ms <<<"$FENCE_DRAIN")" -ge "$(jq -r .updated_at_ms <<<"$FENCE_START")" ]] || {
   echo "deployment producer fence-directory drain authority is malformed" >&2
+  exit 1
+}
+
+ACTIVE_READY_REF=$(jq -cS .runtime.ready_predecessor_ref <<<"$JOURNAL")
+ACTIVE_READY_VERSION=$(jq -r .version <<<"$ACTIVE_READY_REF")
+require_active_ready_parameter_metadata "$ACTIVE_READY_VERSION" || {
+  echo "deployment producer ACTIVE/READY parameter metadata is not exact" >&2
+  exit 1
+}
+ACTIVE_READY_ENVELOPE=$(get_active_ready_param "${ACTIVE_READY_JOURNAL_PARAM}:${ACTIVE_READY_VERSION}")
+ACTIVE_READY_ENVELOPE=$(jq -cS . <<<"$ACTIVE_READY_ENVELOPE")
+[[ "$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")" == "$ACTIVE_READY_VERSION" &&
+   "$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM" | jq -cS .)" == "$ACTIVE_READY_ENVELOPE" &&
+   ${#ACTIVE_READY_ENVELOPE} -le 4096 &&
+   "$(canonical_digest "$ACTIVE_READY_ENVELOPE")" == "$(jq -r .sha256 <<<"$ACTIVE_READY_REF")" ]] || {
+  echo "deployment producer ACTIVE/READY journal reference is not current and exact" >&2
+  exit 1
+}
+ACTIVE_READY_JOURNAL=$(decode_active_ready_journal "$ACTIVE_READY_ENVELOPE")
+validate_active_ready_journal_authority "$ACTIVE_READY_JOURNAL" "$(jq -r .repair.orchestrator_sha <<<"$STATE")" \
+  4268c108fe2685c5a475d05f2ec98d5d58c54618dc3934289b97bc0da855dca6 \
+  49a0da6ea26c551ed99f51ad1e1a4608aa89ab7d1f97a40f22c2c12ce99b1a5c \
+  "$(jq -r .runtime.fence_drain.directory_sha256 <<<"$JOURNAL")" || {
+  echo "deployment producer ACTIVE/READY terminal ledger is malformed or torn" >&2
+  exit 1
+}
+[[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == complete ]] || {
+  echo "deployment producer ACTIVE/READY terminal ledger is incomplete" >&2
+  exit 1
+}
+ACTIVE_READY_PLAN_DIGEST=$(jq -r .plan_sha256 <<<"$ACTIVE_READY_JOURNAL")
+ACTIVE_READY_QUIESCENCE_DIGEST=$(jq -r .quiescence_sha256 <<<"$ACTIVE_READY_JOURNAL")
+AC_PLAN_DIGEST=$(printf 'v1\n%s\n%s\n' "$ACTIVE_READY_PLAN_DIGEST" "$ACTIVE_READY_QUIESCENCE_DIGEST" |
+  sha256sum | awk '{print $1}')
+
+[[ "$(get_param_version "$STATE_PARAM")" == "$STATE_VERSION" &&
+   "$(get_param "$STATE_PARAM" | jq -cS .)" == "$STATE" &&
+   "$(get_param_version "$STALE_JOURNAL_PARAM")" == "$JOURNAL_VERSION" &&
+   "$(get_param "$STALE_JOURNAL_PARAM" | jq -cS .)" == "$JOURNAL_ENVELOPE" &&
+   "$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")" == "$ACTIVE_READY_VERSION" &&
+   "$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM" | jq -cS .)" == "$ACTIVE_READY_ENVELOPE" ]] || {
+  echo "deployment producer three-layer recovery authority changed across its strong bracket" >&2
   exit 1
 }
 
@@ -389,7 +470,7 @@ if ! validate_runtime_intent cell0 layerv-nhp-sandbox-server "$(jq -r .server_pr
    ! validate_runtime_intent cell1 layerv-nhp-sandbox-cell1-server-green "$(jq -r .server_provenance <<<"$RUNTIME")" \
      "$SERVER_REFRESH_ORCHESTRATOR_SHA" ||
    ! validate_runtime_intent ac layerv-nhp-sandbox-ac-green "$(jq -r .ac_provenance <<<"$RUNTIME")" \
-     "$(jq -r .repair.orchestrator_sha <<<"$STATE")" "$(jq -r .predecessor_plan_sha256 <<<"$RUNTIME")"; then
+     "$(jq -r .repair.orchestrator_sha <<<"$STATE")" "$AC_PLAN_DIGEST"; then
   echo "deployment producer runtime-refresh intent authority is malformed" >&2
   exit 1
 fi
