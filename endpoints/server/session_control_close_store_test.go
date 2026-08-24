@@ -391,7 +391,7 @@ func TestDynamoSessionControlEnsureExactCloseFreshResultRecognizesOverflowPromot
 func TestDynamoSessionControlEnsureExactCloseNormalLostResponse(t *testing.T) {
 	directory := sessionControlCloseTestDirectory(testSessionControlSessionSnapshot(10), 1_800_000_000_000)
 	fake, store, reserved := newSessionControlExactCloseFixture(t, directory)
-	store.operationTimeout = time.Millisecond
+	store.operationTimeout = 250 * time.Millisecond
 	expected := expectedSessionControlExactClose(t, reserved, directory, store.nowUTC().UnixMilli(), reserved.RetainUntilMillis)
 	fake.transactHook = func(ctx context.Context, _ *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
 		<-ctx.Done()
@@ -463,7 +463,7 @@ func TestDynamoSessionControlEnsureExactCloseExtendsRetentionIdempotently(t *tes
 func TestDynamoSessionControlEnsureExactCloseRetentionExtensionAmbiguousCommit(t *testing.T) {
 	directory := sessionControlCloseTestDirectory(testSessionControlSessionSnapshot(4), 1_800_000_000_000)
 	fake, store, reserved := newSessionControlExactCloseFixture(t, directory)
-	store.operationTimeout = time.Millisecond
+	store.operationTimeout = 250 * time.Millisecond
 	committed := expectedSessionControlExactClose(t, reserved, directory, store.nowUTC().UnixMilli(), reserved.RetainUntilMillis)
 	seedCommittedSessionControlExactClose(t, fake, directory, committed)
 	higher := committed.Session.RetainUntilMillis + 20_000

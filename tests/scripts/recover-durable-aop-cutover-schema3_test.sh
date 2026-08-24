@@ -7,14 +7,19 @@ SCRIPT=$ROOT/.github/scripts/recover-durable-aop-cutover-schema3.sh
 ORIGINAL=e9b11398a4cea98da6ae5b41cfe635562e1b7c72
 REPAIR=422b1d9acac53d50fe5602158fb02c8120ef108d
 RECOVERY=abcdefabcdefabcdefabcdefabcdefabcdefabcd
+RUNTIME=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
 RECOVERY_PREDECESSOR=519bed05f0dc5ea2e40a0f45afffb8e86cc729be
 RECOVERY_HANDOFF_STATE_DIGEST=bf64f92a30915349c4561bedda2ba84c967e2060e1ac46baa66435338104d9fe
+STALE_RETIREMENT_PREDECESSOR=84ed10e2773c49894b3c2c5f2fccdcdfa52b447d
+STALE_RETIREMENT_STATE_DIGEST=b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5d19e75f45ef348
 MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
 OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 ORIGINAL_LOCK_DIGEST=6c7224d78837a4d56547409439d9bce30efa9b214367c4f19fd13cc3fe3b2ebd
 SERVER_DIGEST=sha256:d758d39bf760e44bcdba4e56d464ff98e7adc887ebe426a06a7ab9e261fccfcb
 AC_DIGEST=sha256:16188f567aa0e169a70eed8e75c370ffda532e1d3bce0eec8f439be582d559fb
+RUNTIME_SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
+RUNTIME_AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
 CONNECTOR=2222222222222222222222222222222222222222
 CONNECTOR_PR=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
 CONNECTOR_BASE=e70923168818da0b8002e5e63e7dcfe9e060ba12
@@ -26,14 +31,105 @@ export QURL_GO
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/helpers" "$WORK/connector-artifact"
+mkdir -p "$WORK/repo/.github"
+cp -R "$ROOT/.github/scripts" "$WORK/repo/.github/scripts"
+ln -s "$ROOT/scripts" "$WORK/repo/scripts"
+ln -s "$ROOT/terraform" "$WORK/repo/terraform"
+SCRIPT=$WORK/repo/.github/scripts/recover-durable-aop-cutover-schema3.sh
 export FAKE_PARAMS=$WORK/params FAKE_ASGS=$WORK/asgs FAKE_ACTIONS=$WORK/actions
 export FAKE_ORIGINAL_STATE_RECORD=$WORK/original-state FAKE_ORIGINAL_LOCK_RECORD=$WORK/original-lock
 export FAKE_STATE_VERSION_FILE=$WORK/state-version
+export FAKE_JOURNAL_VERSION_FILE=$WORK/journal-version
+export FAKE_PREDECESSOR_ORPHAN_VERSION_FILE=$WORK/predecessor-orphan-version
 export FAKE_ORIGINAL=$ORIGINAL FAKE_REPAIR=$REPAIR FAKE_SERVER_DIGEST=$SERVER_DIGEST FAKE_AC_DIGEST=$AC_DIGEST
+export RUNTIME_SERVER_DIGEST RUNTIME_AC_DIGEST
 export FAKE_RECOVERY=$RECOVERY FAKE_CONNECTOR=$CONNECTOR FAKE_CONNECTOR_PR=$CONNECTOR_PR
 export FAKE_CONNECTOR_BASE=$CONNECTOR_BASE
 export FAKE_CONNECTOR_TREE=$CONNECTOR_TREE
 export FAKE_INFRA=$INFRA FAKE_INTEGRATIONS=$INTEGRATIONS
+export RUNTIME
+
+(cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/stale-target-plan.json"
+cat >"$WORK/helpers/stale-retire" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+directory_receipt() {
+  local count=$1 version=$2 updated=$3 digest
+  digest=$({
+    printf '\0%s' v1 cell0 "$version" "$count" false 0 '' 0 0 1787530000000 "$updated"
+  } | sha256sum | awk '{print $1}')
+  jq -cn --arg version "$version" --arg count "$count" --arg updated "$updated" --arg digest "$digest" '
+    {schema:"layerv.durable-aop-fence-directory-receipt.v1",cell_id:"cell0",version:$version,
+     active_fence_count:$count,admission_blocked:false,overflow_close_count:"0",overflow_leader_event_id:"",
+     overflow_leader_prepared_directory_version:"0",overflow_leader_selected_directory_version:"0",
+     created_at_ms:"1787530000000",updated_at_ms:$updated,directory_sha256:$digest}'
+}
+decode_journal() {
+  printf '%s' "$1" | python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
+case ${1:-} in
+  plan) cat "$FAKE_STALE_TARGET_PLAN" ;;
+  snapshot-fence-directory) directory_receipt 8 19 1787535000000 ;;
+  verify-fence-drain)
+    if [[ "${FAKE_FENCE_DRAIN_INCOMPLETE:-}" == true ]]; then exit 75; fi
+    directory_receipt 0 27 1787545000000
+    ;;
+  snapshot-predecessors)
+		printf 'snapshot-predecessors\n' >>"$FAKE_ACTIONS"
+    jq -cn '{schema:"layerv.durable-aop-predecessor-target-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",targets:[
+      {id:"predecessor-1",fence_sha256:"ac8512dc6d0cac5a9ddfe5b471458418bab6c55d1b9df6aa49a26abb748c9967",fence:{ac_id:"layerv-ac-tf",public_key:"current-predecessor",boot_id:"boot-current",flush_generation:"3",version:"49",authority_version:"5",counted_active_slot:true,control_cell_id:"cell0",activated_control_version:"0",ready_control_version:"0",aak_enqueued_at_ms:"0",aak_transaction_id:"0",created_at_ms:"1787529555693",prepared_at_ms:"1787533540595"}}]}'
+    ;;
+  retire)
+    shift
+    id= table= region=
+    while (($#)); do
+      case $1 in --target-id) id=$2; shift 2;; --table) table=$2; shift 2;; --region) region=$2; shift 2;; *) exit 98;; esac
+    done
+    [[ "$table" == layerv-nhp-sandbox-cell0-nhp-session-control && "$region" == us-east-2 ]]
+    target=$(jq -ce --arg id "$id" '.targets[] | select(.id == $id)' "$FAKE_STALE_TARGET_PLAN")
+    jq -cn --arg id "$id" --arg key "$(jq -r .fence.public_key <<<"$target")" \
+      --arg version "$(( $(jq -r .fence.version <<<"$target") + 1 ))" \
+      --arg authority "$(( $(jq -r .fence.authority_version <<<"$target") + 1 ))" '
+      {schema:"layerv.durable-aop-stale-target-retirement-receipt.v1",target_id:$id,public_key:$key,
+       version:$version,authority_version:$authority,counted_active_slot:false,retired_at_ms:"1787539000000",
+       retired_target_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+    ;;
+  retire-predecessor)
+    shift
+    id=
+    while (($#)); do
+      case $1 in --target-id) id=$2; shift 2;; *) exit 98;; esac
+    done
+    [[ "$id" == predecessor-1 ]]
+		printf 'retire-predecessor\t%s\n' "$id" >>"$FAKE_ACTIONS"
+    state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+    ref=$(jq -er '.repair.stale_target_retirement_ref.version' <<<"$state")
+    read -r current_version <"$FAKE_JOURNAL_VERSION_FILE"
+    current=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+    historical=$(awk -F '\t' -v n="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${ref}" '$1==n {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+    if [[ "$current_version" == "$ref" ]]; then
+      [[ "$current" == "$historical" ]]
+      jq -cn --arg id "$id" '{schema:"layerv.durable-aop-stale-target-retirement-receipt.v1",target_id:$id,public_key:"current-predecessor",version:"50",authority_version:"6",counted_active_slot:false,retired_at_ms:"1787540000000",retired_target_sha256:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    elif [[ "$current_version" == "$((ref + 1))" ]]; then
+      old=$(decode_journal "$historical")
+      successor=$(decode_journal "$current")
+      old_target=$(jq -cS --arg id "$id" '.runtime.predecessor_targets[] | select(.id==$id)' <<<"$old")
+      new_target=$(jq -cS --arg id "$id" '.runtime.predecessor_targets[] | select(.id==$id)' <<<"$successor")
+      [[ "$(jq -r .status <<<"$old_target")" == pending && "$(jq -r .status <<<"$new_target")" == retired ]]
+      normalized=$(jq -cS --arg id "$id" --argjson target "$old_target" '(.runtime.predecessor_targets[] | select(.id==$id))=$target' <<<"$successor")
+      [[ "$normalized" == "$(jq -cS . <<<"$old")" ]]
+      printf '%s\n' "$current_version" >"$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
+      printf 'retire-predecessor-orphan\t%s\t%s\n' "$id" "$current_version" >>"$FAKE_ACTIONS"
+      jq -cS .receipt <<<"$new_target"
+    else
+      exit 98
+    fi
+    ;;
+  *) exit 98 ;;
+esac
+EOF
+chmod +x "$WORK/helpers/stale-retire"
+export FAKE_STALE_TARGET_PLAN=$WORK/stale-target-plan.json
 
 jq -cn --arg connector "$CONNECTOR" --arg controller "$RECOVERY" '
   {schema_version:1,phase:"pre_removal",repository:"layervai/qurl-connector",commit_sha:$connector,
@@ -46,7 +142,7 @@ jq -cn --arg connector "$CONNECTOR" --arg controller "$RECOVERY" '
      run_id:"55",run_attempt:"4",head_sha:$controller,artifact_id:"54",
      artifact_digest:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
 ' >"$WORK/connector-artifact/strict-sandbox-proof.evidence.json"
-jq -cn --arg connector "$CONNECTOR" --arg qurl_go "$QURL_GO" --arg nhp "$REPAIR" --arg digest "$SERVER_DIGEST" '
+jq -cn --arg connector "$CONNECTOR" --arg qurl_go "$QURL_GO" --arg nhp "$RUNTIME" --arg digest "$RUNTIME_SERVER_DIGEST" '
   {schema_version:1,phase:"pre_removal",retirement_state:"http_lifecycle_present",
    repositories:{qurl_connector:$connector,qurl_go:$qurl_go,nhp:$nhp},connector_modules:{qurl_go:$qurl_go},
    images:{nhp_cell0:$digest,nhp_cell1:$digest}}
@@ -72,7 +168,7 @@ FAKE_CONNECTOR_ZIP_SIZE=$(stat -f %z "$FAKE_CONNECTOR_ZIP" 2>/dev/null || stat -
 # Build the exact six-file protected customer artifact plus its independently
 # downloadable one-file NHP deployment artifact. The recovery controller must
 # verify both byte sets; green workflow metadata alone is insufficient.
-python3 - "$WORK" "$REPAIR" "$RECOVERY" "$SERVER_DIGEST" "$AC_DIGEST" "$INFRA" "$INTEGRATIONS" <<'PY'
+python3 - "$WORK" "$RUNTIME" "$RECOVERY" "$RUNTIME_SERVER_DIGEST" "$RUNTIME_AC_DIGEST" "$INFRA" "$INTEGRATIONS" <<'PY'
 import hashlib, json, pathlib, sys, zipfile
 root = pathlib.Path(sys.argv[1])
 repair, recovery, server, ac, infra, integrations = sys.argv[2:]
@@ -97,7 +193,7 @@ deployment = {
     "schema": "layerv.durable-aop-nhp-deployment.v1", "repository": "layervai/nhp",
     "environment": "sandbox", "profile": "durable-aop-v1", "repair_source_sha": repair,
     "recovery_orchestrator_sha": recovery,
-    "build": {"workflow": ".github/workflows/build-and-push.yml", "run_id": "88", "run_attempt": "2", "head_sha": repair},
+    "build": {"workflow": ".github/workflows/build-and-push.yml", "run_id": "32682520698", "run_attempt": "1", "head_sha": repair},
     "producer": {"workflow": ".github/workflows/udp-proof-deployment-manifest.yml", "source_sha": recovery,
                  "run_id": "66", "run_attempt": "3", "head_sha": recovery},
     "images": {"server": {"repository": "layerv/nhp-server", "digest": server},
@@ -147,7 +243,7 @@ receipt = {
         "sibling_continuity": {"name": "TestSandboxLocalPublishSiblingContinuity", "runtimes": ["hardened_container", "host"], "result": "passed", "two_real_processes": "passed", "get_a_and_b_before_retire": "passed", "retire_a": "passed", "get_b_while_a_retired": "passed", "restart_a_same_state_resource": "passed", "get_a_and_b_after_restart": "passed", "exact_retire_cleanup": "passed"},
         "crid_lifecycle": {"name": "TestSandboxCRIDJourney", "runtime": "host", "result": "passed", "create_list_resolve_get_delete": "passed", "idempotent_resource_delete": "passed"}},
     "integration_tests": {
-        "nhp": {"repository": "layervai/nhp", "source_sha": repair, "workflow": ".github/workflows/build-and-push.yml", "run_id": 88, "run_attempt": 2, "event": "workflow_dispatch", "job": "Test", "step": "Run tests (privileged container for iptables)", "result": "passed", "tests": ["TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay", "TestExactSessionFleetCompensationClosesRemoteForwardedSessionOnly", "TestHandleKnockRequestSendFailureCompensatesRemoteAdmissions", "TestHandleRelayForward_ExactSessionRetirementReturnsDurableReceipt", "TestSessionControlLifecycleRecoveryResumesAfterCompleteAndClearsClosingDueAuthority", "TestSessionControlRecoveryClosesReservedCrashGapAfterAckEnqueue"]},
+        "nhp": {"repository": "layervai/nhp", "source_sha": repair, "workflow": ".github/workflows/build-and-push.yml", "run_id": 32682520698, "run_attempt": 1, "event": "workflow_dispatch", "job": "Test", "step": "Run tests (privileged container for iptables)", "result": "passed", "tests": ["TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay", "TestExactSessionFleetCompensationClosesRemoteForwardedSessionOnly", "TestHandleKnockRequestSendFailureCompensatesRemoteAdmissions", "TestHandleRelayForward_ExactSessionRetirementReturnsDurableReceipt", "TestSessionControlLifecycleRecoveryResumesAfterCompleteAndClearsClosingDueAuthority", "TestSessionControlRecoveryClosesReservedCrashGapAfterAckEnqueue"]},
         "qurl_go": {"repository": "layervai/qurl-go", "source_sha": "d02c25995df085f0437c7a572714c26e907a8a59", "workflow": ".github/workflows/ci.yml", "run_id": 32621063743, "run_attempt": 1, "event": "push", "job": "vet + test -race", "step": "go test -race + coverage", "result": "passed", "tests": ["TestConnectAgentRuntime_LostRAKRestartExactReplayAfterTicketExpiry", "TestConnectAgentRuntime_ResumesPersistedCandidateAfterLostCompletionReply", "TestConsumeNativeExactSessionCloseReply_StrictAuthority", "TestRetireRegisteredAgentSession_ClassifiesReceiptAndTransportFailures", "TestRetireRegisteredAgentSession_UsesExactReceiptOriginalEndpointAndRetriesIdempotently"]},
         "qurl_integrations": {"repository": "layervai/qurl-integrations", "source_sha": integrations, "workflow": ".github/workflows/cli.yml", "run_id": 32658570640, "run_attempt": 1, "event": "pull_request", "job": "cli / test", "step": "Run tests with coverage", "result": "passed", "tests": ["TestNativeBlocksNewCycleAdmissionUntilPriorReceiptRetires", "TestNativeEndCycleRetriesExactReceiptUntilAccepted", "TestNativeLostKnockReplyDoesNotFabricateRetirement", "TestNativeLostReplyConsumesAttemptWithoutFabricatingReceipt", "TestNativeRetirementFailureBlocksReplacementAdmission", "TestNativeUsesMonotonicAttemptsAndRetiresEveryReceipt"]}},
     "connector_attended_gate": gate}
@@ -171,11 +267,17 @@ cat >"$WORK/bin/aws" <<'EOF'
 set -euo pipefail
 svc=$1 op=$2; shift 2
 opt() { local key=$1 prev=; shift; for arg in "$@"; do [[ "$prev" == "$key" ]] && { printf '%s' "$arg"; return; }; prev=$arg; done; }
+decode_journal() {
+  printf '%s' "$1" | python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
 case "$svc/$op" in
   ssm/get-parameter)
     name=$(opt --name "$@"); query=$(opt --query "$@")
     if [[ "$query" == Parameter.Version ]]; then
-      if [[ "$name" == */state ]]; then
+      if [[ "$name" == */stale-target-retirement ]]; then
+			[[ -s "$FAKE_JOURNAL_VERSION_FILE" ]] || { echo ParameterNotFound >&2; exit 254; }
+			cat "$FAKE_JOURNAL_VERSION_FILE"
+		elif [[ "$name" == */state ]]; then
         if [[ "${FAKE_STATE_VERSION_READ_ERROR:-}" == true ]]; then
           echo "injected state version read failure" >&2
           exit 75
@@ -201,13 +303,40 @@ case "$svc/$op" in
       : >"$FAKE_FAIL_COMPLETE_STATE_ONCE"
       exit 75
     fi
-    awk -F '\t' -v n="$name" '$1!=n' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
-    printf '%s\t%s\n' "$name" "$value" >>"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+		if [[ "$name" == */state && -n "${FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE:-}" &&
+		      -s "$FAKE_JOURNAL_VERSION_FILE" ]]; then
+			read -r journal_version <"$FAKE_JOURNAL_VERSION_FILE"
+			if ! grep -Fxq "$journal_version" "$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE" 2>/dev/null; then
+				printf '%s\n' "$journal_version" >>"$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE"
+				exit 75
+			fi
+		fi
+		if [[ "$name" == */stale-target-retirement ]]; then
+			version=0; [[ ! -s "$FAKE_JOURNAL_VERSION_FILE" ]] || read -r version <"$FAKE_JOURNAL_VERSION_FILE"
+			version=$((version + 1))
+			printf '%s\n' "$version" >"$FAKE_JOURNAL_VERSION_FILE"
+			awk -F '\t' -v n="$name" -v historical="${name}:${version}" '$1!=n && $1!=historical' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
+			printf '%s\t%s\n%s:%s\t%s\n' "$name" "$value" "$name" "$version" "$value" >>"$FAKE_PARAMS.tmp"
+		else
+			awk -F '\t' -v n="$name" '$1!=n' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
+			printf '%s\t%s\n' "$name" "$value" >>"$FAKE_PARAMS.tmp"
+		fi
+		mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
     if [[ "$name" == */state && -s "${FAKE_STATE_VERSION_FILE:-}" ]]; then
       read -r version <"$FAKE_STATE_VERSION_FILE"
       printf '%s\n' "$((version + 1))" >"$FAKE_STATE_VERSION_FILE"
     fi
     printf 'put\t%s\n' "$name" >>"$FAKE_ACTIONS"
+		if [[ "$name" == */state && -s "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE" ]]; then
+			read -r orphan_version <"$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
+			[[ "$(jq -r '.repair.stale_target_retirement_ref.version // 0' <<<"$value")" == "$orphan_version" ]]
+			printf 'predecessor-orphan-state-adopt\t%s\n' "$orphan_version" >>"$FAKE_ACTIONS"
+			rm -f "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
+		fi
+		if [[ "$name" == */stale-target-retirement && "$(decode_journal "$value" | jq -r .status)" == ac_intent ]]; then
+			printf 'put-predecessor-journal\t%s\n' \
+				"$(decode_journal "$value" | jq -r .runtime.predecessor_plan_sha256)" >>"$FAKE_ACTIONS"
+		fi
     if [[ "$name" == */state && -n "${FAKE_FAIL_AFTER_STATE_PHASE:-}" &&
           "$(jq -r '.phase // empty' <<<"$value")" == "$FAKE_FAIL_AFTER_STATE_PHASE" &&
           -n "${FAKE_FAIL_AFTER_STATE_WRITE_ONCE:-}" && ! -e "$FAKE_FAIL_AFTER_STATE_WRITE_ONCE" ]]; then
@@ -231,7 +360,7 @@ case "$svc/$op" in
     ;;
   autoscaling/describe-instance-refreshes)
     if [[ " $* " == *' --instance-refresh-ids '* ]]; then
-      printf '%s\n' "${FAKE_PERSISTED_REFRESH_STATUS:-InProgress}"
+      printf '%s\n' "${FAKE_PERSISTED_REFRESH_STATUS:-Successful}"
     else
       name=$(opt --auto-scaling-group-name "$@")
       if [[ -n "${FAKE_REFRESH_LIST_COUNT_FILE:-}" ]]; then
@@ -242,10 +371,13 @@ case "$svc/$op" in
       if [[ "${FAKE_UNOWNED_REFRESH:-}" == true ]]; then
         refresh_id=refresh-unowned
       else
-        refresh_id=$(awk -F '\t' -v n="$name" '$1=="refresh" && $2==n {v="refresh-" n} END {print v}' "$FAKE_ACTIONS")
+        marker=$(awk '/^owner-(apply|verify)$/ {line=NR} END {print line+0}' "$FAKE_ACTIONS")
+        refresh_id=$(awk -F '\t' -v n="$name" -v marker="$marker" \
+          'NR>marker && $1=="refresh" && $2==n {v=$3} END {print v}' "$FAKE_ACTIONS")
       fi
       status=${FAKE_REFRESH_STATUS:-InProgress}
       prior=false; [[ "${FAKE_PRIOR_REFRESH:-}" != true ]] || prior=true
+      if [[ "${marker:-0}" -gt 0 ]]; then prior=true; fi
       if [[ -n "$refresh_id" ]]; then
         max=200; [[ "${FAKE_REFRESH_BAD_PREFS:-}" != true ]] || max=199
         jq -cn --arg id "$refresh_id" --arg status "$status" --argjson max "$max" \
@@ -270,12 +402,15 @@ case "$svc/$op" in
     ;;
   autoscaling/start-instance-refresh)
     name=$(opt --auto-scaling-group-name "$@")
-    printf 'refresh\t%s\n' "$name" >>"$FAKE_ACTIONS"
+    marker=$(awk '/^owner-(apply|verify)$/ {line=NR} END {print line+0}' "$FAKE_ACTIONS")
+    refresh_id=refresh-$name
+    [[ "$marker" -eq 0 ]] || refresh_id=runtime-refresh-$name
+    printf 'refresh\t%s\t%s\n' "$name" "$refresh_id" >>"$FAKE_ACTIONS"
     if [[ -n "${FAKE_START_LOST_ONCE:-}" && ! -e "$FAKE_START_LOST_ONCE" ]]; then
       : >"$FAKE_START_LOST_ONCE"
       exit 75
     fi
-    printf 'refresh-%s\n' "$name"
+    printf '%s\n' "$refresh_id"
     ;;
   *) echo "unexpected aws $svc/$op $*" >&2; exit 99 ;;
 esac
@@ -366,7 +501,7 @@ elif [[ "$args" == *'/actions/runs/32658570640/attempts/1/jobs'* ]]; then
 elif [[ "$args" == *'/actions/runs/32658570640/attempts/1'* ]]; then
   jq -cn --arg integrations "$FAKE_INTEGRATIONS" '{id:32658570640,repository:{full_name:"layervai/qurl-integrations"},head_repository:{full_name:"layervai/qurl-integrations"},head_sha:$integrations,head_branch:"fix/exact-session-lifecycle-smoke",event:"pull_request",run_attempt:1,status:"completed",conclusion:"failure",path:".github/workflows/cli.yml",pull_requests:[{number:1247,head:{sha:$integrations},base:{sha:"f1aa5795a0d45b73bd06fbf64d1dc179c4dc2a29"}}]}'
 elif [[ "$args" == *'/actions/runs/66/artifacts'* ]]; then
-  jq -cn --arg name "durable-aop-nhp-deployment-${FAKE_REPAIR}" --arg digest "$FAKE_NHP_ZIP_DIGEST" '[{artifacts:[{id:903,name:$name,digest:$digest,expired:false,size_in_bytes:500,workflow_run:{id:66}}]}]'
+  jq -cn --arg name "durable-aop-nhp-deployment-${RUNTIME}" --arg digest "$FAKE_NHP_ZIP_DIGEST" '[{artifacts:[{id:903,name:$name,digest:$digest,expired:false,size_in_bytes:500,workflow_run:{id:66}}]}]'
 elif [[ "$args" == *'/actions/artifacts/903/zip'* ]]; then
   cat "$FAKE_NHP_ZIP"
 elif [[ "$args" == *'/actions/runs/66/attempts/3'* ]]; then
@@ -394,10 +529,12 @@ elif [[ "$args" == *'/git/ref/heads/main'* ]]; then
   jq -cn --arg sha "$FAKE_CONNECTOR" '{ref:"refs/heads/main",object:{sha:$sha,type:"commit"}}'
 elif [[ "$args" == *'/git/trees/'* ]]; then
   target_blob=9de09c2cb4a8a8bf8ba9d4c2bf1bfb5263331e5d
+  ac_msghandler_blob=4355055da1fe1392a8e131d37791ecfd10245a45
+  [[ "$args" != *"/git/trees/${RUNTIME}"* ]] || ac_msghandler_blob=43417a8ffcee8d4ff54b8016d4f490bd5d500811
   [[ "${FAKE_RUNTIME_MANIFEST_FAILURE:-}" != true ]] || target_blob=2222222222222222222222222222222222222222
-  jq -cn --arg target_blob "$target_blob" '{tree:[
+  jq -cn --arg target_blob "$target_blob" --arg ac_msghandler_blob "$ac_msghandler_blob" '{tree:[
     {path:"endpoints/ac/httpac.go",type:"blob",sha:"4edf08ab08cc21da891fcfa7e699d3a85c430724"},
-    {path:"endpoints/ac/msghandler.go",type:"blob",sha:"4355055da1fe1392a8e131d37791ecfd10245a45"},
+    {path:"endpoints/ac/msghandler.go",type:"blob",sha:$ac_msghandler_blob},
     {path:"endpoints/server/ac_session_control_admission.go",type:"blob",sha:"3b0ee01158dcd1f7732aa26ace332adaefdc017e"},
     {path:"endpoints/server/httpserver.go",type:"blob",sha:"b4357fbcce03c07da9b96628141632a456dea499"},
     {path:"endpoints/server/msghandler.go",type:"blob",sha:"52f2d2a01549c1617a10b8bdbfd94bfe6ba686b6"},
@@ -408,7 +545,8 @@ elif [[ "$args" == *'/git/trees/'* ]]; then
     {path:"endpoints/server/session_control_task_runtime.go",type:"blob",sha:"3bac389b4480960ae876c1c1c83308c23950aab5"},
     {path:"endpoints/server/session_control_task_store.go",type:"blob",sha:"8ae42e853c07623809083aace48517ea8bbe52b7"},
     {path:"endpoints/server/udpserver.go",type:"blob",sha:"85a178523f14f11fe01132f2b154783f959c2a6e"}]}'
-elif [[ "$args" == *'/actions/runs/88/attempts/2/jobs'* ||
+elif [[ "$args" == *'/actions/runs/32682520698/attempts/1/jobs'* ||
+        "$args" == *'/actions/runs/88/attempts/2/jobs'* ||
         "$args" == *'/actions/runs/32656742290/attempts/1/jobs'* ]]; then
   jq -cn '
     def step($n;$c): {name:$n,conclusion:$c};
@@ -427,11 +565,14 @@ elif [[ "$args" == *'/actions/runs/88/attempts/2/jobs'* ||
       {name:"Deploy Sandbox cell1 - Infrastructure",conclusion:"skipped"},{name:"Deploy Sandbox cell1 - Blue/Green",conclusion:"skipped"},
       {name:"Deploy Sandbox - Control",conclusion:"skipped"},{name:"Deploy Sandbox - Validate",conclusion:"skipped"},
       {name:"NHP Smoke (sandbox)",conclusion:"skipped"}]}]'
-elif [[ "$args" == *'/actions/runs/88/attempts/2'* ||
+elif [[ "$args" == *'/actions/runs/32682520698/attempts/1'* ||
+        "$args" == *'/actions/runs/88/attempts/2'* ||
         "$args" == *'/actions/runs/32656742290/attempts/1'* ]]; then
   conclusion=success; [[ "${FAKE_BUILD_FAILURE:-}" != true ]] || conclusion=failure
-  if [[ "$args" == *'/32656742290/'* ]]; then run=32656742290 attempt=1; else run=88 attempt=2; fi
-  jq -cn --arg sha "$FAKE_REPAIR" --arg conclusion "$conclusion" --argjson run "$run" --argjson attempt "$attempt" \
+  if [[ "$args" == *'/32656742290/'* ]]; then run=32656742290 attempt=1; sha=$FAKE_REPAIR
+  elif [[ "$args" == *'/32682520698/'* ]]; then run=32682520698 attempt=1; sha=$RUNTIME
+  else run=88 attempt=2; sha=$FAKE_REPAIR; fi
+  jq -cn --arg sha "$sha" --arg conclusion "$conclusion" --argjson run "$run" --argjson attempt "$attempt" \
     '{id:$run,repository:{full_name:"layervai/nhp"},head_repository:{full_name:"layervai/nhp"},head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:$attempt,status:"completed",conclusion:$conclusion,path:".github/workflows/build-and-push.yml"}'
 else
   echo "unexpected gh $args" >&2
@@ -493,7 +634,11 @@ cat >"$WORK/helpers/provenance" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${FAKE_PROVENANCE_FAILURE:-}" != true ]] || exit 73
-if [[ "$1" == layerv/nhp-server ]]; then digest=$FAKE_SERVER_DIGEST; else digest=$FAKE_AC_DIGEST; fi
+if [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-server ]]; then digest=$RUNTIME_SERVER_DIGEST
+elif [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-ac ]]; then digest=$RUNTIME_AC_DIGEST
+elif [[ "$1" == layerv/nhp-server ]]; then digest=$FAKE_SERVER_DIGEST
+else digest=$FAKE_AC_DIGEST
+fi
 printf 'v1|%s|%s|%s\n' "$2" "$1" "$digest"
 EOF
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$WORK/helpers/verify"
@@ -556,6 +701,9 @@ case "$1" in
     mode=$1; shift
     printf 'owner-%s\n' "$mode" >>"$FAKE_ACTIONS"
     [[ "$1" == --intent-json && -n "$2" ]]
+    digest=$(jq -er .expected_row_sha256 <<<"$2")
+		[[ "$digest" == dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd ||
+		   "$digest" == cac7d0380fc97736575d2701ef0ccc08927b511cd8646c83785c1be8b30f1b8b ]]
     if [[ "$mode" == apply && -n "${FAKE_OWNER_APPLY_FAIL_ONCE:-}" && ! -e "$FAKE_OWNER_APPLY_FAIL_ONCE" ]]; then
       : >"$FAKE_OWNER_APPLY_FAIL_ONCE"
       exit 75
@@ -569,7 +717,7 @@ chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
 seed() {
   : >"$FAKE_ACTIONS"
-  rm -f "$FAKE_STATE_VERSION_FILE"
+  rm -f "$FAKE_STATE_VERSION_FILE" "$FAKE_JOURNAL_VERSION_FILE" "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
   jq -cn --arg image "$ORIGINAL" --arg owner "$OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
      ac:{old_color:"blue",new_color:"green",old_asg:"layerv-nhp-sandbox-ac",new_asg:"layerv-nhp-sandbox-ac-green",old_min:3,old_max:3,old_desired:3,new_attestation:("v2|durable-aop-v1|"+$image+"|layerv/nhp-ac|sha256:2e38672ef7680c60521694c3f2a59e9a74ed8f2d56bfe1fb41a97f3040b4e279|layerv-nhp-sandbox-ac-green")},
@@ -601,6 +749,19 @@ set_fixture_param() {
   awk -F '\t' -v n="$name" '$1!=n' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
   printf '%s\t%s\n' "$name" "$value" >>"$FAKE_PARAMS.tmp"
   mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+}
+
+decode_fixture_journal() {
+	python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
+
+encode_fixture_journal() {
+	python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-stale-target-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
+}
+
+read_fixture_journal() {
+	awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' \
+		"$FAKE_PARAMS" | decode_fixture_journal
 }
 
 seed_live_orchestrator_handoff() {
@@ -641,6 +802,52 @@ seed_live_orchestrator_handoff() {
   printf '20\n' >"$FAKE_STATE_VERSION_FILE"
 }
 
+seed_live_stale_retirement_handoff() {
+  local lock state canonical
+  seed
+  lock=$(cat "$FAKE_ORIGINAL_LOCK_RECORD")
+  state=$(jq -cn --argjson lock "$lock" --arg repair "$REPAIR" --arg predecessor "$STALE_RETIREMENT_PREDECESSOR" \
+    --arg server_digest "$SERVER_DIGEST" --arg ac_digest "$AC_DIGEST" \
+    --arg state_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" '
+    {schema:3,phase:"repaired",
+     original:{state_version:7,state_sha256:$state_digest,lock:$lock,lock_version:2,lock_sha256:$lock_digest},
+     repair:{orchestrator_sha:$predecessor,source_sha:$repair,build_run_id:"32656742290",build_run_attempt:"1",
+       runtime_manifest:"2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78",
+       server_provenance:("v1|"+$repair+"|layerv/nhp-server|"+$server_digest),
+       ac_provenance:("v1|"+$repair+"|layerv/nhp-ac|"+$ac_digest),
+       cell0_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-server|"+$server_digest+"|layerv-nhp-sandbox-server"),
+       cell1_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-server|"+$server_digest+"|layerv-nhp-sandbox-cell1-server-green"),
+       ac_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-ac|"+$ac_digest+"|layerv-nhp-sandbox-ac-green"),
+       cell0_refresh_id:"ea9dae3d-22f8-478e-a9ec-91eb9b9f53fb",
+       cell1_refresh_id:"dc5ab358-ef4e-45a8-bf81-d18112a2ce9c",
+       ac_refresh_id:"b58f804d-6ed2-4f15-90df-749e2e0f93fb",customer_lifecycle:"",connector_lifecycle:"",
+       owner:{status:"ready",intent:{schema:"layerv.durable-aop-customer-owner-intent.v1",action:"create",
+         before_row_sha256:"absent",client_id:"oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy",
+         subject:"oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy@clients",
+         email:"oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz",
+         table:"layerv-nhp-sandbox-control-qurl-customers",region:"us-east-2",source_sha:$repair,
+         provisioned_at:"2026-08-24T00:38:03Z",
+         expected_row_sha256:"cac7d0380fc97736575d2701ef0ccc08927b511cd8646c83785c1be8b30f1b8b",
+         expected_created_at:"2026-08-24T00:38:03Z",expected_updated_at:"2026-08-24T00:38:03Z",
+         expected_usage:"0",expected_assigned_cell_id:""}}}}')
+  canonical=$(jq -cS . <<<"$state")
+  [[ "$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')" == "$STALE_RETIREMENT_STATE_DIGEST" ]]
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$canonical"
+  set_fixture_param /sandbox/nhp/server/image-tag "$REPAIR"
+  set_fixture_param /sandbox/nhp/server/blue-protocol-profile "v1|durable-aop-v1|${REPAIR}"
+  set_fixture_param /sandbox/nhp/server/blue-prepared-slot-attestation \
+    "v2|durable-aop-v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}|layerv-nhp-sandbox-server"
+  set_fixture_param /sandbox-cell1/nhp/server/green-image-tag "$REPAIR"
+  set_fixture_param /sandbox-cell1/nhp/server/green-protocol-profile "v1|durable-aop-v1|${REPAIR}"
+  set_fixture_param /sandbox-cell1/nhp/server/green-prepared-slot-attestation \
+    "v2|durable-aop-v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}|layerv-nhp-sandbox-cell1-server-green"
+  set_fixture_param /sandbox/nhp/ac/green-image-tag "$REPAIR"
+  set_fixture_param /sandbox/nhp/ac/green-protocol-profile "v1|durable-aop-v1|${REPAIR}"
+  set_fixture_param /sandbox/nhp/ac/green-prepared-slot-attestation \
+    "v2|durable-aop-v1|${REPAIR}|layerv/nhp-ac|${AC_DIGEST}|layerv-nhp-sandbox-ac-green"
+  printf '22\n' >"$FAKE_STATE_VERSION_FILE"
+}
+
 invoke() {
   PATH="$WORK/bin:$PATH" AWS_REGION=us-east-2 GH_TOKEN=x CUTOVER_CUSTOMER_GH_TOKEN=customer-x \
     CUTOVER_CONNECTOR_GH_TOKEN=connector-x GITHUB_REPOSITORY=layervai/nhp \
@@ -648,6 +855,7 @@ invoke() {
     CUTOVER_VERIFY_PROVENANCE_SCRIPT=$WORK/helpers/provenance CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify \
     CUTOVER_VERIFY_LIFECYCLE_SCRIPT=$WORK/helpers/verify CUTOVER_VERIFY_TOPOLOGY_SCRIPT=$WORK/helpers/verify \
     CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
+    CUTOVER_STALE_TARGET_RETIRE_SCRIPT=$WORK/helpers/stale-retire \
     FAKE_METRIC_HELPER=$ROOT/.github/scripts/emit-deployment-window-metric.sh \
     CUTOVER_WAIT_REFRESH_SCRIPT=${FAKE_WAIT_HELPER:-$WORK/helpers/wait} CUTOVER_STABILITY_SECONDS=1 \
     CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID=${LIFECYCLE_RUN_ID:-} CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT=${LIFECYCLE_RUN_ATTEMPT:-} \
@@ -773,22 +981,72 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 [[ "$(jq -r .repair.orchestrator_sha <<<"$state")" == "$RECOVERY" ]]
 [[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
 [[ "$(jq -cS .repair.owner.intent <<<"$state")" == "$intent_before" ]]
-[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 22 ]]
+[[ "$(cat "$FAKE_STATE_VERSION_FILE")" -gt 22 ]]
+journal=$(read_fixture_journal)
+[[ "$(jq -r .status <<<"$journal")" == complete ]]
 [[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c '^snapshot-predecessors$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^retire-predecessor\t' "$FAKE_ACTIONS")" == 1 ]]
+journal_line=$(grep -n $'^put-predecessor-journal\t' "$FAKE_ACTIONS" | cut -d: -f1)
+ac_refresh_line=$(grep -n $'^refresh\tlayerv-nhp-sandbox-ac-green\t' "$FAKE_ACTIONS" | cut -d: -f1)
+predecessor_retire_line=$(grep -n $'^retire-predecessor\t' "$FAKE_ACTIONS" | cut -d: -f1)
+[[ -n "$journal_line" && "$journal_line" -lt "$ac_refresh_line" && "$ac_refresh_line" -lt "$predecessor_retire_line" ]] || {
+	echo "predecessor retirement was not ordered after its durable plan and AC refresh" >&2
+	exit 1
+}
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 cp "$FAKE_PARAMS" "$WORK/params.handoff-current"
 cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.handoff-current"
+cp "$FAKE_JOURNAL_VERSION_FILE" "$WORK/journal-version.handoff-current"
 
 # Exact successor replay is allowed. A changed predecessor ledger, a v20 state
 # that self-asserts the successor, or any third controller source fails before
 # a state write, fleet action, or owner mutation.
 : >"$FAKE_ACTIONS"
 invoke >/dev/null
-if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply)\t?' "$FAKE_ACTIONS"; then
+if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply|snapshot-predecessors|retire-predecessor)\t?' "$FAKE_ACTIONS"; then
   echo "exact successor replay performed a mutation" >&2
   exit 1
 fi
+
+# The AC intent commits the canonical predecessor-plan digest before the AC
+# refresh. A caller-selected extra fence cannot be added later even if its
+# plan, per-fence digest, and pending ledger entry are made self-consistent:
+# the precommitted AC intent no longer matches and rejection occurs before any
+# resnapshot or retirement call.
+cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
+cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+journal=$(read_fixture_journal)
+mutated=$(jq -c '
+  (.incident_plan.targets[0] |
+    .id="predecessor-2") as $extra |
+  .runtime.predecessor_plan.targets += [$extra] |
+  .runtime.predecessor_targets +=
+    [{id:$extra.id,fence_sha256:$extra.fence_sha256,status:"pending"}]
+' <<<"$journal")
+plan=$(jq -cS .runtime.predecessor_plan <<<"$mutated")
+mutated=$(jq -cS --arg digest "$(printf '%s' "$plan" | sha256sum | awk '{print $1}')" \
+  '.runtime.predecessor_plan_sha256=$digest' <<<"$mutated")
+envelope=$(printf '%s' "$mutated" | encode_fixture_journal)
+version=$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")
+set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
+set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${version}" "$envelope"
+state=$(jq -c --arg digest "$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')" \
+	'.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")
+set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
+: >"$FAKE_ACTIONS"
+if invoke >/dev/null 2>&1; then
+	echo "caller-selected predecessor fence was accepted after plan precommit" >&2
+	exit 1
+fi
+if grep -Eq '^(snapshot-predecessors|retire-predecessor)' "$FAKE_ACTIONS"; then
+	echo "mutated predecessor plan reached snapshot or retirement" >&2
+	exit 1
+fi
+cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
+cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
 for mutation in \
   predecessor_bytes wrong_phase owner_present wrong_state_version missing_lock changed_lock \
   successor_at_v20 third_stored predecessor_as_current; do
@@ -835,6 +1093,7 @@ unset INVOKE_RECOVERY_SHA
 
 cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
 cp "$WORK/state-version.handoff-current" "$FAKE_STATE_VERSION_FILE"
+cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
 : >"$FAKE_ACTIONS"
 export INVOKE_RECOVERY_SHA=9999999999999999999999999999999999999999
 if invoke >/dev/null 2>&1; then
@@ -844,8 +1103,191 @@ fi
 [[ ! -s "$FAKE_ACTIONS" ]]
 unset INVOKE_RECOVERY_SHA INVOKE_BUILD_RUN_ID INVOKE_BUILD_RUN_ATTEMPT
 
+# The third incident boundary is the exact live schema-3 v22 state after the
+# canonical owner reached READY. Only the reviewed 84ed predecessor may hand
+# that byte-for-byte state to this controller. The first durable write creates
+# the cell0 runtime-refresh intent, advances v22 -> v23, and installs the
+# current controller SHA before any image or instance-refresh mutation.
+export INVOKE_BUILD_RUN_ID=32656742290 INVOKE_BUILD_RUN_ATTEMPT=1
+seed_live_stale_retirement_handoff
+: >"$FAKE_ACTIONS"
+export FAKE_FAIL_AFTER_STATE_PHASE=repaired
+export FAKE_FAIL_AFTER_STATE_WRITE_ONCE=$WORK/stale-v23-write-stop
+if stale_handoff_output=$(invoke 2>&1); then
+  echo "exact v22 stale-target handoff unexpectedly passed the injected v23 stop" >&2
+  exit 1
+fi
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 23 ]] || {
+  echo "exact v22 stale-target handoff stopped before v23: $stale_handoff_output" >&2
+  exit 1
+}
+[[ "$(jq -r .repair.orchestrator_sha <<<"$state")" == "$RECOVERY" ]]
+journal=$(read_fixture_journal)
+[[ "$(jq -r .status <<<"$journal")" == cell0_intent ]]
+[[ "$(jq -r .source_state_version <<<"$journal")" == 22 ]]
+[[ "$(jq -r .source_state_sha256 <<<"$journal")" == "$STALE_RETIREMENT_STATE_DIGEST" ]]
+if grep -q $'^refresh\t' "$FAKE_ACTIONS"; then
+  echo "v22 handoff started a refresh before its v23 intent was durable" >&2
+  exit 1
+fi
+unset FAKE_FAIL_AFTER_STATE_PHASE FAKE_FAIL_AFTER_STATE_WRITE_ONCE
+
+# Every mutation of the exact historical state/version/owner/lock boundary is
+# rejected before a state write or refresh. A third controller source cannot
+# self-select itself as the reviewed successor.
+for mutation in bytes version owner digest missing_lock changed_lock third_stored predecessor_current; do
+  seed_live_stale_retirement_handoff
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  unset INVOKE_RECOVERY_SHA
+  case "$mutation" in
+    bytes) mutated=$(jq -c '.repair.ac_refresh_id="changed-refresh"' <<<"$state") ;;
+    version)
+      mutated=$state
+      printf '23\n' >"$FAKE_STATE_VERSION_FILE"
+      ;;
+    owner) mutated=$(jq -c '.repair.owner.intent.expected_usage="1"' <<<"$state") ;;
+    digest) mutated=$(jq -c '.repair.owner.intent.expected_row_sha256="9999999999999999999999999999999999999999999999999999999999999999"' <<<"$state") ;;
+    missing_lock)
+      mutated=$state
+      awk -F '\t' '$1!="/layerv-nhp-sandbox/qurl-live-env-lock"' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
+      mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+      ;;
+    changed_lock)
+      mutated=$state
+      lock=$(awk -F '\t' '$1=="/layerv-nhp-sandbox/qurl-live-env-lock" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_fixture_param /layerv-nhp-sandbox/qurl-live-env-lock "$(jq -c '.created_at += 1' <<<"$lock")"
+      ;;
+    third_stored) mutated=$(jq -c '.repair.orchestrator_sha="9999999999999999999999999999999999999999"' <<<"$state") ;;
+    predecessor_current)
+      mutated=$state
+      export INVOKE_RECOVERY_SHA=$STALE_RETIREMENT_PREDECESSOR
+      ;;
+  esac
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$mutated"
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "mutated exact v22 stale-target handoff was accepted: $mutation" >&2
+    exit 1
+  fi
+  if grep -Eq $'^(put|delete|refresh)\t' "$FAKE_ACTIONS"; then
+    echo "mutated exact v22 stale-target handoff reached a mutation: $mutation" >&2
+    exit 1
+  fi
+done
+unset INVOKE_RECOVERY_SHA
+
+# Every journal transition is crash-safe at the exact journal-put-before-state
+# boundary. The first failure leaves an initial-create orphan with schema-3
+# still at v22. Each retry adopts only that exact version, commits its state
+# reference, and advances until the next journal version. Thus every journal
+# version is stopped once before its state reference and the final retry
+# converges without replanning authority.
+seed_live_stale_retirement_handoff
+: >"$FAKE_ACTIONS"
+export FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE=$WORK/journal-state-crash-versions
+rm -f "$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE"
+journal_crash_attempts=0
+journal_crash_complete=false
+while (( journal_crash_attempts < 40 )); do
+	if journal_crash_output=$(invoke 2>&1); then
+		journal_crash_complete=true
+		break
+	fi
+	journal_crash_attempts=$((journal_crash_attempts + 1))
+	if (( journal_crash_attempts == 1 )); then
+		state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+		[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 22 &&
+		   "$(jq -r '.repair.stale_target_retirement_ref // empty' <<<"$state")" == "" &&
+		   "$(cat "$FAKE_JOURNAL_VERSION_FILE")" == 1 ]] || {
+			echo "initial journal create did not stop as an unreferenced v1 orphan" >&2; exit 1;
+		}
+	fi
+done
+unset FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE
+[[ "$journal_crash_complete" == true ]] || {
+	echo "journal-put-before-state crash sequence did not converge: $journal_crash_output" >&2; exit 1;
+}
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+journal_version=$(cat "$FAKE_JOURNAL_VERSION_FILE")
+[[ "$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")" == "$journal_version" &&
+   "$(jq -r .status <<<"$(read_fixture_journal)")" == complete &&
+   "$(wc -l <"$WORK/journal-state-crash-versions" | tr -d ' ')" == "$journal_version" ]] || {
+	echo "not every journal update was recovered through its exact state-reference crash boundary" >&2; exit 1;
+}
+awk 'NR != $1 {exit 1}' "$WORK/journal-state-crash-versions"
+grep -Eq $'^retire-predecessor-orphan\tpredecessor-1\t[1-9][0-9]*$' "$FAKE_ACTIONS" || {
+	echo "predecessor DDB replay did not consume the exact journal N+1 orphan before state-reference adoption" >&2
+	exit 1
+}
+grep -Eq $'^predecessor-orphan-state-adopt\t[1-9][0-9]*$' "$FAKE_ACTIONS" || {
+	echo "exact predecessor journal N+1 orphan did not become the same schema-3 state reference" >&2
+	exit 1
+}
+grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
+if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
+
+# A state reference admits at most one exact derived successor. An unrelated
+# but internally valid current v+1, a v+2 current value, or a state reference
+# to a version that was never verified all fail before any mutation.
+cp "$FAKE_PARAMS" "$WORK/params.journal-crash-complete"
+cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.journal-crash-complete"
+cp "$FAKE_JOURNAL_VERSION_FILE" "$WORK/journal-version.journal-crash-complete"
+for mutation in unrelated_successor extra_successor unverified_reference; do
+	cp "$WORK/params.journal-crash-complete" "$FAKE_PARAMS"
+	cp "$WORK/state-version.journal-crash-complete" "$FAKE_STATE_VERSION_FILE"
+	cp "$WORK/journal-version.journal-crash-complete" "$FAKE_JOURNAL_VERSION_FILE"
+	state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+	version=$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")
+	envelope=$(awk -F '\t' -v n="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${version}" \
+		'$1==n {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+	journal=$(printf '%s' "$envelope" | decode_fixture_journal)
+	mutated=$(jq -cS '.runtime.cell0.refresh_id="unrelated-successor"' <<<"$journal")
+	unrelated=$(printf '%s' "$mutated" | encode_fixture_journal)
+	case "$mutation" in
+		unrelated_successor)
+			successor=$((version + 1))
+			set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$unrelated"
+			set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${successor}" "$unrelated"
+			printf '%s\n' "$successor" >"$FAKE_JOURNAL_VERSION_FILE"
+			;;
+		extra_successor)
+			successor=$((version + 2))
+			set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$unrelated"
+			set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${successor}" "$unrelated"
+			printf '%s\n' "$successor" >"$FAKE_JOURNAL_VERSION_FILE"
+			;;
+		unverified_reference)
+			successor=$((version + 1))
+			state=$(jq -c --argjson version "$successor" --arg digest "$(printf '%s' "$unrelated" | sha256sum | awk '{print $1}')" \
+				'.repair.stale_target_retirement_ref.version=$version | .repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")
+			set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
+			;;
+	esac
+	: >"$FAKE_ACTIONS"
+	if invoke >/dev/null 2>&1; then echo "journal authority accepted $mutation" >&2; exit 1; fi
+	if grep -Eq $'^(put|delete|refresh|retire-|owner-plan|owner-apply|snapshot-)\t?' "$FAKE_ACTIONS"; then
+		echo "journal authority mutation reached a write-capable action: $mutation" >&2; exit 1
+	fi
+done
+
+# An unrelated orphan at initial creation is never self-pinned as authority.
+seed_live_stale_retirement_handoff
+unrelated=$(printf '%s' '{"schema":"unrelated"}' | encode_fixture_journal)
+set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$unrelated"
+set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:1 "$unrelated"
+printf '1\n' >"$FAKE_JOURNAL_VERSION_FILE"
+: >"$FAKE_ACTIONS"
+if invoke >/dev/null 2>&1; then echo "unrelated initial journal orphan was adopted" >&2; exit 1; fi
+if grep -Eq $'^(put|refresh|retire-)\t' "$FAKE_ACTIONS"; then
+	echo "unrelated initial journal orphan reached a mutation" >&2; exit 1
+fi
+
+unset INVOKE_BUILD_RUN_ID INVOKE_BUILD_RUN_ATTEMPT
+
 # A malformed successor-version read cannot bypass the exact v20 exclusion.
 cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
+cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
 printf 'unreadable\n' >"$FAKE_STATE_VERSION_FILE"
 : >"$FAKE_ACTIONS"
 export INVOKE_BUILD_RUN_ID=32656742290 INVOKE_BUILD_RUN_ATTEMPT=1
@@ -855,6 +1297,7 @@ if invoke >/dev/null 2>&1; then
 fi
 [[ ! -s "$FAKE_ACTIONS" ]]
 cp "$WORK/state-version.handoff-current" "$FAKE_STATE_VERSION_FILE"
+cp "$WORK/journal-version.handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
 : >"$FAKE_ACTIONS"
 export FAKE_STATE_VERSION_READ_ERROR=true
 if invoke >/dev/null 2>&1; then
@@ -887,11 +1330,11 @@ grep -q 'reached repaired+owner_ready' <<<"$output"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 [[ "$(jq -r .phase <<<"$state")" == repaired ]]
 [[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
-[[ "$(grep -c '^metric-wait-source$' "$FAKE_ACTIONS")" == 4 ]]
-[[ "$(grep -c $'^metric-wait-call\t' "$FAKE_ACTIONS")" == 4 ]]
-[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
-[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-cell1-server-green$' "$FAKE_ACTIONS")" == 2 ]]
-[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-ac-green$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c '^metric-wait-source$' "$FAKE_ACTIONS")" == 7 ]]
+[[ "$(grep -c $'^metric-wait-call\t' "$FAKE_ACTIONS")" == 7 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 2 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-cell1-server-green$' "$FAKE_ACTIONS")" == 3 ]]
+[[ "$(grep -c $'^metric-wait-call\tlayerv-nhp-sandbox-ac-green$' "$FAKE_ACTIONS")" == 2 ]]
 unset FAKE_WAIT_HELPER
 
 # Crash after the durable owner intent but before a confirmed customer write
@@ -940,9 +1383,12 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 [[ "$(jq -r .repair.runtime_manifest <<<"$state")" == "$MANIFEST" ]]
 [[ "$(jq -r .repair.build_run_attempt <<<"$state")" == 2 ]]
 [[ "$(jq -r .repair.cell0_refresh_id <<<"$state")" == refresh-layerv-nhp-sandbox-server ]]
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
-(( ${#state} <= 4096 )) || { echo "schema-3 state exceeds the SSM standard-parameter limit" >&2; exit 1; }
-[[ "$(awk -F '\t' '$1=="/sandbox/nhp/ac/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$REPAIR" ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 2 ]]
+envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+(( ${#state} < 4096 && ${#envelope} < 4096 )) || {
+	echo "schema-3 state or stale-target journal exceeds the SSM standard-parameter limit" >&2; exit 1;
+}
+[[ "$(awk -F '\t' '$1=="/sandbox/nhp/ac/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$RUNTIME" ]]
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 
@@ -970,21 +1416,19 @@ for mutation in client source digest; do
 done
 cp "$WORK/params.owner-ready" "$FAKE_PARAMS"
 
-# READY -> PREPARING with the same precommitted intent is the valid
-# crash-after-DynamoDB-commit/before-ready-ledger window. It must classify the
-# exact row, restore READY, and never plan a new timestamp or digest.
+# Once the runtime-retirement journal exists, READY cannot move back to
+# PREPARING even with the same owner intent. The earlier injected owner-apply
+# crash pins the valid pre-journal self-heal boundary.
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-intent_before=$(jq -cS .repair.owner.intent <<<"$state")
-plan_count=$(grep -c '^owner-plan$' "$FAKE_ACTIONS")
 mutated=$(jq -c '.repair.owner.status="preparing"' <<<"$state")
 awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
   "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
-output=$(invoke)
-grep -q 'reached repaired+owner_ready' <<<"$output"
+if invoke >/dev/null 2>&1; then
+  echo "post-journal owner status rollback was accepted" >&2
+  exit 1
+fi
+cp "$WORK/params.owner-ready" "$FAKE_PARAMS"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-[[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
-[[ "$(jq -cS .repair.owner.intent <<<"$state")" == "$intent_before" ]]
-[[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == "$plan_count" ]]
 
 # A self-consistent-looking phase jump cannot skip the three durable refresh
 # ids/attestations or the two protected receipts.
@@ -1048,7 +1492,7 @@ if invoke >/dev/null 2>&1; then echo "COMPLETE replay accepted another connector
 # server image digest.
 cp "$WORK/params.complete" "$FAKE_PARAMS"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-mutated=$(jq -c --arg old "$SERVER_DIGEST" --arg new sha256:9999999999999999999999999999999999999999999999999999999999999999 \
+mutated=$(jq -c --arg old "$RUNTIME_SERVER_DIGEST" --arg new sha256:9999999999999999999999999999999999999999999999999999999999999999 \
   '.repair.connector_lifecycle |= sub($old;$new)' <<<"$state")
 awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
   "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
@@ -1063,7 +1507,7 @@ export CONNECTOR_RUN_ID=901 CONNECTOR_RUN_ATTEMPT=2 CONNECTOR_SOURCE_SHA=$CONNEC
 export CONNECTOR_PR_HEAD_SHA=$CONNECTOR_PR CONNECTOR_CONTROLLER_RUN_ID=66 CONNECTOR_CONTROLLER_RUN_ATTEMPT=3
 invoke >/dev/null
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-mutated=$(jq -c --arg old "$AC_DIGEST" --arg new sha256:9999999999999999999999999999999999999999999999999999999999999999 \
+mutated=$(jq -c --arg old "$RUNTIME_AC_DIGEST" --arg new sha256:9999999999999999999999999999999999999999999999999999999999999999 \
   '.repair.customer_lifecycle |= sub($old;$new)' <<<"$state")
 awk -F '\t' -v value="$mutated" '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {$0=$1 "\t" value} {print}' \
   "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"; mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
@@ -1100,7 +1544,7 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 [[ "$(jq -r .phase <<<"$state")" == cell0_refreshing ]]
 [[ "$(jq -r .repair.cell0_refresh_id <<<"$state")" == "" ]]
 [[ "$(jq -r .repair.refresh_intent <<<"$state")" =~ ^v1\|[0-9a-f]{64}\|-$ ]]
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 1 ]]
 [[ "$(awk -F '\t' '$1=="/sandbox/nhp/server/image-tag" {print $2}' "$FAKE_PARAMS")" == "$REPAIR" ]]
 [[ "$(awk -F '\t' '$1=="/sandbox/nhp/server/blue-protocol-profile" {print $2}' "$FAKE_PARAMS")" == "v1|durable-aop-v1|${REPAIR}" ]]
 if grep -q '^/sandbox/nhp/server/blue-prepared-slot-attestation' "$FAKE_PARAMS"; then
@@ -1108,7 +1552,7 @@ if grep -q '^/sandbox/nhp/server/blue-prepared-slot-attestation' "$FAKE_PARAMS";
 fi
 unset FAKE_START_LOST_ONCE
 invoke >/dev/null
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 2 ]]
 
 # A crash after the durable intent but before the StartInstanceRefresh call
 # leaves no AWS refresh and resumes from that exact intent.
@@ -1121,7 +1565,7 @@ state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print sub
 if grep -q $'^refresh\t' "$FAKE_ACTIONS"; then echo "refresh started before the injected intent crash" >&2; exit 1; fi
 unset FAKE_REFRESH_LIST_COUNT_FILE FAKE_REFRESH_LIST_FAIL_AT
 invoke >/dev/null
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 2 ]]
 
 # With existing history, only the one newest exact successor to the recorded
 # boundary is eligible for adoption. A missing/out-of-window boundary fails.
@@ -1132,7 +1576,7 @@ unset FAKE_START_LOST_ONCE
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 [[ "$(jq -r .repair.refresh_intent <<<"$state")" == v1\|*\|refresh-prior ]]
 invoke >/dev/null
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 2 ]]
 seed
 export FAKE_START_LOST_ONCE=$WORK/start-lost-missing-prior
 if invoke >/dev/null 2>&1; then exit 1; fi
@@ -1150,7 +1594,7 @@ unset FAKE_START_LOST_ONCE
 export FAKE_REFRESH_BAD_PREFS=true
 if invoke >/dev/null 2>&1; then echo "refresh with mutated preferences was adopted" >&2; exit 1; fi
 unset FAKE_REFRESH_BAD_PREFS
-[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server$' "$FAKE_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS")" == 1 ]]
 export FAKE_REFRESH_EXTRA=true
 if invoke >/dev/null 2>&1; then echo "multiple post-intent refreshes were adopted" >&2; exit 1; fi
 unset FAKE_REFRESH_EXTRA

@@ -21,6 +21,7 @@ PRODUCER_RUN_ID=${GITHUB_RUN_ID:-}
 PRODUCER_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
+STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 OWNER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
@@ -31,6 +32,15 @@ FLOOR_PARAM=/sandbox/nhp/minimum-protocol-profile
 PROFILE=durable-aop-v1
 APPROVED_RUNTIME_MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
 APPROVED_REPAIR_SOURCE_SHA=422b1d9acac53d50fe5602158fb02c8120ef108d
+APPROVED_STALE_SOURCE_STATE_VERSION=22
+APPROVED_STALE_SOURCE_STATE_DIGEST=b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5d19e75f45ef348
+APPROVED_STALE_INCIDENT_PLAN_DIGEST=f434ce1e13c69f8749e9004be26304002e7e8da28939815d062f643124abcfc6
+# Exact merged runtime source and successful claim-free build-only run. Both
+# image/SBOM attestations succeeded and every deployment job was skipped.
+APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
+APPROVED_STALE_RUNTIME_MANIFEST=906c0461bf3d44175750b91ec9251de114da0c3646750287656803e3783d5ed0
+APPROVED_STALE_RUNTIME_BUILD_RUN_ID=32682520698
+APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT=1
 APPROVED_ORIGINAL_STATE_VERSION=7
 APPROVED_ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 APPROVED_ORIGINAL_LOCK_VERSION=2
@@ -53,9 +63,19 @@ export AWS_REGION GITHUB_REPOSITORY
   echo "deployment manifest output must use the canonical filename" >&2; exit 2;
 }
 : "${GH_TOKEN:?GH_TOKEN is required}"
+[[ "$APPROVED_STALE_RUNTIME_SOURCE_SHA" != 0000000000000000000000000000000000000000 &&
+   "$APPROVED_STALE_RUNTIME_MANIFEST" != 0000000000000000000000000000000000000000000000000000000000000000 &&
+   "$APPROVED_STALE_RUNTIME_BUILD_RUN_ID" =~ ^[1-9][0-9]*$ &&
+   "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "deployment producer runtime recovery authority is not finalized" >&2
+  exit 2
+}
 
 get_param() {
   aws ssm get-parameter --name "$1" --query Parameter.Value --output text --region "$AWS_REGION"
+}
+get_param_version() {
+  aws ssm get-parameter --name "$1" --query Parameter.Version --output text --region "$AWS_REGION"
 }
 get_optional() { bash "$ROOT/scripts/ssm-read-optional.sh" "$1"; }
 slot_image_param() { [[ "$3" == green ]] && printf '/%s/nhp/%s/green-image-tag\n' "$1" "$2" || printf '/%s/nhp/%s/image-tag\n' "$1" "$2"; }
@@ -67,10 +87,123 @@ canonical_asg() {
   base="layerv-nhp-${env}-${component}"
   [[ "$color" == green ]] && printf '%s-green\n' "$base" || printf '%s\n' "$base"
 }
+canonical_digest() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
+decode_stale_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read(); value = json.loads(raw)
+if set(value) != {"encoding", "payload", "schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-stale-target-journal-envelope.v1": raise SystemExit(1)
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw: raise SystemExit(1)
+decoded = gzip.decompress(base64.b64decode(value["payload"], validate=True))
+if len(decoded) > 65536: raise SystemExit(1)
+parsed = json.loads(decoded)
+if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded: raise SystemExit(1)
+sys.stdout.buffer.write(decoded)
+'
+}
+fence_digest() {
+  local fence=$1
+  {
+    printf '\0%s' v1
+    for field in ac_id public_key boot_id flush_generation version authority_version counted_active_slot \
+      control_cell_id activated_control_version ready_control_version aak_enqueued_at_ms aak_transaction_id \
+      created_at_ms prepared_at_ms; do
+      printf '\0%s' "$(jq -r ".${field}" <<<"$fence")"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+directory_digest() {
+  local receipt=$1
+  {
+    printf '\0%s' v1
+    for field in cell_id version active_fence_count admission_blocked overflow_close_count \
+      overflow_leader_event_id overflow_leader_prepared_directory_version \
+      overflow_leader_selected_directory_version created_at_ms updated_at_ms; do
+      printf '\0%s' "$(jq -r ".${field}" <<<"$receipt")"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+validate_directory_receipt() {
+  local receipt=$1 count=$2
+  jq -e --arg count "$count" '
+    type == "object" and (keys | sort) ==
+      ["active_fence_count","admission_blocked","cell_id","created_at_ms","directory_sha256",
+       "overflow_close_count","overflow_leader_event_id","overflow_leader_prepared_directory_version",
+       "overflow_leader_selected_directory_version","schema","updated_at_ms","version"] and
+    .schema == "layerv.durable-aop-fence-directory-receipt.v1" and .cell_id == "cell0" and
+    .active_fence_count == $count and (.admission_blocked | type == "boolean") and
+    ([.version,.active_fence_count,.overflow_close_count,.overflow_leader_prepared_directory_version,
+      .overflow_leader_selected_directory_version,.created_at_ms,.updated_at_ms] |
+      all(type == "string" and test("^(0|[1-9][0-9]*)$"))) and
+    (.overflow_leader_event_id | type == "string") and
+    (.directory_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+  ' >/dev/null <<<"$receipt" &&
+    [[ "$(directory_digest "$receipt")" == "$(jq -r .directory_sha256 <<<"$receipt")" ]]
+}
+validate_retirement_plan() {
+  local plan=$1 schema=$2 prefix=$3 min=$4 max=$5 count index target fence
+  jq -e --arg schema "$schema" --arg prefix "$prefix" --argjson min "$min" --argjson max "$max" '
+    type == "object" and (keys | sort) == ["ac_id","control_cell_id","region","schema","table","targets"] and
+    .schema == $schema and .table == "layerv-nhp-sandbox-cell0-nhp-session-control" and
+    .region == "us-east-2" and .ac_id == "layerv-ac-tf" and .control_cell_id == "cell0" and
+    (.targets | type == "array" and length >= $min and length <= $max) and
+    ([.targets[].id] == [range(1;(.targets|length)+1) | ($prefix + (.|tostring))]) and
+    ([.targets[] | (keys | sort) == ["fence","fence_sha256","id"] and
+      (.fence_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.fence | type == "object" and (keys | sort) ==
+        ["aak_enqueued_at_ms","aak_transaction_id","ac_id","activated_control_version","authority_version",
+         "boot_id","control_cell_id","counted_active_slot","created_at_ms","flush_generation","prepared_at_ms",
+         "public_key","ready_control_version","version"] and
+        .ac_id == "layerv-ac-tf" and .control_cell_id == "cell0" and .counted_active_slot == true and
+        .activated_control_version == "0" and .ready_control_version == "0" and
+        .aak_enqueued_at_ms == "0" and .aak_transaction_id == "0" and
+        ([.flush_generation,.version,.authority_version,.created_at_ms,.prepared_at_ms] |
+          all(type == "string" and test("^[1-9][0-9]*$"))) and
+        ([.public_key,.boot_id] | all(type == "string" and length > 0)))] | all)
+  ' >/dev/null <<<"$plan" || return 1
+  count=$(jq '.targets|length' <<<"$plan")
+  for ((index=0; index<count; index++)); do
+    target=$(jq -c --argjson i "$index" '.targets[$i]' <<<"$plan")
+    fence=$(jq -cS .fence <<<"$target")
+    [[ "$(fence_digest "$fence")" == "$(jq -r .fence_sha256 <<<"$target")" ]] || return 1
+  done
+}
+validate_retired_ledger() {
+  local plan=$1 ledger=$2 count index planned row receipt version authority
+  count=$(jq '.targets|length' <<<"$plan")
+  [[ "$(jq 'length' <<<"$ledger")" == "$count" ]] || return 1
+  for ((index=0; index<count; index++)); do
+    planned=$(jq -c --argjson i "$index" '.targets[$i]' <<<"$plan")
+    row=$(jq -c --argjson i "$index" '.[$i]' <<<"$ledger")
+    receipt=$(jq -cS .receipt <<<"$row")
+    version=$(( $(jq -r .fence.version <<<"$planned") + 1 ))
+    authority=$(( $(jq -r .fence.authority_version <<<"$planned") + 1 ))
+    jq -e --arg id "$(jq -r .id <<<"$planned")" --arg fence "$(jq -r .fence_sha256 <<<"$planned")" \
+      --arg key "$(jq -r .fence.public_key <<<"$planned")" --arg version "$version" --arg authority "$authority" '
+      (keys | sort) == ["fence_sha256","id","receipt","status"] and
+      .id == $id and .fence_sha256 == $fence and .status == "retired" and
+      (.receipt | type == "object" and (keys | sort) ==
+        ["authority_version","counted_active_slot","public_key","retired_at_ms","retired_target_sha256",
+         "schema","target_id","version"] and
+        .schema == "layerv.durable-aop-stale-target-retirement-receipt.v1" and
+        .target_id == $id and .public_key == $key and .version == $version and
+        .authority_version == $authority and .counted_active_slot == false and
+        (.retired_at_ms | type == "string" and test("^[1-9][0-9]*$")) and
+        (.retired_target_sha256 | type == "string" and test("^[0-9a-f]{64}$")))
+    ' >/dev/null <<<"$row" || return 1
+  done
+}
 
 STATE=$(get_param "$STATE_PARAM")
 STATE=$(jq -cS . <<<"$STATE")
 jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
+  --arg runtime_source "$APPROVED_STALE_RUNTIME_SOURCE_SHA" \
+  --arg runtime_manifest "$APPROVED_STALE_RUNTIME_MANIFEST" \
+  --arg runtime_build "$APPROVED_STALE_RUNTIME_BUILD_RUN_ID" \
+  --arg runtime_attempt "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" \
+  --arg stale_source_digest "$APPROVED_STALE_SOURCE_STATE_DIGEST" \
+  --arg incident_plan_digest "$APPROVED_STALE_INCIDENT_PLAN_DIGEST" \
+  --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
   --arg state_digest "$APPROVED_ORIGINAL_STATE_DIGEST" --arg lock_digest "$APPROVED_ORIGINAL_LOCK_DIGEST" \
   --argjson state_version "$APPROVED_ORIGINAL_STATE_VERSION" --argjson lock_version "$APPROVED_ORIGINAL_LOCK_VERSION" '
   type == "object" and (keys | sort) == ["original","phase","repair","schema"] and
@@ -84,7 +217,7 @@ jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
     ["ac_attestation","ac_provenance","ac_refresh_id","build_run_attempt","build_run_id",
      "cell0_attestation","cell0_refresh_id","cell1_attestation","cell1_refresh_id",
      "connector_lifecycle","customer_lifecycle","orchestrator_sha","owner","runtime_manifest",
-     "server_provenance","source_sha"]) and
+     "server_provenance","source_sha","stale_target_retirement_ref"]) and
   .repair.runtime_manifest == $manifest and
   ([.repair.orchestrator_sha,.repair.source_sha] | all(type == "string" and test("^[0-9a-f]{40}$"))) and
   ([.repair.build_run_id,.repair.build_run_attempt] | all(type == "string" and test("^[1-9][0-9]*$"))) and
@@ -93,11 +226,109 @@ jq -e --arg manifest "$APPROVED_RUNTIME_MANIFEST" \
     all(type == "string" and length > 0)) and
   (.repair.owner | type == "object" and (keys | sort) == ["intent","status"] and .status == "ready") and
   (.repair.owner.intent | type == "object" and length == 15) and
-  .repair.customer_lifecycle == "" and .repair.connector_lifecycle == ""
+  .repair.customer_lifecycle == "" and .repair.connector_lifecycle == "" and
+  (.repair.stale_target_retirement_ref | type == "object" and (keys | sort) == ["parameter","sha256","version"] and
+    .parameter == "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" and
+    (.version | type == "number" and . > 0 and floor == .) and (.sha256 | test("^[0-9a-f]{64}$")))
 ' >/dev/null <<<"$STATE" || {
-  echo "deployment producer requires the exact pre-lifecycle schema-3 REPAIRED authority" >&2
+  echo "deployment producer requires the completed runtime-retirement schema-3 authority" >&2
   exit 1
 }
+
+JOURNAL_REF=$(jq -cS .repair.stale_target_retirement_ref <<<"$STATE")
+JOURNAL_VERSION=$(jq -r .version <<<"$JOURNAL_REF")
+JOURNAL_ENVELOPE=$(get_param "${STALE_JOURNAL_PARAM}:${JOURNAL_VERSION}"); JOURNAL_ENVELOPE=$(jq -cS . <<<"$JOURNAL_ENVELOPE")
+[[ "$(get_param_version "$STALE_JOURNAL_PARAM")" == "$JOURNAL_VERSION" &&
+   "$(get_param "$STALE_JOURNAL_PARAM" | jq -cS .)" == "$JOURNAL_ENVELOPE" &&
+   ${#JOURNAL_ENVELOPE} -lt 4096 && "$(canonical_digest "$JOURNAL_ENVELOPE")" == "$(jq -r .sha256 <<<"$JOURNAL_REF")" ]] || {
+  echo "deployment producer stale-target journal reference is not current and exact" >&2
+  exit 1
+}
+JOURNAL=$(decode_stale_journal "$JOURNAL_ENVELOPE")
+jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
+  --arg stale_source_digest "$APPROVED_STALE_SOURCE_STATE_DIGEST" \
+  --arg incident_plan_digest "$APPROVED_STALE_INCIDENT_PLAN_DIGEST" \
+  --arg runtime_source "$APPROVED_STALE_RUNTIME_SOURCE_SHA" \
+  --arg runtime_manifest "$APPROVED_STALE_RUNTIME_MANIFEST" \
+  --arg runtime_build "$APPROVED_STALE_RUNTIME_BUILD_RUN_ID" \
+  --arg runtime_attempt "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" '
+  . as $j |
+    ($j | type == "object" and (keys | sort) ==
+      ["incident_plan","incident_plan_sha256","incident_targets","runtime","schema","source_state_sha256",
+       "source_state_version","status"]) and
+    $j.schema == "layerv.durable-aop-stale-target-retirement-journal.v1" and $j.status == "complete" and
+    $j.source_state_version == $stale_source_version and $j.source_state_sha256 == $stale_source_digest and
+    $j.incident_plan_sha256 == $incident_plan_digest and
+    ($j.incident_plan | type == "object") and ($j.incident_targets | type == "array" and length == 3) and
+    ([ $j.incident_targets[].status ] | all(. == "retired")) and
+    ($j.runtime | type == "object" and (keys | sort) ==
+      ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+       "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
+       "server_provenance","source_sha"]) and
+    $j.runtime.source_sha == $runtime_source and $j.runtime.runtime_manifest == $runtime_manifest and
+    $j.runtime.build_run_id == $runtime_build and $j.runtime.build_run_attempt == $runtime_attempt and
+    ($j.runtime.server_provenance | type == "string") and ($j.runtime.ac_provenance | type == "string") and
+    ($j.runtime.fence_start | type == "object" and .active_fence_count == "8") and
+    ($j.runtime.fence_drain | type == "object" and .active_fence_count == "0") and
+    ($j.runtime.predecessor_plan | type == "object") and
+    ($j.runtime.predecessor_plan_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    ($j.runtime.predecessor_targets | type == "array" and length >= 1 and length <= 3) and
+    ([ $j.runtime.predecessor_targets[].status ] | all(. == "retired")) and
+    ([ $j.runtime.cell0, $j.runtime.cell1, $j.runtime.ac ] | all(
+      type == "object" and (keys | sort) == ["asg","attestation","intent_sha256","prior_refresh_id","refresh_id"] and
+      (.intent_sha256 | test("^[0-9a-f]{64}$")) and
+      ([.asg,.attestation,.prior_refresh_id,.refresh_id] | all(type == "string" and length > 0))))
+' >/dev/null <<<"$JOURNAL" || {
+  echo "deployment producer requires the completed exact stale-target journal" >&2
+  exit 1
+}
+RUNTIME=$(jq -cS .runtime <<<"$JOURNAL")
+INCIDENT_PLAN=$(jq -cS .incident_plan <<<"$JOURNAL")
+PREDECESSOR_PLAN=$(jq -cS .runtime.predecessor_plan <<<"$JOURNAL")
+[[ "$(canonical_digest "$INCIDENT_PLAN")" == "$APPROVED_STALE_INCIDENT_PLAN_DIGEST" &&
+   "$(canonical_digest "$PREDECESSOR_PLAN")" == "$(jq -r .runtime.predecessor_plan_sha256 <<<"$JOURNAL")" ]] || {
+  echo "deployment producer retirement plan bytes differ from their durable digests" >&2
+  exit 1
+}
+if ! validate_retirement_plan "$INCIDENT_PLAN" layerv.durable-aop-stale-target-retirement-plan.v1 stale-ac-target- 3 3 ||
+   ! validate_retirement_plan "$PREDECESSOR_PLAN" layerv.durable-aop-predecessor-target-plan.v1 predecessor- 1 3 ||
+   ! validate_retired_ledger "$INCIDENT_PLAN" "$(jq -c .incident_targets <<<"$JOURNAL")" ||
+   ! validate_retired_ledger "$PREDECESSOR_PLAN" "$(jq -c .runtime.predecessor_targets <<<"$JOURNAL")"; then
+  echo "deployment producer target-retirement ledger is malformed or torn" >&2
+  exit 1
+fi
+FENCE_START=$(jq -cS .runtime.fence_start <<<"$JOURNAL")
+FENCE_DRAIN=$(jq -cS .runtime.fence_drain <<<"$JOURNAL")
+validate_directory_receipt "$FENCE_START" 8 && validate_directory_receipt "$FENCE_DRAIN" 0 &&
+  [[ "$(jq -r .created_at_ms <<<"$FENCE_START")" == "$(jq -r .created_at_ms <<<"$FENCE_DRAIN")" &&
+     "$(jq -r .version <<<"$FENCE_DRAIN")" -ge "$(jq -r .version <<<"$FENCE_START")" &&
+     "$(jq -r .updated_at_ms <<<"$FENCE_DRAIN")" -ge "$(jq -r .updated_at_ms <<<"$FENCE_START")" ]] || {
+  echo "deployment producer fence-directory drain authority is malformed" >&2
+  exit 1
+}
+
+REFRESH_PREFERENCES='{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"SkipMatching":false}'
+validate_runtime_intent() {
+  local label=$1 asg=$2 provenance=$3 plan_digest=${4:--} component prior expected_attestation expected_intent
+  component=$(jq -c --arg label "$label" '.[$label]' <<<"$RUNTIME")
+  expected_attestation="v2|${PROFILE}|${provenance#v1|}|${asg}"
+  prior=$(jq -r .prior_refresh_id <<<"$component")
+  expected_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$label" "$asg" "$APPROVED_STALE_RUNTIME_SOURCE_SHA" "$APPROVED_STALE_RUNTIME_BUILD_RUN_ID" \
+    "$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$provenance" "$(jq -r .repair.orchestrator_sha <<<"$STATE")" \
+    "$REFRESH_PREFERENCES" "$prior" "$plan_digest" | sha256sum | awk '{print $1}')
+  [[ "$(jq -r .asg <<<"$component")" == "$asg" &&
+     "$(jq -r .attestation <<<"$component")" == "$expected_attestation" &&
+     "$prior" =~ ^(-|[A-Za-z0-9-]+)$ && "$(jq -r .refresh_id <<<"$component")" =~ ^[A-Za-z0-9-]+$ &&
+     "$(jq -r .intent_sha256 <<<"$component")" == "$expected_intent" ]]
+}
+if ! validate_runtime_intent cell0 layerv-nhp-sandbox-server "$(jq -r .server_provenance <<<"$RUNTIME")" ||
+   ! validate_runtime_intent cell1 layerv-nhp-sandbox-cell1-server-green "$(jq -r .server_provenance <<<"$RUNTIME")" ||
+   ! validate_runtime_intent ac layerv-nhp-sandbox-ac-green "$(jq -r .ac_provenance <<<"$RUNTIME")" \
+     "$(jq -r .predecessor_plan_sha256 <<<"$RUNTIME")"; then
+  echo "deployment producer runtime-refresh intent authority is malformed" >&2
+  exit 1
+fi
 
 OWNER_INTENT=$(jq -cS .repair.owner.intent <<<"$STATE")
 jq -e --arg client "$OWNER_CLIENT_ID" --arg subject "$OWNER_SUBJECT" --arg email "$OWNER_EMAIL" \
@@ -138,13 +369,14 @@ jq -e '
   .created_at == 1787485146 and .expires_at == 253402300799
 ' >/dev/null <<<"$embedded_lock" || { echo "historical incident lock shape is malformed" >&2; exit 1; }
 
-REPAIR_SOURCE_SHA=$(jq -r .repair.source_sha <<<"$STATE")
-[[ "$REPAIR_SOURCE_SHA" == "$APPROVED_REPAIR_SOURCE_SHA" ]] || {
+HISTORICAL_REPAIR_SOURCE_SHA=$(jq -r .repair.source_sha <<<"$STATE")
+[[ "$HISTORICAL_REPAIR_SOURCE_SHA" == "$APPROVED_REPAIR_SOURCE_SHA" ]] || {
   echo "deployment producer is not finalized for the exact merged #3935 source" >&2; exit 1;
 }
+REPAIR_SOURCE_SHA=$(jq -r .source_sha <<<"$RUNTIME")
 RECOVERY_SOURCE_SHA=$(jq -r .repair.orchestrator_sha <<<"$STATE")
-BUILD_RUN_ID=$(jq -r .repair.build_run_id <<<"$STATE")
-BUILD_RUN_ATTEMPT=$(jq -r .repair.build_run_attempt <<<"$STATE")
+BUILD_RUN_ID=$(jq -r .build_run_id <<<"$RUNTIME")
+BUILD_RUN_ATTEMPT=$(jq -r .build_run_attempt <<<"$RUNTIME")
 [[ "$PRODUCER_SHA" == "$RECOVERY_SOURCE_SHA" ]] || {
   echo "producer source differs from the exact schema-3 recovery controller" >&2; exit 1;
 }
@@ -176,8 +408,8 @@ build_receipt=$("$VERIFY_BUILD_ONLY" "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$REPA
 
 SERVER_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$REPAIR_SOURCE_SHA")
 AC_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$REPAIR_SOURCE_SHA")
-[[ "$SERVER_PROVENANCE" == "$(jq -r .repair.server_provenance <<<"$STATE")" &&
-   "$AC_PROVENANCE" == "$(jq -r .repair.ac_provenance <<<"$STATE")" ]] || {
+[[ "$SERVER_PROVENANCE" == "$(jq -r .server_provenance <<<"$RUNTIME")" &&
+   "$AC_PROVENANCE" == "$(jq -r .ac_provenance <<<"$RUNTIME")" ]] || {
   echo "live image provenance differs from schema-3 repair authority" >&2; exit 1;
 }
 SERVER_DIGEST=${SERVER_PROVENANCE##*|}
@@ -230,15 +462,15 @@ AC_COLOR=$(jq -r .ac.new_color <<<"$embedded_state")
 AC_ASG=$(jq -r .ac.new_asg <<<"$embedded_state")
 
 prove_deployment cell0 sandbox server "$CELL0_COLOR" "$CELL0_ASG" "$SERVER_DIGEST" "$SERVER_PROVENANCE" \
-  "$(jq -r .repair.cell0_attestation <<<"$STATE")" "$(jq -r .repair.cell0_refresh_id <<<"$STATE")" \
+  "$(jq -r .cell0.attestation <<<"$RUNTIME")" "$(jq -r .cell0.refresh_id <<<"$RUNTIME")" \
   'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
 CELL0_DEPLOYMENT=$DEPLOYMENT_JSON
 prove_deployment cell1 sandbox-cell1 server "$CELL1_COLOR" "$CELL1_ASG" "$SERVER_DIGEST" "$SERVER_PROVENANCE" \
-  "$(jq -r .repair.cell1_attestation <<<"$STATE")" "$(jq -r .repair.cell1_refresh_id <<<"$STATE")" \
+  "$(jq -r .cell1.attestation <<<"$RUNTIME")" "$(jq -r .cell1.refresh_id <<<"$RUNTIME")" \
   'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
 CELL1_DEPLOYMENT=$DEPLOYMENT_JSON
 prove_deployment ac sandbox ac "$AC_COLOR" "$AC_ASG" "$AC_DIGEST" "$AC_PROVENANCE" \
-  "$(jq -r .repair.ac_attestation <<<"$STATE")" "$(jq -r .repair.ac_refresh_id <<<"$STATE")" \
+  "$(jq -r .ac.attestation <<<"$RUNTIME")" "$(jq -r .ac.refresh_id <<<"$RUNTIME")" \
   'systemctl is-active --quiet nhp-acd && curl -sfS -o /dev/null http://127.0.0.1:8888/nhp-ac/ready'
 AC_DEPLOYMENT=$DEPLOYMENT_JSON
 

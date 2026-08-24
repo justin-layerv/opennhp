@@ -24,42 +24,98 @@ opt() { local key=$1 prev=; shift; for arg in "$@"; do [[ "$prev" == "$key" ]] &
 case "$svc/$op" in
   autoscaling/describe-auto-scaling-groups)
     name=$(opt --auto-scaling-group-names "$@")
-    jq -cn --arg name "$name" '{AutoScalingGroups:[{AutoScalingGroupName:$name,MinSize:1,MaxSize:4,DesiredCapacity:1,Instances:[{InstanceId:"i-1",LifecycleState:"InService",HealthStatus:"Healthy"}]}]}'
+    if [[ "$name" == ac-new ]]; then
+      jq -cn --arg name "$name" '{AutoScalingGroups:[{AutoScalingGroupName:$name,MinSize:3,MaxSize:6,DesiredCapacity:3,Instances:[
+        {InstanceId:"i-ac1",LifecycleState:"InService",HealthStatus:"Healthy"},
+        {InstanceId:"i-ac2",LifecycleState:"InService",HealthStatus:"Healthy"},
+        {InstanceId:"i-ac3",LifecycleState:"InService",HealthStatus:"Healthy"}]}]}'
+    else
+      jq -cn --arg name "$name" '{AutoScalingGroups:[{AutoScalingGroupName:$name,MinSize:1,MaxSize:4,DesiredCapacity:1,Instances:[{InstanceId:"i-1",LifecycleState:"InService",HealthStatus:"Healthy"}]}]}'
+    fi
     ;;
   ssm/get-parameter)
     name=$(opt --name "$@")
     case "$name" in /sandbox/nhp/ac/active-color) echo green;; /sandbox/nhp/ac/green-asg-name) echo ac-new;; *) exit 99;; esac
     ;;
   dynamodb/query)
-    state=active; [[ "$FAKE_MODE" != target_preparing ]] || state=preparing
-    activated=10; ready=10; counted=true
-    [[ "$state" == active ]] || { activated=0; ready=0; counted=false; }
+    [[ $(opt --limit "$@") == 65 ]] || { echo "target inventory query limit is not 65" >&2; exit 97; }
     junk='[]'; [[ "$FAKE_MODE" != junk_target_row ]] || junk='[{pk:{S:"AC#authority"},sk:{S:"JUNK"},kind:{S:"junk"}}]'
-    jq -cn --arg state "$state" --argjson activated "$activated" --argjson ready "$ready" --argjson counted "$counted" --argjson junk "$junk" '
+    preparing='[]'; [[ "$FAKE_MODE" != target_preparing ]] || preparing='[{pk:{S:"AC#authority"},sk:{S:"TARGET#preparing"},kind:{S:"target"},schema_version:{N:"2"},ac_id:{S:"layerv-ac-tf"},public_key:{S:"preparing-key"},boot_id:{S:"boot-p"},flush_generation:{N:"1"},state:{S:"preparing"},version:{N:"1"},authority_version:{N:"8"},counted_active_slot:{BOOL:false},control_cell_id:{S:"cell0"},activated_control_version:{N:"0"},ready_control_version:{N:"0"},aak_enqueued_at_ms:{N:"0"},aak_transaction_id:{N:"0"},created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"20"}}]'
+    history_count=0
+    [[ "$FAKE_MODE" != terminal_64_items ]] || history_count=58
+    [[ "$FAKE_MODE" != terminal_65_items ]] || history_count=59
+    lek='null'; [[ "$FAKE_MODE" != paginated ]] || lek='{pk:{S:"next"}}'
+    jq -cn --argjson junk "$junk" --argjson preparing "$preparing" --argjson history_count "$history_count" --argjson lek "$lek" '
+      def ready($n):
+        {pk:{S:"AC#authority"},sk:{S:("TARGET#ready"+($n|tostring))},kind:{S:"target"},schema_version:{N:"2"},
+         ac_id:{S:"layerv-ac-tf"},public_key:{S:("ready-key-"+($n|tostring))},boot_id:{S:("boot-r"+($n|tostring))},flush_generation:{N:"2"},
+         state:{S:"active"},version:{N:"3"},authority_version:{N:"8"},counted_active_slot:{BOOL:true},control_cell_id:{S:"cell0"},
+         activated_control_version:{N:"10"},ready_control_version:{N:"10"},aak_enqueued_at_ms:{N:"30"},aak_transaction_id:{N:"5"},
+         created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"30"}};
+      def canceled_history($n):
+        {pk:{S:"AC#authority"},sk:{S:("TARGET#history-"+($n|tostring))},kind:{S:"target"},schema_version:{N:"2"},
+         ac_id:{S:"layerv-ac-tf"},public_key:{S:("history-key-"+($n|tostring))},boot_id:{S:("boot-history-"+($n|tostring))},flush_generation:{N:"2"},
+         state:{S:"canceled"},version:{N:"7"},authority_version:{N:"8"},counted_active_slot:{BOOL:false},control_cell_id:{S:"cell0"},
+         activated_control_version:{N:"0"},ready_control_version:{N:"0"},aak_enqueued_at_ms:{N:"0"},aak_transaction_id:{N:"0"},
+         created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"30"}};
+      [range(1; $history_count + 1) | canceled_history(.)] as $history |
       {Items:([
         {pk:{S:"AC#authority"},sk:{S:"AUTHORITY"},kind:{S:"authority"},schema_version:{N:"1"},
-         ac_id:{S:"layerv-ac-tf"},control_cell_id:{S:"cell0"},version:{N:"4"},active_target_count:{N:"1"},
+         ac_id:{S:"layerv-ac-tf"},control_cell_id:{S:"cell0"},version:{N:"8"},active_target_count:{N:"3"},
          created_at_ms:{N:"10"},updated_at_ms:{N:"30"}},
-        {pk:{S:"AC#authority"},sk:{S:"TARGET#one"},kind:{S:"target"},schema_version:{N:"2"},
-         ac_id:{S:"layerv-ac-tf"},public_key:{S:"public-key"},boot_id:{S:"boot-1"},flush_generation:{N:"2"},
-         state:{S:$state},version:{N:"3"},authority_version:{N:"4"},counted_active_slot:{BOOL:$counted},
-         control_cell_id:{S:"cell0"},activated_control_version:{N:($activated|tostring)},ready_control_version:{N:($ready|tostring)},
-         aak_enqueued_at_ms:{N:"30"},aak_transaction_id:{N:"5"},created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"30"}}
-      ] + $junk),Count:(2+($junk|length)),ScannedCount:(2+($junk|length))}'
+        ready(1),ready(2),ready(3),
+        {pk:{S:"AC#authority"},sk:{S:"TARGET#retired"},kind:{S:"target"},schema_version:{N:"2"},
+         ac_id:{S:"layerv-ac-tf"},public_key:{S:"retired-key"},boot_id:{S:"boot-retired"},flush_generation:{N:"2"},
+         state:{S:"retired"},version:{N:"5"},authority_version:{N:"8"},counted_active_slot:{BOOL:false},control_cell_id:{S:"cell0"},
+         activated_control_version:{N:"0"},ready_control_version:{N:"0"},aak_enqueued_at_ms:{N:"0"},aak_transaction_id:{N:"0"},
+         created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"40"},retired_at_ms:{N:"40"}},
+        {pk:{S:"AC#authority"},sk:{S:"TARGET#canceled"},kind:{S:"target"},schema_version:{N:"2"},
+         ac_id:{S:"layerv-ac-tf"},public_key:{S:"canceled-key"},boot_id:{S:"boot-canceled"},flush_generation:{N:"2"},
+         state:{S:"canceled"},version:{N:"7"},authority_version:{N:"8"},counted_active_slot:{BOOL:false},control_cell_id:{S:"cell0"},
+         activated_control_version:{N:"0"},ready_control_version:{N:"0"},aak_enqueued_at_ms:{N:"0"},aak_transaction_id:{N:"0"},
+         created_at_ms:{N:"10"},prepared_at_ms:{N:"20"},updated_at_ms:{N:"30"}}
+      ] + $history + $preparing + $junk),Count:(6+($history|length)+($preparing|length)+($junk|length)),ScannedCount:(6+($history|length)+($preparing|length)+($junk|length)),LastEvaluatedKey:$lek}'
     ;;
   dynamodb/get-item)
     table=$(opt --table-name "$@")
     case "$table" in
       *session-control)
+        key=$(opt --key "$@")
+        case "$key" in
+          *"$OWNER_READY1"*) public=ready-key-1; boot=boot-r1; phase=ready; version=3; counted=true; activated=10; ready=10; aak=30; tx=5; target_updated=30; retired=0;;
+          *"$OWNER_READY2"*) public=ready-key-2; boot=boot-r2; phase=ready; version=3; counted=true; activated=10; ready=10; aak=30; tx=5; target_updated=30; retired=0;;
+          *"$OWNER_READY3"*) public=ready-key-3; boot=boot-r3; phase=ready; version=3; counted=true; activated=10; ready=10; aak=30; tx=5; target_updated=30; retired=0;;
+          *"$OWNER_RETIRED"*) public=retired-key; boot=boot-retired; phase=retired; version=5; counted=false; activated=0; ready=0; aak=0; tx=0; target_updated=40; retired=40;;
+          *"$OWNER_CANCELED"*) public=canceled-key; boot=boot-canceled; phase=preparing; version=6; counted=false; activated=0; ready=0; aak=0; tx=0; target_updated=20; retired=0;;
+          *)
+            matched=false
+            for n in $(seq 1 59); do
+              candidate="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0history-key-%s' "$n" | sha256sum | awk '{print $1}')"
+              if [[ "$key" == *"$candidate"* ]]; then
+                public="history-key-$n"; boot="boot-history-$n"; phase=preparing; version=6; counted=false
+                activated=0; ready=0; aak=0; tx=0; target_updated=20; retired=0; matched=true
+                break
+              fi
+            done
+            [[ "$matched" == true ]] || exit 98
+            ;;
+        esac
         pending=0; [[ "$FAKE_MODE" != pending ]] || pending=1
+        [[ "$FAKE_MODE" != retired_owner_ready || "$public" != retired-key ]] || phase=ready
+        [[ "$FAKE_MODE" != canceled_owner_version || "$public" != canceled-key ]] || version=5
         ttl='{}'; [[ "$FAKE_MODE" != owner_ttl ]] || ttl=',"ttl":{"N":"9999"}'
-        jq -cn --argjson pending "$pending" --argjson ttl "$ttl" '
-          {Item:{pk:{S:"TARGETWORK#owner"},sk:{S:"DIRECTORY"},kind:{S:"target_work_directory"},schema_version:{N:"1"},
-           cell_id:{S:"cell0"},ac_id:{S:"layerv-ac-tf"},public_key:{S:"public-key"},lifecycle_version:{N:"1"},work_version:{N:"1"},
-           task_count:{N:($pending|tostring)},pending_count:{N:($pending|tostring)},phase:{S:"ready"},boot_id:{S:"boot-1"},flush_generation:{N:"2"},
-           target_version:{N:"3"},target_authority_version:{N:"4"},target_counted_active_slot:{BOOL:true},activated_control_version:{N:"10"},
-           ready_control_version:{N:"10"},target_created_at_ms:{N:"10"},target_prepared_at_ms:{N:"20"},target_updated_at_ms:{N:"30"},
-           aak_enqueued_at_ms:{N:"30"},aak_transaction_id:{N:"5"},created_at_ms:{N:"10"},updated_at_ms:{N:"30"}} + $ttl}'
+        jq -cn --arg pk "$(jq -r .pk.S <<<"$key")" --arg public "$public" --arg boot "$boot" --arg phase "$phase" \
+          --argjson version "$version" --argjson counted "$counted" --argjson activated "$activated" --argjson ready "$ready" \
+          --argjson aak "$aak" --argjson tx "$tx" --argjson target_updated "$target_updated" --argjson retired "$retired" \
+          --argjson pending "$pending" --argjson ttl "$ttl" '
+          {Item:({pk:{S:$pk},sk:{S:"DIRECTORY"},kind:{S:"target_work_directory"},schema_version:{N:"1"},
+           cell_id:{S:"cell0"},ac_id:{S:"layerv-ac-tf"},public_key:{S:$public},lifecycle_version:{N:"2"},work_version:{N:"1"},
+           task_count:{N:($pending|tostring)},pending_count:{N:($pending|tostring)},phase:{S:$phase},boot_id:{S:$boot},flush_generation:{N:"2"},
+           target_version:{N:($version|tostring)},target_authority_version:{N:"8"},target_counted_active_slot:{BOOL:$counted},
+           activated_control_version:{N:($activated|tostring)},ready_control_version:{N:($ready|tostring)},target_created_at_ms:{N:"10"},
+           target_prepared_at_ms:{N:"20"},target_updated_at_ms:{N:($target_updated|tostring)},aak_enqueued_at_ms:{N:($aak|tostring)},
+           aak_transaction_id:{N:($tx|tostring)},created_at_ms:{N:"10"},updated_at_ms:{N:(if $retired > 0 then ($retired|tostring) else "30" end)}} +
+           (if $retired > 0 then {retired_at_ms:{N:($retired|tostring)}} else {} end) + $ttl)}'
         ;;
       *connector-authority)
         assignable='{}'; [[ "$FAKE_MODE" != catalog_explicit_assignable ]] || assignable=',"general_assignable":{"BOOL":true}'
@@ -100,8 +156,13 @@ chmod +x "$WORK/bin/"* "$WORK/original/.github/scripts/verify-knock-ready.sh"
 # Match production's canonical hashes rather than teaching the fake AWS script
 # to accept arbitrary keys.
 target_pk="AC#$(printf layerv-ac-tf | sha256sum | awk '{print $1}')"
-owner_pk="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0public-key' | sha256sum | awk '{print $1}')"
-sed -i.bak "s/AC#authority/$target_pk/g; s/TARGETWORK#owner/$owner_pk/g" "$WORK/bin/aws"; rm "$WORK/bin/aws.bak"
+sed -i.bak "s/AC#authority/$target_pk/g" "$WORK/bin/aws"; rm "$WORK/bin/aws.bak"
+OWNER_READY1="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0ready-key-1' | sha256sum | awk '{print $1}')"
+OWNER_READY2="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0ready-key-2' | sha256sum | awk '{print $1}')"
+OWNER_READY3="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0ready-key-3' | sha256sum | awk '{print $1}')"
+OWNER_RETIRED="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0retired-key' | sha256sum | awk '{print $1}')"
+OWNER_CANCELED="TARGETWORK#$(printf 'v1\0cell0\0layerv-ac-tf\0canceled-key' | sha256sum | awk '{print $1}')"
+export OWNER_READY1 OWNER_READY2 OWNER_READY3 OWNER_RETIRED OWNER_CANCELED
 
 run() {
   : >"$WORK/assignment-reads"
@@ -111,7 +172,8 @@ run() {
 
 run >/dev/null
 FAKE_MODE=assignment_heartbeat run >/dev/null
-for mode in pending target_preparing junk_target_row owner_ttl catalog_explicit_assignable catalog_ttl \
+FAKE_MODE=terminal_64_items run >/dev/null
+for mode in pending target_preparing junk_target_row paginated terminal_65_items retired_owner_ready canceled_owner_version owner_ttl catalog_explicit_assignable catalog_ttl \
   stale_assignment future_assignment expired_assignment wrong_assignment_instance persisted_asg_name \
   assignment_structural_drift assignment_version_rollback assignment_time_rollback assignment_unversioned_heartbeat; do
   export FAKE_MODE=$mode

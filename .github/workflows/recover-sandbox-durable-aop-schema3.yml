@@ -103,6 +103,22 @@ jobs:
           path: .cutover-original-e9
           persist-credentials: false
 
+      - name: Install exact Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: endpoints/go.mod
+          cache-dependency-path: endpoints/go.sum
+
+      - name: Build incident-only stale-target retirement command
+        working-directory: endpoints
+        env:
+          GOWORK: 'off'
+          KBS_SKIP_INIT: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p ../.bin
+          go build -trimpath -o ../.bin/session-control-stale-target-retirement ./cmd/session-control-stale-target-retirement
+
       # github.token remains private to this NHP repository. Public repository
       # authority is read through bounded anonymous HTTPS. Each private
       # lifecycle repository gets its own least-privilege token on terminal
@@ -177,6 +193,7 @@ jobs:
           CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT: ${{ inputs.lifecycle_run_attempt }}
           CUTOVER_CONNECTOR_LIFECYCLE_RUN_ID: ${{ inputs.connector_lifecycle_run_id }}
           CUTOVER_CONNECTOR_LIFECYCLE_RUN_ATTEMPT: ${{ inputs.connector_lifecycle_run_attempt }}
+          CUTOVER_STALE_TARGET_RETIRE_SCRIPT: ${{ github.workspace }}/.bin/session-control-stale-target-retirement
         run: |
           set -euo pipefail
           ./.github/scripts/recover-durable-aop-cutover-schema3.sh \

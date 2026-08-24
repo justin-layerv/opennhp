@@ -3,22 +3,31 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT=$ROOT/.github/scripts/emit-durable-aop-nhp-deployment-manifest.sh
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/bin" "$WORK/helpers"
+mkdir -p "$WORK/bin" "$WORK/helpers" "$WORK/repo/.github"
+cp -R "$ROOT/.github/scripts" "$WORK/repo/.github/scripts"
+ln -s "$ROOT/scripts" "$WORK/repo/scripts"
+ln -s "$ROOT/terraform" "$WORK/repo/terraform"
+SCRIPT=$WORK/repo/.github/scripts/emit-durable-aop-nhp-deployment-manifest.sh
 export FAKE_PARAMS=$WORK/params
 REPAIR=422b1d9acac53d50fe5602158fb02c8120ef108d
 RECOVERY=abcdefabcdefabcdefabcdefabcdefabcdefabcd
 SERVER_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 AC_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 RUNTIME=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
+LIVE_SOURCE=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
+LIVE_RUNTIME=906c0461bf3d44175750b91ec9251de114da0c3646750287656803e3783d5ed0
 ORIGINAL=e9b11398a4cea98da6ae5b41cfe635562e1b7c72
 ORIGINAL_OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 ORIGINAL_LOCK_DIGEST=6c7224d78837a4d56547409439d9bce30efa9b214367c4f19fd13cc3fe3b2ebd
-export REPAIR RECOVERY SERVER_DIGEST AC_DIGEST
+export REPAIR RECOVERY LIVE_SOURCE SERVER_DIGEST AC_DIGEST
 export FAKE_OWNER_ACTIONS=$WORK/owner-actions
+(cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 \
+  go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/incident-plan.json"
+[[ "$(printf '%s' "$(jq -cS . "$WORK/incident-plan.json")" | sha256sum | awk '{print $1}')" == \
+  f434ce1e13c69f8749e9004be26304002e7e8da28939815d062f643124abcfc6 ]]
 
 set_param() {
   local name=$1 value=$2
@@ -35,6 +44,12 @@ opt() { local key=$1 prior=; shift; for arg in "$@"; do [[ "$prior" == "$key" ]]
 case "$service/$operation" in
   ssm/get-parameter)
     name=$(opt --name "$@")
+    query=$(opt --query "$@")
+    if [[ "$query" == Parameter.Version ]]; then
+      [[ "$name" == */stale-target-retirement ]] || { echo "unexpected version authority $name" >&2; exit 99; }
+      printf '1\n'
+      exit 0
+    fi
     awk -F '\t' -v name="$name" '$1 == name {print substr($0,index($0,"\t")+1); found=1} END {exit !found}' "$FAKE_PARAMS" || {
       echo ParameterNotFound >&2; exit 254;
     }
@@ -61,7 +76,7 @@ if [[ "$args" == *'/actions/runs/700/attempts/2'* ]]; then
   conclusion=${FAKE_RECOVERY_CONCLUSION:-success}
   jq -cn --arg sha "$RECOVERY" --arg conclusion "$conclusion" \
     '{head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:2,status:"completed",conclusion:$conclusion,path:".github/workflows/recover-sandbox-durable-aop-schema3.yml"}'
-elif [[ "$args" == *'/actions/runs/800/attempts/3/jobs'* ]]; then
+elif [[ "$args" == *'/actions/runs/32682520698/attempts/1/jobs'* ]]; then
   jq -cn '
     def step($n;$c): {name:$n,conclusion:$c};
     def build($n): {name:$n,conclusion:"success",steps:[step("Skip notice";"skipped"),
@@ -79,10 +94,10 @@ elif [[ "$args" == *'/actions/runs/800/attempts/3/jobs'* ]]; then
       {name:"Deploy Sandbox cell1 - Infrastructure",conclusion:"skipped"},{name:"Deploy Sandbox cell1 - Blue/Green",conclusion:"skipped"},
       {name:"Deploy Sandbox - Control",conclusion:"skipped"},{name:"Deploy Sandbox - Validate",conclusion:"skipped"},
       {name:"NHP Smoke (sandbox)",conclusion:"skipped"}]}]'
-elif [[ "$args" == *'/actions/runs/800/attempts/3'* ]]; then
-  sha=$REPAIR; [[ "${FAKE_BUILD_DRIFT:-}" != true ]] || sha=9999999999999999999999999999999999999999
+elif [[ "$args" == *'/actions/runs/32682520698/attempts/1'* ]]; then
+  sha=$LIVE_SOURCE; [[ "${FAKE_BUILD_DRIFT:-}" != true ]] || sha=9999999999999999999999999999999999999999
   jq -cn --arg sha "$sha" \
-    '{id:800,repository:{full_name:"layervai/nhp"},head_repository:{full_name:"layervai/nhp"},head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:3,status:"completed",conclusion:"success",path:".github/workflows/build-and-push.yml"}'
+    '{id:32682520698,repository:{full_name:"layervai/nhp"},head_repository:{full_name:"layervai/nhp"},head_sha:$sha,head_branch:"main",event:"workflow_dispatch",run_attempt:1,status:"completed",conclusion:"success",path:".github/workflows/build-and-push.yml"}'
 else
   echo "unexpected gh $args" >&2
   exit 99
@@ -92,6 +107,7 @@ EOF
 cat >"$WORK/helpers/provenance" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ "$2" == "$LIVE_SOURCE" ]]
 if [[ "$1" == layerv/nhp-server ]]; then digest=$SERVER_DIGEST; else digest=$AC_DIGEST; fi
 printf 'v1|%s|%s|%s\n' "$2" "$1" "$digest"
 EOF
@@ -118,11 +134,68 @@ jq -r .expected_row_sha256 <<<"$intent"
 EOF
 chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
+fixture_fence_digest() {
+  local fence=$1
+  {
+    printf '\0%s' v1
+    for field in ac_id public_key boot_id flush_generation version authority_version counted_active_slot \
+      control_cell_id activated_control_version ready_control_version aak_enqueued_at_ms aak_transaction_id \
+      created_at_ms prepared_at_ms; do
+      printf '\0%s' "$(jq -r ".${field}" <<<"$fence")"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+
+fixture_directory_receipt() {
+  local count=$1 version=$2 updated=$3 digest
+  digest=$({
+    printf '\0%s' v1 cell0 "$version" "$count" false 0 '' 0 0 1787530000000 "$updated"
+  } | sha256sum | awk '{print $1}')
+  jq -cn --arg count "$count" --arg version "$version" --arg updated "$updated" --arg digest "$digest" '
+    {schema:"layerv.durable-aop-fence-directory-receipt.v1",cell_id:"cell0",version:$version,
+     active_fence_count:$count,admission_blocked:false,overflow_close_count:"0",overflow_leader_event_id:"",
+     overflow_leader_prepared_directory_version:"0",overflow_leader_selected_directory_version:"0",
+     created_at_ms:"1787530000000",updated_at_ms:$updated,directory_sha256:$digest}'
+}
+
+fixture_retired_ledger() {
+  local plan=$1
+  jq -c '[.targets[] | {id,fence_sha256,status:"retired",receipt:{
+    schema:"layerv.durable-aop-stale-target-retirement-receipt.v1",target_id:.id,
+    public_key:.fence.public_key,version:((.fence.version|tonumber)+1|tostring),
+    authority_version:((.fence.authority_version|tonumber)+1|tostring),counted_active_slot:false,
+    retired_at_ms:"1787540000000",retired_target_sha256:("d"*64)}}]' <<<"$plan"
+}
+
+encode_fixture_journal() {
+  python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-stale-target-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
+}
+
+decode_fixture_journal() {
+  python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
+
+mutate_fixture_journal() {
+  local filter=$1 envelope journal digest state
+  envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  journal=$(printf '%s' "$envelope" | decode_fixture_journal | jq -cS "$filter")
+  envelope=$(printf '%s' "$journal" | encode_fixture_journal)
+  digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:1 "$envelope"
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/state \
+    "$(jq -c --arg digest "$digest" '.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")"
+}
+
 seed() {
   : >"$FAKE_PARAMS"
   local server_provenance="v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}"
   local ac_provenance="v1|${REPAIR}|layerv/nhp-ac|${AC_DIGEST}"
-  local lock original_state state
+  local live_server_provenance="v1|${LIVE_SOURCE}|layerv/nhp-server|${SERVER_DIGEST}"
+  local live_ac_provenance="v1|${LIVE_SOURCE}|layerv/nhp-ac|${AC_DIGEST}"
+  local lock original_state state journal envelope journal_digest incident_plan predecessor_fence predecessor_plan predecessor_plan_digest
+  local incident_ledger predecessor_ledger fence_start fence_drain preferences c0_intent c1_intent ac_intent
   original_state=$(jq -cn --arg image "$ORIGINAL" --arg owner "$ORIGINAL_OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
      ac:{old_color:"blue",new_color:"green",old_asg:"layerv-nhp-sandbox-ac",new_asg:"layerv-nhp-sandbox-ac-green",old_min:3,old_max:3,old_desired:3,new_attestation:("v2|durable-aop-v1|"+$image+"|layerv/nhp-ac|sha256:2e38672ef7680c60521694c3f2a59e9a74ed8f2d56bfe1fb41a97f3040b4e279|layerv-nhp-sandbox-ac-green")},
@@ -132,8 +205,41 @@ seed() {
     '{schema:1,kind:"durable-aop-cutover-recovery",owner:$owner,image:$image,orchestrator_sha:$image,created_at:1787485146,expires_at:253402300799}')
   [[ "$(printf '%s' "$(jq -cS . <<<"$original_state")" | sha256sum | awk '{print $1}')" == "$ORIGINAL_STATE_DIGEST" ]]
   [[ "$(printf '%s' "$(jq -cS . <<<"$lock")" | sha256sum | awk '{print $1}')" == "$ORIGINAL_LOCK_DIGEST" ]]
+  incident_plan=$(jq -cS . "$WORK/incident-plan.json")
+  predecessor_fence=$(jq -cn '{ac_id:"layerv-ac-tf",public_key:"current-predecessor",boot_id:"boot-current",
+    flush_generation:"3",version:"49",authority_version:"5",counted_active_slot:true,control_cell_id:"cell0",
+    activated_control_version:"0",ready_control_version:"0",aak_enqueued_at_ms:"0",aak_transaction_id:"0",
+    created_at_ms:"1787529555693",prepared_at_ms:"1787533540595"}')
+  predecessor_plan=$(jq -cn --arg digest "$(fixture_fence_digest "$predecessor_fence")" \
+    --argjson fence "$predecessor_fence" '
+    {schema:"layerv.durable-aop-predecessor-target-plan.v1",table:"layerv-nhp-sandbox-cell0-nhp-session-control",
+     region:"us-east-2",ac_id:"layerv-ac-tf",control_cell_id:"cell0",
+     targets:[{id:"predecessor-1",fence:$fence,fence_sha256:$digest}]}')
+  predecessor_plan=$(jq -cS . <<<"$predecessor_plan")
+  predecessor_plan_digest=$(printf '%s' "$predecessor_plan" | sha256sum | awk '{print $1}')
+  incident_ledger=$(fixture_retired_ledger "$incident_plan")
+  predecessor_ledger=$(fixture_retired_ledger "$predecessor_plan")
+  fence_start=$(fixture_directory_receipt 8 19 1787535000000)
+  fence_drain=$(fixture_directory_receipt 0 27 1787545000000)
+  preferences='{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"SkipMatching":false}'
+  c0_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    cell0 layerv-nhp-sandbox-server "$LIVE_SOURCE" 32682520698 1 "$live_server_provenance" "$RECOVERY" \
+    "$preferences" prior-cell0 - | sha256sum | awk '{print $1}')
+  c1_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    cell1 layerv-nhp-sandbox-cell1-server-green "$LIVE_SOURCE" 32682520698 1 "$live_server_provenance" "$RECOVERY" \
+    "$preferences" prior-cell1 - | sha256sum | awk '{print $1}')
+  ac_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    ac layerv-nhp-sandbox-ac-green "$LIVE_SOURCE" 32682520698 1 "$live_ac_provenance" "$RECOVERY" \
+    "$preferences" prior-ac "$predecessor_plan_digest" | sha256sum | awk '{print $1}')
   state=$(jq -cn --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg runtime "$RUNTIME" \
+    --arg live_source "$LIVE_SOURCE" --arg live_runtime "$LIVE_RUNTIME" \
     --arg server "$server_provenance" --arg ac "$ac_provenance" \
+    --arg live_server "$live_server_provenance" --arg live_ac "$live_ac_provenance" \
+    --argjson incident_plan "$incident_plan" --argjson incident_ledger "$incident_ledger" \
+    --argjson predecessor_plan "$predecessor_plan" --arg predecessor_digest "$predecessor_plan_digest" \
+    --argjson predecessor_ledger "$predecessor_ledger" --argjson fence_start "$fence_start" \
+    --argjson fence_drain "$fence_drain" --argjson preferences "$preferences" \
+    --arg c0_intent "$c0_intent" --arg c1_intent "$c1_intent" --arg ac_intent "$ac_intent" \
     --argjson lock "$lock" --arg state_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" '
     {schema:3,phase:"repaired",original:{state_version:7,state_sha256:$state_digest,
       lock:$lock,lock_version:2,lock_sha256:$lock_digest},
@@ -151,8 +257,30 @@ seed() {
         table:"layerv-nhp-sandbox-control-qurl-customers",region:"us-east-2",source_sha:$repair,
         provisioned_at:"2026-08-23T21:00:00Z",expected_created_at:"2026-08-23T21:00:00Z",
         expected_updated_at:"2026-08-23T21:00:00Z",expected_usage:"0",expected_assigned_cell_id:"",
-        expected_row_sha256:("d"*64)}}}}')
+        expected_row_sha256:("d"*64)}},
+      stale_target_retirement:{schema:"layerv.durable-aop-stale-target-retirement-journal.v1",status:"complete",
+        source_state_version:"22",source_state_sha256:"b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5d19e75f45ef348",
+        incident_plan_sha256:"f434ce1e13c69f8749e9004be26304002e7e8da28939815d062f643124abcfc6",
+        incident_plan:$incident_plan,incident_targets:$incident_ledger,
+        runtime:{source_sha:$live_source,build_run_id:"32682520698",build_run_attempt:"1",runtime_manifest:$live_runtime,
+          server_provenance:$live_server,ac_provenance:$live_ac,preferences:$preferences,
+          cell0:{asg:"layerv-nhp-sandbox-server",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-server|"+($live_server|split("|")[-1])+"|layerv-nhp-sandbox-server"),prior_refresh_id:"prior-cell0",intent_sha256:$c0_intent,refresh_id:"runtime-cell0"},
+          cell1:{asg:"layerv-nhp-sandbox-cell1-server-green",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-server|"+($live_server|split("|")[-1])+"|layerv-nhp-sandbox-cell1-server-green"),prior_refresh_id:"prior-cell1",intent_sha256:$c1_intent,refresh_id:"runtime-cell1"},
+          ac:{asg:"layerv-nhp-sandbox-ac-green",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-ac|"+($live_ac|split("|")[-1])+"|layerv-nhp-sandbox-ac-green"),prior_refresh_id:"prior-ac",intent_sha256:$ac_intent,refresh_id:"runtime-ac"},
+          fence_start:$fence_start,fence_drain:$fence_drain,
+          predecessor_plan:$predecessor_plan,predecessor_plan_sha256:$predecessor_digest,
+          predecessor_targets:$predecessor_ledger}}}}')
+  journal=$(jq -cS .repair.stale_target_retirement <<<"$state")
+  envelope=$(printf '%s' "$journal" | encode_fixture_journal)
+  journal_digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
+  state=$(jq -c --arg parameter /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement \
+    --arg digest "$journal_digest" '
+      del(.repair.stale_target_retirement) |
+      .repair.stale_target_retirement_ref={parameter:$parameter,version:1,sha256:$digest}
+    ' <<<"$state")
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:1 "$envelope"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock "$lock"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state:7 "$original_state"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock:2 "$lock"
@@ -161,12 +289,12 @@ seed() {
     'sandbox-cell1 server green layerv-nhp-sandbox-cell1-server-green' \
     'sandbox ac green layerv-nhp-sandbox-ac-green'; do
     read -r env component color asg <<<"$spec"
-    if [[ "$component" == ac ]]; then provenance=$ac_provenance; else provenance=$server_provenance; fi
+    if [[ "$component" == ac ]]; then provenance=$live_ac_provenance; else provenance=$live_server_provenance; fi
     set_param "/${env}/nhp/${component}/active-color" "$color"
     suffix=; [[ "$color" == green ]] && suffix=green-
     set_param "/${env}/nhp/${component}/${suffix}asg-name" "$asg"
-    set_param "/${env}/nhp/${component}/${suffix}image-tag" "$REPAIR"
-    set_param "/${env}/nhp/${component}/${color}-protocol-profile" "v1|durable-aop-v1|${REPAIR}"
+    set_param "/${env}/nhp/${component}/${suffix}image-tag" "$LIVE_SOURCE"
+    set_param "/${env}/nhp/${component}/${color}-protocol-profile" "v1|durable-aop-v1|${LIVE_SOURCE}"
     set_param "/${env}/nhp/${component}/${color}-prepared-slot-attestation" \
       "v2|durable-aop-v1|${provenance#v1|}|${asg}"
   done
@@ -185,10 +313,10 @@ seed
 : >"$FAKE_OWNER_ACTIONS"
 invoke >/dev/null
 [[ "$(cat "$FAKE_OWNER_ACTIONS")" == verify ]]
-jq -e --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
+jq -e --arg repair "$LIVE_SOURCE" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
   (keys | sort) == ["build","deployments","environment","images","producer","profile","recovery_orchestrator_sha","repair_source_sha","repository","schema"] and
   .schema == "layerv.durable-aop-nhp-deployment.v1" and .repair_source_sha == $repair and
-  .recovery_orchestrator_sha == $recovery and .build.run_id == "800" and .build.run_attempt == "3" and
+  .recovery_orchestrator_sha == $recovery and .build.run_id == "32682520698" and .build.run_attempt == "1" and
   .producer.run_id == "900" and .producer.run_attempt == "4" and
   .images.server.digest == $server and .images.ac.digest == $ac and $server != $ac and
   .deployments.cell0.active_asg == "layerv-nhp-sandbox-server" and
@@ -201,6 +329,9 @@ jq -e --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg server "$SERVER_DI
 for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift refresh_failed asg_unhealthy \
   equal_digest floor_present slot_drift owner_missing owner_preparing owner_client_drift owner_source_drift \
   owner_digest_drift owner_live_verify_failed \
+  journal_missing journal_status journal_source journal_build journal_manifest journal_source_digest \
+  incident_plan_digest incident_fence_digest incident_receipt fence_drain_count fence_drain_digest \
+  component_intent predecessor_plan_digest predecessor_receipt \
   state_validated historical_state_mutated embedded_lock_mutated ledger_state_digest_mutated \
   ledger_lock_digest_mutated; do
   seed
@@ -244,6 +375,49 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
       ;;
     owner_live_verify_failed)
       export FAKE_OWNER_VERIFY_FAIL=true
+      ;;
+    journal_missing)
+      value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c 'del(.repair.stale_target_retirement_ref)' <<<"$value")"
+      ;;
+    journal_status)
+      mutate_fixture_journal '.status="predecessor_retiring"'
+      ;;
+    journal_source)
+      mutate_fixture_journal '.runtime.source_sha=("9"*40)'
+      ;;
+    journal_build)
+      mutate_fixture_journal '.runtime.build_run_id="801"'
+      ;;
+    journal_manifest)
+      mutate_fixture_journal '.runtime.runtime_manifest=("9"*64)'
+      ;;
+    journal_source_digest)
+      mutate_fixture_journal '.source_state_sha256=("9"*64)'
+      ;;
+    incident_plan_digest)
+      mutate_fixture_journal '.incident_plan_sha256=("9"*64)'
+      ;;
+    incident_fence_digest)
+      mutate_fixture_journal '.incident_plan.targets[0].fence_sha256=("9"*64)'
+      ;;
+    incident_receipt)
+      mutate_fixture_journal '.incident_targets[0].receipt.version="999"'
+      ;;
+    fence_drain_count)
+      mutate_fixture_journal '.runtime.fence_drain.active_fence_count="1"'
+      ;;
+    fence_drain_digest)
+      mutate_fixture_journal '.runtime.fence_drain.directory_sha256=("9"*64)'
+      ;;
+    component_intent)
+      mutate_fixture_journal '.runtime.ac.intent_sha256=("9"*64)'
+      ;;
+    predecessor_plan_digest)
+      mutate_fixture_journal '.runtime.predecessor_plan_sha256=("9"*64)'
+      ;;
+    predecessor_receipt)
+      mutate_fixture_journal '.runtime.predecessor_targets[0].receipt.authority_version="99"'
       ;;
     historical_state_mutated)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state:7" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")

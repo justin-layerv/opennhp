@@ -136,6 +136,18 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertNotIn("CUTOVER_VERIFY_CUSTOMER_LIFECYCLE_SCRIPT", text)
         self.assertNotIn("CUTOVER_VERIFY_CONNECTOR_LIFECYCLE_SCRIPT", text)
         self.assertIn("recovery_outcome: ${{ steps.recovery.outputs.recovery_outcome }}", text)
+        self.assertIn("Install exact Go toolchain", text)
+        self.assertIn("go-version-file: endpoints/go.mod", text)
+        self.assertIn("Build incident-only stale-target retirement command", text)
+        self.assertIn(
+            "go build -trimpath -o ../.bin/session-control-stale-target-retirement "
+            "./cmd/session-control-stale-target-retirement",
+            text.replace("\n", " "),
+        )
+        self.assertIn(
+            "CUTOVER_STALE_TARGET_RETIRE_SCRIPT: ${{ github.workspace }}/.bin/session-control-stale-target-retirement",
+            text,
+        )
         reject = text[text.index("- name: Reject mutable or malformed recovery dispatch"):text.index("- name: Checkout exact recovery controller")]
         self.assertIn('if [[ -z "$LIFECYCLE_RUN_ID$LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]', reject)
         self.assertEqual(reject.count('=~ ^[1-9][0-9]*$'), 6)
@@ -144,7 +156,7 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         text = SCRIPT.read_text()
         cell0 = text.index('write_state cell0_refreshed')
         cell1 = text.index('write_state cell1_refreshed')
-        ac = text.index('write_state repaired')
+        ac = text.index('write_state repaired', cell1)
         owner_plan = text.index('OWNER_INTENT=$("$OWNER_PROJECTOR" plan')
         owner_preparing = text.index('write_state repaired', owner_plan)
         owner_apply = text.index('"$OWNER_PROJECTOR" apply --intent-json "$OWNER_INTENT"')
@@ -161,7 +173,22 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertLess(owner_plan, owner_preparing)
         self.assertLess(owner_preparing, owner_apply)
         self.assertLess(owner_apply, owner_ready)
-        self.assertLess(owner_ready, deferred)
+        runtime_flow = text.index("# The merged runtime repair contains both server close-drain")
+        runtime_cell0 = text.index("advance_runtime_component_refresh cell0", runtime_flow)
+        runtime_cell1 = text.index("advance_runtime_component_refresh cell1", runtime_flow)
+        fence_drain = text.index("record_fence_drain", runtime_cell1)
+        incident_retirement = text.index("advance_stale_target_retirement", fence_drain)
+        ac_intent = text.index("initialize_ac_runtime_refresh", incident_retirement)
+        runtime_ac = text.index("advance_runtime_component_refresh ac", ac_intent)
+        predecessor_retirement = text.index("advance_predecessor_retirement", runtime_ac)
+        self.assertLess(owner_ready, runtime_cell0)
+        self.assertLess(runtime_cell0, runtime_cell1)
+        self.assertLess(runtime_cell1, fence_drain)
+        self.assertLess(fence_drain, incident_retirement)
+        self.assertLess(incident_retirement, ac_intent)
+        self.assertLess(ac_intent, runtime_ac)
+        self.assertLess(runtime_ac, predecessor_retirement)
+        self.assertLess(predecessor_retirement, deferred)
         self.assertLess(ac, ready)
         self.assertLess(ready, lifecycle)
         self.assertLess(lifecycle, connector)
@@ -194,7 +221,7 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertIn("OWNER_STATUS=preparing", text)
         self.assertIn("OWNER_STATUS=ready", text)
         deferred_start = text.index('if [[ "$LIFECYCLE_MODE" == deferred ]]')
-        deferred_end = text.index("\nrequire_hard_lock\nrefresh_active_component", deferred_start)
+        deferred_end = text.index("\nfi\n\nrequire_hard_lock", deferred_start) + len("\nfi")
         deferred = text[deferred_start:deferred_end]
         self.assertIn("require_hard_lock", deferred)
         self.assertIn("repaired_owner_ready_waiting_for_lifecycle", deferred)
