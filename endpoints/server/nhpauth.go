@@ -14,25 +14,32 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
 func bindServerSessionAuthorityForPluginCallback(callbackReq *common.NhpAuthRequest,
-	sessionID uint64, issuedAt time.Time, agentPublicKey, runID string, runAttempt uint64,
+	sessionID uint64, issuedAt time.Time, authority common.AgentKnockMsg,
 ) (*common.NhpAuthRequest, error) {
 	if callbackReq == nil || callbackReq.Msg == nil || sessionID == 0 || issuedAt.IsZero() ||
-		!common.ValidNHPAgentPublicKey(agentPublicKey) {
+		!common.ValidNHPAgentPublicKey(authority.NHPAgentPublicKey) {
 		return nil, common.ErrInvalidInput
 	}
 	requestCopy := *callbackReq
 	messageCopy := *callbackReq.Msg
 	requestCopy.SessionId = sessionID
 	requestCopy.SessionIssuedAt = issuedAt
-	requestCopy.PublicKey = agentPublicKey
+	requestCopy.PublicKey = authority.NHPAgentPublicKey
 	messageCopy.NHPSessionId = sessionID
 	messageCopy.NHPSessionIssuedAt = issuedAt
-	messageCopy.NHPAgentPublicKey = agentPublicKey
-	messageCopy.RunID = runID
-	messageCopy.RunAttempt = runAttempt
+	messageCopy.NHPAgentPublicKey = authority.NHPAgentPublicKey
+	messageCopy.NHPAgentOwnerID = authority.NHPAgentOwnerID
+	messageCopy.RunID = authority.RunID
+	messageCopy.RunAttempt = authority.RunAttempt
+	messageCopy.NativeSessionOperationID = authority.NativeSessionOperationID
+	messageCopy.NativeSessionOperationBinding = authority.NativeSessionOperationBinding
+	messageCopy.NativeSessionOperationOwnerID = authority.NativeSessionOperationOwnerID
+	messageCopy.NativeSessionOperationPrepared = authority.NativeSessionOperationPrepared
+	messageCopy.NativeSessionOperationExpiresAt = authority.NativeSessionOperationExpiresAt
 	requestCopy.Msg = &messageCopy
 	return &requestCopy, nil
 }
@@ -146,6 +153,11 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 		return nil, "", nil, errors.New("bodyless NHP_EXT is not authenticated authority on the current envelope")
 	}
 	if ppd.HeaderType == core.NHP_EXT {
+		var recovery common.AgentNativeSessionOperationRecoveryMsg
+		if err := common.DecodeAgentNativeSessionOperationRecoveryMsg(ppd.BodyMessage, &recovery); err == nil {
+			ack, userID, recoveryErr := s.buildAgentNativeSessionOperationRecoveryAck(ppd, recovery)
+			return ack, userID, nil, recoveryErr
+		}
 		ack, userID, err := s.buildAgentExactSessionCloseAck(ppd)
 		return ack, userID, nil, err
 	}
@@ -181,6 +193,7 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 	var closureErr error
 	var sessionReserved bool
 	var durableCandidate *sessionControlSessionCandidate
+	var nativeOperation *sessionControlNativeOperation
 	var durableCompensationErr error
 	var reservedSessionID uint64
 	var reservedSessionIssuedAt time.Time
@@ -286,6 +299,30 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 			return
 		}
 		knkMsg.NHPAgentPublicKey = base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+		operationPresent := common.NativeSessionOperationPresent(*knkMsg)
+		if operationPresent || (s.nativeSessionOperationEnabled() && knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID) {
+			if !operationPresent || !s.nativeSessionOperationEnabled() {
+				closureErr = common.ErrInvalidInput
+				ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+				ackMsg.ErrMsg = common.ErrServerACOpsFailed.Error()
+				return
+			}
+			serverBinding, bindingErr := s.nativeSessionOperationServerBinding()
+			if bindingErr == nil {
+				bindingErr = common.ValidateNativeSessionOperation(*knkMsg, knkMsg.NHPAgentPublicKey, serverBinding, time.Now())
+			}
+			var operation sessionControlNativeOperation
+			if bindingErr == nil {
+				operation, bindingErr = sessionControlNativeOperationForKnock(knkMsg, knkMsg.NHPAgentPublicKey, serverBinding)
+			}
+			if bindingErr != nil {
+				closureErr = common.ErrInvalidInput
+				ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+				ackMsg.ErrMsg = common.ErrServerACOpsFailed.Error()
+				return
+			}
+			nativeOperation = &operation
+		}
 
 		// Cloud mode agent peer resolution: with
 		// DisableAgentPeerValidation=true the noise responder skipped
@@ -294,7 +331,7 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 		// qurl-agent-keys DDB table. Nil lookup = DDB-backed agent
 		// path disabled (legacy etcd / file deployments); fall
 		// through to the auth handler unchanged.
-		if s.agentPeerLookup != nil && !isQurlRelaySelfAuthKnock(ppd, knkMsg) {
+		if nativeOperation == nil && s.agentPeerLookup != nil && !isQurlRelaySelfAuthKnock(ppd, knkMsg) {
 			if resolveErr := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, transactionId, addrStr); resolveErr != nil {
 				// resolveAgentPeerForKnock has already populated ackMsg.ErrCode/
 				// ErrMsg; the reject rides in the ack, so just stop the pipeline.
@@ -317,33 +354,35 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 		// (hot path, no allocation). Only fall through to
 		// ResolveAuthSvcProvider (which formats the log prefix and
 		// consults DDB) on a cache miss.
-		aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
-		if aspData == nil {
-			aspData = s.ResolveAuthSvcProvider(s.LifecycleCtx(), knkMsg.AuthServiceId,
-				fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
-		}
-		if aspData == nil {
-			closureErr = common.ErrAuthServiceProviderNotFound
-			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
-			ackMsg.ErrMsg = closureErr.Error()
-			// MetricAuthFailure attribution is owned by
-			// ResolveAuthSvcProvider: it fires on auth-policy-outcome
-			// branches (unknown aspId, no resource lookup wired AND no
-			// in-memory entry) and suppresses on DDB-error / graceful-
-			// shutdown branches. The caller MUST NOT add its own
-			// counter here or the MetricResourceLookupDDBError vs
-			// MetricAuthFailure split collapses.
-			return
-		}
-
-		// find out auth plugin handler
-		handler := s.FindPluginHandler(knkMsg.AuthServiceId)
-		if handler == nil {
-			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest-Auth] failed to find service provider with %s", knkMsg.UserId, transactionId, addrStr, knkMsg.AuthServiceId)
-			closureErr = common.ErrAuthServiceProviderNotFound
-			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
-			ackMsg.ErrMsg = closureErr.Error()
-			return
+		var aspData *common.AuthServiceProviderData
+		var handler plugins.PluginHandler
+		if nativeOperation == nil {
+			aspData = s.FindAuthSvcProvider(knkMsg.AuthServiceId)
+			if aspData == nil {
+				aspData = s.ResolveAuthSvcProvider(s.LifecycleCtx(), knkMsg.AuthServiceId,
+					fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
+			}
+			if aspData == nil {
+				closureErr = common.ErrAuthServiceProviderNotFound
+				ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+				// MetricAuthFailure attribution is owned by
+				// ResolveAuthSvcProvider: it fires on auth-policy-outcome
+				// branches (unknown aspId, no resource lookup wired AND no
+				// in-memory entry) and suppresses on DDB-error / graceful-
+				// shutdown branches. The caller MUST NOT add its own
+				// counter here or the MetricResourceLookupDDBError vs
+				// MetricAuthFailure split collapses.
+				return
+			}
+			handler = s.FindPluginHandler(knkMsg.AuthServiceId)
+			if handler == nil {
+				log.Error("server-agent(%s#%d@%s)[HandleKnockRequest-Auth] failed to find service provider with %s", knkMsg.UserId, transactionId, addrStr, knkMsg.AuthServiceId)
+				closureErr = common.ErrAuthServiceProviderNotFound
+				ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+				return
+			}
 		}
 
 		// The NHP-Server assigns one non-zero 8-byte session identifier for
@@ -364,8 +403,17 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 
 			candidate, candidateErr := sessionControlCandidateForKnock(s.sessionControlCellID, knkMsg)
 			if candidateErr == nil {
-				reserveCtx, reserveCancel := udpCorrelationCtx(DefaultStorageTimeout, knkMsg.UserId, transactionId)
-				candidateErr = s.reserveDurableSession(reserveCtx, candidate)
+				reserveBudget := DefaultStorageTimeout
+				if nativeOperation != nil {
+					candidate.NativeOperation = nativeOperation.Binding
+					reserveBudget = sessionControlNativeOperationWriteTimeout + sessionControlNativeOperationReadTimeout
+				}
+				reserveCtx, reserveCancel := udpCorrelationCtx(reserveBudget, knkMsg.UserId, transactionId)
+				if nativeOperation != nil {
+					candidateErr = s.reserveNativeDurableSession(reserveCtx, candidate, *nativeOperation, reservedSessionIssuedAt)
+				} else {
+					candidateErr = s.reserveDurableSession(reserveCtx, candidate)
+				}
 				reserveCancel()
 			}
 			if candidateErr == nil {
@@ -384,10 +432,21 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 			(s.sessionControlAuthorityRequired() && durableCandidate == nil) {
 			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to reserve NHP session authority: %v",
 				knkMsg.UserId, transactionId, addrStr, closureErr)
-			closureErr = common.ErrServerACOpsFailed
-			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-			ackMsg.ErrMsg = closureErr.Error()
+			if errors.Is(closureErr, common.ErrNativeSessionOperationRecoveryRequired) {
+				closureErr = common.ErrNativeSessionOperationRecoveryRequired
+				ackMsg.ErrCode = common.ErrNativeSessionOperationRecoveryRequired.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+			} else {
+				closureErr = common.ErrServerACOpsFailed
+				ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+			}
 			return
+		}
+		if nativeOperation != nil {
+			knkMsg.NHPAgentOwnerID = nativeOperation.OwnerID
+			peer := &core.UdpPeer{PubKeyBase64: knkMsg.NHPAgentPublicKey, Type: core.NHP_AGENT}
+			s.AddAgentPeer(peer)
 		}
 		// Everything after the plugin boundary uses this immutable server-owned
 		// tuple. A plugin may mutate req.Msg for resource resolution, but it must
@@ -395,6 +454,20 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 		// local and durable reservation during compensation.
 		sessionReserved = true
 		ackMsg.SessionId = reservedSessionID
+		// The durable OP transaction is the first external authority on this
+		// path. Only after it commits may the server consult ASP/plugin catalog
+		// state or invoke plugin/AOP work. A missing in-memory contract is then a
+		// normal compensated admission failure, never a pre-transaction bypass.
+		if nativeOperation != nil {
+			aspData = s.FindAuthSvcProvider(knkMsg.AuthServiceId)
+			handler = s.FindPluginHandler(knkMsg.AuthServiceId)
+			if aspData == nil || handler == nil {
+				closureErr = common.ErrAuthServiceProviderNotFound
+				ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+				return
+			}
+		}
 
 		authReq := &common.NhpAuthRequest{
 			Msg:            knkMsg,
@@ -409,9 +482,7 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 			SessionId:       reservedSessionID,
 			SessionIssuedAt: reservedSessionIssuedAt,
 		}
-		immutableAgentPublicKey := authReq.PublicKey
-		immutableRunID := knkMsg.RunID
-		immutableRunAttempt := knkMsg.RunAttempt
+		immutableSessionAuthority := *knkMsg
 		helper := s.NewNhpServerHelper(ppd, aspData)
 		helper.AuthWithNhpCallbackFunc = func(callbackReq *common.NhpAuthRequest,
 			res *common.ResourceData,
@@ -419,7 +490,7 @@ func (s *UdpServer) buildKnockAckWithAdmission(ppd *core.PacketParserData) ([]by
 			// A plugin may normalize resource fields before dispatch, but it may
 			// not rewrite or cross-swap the authenticated session authority.
 			requestCopy, bindErr := bindServerSessionAuthorityForPluginCallback(callbackReq,
-				reservedSessionID, reservedSessionIssuedAt, immutableAgentPublicKey, immutableRunID, immutableRunAttempt)
+				reservedSessionID, reservedSessionIssuedAt, immutableSessionAuthority)
 			if bindErr != nil {
 				return nil, bindErr
 			}

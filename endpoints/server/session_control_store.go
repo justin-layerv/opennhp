@@ -10,6 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 const sessionControlHealthPK = "CONTROL#__healthcheck__"
@@ -39,9 +41,19 @@ type sessionControlDynamoAPI interface {
 	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 }
 
+type sessionControlNativeOperationDynamoAPI interface {
+	TransactGetItems(context.Context, *dynamodb.TransactGetItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactGetItemsOutput, error)
+	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+}
+
 type dynamoSessionControlStore struct {
 	client           sessionControlDynamoAPI
+	operationClient  sessionControlNativeOperationDynamoAPI
 	tableName        string
+	agentKeysTable   string
+	awsAccountID     string
+	awsRegion        string
+	nativeOperations bool
 	nowUTC           func() time.Time
 	operationTimeout time.Duration
 }
@@ -64,13 +76,38 @@ func NewSessionControlStoreFromStorage(ctx context.Context, storage StorageBacke
 	if ddb.config.SessionControlTable == "" {
 		return nil, errors.New("session-control store: SessionControlTable is not configured")
 	}
+	var operationClient sessionControlNativeOperationDynamoAPI
+	if ddb.config.NativeSessionOperations {
+		var ok bool
+		operationClient, ok = any(ddb.client).(sessionControlNativeOperationDynamoAPI)
+		if !ok {
+			return nil, errors.New("session-control store: DynamoDB client lacks native operation transactions")
+		}
+		binding := common.NativeSessionOperationServerBinding{
+			AWSAccountID: ddb.config.AccountID, AWSRegion: ddb.config.Region, CellID: "startup",
+			SessionControlTable: ddb.config.SessionControlTable, AgentKeysTable: ddb.config.AgentKeysTable,
+			AgentKeySchema:   common.NativeSessionOperationAgentKeySchema,
+			CredentialKind:   common.NativeSessionOperationCredentialKind,
+			ConnectorIDClaim: common.NativeSessionOperationConnectorIDClaim,
+		}
+		if err := validateNativeSessionOperationServerBindingConfig(binding); err != nil {
+			return nil, fmt.Errorf("session-control store: %w", err)
+		}
+	}
 	store := &dynamoSessionControlStore{
-		client:    ddb.client,
-		tableName: ddb.config.SessionControlTable,
-		nowUTC:    func() time.Time { return time.Now().UTC() },
+		client: ddb.client, operationClient: operationClient,
+		tableName: ddb.config.SessionControlTable, agentKeysTable: ddb.config.AgentKeysTable,
+		awsAccountID: ddb.config.AccountID, awsRegion: ddb.config.Region,
+		nativeOperations: ddb.config.NativeSessionOperations,
+		nowUTC:           func() time.Time { return time.Now().UTC() },
 	}
 	if err := store.PingSessionControl(ctx); err != nil {
 		return nil, err
+	}
+	if store.nativeOperations {
+		if err := store.PingNativeSessionOperation(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return store, nil
 }

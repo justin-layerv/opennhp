@@ -362,6 +362,11 @@ type UdpServer struct {
 	// during cloud Start before the UDP listener binds. It is immutable after
 	// Start and is the cell authority used by AOL fence snapshots/activation.
 	sessionControlCellID string
+	// nativeSessionOperationFences is a strong boot-loaded per-cell snapshot.
+	// Healthy OP admissions make no pre-transaction AWS call; the transaction
+	// conditions this exact directory identity. Staleness can only reject, never
+	// admit across a changed fence.
+	nativeSessionOperationFences *sessionControlNativeOperationFenceCache
 	// acSessionControlAdmission serializes the durable Prepare -> catch-up ->
 	// Activate -> publish transition per AC identity. Its bookkeeping mutex is
 	// never held while waiting for the keyed mutex and the keyed mutex is never
@@ -970,6 +975,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 				}
 				if err := s.validateSessionControlRecoveryCapabilities(); err != nil {
 					return fmt.Errorf("initialize mandatory session-control recovery authority: %w", err)
+				}
+				if err := s.initializeNativeSessionOperationFenceCache(ctx); err != nil {
+					return fmt.Errorf("initialize native session operation fence authority: %w", err)
 				}
 				log.Info("Session-control authority initialized (DDB, strong startup read succeeded)")
 			}
@@ -5461,7 +5469,10 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	// registry wired). ResolveOwnerIDByPubKey returns "" via its
 	// receiver nil-guard — the same empty contract as legacy entries.
 	// Cache-eviction observability tracked in #2148.
-	ownerId := s.ResolveOwnerIDByPubKey(s.LifecycleCtx(), req.PublicKey)
+	ownerId := knkMsg.NHPAgentOwnerID
+	if ownerId == "" {
+		ownerId = s.ResolveOwnerIDByPubKey(s.LifecycleCtx(), req.PublicKey)
+	}
 	if publishErr := s.PublishACKTokens(s.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
 		log.Error("server-agent(%s@%s)[handleNhpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, addrStr, publishErr)
 		if agentPubKey, keyErr := decodeAgentPublicKey(req.PublicKey); keyErr == nil {

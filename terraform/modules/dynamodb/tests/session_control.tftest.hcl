@@ -225,3 +225,142 @@ run "other_cells_do_not_receive_incident_delete_authority" {
     error_message = "The attended sandbox cell0 incident permission must not widen to another cell."
   }
 }
+
+run "sandbox_native_operation_authority_is_transaction_only" {
+  command = apply
+
+  variables {
+    deploy_qurl_tables                             = true
+    enable_native_session_operations               = true
+    native_session_operations_use_local_agent_keys = true
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DenyDirectNativeSessionOperationWrite"
+      ]) == {
+      Sid      = "DenyDirectNativeSessionOperationWrite"
+      Effect   = "Deny"
+      Action   = ["dynamodb:PutItem"]
+      Resource = [aws_dynamodb_table.session_control.arn]
+      Condition = {
+        "ForAnyValue:StringLike" = {
+          "dynamodb:LeadingKeys" = ["OP#*"]
+        }
+        "StringNotEqualsIfExists" = {
+          "dynamodb:EnclosingOperation" = "TransactWriteItems"
+        }
+      }
+    }
+    error_message = "Direct, missing-enclosure, and wrong-transaction OP mutations must be explicitly denied even though the legacy base-table statement allows constituent item verbs."
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DenyNativeSessionOperationUpdateDelete"
+      ]) == {
+      Sid    = "DenyNativeSessionOperationUpdateDelete"
+      Effect = "Deny"
+      Action = [
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:UpdateItem",
+      ]
+      Resource = [aws_dynamodb_table.session_control.arn]
+      Condition = {
+        "ForAnyValue:StringLike" = {
+          "dynamodb:LeadingKeys" = ["OP#*"]
+        }
+      }
+    }
+    error_message = "OP ConditionCheckItem, Query, UpdateItem, and DeleteItem must be denied for every enclosing operation; exact transitions use conditional PutItem and exact reads use TransactGetItems only."
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DenyDirectNativeSessionOperationRead"
+      ]) == {
+      Sid      = "DenyDirectNativeSessionOperationRead"
+      Effect   = "Deny"
+      Action   = ["dynamodb:GetItem"]
+      Resource = [aws_dynamodb_table.session_control.arn]
+      Condition = {
+        "ForAnyValue:StringLike" = {
+          "dynamodb:LeadingKeys" = ["OP#*"]
+        }
+        "StringNotEqualsIfExists" = {
+          "dynamodb:EnclosingOperation" = "TransactGetItems"
+        }
+      }
+    }
+    error_message = "OP reads must be available only as TransactGetItems members; direct GetItem and wrong enclosing operations must be denied."
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+      if statement.Sid == "DynamoDBQurlAgentKeysTransactionCondition"
+      ]) == {
+      Sid      = "DynamoDBQurlAgentKeysTransactionCondition"
+      Effect   = "Allow"
+      Action   = ["dynamodb:ConditionCheckItem"]
+      Resource = aws_dynamodb_table.qurl_agent_keys[0].arn
+      Condition = {
+        StringEquals = {
+          "dynamodb:EnclosingOperation" = "TransactWriteItems"
+        }
+      }
+    }
+    error_message = "The agent-key table must grant only ConditionCheckItem inside TransactWriteItems on its exact base ARN."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : (
+        statement.Resource != aws_dynamodb_table.qurl_agent_keys[0].arn ||
+        length(setintersection(toset(statement.Action), toset([
+          "dynamodb:DeleteItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]))) == 0
+      )
+    ])
+    error_message = "NHP must never receive Put, Update, or Delete authority on qurl-agent-keys."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement :
+      !can(regex("/index/", tostring(statement.Resource))) || statement.Sid == "DynamoDBQurlAgentKeysPubkeyIndexQuery" || statement.Sid == "DynamoDBSessionControlDueIndex" || statement.Sid == "DynamoDBReadAccess"
+    ])
+    error_message = "Native operation transaction authority must not widen to any index ARN."
+  }
+}
+
+run "control_identity_native_operations_do_not_grant_local_agent_keys" {
+  command = apply
+
+  variables {
+    deploy_qurl_tables                             = true
+    enable_native_session_operations               = true
+    native_session_operations_use_local_agent_keys = false
+  }
+
+  assert {
+    condition = (
+      length([
+        for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+        if statement.Sid == "DynamoDBQurlAgentKeysTransactionCondition"
+      ]) == 0 &&
+      length([
+        for statement in jsondecode(aws_iam_policy.dynamodb_read.policy).Statement : statement
+        if statement.Sid == "DenyDirectNativeSessionOperationWrite" || statement.Sid == "DenyDirectNativeSessionOperationRead" || statement.Sid == "DenyNativeSessionOperationUpdateDelete"
+      ]) == 3
+    )
+    error_message = "Control identity must retain the session-table OP fence without granting ConditionCheckItem on the unused cell-local agent-key table."
+  }
+}

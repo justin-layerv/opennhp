@@ -547,6 +547,62 @@ resource "aws_iam_policy" "dynamodb_read" {
           aws_dynamodb_table.session_control.arn
         ]
       },
+      ], var.enable_native_session_operations ? [
+      {
+        # The legacy authority above must continue to serve every non-OP
+        # namespace. These explicit denies make OP# rows usable only as
+        # members of the reviewed atomic transactions, even though IAM
+        # authorizes DynamoDB transactions by their constituent item verbs.
+        Sid      = "DenyDirectNativeSessionOperationWrite"
+        Effect   = "Deny"
+        Action   = ["dynamodb:PutItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+          "StringNotEqualsIfExists" = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
+      }
+      ] : [], var.enable_native_session_operations ? [
+      {
+        # Every OP transition is an exact conditional Put and every OP read is
+        # an exact TransactGetItems member. No OP path uses ConditionCheckItem,
+        # Query, UpdateItem, or DeleteItem, so deny them even when broader
+        # session-control authority permits the same actions on other keys.
+        Sid    = "DenyNativeSessionOperationUpdateDelete"
+        Effect = "Deny"
+        Action = [
+          "dynamodb:ConditionCheckItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+        }
+      }
+      ] : [], var.enable_native_session_operations ? [
+      {
+        Sid      = "DenyDirectNativeSessionOperationRead"
+        Effect   = "Deny"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+          "StringNotEqualsIfExists" = {
+            "dynamodb:EnclosingOperation" = "TransactGetItems"
+          }
+        }
+      }
+      ] : [], [
       {
         # due-index is discovery only. Workers strong-read the base row before
         # claiming work, so the GSI receives Query and no write/read widening.
@@ -600,6 +656,18 @@ resource "aws_iam_policy" "dynamodb_read" {
         Effect   = "Allow"
         Action   = ["dynamodb:Query"]
         Resource = "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/pubkey-index"
+      }
+      ] : [], var.native_session_operations_use_local_agent_keys ? [
+      {
+        Sid      = "DynamoDBQurlAgentKeysTransactionCondition"
+        Effect   = "Allow"
+        Action   = ["dynamodb:ConditionCheckItem"]
+        Resource = aws_dynamodb_table.qurl_agent_keys[0].arn
+        Condition = {
+          StringEquals = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
       }
       ] : [], var.kms_key_arn != null ? [{
         # Encrypt/GenerateDataKey are required for nhp-server PutItem calls

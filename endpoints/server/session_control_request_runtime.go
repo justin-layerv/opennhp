@@ -30,6 +30,16 @@ type sessionControlRequestStore interface {
 	EnsureExactSessionClose(context.Context, sessionControlSessionCandidate, int64) (*sessionControlExactClosePreparation, error)
 }
 
+type sessionControlNativeOperationRequestStore interface {
+	ReserveNativeSessionOperation(context.Context, sessionControlSessionCandidate, sessionControlNativeOperation,
+		sessionControlFenceSnapshot, time.Time) (*sessionControlSessionAuthority, error)
+	VerifyMappedNativeSessionOperation(context.Context, sessionControlSessionCandidate,
+		sessionControlNativeOperation) (*sessionControlSessionAuthority, *sessionControlFenceDirectory, error)
+	CancelAbsentNativeSessionOperation(context.Context, sessionControlNativeOperation,
+		time.Time) (*sessionControlNativeOperationAuthority, error)
+	ResolveNativeSessionOperation(context.Context, string) (*sessionControlNativeOperationAuthority, error)
+}
+
 // sessionControlExactRetirementStore is the authenticated client-close seam.
 // Session IDs are globally non-reused durable keys; the strong resolver also
 // binds the authenticated agent and assigned cell before the existing exact
@@ -194,6 +204,69 @@ func sessionControlCandidateForKnock(cellID string, knkMsg *common.AgentKnockMsg
 	return candidate, nil
 }
 
+func (s *UdpServer) nativeSessionOperationEnabled() bool {
+	return s != nil && s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB &&
+		s.storageConfig.DynamoDB.NativeSessionOperations
+}
+
+func (s *UdpServer) nativeSessionOperationServerBinding() (common.NativeSessionOperationServerBinding, error) {
+	if !s.nativeSessionOperationEnabled() {
+		return common.NativeSessionOperationServerBinding{}, errors.New("native session operations are disabled")
+	}
+	binding := common.NativeSessionOperationServerBinding{
+		AWSAccountID: s.storageConfig.DynamoDB.AccountID, AWSRegion: s.storageConfig.DynamoDB.Region,
+		CellID: s.sessionControlCellID, SessionControlTable: s.storageConfig.DynamoDB.SessionControlTable,
+		AgentKeysTable:   s.storageConfig.DynamoDB.AgentKeysTable,
+		AgentKeySchema:   common.NativeSessionOperationAgentKeySchema,
+		CredentialKind:   common.NativeSessionOperationCredentialKind,
+		ConnectorIDClaim: common.NativeSessionOperationConnectorIDClaim,
+	}
+	if err := validateNativeSessionOperationServerBindingConfig(binding); err != nil {
+		return common.NativeSessionOperationServerBinding{}, err
+	}
+	return binding, nil
+}
+
+func (s *UdpServer) nativeSessionOperationStore() (sessionControlNativeOperationRequestStore, error) {
+	if !s.nativeSessionOperationEnabled() || s.sessionControlStore == nil {
+		return nil, errors.New("native session operation store is unavailable")
+	}
+	store, ok := s.sessionControlStore.(sessionControlNativeOperationRequestStore)
+	if !ok {
+		return nil, errors.New("native session operation store capability is incomplete")
+	}
+	return store, nil
+}
+
+func (s *UdpServer) reserveNativeDurableSession(ctx context.Context, candidate sessionControlSessionCandidate,
+	op sessionControlNativeOperation, now time.Time,
+) error {
+	store, err := s.nativeSessionOperationStore()
+	if err != nil {
+		return err
+	}
+	if s.nativeSessionOperationFences == nil {
+		return errors.New("native session operation fence cache is unavailable")
+	}
+	snapshot, err := s.nativeSessionOperationFences.allowSnapshot()
+	if err != nil {
+		s.nativeSessionOperationFences.refreshAsync(s)
+		return err
+	}
+	reserved, err := store.ReserveNativeSessionOperation(ctx, candidate, op, snapshot, now)
+	if err != nil {
+		if errors.Is(err, errSessionControlNativeOperationConflict) || errors.Is(err, errSessionControlSessionFenceStale) {
+			s.nativeSessionOperationFences.refreshAsync(s)
+		}
+		return err
+	}
+	if reserved == nil || reserved.Candidate != candidate || reserved.State != sessionControlSessionStateReserved ||
+		reserved.Version != 1 || reserved.TargetCount != 0 {
+		return errSessionControlNativeOperationCorrupt
+	}
+	return nil
+}
+
 func sessionControlRetainUntilMillis(candidate sessionControlSessionCandidate, openTime uint32, deliveryDeadline time.Time) (int64, error) {
 	baseMillis := time.Now().UnixMilli()
 	if deliveryDeadline.UnixMilli() > baseMillis {
@@ -263,6 +336,34 @@ func (s *UdpServer) VerifyForwardedDurableNHPSession(ctx context.Context,
 	candidate, err := sessionControlCandidateForKnock(s.sessionControlCellID, knkMsg)
 	if err != nil {
 		return common.AgentSessionReceipt{}, err
+	}
+	if common.NativeSessionOperationPresent(*knkMsg) {
+		binding, bindingErr := s.nativeSessionOperationServerBinding()
+		if bindingErr != nil {
+			return common.AgentSessionReceipt{}, bindingErr
+		}
+		op, operationErr := sessionControlNativeOperationForKnock(knkMsg, knkMsg.NHPAgentPublicKey, binding)
+		if operationErr != nil {
+			return common.AgentSessionReceipt{}, operationErr
+		}
+		candidate.NativeOperation = op.Binding
+		store, storeErr := s.nativeSessionOperationStore()
+		if storeErr != nil {
+			return common.AgentSessionReceipt{}, storeErr
+		}
+		verified, _, verifyErr := store.VerifyMappedNativeSessionOperation(ctx, candidate, op)
+		if verifyErr != nil {
+			return common.AgentSessionReceipt{}, verifyErr
+		}
+		if verified == nil || verified.Candidate != candidate || verified.State != sessionControlSessionStateReserved {
+			return common.AgentSessionReceipt{}, errSessionControlNativeOperationCorrupt
+		}
+		knkMsg.NHPAgentOwnerID = op.OwnerID
+		return common.AgentSessionReceipt{
+			CellID: candidate.CellID, SessionID: candidate.SessionID,
+			SessionIssuedAtMillis: candidate.IssuedAtMillis,
+			RunID:                 candidate.RunID, RunAttempt: candidate.RunAttempt,
+		}, nil
 	}
 	store, err := s.requestSessionControlStore()
 	if err != nil {

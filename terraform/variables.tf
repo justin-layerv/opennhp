@@ -312,6 +312,17 @@ variable "enable_matched_cohort_canary" {
   default     = false
 }
 
+variable "enable_native_session_operations" {
+  description = "Enable the sandbox-only durable registered-agent operation protocol."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_native_session_operations || var.environment == "sandbox"
+    error_message = "enable_native_session_operations is restricted to sandbox."
+  }
+}
+
 variable "matched_cohort_smoke_ingress_cidrs" {
   description = "Exact protected-runner IPv4 /32 CIDRs allowed to reach candidate-only server and relay listeners."
   type        = list(string)

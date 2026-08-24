@@ -417,6 +417,7 @@ type StorageConfig struct {
 
 // DynamoDBConfig configures the DynamoDB storage backend.
 type DynamoDBConfig struct {
+	AccountID                  string `toml:"AccountID"`
 	Region                     string `toml:"Region"`
 	LicensesTable              string `toml:"LicensesTable"`
 	ACAssignmentsTable         string `toml:"ACAssignmentsTable"`
@@ -443,7 +444,11 @@ type DynamoDBConfig struct {
 	// close-operation, and per-target recovery rows. Pending rows never rely on
 	// DynamoDB TTL for correctness; recovery reads the base PK/SK strongly.
 	SessionControlTable string `toml:"SessionControlTable"`
-	Endpoint            string `toml:"Endpoint,omitempty"` // For local development
+	// NativeSessionOperations enables the sandbox-only durable registered-agent
+	// operation protocol. Production remains false until a separately reviewed
+	// matched-cohort rollout is authorized.
+	NativeSessionOperations bool   `toml:"NativeSessionOperations"`
+	Endpoint                string `toml:"Endpoint,omitempty"` // For local development
 }
 
 // EtcdStorageConfig configures the etcd storage backend.

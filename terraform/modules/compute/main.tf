@@ -695,7 +695,7 @@ resource "aws_iam_role_policy" "server_control_identity_agent_keys" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "ControlIdentityAgentKeysGetItem"
         Effect   = "Allow"
@@ -720,7 +720,17 @@ resource "aws_iam_role_policy" "server_control_identity_agent_keys" {
           }
         }
       }
-    ]
+      ], var.enable_native_session_operations ? [{
+        Sid      = "ControlIdentityAgentKeysTransactionCondition"
+        Effect   = "Allow"
+        Action   = ["dynamodb:ConditionCheckItem"]
+        Resource = var.control_identity_agent_keys_table_arn
+        Condition = {
+          StringEquals = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
+    }] : [])
   })
 
   lifecycle {
@@ -1117,6 +1127,7 @@ locals {
     dynamodb_agent_keys_table              = var.dynamodb_agent_keys_table
     dynamodb_ack_tokens_table              = var.dynamodb_ack_tokens_table
     dynamodb_session_control_table         = var.dynamodb_session_control_table
+    enable_native_session_operations       = var.enable_native_session_operations
     # Cloud Map configuration for server health discovery
     cloudmap_enabled        = var.cloudmap_enabled
     cloudmap_namespace_name = var.cloudmap_namespace_name

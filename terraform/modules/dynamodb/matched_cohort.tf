@@ -188,6 +188,54 @@ resource "aws_iam_policy" "matched_cohort_server" {
         ]
         Resource = aws_dynamodb_table.session_control.arn
       },
+      ], var.enable_native_session_operations ? [
+      {
+        Sid      = "DenyCandidateDirectNativeSessionOperationWrite"
+        Effect   = "Deny"
+        Action   = ["dynamodb:PutItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+          "StringNotEqualsIfExists" = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
+      }
+      ] : [], var.enable_native_session_operations ? [
+      {
+        Sid    = "DenyCandidateNativeSessionOperationUpdateDelete"
+        Effect = "Deny"
+        Action = [
+          "dynamodb:ConditionCheckItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+        }
+      }
+      ] : [], var.enable_native_session_operations ? [
+      {
+        Sid      = "DenyCandidateDirectNativeSessionOperationRead"
+        Effect   = "Deny"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.session_control.arn]
+        Condition = {
+          "ForAnyValue:StringLike" = {
+            "dynamodb:LeadingKeys" = ["OP#*"]
+          }
+          "StringNotEqualsIfExists" = {
+            "dynamodb:EnclosingOperation" = "TransactGetItems"
+          }
+        }
+      }
+      ] : [], [
       {
         Sid      = "CandidateSessionControlDueIndex"
         Effect   = "Allow"
@@ -207,6 +255,18 @@ resource "aws_iam_policy" "matched_cohort_server" {
         Action   = ["dynamodb:Query"]
         Resource = "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/pubkey-index"
       },
+      ] : [], var.native_session_operations_use_local_agent_keys ? [
+      {
+        Sid      = "CandidateQurlAgentKeysTransactionCondition"
+        Effect   = "Allow"
+        Action   = ["dynamodb:ConditionCheckItem"]
+        Resource = aws_dynamodb_table.qurl_agent_keys[0].arn
+        Condition = {
+          StringEquals = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
+      }
       ] : [], var.kms_key_arn != null ? [{
         Sid      = "CandidateDynamoDBKMS"
         Effect   = "Allow"

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -364,21 +365,37 @@ func TestPluginCallbackRestoresFullServerSessionAuthority(t *testing.T) {
 	originalMessage := &common.AgentKnockMsg{
 		NHPSessionId: 991, NHPSessionIssuedAt: issuedAt.Add(24 * time.Hour),
 		NHPAgentPublicKey: testPubkeyB64(0x62), RunID: "fedcba9876543210", RunAttempt: 9,
+		NHPAgentOwnerID: "mutated-owner", NativeSessionOperationID: strings.Repeat("b", 64),
+		NativeSessionOperationBinding: strings.Repeat("c", 64), NativeSessionOperationOwnerID: "mutated-owner",
+		NativeSessionOperationPrepared: 1, NativeSessionOperationExpiresAt: 2,
 		ResourceId: "plugin-normalized-resource",
 	}
 	mutated := &common.NhpAuthRequest{
 		Msg: originalMessage, SessionId: 992, SessionIssuedAt: issuedAt.Add(48 * time.Hour),
 		PublicKey: testPubkeyB64(0x63),
 	}
-	bound, err := bindServerSessionAuthorityForPluginCallback(mutated, 990, issuedAt,
-		agentPublicKey, "0123456789abcdef", 3)
+	authority := common.AgentKnockMsg{
+		NHPAgentPublicKey: agentPublicKey, NHPAgentOwnerID: "auth0|fixed-owner",
+		RunID: "0123456789abcdef", RunAttempt: 3,
+		NativeSessionOperationID:       strings.Repeat("a", 64),
+		NativeSessionOperationBinding:  strings.Repeat("d", 64),
+		NativeSessionOperationOwnerID:  "auth0|fixed-owner",
+		NativeSessionOperationPrepared: 100, NativeSessionOperationExpiresAt: 200,
+	}
+	bound, err := bindServerSessionAuthorityForPluginCallback(mutated, 990, issuedAt, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bound.SessionId != 990 || !bound.SessionIssuedAt.Equal(issuedAt) || bound.PublicKey != agentPublicKey ||
 		bound.Msg.NHPSessionId != 990 || !bound.Msg.NHPSessionIssuedAt.Equal(issuedAt) ||
 		bound.Msg.NHPAgentPublicKey != agentPublicKey || bound.Msg.RunID != "0123456789abcdef" ||
-		bound.Msg.RunAttempt != 3 || bound.Msg.ResourceId != "plugin-normalized-resource" {
+		bound.Msg.RunAttempt != 3 || bound.Msg.ResourceId != "plugin-normalized-resource" ||
+		bound.Msg.NHPAgentOwnerID != authority.NHPAgentOwnerID ||
+		bound.Msg.NativeSessionOperationID != authority.NativeSessionOperationID ||
+		bound.Msg.NativeSessionOperationBinding != authority.NativeSessionOperationBinding ||
+		bound.Msg.NativeSessionOperationOwnerID != authority.NativeSessionOperationOwnerID ||
+		bound.Msg.NativeSessionOperationPrepared != authority.NativeSessionOperationPrepared ||
+		bound.Msg.NativeSessionOperationExpiresAt != authority.NativeSessionOperationExpiresAt {
 		t.Fatalf("bound callback authority = %#v", bound)
 	}
 	if mutated.SessionId != 992 || mutated.Msg.NHPSessionId != 991 || mutated.Msg.ResourceId != "plugin-normalized-resource" {

@@ -491,7 +491,7 @@ func sessionControlSessionCloseUpdate(current, planned sessionControlSessionAuth
 	condition := "kind = :kind AND schema_version = :schema AND cell_id = :cell_id AND agent_public_key = :agent_public_key AND session_id = :session_id AND issued_at_ms = :issued_at AND reservation_deadline_ms = :reservation_deadline AND run_id = :run_id AND run_attempt = :run_attempt AND #state = :state AND #version = :version AND target_count = :count AND retain_until_ms = :retain AND reserved_directory_version = :reserved_version AND reserved_active_fence_count = :reserved_count AND attribute_not_exists(close_event_id) AND attribute_not_exists(close_prepared_directory_version) AND attribute_not_exists(close_prepared_at_ms) AND attribute_not_exists(#ttl)"
 	values := map[string]types.AttributeValue{
 		":kind":                   &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
-		":schema":                 &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchema)},
+		":schema":                 &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchemaForCandidate(candidate))},
 		":cell_id":                &types.AttributeValueMemberS{Value: candidate.CellID},
 		":agent_public_key":       &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
 		":session_id":             &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
@@ -527,6 +527,7 @@ func sessionControlSessionCloseUpdate(current, planned sessionControlSessionAuth
 		condition += " AND ack_enqueued_at_ms = :ack_enqueued_at AND attribute_not_exists(due_shard) AND attribute_not_exists(due_sort)"
 		values[":ack_enqueued_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(current.AckEnqueuedAtMillis)}
 	}
+	condition = sessionControlAppendNativeOperationCondition(condition, values, candidate)
 	return types.TransactWriteItem{Update: &types.Update{
 		Key:                       sessionControlSessionDynamoKey(candidate.SessionID),
 		UpdateExpression:          aws.String("SET #state = :next_state, retain_until_ms = :next_retain, close_event_id = :close_event_id, close_prepared_directory_version = :close_prepared_version, close_prepared_at_ms = :close_prepared_at, due_shard = :next_due_shard, due_sort = :next_due_sort"),
@@ -541,7 +542,7 @@ func sessionControlSessionCloseRetentionUpdate(current sessionControlSessionAuth
 	condition := "kind = :kind AND schema_version = :schema AND cell_id = :cell_id AND agent_public_key = :agent_public_key AND session_id = :session_id AND issued_at_ms = :issued_at AND reservation_deadline_ms = :reservation_deadline AND run_id = :run_id AND run_attempt = :run_attempt AND #state = :state AND #version = :version AND target_count = :count AND retain_until_ms = :retain AND reserved_directory_version = :reserved_version AND reserved_active_fence_count = :reserved_count AND close_event_id = :close_event_id AND close_prepared_directory_version = :close_prepared_version AND close_prepared_at_ms = :close_prepared_at AND due_shard = :due_shard AND due_sort = :due_sort AND attribute_not_exists(#ttl)"
 	values := map[string]types.AttributeValue{
 		":kind":                   &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
-		":schema":                 &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchema)},
+		":schema":                 &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchemaForCandidate(candidate))},
 		":cell_id":                &types.AttributeValueMemberS{Value: candidate.CellID},
 		":agent_public_key":       &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
 		":session_id":             &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
@@ -574,6 +575,7 @@ func sessionControlSessionCloseRetentionUpdate(current sessionControlSessionAuth
 		condition += " AND ack_enqueued_at_ms = :ack_enqueued_at"
 		values[":ack_enqueued_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(current.AckEnqueuedAtMillis)}
 	}
+	condition = sessionControlAppendNativeOperationCondition(condition, values, candidate)
 	return types.TransactWriteItem{Update: &types.Update{
 		Key:                       sessionControlSessionDynamoKey(candidate.SessionID),
 		UpdateExpression:          aws.String("SET retain_until_ms = :next_retain"),
@@ -616,7 +618,14 @@ func (s *dynamoSessionControlStore) EnsureExactSessionClose(ctx context.Context,
 		if stable.Session == nil {
 			return nil, errSessionControlSessionNotFound
 		}
+		nativeAuthority, err := s.nativeOperationForSession(closeCtx, candidate, "")
+		if err != nil {
+			return nil, err
+		}
 		if stable.Session.State == sessionControlSessionStateClosing {
+			if nativeAuthority != nil && nativeAuthority.State != sessionControlNativeOperationStateClosing {
+				return nil, errSessionControlNativeOperationConflict
+			}
 			classified, classifyErr := s.classifyExistingExactClose(closeCtx, candidate, eventID, stable)
 			if classifyErr != nil {
 				return nil, classifyErr
@@ -681,16 +690,23 @@ func (s *dynamoSessionControlStore) EnsureExactSessionClose(ctx context.Context,
 				}
 				continue
 			}
-			resultCtx, resultCancel := s.sessionResultContext(ctx)
+			resultCtx, resultCancel := s.exactCloseResultContext(ctx, candidate)
 			latest, latestErr := s.readStableExactCloseState(resultCtx, candidate, eventID)
 			if latestErr == nil {
 				latestClose, exactErr := s.classifyExistingExactClose(resultCtx, candidate, eventID, latest)
 				if exactErr == nil && latestClose.Overflow && latestClose.Complete == nil {
 					_, exactErr = s.getOverflowOrder(resultCtx, latestClose.Work)
 				}
+				if exactErr == nil && candidate.NativeOperation.present() {
+					_, exactErr = s.nativeOperationForSession(resultCtx, candidate,
+						sessionControlNativeOperationStateClosing)
+				}
 				resultCancel()
 				if exactErr == nil && latestClose.Session.RetainUntilMillis >= requiredRetainUntilMillis {
 					return latestClose, nil
+				}
+				if exactErr != nil {
+					return nil, exactErr
 				}
 			} else {
 				resultCancel()
@@ -699,6 +715,9 @@ func (s *dynamoSessionControlStore) EnsureExactSessionClose(ctx context.Context,
 		}
 		if stable.Meta != nil || stable.Active != nil || stable.Work != nil || stable.Overflow != nil {
 			return nil, errSessionControlCloseCorrupt
+		}
+		if nativeAuthority != nil && nativeAuthority.State != sessionControlNativeOperationStateMapped {
+			return nil, errSessionControlNativeOperationConflict
 		}
 		directory := stable.Directory
 		if directory.Version >= ^uint64(0)-2 {
@@ -818,6 +837,18 @@ func (s *dynamoSessionControlStore) EnsureExactSessionClose(ctx context.Context,
 			}
 			fence = &prepared
 		}
+		if nativeAuthority != nil {
+			closingAuthority, transitionErr := sessionControlNativeOperationPlanClosing(*nativeAuthority)
+			if transitionErr != nil {
+				return nil, transitionErr
+			}
+			operationWrite, transitionErr := sessionControlNativeOperationExactTransition(s.tableName,
+				*nativeAuthority, closingAuthority)
+			if transitionErr != nil {
+				return nil, transitionErr
+			}
+			transaction.TransactItems = append(transaction.TransactItems, operationWrite)
+		}
 		_, writeErr := s.client.TransactWriteItems(closeCtx, transaction)
 		if writeErr == nil {
 			return &sessionControlExactClosePreparation{
@@ -831,16 +862,23 @@ func (s *dynamoSessionControlStore) EnsureExactSessionClose(ctx context.Context,
 			}
 			continue
 		}
-		resultCtx, resultCancel := s.sessionResultContext(ctx)
+		resultCtx, resultCancel := s.exactCloseResultContext(ctx, candidate)
 		latest, classifyErr := s.readStableExactCloseState(resultCtx, candidate, eventID)
 		if classifyErr == nil && latest.Session != nil && latest.Session.State == sessionControlSessionStateClosing {
 			classified, exactErr := s.classifyExistingExactClose(resultCtx, candidate, eventID, latest)
 			if exactErr == nil && classified.Overflow && classified.Complete == nil {
 				_, exactErr = s.getOverflowOrder(resultCtx, classified.Work)
 			}
+			if exactErr == nil && candidate.NativeOperation.present() {
+				_, exactErr = s.nativeOperationForSession(resultCtx, candidate,
+					sessionControlNativeOperationStateClosing)
+			}
 			resultCancel()
 			if exactErr == nil && classified.Session.RetainUntilMillis >= plannedSession.RetainUntilMillis {
 				return classified, nil
+			}
+			if exactErr != nil {
+				return nil, exactErr
 			}
 			if exactErr == nil && closeCtx.Err() == nil {
 				// Another caller may have committed the deterministic close with a

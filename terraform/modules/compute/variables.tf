@@ -475,6 +475,17 @@ variable "dynamodb_session_control_table" {
   default     = null
 }
 
+variable "enable_native_session_operations" {
+  description = "Enable the durable registered-agent operation protocol. Sandbox only; false is the inert default."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_native_session_operations || var.environment == "sandbox"
+    error_message = "enable_native_session_operations is restricted to sandbox."
+  }
+}
+
 variable "attach_storage_policies" {
   description = "Whether to attach storage backend policies (DynamoDB + keypair). Must be true when storage_backend is 'dynamodb'. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
   type        = bool

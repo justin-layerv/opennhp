@@ -18,6 +18,11 @@ const (
 	QURLAgentKeysTTLAttr                      = "ttl"
 	QURLAgentKeysEnrollmentCredentialKindAttr = "enrollment_credential_kind"
 	QURLAgentKeysConnectorIDClaimAttr         = "connector_id_claim"
+	QURLAgentKeysPublicKeyClaimOwnerAttr      = "claim_owner"
+	QURLAgentKeysPublicKeyClaimSchemeAttr     = "claim_scheme"
+	QURLAgentKeysPublicKeyClaimAgentID        = "claim"
+	QURLAgentKeysPublicKeyClaimOwnerPrefix    = "pubkeyclaim#"
+	QURLAgentKeysPublicKeyClaimScheme         = "pubkey_owner_v1"
 
 	// QURLAgentKeysPubkeyIndexName is the GSI nhp-server queries on first knock.
 	QURLAgentKeysPubkeyIndexName = "pubkey-index"

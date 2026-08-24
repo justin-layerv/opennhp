@@ -24,6 +24,7 @@ const (
 	sessionControlSessionMetaSK              = "META"
 	sessionControlSessionTargetPrefix        = "TARGET#"
 	sessionControlSessionSchema              = uint64(3)
+	sessionControlOperationSessionSchema     = uint64(4)
 	sessionControlSessionStateReserved       = "reserved"
 	sessionControlSessionStateAckEnqueued    = "ack_enqueued"
 	sessionControlSessionStateClosing        = "closing"
@@ -65,6 +66,7 @@ type sessionControlSessionCandidate struct {
 	ReservationDeadlineMillis int64
 	RunID                     string
 	RunAttempt                uint64
+	NativeOperation           sessionControlNativeOperationBinding
 }
 
 type sessionControlSessionFence struct {
@@ -136,6 +138,8 @@ type sessionControlSessionRow struct {
 	ReservationDeadlineMillis int64  `dynamodbav:"reservation_deadline_ms"`
 	RunID                     string `dynamodbav:"run_id"`
 	RunAttempt                uint64 `dynamodbav:"run_attempt"`
+	OperationID               string `dynamodbav:"operation_id,omitempty"`
+	OperationBindingSHA256    string `dynamodbav:"operation_binding_sha256,omitempty"`
 	State                     string `dynamodbav:"state"`
 	Version                   uint64 `dynamodbav:"version"`
 	TargetCount               uint64 `dynamodbav:"target_count"`
@@ -163,6 +167,8 @@ type sessionControlSessionMembershipRow struct {
 	ReservationDeadlineMillis int64  `dynamodbav:"reservation_deadline_ms"`
 	RunID                     string `dynamodbav:"run_id"`
 	RunAttempt                uint64 `dynamodbav:"run_attempt"`
+	OperationID               string `dynamodbav:"operation_id,omitempty"`
+	OperationBindingSHA256    string `dynamodbav:"operation_binding_sha256,omitempty"`
 }
 
 func sessionControlSessionRowAbsentAttributes(row sessionControlSessionRow) []string {
@@ -188,6 +194,9 @@ func sessionControlSessionRowAbsentAttributes(row sessionControlSessionRow) []st
 	if row.DueSort == "" {
 		absent = append(absent, "due_sort")
 	}
+	if row.OperationID == "" {
+		absent = append(absent, "operation_id", "operation_binding_sha256")
+	}
 	return absent
 }
 
@@ -203,6 +212,8 @@ type sessionControlSessionIntentRow struct {
 	ReservationDeadlineMillis int64  `dynamodbav:"reservation_deadline_ms"`
 	RunID                     string `dynamodbav:"run_id"`
 	RunAttempt                uint64 `dynamodbav:"run_attempt"`
+	OperationID               string `dynamodbav:"operation_id,omitempty"`
+	OperationBindingSHA256    string `dynamodbav:"operation_binding_sha256,omitempty"`
 	TargetACID                string `dynamodbav:"target_ac_id"`
 	TargetPublicKey           string `dynamodbav:"target_public_key"`
 	TargetBootID              string `dynamodbav:"target_boot_id"`
@@ -231,6 +242,24 @@ type sessionControlSessionIntentRow struct {
 	PreparedActiveFenceCount  uint64 `dynamodbav:"prepared_active_fence_count"`
 }
 
+func sessionControlSessionSchemaForCandidate(candidate sessionControlSessionCandidate) uint64 {
+	if candidate.NativeOperation.present() {
+		return sessionControlOperationSessionSchema
+	}
+	return sessionControlSessionSchema
+}
+
+func sessionControlAppendNativeOperationCondition(condition string, values map[string]types.AttributeValue,
+	candidate sessionControlSessionCandidate,
+) string {
+	if candidate.NativeOperation.present() {
+		values[":operation_id"] = &types.AttributeValueMemberS{Value: candidate.NativeOperation.OperationID}
+		values[":operation_binding"] = &types.AttributeValueMemberS{Value: candidate.NativeOperation.BindingSHA256}
+		return condition + " AND operation_id = :operation_id AND operation_binding_sha256 = :operation_binding"
+	}
+	return condition + " AND attribute_not_exists(operation_id) AND attribute_not_exists(operation_binding_sha256)"
+}
+
 func sessionControlIntentTargetReadinessAttributesPresent(item map[string]types.AttributeValue) bool {
 	for _, name := range []string{"target_ready_cursor", "target_aak_enqueued_at_ms", "target_aak_transaction_id",
 		"owner_lifecycle_version", "owner_work_version", "owner_task_count", "owner_pending_count"} {
@@ -244,11 +273,13 @@ func sessionControlIntentTargetReadinessAttributesPresent(item map[string]types.
 func validSessionControlSessionCandidate(candidate sessionControlSessionCandidate) bool {
 	runBindingValid := (candidate.RunID == "" && candidate.RunAttempt == 0) ||
 		(common.ValidateAgentKnockRunID(candidate.RunID) == nil && candidate.RunAttempt > 0)
+	operationValid := (!candidate.NativeOperation.present() && candidate.NativeOperation == (sessionControlNativeOperationBinding{})) ||
+		candidate.NativeOperation.valid()
 	return validSessionControlCellID(candidate.CellID) && common.ValidNHPAgentPublicKey(candidate.AgentPublicKey) &&
 		candidate.SessionID > 0 && candidate.IssuedAtMillis > 0 &&
 		candidate.ReservationDeadlineMillis > candidate.IssuedAtMillis &&
 		candidate.ReservationDeadlineMillis-candidate.IssuedAtMillis == pendingSessionReservationTTL.Milliseconds() &&
-		runBindingValid
+		runBindingValid && operationValid
 }
 
 func validateSessionControlFenceSnapshot(snapshot sessionControlFenceSnapshot, cellID string) error {
@@ -519,13 +550,18 @@ func sessionControlSessionToRow(authority sessionControlSessionAuthority) (sessi
 		CellID: candidate.CellID, AgentPublicKey: candidate.AgentPublicKey, SessionID: candidate.SessionID,
 		IssuedAtMillis: candidate.IssuedAtMillis, ReservationDeadlineMillis: candidate.ReservationDeadlineMillis,
 		RunID: candidate.RunID, RunAttempt: candidate.RunAttempt, State: authority.State,
-		Version: authority.Version, TargetCount: authority.TargetCount,
+		OperationID:            candidate.NativeOperation.OperationID,
+		OperationBindingSHA256: candidate.NativeOperation.BindingSHA256,
+		Version:                authority.Version, TargetCount: authority.TargetCount,
 		SessionExpiresAtMillis: authority.SessionExpiresAtMillis, RetainUntilMillis: authority.RetainUntilMillis,
 		ReservedDirectoryVersion: authority.ReservedDirectoryVersion,
 		ReservedActiveFenceCount: authority.ReservedActiveFenceCount,
 		AckEnqueuedAtMillis:      authority.AckEnqueuedAtMillis,
 		CloseEventID:             authority.CloseEventID, ClosePreparedDirectory: authority.ClosePreparedDirectory,
 		ClosePreparedAtMillis: authority.ClosePreparedAtMillis,
+	}
+	if candidate.NativeOperation.present() {
+		row.SchemaVersion = sessionControlOperationSessionSchema
 	}
 	if authority.State == sessionControlSessionStateReserved || authority.State == sessionControlSessionStateClosing {
 		row.DueShard = sessionControlSessionAuthorityDueShard(authority)
@@ -540,6 +576,9 @@ func sessionControlSessionFromRow(row sessionControlSessionRow, expectedSessionI
 			CellID: row.CellID, AgentPublicKey: row.AgentPublicKey, SessionID: row.SessionID,
 			IssuedAtMillis: row.IssuedAtMillis, ReservationDeadlineMillis: row.ReservationDeadlineMillis,
 			RunID: row.RunID, RunAttempt: row.RunAttempt,
+			NativeOperation: sessionControlNativeOperationBinding{
+				OperationID: row.OperationID, BindingSHA256: row.OperationBindingSHA256,
+			},
 		},
 		State: row.State, Version: row.Version, TargetCount: row.TargetCount,
 		SessionExpiresAtMillis: row.SessionExpiresAtMillis, RetainUntilMillis: row.RetainUntilMillis,
@@ -549,9 +588,13 @@ func sessionControlSessionFromRow(row sessionControlSessionRow, expectedSessionI
 		CloseEventID:             row.CloseEventID, ClosePreparedDirectory: row.ClosePreparedDirectory,
 		ClosePreparedAtMillis: row.ClosePreparedAtMillis,
 	}
-	if row.Kind != sessionControlSessionMetaKind || row.SchemaVersion != sessionControlSessionSchema ||
+	if row.Kind != sessionControlSessionMetaKind ||
+		(row.SchemaVersion != sessionControlSessionSchema && row.SchemaVersion != sessionControlOperationSessionSchema) ||
 		row.PK != sessionControlSessionPK(row.SessionID) || row.SK != sessionControlSessionMetaSK || row.SessionID != expectedSessionID ||
 		validateSessionControlSessionAuthority(authority) != nil {
+		return sessionControlSessionAuthority{}, errSessionControlSessionCorrupt
+	}
+	if (row.SchemaVersion == sessionControlSessionSchema) != !authority.Candidate.NativeOperation.present() {
 		return sessionControlSessionAuthority{}, errSessionControlSessionCorrupt
 	}
 	if authority.State == sessionControlSessionStateReserved || authority.State == sessionControlSessionStateClosing {
@@ -569,14 +612,20 @@ func sessionControlSessionMembershipToRow(candidate sessionControlSessionCandida
 	if !validSessionControlSessionCandidate(candidate) {
 		return sessionControlSessionMembershipRow{}, errSessionControlSessionCorrupt
 	}
-	return sessionControlSessionMembershipRow{
+	row := sessionControlSessionMembershipRow{
 		PK:   sessionControlAgentSessionPK(candidate.AgentPublicKey),
 		SK:   sessionControlSessionMembershipSK(candidate.IssuedAtMillis, candidate.SessionID),
 		Kind: sessionControlAgentSessionKind, SchemaVersion: sessionControlSessionSchema,
 		CellID: candidate.CellID, AgentPublicKey: candidate.AgentPublicKey, SessionID: candidate.SessionID,
 		IssuedAtMillis: candidate.IssuedAtMillis, ReservationDeadlineMillis: candidate.ReservationDeadlineMillis,
 		RunID: candidate.RunID, RunAttempt: candidate.RunAttempt,
-	}, nil
+		OperationID:            candidate.NativeOperation.OperationID,
+		OperationBindingSHA256: candidate.NativeOperation.BindingSHA256,
+	}
+	if candidate.NativeOperation.present() {
+		row.SchemaVersion = sessionControlOperationSessionSchema
+	}
+	return row, nil
 }
 
 func sessionControlSessionMembershipFromRow(row sessionControlSessionMembershipRow, expected sessionControlSessionCandidate) (sessionControlSessionCandidate, error) {
@@ -584,11 +633,18 @@ func sessionControlSessionMembershipFromRow(row sessionControlSessionMembershipR
 		CellID: row.CellID, AgentPublicKey: row.AgentPublicKey, SessionID: row.SessionID,
 		IssuedAtMillis: row.IssuedAtMillis, ReservationDeadlineMillis: row.ReservationDeadlineMillis,
 		RunID: row.RunID, RunAttempt: row.RunAttempt,
+		NativeOperation: sessionControlNativeOperationBinding{
+			OperationID: row.OperationID, BindingSHA256: row.OperationBindingSHA256,
+		},
 	}
-	if row.Kind != sessionControlAgentSessionKind || row.SchemaVersion != sessionControlSessionSchema ||
+	if row.Kind != sessionControlAgentSessionKind ||
+		(row.SchemaVersion != sessionControlSessionSchema && row.SchemaVersion != sessionControlOperationSessionSchema) ||
 		row.PK != sessionControlAgentSessionPK(row.AgentPublicKey) ||
 		row.SK != sessionControlSessionMembershipSK(row.IssuedAtMillis, row.SessionID) ||
 		!validSessionControlSessionCandidate(candidate) || candidate != expected {
+		return sessionControlSessionCandidate{}, errSessionControlSessionCorrupt
+	}
+	if (row.SchemaVersion == sessionControlSessionSchema) != !candidate.NativeOperation.present() {
 		return sessionControlSessionCandidate{}, errSessionControlSessionCorrupt
 	}
 	return candidate, nil
@@ -599,12 +655,14 @@ func sessionControlIntentToRow(intent sessionControlSessionIntent, reverse bool)
 		return sessionControlSessionIntentRow{}, err
 	}
 	row := sessionControlSessionIntentRow{
-		Kind: sessionControlSessionIntentKind, SchemaVersion: sessionControlSessionSchema,
+		Kind: sessionControlSessionIntentKind, SchemaVersion: sessionControlSessionSchemaForCandidate(intent.Session),
 		CellID: intent.Session.CellID, AgentPublicKey: intent.Session.AgentPublicKey,
 		SessionID: intent.Session.SessionID, IssuedAtMillis: intent.Session.IssuedAtMillis,
 		ReservationDeadlineMillis: intent.Session.ReservationDeadlineMillis,
 		RunID:                     intent.Session.RunID, RunAttempt: intent.Session.RunAttempt,
-		TargetACID: intent.Target.ACID, TargetPublicKey: intent.Target.PublicKey,
+		OperationID:            intent.Session.NativeOperation.OperationID,
+		OperationBindingSHA256: intent.Session.NativeOperation.BindingSHA256,
+		TargetACID:             intent.Target.ACID, TargetPublicKey: intent.Target.PublicKey,
 		TargetBootID: intent.Target.BootID, TargetFlushGeneration: intent.Target.FlushGeneration,
 		TargetVersion: intent.Target.Version, TargetAuthorityVersion: intent.Target.AuthorityVersion,
 		TargetCountedActiveSlot: intent.Target.CountedActiveSlot, TargetControlCellID: intent.Target.ControlCellID,
@@ -638,6 +696,9 @@ func sessionControlIntentFromRow(row sessionControlSessionIntentRow, reverse boo
 			CellID: row.CellID, AgentPublicKey: row.AgentPublicKey, SessionID: row.SessionID,
 			IssuedAtMillis: row.IssuedAtMillis, ReservationDeadlineMillis: row.ReservationDeadlineMillis,
 			RunID: row.RunID, RunAttempt: row.RunAttempt,
+			NativeOperation: sessionControlNativeOperationBinding{
+				OperationID: row.OperationID, BindingSHA256: row.OperationBindingSHA256,
+			},
 		},
 		Target: sessionControlTargetAuthority{
 			ACID: row.TargetACID, PublicKey: row.TargetPublicKey, BootID: row.TargetBootID,
@@ -677,7 +738,8 @@ func sessionControlIntentFromRow(row sessionControlSessionIntentRow, reverse boo
 		expectedPK = sessionControlTargetSessionPK(intent.Target)
 		expectedSK = sessionControlSessionMembershipSK(row.IssuedAtMillis, row.SessionID)
 	}
-	if row.Kind != expectedKind || row.SchemaVersion != sessionControlSessionSchema || row.PK != expectedPK || row.SK != expectedSK ||
+	if row.Kind != expectedKind || row.SchemaVersion != sessionControlSessionSchemaForCandidate(intent.Session) ||
+		row.PK != expectedPK || row.SK != expectedSK ||
 		validateSessionControlSessionIntent(intent) != nil {
 		return sessionControlSessionIntent{}, errSessionControlSessionCorrupt
 	}
@@ -1080,6 +1142,19 @@ func (s *dynamoSessionControlStore) sessionResultContext(ctx context.Context) (c
 	return context.WithTimeout(context.WithoutCancel(ctx), s.timeout())
 }
 
+// Native-operation recovery has a caller-visible subsecond aggregate ceiling.
+// Its exact-close ambiguity classifier must remain inside that same authority;
+// legacy close callers retain the established detached result-classification
+// behavior.
+func (s *dynamoSessionControlStore) exactCloseResultContext(ctx context.Context,
+	candidate sessionControlSessionCandidate,
+) (context.Context, context.CancelFunc) {
+	if candidate.NativeOperation.present() {
+		return context.WithTimeout(ctx, sessionControlNativeOperationReadTimeout)
+	}
+	return s.sessionResultContext(ctx)
+}
+
 // ReserveSession atomically orders a caller-chosen numeric session ID against
 // the exact active-fence directory cursor. The immutable agent membership is a
 // base-table row; no GSI or TTL participates in correctness.
@@ -1303,35 +1378,37 @@ func sessionControlSessionUpdate(fence sessionControlSessionFence, planned sessi
 	if enforceCapacity {
 		condition += " AND target_count < :capacity"
 	}
+	values := map[string]types.AttributeValue{
+		":kind":                    &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
+		":schema":                  &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchemaForCandidate(candidate))},
+		":cell_id":                 &types.AttributeValueMemberS{Value: candidate.CellID},
+		":agent_public_key":        &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
+		":session_id":              &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
+		":issued_at":               &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.IssuedAtMillis)},
+		":reservation_deadline":    &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.ReservationDeadlineMillis)},
+		":run_id":                  &types.AttributeValueMemberS{Value: candidate.RunID},
+		":run_attempt":             &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.RunAttempt)},
+		":state":                   &types.AttributeValueMemberS{Value: sessionControlSessionStateReserved},
+		":version":                 &types.AttributeValueMemberN{Value: fmt.Sprint(fence.Version)},
+		":count":                   &types.AttributeValueMemberN{Value: fmt.Sprint(fence.TargetCount)},
+		":retain":                  &types.AttributeValueMemberN{Value: fmt.Sprint(fence.RetainUntilMillis)},
+		":reserved_version":        &types.AttributeValueMemberN{Value: fmt.Sprint(fence.ReservedDirectoryVersion)},
+		":reserved_count":          &types.AttributeValueMemberN{Value: fmt.Sprint(fence.ReservedActiveFenceCount)},
+		":due_shard":               &types.AttributeValueMemberS{Value: sessionControlSessionDueShard(candidate)},
+		":due_sort":                &types.AttributeValueMemberS{Value: sessionControlSessionDueSort(candidate)},
+		":capacity":                &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionMaxTargets)},
+		":next_version":            &types.AttributeValueMemberN{Value: fmt.Sprint(planned.Version)},
+		":next_count":              &types.AttributeValueMemberN{Value: fmt.Sprint(planned.TargetCount)},
+		":next_session_expires_at": &types.AttributeValueMemberN{Value: fmt.Sprint(planned.SessionExpiresAtMillis)},
+		":next_retain":             &types.AttributeValueMemberN{Value: fmt.Sprint(planned.RetainUntilMillis)},
+	}
+	condition = sessionControlAppendNativeOperationCondition(condition, values, candidate)
 	write := types.TransactWriteItem{Update: &types.Update{
-		Key:                      sessionControlSessionDynamoKey(candidate.SessionID),
-		UpdateExpression:         aws.String("SET #version = :next_version, target_count = :next_count, session_expires_at_ms = :next_session_expires_at, retain_until_ms = :next_retain"),
-		ConditionExpression:      aws.String(condition),
-		ExpressionAttributeNames: map[string]string{"#state": "state", "#version": "version", "#ttl": "ttl"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":kind":                    &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
-			":schema":                  &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchema)},
-			":cell_id":                 &types.AttributeValueMemberS{Value: candidate.CellID},
-			":agent_public_key":        &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
-			":session_id":              &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
-			":issued_at":               &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.IssuedAtMillis)},
-			":reservation_deadline":    &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.ReservationDeadlineMillis)},
-			":run_id":                  &types.AttributeValueMemberS{Value: candidate.RunID},
-			":run_attempt":             &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.RunAttempt)},
-			":state":                   &types.AttributeValueMemberS{Value: sessionControlSessionStateReserved},
-			":version":                 &types.AttributeValueMemberN{Value: fmt.Sprint(fence.Version)},
-			":count":                   &types.AttributeValueMemberN{Value: fmt.Sprint(fence.TargetCount)},
-			":retain":                  &types.AttributeValueMemberN{Value: fmt.Sprint(fence.RetainUntilMillis)},
-			":reserved_version":        &types.AttributeValueMemberN{Value: fmt.Sprint(fence.ReservedDirectoryVersion)},
-			":reserved_count":          &types.AttributeValueMemberN{Value: fmt.Sprint(fence.ReservedActiveFenceCount)},
-			":due_shard":               &types.AttributeValueMemberS{Value: sessionControlSessionDueShard(candidate)},
-			":due_sort":                &types.AttributeValueMemberS{Value: sessionControlSessionDueSort(candidate)},
-			":capacity":                &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionMaxTargets)},
-			":next_version":            &types.AttributeValueMemberN{Value: fmt.Sprint(planned.Version)},
-			":next_count":              &types.AttributeValueMemberN{Value: fmt.Sprint(planned.TargetCount)},
-			":next_session_expires_at": &types.AttributeValueMemberN{Value: fmt.Sprint(planned.SessionExpiresAtMillis)},
-			":next_retain":             &types.AttributeValueMemberN{Value: fmt.Sprint(planned.RetainUntilMillis)},
-		},
+		Key:                       sessionControlSessionDynamoKey(candidate.SessionID),
+		UpdateExpression:          aws.String("SET #version = :next_version, target_count = :next_count, session_expires_at_ms = :next_session_expires_at, retain_until_ms = :next_retain"),
+		ConditionExpression:       aws.String(condition),
+		ExpressionAttributeNames:  map[string]string{"#state": "state", "#version": "version", "#ttl": "ttl"},
+		ExpressionAttributeValues: values,
 	}}
 	if fence.TargetCount > 0 {
 		write.Update.ExpressionAttributeValues[":session_expires_at"] = &types.AttributeValueMemberN{Value: fmt.Sprint(fence.SessionExpiresAtMillis)}
@@ -1712,35 +1789,37 @@ func (s *dynamoSessionControlStore) VerifySession(ctx context.Context, candidate
 
 func sessionControlSessionAckUpdate(current sessionControlSessionAuthority, ackEnqueuedAtMillis int64) types.TransactWriteItem {
 	candidate := current.Candidate
+	values := map[string]types.AttributeValue{
+		":kind":                 &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
+		":schema":               &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchemaForCandidate(candidate))},
+		":cell_id":              &types.AttributeValueMemberS{Value: candidate.CellID},
+		":agent_public_key":     &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
+		":session_id":           &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
+		":issued_at":            &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.IssuedAtMillis)},
+		":reservation_deadline": &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.ReservationDeadlineMillis)},
+		":run_id":               &types.AttributeValueMemberS{Value: candidate.RunID},
+		":run_attempt":          &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.RunAttempt)},
+		":state":                &types.AttributeValueMemberS{Value: sessionControlSessionStateReserved},
+		":next_state":           &types.AttributeValueMemberS{Value: sessionControlSessionStateAckEnqueued},
+		":ack_enqueued_at":      &types.AttributeValueMemberN{Value: fmt.Sprint(ackEnqueuedAtMillis)},
+		":version":              &types.AttributeValueMemberN{Value: fmt.Sprint(current.Version)},
+		":count":                &types.AttributeValueMemberN{Value: fmt.Sprint(current.TargetCount)},
+		":session_expires_at":   &types.AttributeValueMemberN{Value: fmt.Sprint(current.SessionExpiresAtMillis)},
+		":retain":               &types.AttributeValueMemberN{Value: fmt.Sprint(current.RetainUntilMillis)},
+		":reserved_version":     &types.AttributeValueMemberN{Value: fmt.Sprint(current.ReservedDirectoryVersion)},
+		":reserved_count":       &types.AttributeValueMemberN{Value: fmt.Sprint(current.ReservedActiveFenceCount)},
+		":due_shard":            &types.AttributeValueMemberS{Value: sessionControlSessionDueShard(candidate)},
+		":due_sort":             &types.AttributeValueMemberS{Value: sessionControlSessionDueSort(candidate)},
+	}
+	condition := sessionControlAppendNativeOperationCondition("kind = :kind AND schema_version = :schema AND cell_id = :cell_id AND agent_public_key = :agent_public_key AND session_id = :session_id AND issued_at_ms = :issued_at AND reservation_deadline_ms = :reservation_deadline AND run_id = :run_id AND run_attempt = :run_attempt AND #state = :state AND #version = :version AND target_count = :count AND session_expires_at_ms = :session_expires_at AND retain_until_ms = :retain AND reserved_directory_version = :reserved_version AND reserved_active_fence_count = :reserved_count AND due_shard = :due_shard AND due_sort = :due_sort AND attribute_not_exists(ack_enqueued_at_ms) AND attribute_not_exists(close_event_id) AND attribute_not_exists(close_prepared_directory_version) AND attribute_not_exists(#ttl)", values, candidate)
 	return types.TransactWriteItem{Update: &types.Update{
 		Key:                 sessionControlSessionDynamoKey(candidate.SessionID),
 		UpdateExpression:    aws.String("SET #state = :next_state, ack_enqueued_at_ms = :ack_enqueued_at REMOVE due_shard, due_sort"),
-		ConditionExpression: aws.String("kind = :kind AND schema_version = :schema AND cell_id = :cell_id AND agent_public_key = :agent_public_key AND session_id = :session_id AND issued_at_ms = :issued_at AND reservation_deadline_ms = :reservation_deadline AND run_id = :run_id AND run_attempt = :run_attempt AND #state = :state AND #version = :version AND target_count = :count AND session_expires_at_ms = :session_expires_at AND retain_until_ms = :retain AND reserved_directory_version = :reserved_version AND reserved_active_fence_count = :reserved_count AND due_shard = :due_shard AND due_sort = :due_sort AND attribute_not_exists(ack_enqueued_at_ms) AND attribute_not_exists(close_event_id) AND attribute_not_exists(close_prepared_directory_version) AND attribute_not_exists(#ttl)"),
+		ConditionExpression: aws.String(condition),
 		ExpressionAttributeNames: map[string]string{
 			"#state": "state", "#version": "version", "#ttl": "ttl",
 		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":kind":                 &types.AttributeValueMemberS{Value: sessionControlSessionMetaKind},
-			":schema":               &types.AttributeValueMemberN{Value: fmt.Sprint(sessionControlSessionSchema)},
-			":cell_id":              &types.AttributeValueMemberS{Value: candidate.CellID},
-			":agent_public_key":     &types.AttributeValueMemberS{Value: candidate.AgentPublicKey},
-			":session_id":           &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.SessionID)},
-			":issued_at":            &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.IssuedAtMillis)},
-			":reservation_deadline": &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.ReservationDeadlineMillis)},
-			":run_id":               &types.AttributeValueMemberS{Value: candidate.RunID},
-			":run_attempt":          &types.AttributeValueMemberN{Value: fmt.Sprint(candidate.RunAttempt)},
-			":state":                &types.AttributeValueMemberS{Value: sessionControlSessionStateReserved},
-			":next_state":           &types.AttributeValueMemberS{Value: sessionControlSessionStateAckEnqueued},
-			":ack_enqueued_at":      &types.AttributeValueMemberN{Value: fmt.Sprint(ackEnqueuedAtMillis)},
-			":version":              &types.AttributeValueMemberN{Value: fmt.Sprint(current.Version)},
-			":count":                &types.AttributeValueMemberN{Value: fmt.Sprint(current.TargetCount)},
-			":session_expires_at":   &types.AttributeValueMemberN{Value: fmt.Sprint(current.SessionExpiresAtMillis)},
-			":retain":               &types.AttributeValueMemberN{Value: fmt.Sprint(current.RetainUntilMillis)},
-			":reserved_version":     &types.AttributeValueMemberN{Value: fmt.Sprint(current.ReservedDirectoryVersion)},
-			":reserved_count":       &types.AttributeValueMemberN{Value: fmt.Sprint(current.ReservedActiveFenceCount)},
-			":due_shard":            &types.AttributeValueMemberS{Value: sessionControlSessionDueShard(candidate)},
-			":due_sort":             &types.AttributeValueMemberS{Value: sessionControlSessionDueSort(candidate)},
-		},
+		ExpressionAttributeValues: values,
 	}}
 }
 

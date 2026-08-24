@@ -662,7 +662,13 @@ module "dynamodb" {
   # KMS encryption
   kms_key_arn = module.kms.secrets_key_arn
 
-  enable_matched_cohort_canary = var.enable_matched_cohort_canary
+  enable_matched_cohort_canary     = var.enable_matched_cohort_canary
+  enable_native_session_operations = var.enable_native_session_operations
+  # Control identity has separate exact-table inline grants on both server
+  # roles. Do not also authorize the unused cell-local agent-key table.
+  native_session_operations_use_local_agent_keys = (
+    var.enable_native_session_operations && local.control_identity_agent_keys_table_arn == ""
+  )
 
   # QURL Service tables
   deploy_qurl_tables = var.deploy_qurl_service
@@ -995,6 +1001,7 @@ module "compute" {
   # Blue/Green deployment configuration
   enable_blue_green                  = var.enable_blue_green
   enable_matched_cohort_canary       = var.enable_matched_cohort_canary
+  enable_native_session_operations   = var.enable_native_session_operations
   matched_cohort_smoke_ingress_cidrs = var.matched_cohort_smoke_ingress_cidrs
   green_standby_min_size             = var.green_standby_min_size
   deployment_stale_threshold_days    = var.deployment_stale_threshold_days

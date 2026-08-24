@@ -1142,15 +1142,18 @@ class DynamoDBReadPolicyTests(unittest.TestCase):
         broad_start = policy.index('Sid = "DynamoDBReadAccess"')
         get_start = policy.index('Sid = "DynamoDBQurlAgentKeysGetItem"')
         query_start = policy.index('Sid = "DynamoDBQurlAgentKeysPubkeyIndexQuery"')
-        next_start = policy.index("var.kms_key_arn", query_start)
+        condition_start = policy.index('Sid = "DynamoDBQurlAgentKeysTransactionCondition"')
+        next_start = policy.index("var.kms_key_arn", condition_start)
 
         broad_stmt = policy[broad_start:get_start]
         self.assertNotIn("qurl_agent_keys", broad_stmt)
 
-        agent_conditional = policy[policy.rindex("var.deploy_qurl_tables ? [", 0, get_start):next_start]
-        self.assertIn('Action = ["dynamodb:GetItem"]', agent_conditional)
-        self.assertIn('Action = ["dynamodb:Query"]', agent_conditional)
-        self.assertNotIn("Resource = []", agent_conditional)
+        read_conditional = policy[
+            policy.rindex("var.deploy_qurl_tables ? [", 0, get_start):condition_start
+        ]
+        self.assertIn('Action = ["dynamodb:GetItem"]', read_conditional)
+        self.assertIn('Action = ["dynamodb:Query"]', read_conditional)
+        self.assertNotIn("Resource = []", read_conditional)
 
         get_stmt = policy[get_start:query_start]
         self.assertIn('Action = ["dynamodb:GetItem"]', get_stmt)
@@ -1158,7 +1161,7 @@ class DynamoDBReadPolicyTests(unittest.TestCase):
         self.assertNotIn("dynamodb:Query", get_stmt)
         self.assertNotIn("pubkey-index", get_stmt)
 
-        query_stmt = policy[query_start:next_start]
+        query_stmt = policy[query_start:condition_start]
         self.assertIn('Action = ["dynamodb:Query"]', query_stmt)
         self.assertIn(
             'Resource = "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/pubkey-index"',
@@ -1172,6 +1175,17 @@ class DynamoDBReadPolicyTests(unittest.TestCase):
             self.assertNotIn("dynamodb:PutItem", stmt)
             self.assertNotIn("dynamodb:UpdateItem", stmt)
             self.assertNotIn("${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/*", stmt)
+
+        condition_stmt = policy[condition_start:next_start]
+        self.assertIn('Action = ["dynamodb:ConditionCheckItem"]', condition_stmt)
+        self.assertIn("Resource = aws_dynamodb_table.qurl_agent_keys[0].arn", condition_stmt)
+        self.assertIn(
+            '"dynamodb:EnclosingOperation" = "TransactWriteItems"',
+            condition_stmt,
+        )
+        self.assertNotIn("dynamodb:GetItem", condition_stmt)
+        self.assertNotIn("dynamodb:Query", condition_stmt)
+        self.assertNotIn("/index/", condition_stmt)
 
 
 if __name__ == "__main__":

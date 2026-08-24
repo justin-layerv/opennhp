@@ -34,6 +34,28 @@ variable "enable_matched_cohort_canary" {
   default     = false
 }
 
+variable "enable_native_session_operations" {
+  description = "Enable the sandbox-only durable native-session operation IAM fences."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_native_session_operations || var.environment == "sandbox"
+    error_message = "enable_native_session_operations is restricted to sandbox."
+  }
+}
+
+variable "native_session_operations_use_local_agent_keys" {
+  description = "Grant native-operation ConditionCheckItem on this module's qurl-agent-keys table. False when the runtime uses the external Control identity table."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.native_session_operations_use_local_agent_keys || (var.enable_native_session_operations && var.deploy_qurl_tables)
+    error_message = "Local native-operation agent-key authority requires the native operation protocol and local qurl tables."
+  }
+}
+
 # ==================== QURL Service Tables ====================
 
 variable "deploy_qurl_tables" {

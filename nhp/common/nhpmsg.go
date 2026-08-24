@@ -77,16 +77,27 @@ type ServerRegisterAckMsg struct {
 // knocks dispatched to the registered-agent auth service require it together
 // with a positive RunAttempt before any registry, resource, or AC work.
 type AgentKnockMsg struct {
-	HeaderType     int            `json:"headerType"`
-	UserId         string         `json:"usrId"`
-	DeviceId       string         `json:"devId"`
-	OrganizationId string         `json:"orgId,omitempty"`
-	AuthServiceId  string         `json:"aspId"`
-	ResourceId     string         `json:"resId"`
-	RunID          string         `json:"runId,omitempty"`
-	RunAttempt     uint64         `json:"runAttempt,omitempty"`
-	CheckResults   map[string]any `json:"results,omitempty"`
-	UserData       map[string]any `json:"usrData,omitempty"`
+	HeaderType     int    `json:"headerType"`
+	UserId         string `json:"usrId"`
+	DeviceId       string `json:"devId"`
+	OrganizationId string `json:"orgId,omitempty"`
+	AuthServiceId  string `json:"aspId"`
+	ResourceId     string `json:"resId"`
+	RunID          string `json:"runId,omitempty"`
+	RunAttempt     uint64 `json:"runAttempt,omitempty"`
+	// NativeSessionOperationID and its binding fields are an additive,
+	// authenticated registered-agent admission authority. They are either all
+	// absent (legacy knock) or all present in their exact canonical form. The
+	// compact projection deliberately excludes deployment routes and table
+	// names: those are server configuration and encrypted orchestration
+	// authority, not caller-selected wire inputs.
+	NativeSessionOperationID        string         `json:"operation_id,omitempty"`
+	NativeSessionOperationBinding   string         `json:"binding_sha256,omitempty"`
+	NativeSessionOperationOwnerID   string         `json:"owner_id,omitempty"`
+	NativeSessionOperationPrepared  int64          `json:"prepared_at_ms,omitempty"`
+	NativeSessionOperationExpiresAt int64          `json:"expires_at_ms,omitempty"`
+	CheckResults                    map[string]any `json:"results,omitempty"`
+	UserData                        map[string]any `json:"usrData,omitempty"`
 
 	// NHPSessionId is assigned by the NHP-Server after the authenticated KNK
 	// body is decoded. It is server-internal state, never accepted from or
@@ -98,6 +109,11 @@ type AgentKnockMsg struct {
 	// copied from PacketParserData.RemotePubKey and carried to the AOP Public Key
 	// field; a KNK body can never supply or override it.
 	NHPAgentPublicKey string `json:"-"`
+	// NHPAgentOwnerID is populated only after the durable operation admission
+	// transaction has condition-checked the exact owner/agent registration and
+	// public-key claim. Downstream token writers use this server-owned value and
+	// never repeat an eventual GSI lookup.
+	NHPAgentOwnerID string `json:"-"`
 	// ProtectedResourceId is the server-resolved canonical public resource
 	// identity bound to a registered-agent ACK token. It is distinct from the
 	// wire ResourceId, which is only the knock/catalog routing key, and is never

@@ -410,6 +410,9 @@ Backend = "${storage_backend}"
 
 %{ if storage_backend == "dynamodb" ~}
 [DynamoDB]
+%{ if enable_native_session_operations ~}
+AccountID = "${account_id}"
+%{ endif ~}
 Region = "${dynamodb_region}"
 %{ if dynamodb_licenses_table != null ~}
 LicensesTable = "${dynamodb_licenses_table}"
@@ -431,6 +434,9 @@ AckTokensTable = "${dynamodb_ack_tokens_table}"
 %{ endif ~}
 %{ if dynamodb_session_control_table != null ~}
 SessionControlTable = "${dynamodb_session_control_table}"
+%{ if enable_native_session_operations ~}
+NativeSessionOperations = true
+%{ endif ~}
 %{ endif ~}
 %{ endif ~}
 

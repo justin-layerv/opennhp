@@ -939,7 +939,11 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// Verify the origin's durable reservation immediately after reconstructing
 	// the authenticated session tuple. Rejection must precede catalog, placement,
 	// protected-resource, local-registry, and AC work.
-	verifyCtx, verifyCancel := context.WithTimeout(f.deps.LifecycleCtx(), DefaultStorageTimeout)
+	verifyBudget := DefaultStorageTimeout
+	if common.NativeSessionOperationPresent(*knkMsg) {
+		verifyBudget = sessionControlNativeOperationReadTimeout
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(f.deps.LifecycleCtx(), verifyBudget)
 	verifiedReceipt, verifyErr := sessionDeps.VerifyForwardedDurableNHPSession(verifyCtx, knkMsg)
 	verifyCancel()
 	if verifyErr != nil {
@@ -1154,10 +1158,13 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 		// DDB outage, non-cloud-mode) returns "" — the path falls
 		// back to the historical empty-OwnerId behavior, never blocks
 		// the forward.
-		ownerId := f.deps.ResolveOwnerIDByPubKey(
-			f.deps.LifecycleCtx(),
-			agentPubKey,
-		)
+		ownerId := knkMsg.NHPAgentOwnerID
+		if ownerId == "" {
+			ownerId = f.deps.ResolveOwnerIDByPubKey(
+				f.deps.LifecycleCtx(),
+				agentPubKey,
+			)
+		}
 		if publishErr := f.deps.PublishACKTokens(f.deps.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
 			log.Error("Failed to persist ACK token metadata for forwarded knock: %v", publishErr)
 			sessionDeps.CompensateForwardedNHPSession(agentPubKey, knkMsg.NHPSessionId, knkMsg.NHPSessionIssuedAt)

@@ -180,6 +180,63 @@ run "cloud_storage_requires_session_control_authority" {
   expect_failures = [terraform_data.session_control_storage_contract]
 }
 
+run "native_operation_control_identity_authority_is_exact" {
+  command = plan
+
+  variables {
+    enable_native_session_operations      = true
+    dynamodb_region                       = "us-east-2"
+    control_identity_agent_keys_table_arn = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-control-qurl-agent-keys"
+    control_identity_kms_key_arn          = "arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000002"
+    control_identity_home_region          = "us-east-2"
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_role_policy.server_control_identity_agent_keys[0].policy).Statement : statement
+      if statement.Sid == "ControlIdentityAgentKeysTransactionCondition"
+      ]) == {
+      Sid      = "ControlIdentityAgentKeysTransactionCondition"
+      Effect   = "Allow"
+      Action   = ["dynamodb:ConditionCheckItem"]
+      Resource = "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-control-qurl-agent-keys"
+      Condition = {
+        StringEquals = {
+          "dynamodb:EnclosingOperation" = "TransactWriteItems"
+        }
+      }
+    }
+    error_message = "The native operation may condition only the exact Control registration base table and only inside TransactWriteItems."
+  }
+
+  assert {
+    condition = one([
+      for statement in jsondecode(aws_iam_role_policy.server_control_identity_agent_keys[0].policy).Statement : statement
+      if statement.Sid == "ControlIdentityAgentKeysKMSDecrypt"
+      ]) == {
+      Sid      = "ControlIdentityAgentKeysKMSDecrypt"
+      Effect   = "Allow"
+      Action   = ["kms:Decrypt"]
+      Resource = ["arn:aws:kms:us-east-2:767397897469:key/00000000-0000-0000-0000-000000000002"]
+      Condition = {
+        StringEquals = {
+          "kms:CallerAccount" = "767397897469"
+          "kms:ViaService"    = "dynamodb.us-east-2.amazonaws.com"
+        }
+      }
+    }
+    error_message = "Control registration reads must retain the exact KMS key, account, region, and DynamoDB service path."
+  }
+
+  assert {
+    condition = alltrue([
+      strcontains(file("${path.module}/user_data.sh.tpl"), "%%{ if enable_native_session_operations ~}\nAccountID = \"$${account_id}\""),
+      strcontains(file("${path.module}/user_data.sh.tpl"), "SessionControlTable = \"$${dynamodb_session_control_table}\"\n%%{ if enable_native_session_operations ~}\nNativeSessionOperations = true"),
+    ])
+    error_message = "The sandbox gate must render the exact account and native-operation flag next to the shared session-control table."
+  }
+}
+
 run "four_operation_rollout_predecessor_is_byte_compatible" {
   command = plan
 

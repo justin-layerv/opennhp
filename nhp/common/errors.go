@@ -278,6 +278,12 @@ var (
 	// packets and durable control-plane operations, not an admission protocol.
 	ErrHTTPAccessOperationUnsupported = newError("52027", "HTTP access admission is not supported; use authenticated NHP")
 	ErrACSessionControlNotReady       = newError("52028", "AC session-control boot flush is not ready")
+	// ErrNativeSessionOperationRecoveryRequired denies an exact duplicate
+	// registered-agent admission after the durable operation row already maps
+	// the selector to a server session. The server must not rerun the plugin or
+	// reproduce bearer-bearing ACK material; the client closes/reconciles the
+	// mapped operation and advances RunAttempt.
+	ErrNativeSessionOperationRecoveryRequired = newError("52029", "native session operation recovery required")
 
 	// server: agent registration (52100+). Reject vocabulary for NHP-native
 	// agent self-registration (NHP_OTP / NHP_REG / NHP_RAK). Reserved as its

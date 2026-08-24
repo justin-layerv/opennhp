@@ -1006,6 +1006,11 @@ func (s *dynamoSessionControlStore) classifyTerminalExactClose(ctx context.Conte
 			return nil, errSessionControlTerminalConflict
 		}
 	}
+	if candidate.NativeOperation.present() {
+		if _, err := s.nativeOperationForSession(ctx, candidate, sessionControlNativeOperationStateClosed); err != nil {
+			return nil, err
+		}
+	}
 	return closed, nil
 }
 
@@ -1077,6 +1082,10 @@ func (s *dynamoSessionControlStore) FinalizeTerminalExactClose(ctx context.Conte
 		*stable.Meta != *stable.Active || stable.Meta.State != sessionControlFenceConverged ||
 		stable.Session.State != sessionControlSessionStateClosing {
 		return nil, errSessionControlTerminalConflict
+	}
+	nativeAuthority, err := s.nativeOperationForSession(opCtx, candidate, sessionControlNativeOperationStateClosing)
+	if err != nil {
+		return nil, err
 	}
 	complete, err := s.getCloseComplete(opCtx, eventID)
 	if err != nil {
@@ -1224,7 +1233,24 @@ func (s *dynamoSessionControlStore) FinalizeTerminalExactClose(ctx context.Conte
 		}
 		transaction = append(transaction, condition)
 	}
-	if len(transaction) > 30 {
+	if nativeAuthority != nil {
+		closedAuthority, transitionErr := sessionControlNativeOperationPlanClosed(*nativeAuthority,
+			closed.ClosedAtMillis, closed.SessionAfter.RetainUntilMillis)
+		if transitionErr != nil {
+			return nil, transitionErr
+		}
+		operationWrite, transitionErr := sessionControlNativeOperationExactTransition(s.tableName,
+			*nativeAuthority, closedAuthority)
+		if transitionErr != nil {
+			return nil, transitionErr
+		}
+		transaction = append(transaction, operationWrite)
+	}
+	maximumItems := 30
+	if nativeAuthority != nil {
+		maximumItems++
+	}
+	if len(transaction) > maximumItems {
 		return nil, errSessionControlTerminalCorrupt
 	}
 	token, err := sessionControlTerminalToken(s.tableName, "close", closed)

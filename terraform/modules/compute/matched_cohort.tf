@@ -344,7 +344,7 @@ resource "aws_iam_role_policy" "server_candidate_control_identity_agent_keys" {
   role = aws_iam_role.server_candidate[0].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "CandidateControlIdentityAgentKeysGetItem"
         Effect   = "Allow"
@@ -369,7 +369,17 @@ resource "aws_iam_role_policy" "server_candidate_control_identity_agent_keys" {
           }
         }
       },
-    ]
+      ], var.enable_native_session_operations ? [{
+        Sid      = "CandidateControlIdentityAgentKeysTransactionCondition"
+        Effect   = "Allow"
+        Action   = ["dynamodb:ConditionCheckItem"]
+        Resource = var.control_identity_agent_keys_table_arn
+        Condition = {
+          StringEquals = {
+            "dynamodb:EnclosingOperation" = "TransactWriteItems"
+          }
+        }
+    }] : [])
   })
 }
 
