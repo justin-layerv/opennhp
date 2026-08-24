@@ -25,6 +25,10 @@ locals {
     for suffix in concat(["iro", "ar", "cr", "ccr"], local.connector_authority_resource_enabled ? ["creso"] : []) :
     "arn:aws:lambda:${var.connector_authority_cell_config.aws_region}:${var.connector_authority_cell_config.aws_account_id}:function:layerv-nhp-${var.connector_authority_cell_config.environment}-ca-${suffix}-${var.cell_id}:${local.connector_authority_cell_alias_color}"
   ]) : []
+  # Keep the candidate principal plan-known. Referencing the ARN attribute of
+  # the new IAM role would make the saved-plan endpoint policy unknown and
+  # prevent the pre-apply checker from validating the sole admitted update.
+  matched_cohort_candidate_server_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.name_prefix}-server-candidate"
 }
 
 # One fail-closed boundary owns the caller graph. The exact four-operation
@@ -132,7 +136,10 @@ resource "aws_vpc_endpoint" "connector_authority_lambda" {
       Resource  = local.connector_authority_cell_alias_arns
       Condition = {
         StringEquals = {
-          "aws:PrincipalArn" = [aws_iam_role.server.arn]
+          "aws:PrincipalArn" = sort(compact([
+            aws_iam_role.server.arn,
+            var.enable_matched_cohort_canary ? local.matched_cohort_candidate_server_role_arn : "",
+          ]))
         }
       }
     }]
@@ -152,6 +159,27 @@ resource "aws_iam_role_policy" "server_connector_authority" {
 
   name = "connector-authority-cell-invoke"
   role = aws_iam_role.server.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "InvokeAssignedCellAuthority"
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = local.connector_authority_cell_alias_arns
+      Condition = {
+        StringEquals = {
+          "aws:SourceVpce" = aws_vpc_endpoint.connector_authority_lambda[0].id
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "server_candidate_connector_authority" {
+  count = local.connector_authority_cell_enabled && var.enable_matched_cohort_canary ? 1 : 0
+
+  name = "connector-authority-cell-invoke"
+  role = aws_iam_role.server_candidate[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

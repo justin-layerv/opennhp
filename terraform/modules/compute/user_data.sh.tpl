@@ -417,6 +417,9 @@ LicensesTable = "${dynamodb_licenses_table}"
 %{ if dynamodb_ac_assignments_table != null ~}
 ACAssignmentsTable = "${dynamodb_ac_assignments_table}"
 %{ endif ~}
+%{ if dynamodb_ac_assignment_authority_table != null ~}
+ACAssignmentAuthorityTable = "${dynamodb_ac_assignment_authority_table}"
+%{ endif ~}
 %{ if dynamodb_resources_table != null ~}
 ResourcesTable = "${dynamodb_resources_table}"
 %{ endif ~}

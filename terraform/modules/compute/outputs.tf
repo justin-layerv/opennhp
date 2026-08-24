@@ -161,6 +161,19 @@ output "security_group_id" {
   value       = aws_security_group.server.id
 }
 
+output "matched_cohort_public_ingress_rule" {
+  description = "Exact canonical public UDP target rule changed only by the attended maintenance gate."
+  value = var.enable_matched_cohort_canary ? {
+    security_group_id      = aws_security_group.server.id
+    security_group_rule_id = aws_vpc_security_group_ingress_rule.server_nhp_udp[0].security_group_rule_id
+    description            = aws_vpc_security_group_ingress_rule.server_nhp_udp[0].description
+    ip_protocol            = "udp"
+    from_port              = 62206
+    to_port                = 62206
+    open_cidr_ipv4         = "0.0.0.0/0"
+  } : null
+}
+
 output "log_group_name" {
   description = "CloudWatch log group name"
   value       = aws_cloudwatch_log_group.server.name
@@ -281,6 +294,106 @@ output "ssm_green_image_tag_parameter" {
 output "ssm_green_asg_name_parameter" {
   description = "SSM parameter name for green ASG name (null if blue/green not enabled)"
   value       = var.enable_blue_green ? aws_ssm_parameter.green_asg_name[0].name : null
+}
+
+output "matched_cohort_registration_blue_dns_name" {
+  description = "Blue-only AC registration endpoint for the matched-cohort canary."
+  value       = var.enable_matched_cohort_canary ? aws_lb.server_registration_blue[0].dns_name : null
+}
+
+output "matched_cohort_registration_green_dns_name" {
+  description = "Green-only AC registration endpoint for the matched-cohort canary."
+  value       = var.enable_matched_cohort_canary ? aws_lb.server_registration_green[0].dns_name : null
+}
+
+output "matched_cohort_relay_green_dns_name" {
+  description = "Green-only internal server endpoint for the candidate relay fleet."
+  value       = var.enable_matched_cohort_canary ? aws_lb.server_relay_green[0].dns_name : null
+}
+
+output "matched_cohort_candidate_server_dns_name" {
+  description = "Restricted green-only direct-smoke endpoint."
+  value       = var.enable_matched_cohort_canary ? aws_lb.server_candidate[0].dns_name : null
+}
+
+output "matched_cohort_candidate_listener_arn" {
+  description = "Source-fenced candidate server UDP listener."
+  value       = var.enable_matched_cohort_canary ? aws_lb_listener.server_candidate[0].arn : null
+}
+
+output "matched_cohort_candidate_smoke_target_group_arn" {
+  description = "Candidate server target group used only by the source-fenced smoke listener."
+  value       = var.enable_matched_cohort_canary ? aws_lb_target_group.server_candidate[0].arn : null
+}
+
+output "matched_cohort_candidate_promotion_target_group_arn" {
+  description = "Green server target group reserved for the canonical listener selector."
+  value       = var.enable_matched_cohort_canary ? aws_lb_target_group.server_candidate_promotion[0].arn : null
+}
+
+output "matched_cohort_candidate_asg_name" {
+  description = "Full-size isolated server candidate ASG."
+  value       = var.enable_matched_cohort_canary ? aws_autoscaling_group.server_candidate[0].name : null
+}
+
+output "matched_cohort_candidate_image_parameter" {
+  description = "SSM image slot consumed only by the isolated server candidate ASG."
+  value       = var.enable_matched_cohort_canary ? aws_ssm_parameter.matched_cohort_server_image_tag[0].name : null
+}
+
+output "matched_cohort_candidate_launch_template_id" {
+  description = "Candidate server launch template ID; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? aws_launch_template.server_candidate[0].id : null
+}
+
+output "matched_cohort_candidate_launch_template_version" {
+  description = "Candidate server launch template version; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? tostring(aws_launch_template.server_candidate[0].latest_version) : null
+}
+
+output "matched_cohort_blue_rollback_authority" {
+  description = "Exact active server fleet authority retained for matched-cohort rollback."
+  value = var.enable_matched_cohort_canary ? {
+    asg_name                = aws_autoscaling_group.server.name
+    min_size                = var.min_capacity
+    max_size                = var.max_capacity
+    desired_capacity        = var.min_capacity
+    launch_template_id      = aws_launch_template.server.id
+    launch_template_version = tostring(aws_launch_template.server.latest_version)
+    image_parameter         = aws_ssm_parameter.image_tag.name
+    image_tag               = nonsensitive(data.aws_ssm_parameter.matched_cohort_blue_image_tag[0].value)
+    target_group_arns = sort(compact([
+      aws_lb_target_group.udp[0].arn,
+      aws_lb_target_group.server_registration_blue[0].arn,
+      var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https[0].arn : "",
+      var.relay_enabled ? aws_lb_target_group.udp_internal[0].arn : "",
+    ]))
+  } : null
+}
+
+output "matched_cohort_candidate_authority" {
+  description = "Exact isolated server candidate fleet authority."
+  value = var.enable_matched_cohort_canary ? {
+    asg_name                = aws_autoscaling_group.server_candidate[0].name
+    min_size                = var.min_capacity
+    max_size                = var.max_capacity
+    desired_capacity        = var.min_capacity
+    launch_template_id      = aws_launch_template.server_candidate[0].id
+    launch_template_version = tostring(aws_launch_template.server_candidate[0].latest_version)
+    image_parameter         = aws_ssm_parameter.matched_cohort_server_image_tag[0].name
+    image_tag               = nonsensitive(data.aws_ssm_parameter.matched_cohort_candidate_image_tag[0].value)
+    target_group_arns = sort([
+      aws_lb_target_group.server_registration_green[0].arn,
+      aws_lb_target_group.server_relay_green[0].arn,
+      aws_lb_target_group.server_candidate[0].arn,
+      aws_lb_target_group.server_candidate_promotion[0].arn,
+    ])
+  } : null
+}
+
+output "matched_cohort_candidate_cloudmap_service_arn" {
+  description = "Green-only Cloud Map service ARN; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? aws_service_discovery_service.server_candidate[0].arn : null
 }
 
 # =============================================================================

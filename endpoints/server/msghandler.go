@@ -1747,6 +1747,10 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		redirected, peers, ardErr := s.handleACServerAssignment(ppd, aolMsg, transactionId, addrStr)
 		if ardErr != nil {
 			log.Error("server-ac(%s#%d@%s)[HandleACOnline] server assignment lookup error: %v", acId, transactionId, addrStr, ardErr)
+			if IsACAssignmentAuthorityError(ardErr) {
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrServerACOpsFailed, acId, addrStr, "candidate-assignment-authority")
+				return ardErr
+			}
 			// Fall through to direct registration on error
 		} else if redirected {
 			// AC was redirected via NHP_ARD to its assigned servers
@@ -2787,6 +2791,10 @@ func (s *UdpServer) autoAssignAC(
 	// `assignment` value as a retry input elsewhere — see
 	// saveAssignmentWithRetry's docstring.
 	if saveErr := s.saveAssignmentWithRetry(acId, transactionId, addrStr, assignment); saveErr != nil {
+		if IsACAssignmentAuthorityError(saveErr) {
+			log.Error("server-ac(%s#%d@%s)[autoAssignAC] candidate assignment authority failed closed: %v", acId, transactionId, addrStr, saveErr)
+			return false, saveErr
+		}
 		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to save assignment: %v, accepting directly", acId, transactionId, addrStr, saveErr)
 		return false, nil
 	}
@@ -2891,9 +2899,9 @@ const (
 // increments by 1, and tries again.
 //
 // Returns nil on success. Returns the last error on exhaustion or
-// on any non-VersionConflict storage error (preserves the legacy
-// availability fallthrough — caller turns the error into "accept
-// directly").
+// on any non-VersionConflict storage error. The ordinary caller preserves its
+// established availability fallthrough; the split candidate authority caller
+// recognizes ACAssignmentAuthorityError and rejects instead.
 //
 // saveAssignmentWithRetry mutates assignment.Version on each retry
 // to the freshly observed-version+1, so the function is NOT
@@ -2983,7 +2991,7 @@ func (s *UdpServer) saveAssignmentWithRetry(
 		}
 	}
 	s.metrics.IncrCounter(MetricACAssignmentVersionConflictExhausted)
-	log.Warning("server-ac(%s#%d@%s)[autoAssignAC] version conflict retries exhausted (%d attempts), accepting directly",
+	log.Warning("server-ac(%s#%d@%s)[autoAssignAC] version conflict retries exhausted (%d attempts), returning last conflict",
 		acId, transactionId, addrStr, saveAssignmentMaxAttempts)
 	return lastErr
 }

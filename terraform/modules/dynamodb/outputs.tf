@@ -12,6 +12,16 @@ output "ac_assignments_table_arn" {
   value       = aws_dynamodb_table.ac_assignments.arn
 }
 
+output "matched_cohort_ac_assignments_table_arn" {
+  description = "ARN of the isolated candidate AC assignments table; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? aws_dynamodb_table.matched_cohort_ac_assignments[0].arn : null
+}
+
+output "matched_cohort_operator_lock_table_name" {
+  description = "Durable exact-owner lock table for matched-cohort maintenance and selector operations; null when disabled."
+  value       = var.enable_matched_cohort_canary ? aws_dynamodb_table.matched_cohort_operator_lock[0].name : null
+}
+
 output "resources_table_arn" {
   description = "ARN of the resources DynamoDB table"
   value       = aws_dynamodb_table.resources.arn
@@ -42,6 +52,21 @@ output "licenses_table_name" {
 output "ac_assignments_table_name" {
   description = "Name of the AC assignments DynamoDB table"
   value       = aws_dynamodb_table.ac_assignments.name
+}
+
+output "matched_cohort_ac_assignments_table_name" {
+  description = "Name of the isolated candidate AC assignments table; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? aws_dynamodb_table.matched_cohort_ac_assignments[0].name : null
+}
+
+output "matched_cohort_server_policy_arn" {
+  description = "Least-privilege candidate server DynamoDB policy ARN; null while the matched-cohort canary is disabled."
+  value       = var.enable_matched_cohort_canary ? aws_iam_policy.matched_cohort_server[0].arn : null
+}
+
+output "matched_cohort_server_policy_doc_hash" {
+  description = "Candidate server DynamoDB policy digest used by the candidate IAM propagation barrier."
+  value       = var.enable_matched_cohort_canary ? sha256(aws_iam_policy.matched_cohort_server[0].policy) : null
 }
 
 output "resources_table_name" {

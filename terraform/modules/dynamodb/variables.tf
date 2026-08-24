@@ -28,6 +28,12 @@ variable "kms_key_arn" {
   default     = null
 }
 
+variable "enable_matched_cohort_canary" {
+  description = "Create the isolated candidate AC-assignment authority used by the production matched-cohort canary."
+  type        = bool
+  default     = false
+}
+
 # ==================== QURL Service Tables ====================
 
 variable "deploy_qurl_tables" {

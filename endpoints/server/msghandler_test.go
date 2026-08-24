@@ -536,6 +536,52 @@ func TestHandleACServerAssignment_CrossColorSaveFailureDoesNotCountMigration(t *
 	}
 }
 
+type assignmentAuthorityFailureStorage struct{ *mockStorageBackend }
+
+func (s *assignmentAuthorityFailureStorage) GetACAssignment(context.Context, string) (*ACAssignment, error) {
+	return nil, NewACAssignmentAuthorityError(errors.New("injected authority failure"))
+}
+
+func TestHandleACServerAssignmentCandidateAuthorityFailureDoesNotFallThrough(t *testing.T) {
+	storage := &assignmentAuthorityFailureStorage{mockStorageBackend: newMockStorageBackend()}
+	srv := &UdpServer{storage: storage}
+	_, _, err := srv.handleACServerAssignment(
+		newACOnlinePPD(),
+		&common.ACOnlineMsg{ACId: "ac-candidate"},
+		33334,
+		"10.99.0.4:62206",
+	)
+	if !IsACAssignmentAuthorityError(err) {
+		t.Fatalf("handleACServerAssignment error = %v, want candidate authority rejection", err)
+	}
+}
+
+func TestAutoAssignACCandidateAuthoritySaveFailureDoesNotAcceptDirectly(t *testing.T) {
+	const acID = "ac-candidate-save"
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{{
+			ID: "green-1", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, ASGName: "green",
+		}},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+	storage := newMockStorageBackend()
+	storage.saveOverride = func(*ACAssignment) error {
+		return NewACAssignmentAuthorityError(errors.New("injected candidate write failure"))
+	}
+	srv, _ := newColorTestServer(t, storage, cloudMap, "green-1", "green", "10.0.1.1")
+	_, err := srv.autoAssignAC(
+		newACOnlinePPD(),
+		&common.ACOnlineMsg{ACId: acID},
+		33335,
+		"10.99.0.5:62206",
+		0,
+		nil,
+	)
+	if !IsACAssignmentAuthorityError(err) {
+		t.Fatalf("autoAssignAC error = %v, want candidate authority rejection", err)
+	}
+}
+
 // TestHandleACServerAssignment_SuppressesCrossColorMigrationWhenTargetWouldShrinkCoverage
 // fences the qURL timeout class seen in sandbox: a shared ACId had a healthy
 // three-server assignment, but a cross-color registration rewrote it to the one

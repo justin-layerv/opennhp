@@ -33,6 +33,26 @@ resource "aws_ssm_parameter" "relay_image_tag" {
   }
 }
 
+resource "aws_ssm_parameter" "relay_matched_cohort_image_tag" {
+  count = var.deploy_relay && var.enable_matched_cohort_canary ? 1 : 0
+
+  name        = "/${var.environment}/nhp/relay/green-image-tag"
+  description = "Candidate NHP Relay image tag for the coordinated matched-cohort canary"
+  type        = "String"
+  value       = var.image_tag
+
+  tags = merge(local.common_tags, {
+    Name        = "${local.name_prefix}-ssm-relay-green-image-tag"
+    Component   = "relay"
+    Service     = "nhp-relay"
+    DeployColor = "green"
+  })
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # Single authoritative deploy target. CI continues reading the established
 # /<environment>/nhp/relay/asg-name path; only Terraform ownership moves out of
 # the disposable fleet. Replacing the sandbox fleet updates this value in place.

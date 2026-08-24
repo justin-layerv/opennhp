@@ -408,6 +408,18 @@ variable "dynamodb_ac_assignments_table" {
   default     = null
 }
 
+variable "matched_cohort_ac_assignments_table" {
+  description = "Candidate-only AC assignments table name. Required when enable_matched_cohort_canary is true."
+  type        = string
+  default     = ""
+}
+
+variable "matched_cohort_ac_assignments_arn" {
+  description = "Candidate-only AC assignments table ARN. Required when enable_matched_cohort_canary is true."
+  type        = string
+  default     = ""
+}
+
 variable "dynamodb_resources_table" {
   description = "DynamoDB table name for resources"
   type        = string
@@ -479,6 +491,18 @@ variable "dynamodb_read_policy_doc_hash" {
   description = "sha256 of the NHP server DynamoDB storage-access policy document. Used to re-fire the server IAM propagation wait when policy contents change."
   type        = string
   default     = null
+}
+
+variable "matched_cohort_server_policy_arn" {
+  description = "Least-privilege DynamoDB policy for the isolated candidate server role."
+  type        = string
+  default     = ""
+}
+
+variable "matched_cohort_server_policy_doc_hash" {
+  description = "Digest of the isolated candidate server DynamoDB policy for IAM propagation ordering."
+  type        = string
+  default     = ""
 }
 
 variable "keypair_policy_arn" {
@@ -893,6 +917,39 @@ variable "enable_blue_green" {
   description = "Enable blue/green deployment infrastructure. Creates a second ASG (green) and SSM parameters for traffic switching."
   type        = bool
   default     = false
+}
+
+variable "enable_matched_cohort_canary" {
+  description = "Create the dormant, color-isolated server candidate and smoke edges used by the coordinated server/AC/relay production canary. This is independent of the legacy canary/blue-green deploy mode and never switches active traffic."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !(var.enable_matched_cohort_canary && var.enable_blue_green)
+    error_message = "enable_matched_cohort_canary and enable_blue_green are separate deployment regimes and cannot both own the green image slot."
+  }
+}
+
+variable "matched_cohort_smoke_ingress_cidrs" {
+  description = "Sorted, duplicate-free exact IPv4 /32 sources allowed to reach the isolated candidate server edge. Empty unless enable_matched_cohort_canary is true."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = (
+      !var.enable_matched_cohort_canary ||
+      (length(var.matched_cohort_smoke_ingress_cidrs) > 0 && alltrue([
+        for cidr in var.matched_cohort_smoke_ingress_cidrs :
+        can(cidrhost(cidr, 0)) && endswith(cidr, "/32")
+      ]))
+    )
+    error_message = "matched_cohort_smoke_ingress_cidrs must contain at least one exact IPv4 /32 when the matched-cohort canary is enabled."
+  }
+
+  validation {
+    condition     = var.matched_cohort_smoke_ingress_cidrs == sort(distinct(var.matched_cohort_smoke_ingress_cidrs))
+    error_message = "matched_cohort_smoke_ingress_cidrs must be sorted and duplicate-free."
+  }
 }
 
 variable "green_standby_min_size" {

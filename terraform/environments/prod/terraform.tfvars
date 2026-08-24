@@ -38,6 +38,7 @@ ac_auth_service_id = "agent"
 # with resource identity. Hard-cutover rename in PR shipping this file.
 ac_resource_ids = ["qurl", "qurl-tunnel-server"]
 ac_min_capacity = 3
+# Matched-cohort EIP and saved-plan inventories bind this reviewed prod ceiling.
 ac_max_capacity = 10
 # eBPF/XDP datapath (E5 flip). 1 = FilterMode_EBPFXDP, 0 = iptables.
 #

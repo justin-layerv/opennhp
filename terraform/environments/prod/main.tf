@@ -88,10 +88,12 @@ module "nhp" {
   nhp_overload_cookie_time_window_seconds = var.nhp_overload_cookie_time_window_seconds
 
   # Knock-port DoS hardening (#1159)
-  nhp_knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
-  nhp_knock_global_rate_limit_burst = var.nhp_knock_global_rate_limit_burst
-  nhp_udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
-  public_nhp_udp_ingress_cidrs      = var.public_nhp_udp_ingress_cidrs
+  nhp_knock_global_rate_limit_pps    = var.nhp_knock_global_rate_limit_pps
+  nhp_knock_global_rate_limit_burst  = var.nhp_knock_global_rate_limit_burst
+  nhp_udp_recv_buffer_bytes          = var.nhp_udp_recv_buffer_bytes
+  public_nhp_udp_ingress_cidrs       = var.public_nhp_udp_ingress_cidrs
+  enable_matched_cohort_canary       = var.enable_matched_cohort_canary
+  matched_cohort_smoke_ingress_cidrs = var.matched_cohort_smoke_ingress_cidrs
 
   # Monitoring
   enable_slack_notifications                  = var.enable_slack_notifications

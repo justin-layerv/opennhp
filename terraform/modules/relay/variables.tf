@@ -164,6 +164,60 @@ variable "ssm_image_tag_parameter" {
   }
 }
 
+variable "enable_matched_cohort_canary" {
+  description = "Create an isolated candidate relay fleet and restricted candidate listener without changing the canonical relay rule."
+  type        = bool
+  default     = false
+}
+
+variable "matched_cohort_image_tag_parameter" {
+  description = "SSM image slot consumed only by the isolated candidate relay fleet."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = !var.enable_matched_cohort_canary || (
+      var.matched_cohort_image_tag_parameter == "/${var.environment}/nhp/relay/green-image-tag"
+    )
+    error_message = "matched_cohort_image_tag_parameter must be /<environment>/nhp/relay/green-image-tag when enabled."
+  }
+}
+
+variable "matched_cohort_cell_servers" {
+  description = "Candidate relay cell table. Every host must be a green-only server endpoint."
+  type = list(object({
+    name       = string
+    public_key = string
+    host       = string
+    port       = number
+  }))
+  default = []
+
+  validation {
+    condition = !var.enable_matched_cohort_canary || (
+      length(var.matched_cohort_cell_servers) == length(var.cell_servers) &&
+      length(var.matched_cohort_cell_servers) > 0 &&
+      alltrue([for s in var.matched_cohort_cell_servers : trimspace(s.host) != "" && s.port == 62206])
+    )
+    error_message = "matched_cohort_cell_servers must contain one non-empty green-only UDP 62206 endpoint per ordinary cell."
+  }
+}
+
+variable "matched_cohort_smoke_ingress_cidrs" {
+  description = "Sorted duplicate-free IPv4 /32 sources allowed to reach the candidate relay listener."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = !var.enable_matched_cohort_canary || (
+      length(var.matched_cohort_smoke_ingress_cidrs) > 0 &&
+      var.matched_cohort_smoke_ingress_cidrs == sort(distinct(var.matched_cohort_smoke_ingress_cidrs)) &&
+      alltrue([for cidr in var.matched_cohort_smoke_ingress_cidrs : can(cidrhost(cidr, 0)) && endswith(cidr, "/32")])
+    )
+    error_message = "matched_cohort_smoke_ingress_cidrs must be a non-empty sorted duplicate-free list of IPv4 /32s when enabled."
+  }
+}
+
 variable "relay_secret_arn" {
   description = "ARN of the independently owned relay identity secret. Only relay instances receive read access."
   type        = string

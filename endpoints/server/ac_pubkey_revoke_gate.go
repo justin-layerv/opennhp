@@ -202,6 +202,11 @@ const (
 	// ACAssignment.RevokedPubKeys. Permit logs+metric and accepts
 	// (pre-fix behavior); strict rejects.
 	verdictACPubkeyRevokeRevoked
+	// verdictACPubkeyRevokeAuthorityUnavailable is candidate-only. Ordinary
+	// storage failures preserve the established availability-first behavior,
+	// but a split assignment store cannot admit unless the active revocation
+	// authority was strongly read.
+	verdictACPubkeyRevokeAuthorityUnavailable
 )
 
 // Per-process forensic anchors. Each guarantees at least one log
@@ -329,6 +334,10 @@ func (s *UdpServer) applyACPubkeyRevokeVerdict(
 			})
 		}
 		return true, nil
+	case verdictACPubkeyRevokeAuthorityUnavailable:
+		log.Error("server-ac(%s#%d@%s)[ACPubkeyRevoked] candidate assignment authority unavailable; rejecting before admission",
+			acId, transactionId, addrStr)
+		return false, common.ErrServerACOpsFailed
 	}
 	// Fail-closed default. Same pattern as the other gates: a future
 	// PR that adds a new verdict constant and forgets to register
@@ -376,6 +385,10 @@ func (s *UdpServer) evaluateACPubkeyRevokeVerdict(
 	if err != nil {
 		if IsNotFoundError(err) {
 			return verdictACPubkeyRevokeOK
+		}
+		if IsACAssignmentAuthorityError(err) {
+			s.metrics.IncrCounter(MetricACPubkeyRevokedLookupErr)
+			return verdictACPubkeyRevokeAuthorityUnavailable
 		}
 		// Transient error: degrade to skip-the-gate + lookup-err
 		// counter. Strict mode does NOT escalate — see package doc.

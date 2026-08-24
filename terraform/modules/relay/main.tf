@@ -75,4 +75,17 @@ locals {
     cell_servers         = var.cell_servers
     cors_allowed_origins = var.cors_allowed_origins
   })
+
+  matched_cohort_user_data = var.enable_matched_cohort_canary ? templatefile("${path.module}/user_data.sh.tpl", {
+    region                  = data.aws_region.current.id
+    environment             = var.environment
+    relay_repo_url          = var.relay_repo_url
+    secret_arn              = var.relay_secret_arn
+    ssm_image_tag_parameter = var.matched_cohort_image_tag_parameter
+    log_group               = aws_cloudwatch_log_group.relay.name
+    listen_port             = var.listen_port
+    udp_listen_port         = var.udp_listen_port
+    cell_servers            = var.matched_cohort_cell_servers
+    cors_allowed_origins    = var.cors_allowed_origins
+  }) : ""
 }

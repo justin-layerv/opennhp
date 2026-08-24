@@ -209,6 +209,8 @@ type mockStorageBackend struct {
 	saveOverride func(*ACAssignment) error
 }
 
+func (*mockStorageBackend) acAssignmentCacheSafeLeaf() {}
+
 func newMockStorageBackend() *mockStorageBackend {
 	return &mockStorageBackend{
 		assignments: make(map[string]*ACAssignment),

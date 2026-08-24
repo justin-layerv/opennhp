@@ -302,6 +302,28 @@ type StorageError struct {
 	Err     error
 }
 
+// ACAssignmentAuthorityError marks candidate-routing failures that cannot use
+// the ordinary availability-first assignment fallback. A candidate server must
+// prove the distinct active row before it can admit the physical AC; otherwise
+// a missing/malformed authority row or a transient read failure could bypass a
+// live revoked_pubkeys entry.
+type ACAssignmentAuthorityError struct{ Err error }
+
+func (e *ACAssignmentAuthorityError) Error() string {
+	return "AC assignment authority unavailable: " + e.Err.Error()
+}
+
+func (e *ACAssignmentAuthorityError) Unwrap() error { return e.Err }
+
+func NewACAssignmentAuthorityError(err error) *ACAssignmentAuthorityError {
+	return &ACAssignmentAuthorityError{Err: err}
+}
+
+func IsACAssignmentAuthorityError(err error) bool {
+	var authorityErr *ACAssignmentAuthorityError
+	return errors.As(err, &authorityErr)
+}
+
 func (e *StorageError) Error() string {
 	if e.Err != nil {
 		return e.Message + ": " + e.Err.Error()
@@ -395,10 +417,11 @@ type StorageConfig struct {
 
 // DynamoDBConfig configures the DynamoDB storage backend.
 type DynamoDBConfig struct {
-	Region             string `toml:"Region"`
-	LicensesTable      string `toml:"LicensesTable"`
-	ACAssignmentsTable string `toml:"ACAssignmentsTable"`
-	ResourcesTable     string `toml:"ResourcesTable"`
+	Region                     string `toml:"Region"`
+	LicensesTable              string `toml:"LicensesTable"`
+	ACAssignmentsTable         string `toml:"ACAssignmentsTable"`
+	ACAssignmentAuthorityTable string `toml:"ACAssignmentAuthorityTable"`
+	ResourcesTable             string `toml:"ResourcesTable"`
 	// AgentKeysTable holds sidecar agent registrations written by
 	// qurl-service's bootstrap path. nhp-server reads it on every
 	// knock receipt via the `pubkey-index` GSI to resolve the
@@ -478,8 +501,9 @@ func DefaultStorageConfig() StorageConfig {
 
 // CachedStorage wraps a StorageBackend with an LRU cache.
 type CachedStorage struct {
-	backend StorageBackend
-	cache   *AssignmentCache
+	backend                 StorageBackend
+	cache                   *AssignmentCache
+	bypassACAssignmentCache bool
 }
 
 // Compile-time interface compliance check
@@ -488,10 +512,47 @@ var _ StorageBackend = (*CachedStorage)(nil)
 // NewCachedStorage creates a new cached storage wrapper.
 func NewCachedStorage(backend StorageBackend, config CacheConfig) *CachedStorage {
 	return &CachedStorage{
-		backend: backend,
-		cache:   NewAssignmentCache(config),
+		backend:                 backend,
+		cache:                   NewAssignmentCache(config),
+		bypassACAssignmentCache: backendUsesExternalACAssignmentAuthority(backend),
 	}
 }
+
+// backendUsesExternalACAssignmentAuthority identifies the candidate-only
+// routing mode through the normal decorator chain. In that mode each
+// assignment read must reach DynamoDB so a newly-added active-table
+// revoked_pubkeys member is authoritative for the next AOL; caching the merged
+// row would extend admission after revocation. A malformed/cyclic wrapper chain
+// fails safe by bypassing the cache.
+func backendUsesExternalACAssignmentAuthority(backend StorageBackend) bool {
+	type cacheSafeLeaf interface{ acAssignmentCacheSafeLeaf() }
+	type unwrapper interface{ Backend() StorageBackend }
+	for hops := 0; backend != nil && hops < unwrapMaxHops; hops++ {
+		if ddb, ok := backend.(*DynamoDBStorage); ok {
+			return ddb.config.ACAssignmentAuthorityTable != ""
+		}
+		if _, ok := backend.(cacheSafeLeaf); ok {
+			return false
+		}
+		wrapped, ok := backend.(unwrapper)
+		if !ok {
+			return true
+		}
+		next := wrapped.Backend()
+		if next == backend {
+			return true
+		}
+		backend = next
+	}
+	return backend != nil
+}
+
+// acAssignmentCacheSafeLeaf is an explicit opt-in. New opaque storage
+// implementations and decorators bypass the assignment cache until they
+// expose their backend or establish that they have no external revocation
+// authority hidden below them.
+func (*MemoryStorage) acAssignmentCacheSafeLeaf() {}
+func (*EtcdStorage) acAssignmentCacheSafeLeaf()   {}
 
 // GetACAssignment retrieves the AC assignment, using cache when available.
 //
@@ -510,6 +571,13 @@ func NewCachedStorage(backend StorageBackend, config CacheConfig) *CachedStorage
 // forwarding, but prod forward traffic is sparse and the registration
 // kernels are periodic, so the rate is low regardless.
 func (cs *CachedStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
+	if cs.bypassACAssignmentCache {
+		assignment, err := cs.backend.GetACAssignment(ctx, acID)
+		if err != nil || assignment == nil {
+			return assignment, err
+		}
+		return assignment.Clone(), nil
+	}
 	assignment := cs.cache.Get(acID)
 	if assignment == nil {
 		fetched, err := cs.backend.GetACAssignment(ctx, acID)
@@ -563,6 +631,9 @@ func (cs *CachedStorage) SaveACAssignment(ctx context.Context, assignment *ACAss
 	toSave := assignment.Clone()
 	if err := cs.backend.SaveACAssignment(ctx, toSave); err != nil {
 		return err
+	}
+	if cs.bypassACAssignmentCache {
+		return nil
 	}
 	// toSave is deliberately shared between the backend write and the
 	// cache entry: the StorageBackend.SaveACAssignment contract forbids

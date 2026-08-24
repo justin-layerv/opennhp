@@ -1075,7 +1075,7 @@ resource "aws_vpc_security_group_egress_rule" "server_all" {
 # User Data script - using templatefile for proper interpolation
 locals {
   protocol_environment = coalesce(var.protocol_environment, var.environment)
-  user_data = templatefile("${path.module}/user_data.sh.tpl", {
+  server_user_data_inputs = {
     secret_arn                      = aws_secretsmanager_secret.server.arn
     region                          = data.aws_region.current.id
     account_id                      = data.aws_caller_identity.current.account_id
@@ -1108,14 +1108,15 @@ locals {
     server_plugins  = var.server_plugins
     auth_service_id = var.auth_service_id
     # Storage backend configuration (Phase 4)
-    storage_backend                = var.storage_backend
-    dynamodb_region                = coalesce(var.dynamodb_region, data.aws_region.current.id)
-    dynamodb_licenses_table        = var.dynamodb_licenses_table
-    dynamodb_ac_assignments_table  = var.dynamodb_ac_assignments_table
-    dynamodb_resources_table       = var.dynamodb_resources_table
-    dynamodb_agent_keys_table      = var.dynamodb_agent_keys_table
-    dynamodb_ack_tokens_table      = var.dynamodb_ack_tokens_table
-    dynamodb_session_control_table = var.dynamodb_session_control_table
+    storage_backend                        = var.storage_backend
+    dynamodb_region                        = coalesce(var.dynamodb_region, data.aws_region.current.id)
+    dynamodb_licenses_table                = var.dynamodb_licenses_table
+    dynamodb_ac_assignments_table          = var.dynamodb_ac_assignments_table
+    dynamodb_ac_assignment_authority_table = null
+    dynamodb_resources_table               = var.dynamodb_resources_table
+    dynamodb_agent_keys_table              = var.dynamodb_agent_keys_table
+    dynamodb_ack_tokens_table              = var.dynamodb_ack_tokens_table
+    dynamodb_session_control_table         = var.dynamodb_session_control_table
     # Cloud Map configuration for server health discovery
     cloudmap_enabled        = var.cloudmap_enabled
     cloudmap_namespace_name = var.cloudmap_namespace_name
@@ -1192,7 +1193,9 @@ locals {
     relay_toml = var.relay_enabled ? chomp(templatefile("${path.module}/relay.toml.tpl", {
       relay_trusted_public_keys_b64 = var.relay_trusted_public_keys_b64
     })) : ""
-  })
+  }
+
+  user_data = templatefile("${path.module}/user_data.sh.tpl", local.server_user_data_inputs)
 
   # Launch template user_data — small fetcher when the plugin bucket exists,
   # legacy inline base64gzip path otherwise. Computed in a local so the

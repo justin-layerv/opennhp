@@ -272,6 +272,8 @@ locals {
   resolved_max_capacity             = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
   resolved_deletion_spike_threshold = coalesce(var.secret_reconciliation_deletion_spike_threshold, local.is_prod ? 10 : 60)
   eip_pool_tag                      = "${var.name_prefix}-ac"
+  matched_cohort_blue_eip_pool_tag  = "${var.name_prefix}-ac-matched-blue"
+  matched_cohort_green_eip_pool_tag = "${var.name_prefix}-ac-matched-green"
 
   # FRPS control channel TG name. Computed once so the resource
   # `name` attribute and the length precondition cannot drift.
@@ -990,7 +992,7 @@ resource "aws_service_discovery_service" "ac" {
 
 # User data script
 locals {
-  user_data = templatefile("${path.module}/user_data.sh.tpl", {
+  user_data_inputs = {
     region                = local.region
     account_id            = local.account_id
     ac_repo_url           = var.ac_repo_url
@@ -1100,7 +1102,29 @@ locals {
     frp_control_upstream_host        = var.frp_control_upstream_host
     frp_control_additional_upstreams = var.frp_control_additional_upstreams
     frp_control_listener_ports       = local.frp_control_listener_ports
-  })
+  }
+
+  user_data = templatefile("${path.module}/user_data.sh.tpl", local.user_data_inputs)
+
+  matched_cohort_blue_user_data = var.enable_matched_cohort_canary ? templatefile(
+    "${path.module}/user_data.sh.tpl",
+    merge(local.user_data_inputs, {
+      server_endpoint               = var.matched_cohort_blue_server_endpoint
+      enable_blue_green             = true
+      ssm_green_image_tag_parameter = aws_ssm_parameter.matched_cohort_ac_image_tag[0].name
+      eip_pool_tag                  = local.matched_cohort_blue_eip_pool_tag
+    }),
+  ) : ""
+
+  matched_cohort_green_user_data = var.enable_matched_cohort_canary ? templatefile(
+    "${path.module}/user_data.sh.tpl",
+    merge(local.user_data_inputs, {
+      server_endpoint               = var.matched_cohort_green_server_endpoint
+      enable_blue_green             = true
+      ssm_green_image_tag_parameter = aws_ssm_parameter.matched_cohort_ac_image_tag[0].name
+      eip_pool_tag                  = local.matched_cohort_green_eip_pool_tag
+    }),
+  ) : ""
 }
 
 resource "terraform_data" "frps_control_listener_port_preconditions" {

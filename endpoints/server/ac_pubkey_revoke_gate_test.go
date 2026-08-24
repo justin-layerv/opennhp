@@ -294,6 +294,25 @@ func TestEvaluateACPubkeyRevokeVerdict_StorageErrorReturnsOK(t *testing.T) {
 	}
 }
 
+func TestEvaluateACPubkeyRevokeVerdict_CandidateAuthorityErrorRejects(t *testing.T) {
+	mem := NewMemoryStorage()
+	storage := &errStorageACAssignment{
+		MemoryStorage: mem,
+		err:           NewACAssignmentAuthorityError(errors.New("active authority unavailable")),
+	}
+	s := newTestServerForLicenseGate(t, mem)
+	s.storage = storage
+
+	verdict := s.evaluateACPubkeyRevokeVerdict(context.Background(), "ac-1", testPubkeyB64(0x01), 1, "10.0.0.1:62206")
+	if verdict != verdictACPubkeyRevokeAuthorityUnavailable {
+		t.Fatalf("candidate authority error verdict=%v, want fail-closed authority verdict", verdict)
+	}
+	proceed, rejectErr := s.applyACPubkeyRevokeVerdict(verdict, "ac-1", testPubkeyB64(0x01), 1, "10.0.0.1:62206")
+	if proceed || !errors.Is(rejectErr, common.ErrServerACOpsFailed) {
+		t.Fatalf("apply candidate authority verdict=(%v,%v), want rejection %v", proceed, rejectErr, common.ErrServerACOpsFailed)
+	}
+}
+
 func TestEvaluateACPubkeyRevokeVerdict_NotFoundReturnsOK(t *testing.T) {
 	mem := NewMemoryStorage()
 	s := newTestServerForLicenseGate(t, mem)

@@ -566,6 +566,18 @@ variable "server_nlb_security_group_id" {
   nullable    = false
 }
 
+variable "server_security_group_id" {
+  description = "NHP Server instance security group that accepts exact matched-cohort AC registration and assigned-server refresh traffic."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = !var.enable_matched_cohort_canary || trimspace(var.server_security_group_id) != ""
+    error_message = "server_security_group_id is required when the matched-cohort canary is enabled."
+  }
+}
+
 # ============================================================================
 # Deployment Configuration
 # ============================================================================
@@ -824,6 +836,54 @@ variable "enable_blue_green" {
   description = "Enable blue/green deployment infrastructure for AC"
   type        = bool
   default     = false
+}
+
+variable "enable_matched_cohort_canary" {
+  description = "Create isolated blue/candidate registration launch slots and a restricted candidate AC edge without changing the canonical AC listener."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !(var.enable_matched_cohort_canary && var.enable_blue_green)
+    error_message = "enable_matched_cohort_canary and enable_blue_green cannot both own the green AC image slot."
+  }
+}
+
+variable "matched_cohort_blue_server_endpoint" {
+  description = "Blue-only server registration hostname rendered into the reversible old-cohort AC launch slot."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.enable_matched_cohort_canary || trimspace(var.matched_cohort_blue_server_endpoint) != ""
+    error_message = "matched_cohort_blue_server_endpoint is required when the matched cohort canary is enabled."
+  }
+}
+
+variable "matched_cohort_green_server_endpoint" {
+  description = "Green-only server registration hostname rendered into the candidate AC launch slot."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.enable_matched_cohort_canary || trimspace(var.matched_cohort_green_server_endpoint) != ""
+    error_message = "matched_cohort_green_server_endpoint is required when the matched cohort canary is enabled."
+  }
+}
+
+variable "matched_cohort_smoke_ingress_cidrs" {
+  description = "Sorted, duplicate-free IPv4 /32 sources allowed to reach the isolated candidate AC edge."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = !var.enable_matched_cohort_canary || (
+      length(var.matched_cohort_smoke_ingress_cidrs) > 0 &&
+      var.matched_cohort_smoke_ingress_cidrs == sort(distinct(var.matched_cohort_smoke_ingress_cidrs)) &&
+      alltrue([for cidr in var.matched_cohort_smoke_ingress_cidrs : can(cidrhost(cidr, 0)) && endswith(cidr, "/32")])
+    )
+    error_message = "matched_cohort_smoke_ingress_cidrs must be a non-empty sorted duplicate-free list of IPv4 /32s when enabled."
+  }
 }
 
 variable "green_standby_min_size" {

@@ -403,6 +403,18 @@ variable "public_nhp_udp_ingress_cidrs" {
   }
 }
 
+variable "enable_matched_cohort_canary" {
+  description = "Create the additive matched server/AC/relay candidate cohort without selecting it for public traffic."
+  type        = bool
+  default     = false
+}
+
+variable "matched_cohort_smoke_ingress_cidrs" {
+  description = "Exact protected-runner IPv4 /32 CIDRs for candidate-only server, AC, and relay edges."
+  type        = list(string)
+  default     = []
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

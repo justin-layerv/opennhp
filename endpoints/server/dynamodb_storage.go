@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -26,6 +28,12 @@ const (
 	// GetItem on this non-existent key returns an empty result (not an error),
 	// confirming connectivity and table access with only dynamodb:GetItem permission.
 	healthCheckSentinelKey = "__healthcheck__"
+
+	// candidateServerTerminationFencePrefix reserves non-assignment rows in
+	// the isolated candidate table. Every candidate assignment write checks
+	// the exact fence for each selected physical server in the same DynamoDB
+	// transaction, so cleanup can linearize before its strong scan.
+	candidateServerTerminationFencePrefix = "__server_termination__#"
 )
 
 // ============================================================================
@@ -41,12 +49,29 @@ const (
 
 // DynamoDBStorage implements StorageBackend using AWS DynamoDB.
 type DynamoDBStorage struct {
-	client *dynamodb.Client
-	config DynamoDBConfig
+	client           *dynamodb.Client
+	assignmentClient dynamoAssignmentClient
+	config           DynamoDBConfig
+}
+
+type dynamoAssignmentClient interface {
+	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	PutItem(context.Context, *dynamodb.PutItemInput, ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+}
+
+func (d *DynamoDBStorage) assignmentAPI() dynamoAssignmentClient {
+	if d.assignmentClient != nil {
+		return d.assignmentClient
+	}
+	return d.client
 }
 
 // NewDynamoDBStorage creates a new DynamoDB storage backend.
 func NewDynamoDBStorage(ctx context.Context, cfg DynamoDBConfig) (*DynamoDBStorage, error) {
+	if err := validateDynamoDBAssignmentAuthorityConfig(cfg); err != nil {
+		return nil, err
+	}
 	// Build AWS config options
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.Region),
@@ -91,8 +116,24 @@ func NewDynamoDBStorage(ctx context.Context, cfg DynamoDBConfig) (*DynamoDBStora
 
 	log.Info("DynamoDB storage initialized: region=%s, licenses=%s, assignments=%s, resources=%s",
 		cfg.Region, cfg.LicensesTable, cfg.ACAssignmentsTable, cfg.ResourcesTable)
+	if cfg.ACAssignmentAuthorityTable != "" {
+		log.Info("DynamoDB candidate assignment routing uses external active authority table=%s", cfg.ACAssignmentAuthorityTable)
+	}
 
 	return storage, nil
+}
+
+func validateDynamoDBAssignmentAuthorityConfig(cfg DynamoDBConfig) error {
+	if cfg.ACAssignmentAuthorityTable == "" {
+		return nil
+	}
+	if cfg.ACAssignmentsTable == "" {
+		return errors.New("ACAssignmentAuthorityTable requires ACAssignmentsTable")
+	}
+	if cfg.ACAssignmentAuthorityTable == cfg.ACAssignmentsTable {
+		return errors.New("ACAssignmentAuthorityTable must be distinct from ACAssignmentsTable")
+	}
+	return nil
 }
 
 // Name returns the backend name.
@@ -147,13 +188,76 @@ func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 func (d *DynamoDBStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
+	if d.config.ACAssignmentAuthorityTable == "" {
+		return d.getACAssignmentFromTable(ctx, d.config.ACAssignmentsTable, acID, false)
+	}
 
-	result, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(d.config.ACAssignmentsTable),
+	// Candidate routing and active revocation authority are independent rows.
+	// Read them concurrently under one aggregate deadline: adding the active
+	// authority boundary must not add a second full DynamoDB round trip to the
+	// healthy AOL path.
+	type assignmentRead struct {
+		authority  bool
+		assignment *ACAssignment
+		err        error
+	}
+	reads := make(chan assignmentRead, 2)
+	go func() {
+		assignment, err := d.getACAssignmentFromTable(ctx, d.config.ACAssignmentsTable, acID, true)
+		reads <- assignmentRead{assignment: assignment, err: err}
+	}()
+	go func() {
+		assignment, err := d.getACAssignmentFromTable(ctx, d.config.ACAssignmentAuthorityTable, acID, true)
+		reads <- assignmentRead{authority: true, assignment: assignment, err: err}
+	}()
+	var route, authority *ACAssignment
+	var routeErr, authorityErr error
+	for range 2 {
+		read := <-reads
+		if read.authority {
+			authority, authorityErr = read.assignment, read.err
+		} else {
+			route, routeErr = read.assignment, read.err
+		}
+	}
+	if routeErr != nil && !IsNotFoundError(routeErr) {
+		return nil, NewACAssignmentAuthorityError(routeErr)
+	}
+	if authorityErr != nil {
+		if IsNotFoundError(authorityErr) {
+			authorityErr = &StorageError{Code: ErrCodeValidationFailed, Message: "active AC assignment authority is missing", Err: authorityErr}
+		}
+		return nil, NewACAssignmentAuthorityError(authorityErr)
+	}
+	if route == nil || IsNotFoundError(routeErr) {
+		route = &ACAssignment{ACID: acID}
+	}
+	if err := mergeACAssignmentAuthority(route, authority, acID); err != nil {
+		return nil, NewACAssignmentAuthorityError(err)
+	}
+	return route, nil
+}
+
+func (d *DynamoDBStorage) getACAssignmentFromTable(
+	ctx context.Context,
+	table string,
+	acID string,
+	consistent bool,
+) (*ACAssignment, error) {
+	if d.assignmentAPI() == nil {
+		return nil, NewServiceUnavailableError("DynamoDB unavailable", errors.New("DynamoDB client not initialized"))
+	}
+
+	input := &dynamodb.GetItemInput{
+		TableName: aws.String(table),
 		Key: map[string]types.AttributeValue{
 			"ac_id": &types.AttributeValueMemberS{Value: acID},
 		},
-	})
+	}
+	if consistent {
+		input.ConsistentRead = aws.Bool(true)
+	}
+	result, err := d.assignmentAPI().GetItem(ctx, input)
 	if err != nil {
 		log.Error("DynamoDB GetItem failed for AC %s: %v", acID, err)
 		return nil, NewServiceUnavailableError("DynamoDB unavailable", err)
@@ -172,14 +276,100 @@ func (d *DynamoDBStorage) GetACAssignment(ctx context.Context, acID string) (*AC
 	return &assignment, nil
 }
 
+func mergeACAssignmentAuthority(route, authority *ACAssignment, acID string) error {
+	if route == nil || authority == nil || acID == "" || strings.TrimSpace(acID) != acID ||
+		route.ACID != acID || authority.ACID != acID ||
+		authority.ResourceFQDN == "" || strings.TrimSpace(authority.ResourceFQDN) != authority.ResourceFQDN ||
+		authority.CustomerID == "" || strings.TrimSpace(authority.CustomerID) != authority.CustomerID {
+		return &StorageError{Code: ErrCodeValidationFailed, Message: "AC assignment authority identity is malformed"}
+	}
+	if route.ResourceFQDN != "" && route.ResourceFQDN != authority.ResourceFQDN {
+		return &StorageError{Code: ErrCodeValidationFailed, Message: "candidate AC assignment resource identity conflicts with active authority"}
+	}
+	if route.CustomerID != "" && route.CustomerID != authority.CustomerID {
+		return &StorageError{Code: ErrCodeValidationFailed, Message: "candidate AC assignment customer identity conflicts with active authority"}
+	}
+	route.ResourceFQDN = authority.ResourceFQDN
+	route.CustomerID = authority.CustomerID
+	route.RevokedPubKeys = append([]string(nil), authority.RevokedPubKeys...)
+	return nil
+}
+
+func candidateServerTerminationFenceKey(serverID string) (string, error) {
+	if serverID == "" || strings.TrimSpace(serverID) != serverID || strings.HasPrefix(serverID, candidateServerTerminationFencePrefix) {
+		return "", &StorageError{Code: ErrCodeValidationFailed, Message: "candidate assignment server identity is malformed"}
+	}
+	return candidateServerTerminationFencePrefix + serverID, nil
+}
+
+func candidateAssignmentTransaction(
+	table string,
+	assignment *ACAssignment,
+	put *dynamodb.PutItemInput,
+) ([]types.TransactWriteItem, error) {
+	if assignment == nil || assignment.ACID == "" || strings.HasPrefix(assignment.ACID, candidateServerTerminationFencePrefix) {
+		return nil, &StorageError{Code: ErrCodeValidationFailed, Message: "candidate assignment identity is malformed"}
+	}
+	serverIDs := make([]string, 0, len(assignment.AssignedServers))
+	seen := make(map[string]struct{}, len(assignment.AssignedServers))
+	for _, server := range assignment.AssignedServers {
+		key, err := candidateServerTerminationFenceKey(server.ID)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, &StorageError{Code: ErrCodeValidationFailed, Message: "candidate assignment contains duplicate server identities"}
+		}
+		seen[key] = struct{}{}
+		serverIDs = append(serverIDs, key)
+	}
+	if len(serverIDs) > MaxServersPerAssignment {
+		return nil, &StorageError{Code: ErrCodeValidationFailed, Message: "candidate assignment exceeds the server ceiling"}
+	}
+	sort.Strings(serverIDs)
+	items := make([]types.TransactWriteItem, 0, len(serverIDs)+1)
+	for _, key := range serverIDs {
+		items = append(items, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: aws.String(table),
+			Key: map[string]types.AttributeValue{
+				"ac_id": &types.AttributeValueMemberS{Value: key},
+			},
+			ConditionExpression: aws.String("attribute_not_exists(ac_id)"),
+		}})
+	}
+	items = append(items, types.TransactWriteItem{Put: &types.Put{
+		TableName:                 put.TableName,
+		Item:                      put.Item,
+		ConditionExpression:       put.ConditionExpression,
+		ExpressionAttributeNames:  put.ExpressionAttributeNames,
+		ExpressionAttributeValues: put.ExpressionAttributeValues,
+	}})
+	return items, nil
+}
+
 // SaveACAssignment stores or updates an AC assignment.
 func (d *DynamoDBStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
+	toSave := assignment
+	if d.config.ACAssignmentAuthorityTable != "" {
+		authority, err := d.getACAssignmentFromTable(ctx, d.config.ACAssignmentAuthorityTable, assignment.ACID, true)
+		if err != nil {
+			return NewACAssignmentAuthorityError(err)
+		}
+		toSave = assignment.Clone()
+		if err := mergeACAssignmentAuthority(toSave, authority, assignment.ACID); err != nil {
+			return NewACAssignmentAuthorityError(err)
+		}
+		// The active table is the sole revocation authority. Candidate routing
+		// rows deliberately never persist a snapshot that could later be read as
+		// an independent or stale denylist.
+		toSave.RevokedPubKeys = nil
+	}
 
-	item, err := attributevalue.MarshalMap(assignment)
+	item, err := attributevalue.MarshalMap(toSave)
 	if err != nil {
-		log.Error("Failed to marshal AC assignment %s: %v", assignment.ACID, err)
+		log.Error("Failed to marshal AC assignment %s: %v", toSave.ACID, err)
 		return &StorageError{Code: ErrCodeValidationFailed, Message: "failed to marshal assignment", Err: err}
 	}
 
@@ -200,18 +390,55 @@ func (d *DynamoDBStorage) SaveACAssignment(ctx context.Context, assignment *ACAs
 		}
 	}
 
-	_, err = d.client.PutItem(ctx, input)
+	if d.config.ACAssignmentAuthorityTable != "" {
+		items, transactionErr := candidateAssignmentTransaction(d.config.ACAssignmentsTable, toSave, input)
+		if transactionErr != nil {
+			return NewACAssignmentAuthorityError(transactionErr)
+		}
+		_, err = d.assignmentAPI().TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		if err != nil {
+			var canceled *types.TransactionCanceledException
+			if errors.As(err, &canceled) && len(canceled.CancellationReasons) == len(items) {
+				for index := range len(items) - 1 {
+					if aws.ToString(canceled.CancellationReasons[index].Code) == "ConditionalCheckFailed" {
+						return NewACAssignmentAuthorityError(&StorageError{
+							Code: ErrCodeValidationFailed, Message: "candidate assignment selected a terminating server",
+						})
+					}
+				}
+				if aws.ToString(canceled.CancellationReasons[len(items)-1].Code) == "ConditionalCheckFailed" {
+					return NewACAssignmentAuthorityError(NewVersionConflictError(
+						fmt.Sprintf("version conflict for AC %s (expected version %d)", assignment.ACID, assignment.Version-1),
+					))
+				}
+			}
+			log.Error("DynamoDB candidate assignment transaction failed for AC %s: %v", assignment.ACID, err)
+			return NewACAssignmentAuthorityError(NewServiceUnavailableError("DynamoDB unavailable", err))
+		}
+		log.Info("Saved candidate AC assignment %s with %d servers behind termination fences", toSave.ACID, len(toSave.AssignedServers))
+		return nil
+	}
+
+	_, err = d.assignmentAPI().PutItem(ctx, input)
 	if err != nil {
 		// Check for conditional check failure (version conflict)
 		var ccf *types.ConditionalCheckFailedException
 		if errors.As(err, &ccf) {
-			return NewVersionConflictError(fmt.Sprintf("version conflict for AC %s (expected version %d)", assignment.ACID, assignment.Version-1))
+			conflict := NewVersionConflictError(fmt.Sprintf("version conflict for AC %s (expected version %d)", assignment.ACID, assignment.Version-1))
+			if d.config.ACAssignmentAuthorityTable != "" {
+				return NewACAssignmentAuthorityError(conflict)
+			}
+			return conflict
 		}
 		log.Error("DynamoDB PutItem failed for AC %s: %v", assignment.ACID, err)
-		return NewServiceUnavailableError("DynamoDB unavailable", err)
+		unavailable := NewServiceUnavailableError("DynamoDB unavailable", err)
+		if d.config.ACAssignmentAuthorityTable != "" {
+			return NewACAssignmentAuthorityError(unavailable)
+		}
+		return unavailable
 	}
 
-	log.Info("Saved AC assignment %s with %d servers", assignment.ACID, len(assignment.AssignedServers))
+	log.Info("Saved AC assignment %s with %d servers", toSave.ACID, len(toSave.AssignedServers))
 	return nil
 }
 

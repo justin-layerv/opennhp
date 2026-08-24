@@ -306,6 +306,27 @@ variable "public_nhp_udp_ingress_cidrs" {
   default     = null
 }
 
+variable "enable_matched_cohort_canary" {
+  description = "Create dormant matched server/AC/relay candidate infrastructure without selecting it for production traffic."
+  type        = bool
+  default     = false
+}
+
+variable "matched_cohort_smoke_ingress_cidrs" {
+  description = "Exact protected-runner IPv4 /32 CIDRs allowed to reach candidate-only server and relay listeners."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = !var.enable_matched_cohort_canary || (
+      length(var.matched_cohort_smoke_ingress_cidrs) > 0 &&
+      var.matched_cohort_smoke_ingress_cidrs == sort(distinct(var.matched_cohort_smoke_ingress_cidrs)) &&
+      alltrue([for cidr in var.matched_cohort_smoke_ingress_cidrs : can(cidrhost(cidr, 0)) && endswith(cidr, "/32")])
+    )
+    error_message = "matched_cohort_smoke_ingress_cidrs must be a non-empty sorted duplicate-free list of exact IPv4 /32s when enabled."
+  }
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' uses config files, 'api' uses external auth service"
   type        = string

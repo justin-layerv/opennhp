@@ -224,7 +224,9 @@ resource "aws_lb_listener" "https" {
 # browser caches the preflight rather than re-sending it per knock.
 resource "aws_lb_listener_rule" "relay" {
   listener_arn = aws_lb_listener.https.arn
-  priority     = 1
+  # Priority 1 is the dormant matched-cohort fixed-response gate when the
+  # additive canary authority is enabled.
+  priority = var.enable_matched_cohort_canary ? 2 : 1
 
   action {
     type             = "forward"

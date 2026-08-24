@@ -662,6 +662,8 @@ module "dynamodb" {
   # KMS encryption
   kms_key_arn = module.kms.secrets_key_arn
 
+  enable_matched_cohort_canary = var.enable_matched_cohort_canary
+
   # QURL Service tables
   deploy_qurl_tables = var.deploy_qurl_service
 
@@ -908,7 +910,15 @@ module "compute" {
   attach_storage_policies       = true
   dynamodb_read_policy_arn      = module.dynamodb.read_policy_arn
   dynamodb_read_policy_doc_hash = module.dynamodb.read_policy_doc_hash
-  keypair_policy_arn            = module.nhp_keypair.server_keypair_policy_arn
+  matched_cohort_server_policy_arn = (
+    module.dynamodb.matched_cohort_server_policy_arn == null ? "" :
+    module.dynamodb.matched_cohort_server_policy_arn
+  )
+  matched_cohort_server_policy_doc_hash = (
+    module.dynamodb.matched_cohort_server_policy_doc_hash == null ? "" :
+    module.dynamodb.matched_cohort_server_policy_doc_hash
+  )
+  keypair_policy_arn = module.nhp_keypair.server_keypair_policy_arn
 
   # Storage backend configuration
   # - "dynamodb" (default): Uses AWS DynamoDB for cloud deployments
@@ -951,6 +961,9 @@ module "compute" {
   dynamodb_ac_assignments_arn    = module.dynamodb.ac_assignments_table_arn
   dynamodb_server_ac_index_arn   = module.dynamodb.server_ac_index_table_arn
 
+  matched_cohort_ac_assignments_table = module.dynamodb.matched_cohort_ac_assignments_table_name == null ? "" : module.dynamodb.matched_cohort_ac_assignments_table_name
+  matched_cohort_ac_assignments_arn   = module.dynamodb.matched_cohort_ac_assignments_table_arn == null ? "" : module.dynamodb.matched_cohort_ac_assignments_table_arn
+
   # SNS topic for Lambda error alarms (from monitoring module)
   # Note: The SNS topic is created before compute resources, avoiding circular dependency
   alerts_sns_topic_arn = module.monitoring.sns_topic_arn
@@ -980,9 +993,11 @@ module "compute" {
   udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
 
   # Blue/Green deployment configuration
-  enable_blue_green               = var.enable_blue_green
-  green_standby_min_size          = var.green_standby_min_size
-  deployment_stale_threshold_days = var.deployment_stale_threshold_days
+  enable_blue_green                  = var.enable_blue_green
+  enable_matched_cohort_canary       = var.enable_matched_cohort_canary
+  matched_cohort_smoke_ingress_cidrs = var.matched_cohort_smoke_ingress_cidrs
+  green_standby_min_size             = var.green_standby_min_size
+  deployment_stale_threshold_days    = var.deployment_stale_threshold_days
 
   # Ensure the secret is populated before launch templates are created.
   # Without this, instances may come up reading an unseeded (empty) secret
@@ -1500,10 +1515,15 @@ module "ac" {
   resource_ids    = var.ac_resource_ids
   # AC registration remains on the cell's public NHP NLB and is independent of
   # whether browser knocks enter through the relay ALB.
-  server_endpoint              = module.compute.nlb_dns_name
-  server_secret_arn            = module.compute.server_secret_arn
-  server_nlb_source_fenced     = var.public_nhp_udp_ingress_cidrs != null
-  server_nlb_security_group_id = module.compute.nlb_security_group_id
+  server_endpoint                      = module.compute.nlb_dns_name
+  enable_matched_cohort_canary         = var.enable_matched_cohort_canary
+  matched_cohort_blue_server_endpoint  = module.compute.matched_cohort_registration_blue_dns_name == null ? "" : module.compute.matched_cohort_registration_blue_dns_name
+  matched_cohort_green_server_endpoint = module.compute.matched_cohort_registration_green_dns_name == null ? "" : module.compute.matched_cohort_registration_green_dns_name
+  matched_cohort_smoke_ingress_cidrs   = var.matched_cohort_smoke_ingress_cidrs
+  server_secret_arn                    = module.compute.server_secret_arn
+  server_security_group_id             = module.compute.security_group_id
+  server_nlb_source_fenced             = var.public_nhp_udp_ingress_cidrs != null
+  server_nlb_security_group_id         = module.compute.nlb_security_group_id
 
   # L3 flush-on-expiry (active session teardown).
   enable_l3_flush_on_expiry       = var.enable_l3_flush_on_expiry
@@ -5648,10 +5668,19 @@ module "relay" {
 
   # Relay image (5b-1 ECR repo) + AMI (reuse the server AMI: Docker + awscli +
   # the systemd-resolved stub fix used for the relay's internal-NLB lookup).
-  relay_repo_url          = module.ecr.relay_repo_url
-  relay_repo_arn          = module.ecr.relay_repo_arn
-  server_ami_id           = var.server_ami_id
-  ssm_image_tag_parameter = aws_ssm_parameter.relay_image_tag[0].name
+  relay_repo_url                     = module.ecr.relay_repo_url
+  relay_repo_arn                     = module.ecr.relay_repo_arn
+  server_ami_id                      = var.server_ami_id
+  ssm_image_tag_parameter            = aws_ssm_parameter.relay_image_tag[0].name
+  enable_matched_cohort_canary       = var.enable_matched_cohort_canary
+  matched_cohort_image_tag_parameter = var.enable_matched_cohort_canary ? aws_ssm_parameter.relay_matched_cohort_image_tag[0].name : ""
+  matched_cohort_cell_servers = var.enable_matched_cohort_canary ? [{
+    name       = "${var.environment}-${var.cell_id}"
+    public_key = module.compute.server_public_key_b64
+    host       = module.compute.matched_cohort_relay_green_dns_name
+    port       = 62206
+  }] : []
+  matched_cohort_smoke_ingress_cidrs = var.matched_cohort_smoke_ingress_cidrs
 
   relay_secret_arn = module.relay_identity[0].secret_arn
   certificate_arn  = local.relay_effective_certificate_arn
