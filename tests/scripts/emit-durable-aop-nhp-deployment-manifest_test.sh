@@ -13,8 +13,8 @@ SCRIPT=$WORK/repo/.github/scripts/emit-durable-aop-nhp-deployment-manifest.sh
 export FAKE_PARAMS=$WORK/params
 REPAIR=422b1d9acac53d50fe5602158fb02c8120ef108d
 RECOVERY=abcdefabcdefabcdefabcdefabcdefabcdefabcd
-SERVER_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-AC_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
+AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
 RUNTIME=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
 LIVE_SOURCE=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
 LIVE_RUNTIME=906c0461bf3d44175750b91ec9251de114da0c3646750287656803e3783d5ed0
@@ -23,6 +23,8 @@ ORIGINAL_OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 ORIGINAL_LOCK_DIGEST=6c7224d78837a4d56547409439d9bce30efa9b214367c4f19fd13cc3fe3b2ebd
 export REPAIR RECOVERY LIVE_SOURCE SERVER_DIGEST AC_DIGEST
+export LIVE_SERVER_SELECTOR=${LIVE_SOURCE}@${SERVER_DIGEST}
+export LIVE_AC_SELECTOR=${LIVE_SOURCE}@${AC_DIGEST}
 export FAKE_OWNER_ACTIONS=$WORK/owner-actions
 (cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 \
   go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/incident-plan.json"
@@ -107,8 +109,9 @@ EOF
 cat >"$WORK/helpers/provenance" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$2" == "$LIVE_SOURCE" ]]
+[[ $# == 5 && "$2" == "$LIVE_SOURCE" && "$3" == 32682520698 && "$4" == 1 ]]
 if [[ "$1" == layerv/nhp-server ]]; then digest=$SERVER_DIGEST; else digest=$AC_DIGEST; fi
+[[ "$5" == "$digest" ]]
 printf 'v1|%s|%s|%s\n' "$2" "$1" "$digest"
 EOF
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$WORK/helpers/verify-asg"
@@ -293,7 +296,8 @@ seed() {
     set_param "/${env}/nhp/${component}/active-color" "$color"
     suffix=; [[ "$color" == green ]] && suffix=green-
     set_param "/${env}/nhp/${component}/${suffix}asg-name" "$asg"
-    set_param "/${env}/nhp/${component}/${suffix}image-tag" "$LIVE_SOURCE"
+    if [[ "$component" == ac ]]; then selector=$LIVE_AC_SELECTOR; else selector=$LIVE_SERVER_SELECTOR; fi
+    set_param "/${env}/nhp/${component}/${suffix}image-tag" "$selector"
     set_param "/${env}/nhp/${component}/${color}-protocol-profile" "v1|durable-aop-v1|${LIVE_SOURCE}"
     set_param "/${env}/nhp/${component}/${color}-prepared-slot-attestation" \
       "v2|durable-aop-v1|${provenance#v1|}|${asg}"
@@ -338,7 +342,7 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
   : >"$FAKE_OWNER_ACTIONS"
   unset FAKE_RECOVERY_CONCLUSION FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY \
     FAKE_OWNER_VERIFY_FAIL
-  export AC_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  export AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
   case "$mode" in
     recovery_failure) export FAKE_RECOVERY_CONCLUSION=failure ;;
     recovery_timed_out) export FAKE_RECOVERY_CONCLUSION=timed_out ;;
@@ -348,7 +352,7 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
     asg_unhealthy) export FAKE_ASG_UNHEALTHY=true ;;
     equal_digest) export AC_DIGEST=$SERVER_DIGEST ;;
     floor_present) set_param /sandbox/nhp/minimum-protocol-profile durable-aop-v1 ;;
-    slot_drift) set_param /sandbox/nhp/server/image-tag 9999999999999999999999999999999999999999 ;;
+    slot_drift) set_param /sandbox/nhp/server/image-tag "${LIVE_SOURCE}@sha256:$(printf '9%.0s' {1..64})" ;;
     state_validated)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
       set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c '.phase="validated"' <<<"$value")"

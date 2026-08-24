@@ -20,6 +20,8 @@ SERVER_DIGEST=sha256:d758d39bf760e44bcdba4e56d464ff98e7adc887ebe426a06a7ab9e261f
 AC_DIGEST=sha256:16188f567aa0e169a70eed8e75c370ffda532e1d3bce0eec8f439be582d559fb
 RUNTIME_SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
 RUNTIME_AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
+RUNTIME_SERVER_SELECTOR=${RUNTIME}@${RUNTIME_SERVER_DIGEST}
+RUNTIME_AC_SELECTOR=${RUNTIME}@${RUNTIME_AC_DIGEST}
 CONNECTOR=2222222222222222222222222222222222222222
 CONNECTOR_PR=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
 CONNECTOR_BASE=e70923168818da0b8002e5e63e7dcfe9e060ba12
@@ -37,17 +39,30 @@ ln -s "$ROOT/scripts" "$WORK/repo/scripts"
 ln -s "$ROOT/terraform" "$WORK/repo/terraform"
 SCRIPT=$WORK/repo/.github/scripts/recover-durable-aop-cutover-schema3.sh
 export FAKE_PARAMS=$WORK/params FAKE_ASGS=$WORK/asgs FAKE_ACTIONS=$WORK/actions
+export FAKE_PROVENANCE_CALLS=$WORK/provenance-calls
 export FAKE_ORIGINAL_STATE_RECORD=$WORK/original-state FAKE_ORIGINAL_LOCK_RECORD=$WORK/original-lock
 export FAKE_STATE_VERSION_FILE=$WORK/state-version
 export FAKE_JOURNAL_VERSION_FILE=$WORK/journal-version
 export FAKE_PREDECESSOR_ORPHAN_VERSION_FILE=$WORK/predecessor-orphan-version
 export FAKE_ORIGINAL=$ORIGINAL FAKE_REPAIR=$REPAIR FAKE_SERVER_DIGEST=$SERVER_DIGEST FAKE_AC_DIGEST=$AC_DIGEST
 export RUNTIME_SERVER_DIGEST RUNTIME_AC_DIGEST
+export RUNTIME_SERVER_SELECTOR RUNTIME_AC_SELECTOR
 export FAKE_RECOVERY=$RECOVERY FAKE_CONNECTOR=$CONNECTOR FAKE_CONNECTOR_PR=$CONNECTOR_PR
 export FAKE_CONNECTOR_BASE=$CONNECTOR_BASE
 export FAKE_CONNECTOR_TREE=$CONNECTOR_TREE
 export FAKE_INFRA=$INFRA FAKE_INTEGRATIONS=$INTEGRATIONS
 export RUNTIME
+
+# The one-time recovery selector is consumed unchanged by both launch-template
+# boot paths. Docker's tag@digest reference keeps the source tag readable while
+# the digest, rather than the mutable tag, selects the pulled image bytes.
+[[ "$RUNTIME_SERVER_SELECTOR" =~ ^[0-9a-f]{40}@sha256:[0-9a-f]{64}$ &&
+   "$RUNTIME_AC_SELECTOR" =~ ^[0-9a-f]{40}@sha256:[0-9a-f]{64}$ ]]
+grep -F 'docker pull "$ECR_REPO:$IMAGE_TAG"' "$ROOT/terraform/modules/compute/user_data.sh.tpl" >/dev/null
+grep -F 'NHP_IMAGE_TAG=$IMAGE_TAG' "$ROOT/terraform/modules/compute/user_data.sh.tpl" >/dev/null
+grep -F '$${NHP_ECR_REPO}:$${NHP_IMAGE_TAG}"' "$ROOT/terraform/modules/compute/user_data.sh.tpl" >/dev/null
+grep -F 'docker pull "$ECR_REPO:$IMAGE_TAG"' "$ROOT/terraform/modules/ac/user_data.sh.tpl" >/dev/null
+grep -F 'docker create "$ECR_REPO:$IMAGE_TAG"' "$ROOT/terraform/modules/ac/user_data.sh.tpl" >/dev/null
 
 (cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/stale-target-plan.json"
 cat >"$WORK/helpers/stale-retire" <<'EOF'
@@ -634,11 +649,19 @@ cat >"$WORK/helpers/provenance" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${FAKE_PROVENANCE_FAILURE:-}" != true ]] || exit 73
-if [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-server ]]; then digest=$RUNTIME_SERVER_DIGEST
-elif [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-ac ]]; then digest=$RUNTIME_AC_DIGEST
-elif [[ "$1" == layerv/nhp-server ]]; then digest=$FAKE_SERVER_DIGEST
-else digest=$FAKE_AC_DIGEST
+[[ $# == 5 && "$3" =~ ^[1-9][0-9]*$ && "$4" =~ ^[1-9][0-9]*$ ]]
+printf '%s\t%s\t%s\t%s\t%s\n' "$@" >>"$FAKE_PROVENANCE_CALLS"
+call_count=$(wc -l <"$FAKE_PROVENANCE_CALLS" | tr -d ' ')
+[[ "${FAKE_PROVENANCE_FAILURE_AT:-}" != "$call_count" ]] || exit 73
+if [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-server ]]; then
+  digest=$RUNTIME_SERVER_DIGEST; [[ "$3" == 32682520698 && "$4" == 1 ]]
+elif [[ "$2" == "$RUNTIME" && "$1" == layerv/nhp-ac ]]; then
+  digest=$RUNTIME_AC_DIGEST; [[ "$3" == 32682520698 && "$4" == 1 ]]
+elif [[ "$2" == "$FAKE_REPAIR" && "$1" == layerv/nhp-server ]]; then digest=$FAKE_SERVER_DIGEST
+elif [[ "$2" == "$FAKE_REPAIR" && "$1" == layerv/nhp-ac ]]; then digest=$FAKE_AC_DIGEST
+else exit 72
 fi
+[[ "$5" == "$digest" ]]
 printf 'v1|%s|%s|%s\n' "$2" "$1" "$digest"
 EOF
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$WORK/helpers/verify"
@@ -717,6 +740,7 @@ chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
 seed() {
   : >"$FAKE_ACTIONS"
+  : >"$FAKE_PROVENANCE_CALLS"
   rm -f "$FAKE_STATE_VERSION_FILE" "$FAKE_JOURNAL_VERSION_FILE" "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
   jq -cn --arg image "$ORIGINAL" --arg owner "$OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
@@ -1388,7 +1412,9 @@ envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-r
 (( ${#state} < 4096 && ${#envelope} < 4096 )) || {
 	echo "schema-3 state or stale-target journal exceeds the SSM standard-parameter limit" >&2; exit 1;
 }
-[[ "$(awk -F '\t' '$1=="/sandbox/nhp/ac/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$RUNTIME" ]]
+[[ "$(awk -F '\t' '$1=="/sandbox/nhp/server/image-tag" {print $2}' "$FAKE_PARAMS")" == "$RUNTIME_SERVER_SELECTOR" ]]
+[[ "$(awk -F '\t' '$1=="/sandbox-cell1/nhp/server/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$RUNTIME_SERVER_SELECTOR" ]]
+[[ "$(awk -F '\t' '$1=="/sandbox/nhp/ac/green-image-tag" {print $2}' "$FAKE_PARAMS")" == "$RUNTIME_AC_SELECTOR" ]]
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 
@@ -1518,6 +1544,19 @@ seed
 export FAKE_PROVENANCE_FAILURE=true
 if invoke >/dev/null 2>&1; then echo "missing repair provenance was accepted" >&2; exit 1; fi
 unset FAKE_PROVENANCE_FAILURE
+[[ ! -s "$FAKE_ACTIONS" ]]
+seed
+export FAKE_PROVENANCE_FAILURE_AT=4
+if invoke >/dev/null 2>&1; then echo "missing fourth image authority was accepted" >&2; exit 1; fi
+unset FAKE_PROVENANCE_FAILURE_AT
+[[ ! -s "$FAKE_ACTIONS" && "$(wc -l <"$FAKE_PROVENANCE_CALLS" | tr -d ' ')" == 4 ]]
+diff -u <(cat <<EOF
+layerv/nhp-server	$REPAIR	88	2	$SERVER_DIGEST
+layerv/nhp-ac	$REPAIR	88	2	$AC_DIGEST
+layerv/nhp-server	$RUNTIME	32682520698	1	$RUNTIME_SERVER_DIGEST
+layerv/nhp-ac	$RUNTIME	32682520698	1	$RUNTIME_AC_DIGEST
+EOF
+) "$FAKE_PROVENANCE_CALLS"
 export FAKE_RUNTIME_MANIFEST_FAILURE=true
 if invoke >/dev/null 2>&1; then echo "unreviewed runtime manifest was accepted" >&2; exit 1; fi
 unset FAKE_RUNTIME_MANIFEST_FAILURE

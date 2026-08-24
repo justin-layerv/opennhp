@@ -30,6 +30,8 @@ RECOVERY_ORCHESTRATOR_SHA=${CUTOVER_RECOVERY_ORCHESTRATOR_SHA:-${GITHUB_SHA:-}}
 # tree API before any schema-3 adoption or fleet refresh.
 APPROVED_REPAIR_SOURCE_SHA=422b1d9acac53d50fe5602158fb02c8120ef108d
 APPROVED_REPAIR_RUNTIME_MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
+APPROVED_REPAIR_SERVER_DIGEST=sha256:d758d39bf760e44bcdba4e56d464ff98e7adc887ebe426a06a7ab9e261fccfcb
+APPROVED_REPAIR_AC_DIGEST=sha256:16188f567aa0e169a70eed8e75c370ffda532e1d3bce0eec8f439be582d559fb
 APPROVED_CUSTOMER_INFRA_SHA=d30d3fce3a6c3cf15e1340a5106b6cc76bce7e82
 APPROVED_INTEGRATIONS_SHA=356ecd44bbf09fca392247d971bbc093b337d4e5
 APPROVED_CONNECTOR_PR_HEAD_SHA=16dd7d3c835bf4f44b212e2d6a34205a3c04a8d8
@@ -64,6 +66,8 @@ APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
 APPROVED_STALE_RUNTIME_MANIFEST=906c0461bf3d44175750b91ec9251de114da0c3646750287656803e3783d5ed0
 APPROVED_STALE_RUNTIME_BUILD_RUN_ID=32682520698
 APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT=1
+APPROVED_STALE_RUNTIME_SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
+APPROVED_STALE_RUNTIME_AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
 STALE_RUNTIME_SOURCE_SHA=$APPROVED_STALE_RUNTIME_SOURCE_SHA
 STALE_RUNTIME_BUILD_RUN_ID=$APPROVED_STALE_RUNTIME_BUILD_RUN_ID
 STALE_RUNTIME_BUILD_RUN_ATTEMPT=$APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT
@@ -575,14 +579,15 @@ assert_completed_repair_slot() {
 
 assert_completed_runtime_slot() {
   local env=$1 component=$2 color=$3 asg=$4 label=$5 provenance=$6 health=$7
-  local expected refresh_id status
+  local expected selector refresh_id status
   expected=$(expected_repair_attestation "$provenance" "$asg")
+  selector=$(immutable_image_selector "$provenance")
   refresh_id=$(jq -r --arg label "$label" '.runtime[$label].refresh_id' <<<"$STALE_TARGET_RETIREMENT")
   [[ "$refresh_id" =~ ^[A-Za-z0-9-]+$ &&
      "$(jq -r --arg label "$label" '.runtime[$label].attestation' <<<"$STALE_TARGET_RETIREMENT")" == "$expected" &&
      "$(get_param "/${env}/nhp/${component}/active-color")" == "$color" &&
      "$(get_param "$(slot_asg_param "$env" "$component" "$color")")" == "$asg" &&
-     "$(get_param "$(slot_image_param "$env" "$component" "$color")")" == "$STALE_RUNTIME_SOURCE_SHA" &&
+     "$(get_param "$(slot_image_param "$env" "$component" "$color")")" == "$selector" &&
      "$(get_param "$(slot_profile_param "$env" "$component" "$color")")" == "v1|${TARGET_PROFILE}|${STALE_RUNTIME_SOURCE_SHA}" &&
      "$(get_param "$(slot_attestation_param "$env" "$component" "$color")")" == "$expected" ]] || {
     echo "$label completed runtime slot authority has drifted" >&2; return 1;
@@ -965,7 +970,7 @@ classify_runtime_component_refresh() {
 advance_runtime_component_refresh() {
   local label=$1 env=$2 component=$3 color=$4 asg=$5 health=$6 success_status=$7
   local status refresh_id classify_status=0 max_iterations attestation image_param profile_param attestation_param
-  local current_image current_profile current_attestation prior_attestation
+  local current_image current_profile current_attestation prior_attestation selector
   status=$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")
   [[ "$status" == "${label}_intent" || "$status" == "${label}_refreshing" ]] || return 1
   require_hard_lock
@@ -983,7 +988,8 @@ advance_runtime_component_refresh() {
   elif [[ "$label" == cell0 ]]; then prior_attestation=$CELL0_REPAIR_ATTESTATION
   else prior_attestation=$CELL1_REPAIR_ATTESTATION
   fi
-  [[ "$current_image" == "$REPAIR_SOURCE_SHA" || "$current_image" == "$STALE_RUNTIME_SOURCE_SHA" ]] || {
+  if [[ "$label" == ac ]]; then selector=$STALE_RUNTIME_AC_SELECTOR; else selector=$STALE_RUNTIME_SERVER_SELECTOR; fi
+  [[ "$current_image" == "$REPAIR_SOURCE_SHA" || "$current_image" == "$selector" ]] || {
     echo "$label active image was mutated outside recovery" >&2; return 1;
   }
   if [[ "$current_image" == "$REPAIR_SOURCE_SHA" ]]; then
@@ -1001,7 +1007,7 @@ advance_runtime_component_refresh() {
     refresh_id=$(classify_runtime_component_refresh "$label" "$asg") || classify_status=$?
     (( classify_status == 0 || classify_status == 2 )) || return "$classify_status"
     delete_optional "$attestation_param"
-    put_param "$image_param" "$STALE_RUNTIME_SOURCE_SHA"
+    put_param "$image_param" "$selector"
     put_param "$profile_param" "v1|${TARGET_PROFILE}|${STALE_RUNTIME_SOURCE_SHA}"
     if (( classify_status == 2 )); then
       refresh_id=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$asg" \
@@ -1024,7 +1030,7 @@ advance_runtime_component_refresh() {
   "$VERIFY_ASG" "$asg" "stale-runtime-${label}" 15 "$health"
   attestation=$(jq -r --arg label "$label" '.runtime[$label].attestation' <<<"$STALE_TARGET_RETIREMENT")
   put_param "$attestation_param" "$attestation"
-  [[ "$(get_param "$image_param")" == "$STALE_RUNTIME_SOURCE_SHA" &&
+  [[ "$(get_param "$image_param")" == "$selector" &&
      "$(get_param "$profile_param")" == "v1|${TARGET_PROFILE}|${STALE_RUNTIME_SOURCE_SHA}" &&
      "$(get_param "$attestation_param")" == "$attestation" ]] || {
     echo "$label runtime refresh authority did not strongly converge" >&2; return 1;
@@ -1445,6 +1451,18 @@ expected_repair_attestation() {
   printf 'v2|%s|%s|%s\n' "$TARGET_PROFILE" "${1#v1|}" "$2"
 }
 
+immutable_image_selector() {
+  local provenance=$1 schema source repository digest extra
+  IFS='|' read -r schema source repository digest extra <<<"$provenance"
+  [[ "$schema" == v1 && "$source" =~ ^[0-9a-f]{40}$ &&
+     "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ &&
+     "$digest" =~ ^sha256:[0-9a-f]{64}$ && -z "$extra" ]] || {
+    echo "image provenance cannot form an immutable selector" >&2
+    return 1
+  }
+  printf '%s@%s\n' "$source" "$digest"
+}
+
 refresh_intent_digest() {
   local label=$1 asg=$2
   printf 'v1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
@@ -1644,18 +1662,24 @@ validate_build_run
 validate_runtime_source "$REPAIR_SOURCE_SHA" "$APPROVED_REPAIR_RUNTIME_MANIFEST" repair
 validate_runtime_source "$STALE_RUNTIME_SOURCE_SHA" "$APPROVED_STALE_RUNTIME_MANIFEST" stale-target
 validate_stale_runtime_build_run
-SERVER_REPAIR_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$REPAIR_SOURCE_SHA")
-AC_REPAIR_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$REPAIR_SOURCE_SHA")
-STALE_RUNTIME_SERVER_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$STALE_RUNTIME_SOURCE_SHA")
-STALE_RUNTIME_AC_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$STALE_RUNTIME_SOURCE_SHA")
-[[ "$SERVER_REPAIR_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-server|sha256:"* ]] || { echo "server repair provenance is malformed" >&2; exit 1; }
-[[ "$AC_REPAIR_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-ac|sha256:"* ]] || { echo "AC repair provenance is malformed" >&2; exit 1; }
-[[ "$STALE_RUNTIME_SERVER_PROVENANCE" == "v1|${STALE_RUNTIME_SOURCE_SHA}|layerv/nhp-server|sha256:"* ]] || {
+SERVER_REPAIR_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$REPAIR_SOURCE_SHA" \
+  "$REPAIR_BUILD_RUN_ID" "$REPAIR_BUILD_RUN_ATTEMPT" "$APPROVED_REPAIR_SERVER_DIGEST")
+AC_REPAIR_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$REPAIR_SOURCE_SHA" \
+  "$REPAIR_BUILD_RUN_ID" "$REPAIR_BUILD_RUN_ATTEMPT" "$APPROVED_REPAIR_AC_DIGEST")
+STALE_RUNTIME_SERVER_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$STALE_RUNTIME_SOURCE_SHA" \
+  "$STALE_RUNTIME_BUILD_RUN_ID" "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$APPROVED_STALE_RUNTIME_SERVER_DIGEST")
+STALE_RUNTIME_AC_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$STALE_RUNTIME_SOURCE_SHA" \
+  "$STALE_RUNTIME_BUILD_RUN_ID" "$STALE_RUNTIME_BUILD_RUN_ATTEMPT" "$APPROVED_STALE_RUNTIME_AC_DIGEST")
+[[ "$SERVER_REPAIR_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-server|${APPROVED_REPAIR_SERVER_DIGEST}" ]] || { echo "server repair provenance is malformed" >&2; exit 1; }
+[[ "$AC_REPAIR_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-ac|${APPROVED_REPAIR_AC_DIGEST}" ]] || { echo "AC repair provenance is malformed" >&2; exit 1; }
+[[ "$STALE_RUNTIME_SERVER_PROVENANCE" == "v1|${STALE_RUNTIME_SOURCE_SHA}|layerv/nhp-server|${APPROVED_STALE_RUNTIME_SERVER_DIGEST}" ]] || {
   echo "stale-target runtime server provenance is malformed" >&2; exit 1;
 }
-[[ "$STALE_RUNTIME_AC_PROVENANCE" == "v1|${STALE_RUNTIME_SOURCE_SHA}|layerv/nhp-ac|sha256:"* ]] || {
+[[ "$STALE_RUNTIME_AC_PROVENANCE" == "v1|${STALE_RUNTIME_SOURCE_SHA}|layerv/nhp-ac|${APPROVED_STALE_RUNTIME_AC_DIGEST}" ]] || {
   echo "stale-target runtime AC provenance is malformed" >&2; exit 1;
 }
+STALE_RUNTIME_SERVER_SELECTOR=$(immutable_image_selector "$STALE_RUNTIME_SERVER_PROVENANCE")
+STALE_RUNTIME_AC_SELECTOR=$(immutable_image_selector "$STALE_RUNTIME_AC_PROVENANCE")
 
 RAW_STATE=$(get_param "$STATE_PARAM")
 LIVE_LOCK=$(get_optional "$LOCK_PARAM")

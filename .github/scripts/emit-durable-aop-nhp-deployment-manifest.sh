@@ -41,6 +41,8 @@ APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
 APPROVED_STALE_RUNTIME_MANIFEST=906c0461bf3d44175750b91ec9251de114da0c3646750287656803e3783d5ed0
 APPROVED_STALE_RUNTIME_BUILD_RUN_ID=32682520698
 APPROVED_STALE_RUNTIME_BUILD_RUN_ATTEMPT=1
+APPROVED_STALE_RUNTIME_SERVER_DIGEST=sha256:0921191723fd6a4919f22e0dded5775411bb08a682dc9d9f9a69fdcded7674c9
+APPROVED_STALE_RUNTIME_AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
 APPROVED_ORIGINAL_STATE_VERSION=7
 APPROVED_ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
 APPROVED_ORIGINAL_LOCK_VERSION=2
@@ -88,6 +90,14 @@ canonical_asg() {
   [[ "$color" == green ]] && printf '%s-green\n' "$base" || printf '%s\n' "$base"
 }
 canonical_digest() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
+immutable_image_selector() {
+  local provenance=$1 schema source repository digest extra
+  IFS='|' read -r schema source repository digest extra <<<"$provenance"
+  [[ "$schema" == v1 && "$source" =~ ^[0-9a-f]{40}$ &&
+     "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ &&
+     "$digest" =~ ^sha256:[0-9a-f]{64}$ && -z "$extra" ]] || return 1
+  printf '%s@%s\n' "$source" "$digest"
+}
 decode_stale_journal() {
   printf '%s' "$1" | python3 -c '
 import base64, gzip, json, sys
@@ -406,10 +416,14 @@ build_receipt=$("$VERIFY_BUILD_ONLY" "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$REPA
   echo "schema-3 build-only receipt is malformed" >&2; exit 1;
 }
 
-SERVER_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$REPAIR_SOURCE_SHA")
-AC_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$REPAIR_SOURCE_SHA")
+SERVER_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-server "$REPAIR_SOURCE_SHA" \
+  "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$APPROVED_STALE_RUNTIME_SERVER_DIGEST")
+AC_PROVENANCE=$("$VERIFY_PROVENANCE" layerv/nhp-ac "$REPAIR_SOURCE_SHA" \
+  "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$APPROVED_STALE_RUNTIME_AC_DIGEST")
 [[ "$SERVER_PROVENANCE" == "$(jq -r .server_provenance <<<"$RUNTIME")" &&
-   "$AC_PROVENANCE" == "$(jq -r .ac_provenance <<<"$RUNTIME")" ]] || {
+   "$AC_PROVENANCE" == "$(jq -r .ac_provenance <<<"$RUNTIME")" &&
+   "$SERVER_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-server|${APPROVED_STALE_RUNTIME_SERVER_DIGEST}" &&
+   "$AC_PROVENANCE" == "v1|${REPAIR_SOURCE_SHA}|layerv/nhp-ac|${APPROVED_STALE_RUNTIME_AC_DIGEST}" ]] || {
   echo "live image provenance differs from schema-3 repair authority" >&2; exit 1;
 }
 SERVER_DIGEST=${SERVER_PROVENANCE##*|}
@@ -421,15 +435,16 @@ AC_DIGEST=${AC_PROVENANCE##*|}
 
 prove_deployment() {
   local label=$1 env=$2 component=$3 color=$4 asg=$5 digest=$6 provenance=$7 attestation=$8 refresh_id=$9 health=${10}
-  local expected_asg expected_attestation refresh_status asg_json
+  local expected_asg expected_attestation selector refresh_status asg_json
   [[ "$color" == blue || "$color" == green ]] || { echo "$label active color is malformed" >&2; return 1; }
   expected_asg=$(canonical_asg "$env" "$component" "$color")
   [[ "$asg" == "$expected_asg" ]] || { echo "$label active ASG is not canonical for its color" >&2; return 1; }
   expected_attestation="v2|${PROFILE}|${provenance#v1|}|${asg}"
+  selector=$(immutable_image_selector "$provenance")
   [[ "$attestation" == "$expected_attestation" ]] || { echo "$label schema-3 attestation is malformed" >&2; return 1; }
   [[ "$(get_param "/${env}/nhp/${component}/active-color")" == "$color" &&
      "$(get_param "$(slot_asg_param "$env" "$component" "$color")")" == "$asg" &&
-     "$(get_param "$(slot_image_param "$env" "$component" "$color")")" == "$REPAIR_SOURCE_SHA" &&
+     "$(get_param "$(slot_image_param "$env" "$component" "$color")")" == "$selector" &&
      "$(get_param "$(slot_profile_param "$env" "$component" "$color")")" == "v1|${PROFILE}|${REPAIR_SOURCE_SHA}" &&
      "$(get_param "$(slot_attestation_param "$env" "$component" "$color")")" == "$attestation" ]] || {
     echo "$label live slot authority differs from schema-3 repair" >&2; return 1;
