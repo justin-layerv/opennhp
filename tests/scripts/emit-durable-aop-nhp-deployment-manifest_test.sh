@@ -150,14 +150,18 @@ fixture_fence_digest() {
 }
 
 fixture_directory_receipt() {
-  local count=$1 version=$2 updated=$3 digest
+  local count=$1 version=$2 updated=$3 blocked=${4:-false} overflow=${5:-0}
+  local event=${6:-} prepared=${7:-0} selected=${8:-0} digest
   digest=$({
-    printf '\0%s' v1 cell0 "$version" "$count" false 0 '' 0 0 1787530000000 "$updated"
+    printf '\0%s' v1 cell0 "$version" "$count" "$blocked" "$overflow" "$event" "$prepared" "$selected" \
+      1787530000000 "$updated"
   } | sha256sum | awk '{print $1}')
-  jq -cn --arg count "$count" --arg version "$version" --arg updated "$updated" --arg digest "$digest" '
+  jq -cn --arg count "$count" --arg version "$version" --argjson blocked "$blocked" --arg overflow "$overflow" \
+    --arg event "$event" --arg prepared "$prepared" --arg selected "$selected" \
+    --arg updated "$updated" --arg digest "$digest" '
     {schema:"layerv.durable-aop-fence-directory-receipt.v1",cell_id:"cell0",version:$version,
-     active_fence_count:$count,admission_blocked:false,overflow_close_count:"0",overflow_leader_event_id:"",
-     overflow_leader_prepared_directory_version:"0",overflow_leader_selected_directory_version:"0",
+     active_fence_count:$count,admission_blocked:$blocked,overflow_close_count:$overflow,overflow_leader_event_id:$event,
+     overflow_leader_prepared_directory_version:$prepared,overflow_leader_selected_directory_version:$selected,
      created_at_ms:"1787530000000",updated_at_ms:$updated,directory_sha256:$digest}'
 }
 
@@ -222,8 +226,12 @@ seed() {
   predecessor_plan_digest=$(printf '%s' "$predecessor_plan" | sha256sum | awk '{print $1}')
   incident_ledger=$(fixture_retired_ledger "$incident_plan")
   predecessor_ledger=$(fixture_retired_ledger "$predecessor_plan")
-  fence_start=$(fixture_directory_receipt 8 19 1787535000000)
-  fence_drain=$(fixture_directory_receipt 0 27 1787545000000)
+  fence_start=$(fixture_directory_receipt "${FAKE_FENCE_START_COUNT:-82}" 83 1787553983425 \
+    "${FAKE_FENCE_START_BLOCKED:-false}" "${FAKE_FENCE_START_OVERFLOW:-0}" \
+    "${FAKE_FENCE_START_EVENT:-}" "${FAKE_FENCE_START_PREPARED:-0}" "${FAKE_FENCE_START_SELECTED:-0}")
+  # The later version pins that zero-target closes may arrive after the exact
+  # starting snapshot; terminal publication still requires stable zero.
+  fence_drain=$(fixture_directory_receipt 0 106 1787555000000)
   preferences='{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"SkipMatching":false}'
   c0_intent=$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     cell0 layerv-nhp-sandbox-server "$LIVE_SOURCE" 32682520698 1 "$live_server_provenance" "$RECOVERY" \
@@ -330,11 +338,48 @@ jq -e --arg repair "$LIVE_SOURCE" --arg recovery "$RECOVERY" --arg server "$SERV
 ' >/dev/null "$WORK/durable-aop-nhp-deployment.json"
 [[ $(wc -c <"$WORK/durable-aop-nhp-deployment.json") -le 65536 ]]
 
+# Completed journals retain the exact starting receipt, but its count is an
+# incident snapshot rather than a historical constant. Both the minimum and
+# store-capacity boundaries remain publishable after a stable zero drain.
+for count in 1 1024; do
+  export FAKE_FENCE_START_COUNT=$count
+  seed
+  : >"$FAKE_OWNER_ACTIONS"
+  invoke >/dev/null
+done
+unset FAKE_FENCE_START_COUNT
+
+# Invalid, noncanonical, blocked, or overflow starting authorities cannot
+# authorize a deployment manifest even when their digest is self-consistent.
+for authority in zero above_capacity noncanonical admission_blocked overflow; do
+  unset FAKE_FENCE_START_COUNT FAKE_FENCE_START_BLOCKED FAKE_FENCE_START_OVERFLOW \
+    FAKE_FENCE_START_EVENT FAKE_FENCE_START_PREPARED FAKE_FENCE_START_SELECTED
+  case "$authority" in
+    zero) export FAKE_FENCE_START_COUNT=0 ;;
+    above_capacity) export FAKE_FENCE_START_COUNT=1025 ;;
+    noncanonical) export FAKE_FENCE_START_COUNT=01 ;;
+    admission_blocked) export FAKE_FENCE_START_BLOCKED=true ;;
+    overflow)
+      export FAKE_FENCE_START_BLOCKED=true FAKE_FENCE_START_OVERFLOW=1
+      export FAKE_FENCE_START_EVENT=11111111111111111111111111111111
+      export FAKE_FENCE_START_PREPARED=82 FAKE_FENCE_START_SELECTED=83
+      ;;
+  esac
+  seed
+  : >"$FAKE_OWNER_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "deployment producer accepted invalid starting fence authority: $authority" >&2
+    exit 1
+  fi
+done
+unset FAKE_FENCE_START_COUNT FAKE_FENCE_START_BLOCKED FAKE_FENCE_START_OVERFLOW \
+  FAKE_FENCE_START_EVENT FAKE_FENCE_START_PREPARED FAKE_FENCE_START_SELECTED
+
 for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift refresh_failed asg_unhealthy \
   equal_digest floor_present slot_drift owner_missing owner_preparing owner_client_drift owner_source_drift \
   owner_digest_drift owner_live_verify_failed \
   journal_missing journal_status journal_source journal_build journal_manifest journal_source_digest \
-  incident_plan_digest incident_fence_digest incident_receipt fence_drain_count fence_drain_digest \
+  incident_plan_digest incident_fence_digest incident_receipt fence_start_malformed fence_drain_count fence_drain_digest \
   component_intent predecessor_plan_digest predecessor_receipt \
   state_validated historical_state_mutated embedded_lock_mutated ledger_state_digest_mutated \
   ledger_lock_digest_mutated; do
@@ -407,6 +452,9 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
       ;;
     incident_receipt)
       mutate_fixture_journal '.incident_targets[0].receipt.version="999"'
+      ;;
+    fence_start_malformed)
+      mutate_fixture_journal '.runtime.fence_start.active_fence_count={}'
       ;;
     fence_drain_count)
       mutate_fixture_journal '.runtime.fence_drain.active_fence_count="1"'

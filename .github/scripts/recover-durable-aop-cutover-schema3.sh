@@ -687,15 +687,26 @@ validate_directory_receipt() {
        "overflow_close_count","overflow_leader_event_id","overflow_leader_prepared_directory_version",
        "overflow_leader_selected_directory_version","schema","updated_at_ms","version"] and
     .schema == "layerv.durable-aop-fence-directory-receipt.v1" and .cell_id == "cell0" and
-    .active_fence_count == $count and (.admission_blocked | type == "boolean") and
+    .active_fence_count == $count and .admission_blocked == false and
     ([.version,.active_fence_count,.overflow_close_count,.overflow_leader_prepared_directory_version,
       .overflow_leader_selected_directory_version,.created_at_ms,.updated_at_ms] |
       all(type == "string" and test("^(0|[1-9][0-9]*)$"))) and
-    (.directory_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-    (.overflow_leader_event_id | type == "string")
+    .overflow_close_count == "0" and .overflow_leader_event_id == "" and
+    .overflow_leader_prepared_directory_version == "0" and
+    .overflow_leader_selected_directory_version == "0" and
+    (.directory_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
   ' >/dev/null <<<"$receipt" || return 1
   digest=$(directory_receipt_digest "$receipt")
   [[ "$digest" == "$(jq -r .directory_sha256 <<<"$receipt")" ]]
+}
+
+validate_starting_directory_receipt() {
+  local receipt=$1 count
+  count=$(jq -er '
+    .active_fence_count |
+    select(type == "string" and test("^[1-9][0-9]{0,3}$") and (tonumber <= 1024))
+  ' <<<"$receipt") || return 1
+  validate_directory_receipt "$receipt" "$count"
 }
 
 validate_retirement_receipt() {
@@ -785,7 +796,9 @@ validate_stale_target_retirement() {
     echo "schema-3 stale-target incident plan bytes drifted" >&2; return 1;
   }
   start=$(jq -cS .runtime.fence_start <<<"$STALE_TARGET_RETIREMENT")
-  validate_directory_receipt "$start" 8 || { echo "schema-3 starting fence authority is malformed" >&2; return 1; }
+  validate_starting_directory_receipt "$start" || {
+    echo "schema-3 starting fence authority is malformed or outside capacity" >&2; return 1;
+  }
   validate_runtime_component cell0 layerv-nhp-sandbox-server "$STALE_RUNTIME_SERVER_PROVENANCE" || return 1
   validate_runtime_component cell1 layerv-nhp-sandbox-cell1-server-green "$STALE_RUNTIME_SERVER_PROVENANCE" || return 1
   validate_runtime_component ac layerv-nhp-sandbox-ac-green "$STALE_RUNTIME_AC_PROVENANCE" || return 1
@@ -917,7 +930,9 @@ initialize_stale_target_recovery() {
   }
   fence_start=$($STALE_TARGET_RETIRER snapshot-fence-directory --table layerv-nhp-sandbox-cell0-nhp-session-control \
     --cell-id cell0 --region "$AWS_REGION"); fence_start=$(jq -cS . <<<"$fence_start")
-  validate_directory_receipt "$fence_start" 8 || { echo "incident fence start is not exact count eight" >&2; return 1; }
+  validate_starting_directory_receipt "$fence_start" || {
+    echo "incident fence start is not a stable positive capacity-bounded authority" >&2; return 1;
+  }
   cell0=$(runtime_component_intent cell0 layerv-nhp-sandbox-server "$STALE_RUNTIME_SERVER_PROVENANCE")
   empty_cell1=$(jq -cn --arg asg layerv-nhp-sandbox-cell1-server-green \
     --arg attestation "$(expected_repair_attestation "$STALE_RUNTIME_SERVER_PROVENANCE" layerv-nhp-sandbox-cell1-server-green)" \
@@ -1819,14 +1834,14 @@ elif [[ "$PHASE" == repaired && "$OWNER_STATUS" == ready ]]; then
 fi
 
 # The merged runtime repair contains both server close-drain and AC transport
-# fixes. Journal its exact build plus the stable eight-fence starting directory,
-# refresh both active server fleets first, and require a stable zero-fence
-# directory before the first retirement. The three fixed incident targets are
-# then retired one at a time. Only after that capacity is free do we precommit
-# every currently counted PREPARING predecessor, refresh AC, and retire those
-# exact decommissioned identities. Every AWS refresh intent and target fence is
-# durable before its mutation; no ordinary runtime interface can invoke target
-# retirement.
+# fixes. Journal its exact build plus the stable, positive, capacity-bounded
+# starting directory, refresh both active server fleets first, and require a
+# stable zero-fence directory before the first retirement. The three fixed
+# incident targets are then retired one at a time. Only after that capacity is
+# free do we precommit every currently counted PREPARING predecessor, refresh
+# AC, and retire those exact decommissioned identities. Every AWS refresh
+# intent and target fence is durable before its mutation; no ordinary runtime
+# interface can invoke target retirement.
 if [[ "$PHASE" == repaired && "$OWNER_STATUS" == ready && -z "$STALE_TARGET_RETIREMENT" ]]; then
   initialize_stale_target_recovery
 fi

@@ -50,13 +50,11 @@ const (
 	sandboxRecoveryACDigest                 = "sha256:16188f567aa0e169a70eed8e75c370ffda532e1d3bce0eec8f439be582d559fb"
 )
 
-const sandboxStaleTargetExpectedInitialFenceCount = 8
-
 // SandboxFenceDirectoryRecoveryReceipt is a lossless, decimal-string snapshot
 // of the strongly read CONTROL/DIRECTORY row. The controller persists the
-// exact eight-fence starting authority before refreshing either server fleet,
-// then requires a stable zero-fence successor before the first stale-target
-// retirement transaction.
+// exact positive, capacity-bounded starting authority before refreshing either
+// server fleet, then requires a stable zero-fence successor before the first
+// stale-target retirement transaction.
 type SandboxFenceDirectoryRecoveryReceipt struct {
 	Schema                                 string `json:"schema"`
 	CellID                                 string `json:"cell_id"`
@@ -372,22 +370,23 @@ func snapshotSandboxFenceDirectoryForRecovery(ctx context.Context, client sessio
 	if *first != *second {
 		return nil, errSessionControlFenceConflict
 	}
-	if requireDrained {
-		if second.ActiveFenceCount != 0 || second.AdmissionBlocked || second.OverflowCloseCount != 0 ||
-			second.OverflowLeaderEventID != "" || second.OverflowLeaderPreparedDirectoryVersion != 0 ||
-			second.OverflowLeaderSelectedDirectoryVersion != 0 {
-			return nil, errSessionControlFenceConflict
-		}
-	} else if second.ActiveFenceCount != sandboxStaleTargetExpectedInitialFenceCount {
+	if second.AdmissionBlocked || second.OverflowCloseCount != 0 || second.OverflowLeaderEventID != "" ||
+		second.OverflowLeaderPreparedDirectoryVersion != 0 || second.OverflowLeaderSelectedDirectoryVersion != 0 {
+		return nil, errSessionControlFenceConflict
+	}
+	if requireDrained && second.ActiveFenceCount != 0 {
+		return nil, errSessionControlFenceConflict
+	}
+	if !requireDrained && (second.ActiveFenceCount == 0 || second.ActiveFenceCount > sessionControlFenceActiveLimit) {
 		return nil, errSessionControlFenceConflict
 	}
 	receipt := sandboxFenceDirectoryReceipt(*second)
 	return &receipt, nil
 }
 
-// SnapshotSandboxFenceDirectoryForRecovery pins the incident's stable
-// eight-fence starting authority. It performs no write and is unavailable on
-// the ordinary session-control store interface.
+// SnapshotSandboxFenceDirectoryForRecovery pins the incident's stable,
+// positive, capacity-bounded starting authority. It performs no write and is
+// unavailable on the ordinary session-control store interface.
 func SnapshotSandboxFenceDirectoryForRecovery(ctx context.Context, client *dynamodb.Client,
 	tableName, cellID string,
 ) (*SandboxFenceDirectoryRecoveryReceipt, error) {
@@ -884,6 +883,13 @@ func sandboxValidateDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceip
 		receipt.OverflowLeaderSelectedDirectoryVersion == "0" && receipt.DirectorySHA256 == sandboxFenceDirectoryDigest(directory)
 }
 
+func sandboxValidateStartingDirectoryReceipt(receipt SandboxFenceDirectoryRecoveryReceipt) bool {
+	activeCount, err := strconv.ParseUint(receipt.ActiveFenceCount, 10, 64)
+	return err == nil && activeCount > 0 && activeCount <= sessionControlFenceActiveLimit &&
+		strconv.FormatUint(activeCount, 10) == receipt.ActiveFenceCount &&
+		sandboxValidateDirectoryReceipt(receipt, receipt.ActiveFenceCount)
+}
+
 func sandboxValidateRuntimeComponent(component sandboxStaleTargetRuntimeComponent, label, asg, provenance,
 	orchestratorSHA, planDigest string,
 ) bool {
@@ -998,7 +1004,7 @@ func sandboxResolveJournaledPredecessorFence(stateSnapshot, currentJournalSnapsh
 		runtime.ACProvenance != "v1|"+sandboxStaleTargetRuntimeSourceSHA+"|layerv/nhp-ac|"+sandboxStaleTargetRuntimeACDigest ||
 		runtime.Preferences != (sandboxStaleTargetRefreshPreferences{InstanceWarmup: 60, MaxHealthyPercentage: 200,
 			MinHealthyPercentage: 100, SkipMatching: false}) ||
-		!sandboxValidateDirectoryReceipt(runtime.FenceStart, "8") || !sandboxValidateDirectoryReceipt(runtime.FenceDrain, "0") ||
+		!sandboxValidateStartingDirectoryReceipt(runtime.FenceStart) || !sandboxValidateDirectoryReceipt(runtime.FenceDrain, "0") ||
 		!sandboxValidateRuntimeComponent(runtime.Cell0, "cell0", "layerv-nhp-sandbox-server", runtime.ServerProvenance,
 			state.Repair.OrchestratorSHA, "-") ||
 		!sandboxValidateRuntimeComponent(runtime.Cell1, "cell1", "layerv-nhp-sandbox-cell1-server-green", runtime.ServerProvenance,

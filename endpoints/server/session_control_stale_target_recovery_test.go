@@ -833,16 +833,23 @@ func seedSandboxFenceDirectoryRecovery(t *testing.T, fake *sessionControlSession
 	return directory
 }
 
-func TestSandboxFenceDirectoryRecoveryPinsEightThenRequiresStableZero(t *testing.T) {
-	fake := newSessionControlSessionDynamoFake()
-	initial := seedSandboxFenceDirectoryRecovery(t, fake, sandboxStaleTargetExpectedInitialFenceCount)
-	receipt, err := snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
-		SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, false)
-	if err != nil || receipt.ActiveFenceCount != "8" || receipt.DirectorySHA256 != sandboxFenceDirectoryDigest(initial) ||
-		receipt.Schema != sandboxFenceDirectoryRecoveryReceiptSchema || len(fake.gets) != 2 {
-		t.Fatalf("initial fence directory = %#v, %v; reads=%d", receipt, err, len(fake.gets))
+func TestSandboxFenceDirectoryRecoveryPinsStablePositiveCapacityBoundThenRequiresStableZero(t *testing.T) {
+	for _, count := range []uint64{1, 82, sessionControlFenceActiveLimit} {
+		t.Run(decimal(count), func(t *testing.T) {
+			fake := newSessionControlSessionDynamoFake()
+			initial := seedSandboxFenceDirectoryRecovery(t, fake, count)
+			receipt, err := snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
+				SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, false)
+			if err != nil || receipt.ActiveFenceCount != decimal(count) ||
+				receipt.DirectorySHA256 != sandboxFenceDirectoryDigest(initial) ||
+				receipt.Schema != sandboxFenceDirectoryRecoveryReceiptSchema || len(fake.gets) != 2 {
+				t.Fatalf("initial fence directory = %#v, %v; reads=%d", receipt, err, len(fake.gets))
+			}
+		})
 	}
 
+	fake := newSessionControlSessionDynamoFake()
+	initial := seedSandboxFenceDirectoryRecovery(t, fake, 82)
 	drained := initial
 	drained.Version++
 	drained.ActiveFenceCount = 0
@@ -852,15 +859,82 @@ func TestSandboxFenceDirectoryRecoveryPinsEightThenRequiresStableZero(t *testing
 		t.Fatal(rowErr)
 	}
 	fake.setItem(marshalSessionControlSessionTestRow(t, row))
-	receipt, err = snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
+	receipt, err := snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
 		SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, true)
 	if err != nil || receipt.ActiveFenceCount != "0" || receipt.DirectorySHA256 != sandboxFenceDirectoryDigest(drained) ||
-		len(fake.gets) != 4 {
+		len(fake.gets) != 2 {
 		t.Fatalf("drained fence directory = %#v, %v; reads=%d", receipt, err, len(fake.gets))
 	}
 }
 
-func TestSandboxFenceDirectoryRecoveryRejectsUnstableOrHalfDrainedAuthority(t *testing.T) {
+func TestSandboxValidateStartingDirectoryReceiptRequiresCanonicalCapacityBound(t *testing.T) {
+	for _, count := range []uint64{1, 82, sessionControlFenceActiveLimit} {
+		directory := sessionControlFenceDirectory{
+			CellID: SandboxStaleTargetFenceDrainCellID, Version: 83, ActiveFenceCount: count,
+			CreatedAtMillis: 1787530000000, UpdatedAtMillis: 1787553983425,
+		}
+		if !sandboxValidateStartingDirectoryReceipt(sandboxFenceDirectoryReceipt(directory)) {
+			t.Fatalf("valid starting fence count %d was rejected", count)
+		}
+	}
+
+	base := sandboxFenceDirectoryReceipt(sessionControlFenceDirectory{
+		CellID: SandboxStaleTargetFenceDrainCellID, Version: 83, ActiveFenceCount: 82,
+		CreatedAtMillis: 1787530000000, UpdatedAtMillis: 1787553983425,
+	})
+	for name, active := range map[string]string{
+		"zero": "0", "above capacity": "1025", "leading zero": "082", "negative": "-1", "overflow": "18446744073709551616",
+	} {
+		t.Run(name, func(t *testing.T) {
+			receipt := base
+			receipt.ActiveFenceCount = active
+			if sandboxValidateStartingDirectoryReceipt(receipt) {
+				t.Fatal("invalid starting fence count was accepted")
+			}
+		})
+	}
+}
+
+func TestSandboxFenceDirectoryRecoveryRejectsInvalidStartOrHalfDrainedAuthority(t *testing.T) {
+	for name, mutate := range map[string]func(map[string]types.AttributeValue){
+		"zero": func(item map[string]types.AttributeValue) {
+			item["active_fence_count"] = &types.AttributeValueMemberN{Value: "0"}
+		},
+		"above capacity": func(item map[string]types.AttributeValue) {
+			item["active_fence_count"] = &types.AttributeValueMemberN{Value: "1025"}
+		},
+		"admission blocked": func(item map[string]types.AttributeValue) {
+			item["admission_blocked"] = &types.AttributeValueMemberBOOL{Value: true}
+		},
+		"pending overflow": func(item map[string]types.AttributeValue) {
+			item["admission_blocked"] = &types.AttributeValueMemberBOOL{Value: true}
+			item["overflow_close_count"] = &types.AttributeValueMemberN{Value: "1"}
+		},
+		"overflow leader": func(item map[string]types.AttributeValue) {
+			item["admission_blocked"] = &types.AttributeValueMemberBOOL{Value: true}
+			item["overflow_close_count"] = &types.AttributeValueMemberN{Value: "1"}
+			item["overflow_leader_event_id"] = &types.AttributeValueMemberS{Value: "11111111111111111111111111111111"}
+			item["overflow_leader_prepared_directory_version"] = &types.AttributeValueMemberN{Value: "1"}
+			item["overflow_leader_selected_directory_version"] = &types.AttributeValueMemberN{Value: "2"}
+		},
+	} {
+		t.Run("start "+name, func(t *testing.T) {
+			fake := newSessionControlSessionDynamoFake()
+			directory := seedSandboxFenceDirectoryRecovery(t, fake, 82)
+			row, err := sessionControlFenceDirectoryToRow(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := marshalSessionControlSessionTestRow(t, row)
+			mutate(item)
+			fake.setItem(item)
+			if _, err = snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
+				SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, false); err == nil {
+				t.Fatal("invalid starting directory was accepted")
+			}
+		})
+	}
+
 	for name, mutate := range map[string]func(*sessionControlFenceDirectory){
 		"active fence":     func(value *sessionControlFenceDirectory) { value.ActiveFenceCount = 1 },
 		"pending overflow": func(value *sessionControlFenceDirectory) { value.AdmissionBlocked = true; value.OverflowCloseCount = 1 },
@@ -888,22 +962,29 @@ func TestSandboxFenceDirectoryRecoveryRejectsUnstableOrHalfDrainedAuthority(t *t
 		})
 	}
 
-	fake := newSessionControlSessionDynamoFake()
-	initial := seedSandboxFenceDirectoryRecovery(t, fake, 0)
-	fake.getHook = func(_ context.Context, input *dynamodb.GetItemInput, call int) (*dynamodb.GetItemOutput, error) {
-		value := initial
-		if call == 1 {
-			value.Version++
-			value.UpdatedAtMillis++
-		}
-		row, err := sessionControlFenceDirectoryToRow(value)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return &dynamodb.GetItemOutput{Item: marshalSessionControlSessionTestRow(t, row)}, nil
-	}
-	if _, err := snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
-		SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, true); err == nil {
-		t.Fatal("directory mutation between strong reads was accepted")
+	for name, test := range map[string]struct {
+		active  uint64
+		drained bool
+	}{"starting": {active: 82}, "drained": {drained: true}} {
+		t.Run("torn "+name, func(t *testing.T) {
+			fake := newSessionControlSessionDynamoFake()
+			initial := seedSandboxFenceDirectoryRecovery(t, fake, test.active)
+			fake.getHook = func(_ context.Context, input *dynamodb.GetItemInput, call int) (*dynamodb.GetItemOutput, error) {
+				value := initial
+				if call == 1 {
+					value.Version++
+					value.UpdatedAtMillis++
+				}
+				row, err := sessionControlFenceDirectoryToRow(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return &dynamodb.GetItemOutput{Item: marshalSessionControlSessionTestRow(t, row)}, nil
+			}
+			if _, err := snapshotSandboxFenceDirectoryForRecovery(context.Background(), fake,
+				SandboxStaleTargetRetirementTable, SandboxStaleTargetFenceDrainCellID, test.drained); err == nil {
+				t.Fatal("directory mutation between strong reads was accepted")
+			}
+		})
 	}
 }

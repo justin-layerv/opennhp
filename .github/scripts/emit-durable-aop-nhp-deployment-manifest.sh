@@ -141,14 +141,25 @@ validate_directory_receipt() {
        "overflow_close_count","overflow_leader_event_id","overflow_leader_prepared_directory_version",
        "overflow_leader_selected_directory_version","schema","updated_at_ms","version"] and
     .schema == "layerv.durable-aop-fence-directory-receipt.v1" and .cell_id == "cell0" and
-    .active_fence_count == $count and (.admission_blocked | type == "boolean") and
+    .active_fence_count == $count and .admission_blocked == false and
     ([.version,.active_fence_count,.overflow_close_count,.overflow_leader_prepared_directory_version,
       .overflow_leader_selected_directory_version,.created_at_ms,.updated_at_ms] |
       all(type == "string" and test("^(0|[1-9][0-9]*)$"))) and
-    (.overflow_leader_event_id | type == "string") and
+    .overflow_close_count == "0" and .overflow_leader_event_id == "" and
+    .overflow_leader_prepared_directory_version == "0" and
+    .overflow_leader_selected_directory_version == "0" and
     (.directory_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
   ' >/dev/null <<<"$receipt" &&
     [[ "$(directory_digest "$receipt")" == "$(jq -r .directory_sha256 <<<"$receipt")" ]]
+}
+
+validate_starting_directory_receipt() {
+  local receipt=$1 count
+  count=$(jq -er '
+    .active_fence_count |
+    select(type == "string" and test("^[1-9][0-9]{0,3}$") and (tonumber <= 1024))
+  ' <<<"$receipt") || return 1
+  validate_directory_receipt "$receipt" "$count"
 }
 validate_retirement_plan() {
   local plan=$1 schema=$2 prefix=$3 min=$4 max=$5 count index target fence
@@ -278,7 +289,7 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
     $j.runtime.source_sha == $runtime_source and $j.runtime.runtime_manifest == $runtime_manifest and
     $j.runtime.build_run_id == $runtime_build and $j.runtime.build_run_attempt == $runtime_attempt and
     ($j.runtime.server_provenance | type == "string") and ($j.runtime.ac_provenance | type == "string") and
-    ($j.runtime.fence_start | type == "object" and .active_fence_count == "8") and
+    ($j.runtime.fence_start | type == "object") and
     ($j.runtime.fence_drain | type == "object" and .active_fence_count == "0") and
     ($j.runtime.predecessor_plan | type == "object") and
     ($j.runtime.predecessor_plan_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -309,7 +320,7 @@ if ! validate_retirement_plan "$INCIDENT_PLAN" layerv.durable-aop-stale-target-r
 fi
 FENCE_START=$(jq -cS .runtime.fence_start <<<"$JOURNAL")
 FENCE_DRAIN=$(jq -cS .runtime.fence_drain <<<"$JOURNAL")
-validate_directory_receipt "$FENCE_START" 8 && validate_directory_receipt "$FENCE_DRAIN" 0 &&
+validate_starting_directory_receipt "$FENCE_START" && validate_directory_receipt "$FENCE_DRAIN" 0 &&
   [[ "$(jq -r .created_at_ms <<<"$FENCE_START")" == "$(jq -r .created_at_ms <<<"$FENCE_DRAIN")" &&
      "$(jq -r .version <<<"$FENCE_DRAIN")" -ge "$(jq -r .version <<<"$FENCE_START")" &&
      "$(jq -r .updated_at_ms <<<"$FENCE_DRAIN")" -ge "$(jq -r .updated_at_ms <<<"$FENCE_START")" ]] || {

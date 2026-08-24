@@ -69,14 +69,18 @@ cat >"$WORK/helpers/stale-retire" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 directory_receipt() {
-  local count=$1 version=$2 updated=$3 digest
+  local count=$1 version=$2 updated=$3 blocked=${4:-false} overflow=${5:-0}
+  local event=${6:-} prepared=${7:-0} selected=${8:-0} digest
   digest=$({
-    printf '\0%s' v1 cell0 "$version" "$count" false 0 '' 0 0 1787530000000 "$updated"
+    printf '\0%s' v1 cell0 "$version" "$count" "$blocked" "$overflow" "$event" "$prepared" "$selected" \
+      1787530000000 "$updated"
   } | sha256sum | awk '{print $1}')
-  jq -cn --arg version "$version" --arg count "$count" --arg updated "$updated" --arg digest "$digest" '
+  jq -cn --arg version "$version" --arg count "$count" --argjson blocked "$blocked" --arg overflow "$overflow" \
+    --arg event "$event" --arg prepared "$prepared" --arg selected "$selected" \
+    --arg updated "$updated" --arg digest "$digest" '
     {schema:"layerv.durable-aop-fence-directory-receipt.v1",cell_id:"cell0",version:$version,
-     active_fence_count:$count,admission_blocked:false,overflow_close_count:"0",overflow_leader_event_id:"",
-     overflow_leader_prepared_directory_version:"0",overflow_leader_selected_directory_version:"0",
+     active_fence_count:$count,admission_blocked:$blocked,overflow_close_count:$overflow,overflow_leader_event_id:$event,
+     overflow_leader_prepared_directory_version:$prepared,overflow_leader_selected_directory_version:$selected,
      created_at_ms:"1787530000000",updated_at_ms:$updated,directory_sha256:$digest}'
 }
 decode_journal() {
@@ -84,10 +88,22 @@ decode_journal() {
 }
 case ${1:-} in
   plan) cat "$FAKE_STALE_TARGET_PLAN" ;;
-  snapshot-fence-directory) directory_receipt 8 19 1787535000000 ;;
+  snapshot-fence-directory)
+    case ${FAKE_FENCE_START_AUTHORITY:-valid} in
+      valid) directory_receipt "${FAKE_FENCE_START_COUNT:-82}" 83 1787553983425 ;;
+      malformed) printf '{"schema":' ;;
+      noncanonical) directory_receipt 01 83 1787553983425 ;;
+      admission_blocked) directory_receipt 82 83 1787553983425 true ;;
+      overflow) directory_receipt 82 83 1787553983425 true 1 11111111111111111111111111111111 82 83 ;;
+      *) exit 98 ;;
+    esac
+    ;;
   verify-fence-drain)
     if [[ "${FAKE_FENCE_DRAIN_INCOMPLETE:-}" == true ]]; then exit 75; fi
-    directory_receipt 0 27 1787545000000
+    printf 'verify-fence-drain\n' >>"$FAKE_ACTIONS"
+    # Version 106 models fences that arrived after the exact v83/count-82
+    # starting snapshot. Only the stable zero successor authorizes retirement.
+    directory_receipt 0 106 1787555000000
     ;;
   snapshot-predecessors)
 		printf 'snapshot-predecessors\n' >>"$FAKE_ACTIONS"
@@ -102,6 +118,7 @@ case ${1:-} in
     done
     [[ "$table" == layerv-nhp-sandbox-cell0-nhp-session-control && "$region" == us-east-2 ]]
     target=$(jq -ce --arg id "$id" '.targets[] | select(.id == $id)' "$FAKE_STALE_TARGET_PLAN")
+    printf 'retire\t%s\n' "$id" >>"$FAKE_ACTIONS"
     jq -cn --arg id "$id" --arg key "$(jq -r .fence.public_key <<<"$target")" \
       --arg version "$(( $(jq -r .fence.version <<<"$target") + 1 ))" \
       --arg authority "$(( $(jq -r .fence.authority_version <<<"$target") + 1 ))" '
@@ -1127,6 +1144,54 @@ fi
 [[ ! -s "$FAKE_ACTIONS" ]]
 unset INVOKE_RECOVERY_SHA INVOKE_BUILD_RUN_ID INVOKE_BUILD_RUN_ATTEMPT
 
+# The recovery start is a stable, strongly read incident receipt, not a
+# hard-coded historical count. Counts 1 and the store capacity 1024 are valid;
+# zero, above-capacity, noncanonical, malformed, blocked, and overflow
+# authorities fail before the first durable state/image/refresh/DDB mutation.
+export INVOKE_BUILD_RUN_ID=32656742290 INVOKE_BUILD_RUN_ATTEMPT=1
+for count in 1 1024; do
+  seed_live_stale_retirement_handoff
+  export FAKE_FENCE_START_COUNT=$count
+  export FAKE_FAIL_AFTER_STATE_PHASE=repaired
+  export FAKE_FAIL_AFTER_STATE_WRITE_ONCE="$WORK/fence-start-${count}-state-stop"
+  rm -f "$FAKE_FAIL_AFTER_STATE_WRITE_ONCE"
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "capacity-bounded fence start $count did not stop after its durable state reference" >&2
+    exit 1
+  fi
+  journal=$(read_fixture_journal)
+  [[ "$(jq -r .runtime.fence_start.active_fence_count <<<"$journal")" == "$count" &&
+     "$(jq -r .status <<<"$journal")" == cell0_intent ]]
+  if grep -Eq $'^(refresh|retire|retire-predecessor)\t' "$FAKE_ACTIONS"; then
+    echo "fence start $count reached a refresh or retirement before journal/state persistence" >&2
+    exit 1
+  fi
+done
+unset FAKE_FENCE_START_COUNT FAKE_FAIL_AFTER_STATE_PHASE FAKE_FAIL_AFTER_STATE_WRITE_ONCE
+
+for authority in zero above_capacity noncanonical malformed admission_blocked overflow; do
+  seed_live_stale_retirement_handoff
+  unset FAKE_FENCE_START_COUNT FAKE_FENCE_START_AUTHORITY
+  case "$authority" in
+    zero) export FAKE_FENCE_START_COUNT=0 ;;
+    above_capacity) export FAKE_FENCE_START_COUNT=1025 ;;
+    *) export FAKE_FENCE_START_AUTHORITY=$authority ;;
+  esac
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "invalid starting fence authority was accepted: $authority" >&2
+    exit 1
+  fi
+  if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply|snapshot-predecessors|retire|retire-predecessor)\t?' \
+    "$FAKE_ACTIONS"; then
+    echo "invalid starting fence authority reached a mutation: $authority" >&2
+    cat "$FAKE_ACTIONS" >&2
+    exit 1
+  fi
+done
+unset FAKE_FENCE_START_COUNT FAKE_FENCE_START_AUTHORITY
+
 # The third incident boundary is the exact live schema-3 v22 state after the
 # canonical owner reached READY. Only the reviewed 84ed predecessor may hand
 # that byte-for-byte state to this controller. The first durable write creates
@@ -1151,11 +1216,34 @@ journal=$(read_fixture_journal)
 [[ "$(jq -r .status <<<"$journal")" == cell0_intent ]]
 [[ "$(jq -r .source_state_version <<<"$journal")" == 22 ]]
 [[ "$(jq -r .source_state_sha256 <<<"$journal")" == "$STALE_RETIREMENT_STATE_DIGEST" ]]
+[[ "$(jq -r .runtime.fence_start.active_fence_count <<<"$journal")" == 82 &&
+   "$(jq -r .runtime.fence_start.version <<<"$journal")" == 83 ]]
 if grep -q $'^refresh\t' "$FAKE_ACTIONS"; then
   echo "v22 handoff started a refresh before its v23 intent was durable" >&2
   exit 1
 fi
 unset FAKE_FAIL_AFTER_STATE_PHASE FAKE_FAIL_AFTER_STATE_WRITE_ONCE
+
+# Even after both f323 server refreshes, an incomplete fence drain retains the
+# hard lock and journal and cannot reach either incident or predecessor target
+# retirement. This is also the safe retry boundary if later arrivals increased
+# the count after the exact starting receipt was committed.
+seed_live_stale_retirement_handoff
+export FAKE_FENCE_DRAIN_INCOMPLETE=true
+: >"$FAKE_ACTIONS"
+if invoke >/dev/null 2>&1; then
+  echo "incomplete zero-target fence drain was accepted" >&2
+  exit 1
+fi
+grep -q $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS"
+grep -q $'^refresh\tlayerv-nhp-sandbox-cell1-server-green\t' "$FAKE_ACTIONS"
+if grep -Eq $'^(retire|retire-predecessor)\t' "$FAKE_ACTIONS"; then
+  echo "target retirement ran before the directory reached stable zero" >&2
+  exit 1
+fi
+grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
+if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
+unset FAKE_FENCE_DRAIN_INCOMPLETE
 
 # Every mutation of the exact historical state/version/owner/lock boundary is
 # rejected before a state write or refresh. A third controller source cannot
@@ -1234,10 +1322,27 @@ unset FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE
 }
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 journal_version=$(cat "$FAKE_JOURNAL_VERSION_FILE")
+journal=$(read_fixture_journal)
 [[ "$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")" == "$journal_version" &&
-   "$(jq -r .status <<<"$(read_fixture_journal)")" == complete &&
+   "$(jq -r .status <<<"$journal")" == complete &&
    "$(wc -l <"$WORK/journal-state-crash-versions" | tr -d ' ')" == "$journal_version" ]] || {
 	echo "not every journal update was recovered through its exact state-reference crash boundary" >&2; exit 1;
+}
+[[ "$(jq -r .runtime.fence_start.active_fence_count <<<"$journal")" == 82 &&
+   "$(jq -r .runtime.fence_start.version <<<"$journal")" == 83 &&
+   "$(jq -r .runtime.fence_drain.active_fence_count <<<"$journal")" == 0 &&
+   "$(jq -r .runtime.fence_drain.version <<<"$journal")" == 106 ]] || {
+  echo "later-arriving fences did not retain the exact start and stable-zero successor receipts" >&2
+  exit 1
+}
+cell0_refresh_line=$(grep -n $'^refresh\tlayerv-nhp-sandbox-server\t' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
+cell1_refresh_line=$(grep -n $'^refresh\tlayerv-nhp-sandbox-cell1-server-green\t' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
+fence_drain_line=$(grep -n '^verify-fence-drain$' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
+incident_retire_line=$(grep -n $'^retire\t' "$FAKE_ACTIONS" | head -1 | cut -d: -f1)
+[[ "$cell0_refresh_line" -lt "$fence_drain_line" && "$cell1_refresh_line" -lt "$fence_drain_line" &&
+   "$fence_drain_line" -lt "$incident_retire_line" ]] || {
+  echo "server refresh, stable-zero drain, and target retirement ordering drifted" >&2
+  exit 1
 }
 awk 'NR != $1 {exit 1}' "$WORK/journal-state-crash-versions"
 grep -Eq $'^retire-predecessor-orphan\tpredecessor-1\t[1-9][0-9]*$' "$FAKE_ACTIONS" || {
