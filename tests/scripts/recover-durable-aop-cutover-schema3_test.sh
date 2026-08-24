@@ -7,8 +7,8 @@ SCRIPT=$ROOT/.github/scripts/recover-durable-aop-cutover-schema3.sh
 ORIGINAL=e9b11398a4cea98da6ae5b41cfe635562e1b7c72
 REPAIR=422b1d9acac53d50fe5602158fb02c8120ef108d
 RECOVERY=abcdefabcdefabcdefabcdefabcdefabcdefabcd
-RECOVERY_PREDECESSOR=c83dfec827b216cd23fb95f08c157318e1153087
-RECOVERY_HANDOFF_STATE_DIGEST=18cc92713387304aa319684fe4aea851ab1a3326ba53e4895e25a8be3f1d494d
+RECOVERY_PREDECESSOR=519bed05f0dc5ea2e40a0f45afffb8e86cc729be
+RECOVERY_HANDOFF_STATE_DIGEST=bf64f92a30915349c4561bedda2ba84c967e2060e1ac46baa66435338104d9fe
 MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
 OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
@@ -610,17 +610,19 @@ seed_live_orchestrator_handoff() {
   state=$(jq -cn --argjson lock "$lock" --arg repair "$REPAIR" --arg predecessor "$RECOVERY_PREDECESSOR" \
     --arg server_digest "$SERVER_DIGEST" --arg ac_digest "$AC_DIGEST" \
     --arg state_digest "$ORIGINAL_STATE_DIGEST" --arg lock_digest "$ORIGINAL_LOCK_DIGEST" '
-    {schema:3,phase:"cell1_refreshing",
+    {schema:3,phase:"repaired",
      original:{state_version:7,state_sha256:$state_digest,lock:$lock,lock_version:2,lock_sha256:$lock_digest},
      repair:{orchestrator_sha:$predecessor,source_sha:$repair,build_run_id:"32656742290",build_run_attempt:"1",
        runtime_manifest:"2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78",
        server_provenance:("v1|"+$repair+"|layerv/nhp-server|"+$server_digest),
        ac_provenance:("v1|"+$repair+"|layerv/nhp-ac|"+$ac_digest),
        cell0_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-server|"+$server_digest+"|layerv-nhp-sandbox-server"),
-       cell1_attestation:"",ac_attestation:"",
+       cell1_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-server|"+$server_digest+"|layerv-nhp-sandbox-cell1-server-green"),
+       ac_attestation:("v2|durable-aop-v1|"+$repair+"|layerv/nhp-ac|"+$ac_digest+"|layerv-nhp-sandbox-ac-green"),
        cell0_refresh_id:"ea9dae3d-22f8-478e-a9ec-91eb9b9f53fb",
        cell1_refresh_id:"dc5ab358-ef4e-45a8-bf81-d18112a2ce9c",
-       ac_refresh_id:"",customer_lifecycle:"",connector_lifecycle:""}}')
+       ac_refresh_id:"b58f804d-6ed2-4f15-90df-749e2e0f93fb",
+       customer_lifecycle:"",connector_lifecycle:""}}')
   canonical=$(jq -cS . <<<"$state")
   [[ "$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')" == "$RECOVERY_HANDOFF_STATE_DIGEST" ]]
   set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$canonical"
@@ -630,9 +632,13 @@ seed_live_orchestrator_handoff() {
     "v2|durable-aop-v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}|layerv-nhp-sandbox-server"
   set_fixture_param /sandbox-cell1/nhp/server/green-image-tag "$REPAIR"
   set_fixture_param /sandbox-cell1/nhp/server/green-protocol-profile "v1|durable-aop-v1|${REPAIR}"
-  awk -F '\t' '$1!="/sandbox-cell1/nhp/server/green-prepared-slot-attestation"' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
-  mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
-  printf '15\n' >"$FAKE_STATE_VERSION_FILE"
+  set_fixture_param /sandbox-cell1/nhp/server/green-prepared-slot-attestation \
+    "v2|durable-aop-v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}|layerv-nhp-sandbox-cell1-server-green"
+  set_fixture_param /sandbox/nhp/ac/green-image-tag "$REPAIR"
+  set_fixture_param /sandbox/nhp/ac/green-protocol-profile "v1|durable-aop-v1|${REPAIR}"
+  set_fixture_param /sandbox/nhp/ac/green-prepared-slot-attestation \
+    "v2|durable-aop-v1|${REPAIR}|layerv/nhp-ac|${AC_DIGEST}|layerv-nhp-sandbox-ac-green"
+  printf '20\n' >"$FAKE_STATE_VERSION_FILE"
 }
 
 invoke() {
@@ -728,43 +734,53 @@ for selector_case in partial_customer missing_connector malformed_customer malfo
 done
 unset LIFECYCLE_RUN_ID LIFECYCLE_RUN_ATTEMPT CONNECTOR_RUN_ID CONNECTOR_RUN_ATTEMPT
 
-# The live incident is schema-3 SSM v15 at cell1_refreshing and binds the
-# predecessor controller. Its one reviewed successor may resume that exact
-# state, but the first committed state write must install the successor SHA.
-# Stop after that exact v15 -> v16 cell1_refreshed write, then resume through AC
-# refresh and owner readiness.
+# The second live stop is schema-3 SSM v20 at repaired with all three exact
+# fleet attestations and no owner authority. Its one reviewed successor may
+# resume only those bytes. The first owner-preparing write must make the exact
+# v20 -> v21 transition and install the successor SHA before any customer-row
+# mutation is attempted.
 export INVOKE_BUILD_RUN_ID=32656742290 INVOKE_BUILD_RUN_ATTEMPT=1
 seed_live_orchestrator_handoff
-export FAKE_FAIL_AFTER_STATE_PHASE=cell1_refreshed
-export FAKE_FAIL_AFTER_STATE_WRITE_ONCE=$WORK/cell1-handoff-state-committed
+export FAKE_OWNER_APPLY_FAIL_ONCE=$WORK/live-owner-apply-failed
 if handoff_output=$(invoke 2>&1); then
-  echo "live predecessor handoff unexpectedly passed the injected v16 stop" >&2
+  echo "live predecessor handoff unexpectedly passed the injected owner apply stop" >&2
   exit 1
 fi
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
-[[ "$(jq -r .phase <<<"$state")" == cell1_refreshed ]] || {
-  echo "live predecessor handoff stopped before the committed v16 boundary: $handoff_output" >&2
+[[ "$(jq -r .phase <<<"$state")" == repaired && "$(jq -r .repair.owner.status <<<"$state")" == preparing ]] || {
+  echo "live predecessor handoff stopped before the committed v21 owner boundary: $handoff_output" >&2
   exit 1
 }
 [[ "$(jq -r .repair.orchestrator_sha <<<"$state")" == "$RECOVERY" ]]
 [[ "$(jq -r .repair.cell1_attestation <<<"$state")" == \
   "v2|durable-aop-v1|${REPAIR}|layerv/nhp-server|${SERVER_DIGEST}|layerv-nhp-sandbox-cell1-server-green" ]]
-[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 16 ]]
+[[ "$(jq -r .repair.ac_attestation <<<"$state")" == \
+  "v2|durable-aop-v1|${REPAIR}|layerv/nhp-ac|${AC_DIGEST}|layerv-nhp-sandbox-ac-green" ]]
+[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 21 ]]
+intent_before=$(jq -cS .repair.owner.intent <<<"$state")
+[[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == 1 ]]
+if grep -q $'^refresh\t' "$FAKE_ACTIONS"; then
+  echo "repaired v20 handoff repeated a completed fleet refresh" >&2
+  exit 1
+fi
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
-unset FAKE_FAIL_AFTER_STATE_PHASE FAKE_FAIL_AFTER_STATE_WRITE_ONCE
+unset FAKE_OWNER_APPLY_FAIL_ONCE
 output=$(invoke)
 grep -q 'reached repaired+owner_ready' <<<"$output"
 state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
 [[ "$(jq -r .phase <<<"$state")" == repaired ]]
 [[ "$(jq -r .repair.orchestrator_sha <<<"$state")" == "$RECOVERY" ]]
 [[ "$(jq -r .repair.owner.status <<<"$state")" == ready ]]
+[[ "$(jq -cS .repair.owner.intent <<<"$state")" == "$intent_before" ]]
+[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 22 ]]
+[[ "$(grep -c '^owner-plan$' "$FAKE_ACTIONS")" == 1 ]]
 grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
 if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 cp "$FAKE_PARAMS" "$WORK/params.handoff-current"
 cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.handoff-current"
 
-# Exact successor replay is allowed. A changed predecessor ledger, a v15 state
+# Exact successor replay is allowed. A changed predecessor ledger, a v20 state
 # that self-asserts the successor, or any third controller source fails before
 # a state write, fleet action, or owner mutation.
 : >"$FAKE_ACTIONS"
@@ -774,16 +790,18 @@ if grep -Eq $'^(put|delete|refresh|owner-plan|owner-apply)\t?' "$FAKE_ACTIONS"; 
   exit 1
 fi
 for mutation in \
-  predecessor_bytes wrong_state_version missing_lock changed_lock \
-  successor_at_v15 third_stored predecessor_as_current; do
+  predecessor_bytes wrong_phase owner_present wrong_state_version missing_lock changed_lock \
+  successor_at_v20 third_stored predecessor_as_current; do
   seed_live_orchestrator_handoff
   state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
   unset INVOKE_RECOVERY_SHA
   case "$mutation" in
-    predecessor_bytes) mutated=$(jq -c '.repair.cell1_refresh_id="changed-refresh"' <<<"$state") ;;
+    predecessor_bytes) mutated=$(jq -c '.repair.ac_refresh_id="changed-refresh"' <<<"$state") ;;
+    wrong_phase) mutated=$(jq -c '.phase="ac_refreshing"' <<<"$state") ;;
+    owner_present) mutated=$(jq -c '.repair.owner={status:"ready",intent:{}}' <<<"$state") ;;
     wrong_state_version)
       mutated=$state
-      printf '16\n' >"$FAKE_STATE_VERSION_FILE"
+      printf '21\n' >"$FAKE_STATE_VERSION_FILE"
       ;;
     missing_lock)
       mutated=$state
@@ -795,7 +813,7 @@ for mutation in \
       lock=$(awk -F '\t' '$1=="/layerv-nhp-sandbox/qurl-live-env-lock" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
       set_fixture_param /layerv-nhp-sandbox/qurl-live-env-lock "$(jq -c '.created_at += 1' <<<"$lock")"
       ;;
-    successor_at_v15) mutated=$(jq -c --arg sha "$RECOVERY" '.repair.orchestrator_sha=$sha' <<<"$state") ;;
+    successor_at_v20) mutated=$(jq -c --arg sha "$RECOVERY" '.repair.orchestrator_sha=$sha' <<<"$state") ;;
     third_stored) mutated=$(jq -c '.repair.orchestrator_sha="9999999999999999999999999999999999999999"' <<<"$state") ;;
     predecessor_as_current)
       mutated=$state
@@ -826,7 +844,7 @@ fi
 [[ ! -s "$FAKE_ACTIONS" ]]
 unset INVOKE_RECOVERY_SHA INVOKE_BUILD_RUN_ID INVOKE_BUILD_RUN_ATTEMPT
 
-# A malformed successor-version read cannot bypass the exact v15 exclusion.
+# A malformed successor-version read cannot bypass the exact v20 exclusion.
 cp "$WORK/params.handoff-current" "$FAKE_PARAMS"
 printf 'unreadable\n' >"$FAKE_STATE_VERSION_FILE"
 : >"$FAKE_ACTIONS"

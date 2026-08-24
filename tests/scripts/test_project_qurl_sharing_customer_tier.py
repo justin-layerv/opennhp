@@ -82,6 +82,24 @@ def test_absent_plan_precommits_exact_complete_system_row():
     assert MOD.row_digest(expected) == intent["expected_row_sha256"]
 
 
+def test_real_aws_empty_get_item_stdout_is_exact_absence():
+    class EmptyAWSRunner(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            assert "get-item" in argv
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    intent = MOD.plan(
+        MOD.TABLE,
+        CLIENT,
+        MOD.REGION,
+        STAMP,
+        SOURCE,
+        runner=EmptyAWSRunner([]),
+    )
+    assert intent["action"] == "create"
+    assert intent["before_row_sha256"] == "absent"
+
+
 def test_create_uses_one_deterministic_transaction_and_classifies_lost_response():
     intent = make_plan()
     expected = MOD.expected_row_from_intent(intent)
@@ -198,6 +216,32 @@ def test_intent_strict_types_digest_and_strong_read_shape():
 
     with pytest.raises(MOD.ProjectionError):
         MOD.strong_read(MOD.TABLE, SUBJECT, MOD.REGION, BadRead([]))
+
+    class RawRead(FakeRunner):
+        def __init__(self, stdout: str, returncode: int = 0):
+            super().__init__([])
+            self.stdout = stdout
+            self.returncode = returncode
+
+        def __call__(self, argv, **kwargs):
+            return subprocess.CompletedProcess(argv, self.returncode, self.stdout, "")
+
+    for raw in (
+        " ",
+        "\n",
+        "null",
+        "[]",
+        "{",
+        '{"Item":null}',
+        '{"Item":{},"extra":true}',
+        '{"ConsumedCapacity":{}}',
+    ):
+        with pytest.raises(MOD.ProjectionError):
+            MOD.strong_read(MOD.TABLE, SUBJECT, MOD.REGION, RawRead(raw))
+
+    assert MOD.strong_read(MOD.TABLE, SUBJECT, MOD.REGION, RawRead("{}")) is None
+    with pytest.raises(MOD.ProjectionError):
+        MOD.strong_read(MOD.TABLE, SUBJECT, MOD.REGION, RawRead("", returncode=75))
 
 
 def test_malformed_or_paid_existing_rows_never_plan():

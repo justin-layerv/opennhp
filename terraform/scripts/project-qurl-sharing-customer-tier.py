@@ -224,12 +224,20 @@ def strong_read(table: str, subject: str, region: str, runner: Runner) -> dict[s
         text=True,
         env={**os.environ, "AWS_PAGER": ""},
     )
+    # AWS CLI v2 emits exactly zero stdout bytes when a successful GetItem
+    # response has no fields because the requested item is absent. Keep this
+    # classification local to the strong GetItem boundary: whitespace, null,
+    # malformed JSON, and noncanonical envelopes still fail closed below.
+    if result.returncode != 0:
+        raise ProjectionError("strong customer read failed")
+    if result.stdout == "":
+        return None
     response = aws_json(result, "strong customer read")
     if set(response) not in (set(), {"Item"}):
         raise ProjectionError("strong customer read did not return the exact requested shape")
-    item = response.get("Item")
-    if item is None:
+    if not response:
         return None
+    item = response["Item"]
     if not isinstance(item, dict):
         raise ProjectionError("strong customer read returned a malformed item")
     return item

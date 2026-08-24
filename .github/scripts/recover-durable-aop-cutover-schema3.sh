@@ -37,16 +37,18 @@ APPROVED_CUSTOMER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
 APPROVED_CUSTOMER_SUBJECT=${APPROVED_CUSTOMER_CLIENT_ID}@clients
 APPROVED_CUSTOMER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
 APPROVED_CUSTOMER_TABLE=layerv-nhp-sandbox-control-qurl-customers
-# The first repaired controller stopped at the exact live SSM v15
-# cell1_refreshing boundary. One successor may adopt only those exact bytes and
-# rewrites the controller authority on its first state transition. This is not
-# a general source-compatibility list. The workflow establishes successor trust
-# before AWS credentials by requiring expected_recovery_sha == GITHUB_SHA and
-# checking out that exact live main commit; the future squash SHA therefore is
-# not a caller-controlled static allowlist entry here.
-APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA=c83dfec827b216cd23fb95f08c157318e1153087
-APPROVED_RECOVERY_HANDOFF_STATE_VERSION=15
-APPROVED_RECOVERY_HANDOFF_STATE_DIGEST=18cc92713387304aa319684fe4aea851ab1a3326ba53e4895e25a8be3f1d494d
+# The second repaired controller stopped at the exact live SSM v20 `repaired`
+# boundary after every fleet attestation, but before an owner intent existed.
+# One successor may adopt only those exact bytes and rewrites controller
+# authority on its first owner-preparing state write. This is not a general
+# source-compatibility list. The workflow establishes successor trust before
+# AWS credentials by requiring expected_recovery_sha == GITHUB_SHA and checking
+# out that exact live main commit; the future squash SHA therefore is not a
+# caller-controlled static allowlist entry here.
+APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA=519bed05f0dc5ea2e40a0f45afffb8e86cc729be
+APPROVED_RECOVERY_HANDOFF_STATE_VERSION=20
+APPROVED_RECOVERY_HANDOFF_STATE_DIGEST=bf64f92a30915349c4561bedda2ba84c967e2060e1ac46baa66435338104d9fe
+APPROVED_RECOVERY_HANDOFF_PHASE=repaired
 GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-layervai/nhp}
 AWS_REGION=${AWS_REGION:-us-east-2}
 export AWS_REGION GITHUB_REPOSITORY
@@ -666,7 +668,7 @@ load_schema3() {
     [[ "$RECOVERY_ORCHESTRATOR_SHA" != "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" &&
        "$state_version" == "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" &&
        "$digest" == "$APPROVED_RECOVERY_HANDOFF_STATE_DIGEST" &&
-       "$(jq -r .phase <<<"$raw")" == cell1_refreshing &&
+       "$(jq -r .phase <<<"$raw")" == "$APPROVED_RECOVERY_HANDOFF_PHASE" &&
        -n "${LIVE_LOCK:-}" && "$LOCK_JSON" == "$ORIGINAL_LOCK" ]] || {
       echo "schema-3 predecessor authority is not the exact live one-hop handoff boundary" >&2
       return 1
