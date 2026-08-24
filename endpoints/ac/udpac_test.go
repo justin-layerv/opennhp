@@ -385,6 +385,49 @@ func TestSendPacket_WriteToUDP(t *testing.T) {
 	t.Logf("SendPacket successfully sent %d bytes to %s using WriteToUDP", n, receiverAddr.String())
 }
 
+func TestSendPacket_ExplicitDestinationRetainsExistingSocket(t *testing.T) {
+	nlbSocket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = nlbSocket.Close() }()
+	nlbAddr := nlbSocket.LocalAddr().(*net.UDPAddr)
+	serverSocket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = serverSocket.Close() }()
+	serverAddr := serverSocket.LocalAddr().(*net.UDPAddr)
+
+	ac := createTestAC(t)
+	defer ac.device.Stop()
+	conn := ac.newConnection(nlbAddr)
+	if conn == nil {
+		t.Fatal("newConnection returned nil")
+	}
+	defer conn.Close()
+	pkt := ac.device.AllocatePoolPacket()
+	pkt.Content = []byte("direct response on NLB-oriented socket")
+	pkt.KeepAfterSend = true
+	pkt.SendTo = serverAddr.AddrPort()
+	if _, err = ac.SendPacket(pkt, conn); err != nil {
+		t.Fatal(err)
+	}
+	_ = serverSocket.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 128)
+	n, from, err := serverSocket.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != string(pkt.Content) || from.Port != conn.ConnData.LocalAddr.Port {
+		t.Fatalf("explicit route received %q from %s, want same socket port %d", buf[:n], from, conn.ConnData.LocalAddr.Port)
+	}
+	_ = nlbSocket.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, _, err = nlbSocket.ReadFromUDP(buf); err == nil {
+		t.Fatal("explicit route also sent packet to NLB")
+	}
+}
+
 // TestMultipleConnections_DifferentPorts verifies that multiple connections
 // each get their own local port (ephemeral port allocation).
 func TestMultipleConnections_DifferentPorts(t *testing.T) {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"net/netip"
 	"testing"
 )
 
@@ -39,6 +40,8 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 	}
 	pkt.HeaderType = NHP_KNK
 	pkt.ReceivedAtNanos = 123
+	pkt.ReceivedFrom = netip.MustParseAddrPort("192.0.2.10:62000")
+	pkt.SendTo = netip.MustParseAddrPort("192.0.2.11:62206")
 
 	device.ReleasePoolPacket(pkt)
 	if pkt.Content != nil {
@@ -49,6 +52,9 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 	}
 	if pkt.ReceivedAtNanos != 0 {
 		t.Fatalf("ReleasePoolPacket retained receipt time %d", pkt.ReceivedAtNanos)
+	}
+	if pkt.ReceivedFrom.IsValid() || pkt.SendTo.IsValid() {
+		t.Fatalf("ReleasePoolPacket retained transport metadata received=%v send=%v", pkt.ReceivedFrom, pkt.SendTo)
 	}
 
 	// Post-release: MinimalLength must panic. A caller that silently

@@ -132,7 +132,7 @@ const (
 // qurl-service#976). Sized to let processACOperation's conn.Close() prune the dead
 // conn and the re-snapshot pick up a still-live SIBLING conn — NOT to let a brand-new
 // AC registration land: a genuine re-register runs NHP_AOL + server-side bcrypt
-// (the ~4.7s work ACLocalTransactionResponseTimeoutMs exists for), which will not
+// (the dedicated NHP_AOL failure ceiling exists for), which will not
 // finish in 300ms. So the retry's recovery vector is an already-registered green conn
 // (blue/green keeps several per acId via MaxACConnsPerID); a single-conn AC with no
 // sibling deterministically hits NoFreshConns and relies on the client's next

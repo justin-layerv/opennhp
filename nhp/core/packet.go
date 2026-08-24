@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/binary"
 	"errors"
+	"net/netip"
 	"sync"
 	"unsafe"
 
@@ -184,6 +185,17 @@ type Packet struct {
 	// inbound packet, expressed as Unix nanoseconds. Outbound packets leave it
 	// zero.
 	ReceivedAtNanos int64
+	// ReceivedFrom is the immutable source address observed by the UDP receive
+	// transport for an inbound packet. It can differ from ConnectionData.RemoteAddr
+	// when one socket sends through an NLB but accepts authenticated replies from
+	// a target directly. Packet content cannot set this field. Non-UDP transports
+	// and outbound packets leave it invalid.
+	ReceivedFrom netip.AddrPort
+	// SendTo is trusted, process-local transport metadata for an outbound UDP
+	// packet that must leave on ConnData's existing socket but target a different
+	// address. It is never serialized. The zero value preserves the connection's
+	// ordinary RemoteAddr route.
+	SendTo netip.AddrPort
 }
 
 var relayPacketPool = sync.Pool{
@@ -384,6 +396,7 @@ func (d *Device) clonePacketForSend(pkt *Packet) (*Packet, error) {
 	// from AllocatePoolPacket, and KeepAfterSend must remain false so the sender
 	// releases its independent copy.
 	clone.HeaderType = pkt.HeaderType
+	clone.SendTo = pkt.SendTo
 	clone.Content = clone.Buf[:len(pkt.Content)]
 	copy(clone.Content, pkt.Content)
 	return clone, nil
@@ -397,6 +410,8 @@ func (d *Device) ReleasePoolPacket(pkt *Packet) {
 		pkt.Content = nil
 		pkt.HeaderType = 0
 		pkt.ReceivedAtNanos = 0
+		pkt.ReceivedFrom = netip.AddrPort{}
+		pkt.SendTo = netip.AddrPort{}
 		relayPacketPool.Put(buf)
 		return
 	}
@@ -406,5 +421,7 @@ func (d *Device) ReleasePoolPacket(pkt *Packet) {
 		pkt.Content = nil
 		pkt.HeaderType = 0
 		pkt.ReceivedAtNanos = 0
+		pkt.ReceivedFrom = netip.AddrPort{}
+		pkt.SendTo = netip.AddrPort{}
 	}
 }

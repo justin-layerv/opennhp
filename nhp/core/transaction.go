@@ -202,6 +202,9 @@ func (d *Device) LocalTransactionTimeout(msgType int) int {
 		}
 		return ServerLocalTransactionResponseTimeoutMs
 	case NHP_AC:
+		if msgType == NHP_AOL {
+			return ACRegistrationTransactionResponseTimeoutMs
+		}
 		return ACLocalTransactionResponseTimeoutMs
 	case NHP_DB:
 		return DELocalTransactionResponseTimeoutMs

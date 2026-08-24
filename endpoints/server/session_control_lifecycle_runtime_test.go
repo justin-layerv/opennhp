@@ -10,6 +10,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
 
+type sessionControlLifecycleMarkStore struct {
+	sessionControlCloseLifecycleStore
+	mark func(context.Context, sessionControlFenceAuthority) (*sessionControlFenceAuthority, error)
+}
+
+func (s *sessionControlLifecycleMarkStore) MarkFenceConverged(ctx context.Context,
+	fence sessionControlFenceAuthority,
+) (*sessionControlFenceAuthority, error) {
+	return s.mark(ctx, fence)
+}
+
 func seedSessionControlLifecycleCleanupAudit(t *testing.T, fixture *sessionControlCleanupFixture,
 	ownerPK string, seed uint64) {
 	t.Helper()
@@ -101,6 +112,70 @@ func TestSessionControlLifecycleRecoveryAdvancesAckedCloseThroughTerminal(t *tes
 	}
 	if _, err = fixture.store.getCloseClosed(context.Background(), fixture.close.EventID); err != nil {
 		t.Fatalf("advanced lifecycle terminal marker: %v", err)
+	}
+}
+
+func TestSessionControlLifecycleRecoveryConvergesZeroTargetFenceBeforeComplete(t *testing.T) {
+	fixture := newSessionControlCompletionFixture(t, 0, false, false)
+	session, err := fixture.store.getSessionItem(context.Background(), fixture.candidate.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markCalls := 0
+	store := &sessionControlLifecycleMarkStore{sessionControlCloseLifecycleStore: fixture.store}
+	store.mark = func(_ context.Context, fence sessionControlFenceAuthority) (*sessionControlFenceAuthority, error) {
+		markCalls++
+		if fixture.close.Fence == nil || fence != *fixture.close.Fence || fence.State != sessionControlFencePreparing {
+			t.Fatalf("zero-target mark input = %#v, want prepared %#v", fence, fixture.close.Fence)
+		}
+		convergeSessionControlCompletionFence(t, &fixture)
+		converged := fixture.fence
+		return &converged, nil
+	}
+	s := &UdpServer{sessionControlCellID: fixture.candidate.CellID, sessionControlStore: fixture.store}
+	_ = s.advanceDurableExactCloseLifecycle(context.Background(), store, *session)
+	if markCalls != 1 {
+		t.Fatalf("zero-target MarkFenceConverged calls = %d, want 1", markCalls)
+	}
+	complete, err := fixture.store.getCloseComplete(context.Background(), fixture.close.EventID)
+	if err != nil || complete.ExpectedTargetCount != 0 || complete.FenceVersion != fixture.fence.Version {
+		t.Fatalf("zero-target COMPLETE = %#v, %v; want converged fence version %d", complete, err, fixture.fence.Version)
+	}
+}
+
+func TestSessionControlLifecycleRecoveryResumesAfterConvergenceResponseLoss(t *testing.T) {
+	fixture := newSessionControlCompletionFixture(t, 0, false, false)
+	session, err := fixture.store.getSessionItem(context.Background(), fixture.candidate.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markCalls := 0
+	store := &sessionControlLifecycleMarkStore{sessionControlCloseLifecycleStore: fixture.store}
+	store.mark = func(_ context.Context, fence sessionControlFenceAuthority) (*sessionControlFenceAuthority, error) {
+		markCalls++
+		if fixture.close.Fence == nil || fence != *fixture.close.Fence {
+			t.Fatalf("lost-response mark input = %#v, want %#v", fence, fixture.close.Fence)
+		}
+		convergeSessionControlCompletionFence(t, &fixture)
+		if markCalls == 1 {
+			return nil, errors.New("injected lost convergence response")
+		}
+		converged := fixture.fence
+		return &converged, nil
+	}
+	s := &UdpServer{sessionControlCellID: fixture.candidate.CellID, sessionControlStore: fixture.store}
+	if err := s.advanceDurableExactCloseLifecycle(context.Background(), store, *session); err == nil {
+		t.Fatal("first lifecycle attempt unexpectedly survived lost convergence response")
+	}
+	if err := s.advanceDurableExactCloseLifecycle(context.Background(), store, *session); !errors.Is(err, errSessionControlFenceReplayHorizon) {
+		t.Fatalf("lifecycle replay after convergence response loss = %v, want committed COMPLETE then replay wait", err)
+	}
+	if markCalls != 1 {
+		t.Fatalf("MarkFenceConverged calls = %d, want one committed transition", markCalls)
+	}
+	complete, err := fixture.store.getCloseComplete(context.Background(), fixture.close.EventID)
+	if err != nil || complete.ExpectedTargetCount != 0 {
+		t.Fatalf("replayed COMPLETE = %#v, %v", complete, err)
 	}
 }
 

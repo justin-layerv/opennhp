@@ -578,10 +578,9 @@ func bareScopeKey(scope revocationScope, scopeKey string) (bare string, err erro
 // is therefore harmless.
 //
 // Delivery-guarantee dependency (do not lose across the slice boundary): NHP_REV
-// is fire-and-forget UDP with no ack, so a lost packet leaves the entry alive to
-// natural expiry — a fail-open outcome. The replay-safety reasoning above assumes
-// the sender provides redelivery. depends on: Slice 2 at-least-once send (the
-// server→AC fanout must retry); tracked in the P4e plan.
+// is an unsolicited UDP push whose exact NHP_RVA acknowledgement drives bounded
+// server redelivery. A lost packet or acknowledgement must therefore retain the
+// same server waiter and authenticated return route until a retry succeeds.
 //
 // Every reject path is fail-closed (drops without calling ApplyRevocation) and
 // increments MetricRevocationRejected so a malformed/forged-event spike is
@@ -761,13 +760,17 @@ func (a *UdpAC) sendSessionControlAck(ppd *core.PacketParserData, closeMsg *comm
 	if err != nil {
 		return err
 	}
+	replyAddr := cloneACReplyAddr(ppd.ConnData.RemoteAddr)
+	if ppd.ReceivedFrom.IsValid() {
+		replyAddr = net.UDPAddrFromAddrPort(ppd.ReceivedFrom)
+	}
 	md := &core.MsgData{
 		// UdpAC.sendMessageRoutine selects or creates the outbound connection by
 		// RemoteAddr before it replaces ConnData with the live connection. The
-		// address is copied from the authenticated inbound connection; leaving it
-		// nil drops the RVA before encryption, while deriving it from message bytes
-		// would let an unauthenticated field redirect the acknowledgement.
-		RemoteAddr:    cloneACReplyAddr(ppd.ConnData.RemoteAddr),
+		// address is the receive transport's actual source after peer authentication,
+		// with the logical connection address as the ordinary fallback. Leaving it
+		// nil drops the RVA before encryption; protocol bytes never control it.
+		RemoteAddr:    replyAddr,
 		ConnData:      ppd.ConnData,
 		HeaderType:    core.NHP_RVA,
 		CipherScheme:  ppd.CipherScheme,
@@ -846,10 +849,14 @@ func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACR
 		return
 	}
 
+	replyAddr := cloneACReplyAddr(ppd.ConnData.RemoteAddr)
+	if ppd.ReceivedFrom.IsValid() {
+		replyAddr = net.UDPAddrFromAddrPort(ppd.ReceivedFrom)
+	}
 	md := &core.MsgData{
-		// Bind the return route to the authenticated inbound connection. The AC
-		// send loop requires RemoteAddr even when ConnData is already known.
-		RemoteAddr:    cloneACReplyAddr(ppd.ConnData.RemoteAddr),
+		// Bind the return route to the authenticated packet's actual transport
+		// source, with the logical connection address as the ordinary fallback.
+		RemoteAddr:    replyAddr,
 		ConnData:      ppd.ConnData,
 		HeaderType:    core.NHP_RVA,
 		CipherScheme:  ppd.CipherScheme,

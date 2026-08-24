@@ -294,6 +294,11 @@ type PacketParserData struct {
 	// timestamp gate); callers that key on it must not invoke before
 	// AEAD verification has succeeded.
 	RemoteSendTime int64
+	// ReceivedFrom is trusted, immutable receive-transport metadata. It is not
+	// carried in protocol bytes. UDP endpoints may use it only after successful
+	// peer authentication to return a message to the datagram's actual source
+	// when ConnectionData.RemoteAddr names an intermediary such as an NLB.
+	ReceivedFrom netip.AddrPort
 
 	noise        NoiseFactory // int
 	HeaderType   int
@@ -367,6 +372,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		ppd.device = d
 		ppd.basePacket = pd.BasePacket
 		ppd.ConnData = pd.ConnData
+		ppd.ReceivedFrom = pd.BasePacket.ReceivedFrom
 		ppd.ConnCookieStore = pd.ConnCookieStore
 		ppd.LocalInitTime = pd.InitTime
 		ppd.ConnLastRemoteSendTime = pd.ConnLastRemoteSendTime

@@ -14,6 +14,7 @@ import (
 // without a scan or a second lifecycle authority.
 type sessionControlCloseLifecycleStore interface {
 	EnsureExactSessionClose(context.Context, sessionControlSessionCandidate, int64) (*sessionControlExactClosePreparation, error)
+	MarkFenceConverged(context.Context, sessionControlFenceAuthority) (*sessionControlFenceAuthority, error)
 	SelectOldestOverflowCloseLeader(context.Context, string) (*sessionControlOverflowLeader, error)
 	MaterializeNormalExactClose(context.Context, sessionControlSessionCandidate, string) (*sessionControlCloseTaskSet, error)
 	MaterializeSelectedOverflowExactClose(context.Context, sessionControlSessionCandidate, string) (*sessionControlCloseTaskSet, error)
@@ -148,6 +149,36 @@ func (s *UdpServer) advanceDurableExactCloseLifecycle(ctx context.Context,
 			complete, err = store.PromoteCompletedOverflowExactClose(ctx, session.Candidate,
 				preparation.EventID, preparation.Session.RetainUntilMillis)
 		} else {
+			// Materialization plus every immutable ACK chunk proves that this
+			// normal fence has reached every required target. Publish CONVERGED
+			// before COMPLETE. This is also required for the zero-target case,
+			// where there are no chunk iterations to provide another transition
+			// point. MarkFenceConverged is exact and idempotent, so a crash after
+			// its commit resumes safely through the same call.
+			if preparation.Fence == nil {
+				return errSessionControlFenceCorrupt
+			}
+			converged := preparation.Fence
+			switch preparation.Fence.State {
+			case sessionControlFencePreparing:
+				var convergeErr error
+				converged, convergeErr = store.MarkFenceConverged(ctx, *preparation.Fence)
+				if convergeErr != nil {
+					return convergeErr
+				}
+			case sessionControlFenceConverged:
+				// A previous attempt can commit convergence and lose the response.
+				// EnsureExactSessionClose returns that exact durable authority, so
+				// continue to COMPLETE without trying to transition it again.
+			default:
+				return errSessionControlFenceCorrupt
+			}
+			if converged == nil || converged.State != sessionControlFenceConverged ||
+				converged.CellID != preparation.Fence.CellID || converged.EventID != preparation.Fence.EventID ||
+				converged.SelectorDigest != preparation.Fence.SelectorDigest ||
+				converged.PreparedDirectoryVersion != preparation.Fence.PreparedDirectoryVersion {
+				return errSessionControlFenceCorrupt
+			}
 			complete, err = store.CompleteNormalExactClose(ctx, session.Candidate,
 				preparation.EventID, preparation.Session.RetainUntilMillis)
 		}

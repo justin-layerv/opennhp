@@ -1835,8 +1835,26 @@ func (a *UdpAC) sendMessageRoutine() {
 
 			addrStr := md.RemoteAddr.String()
 
+			// An authenticated reply can need the actual datagram source as its
+			// destination while retaining the socket that received the request.
+			// This is the initial AOL topology: the socket is indexed by the NLB,
+			// but NHP_REV arrives directly from one server. Reusing that socket
+			// preserves the AC source port and therefore the server's exact
+			// ConnectionData waiter binding. Never mutate ConnData.RemoteAddr.
+			var conn *UdpConn
+			found := false
 			a.remoteConnectionMutex.Lock()
-			conn, found := a.remoteConnectionMap[addrStr]
+			if md.ConnData != nil {
+				for _, candidate := range a.remoteConnectionMap {
+					if candidate != nil && candidate.ConnData == md.ConnData {
+						conn, found = candidate, true
+						break
+					}
+				}
+			}
+			if !found {
+				conn, found = a.remoteConnectionMap[addrStr]
+			}
 			a.remoteConnectionMutex.Unlock()
 
 			if found {
@@ -1876,11 +1894,15 @@ func (a *UdpAC) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err error) {
 
 	pktType := core.HeaderTypeToString(pkt.HeaderType)
 	localAddrStr := conn.ConnData.LocalAddr.String()
-	remoteAddrStr := conn.ConnData.RemoteAddr.String()
+	remoteAddr := conn.ConnData.RemoteAddr
+	if pkt.SendTo.IsValid() {
+		remoteAddr = net.UDPAddrFromAddrPort(pkt.SendTo)
+	}
+	remoteAddrStr := remoteAddr.String()
 	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, localAddrStr, remoteAddrStr, len(pkt.Content))
 	log.Evaluate("Send [%s] packet (%s -> %s, %d bytes)", pktType, localAddrStr, remoteAddrStr, len(pkt.Content))
 	// Use WriteToUDP with explicit destination since we use unconnected sockets
-	return conn.netConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
+	return conn.netConn.WriteToUDP(pkt.Content, remoteAddr)
 }
 
 func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
@@ -1935,6 +1957,11 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 		}
 
 		pkt.Content = pkt.Buf[:n]
+		// Preserve the datagram's actual source independently from the logical
+		// connection destination. During registration this socket targets the NLB,
+		// while an authenticated server can send NHP_REV directly from its own
+		// address before NHP_AAK publishes the direct peer.
+		pkt.ReceivedFrom = fromAddr.AddrPort()
 		//log.Trace("receive udp packet (%s -> %s): %+v", conn.ConnData.RemoteAddr.String(), conn.ConnData.LocalAddr.String(), pkt.Content)
 
 		typ, _, err := a.device.RecvPrecheck(pkt)
@@ -2360,7 +2387,7 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 		log.Debug("serverDiscovery: server=%s, peerPbk len=%d, base64=%s",
 			server.Hostname, len(peerPbk), server.PublicKeyBase64())
 
-		// when a server is not connected, try to connect in every ACLocalTransactionResponseTimeoutMs
+		// when a server is not connected, retry after the NHP_AOL transaction completes
 		// when a server is connected when ServerConnectionInterval is reached since last receive, try resend NHP_AOL for maintaining server connection
 		if !connected || (currTime-lastRecvTime) > int64(ReportToServerInterval*time.Second) {
 			// send NHP_AOL message to server

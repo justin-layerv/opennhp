@@ -654,3 +654,17 @@ func TestLocalTransactionTimeout_AOPDecoupledFromSharedServerTimeout(t *testing.
 		t.Errorf("agent timeout = %d, want AgentLocalTransactionResponseTimeoutMs (%d)", got, AgentLocalTransactionResponseTimeoutMs)
 	}
 }
+
+func TestLocalTransactionTimeout_ACRegistrationOutlivesServerCatchUp(t *testing.T) {
+	ac := &Device{deviceType: NHP_AC}
+	if got := ac.LocalTransactionTimeout(NHP_AOL); got != ACRegistrationTransactionResponseTimeoutMs {
+		t.Fatalf("AC NHP_AOL timeout = %d, want %d", got, ACRegistrationTransactionResponseTimeoutMs)
+	}
+	if ACRegistrationTransactionResponseTimeoutMs <= RemoteTransactionProcessTimeoutMs {
+		t.Fatalf("AC NHP_AOL timeout %d must exceed server remote transaction budget %d",
+			ACRegistrationTransactionResponseTimeoutMs, RemoteTransactionProcessTimeoutMs)
+	}
+	if got := ac.LocalTransactionTimeout(NHP_AOP); got != ACLocalTransactionResponseTimeoutMs {
+		t.Fatalf("non-AOL AC timeout = %d, want %d", got, ACLocalTransactionResponseTimeoutMs)
+	}
+}

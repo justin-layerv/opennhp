@@ -43,6 +43,11 @@ import (
 const (
 	// RegistrationTimeout is the timeout for initial registration.
 	RegistrationTimeout = 30 * time.Second
+	// ConnectionTimeout is the outer wait for one assigned-server NHP_AOL.
+	// It must expire after the core AOL transaction, which itself outlives the
+	// server's complete durable catch-up budget. The peer must remain installed
+	// until the transaction delivers an AAK/error or this backstop fires.
+	ConnectionTimeout = time.Duration(core.ACRegistrationTransactionResponseTimeoutMs)*time.Millisecond + 250*time.Millisecond
 
 	// KeepaliveInterval is how often to send keepalives to each server.
 	// MinNLBReregistrationInterval (= 3 × this) derives from this value, and
@@ -53,8 +58,9 @@ const (
 	// raising it.
 	KeepaliveInterval = 10 * time.Second
 
-	// KeepaliveTimeout is the timeout for keepalive response.
-	KeepaliveTimeout = 3 * time.Second
+	// KeepaliveTimeout lets one periodic NHP_AOL consume the same authoritative
+	// delayed result. AssignedServer.refreshing prevents overlapping refreshes.
+	KeepaliveTimeout = ConnectionTimeout
 
 	// KeepaliveMaxRetries is the max retries before considering server down.
 	KeepaliveMaxRetries = 3
@@ -749,12 +755,13 @@ const (
 
 // AssignedServer represents a server assigned to this AC.
 type AssignedServer struct {
-	mu        sync.RWMutex // Protects mutable fields below
-	Target    common.RedirectTarget
-	Peer      *core.UdpPeer
-	Connected bool
-	LastSeen  time.Time
-	FailCount int
+	mu         sync.RWMutex // Protects mutable fields below
+	Target     common.RedirectTarget
+	Peer       *core.UdpPeer
+	Connected  bool
+	LastSeen   time.Time
+	FailCount  int
+	refreshing atomic.Bool
 }
 
 // SetConnected safely sets the Connected field.
@@ -951,7 +958,7 @@ func (r *ACRegistration) recordRegistrationOutcomeByCode(code string) {
 //
 //   - A transaction-layer TIMEOUT, where no response was actually received: the
 //     transaction's defer fabricates a PPD carrying common.ErrTransactionFailedByTimeout
-//     (nhp/core/transaction.go) after the ~4.7s local-transaction timer fires —
+//     (nhp/core/transaction.go) after the dedicated AOL timer fires —
 //     which beats register()'s 30s RegistrationTimeout select, so this, not the
 //     regTimer.C branch, is the path a blue/green-flip / unreachable-server
 //     timeout actually takes. It is a transport drop (breakdown only, NOT
@@ -2203,8 +2210,8 @@ func (r *ACRegistration) register() error {
 		return ErrRegistrationStopped
 	case <-regTimer.C:
 		r.discardRegistrationAttempt(registrationPeer)
-		// Backstop only: this 30s RegistrationTimeout is almost always beaten by
-		// the ~4.7s local-transaction timeout, which arrives on ResponseMsgCh as
+		// Backstop only: this 30s RegistrationTimeout is normally beaten by the
+		// dedicated AOL transaction timeout, which arrives on ResponseMsgCh as
 		// ErrTransactionFailedByTimeout and is dropped by recordResponseError. This
 		// branch covers the rare case the transaction timer didn't fire. Transport
 		// drop (no response) — breakdown only; registration_stale covers a true
@@ -2784,8 +2791,8 @@ func (r *ACRegistration) handleRedispatchLocked(ardMsg *common.ACRedispatchMsg, 
 	}
 	r.mu.Unlock()
 
-	// Connect to all assigned servers concurrently. Each connection has its own
-	// ConnectionTimeout (10s), so sequential attempts could take 30s+ total.
+	// Connect to all assigned servers concurrently. Each connection keeps its
+	// peer through the complete AOL transaction and outer response margin.
 	var connectWg sync.WaitGroup
 	var successCount int32
 	for _, server := range serversToConnect {
@@ -2870,9 +2877,6 @@ func (r *ACRegistration) handleRedispatchLocked(ardMsg *common.ACRedispatchMsg, 
 
 	return nil
 }
-
-// ConnectionTimeout is the timeout for connecting to an assigned server.
-const ConnectionTimeout = 10 * time.Second
 
 // connectToServer establishes connection to an assigned server.
 func (r *ACRegistration) connectToServer(server *AssignedServer) error {
@@ -3144,6 +3148,10 @@ func (r *ACRegistration) refreshAssignedServerRegistrations() {
 
 // refreshSingleServer sends NHP_AOL to a single assigned server to refresh registration.
 func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *net.UDPAddr) {
+	if server == nil || !server.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	defer server.refreshing.Store(false)
 	aolBytes, err := r.currentAOLBytes()
 	if err != nil {
 		log.Warning("Cannot refresh AC registration before session-control readiness: %v", err)
@@ -3168,7 +3176,9 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 	}
 	r.ac.sendMsgCh <- md
 
-	// Wait for response with short timeout (don't block keepalive loop).
+	// Wait for the authoritative transaction result. The caller uses a goroutine,
+	// and AssignedServer.refreshing prevents the next keepalive tick from starting
+	// an overlapping AOL while this one is still live.
 	// Use time.NewTimer instead of time.After to avoid leaking the timer
 	// goroutine when stopCh fires or a response arrives before timeout.
 	timer := time.NewTimer(KeepaliveTimeout)
@@ -3178,7 +3188,7 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 	case <-r.stopCh:
 		return
 	case <-timer.C:
-		// Timeout is OK - server may be slow or unreachable
+		// Timeout is OK - server may be unreachable.
 		// Health check will eventually detect and trigger re-registration
 		log.Debug("Refresh NHP_AOL to %s timed out", sendAddr.String())
 		return

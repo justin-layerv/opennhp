@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -850,6 +851,103 @@ func TestACRegistration_FailedAssignmentRestoresSameAddressStaticPeer(t *testing
 	}
 	if owned := reg.assignmentPeersSnapshot(); len(owned) != 0 {
 		t.Fatalf("failed assignment retained dynamic ownership: %v", owned)
+	}
+}
+
+func TestACRegistration_DelayedDirectAOLRetainsPeerUntilTransactionResult(t *testing.T) {
+	reg, device := newACRegistrationWithDevice(t)
+	serverKey := bytes.Repeat([]byte{0x54}, core.PublicKeySize)
+	serverPubKey := base64.StdEncoding.EncodeToString(serverKey)
+	server := &AssignedServer{Target: common.RedirectTarget{
+		IP: "127.0.0.1", Port: testServerListenPort, PubKeyBase64: serverPubKey,
+	}}
+	reg.ac.sendMsgCh = make(chan *core.MsgData, 1)
+	reg.ac.running.Store(true)
+	done := make(chan error, 1)
+	go func() { done <- reg.connectToServer(server) }()
+
+	var md *core.MsgData
+	select {
+	case md = <-reg.ac.sendMsgCh:
+	case <-time.After(time.Second):
+		t.Fatal("direct NHP_AOL was not enqueued")
+	}
+	if server.Peer == nil || device.LookupPeer(serverKey) != server.Peer {
+		t.Fatal("direct NHP_AOL did not retain its assigned peer")
+	}
+	// This controlled delay represents work that extends beyond a caller's old
+	// outer wait. The constant assertion in TestACRegistration_Constants binds
+	// the production wait strictly beyond the real core transaction deadline.
+	time.Sleep(20 * time.Millisecond)
+	if device.LookupPeer(serverKey) != server.Peer {
+		t.Fatal("delayed direct NHP_AOL removed its peer before a transaction result")
+	}
+	aak := common.ServerACAckMsg{
+		ErrCode: common.ErrSuccess.ErrorCode(), Registered: true,
+		BootID: reg.ac.bootID, SessionFlushGeneration: reg.ac.sessionFlushGeneration.Load(),
+		AOLTransactionID: md.TransactionId,
+	}
+	body, err := json.Marshal(aak)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md.ResponseMsgCh <- &core.PacketParserData{
+		HeaderType: core.NHP_AAK, BodyMessage: body, SenderTrxId: md.TransactionId,
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("delayed direct NHP_AOL result: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct NHP_AOL did not consume delayed transaction result")
+	}
+	if !server.IsConnected() || device.LookupPeer(serverKey) != server.Peer {
+		t.Fatal("successful delayed direct NHP_AOL did not publish the assigned peer")
+	}
+}
+
+func TestACRegistration_PeriodicAOLRefreshIsSingleFlight(t *testing.T) {
+	reg, _ := newACRegistrationWithDevice(t)
+	serverKey := bytes.Repeat([]byte{0x55}, core.PublicKeySize)
+	peer := &core.UdpPeer{Ip: "127.0.0.1", Port: testServerListenPort,
+		PubKeyBase64: base64.StdEncoding.EncodeToString(serverKey), Type: core.NHP_SERVER}
+	server := &AssignedServer{Target: common.RedirectTarget{
+		IP: peer.Ip, Port: peer.Port, PubKeyBase64: peer.PubKeyBase64,
+	}, Peer: peer, Connected: true}
+	reg.ac.sendMsgCh = make(chan *core.MsgData, 2)
+	reg.ac.running.Store(true)
+	addr := &net.UDPAddr{IP: net.ParseIP(peer.Ip), Port: peer.Port}
+	firstDone := make(chan struct{})
+	go func() { reg.refreshSingleServer(server, addr); close(firstDone) }()
+	first := <-reg.ac.sendMsgCh
+	secondDone := make(chan struct{})
+	go func() { reg.refreshSingleServer(server, addr); close(secondDone) }()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("overlapping refresh did not return")
+	}
+	select {
+	case duplicate := <-reg.ac.sendMsgCh:
+		t.Fatalf("overlapping refresh enqueued duplicate transaction %#v", duplicate)
+	case <-time.After(20 * time.Millisecond):
+	}
+	first.ResponseMsgCh <- &core.PacketParserData{Error: errors.New("injected refresh completion")}
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first refresh did not release single-flight state")
+	}
+
+	thirdDone := make(chan struct{})
+	go func() { reg.refreshSingleServer(server, addr); close(thirdDone) }()
+	third := <-reg.ac.sendMsgCh
+	third.ResponseMsgCh <- &core.PacketParserData{Error: errors.New("injected refresh completion")}
+	select {
+	case <-thirdDone:
+	case <-time.After(time.Second):
+		t.Fatal("later refresh could not acquire released single-flight state")
 	}
 }
 

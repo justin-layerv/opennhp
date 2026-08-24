@@ -157,6 +157,9 @@ func (d *Device) createMsgAssemblerDataWithDiagnostics(md *MsgData, suppressDiag
 			mad.BasePacket = d.AllocatePoolPacket()
 		}
 		mad.BasePacket.HeaderType = mad.HeaderType
+		if md.RemoteAddr != nil {
+			mad.BasePacket.SendTo = md.RemoteAddr.AddrPort()
+		}
 
 		// init cookie if specified
 		if md.ExternalCookie != nil {
@@ -239,6 +242,7 @@ func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64)
 	ppd.basePacket = pkt
 	ppd.CipherScheme = mad.CipherScheme
 	ppd.ConnData = mad.connData
+	ppd.ReceivedFrom = pkt.ReceivedFrom
 	ppd.LocalInitTime = initTime
 	ppd.feedbackMsgCh = mad.ResponseMsgCh
 

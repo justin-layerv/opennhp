@@ -201,9 +201,15 @@ const (
 	// exactly that) if p99 datapath-write-under-burst approaches it. Fenced by
 	// TestReknockRetryFitsKnockProcessingBudget.
 	ServerACOpenTransactionResponseTimeoutMs = 1500 // millisecond (1.5s)
-	// ACLocalTransactionResponseTimeoutMs bounds AC-INITIATED transactions (NHP-AOL
-	// registration + the server-reconnect cadence in udpac.go). Kept at 4.7s: AC
-	// registration validates a bcrypt license server-side and must not fail-fast.
+	// ACRegistrationTransactionResponseTimeoutMs bounds NHP_AOL registration.
+	// The normal path returns as soon as AAK arrives; this is only a failure
+	// ceiling. It exceeds the server's complete remote-transaction budget by one
+	// second so the AC retains the temporary NLB peer/socket through direct
+	// NHP_REV retries and the server's terminal response without adding a second
+	// independent wait to the fast path.
+	ACRegistrationTransactionResponseTimeoutMs = RemoteTransactionProcessTimeoutMs + 1000
+	// ACLocalTransactionResponseTimeoutMs retains the existing fail-fast bound
+	// for any other AC-initiated transaction.
 	ACLocalTransactionResponseTimeoutMs = AgentLocalTransactionResponseTimeoutMs - 300 // millisecond
 
 	RemoteTransactionProcessTimeoutMs   = 10 * 1000 // millisecond

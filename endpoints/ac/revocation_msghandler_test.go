@@ -2,6 +2,7 @@ package ac
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -676,6 +677,176 @@ func TestACAcknowledgementsTraverseRealSendLoopOnAuthenticatedInboundRoute(t *te
 			return nil
 		})
 	})
+}
+
+func TestACSessionControlAckUsesObservedServerSourceOnOriginalNLBSocket(t *testing.T) {
+	serverKey := make([]byte, core.PrivateKeySize)
+	for index := range serverKey {
+		serverKey[index] = byte(240 - index)
+	}
+	serverDevice := core.NewDevice(core.NHP_SERVER, serverKey, nil)
+	acDevice := core.NewDevice(core.NHP_AC, testPrivateKey(), nil)
+	if serverDevice == nil || acDevice == nil {
+		t.Fatal("failed to construct wire devices")
+	}
+	actualServer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46331}
+	nlbAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 46332}
+	serverPeer := &core.UdpPeer{Ip: nlbAddr.IP.String(), Port: nlbAddr.Port,
+		PubKeyBase64: serverDevice.PublicKeyBase64(), Type: core.NHP_SERVER}
+	acDevice.AddPeer(serverPeer)
+	acDevice.Start()
+	t.Cleanup(acDevice.Stop)
+
+	nlbConn := &core.ConnectionData{Device: acDevice, RemoteAddr: nlbAddr,
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		SendQueue:            make(chan *core.Packet, 1), RecvQueue: make(chan *core.Packet, 1),
+		BlockSignal: make(chan struct{}), SetTimeoutSignal: make(chan struct{}, 1), StopSignal: make(chan struct{})}
+	a := &UdpAC{config: &Config{ACId: "test-ac"}, device: acDevice, sendMsgCh: make(chan *core.MsgData, 1),
+		remoteConnectionMap: map[string]*UdpConn{nlbAddr.String(): {ConnData: nlbConn}}}
+	a.signals.stop = make(chan struct{})
+	a.bootID = "00112233445566778899aabbccddeeff"
+	a.sessionFlushGeneration.Store(7)
+	a.sessionFlushComplete.Store(true)
+	a.running.Store(true)
+	a.wg.Add(1)
+	go a.sendMessageRoutine()
+	t.Cleanup(func() { close(a.signals.stop); a.wg.Wait() })
+
+	ppd := &core.PacketParserData{ConnData: nlbConn, ReceivedFrom: actualServer.AddrPort(),
+		RemotePubKey: serverPeer.PublicKey(), CipherScheme: common.CIPHER_SCHEME_CURVE}
+	if err := a.sendSessionControlAck(ppd, &common.ACSessionCloseMsg{
+		Kind: common.ACSessionCloseKind, Scope: common.ACSessionCloseScopeExact,
+		EventID: "ffeeddccbbaa99887766554433221100", AgentPublicKey: testNHPAgentKey('A'),
+		SessionID: 1, SessionIssuedAtMillis: 2,
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-nlbConn.SendQueue:
+		if pkt == nil {
+			t.Fatal("RVA packet is nil")
+		}
+		if pkt.HeaderType != core.NHP_RVA || pkt.SendTo != actualServer.AddrPort() {
+			t.Fatalf("RVA packet route = %#v/%v, want original queue -> %s", pkt, pkt.SendTo, actualServer)
+		}
+		acDevice.ReleasePoolPacket(pkt)
+	case <-time.After(2 * time.Second):
+		t.Fatal("RVA did not use original NLB connection queue")
+	}
+	a.remoteConnectionMutex.Lock()
+	defer a.remoteConnectionMutex.Unlock()
+	if len(a.remoteConnectionMap) != 1 || a.remoteConnectionMap[nlbAddr.String()] == nil ||
+		a.remoteConnectionMap[actualServer.String()] != nil {
+		t.Fatalf("ack route created a second socket: %#v", a.remoteConnectionMap)
+	}
+}
+
+func TestACSessionControlNLBIngressReturnsAuthenticatedRVAOnOriginalSocket(t *testing.T) {
+	a, _ := acWithSendCapture(t)
+	serverKey := make([]byte, core.PrivateKeySize)
+	for index := range serverKey {
+		serverKey[index] = byte(220 - index)
+	}
+	serverDevice := core.NewDevice(core.NHP_SERVER, serverKey, nil)
+	if serverDevice == nil || a.device == nil {
+		t.Fatal("failed to construct wire devices")
+	}
+	actualServer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 46341}
+	nlbAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 46342}
+	acAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: 46343}
+	a.device.AddPeer(&core.UdpPeer{Ip: nlbAddr.IP.String(), Port: nlbAddr.Port,
+		PubKeyBase64: serverDevice.PublicKeyBase64(), Type: core.NHP_SERVER})
+	serverDevice.AddPeer(&core.UdpPeer{Ip: acAddr.IP.String(), Port: acAddr.Port,
+		PubKeyBase64: a.device.PublicKeyBase64(), Type: core.NHP_AC})
+	a.device.Start()
+	serverDevice.Start()
+	t.Cleanup(a.device.Stop)
+	t.Cleanup(serverDevice.Stop)
+
+	nlbConn := &core.ConnectionData{Device: a.device, RemoteAddr: nlbAddr,
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		SendQueue:            make(chan *core.Packet, 1), RecvQueue: make(chan *core.Packet, 1),
+		BlockSignal: make(chan struct{}), SetTimeoutSignal: make(chan struct{}, 1), StopSignal: make(chan struct{})}
+	serverConn := &core.ConnectionData{Device: serverDevice, RemoteAddr: acAddr,
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		SendQueue:            make(chan *core.Packet, 1), RecvQueue: make(chan *core.Packet, 1),
+		BlockSignal: make(chan struct{}), SetTimeoutSignal: make(chan struct{}, 1), StopSignal: make(chan struct{})}
+	a.sendMsgCh = make(chan *core.MsgData, 1)
+	a.remoteConnectionMap = map[string]*UdpConn{nlbAddr.String(): {ConnData: nlbConn}}
+	a.signals.stop = make(chan struct{})
+	a.wg.Add(1)
+	go a.sendMessageRoutine()
+	t.Cleanup(func() { close(a.signals.stop); a.wg.Wait() })
+
+	closeMsg := common.ACSessionCloseMsg{
+		Kind: common.ACSessionCloseKind, Scope: common.ACSessionCloseScopeExact,
+		EventID: "1234567890abcdef1234567890abcdef", AgentPublicKey: testNHPAgentKey('N'),
+		SessionID: 41, SessionIssuedAtMillis: 42,
+	}
+	closeBody, err := json.Marshal(closeMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acPublicKey, err := base64.StdEncoding.DecodeString(a.device.PublicKeyBase64())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDevice.SendMsgToPacket(&core.MsgData{
+		ConnData: serverConn, HeaderType: core.NHP_REV, CipherScheme: common.CIPHER_SCHEME_CURVE,
+		TransactionId: serverDevice.NextCounterIndex(), Compress: true,
+		PeerPk: acPublicKey, Message: closeBody,
+	})
+	var revPacket *core.Packet
+	select {
+	case revPacket = <-serverConn.SendQueue:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not encrypt NHP_REV")
+	}
+	revWire := append([]byte(nil), revPacket.Content...)
+	serverDevice.ReleasePoolPacket(revPacket)
+	revPPD, err := a.device.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: revWire, ReceivedFrom: actualServer.AddrPort()},
+		ConnData:   nlbConn, InitTime: time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("AC decrypt NHP_REV: %v", err)
+	}
+	if revPPD.ConnData != nlbConn || revPPD.ReceivedFrom != actualServer.AddrPort() {
+		t.Fatalf("authenticated REV route = %p/%v, want NLB conn %p and source %v",
+			revPPD.ConnData, revPPD.ReceivedFrom, nlbConn, actualServer.AddrPort())
+	}
+	if err := a.HandleUdpACRevocation(revPPD); err != nil {
+		t.Fatalf("handle encrypted NHP_REV: %v", err)
+	}
+	var rvaPacket *core.Packet
+	select {
+	case rvaPacket = <-nlbConn.SendQueue:
+	case <-time.After(2 * time.Second):
+		t.Fatal("AC did not encrypt NHP_RVA on original connection")
+	}
+	if rvaPacket.SendTo != actualServer.AddrPort() {
+		t.Fatalf("encrypted RVA destination = %v, want actual server %v", rvaPacket.SendTo, actualServer.AddrPort())
+	}
+	rvaWire := append([]byte(nil), rvaPacket.Content...)
+	a.device.ReleasePoolPacket(rvaPacket)
+	rvaPPD, err := serverDevice.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: rvaWire}, ConnData: serverConn, InitTime: time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("server decrypt NHP_RVA: %v", err)
+	}
+	var ack common.ACSessionCloseAckMsg
+	if err := common.DecodeACSessionCloseAckMsg(rvaPPD.BodyMessage, &ack); err != nil {
+		t.Fatalf("strict RVA decode: %v", err)
+	}
+	if ack.EventID != closeMsg.EventID || ack.AgentPublicKey != closeMsg.AgentPublicKey ||
+		ack.SessionID != closeMsg.SessionID || ack.SessionIssuedAtMillis != closeMsg.SessionIssuedAtMillis ||
+		ack.BootID != a.bootID || ack.FlushGeneration != a.sessionFlushGeneration.Load() || ack.Closed != 0 {
+		t.Fatalf("RVA authority = %#v, want exact zero-close acknowledgement", ack)
+	}
+	if nlbConn.RemoteAddr.String() != nlbAddr.String() || len(a.remoteConnectionMap) != 1 {
+		t.Fatalf("NLB connection was mutated or duplicated: remote=%v map=%#v", nlbConn.RemoteAddr, a.remoteConnectionMap)
+	}
 }
 
 func TestHandleUdpACRevocationSessionControlScopesAndAck(t *testing.T) {

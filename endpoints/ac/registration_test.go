@@ -1915,8 +1915,8 @@ func TestACRegistration_Constants(t *testing.T) {
 		t.Errorf("KeepaliveInterval = %v, want 10s", KeepaliveInterval)
 	}
 
-	if KeepaliveTimeout != 3*time.Second {
-		t.Errorf("KeepaliveTimeout = %v, want 3s", KeepaliveTimeout)
+	if KeepaliveTimeout != ConnectionTimeout {
+		t.Errorf("KeepaliveTimeout = %v, want ConnectionTimeout %v", KeepaliveTimeout, ConnectionTimeout)
 	}
 
 	if KeepaliveMaxRetries != 3 {
@@ -1933,8 +1933,12 @@ func TestACRegistration_Constants(t *testing.T) {
 		t.Errorf("DefaultServerPort = %d, want 443", DefaultServerPort)
 	}
 
-	if ConnectionTimeout != 10*time.Second {
-		t.Errorf("ConnectionTimeout = %v, want 10s", ConnectionTimeout)
+	coreAOLTimeout := time.Duration(core.ACRegistrationTransactionResponseTimeoutMs) * time.Millisecond
+	if ConnectionTimeout <= coreAOLTimeout {
+		t.Errorf("ConnectionTimeout = %v, must exceed core AOL timeout %v", ConnectionTimeout, coreAOLTimeout)
+	}
+	if margin := ConnectionTimeout - coreAOLTimeout; margin != 250*time.Millisecond {
+		t.Errorf("ConnectionTimeout margin = %v, want tight 250ms backstop", margin)
 	}
 
 	// Verify health check threshold calculation
