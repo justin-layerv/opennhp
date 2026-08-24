@@ -85,6 +85,16 @@ APPROVED_ACTIVE_READY_HANDOFF_STATE_DIGEST=4268c108fe2685c5a475d05f2ec98d5d58c54
 APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_VERSION=8
 APPROVED_ACTIVE_READY_HANDOFF_JOURNAL_DIGEST=49a0da6ea26c551ed99f51ad1e1a4608aa89ab7d1f97a40f22c2c12ce99b1a5c
 APPROVED_ACTIVE_READY_HANDOFF_PHASE=repaired
+# The exact d4b6 retry retired the three v4 incident targets, then stopped
+# before the ACTIVE/READY subjournal because the recovery role lacked Query.
+# One reviewed successor may add only the exact journaled v21 -> v22 Query
+# grant at this state-v36/main-journal-v14 boundary.
+APPROVED_QUERY_IAM_HANDOFF_PREDECESSOR_SHA=d4b6ee44c5407b839160569f86a17ad1ce67c6a2
+APPROVED_QUERY_IAM_HANDOFF_STATE_VERSION=36
+APPROVED_QUERY_IAM_HANDOFF_STATE_DIGEST=f8cf6f7e25d3c38f0c8eeb537bc9f4084b67124ff79105e5524f205ba7888edd
+APPROVED_QUERY_IAM_HANDOFF_JOURNAL_VERSION=14
+APPROVED_QUERY_IAM_HANDOFF_JOURNAL_DIGEST=032d3a879ce9857c36cca5027741fa253ea5c81875b2aa59bdca56f91ffb821f
+APPROVED_QUERY_IAM_HANDOFF_PHASE=repaired
 # Exact reviewed runtime repair containing both server close-drain and AC
 # transport fixes, plus its successful claim-free build-only authority.
 APPROVED_STALE_RUNTIME_SOURCE_SHA=f32335420d67fd235a6fb6598a1fc3d8eaf8dda7
@@ -144,6 +154,10 @@ STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
 ACTIVE_READY_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors
 ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm
+QUERY_IAM_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam
+QUERY_IAM_JOURNAL_KMS_KEY=alias/aws/ssm
+QUERY_IAM_INTENT_SHA256=e4bc9dda1111e9d696cc24f74341055020f23c1db61a86afe7299c94356d86de
+QUERY_IAM_RECEIPT_SHA256=0ab0ae49ad236e4d03f4d08ced65dcab16a0031ce1cbab94857e4430fa227c4e
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 FLOOR_PARAM=/sandbox/nhp/minimum-protocol-profile
 TARGET_PROFILE=durable-aop-v1
@@ -165,6 +179,7 @@ VERIFY_CONNECTOR_LIFECYCLE=$ROOT/.github/scripts/verify-durable-aop-connector-li
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 STALE_TARGET_RETIRER=${CUTOVER_STALE_TARGET_RETIRE_SCRIPT:-$ROOT/.bin/session-control-stale-target-retirement}
 SESSION_CONTROL_DELETE_IAM=${CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-delete-iam.py}
+SESSION_CONTROL_QUERY_IAM=${CUTOVER_SESSION_CONTROL_QUERY_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-query-iam.py}
 WAIT_REFRESH=${CUTOVER_WAIT_REFRESH_SCRIPT:-$ROOT/.github/scripts/wait-for-instance-refresh.sh}
 ORIGINAL_ROOT=${CUTOVER_ORIGINAL_SOURCE_ROOT:-$ROOT}
 REFRESH_TIMEOUT_MINUTES=${CUTOVER_REPAIR_REFRESH_TIMEOUT_MINUTES:-30}
@@ -280,6 +295,36 @@ sys.stdout.buffer.write(decoded)
 '
 }
 
+encode_query_iam_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read()
+if len(raw) > 65536: raise SystemExit("Query IAM journal exceeds decoded bound")
+value = json.loads(raw)
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw:
+    raise SystemExit("Query IAM journal is not canonical JSON")
+envelope = {"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw, compresslevel=9, mtime=0)).decode(),"schema":"layerv.durable-aop-session-control-query-iam-journal-envelope.v1"}
+sys.stdout.write(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+'
+}
+
+decode_query_iam_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read(); value = json.loads(raw)
+if set(value) != {"encoding","payload","schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-session-control-query-iam-journal-envelope.v1":
+    raise SystemExit("Query IAM journal envelope is malformed")
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw:
+    raise SystemExit("Query IAM journal envelope is not canonical")
+decoded = gzip.decompress(base64.b64decode(value["payload"], validate=True))
+if len(decoded) > 65536: raise SystemExit("Query IAM journal exceeds decoded bound")
+parsed = json.loads(decoded)
+if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded:
+    raise SystemExit("decoded Query IAM journal is not canonical")
+sys.stdout.buffer.write(decoded)
+'
+}
+
 get_active_ready_param() {
   aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION"
 }
@@ -304,6 +349,25 @@ get_active_ready_optional() {
   fi
 }
 
+get_query_iam_param() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION"
+}
+
+get_query_iam_param_version() {
+  aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Version --output text --region "$AWS_REGION"
+}
+
+get_query_iam_optional() {
+  local name=$1 value rc
+  set +e
+  value=$(get_query_iam_param "$name" 2>&1); rc=$?
+  set -e
+  if (( rc == 0 )); then printf '%s\n' "$value"
+  elif grep -q ParameterNotFound <<<"$value"; then printf '\n'
+  else printf 'reading encrypted Query IAM parameter %s failed: %s\n' "$name" "$value" >&2; return "$rc"
+  fi
+}
+
 require_active_ready_parameter_metadata() {
   local expected_version=$1 metadata
   [[ "$expected_version" =~ ^[1-9][0-9]*$ ]] || {
@@ -322,6 +386,132 @@ require_active_ready_parameter_metadata() {
       "$expected_version" "$(jq -cS . <<<"$metadata" 2>/dev/null || printf '<malformed>')" >&2
     return 1
   }
+}
+
+require_query_iam_parameter_metadata() {
+  local expected_version=$1 metadata
+  [[ "$expected_version" =~ ^[1-9][0-9]*$ ]] || return 1
+  metadata=$(aws ssm describe-parameters --parameter-filters "Key=Name,Option=Equals,Values=${QUERY_IAM_JOURNAL_PARAM}" \
+    --query 'Parameters[].{Name:Name,Type:Type,KeyId:KeyId,Tier:Tier,DataType:DataType,Version:Version}' \
+    --output json --region "$AWS_REGION")
+  jq -e --arg name "$QUERY_IAM_JOURNAL_PARAM" --arg key "$QUERY_IAM_JOURNAL_KMS_KEY" --argjson version "$expected_version" '
+    type == "array" and length == 1 and .[0] ==
+      {Name:$name,Type:"SecureString",KeyId:$key,Tier:"Standard",DataType:"text",Version:$version}
+  ' >/dev/null <<<"$metadata" || {
+    echo "Query IAM journal metadata is not the exact encrypted standard authority" >&2
+    return 1
+  }
+}
+
+validate_query_iam_journal_ref() {
+  jq -e --arg parameter "$QUERY_IAM_JOURNAL_PARAM" '
+    type == "object" and (keys | sort) == ["parameter","sha256","version"] and
+    .parameter == $parameter and (.version | type == "number" and . > 0 and floor == .) and
+    (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+  ' >/dev/null <<<"$1"
+}
+
+is_exact_query_iam_successor() {
+  local before=$1 after=$2
+  validate_exact_query_iam_journal_bytes "$before" preparing &&
+    validate_exact_query_iam_journal_bytes "$after" ready &&
+    [[ "$(jq -r .status <<<"$before")" == preparing && "$(jq -r .receipt <<<"$before")" == null &&
+     "$(jq -r .status <<<"$after")" == ready && "$(jq -r .receipt <<<"$after")" != null &&
+     "$(jq -cS --argjson receipt "$(jq -cS .receipt <<<"$after")" '.status="ready" | .receipt=$receipt' <<<"$before")" == "$after" ]]
+}
+
+validate_exact_query_iam_journal_bytes() {
+  local journal=$1 expected_status=$2 intent receipt
+  jq -e --arg status "$expected_status" '
+    type == "object" and (keys | sort) == ["intent","receipt","status"] and .status == $status and
+    (.intent | type == "object") and
+    (($status == "preparing" and .receipt == null) or ($status == "ready" and (.receipt | type == "object")))
+  ' >/dev/null <<<"$journal" || return 1
+  intent=$(jq -cS .intent <<<"$journal")
+  [[ "$(canonical_digest "$intent")" == "$QUERY_IAM_INTENT_SHA256" ]] || return 1
+  if [[ "$expected_status" == ready ]]; then
+    receipt=$(jq -cS .receipt <<<"$journal")
+    [[ "$(canonical_digest "$receipt")" == "$QUERY_IAM_RECEIPT_SHA256" ]]
+  fi
+}
+
+load_query_iam_journal_ref() {
+  local ref=$1 version digest historical current_version current pending
+  validate_query_iam_journal_ref "$ref" || return 1
+  version=$(jq -r .version <<<"$ref"); digest=$(jq -r .sha256 <<<"$ref")
+  historical=$(get_query_iam_param "${QUERY_IAM_JOURNAL_PARAM}:${version}"); historical=$(jq -cS . <<<"$historical")
+  [[ ${#historical} -le 4096 && "$(canonical_digest "$historical")" == "$digest" ]] || return 1
+  QUERY_IAM_JOURNAL=$(decode_query_iam_journal "$historical")
+  QUERY_IAM_JOURNAL=$(jq -cS . <<<"$QUERY_IAM_JOURNAL")
+  if [[ "$version" == 1 ]]; then
+    validate_exact_query_iam_journal_bytes "$QUERY_IAM_JOURNAL" preparing || return 1
+  elif [[ "$version" == 2 ]]; then
+    validate_exact_query_iam_journal_bytes "$QUERY_IAM_JOURNAL" ready || return 1
+  else
+    return 1
+  fi
+  QUERY_IAM_JOURNAL_REF=$(jq -cS . <<<"$ref")
+  QUERY_IAM_JOURNAL_REFERENCED_ENVELOPE=$historical
+  current_version=$(get_query_iam_param_version "$QUERY_IAM_JOURNAL_PARAM")
+  [[ "$current_version" == "$version" || "$current_version" == "$((version + 1))" ]] || return 1
+  require_query_iam_parameter_metadata "$current_version"
+  current=$(get_query_iam_param "$QUERY_IAM_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+  if [[ "$current_version" == "$version" ]]; then
+    [[ "$current" == "$historical" ]] || return 1
+  else
+    pending=$(decode_query_iam_journal "$current"); pending=$(jq -cS . <<<"$pending")
+    is_exact_query_iam_successor "$QUERY_IAM_JOURNAL" "$pending" || return 1
+  fi
+}
+
+write_query_iam_journal_if_changed() {
+  local desired digest ref_version ref_digest current_version current expected err=
+  QUERY_IAM_JOURNAL=$(jq -cS . <<<"$QUERY_IAM_JOURNAL")
+  desired=$(encode_query_iam_journal "$QUERY_IAM_JOURNAL")
+  [[ ${#desired} -le 4096 ]] || { echo "Query IAM journal exceeds the SSM standard-parameter limit" >&2; return 1; }
+  digest=$(canonical_digest "$desired")
+  if [[ -n "${QUERY_IAM_JOURNAL_REF:-}" ]]; then
+    validate_query_iam_journal_ref "$QUERY_IAM_JOURNAL_REF" || return 1
+    ref_version=$(jq -r .version <<<"$QUERY_IAM_JOURNAL_REF"); ref_digest=$(jq -r .sha256 <<<"$QUERY_IAM_JOURNAL_REF")
+    expected=$((ref_version + 1))
+    if [[ "$digest" == "$ref_digest" ]]; then expected=$ref_version; fi
+    current_version=$(get_query_iam_param_version "$QUERY_IAM_JOURNAL_PARAM")
+    current=$(get_query_iam_param "$QUERY_IAM_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    if [[ "$expected" == "$((ref_version + 1))" && "$current_version" == "$ref_version" &&
+       "$current" == "$QUERY_IAM_JOURNAL_REFERENCED_ENVELOPE" ]]; then
+      if ! err=$(aws ssm put-parameter --name "$QUERY_IAM_JOURNAL_PARAM" --value "$desired" --type SecureString \
+        --key-id "$QUERY_IAM_JOURNAL_KMS_KEY" --overwrite --region "$AWS_REGION" 2>&1 >/dev/null); then :; fi
+      current_version=$(get_query_iam_param_version "$QUERY_IAM_JOURNAL_PARAM")
+      current=$(get_query_iam_param "$QUERY_IAM_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    fi
+    [[ "$current_version" == "$expected" && "$current" == "$desired" ]] || {
+      [[ -z "$err" ]] || printf '%s\n' "$err" >&2; return 1;
+    }
+  else
+    expected=1
+    if [[ -z "$(get_query_iam_optional "$QUERY_IAM_JOURNAL_PARAM")" ]]; then
+      if ! err=$(aws ssm put-parameter --name "$QUERY_IAM_JOURNAL_PARAM" --value "$desired" --type SecureString \
+        --key-id "$QUERY_IAM_JOURNAL_KMS_KEY" --no-overwrite --region "$AWS_REGION" 2>&1 >/dev/null); then :; fi
+    fi
+    current_version=$(get_query_iam_param_version "$QUERY_IAM_JOURNAL_PARAM")
+    current=$(get_query_iam_param "$QUERY_IAM_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+    [[ "$current_version" == 1 && "$current" == "$desired" ]] || {
+      [[ -z "$err" ]] || printf '%s\n' "$err" >&2; return 1;
+    }
+  fi
+  require_query_iam_parameter_metadata "$expected"
+  QUERY_IAM_JOURNAL_REFERENCED_ENVELOPE=$desired
+  QUERY_IAM_JOURNAL_REF=$(jq -cnS --arg parameter "$QUERY_IAM_JOURNAL_PARAM" --arg digest "$digest" \
+    --argjson version "$expected" '{parameter:$parameter,version:$version,sha256:$digest}')
+}
+
+require_query_iam_journal_current_exact() {
+  local version current
+  version=$(jq -r .version <<<"$QUERY_IAM_JOURNAL_REF")
+  [[ "$(get_query_iam_param_version "$QUERY_IAM_JOURNAL_PARAM")" == "$version" ]] || return 1
+  require_query_iam_parameter_metadata "$version"
+  current=$(get_query_iam_param "$QUERY_IAM_JOURNAL_PARAM"); current=$(jq -cS . <<<"$current")
+  [[ "$current" == "$QUERY_IAM_JOURNAL_REFERENCED_ENVELOPE" ]]
 }
 
 validate_stale_journal_ref() {
@@ -348,7 +538,7 @@ is_exact_active_ready_main_successor() {
 		return
 	fi
 	if [[ -z "$before_ref" ]]; then
-		[[ "$before_status" == incident_complete && "$after_status" == ready_predecessor_latching &&
+		[[ "$before_status" == query_iam_ready && "$after_status" == ready_predecessor_latching &&
 		   "$(jq -r .version <<<"$after_ref")" == 1 ]] || return 1
 		expected=$(jq -cS --argjson ref "$after_ref" '
 			.status="ready_predecessor_latching" | .runtime.predecessor_plan=null |
@@ -364,8 +554,27 @@ is_exact_active_ready_main_successor() {
 	[[ "$after" == "$expected" ]]
 }
 
+is_exact_query_iam_main_successor() {
+  local before=$1 after=$2 before_ref after_ref expected before_status after_status
+  before_ref=$(jq -cS '.runtime.session_control_query_iam_ref // empty' <<<"$before")
+  after_ref=$(jq -cS '.runtime.session_control_query_iam_ref // empty' <<<"$after")
+  [[ -n "$after_ref" && "$after_ref" == "${QUERY_IAM_JOURNAL_REF:-}" ]] || return 1
+  before_status=$(jq -r .status <<<"$before"); after_status=$(jq -r .status <<<"$after")
+  if [[ -z "$before_ref" ]]; then
+    [[ "$before_status" == incident_complete && "$after_status" == query_iam_preparing &&
+       "$(jq -r .version <<<"$after_ref")" == 1 && "$(jq -r .status <<<"$QUERY_IAM_JOURNAL")" == preparing ]] || return 1
+    expected=$(jq -cS --argjson ref "$after_ref" '.status="query_iam_preparing" | .runtime.session_control_query_iam_ref=$ref' <<<"$before")
+  else
+    [[ "$before_status" == query_iam_preparing && "$after_status" == query_iam_ready &&
+       "$(jq -r .version <<<"$after_ref")" == "$(( $(jq -r .version <<<"$before_ref") + 1 ))" &&
+       "$(jq -r .status <<<"$QUERY_IAM_JOURNAL")" == ready ]] || return 1
+    expected=$(jq -cS --argjson ref "$after_ref" '.status="query_iam_ready" | .runtime.session_control_query_iam_ref=$ref' <<<"$before")
+  fi
+  [[ "$after" == "$expected" ]]
+}
+
 load_stale_journal_ref() {
-  local ref=$1 version expected_digest historical current_version current pending saved pending_active_ref historical_active_ref
+  local ref=$1 version expected_digest historical current_version current pending saved pending_active_ref historical_active_ref pending_query_ref
 	local saved_active saved_active_ref saved_active_envelope exact_active_successor=false
   validate_stale_journal_ref "$ref" || { echo "schema-3 stale-target journal reference is malformed" >&2; return 1; }
   version=$(jq -r .version <<<"$ref")
@@ -381,6 +590,10 @@ load_stale_journal_ref() {
 	STALE_JOURNAL_UNREFERENCED_ENVELOPE=
 	STALE_JOURNAL_STATE_REF_PENDING=false
   ACTIVE_READY_JOURNAL=
+  QUERY_IAM_JOURNAL=
+  QUERY_IAM_JOURNAL_REF=$(jq -cS '.runtime.session_control_query_iam_ref // empty' <<<"$STALE_TARGET_RETIREMENT")
+  QUERY_IAM_JOURNAL_REFERENCED_ENVELOPE=
+  if [[ -n "$QUERY_IAM_JOURNAL_REF" ]]; then load_query_iam_journal_ref "$QUERY_IAM_JOURNAL_REF"; fi
   ACTIVE_READY_JOURNAL_REF=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$STALE_TARGET_RETIREMENT")
   ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=
   if [[ -n "$ACTIVE_READY_JOURNAL_REF" ]]; then
@@ -407,6 +620,10 @@ load_stale_journal_ref() {
     STALE_TARGET_RETIREMENT=$pending
 		pending_active_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$pending")
 		historical_active_ref=${ACTIVE_READY_JOURNAL_REF:-}
+		pending_query_ref=$(jq -cS '.runtime.session_control_query_iam_ref // empty' <<<"$pending")
+		if [[ -n "$pending_query_ref" && "$pending_query_ref" != "${QUERY_IAM_JOURNAL_REF:-}" ]]; then
+			load_query_iam_journal_ref "$pending_query_ref" || { STALE_TARGET_RETIREMENT=$saved; return 1; }
+		fi
 		if [[ -n "$pending_active_ref" && "$pending_active_ref" != "$historical_active_ref" ]]; then
 			# The subjournal commits before the main-journal ref. Loading this
 			# exact referenced version is read-only; the operation-specific main
@@ -417,7 +634,7 @@ load_stale_journal_ref() {
 			}
 		fi
     validate_stale_target_retirement || { STALE_TARGET_RETIREMENT=$saved; return 1; }
-		if is_exact_active_ready_main_successor "$saved" "$pending"; then
+		if is_exact_active_ready_main_successor "$saved" "$pending" || is_exact_query_iam_main_successor "$saved" "$pending"; then
 			exact_active_successor=true
 			STALE_JOURNAL_UNREFERENCED_ENVELOPE=$current
 			STALE_JOURNAL_REFERENCED_ENVELOPE=$current
@@ -1197,10 +1414,77 @@ validate_session_control_delete_iam() {
   if [[ "$status" == iam_preparing ]]; then
     [[ "$(jq -r .status <<<"$iam")" == preparing ]]
   elif [[ "$status" == iam_ready || "$status" == fence_drained || "$status" == incident_preparing ||
-    "$status" == incident_complete || "$status" == ac_intent || "$status" == ac_refreshing ||
+    "$status" == incident_complete || "$status" == query_iam_preparing || "$status" == query_iam_ready ||
+    "$status" == ac_intent || "$status" == ac_refreshing ||
     "$status" == predecessor_retiring || "$status" == ready_predecessor_latching ||
     "$status" == ready_predecessor_retiring || "$status" == complete ]]; then
     [[ "$(jq -r .status <<<"$iam")" == ready ]]
+  else
+    return 1
+  fi
+}
+
+validate_session_control_query_iam() {
+  local status=$1 present iam ref
+  present=$(jq -r '.runtime | has("session_control_query_iam_ref")' <<<"$STALE_TARGET_RETIREMENT")
+  if [[ "$present" == false ]]; then
+    # The fixed incident path predates this grant. It may replay only through
+    # incident_complete without the field; no ACTIVE snapshot is reachable
+    # until initialize_session_control_query_iam persists the closed intent.
+    case "$status" in
+      cell0_intent|cell0_refreshing|cell0_refreshed|cell1_intent|cell1_refreshing|servers_refreshed|iam_preparing|iam_ready|fence_drained|incident_preparing|predecessor_retiring|incident_complete) return ;;
+      *) return 1 ;;
+    esac
+  fi
+  ref=$(jq -cS .runtime.session_control_query_iam_ref <<<"$STALE_TARGET_RETIREMENT")
+  validate_query_iam_journal_ref "$ref" || return 1
+  [[ "$ref" == "${QUERY_IAM_JOURNAL_REF:-}" && -n "${QUERY_IAM_JOURNAL:-}" ]] || return 1
+  iam=$QUERY_IAM_JOURNAL
+  jq -e '
+    type == "object" and (keys | sort) == ["intent","receipt","status"] and
+    (.intent | type == "object" and (keys | sort) ==
+      ["action","attached_role","attached_role_id","before_default_version","before_policy_sha256",
+       "before_versions","desired_default_version","desired_policy_sha256","desired_versions","leading_keys",
+       "policy_arn","policy_id","policy_name","policy_path","prune_version","schema","table_arn"]) and
+    .intent.schema == "layerv.durable-aop-session-control-query-iam-intent.v1" and
+    .intent.policy_arn == "arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data" and
+    .intent.policy_id == "ANPA3FLD2UT62EB536PKL" and
+    .intent.policy_name == "nhp-sandbox-github-actions-terraform-apply-data" and .intent.policy_path == "/" and
+    .intent.attached_role == "nhp-sandbox-github-actions" and .intent.attached_role_id == "AROA3FLD2UT6QBE2U53EL" and
+    .intent.table_arn == "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control" and
+    .intent.action == "dynamodb:Query" and
+    .intent.leading_keys == [
+      "AC#c1f4c688a88e7309e89533f7e95343901da66587f3bb03f98539a16fccf33be2",
+      "TARGET#2b6e9d783ef49c0df152d3a640d63b8846bb056b6ed1672fb27829ac340b85b1",
+      "TARGET#71844969e300ec3c25da593e211196c45a03736a57c3850a3bcfab30d5c005f1",
+      "TARGET#a8d6468608a3380b602b53c11365972843f0a4ecde6fd44e9aae6a97509e313b",
+      "TARGETWORK#2e858d866b8756b13117959015df2228a2f9582e24152035b5962b0142aa0420",
+      "TARGETWORK#316b00aa5b86de97fd481b7af9cb1ef1a6a432aba90a9c768c26b4bcd4ea4665",
+      "TARGETWORK#76dc3461739e82e34f454d811b88ac0e90e0bf4e2bdcf77b5f160b018975ac92"] and
+    .intent.before_default_version == "v21" and .intent.before_versions == ["v17","v18","v19","v20","v21"] and
+    .intent.before_policy_sha256 == "de72b914f4019aa10587414dd759bb4b46e2dcd1843d3183b913547c17129433" and
+    .intent.prune_version == "v17" and .intent.desired_default_version == "v22" and
+    .intent.desired_versions == ["v18","v19","v20","v21","v22"] and
+    .intent.desired_policy_sha256 == "161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce" and
+    (.status == "preparing" or .status == "ready") and
+    ((.status == "preparing" and .receipt == null) or
+     (.status == "ready" and
+      (.receipt | type == "object" and (keys | sort) ==
+        ["action","attached_role","attached_role_id","default_version","leading_keys","policy_arn","policy_id",
+         "policy_sha256","schema","table_arn","versions"]) and
+      .receipt.schema == "layerv.durable-aop-session-control-query-iam-receipt.v1" and
+      .receipt.policy_arn == .intent.policy_arn and .receipt.policy_id == .intent.policy_id and
+      .receipt.attached_role == .intent.attached_role and .receipt.attached_role_id == .intent.attached_role_id and
+      .receipt.table_arn == .intent.table_arn and .receipt.action == .intent.action and
+      .receipt.leading_keys == .intent.leading_keys and .receipt.default_version == .intent.desired_default_version and
+      .receipt.versions == .intent.desired_versions and .receipt.policy_sha256 == .intent.desired_policy_sha256))
+  ' >/dev/null <<<"$iam" || return 1
+  if [[ "$status" == query_iam_preparing ]]; then
+    [[ "$(jq -r .version <<<"$ref")" == 1 && "$(jq -r .status <<<"$iam")" == preparing ]]
+  elif [[ "$status" == query_iam_ready || "$status" == ready_predecessor_latching ||
+    "$status" == ac_intent || "$status" == ac_refreshing || "$status" == ready_predecessor_retiring ||
+    "$status" == complete ]]; then
+    [[ "$(jq -r .version <<<"$ref")" == 2 && "$(jq -r .status <<<"$iam")" == ready ]]
   else
     return 1
   fi
@@ -1240,7 +1524,17 @@ validate_stale_target_retirement() {
        (keys | sort) ==
         ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
          "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","ready_predecessor_ref",
-         "runtime_manifest","server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"])) and
+         "runtime_manifest","server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"] or
+       (keys | sort) ==
+        ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+         "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","runtime_manifest",
+         "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam",
+         "session_control_query_iam_ref","source_sha"] or
+       (keys | sort) ==
+        ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
+         "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","ready_predecessor_ref",
+         "runtime_manifest","server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam",
+         "session_control_query_iam_ref","source_sha"])) and
     .runtime.source_sha == $source and .runtime.build_run_id == $build and .runtime.build_run_attempt == $attempt and
     .runtime.runtime_manifest == $manifest and .runtime.server_provenance == $server and .runtime.ac_provenance == $ac and
     .runtime.preferences == $preferences and
@@ -1263,7 +1557,8 @@ validate_stale_target_retirement() {
        (.runtime.predecessor_targets | type == "array" and length == 0))) and
     (.status == "cell0_intent" or .status == "cell0_refreshing" or .status == "cell0_refreshed" or
      .status == "cell1_intent" or .status == "cell1_refreshing" or .status == "servers_refreshed" or
-     .status == "iam_preparing" or .status == "iam_ready" or
+     .status == "iam_preparing" or .status == "iam_ready" or .status == "query_iam_preparing" or
+     .status == "query_iam_ready" or
      .status == "fence_drained" or .status == "incident_preparing" or .status == "incident_complete" or
      .status == "ac_intent" or .status == "ac_refreshing" or .status == "predecessor_retiring" or
      .status == "ready_predecessor_latching" or .status == "ready_predecessor_retiring" or .status == "complete")
@@ -1289,6 +1584,9 @@ validate_stale_target_retirement() {
     "$RECOVERY_ORCHESTRATOR_SHA" || return 1
   validate_session_control_delete_iam "$status" || {
     echo "schema-3 session-control DeleteItem authority is malformed or out of order" >&2; return 1;
+  }
+  validate_session_control_query_iam "$status" || {
+    echo "schema-3 recovery-role Query authority is malformed or out of order" >&2; return 1;
   }
   if [[ "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null ]]; then
     drain=$(jq -cS .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")
@@ -1387,7 +1685,7 @@ validate_stale_recovery_status() {
     iam_preparing|iam_ready) [[ -n "$c0_refresh$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 0 ]] ;;
     fence_drained) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 0 ]] ;;
     incident_preparing) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" -le 3 ]] ;;
-    incident_complete) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 3 && "$predecessor_count" == 0 ]] ;;
+    incident_complete|query_iam_preparing|query_iam_ready) [[ -n "$c0_refresh$c1_refresh" && "$(jq -r .runtime.fence_drain <<<"$STALE_TARGET_RETIREMENT")" != null && "$incident_retired" == 3 && "$predecessor_count" == 0 ]] ;;
     ready_predecessor_latching) [[ -n "$c0_refresh$c1_refresh" && -z "$ac_prior$ac_refresh" && "$incident_retired" == 3 &&
       "$predecessor_count" == 0 && "$has_ready_ref" == true && ( "$ready_status" == latching || "$ready_status" == quiescent ) ]] ;;
     ac_intent) [[ -n "$c0_refresh$c1_refresh$ac_prior" && "$incident_retired" == 3 && -z "$ac_refresh" &&
@@ -1629,6 +1927,68 @@ verify_session_control_delete_iam() {
   }
 }
 
+initialize_session_control_query_iam() {
+  local intent
+  [[ -x "$SESSION_CONTROL_QUERY_IAM" ]] || {
+    echo "exact recovery-role Query IAM helper is unavailable" >&2; return 1;
+  }
+  require_hard_lock
+  verify_session_control_delete_iam
+  [[ -z "$(get_optional "$FLOOR_PARAM")" && -z "$(get_active_ready_optional "$ACTIVE_READY_JOURNAL_PARAM")" ]] || {
+    echo "Query IAM recovery did not start at the exact pre-ACTIVE-journal boundary" >&2; return 1;
+  }
+  intent=$($SESSION_CONTROL_QUERY_IAM plan)
+  intent=$(jq -cS . <<<"$intent")
+  QUERY_IAM_JOURNAL=$(jq -cnS --argjson intent "$intent" '{status:"preparing",intent:$intent,receipt:null}')
+  QUERY_IAM_JOURNAL_REF=
+  write_query_iam_journal_if_changed
+  STALE_TARGET_RETIREMENT=$(jq -c --argjson ref "$QUERY_IAM_JOURNAL_REF" '
+    .status="query_iam_preparing" | .runtime.session_control_query_iam_ref=$ref
+  ' <<<"$STALE_TARGET_RETIREMENT")
+  validate_stale_target_retirement
+  # Commit the exact v21/v17-v21 intent before DeletePolicyVersion or
+  # CreatePolicyVersion. A retry reuses these bytes and classifies either lost
+  # response; it never replans from a later policy version.
+  write_state repaired
+}
+
+advance_session_control_query_iam() {
+  local intent receipt expected
+  require_hard_lock
+  verify_session_control_delete_iam
+  [[ -z "$(get_optional "$FLOOR_PARAM")" && -z "$(get_active_ready_optional "$ACTIVE_READY_JOURNAL_PARAM")" ]] || {
+    echo "Query IAM recovery crossed the pre-ACTIVE-journal boundary" >&2; return 1;
+  }
+  intent=$(jq -cS .intent <<<"$QUERY_IAM_JOURNAL")
+  receipt=$($SESSION_CONTROL_QUERY_IAM apply --intent-json "$intent")
+  receipt=$(jq -cS . <<<"$receipt")
+  expected=$($SESSION_CONTROL_QUERY_IAM verify --intent-json "$intent")
+  expected=$(jq -cS . <<<"$expected")
+  [[ "$receipt" == "$expected" ]] || {
+    echo "recovery-role Query IAM apply receipt differs from strong verification" >&2; return 1;
+  }
+  QUERY_IAM_JOURNAL=$(jq -cS --argjson receipt "$receipt" '.status="ready" | .receipt=$receipt' <<<"$QUERY_IAM_JOURNAL")
+  write_query_iam_journal_if_changed
+  STALE_TARGET_RETIREMENT=$(jq -c --argjson ref "$QUERY_IAM_JOURNAL_REF" '
+    .status="query_iam_ready" | .runtime.session_control_query_iam_ref=$ref
+  ' <<<"$STALE_TARGET_RETIREMENT")
+  validate_stale_target_retirement
+  write_state repaired
+}
+
+verify_session_control_query_iam() {
+  local intent expected actual
+  [[ "$(jq -r .status <<<"$QUERY_IAM_JOURNAL")" == ready ]] || return 1
+  require_query_iam_journal_current_exact || return 1
+  intent=$(jq -cS .intent <<<"$QUERY_IAM_JOURNAL")
+  expected=$(jq -cS .receipt <<<"$QUERY_IAM_JOURNAL")
+  actual=$($SESSION_CONTROL_QUERY_IAM verify --intent-json "$intent")
+  actual=$(jq -cS . <<<"$actual")
+  [[ "$actual" == "$expected" ]] || {
+    echo "live recovery-role Query IAM authority differs from its durable receipt" >&2; return 1;
+  }
+}
+
 record_fence_drain() {
   local receipt
   verify_session_control_delete_iam
@@ -1669,6 +2029,7 @@ advance_stale_target_retirement() {
 initialize_ac_runtime_refresh() {
   local plan plan_digest component
   verify_session_control_delete_iam
+  verify_session_control_query_iam
   if [[ -n "${ACTIVE_READY_JOURNAL_REF:-}" ]]; then
     [[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == quiescent ]] || {
       echo "ACTIVE/READY predecessors are not latched and quiescent before AC refresh" >&2; return 1;
@@ -1713,6 +2074,7 @@ initialize_active_ready_recovery() {
   local plan plan_digest fence_digest
   require_hard_lock
   verify_session_control_delete_iam
+  verify_session_control_query_iam
 	if [[ -z "${STALE_JOURNAL_UNREFERENCED_ENVELOPE:-}" ]]; then
 		require_stale_journal_current_exact
 	else
@@ -1741,7 +2103,7 @@ initialize_active_ready_recovery() {
 		ACTIVE_READY_JOURNAL_REFERENCED_ENVELOPE=
 	else
 		# A crash may leave the exact initial subjournal and its exact main-ref
-		# successor committed while schema-3 still references incident_complete.
+		# successor committed while schema-3 still references query_iam_ready.
 		# Reuse those durable bytes; never replace them with a fresh plan.
 		validate_active_ready_journal
 		[[ "$(jq -r .status <<<"$ACTIVE_READY_JOURNAL")" == latching &&
@@ -1767,6 +2129,7 @@ advance_active_ready_quiescence() {
     if [[ "$status" == pending ]]; then
       require_hard_lock
       verify_session_control_delete_iam
+      verify_session_control_query_iam
       require_exact_zero_directory
       id=$(jq -r --argjson i "$index" '.targets[$i].id' <<<"$ACTIVE_READY_JOURNAL")
       receipt=$($STALE_TARGET_RETIRER latch-active-ready-predecessor --target-id "$id")
@@ -1779,6 +2142,7 @@ advance_active_ready_quiescence() {
     if [[ "$status" == latched ]]; then
       require_hard_lock
       verify_session_control_delete_iam
+      verify_session_control_query_iam
       require_exact_zero_directory
       id=$(jq -r --argjson i "$index" '.targets[$i].id' <<<"$ACTIVE_READY_JOURNAL")
       receipt=$($STALE_TARGET_RETIRER verify-active-ready-predecessor-quiescence --target-id "$id")
@@ -1799,6 +2163,7 @@ advance_active_ready_quiescence() {
 reprove_active_ready_post_refresh_authority() {
   require_hard_lock
   verify_session_control_delete_iam
+  verify_session_control_query_iam
   require_stale_journal_current_exact
   # A prior command may have committed DDB and the one exact ACTIVE N+1 while
   # the slim-main reference write was lost. This read-only bracket admits only
@@ -2095,7 +2460,8 @@ load_schema3() {
     --arg predecessor_sha "$APPROVED_RECOVERY_HANDOFF_PREDECESSOR_SHA" \
     --arg stale_predecessor_sha "$APPROVED_STALE_RETIREMENT_PREDECESSOR_SHA" \
     --arg iam_predecessor_sha "$APPROVED_IAM_HANDOFF_PREDECESSOR_SHA" \
-    --arg active_predecessor_sha "$APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
+    --arg active_predecessor_sha "$APPROVED_ACTIVE_READY_HANDOFF_PREDECESSOR_SHA" \
+    --arg query_predecessor_sha "$APPROVED_QUERY_IAM_HANDOFF_PREDECESSOR_SHA" --arg repair_sha "$REPAIR_SOURCE_SHA" \
     --arg build_run "$REPAIR_BUILD_RUN_ID" --arg build_attempt "$REPAIR_BUILD_RUN_ATTEMPT" \
     --arg runtime_manifest "$APPROVED_REPAIR_RUNTIME_MANIFEST" \
     --arg server_provenance "$SERVER_REPAIR_PROVENANCE" --arg ac_provenance "$AC_REPAIR_PROVENANCE" '
@@ -2114,7 +2480,7 @@ load_schema3() {
          (has("refresh_intent") | not)))) and
     (.repair.orchestrator_sha == $recovery_sha or .repair.orchestrator_sha == $predecessor_sha or
      .repair.orchestrator_sha == $stale_predecessor_sha or .repair.orchestrator_sha == $iam_predecessor_sha or
-     .repair.orchestrator_sha == $active_predecessor_sha) and
+     .repair.orchestrator_sha == $active_predecessor_sha or .repair.orchestrator_sha == $query_predecessor_sha) and
     .repair.source_sha == $repair_sha and
     .repair.build_run_id == $build_run and .repair.build_run_attempt == $build_attempt and
     .repair.runtime_manifest == $runtime_manifest and
@@ -2188,11 +2554,30 @@ load_schema3() {
       return 1
     }
     RECOVERY_HANDOFF_PENDING=true
+  elif [[ "$stored_recovery_sha" == "$APPROVED_QUERY_IAM_HANDOFF_PREDECESSOR_SHA" ]]; then
+    canonical=$(jq -cS . <<<"$raw")
+    digest=$(canonical_digest "$canonical")
+    [[ "$RECOVERY_ORCHESTRATOR_SHA" != "$APPROVED_QUERY_IAM_HANDOFF_PREDECESSOR_SHA" &&
+       "$state_version" == "$APPROVED_QUERY_IAM_HANDOFF_STATE_VERSION" &&
+       "$digest" == "$APPROVED_QUERY_IAM_HANDOFF_STATE_DIGEST" &&
+       "$(jq -r .phase <<<"$raw")" == "$APPROVED_QUERY_IAM_HANDOFF_PHASE" &&
+       "$(jq -r '.repair.owner.status // ""' <<<"$raw")" == ready &&
+       "$(jq -r '.repair.stale_target_retirement_ref.version // 0' <<<"$raw")" == "$APPROVED_QUERY_IAM_HANDOFF_JOURNAL_VERSION" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.sha256 // ""' <<<"$raw")" == "$APPROVED_QUERY_IAM_HANDOFF_JOURNAL_DIGEST" &&
+       "$(jq -r '.repair.stale_target_retirement_ref.parameter // ""' <<<"$raw")" == "$STALE_JOURNAL_PARAM" &&
+       -z "$(get_active_ready_optional "$ACTIVE_READY_JOURNAL_PARAM")" &&
+       -z "$(get_query_iam_optional "$QUERY_IAM_JOURNAL_PARAM")" &&
+       -n "${LIVE_LOCK:-}" && "$LOCK_JSON" == "$ORIGINAL_LOCK" && -z "$(get_optional "$FLOOR_PARAM")" ]] || {
+      echo "schema-3 Query IAM predecessor is not the exact live v36/journal-v14 handoff boundary" >&2
+      return 1
+    }
+    RECOVERY_HANDOFF_PENDING=true
   else
     [[ "$state_version" != "$APPROVED_RECOVERY_HANDOFF_STATE_VERSION" &&
        "$state_version" != "$APPROVED_STALE_RETIREMENT_STATE_VERSION" &&
        "$state_version" != "$APPROVED_IAM_HANDOFF_STATE_VERSION" &&
-       "$state_version" != "$APPROVED_ACTIVE_READY_HANDOFF_STATE_VERSION" ]] || {
+       "$state_version" != "$APPROVED_ACTIVE_READY_HANDOFF_STATE_VERSION" &&
+       "$state_version" != "$APPROVED_QUERY_IAM_HANDOFF_STATE_VERSION" ]] || {
       echo "schema-3 pinned handoff SSM version cannot self-assert successor authority" >&2
       return 1
     }
@@ -2672,6 +3057,13 @@ if [[ "$PHASE" == repaired && ("$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" 
   advance_stale_target_retirement
 fi
 if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == incident_complete ]]; then
+  initialize_session_control_query_iam
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == query_iam_preparing ]]; then
+  advance_session_control_query_iam
+fi
+if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == query_iam_ready ]]; then
+  verify_session_control_query_iam
   initialize_active_ready_recovery
 fi
 if [[ "$PHASE" == repaired && "$(jq -r .status <<<"$STALE_TARGET_RETIREMENT")" == ready_predecessor_latching ]]; then

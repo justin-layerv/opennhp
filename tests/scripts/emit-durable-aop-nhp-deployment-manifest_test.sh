@@ -32,7 +32,8 @@ export FAKE_READ_COUNTS=$WORK/read-counts
 STATE_VERSION=31
 MAIN_JOURNAL_VERSION=19
 ACTIVE_READY_JOURNAL_VERSION=10
-export STATE_VERSION MAIN_JOURNAL_VERSION ACTIVE_READY_JOURNAL_VERSION
+QUERY_IAM_JOURNAL_VERSION=2
+export STATE_VERSION MAIN_JOURNAL_VERSION ACTIVE_READY_JOURNAL_VERSION QUERY_IAM_JOURNAL_VERSION
 (cd "$ROOT/endpoints" && GOWORK=off KBS_SKIP_INIT=1 \
   go run ./cmd/session-control-stale-target-retirement plan) >"$WORK/incident-plan.json"
 [[ "$(printf '%s' "$(jq -cS . "$WORK/incident-plan.json")" | sha256sum | awk '{print $1}')" == \
@@ -54,7 +55,7 @@ case "$service/$operation" in
   ssm/get-parameter)
     name=$(opt --name "$@")
     query=$(opt --query "$@")
-    if [[ "$name" == */active-ready-predecessors* ]]; then
+    if [[ "$name" == */active-ready-predecessors* || "$name" == */session-control-query-iam* ]]; then
       [[ $# == 9 && $1 == --name && $2 == "$name" && $3 == --with-decryption &&
          $4 == --query && $5 == "$query" && $6 == --output && $7 == text &&
          $8 == --region && $9 == us-east-2 ]] || exit 99
@@ -68,6 +69,7 @@ case "$service/$operation" in
         */state) printf '%s\n' "$STATE_VERSION" ;;
         */stale-target-retirement) printf '%s\n' "$MAIN_JOURNAL_VERSION" ;;
         */active-ready-predecessors) printf '%s\n' "$ACTIVE_READY_JOURNAL_VERSION" ;;
+        */session-control-query-iam) printf '%s\n' "$QUERY_IAM_JOURNAL_VERSION" ;;
         *) echo "unexpected version authority $name" >&2; exit 99 ;;
       esac
       exit 0
@@ -88,24 +90,35 @@ case "$service/$operation" in
     printf '%s\n' "$value"
     ;;
   ssm/describe-parameters)
-    [[ $# == 6 && $1 == --parameter-filters &&
-       $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors' &&
-       $3 == --output && $4 == json && $5 == --region && $6 == us-east-2 ]] || exit 99
-    printf 'active-metadata\n' >>"$FAKE_AWS_ACTIONS"
-    type=SecureString key=alias/aws/ssm tier=Standard data_type=text version=$ACTIVE_READY_JOURNAL_VERSION
-    case ${FAKE_ACTIVE_METADATA_MODE:-exact} in
+    [[ $# == 6 && $1 == --parameter-filters && $3 == --output && $4 == json &&
+       $5 == --region && $6 == us-east-2 ]] || exit 99
+    case "$2" in
+      'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors')
+        name=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors
+        version=$ACTIVE_READY_JOURNAL_VERSION metadata_mode=${FAKE_ACTIVE_METADATA_MODE:-exact}
+        printf 'active-metadata\n' >>"$FAKE_AWS_ACTIONS"
+        ;;
+      'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam')
+        name=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam
+        version=$QUERY_IAM_JOURNAL_VERSION metadata_mode=${FAKE_QUERY_METADATA_MODE:-exact}
+        printf 'query-metadata\n' >>"$FAKE_AWS_ACTIONS"
+        ;;
+      *) exit 99 ;;
+    esac
+    type=SecureString key=alias/aws/ssm tier=Standard data_type=text
+    case $metadata_mode in
       exact) ;;
       wrong_type) type=String ;;
       wrong_key) key=alias/other ;;
       wrong_tier) tier=Advanced ;;
       wrong_data_type) data_type=aws:ec2:image ;;
-      wrong_version) version=$((ACTIVE_READY_JOURNAL_VERSION + 1)) ;;
+      wrong_version) version=$((version + 1)) ;;
       missing) printf '{"Parameters":[]}\n'; exit 0 ;;
-      extra) jq -cn --arg version "$version" '{Parameters:[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]}'; exit 0 ;;
+      extra) jq -cn --arg name "$name" --arg version "$version" '{Parameters:[{Name:$name,Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]}'; exit 0 ;;
       *) exit 98 ;;
     esac
-    jq -cn --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
-      '{Parameters:[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:$type,KeyId:$key,Tier:$tier,DataType:$data,Version:($version|tonumber)}]}'
+    jq -cn --arg name "$name" --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
+      '{Parameters:[{Name:$name,Type:$type,KeyId:$key,Tier:$tier,DataType:$data,Version:($version|tonumber)}]}'
     ;;
   autoscaling/describe-instance-refreshes)
     [[ "${FAKE_REFRESH_FAILED:-}" != true ]] && printf 'Successful\n' || printf 'Failed\n'
@@ -222,6 +235,40 @@ jq -cn '
    default_version:"v9",versions:["v5","v6","v7","v8","v9"],
    policy_sha256:"c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"}
 '
+EOF
+cat >"$WORK/helpers/query-iam" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${FAKE_QUERY_IAM_VERIFY_FAIL:-}" != true ]] || exit 1
+[[ "$1" == verify && "$2" == --intent-json ]]
+intent=$3
+keys='["AC#c1f4c688a88e7309e89533f7e95343901da66587f3bb03f98539a16fccf33be2","TARGET#2b6e9d783ef49c0df152d3a640d63b8846bb056b6ed1672fb27829ac340b85b1","TARGET#71844969e300ec3c25da593e211196c45a03736a57c3850a3bcfab30d5c005f1","TARGET#a8d6468608a3380b602b53c11365972843f0a4ecde6fd44e9aae6a97509e313b","TARGETWORK#2e858d866b8756b13117959015df2228a2f9582e24152035b5962b0142aa0420","TARGETWORK#316b00aa5b86de97fd481b7af9cb1ef1a6a432aba90a9c768c26b4bcd4ea4665","TARGETWORK#76dc3461739e82e34f454d811b88ac0e90e0bf4e2bdcf77b5f160b018975ac92"]'
+jq -e --argjson keys "$keys" '
+  (keys | sort) == ["action","attached_role","attached_role_id","before_default_version","before_policy_sha256",
+    "before_versions","desired_default_version","desired_policy_sha256","desired_versions","leading_keys",
+    "policy_arn","policy_id","policy_name","policy_path","prune_version","schema","table_arn"] and
+  .schema == "layerv.durable-aop-session-control-query-iam-intent.v1" and
+  .policy_arn == "arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data" and
+  .policy_id == "ANPA3FLD2UT62EB536PKL" and .policy_name == "nhp-sandbox-github-actions-terraform-apply-data" and
+  .policy_path == "/" and .attached_role == "nhp-sandbox-github-actions" and
+  .attached_role_id == "AROA3FLD2UT6QBE2U53EL" and
+  .table_arn == "arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control" and
+  .action == "dynamodb:Query" and .leading_keys == $keys and
+  .before_default_version == "v21" and .before_versions == ["v17","v18","v19","v20","v21"] and
+  .before_policy_sha256 == "de72b914f4019aa10587414dd759bb4b46e2dcd1843d3183b913547c17129433" and
+  .prune_version == "v17" and .desired_default_version == "v22" and
+  .desired_versions == ["v18","v19","v20","v21","v22"] and
+  .desired_policy_sha256 == "161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"
+' >/dev/null <<<"$intent"
+printf 'query-verify\n' >>"$FAKE_IAM_ACTIONS"
+jq -cnS --argjson keys "$keys" '{schema:"layerv.durable-aop-session-control-query-iam-receipt.v1",
+  policy_arn:"arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data",
+  policy_id:"ANPA3FLD2UT62EB536PKL",attached_role:"nhp-sandbox-github-actions",
+  attached_role_id:"AROA3FLD2UT6QBE2U53EL",
+  table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+  action:"dynamodb:Query",leading_keys:$keys,default_version:"v22",
+  versions:["v18","v19","v20","v21","v22"],
+  policy_sha256:"161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"}'
 EOF
 chmod +x "$WORK/bin/"* "$WORK/helpers/"*
 
@@ -362,11 +409,19 @@ encode_active_ready_journal() {
   python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-active-ready-predecessor-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
 }
 
+encode_query_iam_journal() {
+  python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-session-control-query-iam-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
+}
+
 decode_fixture_journal() {
   python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
 }
 
 decode_active_ready_journal() {
+  python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
+}
+
+decode_query_iam_journal() {
   python3 -c 'import base64,gzip,json,sys; v=json.load(sys.stdin); sys.stdout.buffer.write(gzip.decompress(base64.b64decode(v["payload"],validate=True)))'
 }
 
@@ -408,6 +463,31 @@ install_active_ready_envelope() {
     "$(jq -c --arg digest "$main_digest" '.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")"
 }
 
+mutate_query_iam_journal() {
+  local filter=$1 envelope journal
+  envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  journal=$(printf '%s' "$envelope" | decode_query_iam_journal | jq -cS "$filter")
+  envelope=$(printf '%s' "$journal" | encode_query_iam_journal)
+  install_query_iam_envelope "$envelope"
+}
+
+install_query_iam_envelope() {
+  local envelope=$1 digest main main_envelope main_digest state
+  digest=$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam "$envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:${QUERY_IAM_JOURNAL_VERSION}" "$envelope"
+  main_envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  main=$(printf '%s' "$main_envelope" | decode_fixture_journal | \
+    jq -cS --arg digest "$digest" '.runtime.session_control_query_iam_ref.sha256=$digest')
+  main_envelope=$(printf '%s' "$main" | encode_fixture_journal)
+  main_digest=$(printf '%s' "$main_envelope" | sha256sum | awk '{print $1}')
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$main_envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${MAIN_JOURNAL_VERSION}" "$main_envelope"
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/state \
+    "$(jq -c --arg digest "$main_digest" '.repair.stale_target_retirement_ref.sha256=$digest' <<<"$state")"
+}
+
 seed() {
   : >"$FAKE_PARAMS"
   rm -rf "$FAKE_READ_COUNTS"
@@ -418,6 +498,7 @@ seed() {
   local live_ac_provenance="v1|${LIVE_SOURCE}|layerv/nhp-ac|${AC_DIGEST}"
   local lock original_state state journal envelope journal_digest incident_plan incident_ledger fence_start fence_drain
   local active_plan active_journal active_envelope active_digest active_plan_digest active_quiescence_digest ac_plan_digest
+  local query_keys query_intent query_receipt query_journal query_envelope query_digest
   local preferences c0_intent c1_intent ac_intent
   local iam_intent iam_receipt
   original_state=$(jq -cn --arg image "$ORIGINAL" --arg owner "$ORIGINAL_OWNER" '
@@ -477,6 +558,28 @@ seed() {
      leading_keys:["ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153","EVENT#*"],
      default_version:"v9",versions:["v5","v6","v7","v8","v9"],
      policy_sha256:"c08cde9b65bb0e088ae7534c28f4f7a751ff6888f432bbc451949615b941b4c1"}')
+  query_keys='["AC#c1f4c688a88e7309e89533f7e95343901da66587f3bb03f98539a16fccf33be2","TARGET#2b6e9d783ef49c0df152d3a640d63b8846bb056b6ed1672fb27829ac340b85b1","TARGET#71844969e300ec3c25da593e211196c45a03736a57c3850a3bcfab30d5c005f1","TARGET#a8d6468608a3380b602b53c11365972843f0a4ecde6fd44e9aae6a97509e313b","TARGETWORK#2e858d866b8756b13117959015df2228a2f9582e24152035b5962b0142aa0420","TARGETWORK#316b00aa5b86de97fd481b7af9cb1ef1a6a432aba90a9c768c26b4bcd4ea4665","TARGETWORK#76dc3461739e82e34f454d811b88ac0e90e0bf4e2bdcf77b5f160b018975ac92"]'
+  query_intent=$(jq -cnS --argjson keys "$query_keys" '{schema:"layerv.durable-aop-session-control-query-iam-intent.v1",
+    policy_arn:"arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data",
+    policy_id:"ANPA3FLD2UT62EB536PKL",policy_name:"nhp-sandbox-github-actions-terraform-apply-data",policy_path:"/",
+    attached_role:"nhp-sandbox-github-actions",attached_role_id:"AROA3FLD2UT6QBE2U53EL",
+    table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+    action:"dynamodb:Query",leading_keys:$keys,before_default_version:"v21",
+    before_versions:["v17","v18","v19","v20","v21"],
+    before_policy_sha256:"de72b914f4019aa10587414dd759bb4b46e2dcd1843d3183b913547c17129433",
+    prune_version:"v17",desired_default_version:"v22",desired_versions:["v18","v19","v20","v21","v22"],
+    desired_policy_sha256:"161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"}')
+  query_receipt=$(jq -cnS --argjson keys "$query_keys" '{schema:"layerv.durable-aop-session-control-query-iam-receipt.v1",
+    policy_arn:"arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data",
+    policy_id:"ANPA3FLD2UT62EB536PKL",attached_role:"nhp-sandbox-github-actions",
+    attached_role_id:"AROA3FLD2UT6QBE2U53EL",
+    table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+    action:"dynamodb:Query",leading_keys:$keys,default_version:"v22",versions:["v18","v19","v20","v21","v22"],
+    policy_sha256:"161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"}')
+  query_journal=$(jq -cnS --argjson intent "$query_intent" --argjson receipt "$query_receipt" \
+    '{intent:$intent,receipt:$receipt,status:"ready"}')
+  query_envelope=$(printf '%s' "$query_journal" | encode_query_iam_journal)
+  query_digest=$(printf '%s' "$query_envelope" | sha256sum | awk '{print $1}')
   state=$(jq -cn --arg repair "$REPAIR" --arg recovery "$RECOVERY" --arg runtime "$RUNTIME" \
     --arg live_source "$LIVE_SOURCE" --arg live_runtime "$LIVE_RUNTIME" \
     --arg server "$server_provenance" --arg ac "$ac_provenance" \
@@ -484,6 +587,8 @@ seed() {
     --argjson incident_plan "$incident_plan" --argjson incident_ledger "$incident_ledger" \
     --arg active_parameter /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors \
     --argjson active_version "$ACTIVE_READY_JOURNAL_VERSION" --arg active_digest "$active_digest" \
+    --arg query_parameter /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam \
+    --argjson query_version "$QUERY_IAM_JOURNAL_VERSION" --arg query_digest "$query_digest" \
     --argjson fence_start "$fence_start" \
     --argjson fence_drain "$fence_drain" --argjson preferences "$preferences" \
     --arg c0_intent "$c0_intent" --arg c1_intent "$c1_intent" --arg ac_intent "$ac_intent" \
@@ -517,6 +622,7 @@ seed() {
           ac:{asg:"layerv-nhp-sandbox-ac-green",attestation:("v2|durable-aop-v1|"+$live_source+"|layerv/nhp-ac|"+($live_ac|split("|")[-1])+"|layerv-nhp-sandbox-ac-green"),prior_refresh_id:"prior-ac",intent_sha256:$ac_intent,refresh_id:"runtime-ac"},
           server_refresh_orchestrator_sha:$recovery,
           session_control_delete_iam:{status:"ready",intent:$iam_intent,receipt:$iam_receipt},
+          session_control_query_iam_ref:{parameter:$query_parameter,version:$query_version,sha256:$query_digest},
           fence_start:$fence_start,fence_drain:$fence_drain,
           predecessor_plan:null,predecessor_plan_sha256:"",predecessor_targets:[],
           ready_predecessor_ref:{parameter:$active_parameter,version:$active_version,sha256:$active_digest}}}}}')
@@ -533,6 +639,8 @@ seed() {
   set_param "/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:${MAIN_JOURNAL_VERSION}" "$envelope"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors "$active_envelope"
   set_param "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:${ACTIVE_READY_JOURNAL_VERSION}" "$active_envelope"
+  set_param /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam "$query_envelope"
+  set_param "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:${QUERY_IAM_JOURNAL_VERSION}" "$query_envelope"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock "$lock"
   set_param /sandbox/nhp/cutovers/durable-aop-v1/state:7 "$original_state"
   set_param /layerv-nhp-sandbox/qurl-live-env-lock:2 "$lock"
@@ -560,6 +668,7 @@ invoke() {
     CUTOVER_VERIFY_ASG_HEALTH_SCRIPT=$WORK/helpers/verify-asg \
     CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
     CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT=$WORK/helpers/delete-iam \
+    CUTOVER_SESSION_CONTROL_QUERY_IAM_SCRIPT=$WORK/helpers/query-iam \
     "$SCRIPT" 700 2 "$WORK/durable-aop-nhp-deployment.json"
 }
 
@@ -569,11 +678,16 @@ seed
 : >"$FAKE_AWS_ACTIONS"
 invoke >/dev/null
 [[ "$(cat "$FAKE_OWNER_ACTIONS")" == verify ]]
-[[ "$(cat "$FAKE_IAM_ACTIONS")" == verify ]]
+[[ "$(grep -c '^verify$' "$FAKE_IAM_ACTIONS")" == 1 ]]
+[[ "$(grep -c '^query-verify$' "$FAKE_IAM_ACTIONS")" == 1 ]]
 [[ "$(grep -c '^active-metadata$' "$FAKE_AWS_ACTIONS")" == 1 ]]
+[[ "$(grep -c '^query-metadata$' "$FAKE_AWS_ACTIONS")" == 1 ]]
 [[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors:10\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 1 ]]
 [[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors\tParameter.Version$' "$FAKE_AWS_ACTIONS")" == 2 ]]
 [[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 2 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:2\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 1 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam\tParameter.Version$' "$FAKE_AWS_ACTIONS")" == 2 ]]
+[[ "$(grep -c $'^active-read\t/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam\tParameter.Value$' "$FAKE_AWS_ACTIONS")" == 2 ]]
 jq -e --arg repair "$LIVE_SOURCE" --arg recovery "$RECOVERY" --arg server "$SERVER_DIGEST" --arg ac "$AC_DIGEST" '
   (keys | sort) == ["build","deployments","environment","images","producer","profile","recovery_orchestrator_sha","repair_source_sha","repository","schema"] and
   .schema == "layerv.durable-aop-nhp-deployment.v1" and .repair_source_sha == $repair and
@@ -631,6 +745,9 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
   server_orchestrator_missing server_orchestrator_drift server_predecessor_nonlive \
   iam_missing iam_preparing iam_policy_drift iam_role_drift iam_table_drift iam_action_drift iam_enclosing_operation_drift \
   iam_leading_key_drift iam_default_drift iam_version_drift iam_digest_drift iam_live_verify_failed \
+  query_ref_missing query_ref_parameter query_ref_version query_ref_digest query_status query_intent_drift \
+  query_receipt_drift query_live_verify_failed query_metadata_type query_metadata_key query_metadata_tier \
+  query_metadata_data query_metadata_version query_metadata_missing query_metadata_extra query_torn \
   journal_missing journal_status journal_source journal_build journal_manifest journal_source_digest \
   incident_plan_digest incident_fence_digest incident_receipt fence_start_malformed fence_drain_count fence_drain_digest \
   component_intent predecessor_plan_digest predecessor_receipt active_ref_missing active_ref_parameter \
@@ -644,7 +761,8 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
   : >"$FAKE_OWNER_ACTIONS"
   : >"$FAKE_IAM_ACTIONS"
   unset FAKE_RECOVERY_CONCLUSION FAKE_BUILD_DRIFT FAKE_REFRESH_FAILED FAKE_ASG_UNHEALTHY \
-    FAKE_OWNER_VERIFY_FAIL FAKE_IAM_VERIFY_FAIL FAKE_ACTIVE_METADATA_MODE FAKE_DRIFT_PARAM
+    FAKE_OWNER_VERIFY_FAIL FAKE_IAM_VERIFY_FAIL FAKE_QUERY_IAM_VERIFY_FAIL FAKE_ACTIVE_METADATA_MODE \
+    FAKE_QUERY_METADATA_MODE FAKE_DRIFT_PARAM
   export AC_DIGEST=sha256:773bd37e915ac767f57e7656b5c038a8f2c70348901b1e81572584d6cfad566e
   case "$mode" in
     recovery_failure) export FAKE_RECOVERY_CONCLUSION=failure ;;
@@ -728,6 +846,22 @@ for mode in recovery_failure recovery_timed_out recovery_cancelled build_drift r
     iam_live_verify_failed)
       export FAKE_IAM_VERIFY_FAIL=true
       ;;
+    query_ref_missing) mutate_fixture_journal 'del(.runtime.session_control_query_iam_ref)' ;;
+    query_ref_parameter) mutate_fixture_journal '.runtime.session_control_query_iam_ref.parameter="/sandbox/nhp/cutovers/durable-aop-v1/other"' ;;
+    query_ref_version) mutate_fixture_journal '.runtime.session_control_query_iam_ref.version=1' ;;
+    query_ref_digest) mutate_fixture_journal '.runtime.session_control_query_iam_ref.sha256=("9"*64)' ;;
+    query_status) mutate_query_iam_journal '.status="preparing" | .receipt=null' ;;
+    query_intent_drift) mutate_query_iam_journal '.intent.leading_keys=["TARGET#other"]' ;;
+    query_receipt_drift) mutate_query_iam_journal '.receipt.default_version="v23"' ;;
+    query_live_verify_failed) export FAKE_QUERY_IAM_VERIFY_FAIL=true ;;
+    query_metadata_type) export FAKE_QUERY_METADATA_MODE=wrong_type ;;
+    query_metadata_key) export FAKE_QUERY_METADATA_MODE=wrong_key ;;
+    query_metadata_tier) export FAKE_QUERY_METADATA_MODE=wrong_tier ;;
+    query_metadata_data) export FAKE_QUERY_METADATA_MODE=wrong_data_type ;;
+    query_metadata_version) export FAKE_QUERY_METADATA_MODE=wrong_version ;;
+    query_metadata_missing) export FAKE_QUERY_METADATA_MODE=missing ;;
+    query_metadata_extra) export FAKE_QUERY_METADATA_MODE=extra ;;
+    query_torn) export FAKE_DRIFT_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam ;;
     journal_missing)
       value=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
       set_param /sandbox/nhp/cutovers/durable-aop-v1/state "$(jq -c 'del(.repair.stale_target_retirement_ref)' <<<"$value")"

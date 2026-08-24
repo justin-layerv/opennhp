@@ -3138,6 +3138,38 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
       },
       {
+        # The attended durable-AOP recovery reads only the exact live target,
+        # owner-task, and reverse-session partitions that it precommits before
+        # closing admission on the repaired-era AC cohort. Query is a base-table
+        # operation here: no index ARN, other table, or other partition key is
+        # in this grant. ForAllValues keeps every LeadingKeys value in the
+        # incident-specific closed union; Null prevents a request without the
+        # service key from bypassing that fence.
+        Sid      = "DynamoDBSessionControlRecoveryQuery"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = ["arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-sandbox-cell0-nhp-session-control"]
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = [
+              "AC#c1f4c688a88e7309e89533f7e95343901da66587f3bb03f98539a16fccf33be2",
+              "TARGET#2b6e9d783ef49c0df152d3a640d63b8846bb056b6ed1672fb27829ac340b85b1",
+              "TARGET#71844969e300ec3c25da593e211196c45a03736a57c3850a3bcfab30d5c005f1",
+              "TARGET#a8d6468608a3380b602b53c11365972843f0a4ecde6fd44e9aae6a97509e313b",
+              "TARGETWORK#2e858d866b8756b13117959015df2228a2f9582e24152035b5962b0142aa0420",
+              "TARGETWORK#316b00aa5b86de97fd481b7af9cb1ef1a6a432aba90a9c768c26b4bcd4ea4665",
+              "TARGETWORK#76dc3461739e82e34f454d811b88ac0e90e0bf4e2bdcf77b5f160b018975ac92",
+            ]
+          }
+          StringEquals = {
+            "aws:PrincipalArn" = "arn:aws:iam::${local.account_id}:role/nhp-sandbox-github-actions"
+          }
+          Null = {
+            "dynamodb:LeadingKeys" = "false"
+          }
+        }
+      },
+      {
         # KMS permissions for DynamoDB/RDS encryption with customer-managed keys
         # CreateGrant is required when creating DynamoDB tables with CMK encryption
         # SECURITY (#1125): condition uses aws:ResourceAccount (not

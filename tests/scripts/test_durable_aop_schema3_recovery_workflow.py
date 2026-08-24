@@ -152,7 +152,7 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
         self.assertIn('if [[ -z "$LIFECYCLE_RUN_ID$LIFECYCLE_RUN_ATTEMPT$CONNECTOR_LIFECYCLE_RUN_ID$CONNECTOR_LIFECYCLE_RUN_ATTEMPT" ]]', reject)
         self.assertEqual(reject.count('=~ ^[1-9][0-9]*$'), 6)
 
-    def test_active_ready_subjournal_has_no_caller_parameter_or_kms_authority(self):
+    def test_recovery_subjournals_have_no_caller_parameter_or_kms_authority(self):
         workflow = WORKFLOW.read_text()
         script = SCRIPT.read_text()
         self.assertIn(
@@ -160,34 +160,46 @@ class DurableAOPSchema3RecoveryWorkflowTest(unittest.TestCase):
             script,
         )
         self.assertIn("ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm", script)
+        self.assertIn(
+            "QUERY_IAM_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam",
+            script,
+        )
+        self.assertIn("QUERY_IAM_JOURNAL_KMS_KEY=alias/aws/ssm", script)
         self.assertNotIn("CUTOVER_ACTIVE_READY_JOURNAL_PARAM", workflow + script)
         self.assertNotIn("CUTOVER_ACTIVE_READY_JOURNAL_KMS_KEY", workflow + script)
+        self.assertNotIn("CUTOVER_QUERY_IAM_JOURNAL_PARAM", workflow + script)
+        self.assertNotIn("CUTOVER_QUERY_IAM_JOURNAL_KMS_KEY", workflow + script)
         self.assertEqual(
             script.count(
                 'aws ssm get-parameter --name "$1" --with-decryption '
                 '--query Parameter.Value --output text --region "$AWS_REGION"'
             ),
-            1,
+            2,
         )
         self.assertEqual(
             script.count(
                 'aws ssm get-parameter --name "$1" --with-decryption '
                 '--query Parameter.Version --output text --region "$AWS_REGION"'
             ),
-            1,
+            2,
         )
         self.assertEqual(
             script.count('aws ssm put-parameter --name "$ACTIVE_READY_JOURNAL_PARAM"'),
             2,
         )
         self.assertEqual(script.count('--type SecureString \\\n        --key-id "$ACTIVE_READY_JOURNAL_KMS_KEY"'), 2)
+        self.assertEqual(
+            script.count('aws ssm put-parameter --name "$QUERY_IAM_JOURNAL_PARAM"'),
+            2,
+        )
+        self.assertEqual(script.count('--type SecureString \\\n        --key-id "$QUERY_IAM_JOURNAL_KMS_KEY"'), 2)
         self.assertIn('--no-overwrite --region "$AWS_REGION"', script)
         self.assertIn('--overwrite --region "$AWS_REGION"', script)
         self.assertIn("Tier:Tier,DataType:DataType,Version:Version", script)
         self.assertIn('[[ ${#desired} -le 4096 ]]', script)
         self.assertNotRegex(
             workflow,
-            re.compile(r"(?m)^      (?:active_ready_.*|kms_.*):$"),
+            re.compile(r"(?m)^      (?:active_ready_.*|query_iam_.*|kms_.*):$"),
         )
 
     def test_script_orders_servers_before_ac_and_terminal_receipts_before_floor(self):

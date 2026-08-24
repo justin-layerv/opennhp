@@ -669,6 +669,7 @@ type sandboxStaleTargetJournalRuntime struct {
 	ServerProvenance             string                                   `json:"server_provenance"`
 	ServerRefreshOrchestratorSHA string                                   `json:"server_refresh_orchestrator_sha"`
 	SessionControlIAM            *sandboxSessionControlDeleteIAMAuthority `json:"session_control_delete_iam"`
+	SessionControlQueryIAMRef    *sandboxStaleTargetJournalRef            `json:"session_control_query_iam_ref,omitempty"`
 	SourceSHA                    string                                   `json:"source_sha"`
 }
 
@@ -940,21 +941,23 @@ func sandboxSessionControlDeleteIAMObjectIsClosed(value any) bool {
 
 func sandboxStaleTargetJournalObjectIsClosed(root map[string]any) bool {
 	runtime, ok := root["runtime"].(map[string]any)
-	oldRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
+	queryRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
 		"cell0", "cell1", "fence_drain", "fence_start", "predecessor_plan", "predecessor_plan_sha256",
 		"predecessor_targets", "preferences", "runtime_manifest", "server_provenance",
-		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha")
-	newRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
+		"server_refresh_orchestrator_sha", "session_control_delete_iam", "session_control_query_iam_ref", "source_sha")
+	newQueryRuntime := ok && sandboxExactObjectKeys(runtime, "ac", "ac_provenance", "build_run_attempt", "build_run_id",
 		"cell0", "cell1", "fence_drain", "fence_start", "predecessor_plan", "predecessor_plan_sha256",
 		"predecessor_targets", "preferences", "ready_predecessor_ref", "runtime_manifest", "server_provenance",
-		"server_refresh_orchestrator_sha", "session_control_delete_iam", "source_sha")
+		"server_refresh_orchestrator_sha", "session_control_delete_iam", "session_control_query_iam_ref", "source_sha")
 	predecessorPlanClosed := runtime["predecessor_plan"] != nil &&
 		sandboxStaleTargetPlanObjectIsClosed(runtime["predecessor_plan"]) &&
 		sandboxStaleTargetLedgerObjectIsClosed(runtime["predecessor_targets"])
 	predecessorTargets, predecessorTargetsOK := runtime["predecessor_targets"].([]any)
-	activeReadyPlanClosed := newRuntime && runtime["predecessor_plan"] == nil &&
+	activeReadyPlanClosed := newQueryRuntime && runtime["predecessor_plan"] == nil &&
 		runtime["predecessor_plan_sha256"] == "" && predecessorTargetsOK && len(predecessorTargets) == 0
-	if !ok || (!oldRuntime && !newRuntime) || (!predecessorPlanClosed && !activeReadyPlanClosed) ||
+	if !ok || (!queryRuntime && !newQueryRuntime) ||
+		(!predecessorPlanClosed && !activeReadyPlanClosed) ||
+		!sandboxExactObjectKeys(runtime["session_control_query_iam_ref"], "parameter", "sha256", "version") ||
 		!sandboxStaleTargetPlanObjectIsClosed(root["incident_plan"]) ||
 		!sandboxStaleTargetLedgerObjectIsClosed(root["incident_targets"]) ||
 		!sandboxSessionControlDeleteIAMObjectIsClosed(runtime["session_control_delete_iam"]) ||
@@ -962,7 +965,13 @@ func sandboxStaleTargetJournalObjectIsClosed(root map[string]any) bool {
 			"MinHealthyPercentage", "SkipMatching") {
 		return false
 	}
-	if newRuntime {
+	queryRef := runtime["session_control_query_iam_ref"].(map[string]any)
+	queryDigest, queryDigestOK := queryRef["sha256"].(string)
+	if queryRef["parameter"] != "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" ||
+		queryRef["version"] != json.Number("2") || !queryDigestOK || !sandboxExactHex(queryDigest, 32) {
+		return false
+	}
+	if newQueryRuntime {
 		if !sandboxExactObjectKeys(runtime["ready_predecessor_ref"], "parameter", "sha256", "version") {
 			return false
 		}

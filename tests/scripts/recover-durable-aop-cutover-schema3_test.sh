@@ -15,6 +15,9 @@ STALE_RETIREMENT_STATE_DIGEST=b972283f4d37bfa6b2d672b531a6d87a5ab305e0973d5a24d5
 IAM_HANDOFF_PREDECESSOR=e668a60b81f14b55278c83d0c79e4f760adeac29
 IAM_HANDOFF_STATE_DIGEST=1ffd68a2259e78a96363c884d2436f9106935363595f41569e117073bb2773f7
 IAM_HANDOFF_JOURNAL_DIGEST=52525f4c3e23cd6e68ce43852c1a1dcd1d25eb309a595066678c9aa93bb380b8
+QUERY_IAM_HANDOFF_PREDECESSOR=d4b6ee44c5407b839160569f86a17ad1ce67c6a2
+QUERY_IAM_HANDOFF_STATE_DIGEST=f8cf6f7e25d3c38f0c8eeb537bc9f4084b67124ff79105e5524f205ba7888edd
+QUERY_IAM_HANDOFF_JOURNAL_DIGEST=032d3a879ce9857c36cca5027741fa253ea5c81875b2aa59bdca56f91ffb821f
 MANIFEST=2895963905453d61874858171529968efe8e18e5450d41842854fd2784d1ec78
 OWNER="nhp:32635672597:durable-aop-cutover:${ORIGINAL}"
 ORIGINAL_STATE_DIGEST=e7ed20adde2ce9e143c9505027a73e415e5dd3d4a9d0c950c912d6398cc5d13e
@@ -47,6 +50,7 @@ export FAKE_ORIGINAL_STATE_RECORD=$WORK/original-state FAKE_ORIGINAL_LOCK_RECORD
 export FAKE_STATE_VERSION_FILE=$WORK/state-version
 export FAKE_JOURNAL_VERSION_FILE=$WORK/journal-version
 export FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE=$WORK/active-ready-journal-version
+export FAKE_QUERY_IAM_JOURNAL_VERSION_FILE=$WORK/query-iam-journal-version
 export FAKE_PREDECESSOR_ORPHAN_VERSION_FILE=$WORK/predecessor-orphan-version
 export FAKE_ORIGINAL=$ORIGINAL FAKE_REPAIR=$REPAIR FAKE_SERVER_DIGEST=$SERVER_DIGEST FAKE_AC_DIGEST=$AC_DIGEST
 export RUNTIME_SERVER_DIGEST RUNTIME_AC_DIGEST
@@ -135,7 +139,8 @@ case ${1:-} in
     printf 'verify-fence-drain\n' >>"$FAKE_ACTIONS"
     # Version 106 models fences that arrived after the exact v83/count-82
     # starting snapshot. Only the stable zero successor authorizes retirement.
-    directory_receipt 0 106 1787555000000 false 0 '' 0 0 "${FAKE_FENCE_DRAIN_CREATED_AT:-1787530000000}"
+    directory_receipt 0 "${FAKE_FENCE_DRAIN_VERSION:-106}" "${FAKE_FENCE_DRAIN_UPDATED_AT:-1787555000000}" \
+      false 0 '' 0 0 "${FAKE_FENCE_DRAIN_CREATED_AT:-1787530000000}"
     ;;
   snapshot-predecessors)
 		printf 'snapshot-predecessors\n' >>"$FAKE_ACTIONS"
@@ -302,6 +307,50 @@ esac
 EOF
 chmod +x "$WORK/helpers/delete-iam"
 
+cat >"$WORK/helpers/query-iam" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+keys='["AC#c1f4c688a88e7309e89533f7e95343901da66587f3bb03f98539a16fccf33be2","TARGET#2b6e9d783ef49c0df152d3a640d63b8846bb056b6ed1672fb27829ac340b85b1","TARGET#71844969e300ec3c25da593e211196c45a03736a57c3850a3bcfab30d5c005f1","TARGET#a8d6468608a3380b602b53c11365972843f0a4ecde6fd44e9aae6a97509e313b","TARGETWORK#2e858d866b8756b13117959015df2228a2f9582e24152035b5962b0142aa0420","TARGETWORK#316b00aa5b86de97fd481b7af9cb1ef1a6a432aba90a9c768c26b4bcd4ea4665","TARGETWORK#76dc3461739e82e34f454d811b88ac0e90e0bf4e2bdcf77b5f160b018975ac92"]'
+intent=$(jq -cnS --argjson keys "$keys" '{schema:"layerv.durable-aop-session-control-query-iam-intent.v1",
+  policy_arn:"arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data",
+  policy_id:"ANPA3FLD2UT62EB536PKL",policy_name:"nhp-sandbox-github-actions-terraform-apply-data",policy_path:"/",
+  attached_role:"nhp-sandbox-github-actions",attached_role_id:"AROA3FLD2UT6QBE2U53EL",
+  table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+  action:"dynamodb:Query",leading_keys:$keys,before_default_version:"v21",
+  before_versions:["v17","v18","v19","v20","v21"],
+  before_policy_sha256:"de72b914f4019aa10587414dd759bb4b46e2dcd1843d3183b913547c17129433",
+  prune_version:"v17",desired_default_version:"v22",desired_versions:["v18","v19","v20","v21","v22"],
+  desired_policy_sha256:"161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"}')
+receipt=$(jq -cnS --argjson keys "$keys" '{schema:"layerv.durable-aop-session-control-query-iam-receipt.v1",
+  policy_arn:"arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-apply-data",
+  policy_id:"ANPA3FLD2UT62EB536PKL",attached_role:"nhp-sandbox-github-actions",
+  attached_role_id:"AROA3FLD2UT6QBE2U53EL",
+  table_arn:"arn:aws:dynamodb:us-east-2:767397897469:table/layerv-nhp-sandbox-cell0-nhp-session-control",
+  action:"dynamodb:Query",leading_keys:$keys,default_version:"v22",
+  versions:["v18","v19","v20","v21","v22"],
+  policy_sha256:"161dc3acd79e1f63accca5df94da0c4deeebebe1271b202f648fcb853ba1f9ce"}')
+mode=$1; shift
+case "$mode" in
+  plan)
+    (($# == 0))
+    printf 'query-iam-plan\n' >>"$FAKE_ACTIONS"
+    printf '%s\n' "$intent"
+    ;;
+  apply|verify)
+    [[ "$1" == --intent-json && "$2" == "$intent" && $# == 2 ]]
+    printf 'query-iam-%s\n' "$mode" >>"$FAKE_ACTIONS"
+    if [[ "$mode" == verify && "${FAKE_QUERY_IAM_VERIFY_FAIL:-}" == true ]]; then exit 75; fi
+    if [[ "$mode" == apply && -n "${FAKE_QUERY_IAM_APPLY_FAIL_ONCE:-}" && ! -e "$FAKE_QUERY_IAM_APPLY_FAIL_ONCE" ]]; then
+      : >"$FAKE_QUERY_IAM_APPLY_FAIL_ONCE"
+      exit 75
+    fi
+    printf '%s\n' "$receipt"
+    ;;
+  *) exit 98 ;;
+esac
+EOF
+chmod +x "$WORK/helpers/query-iam"
+
 jq -cn --arg connector "$CONNECTOR" --arg controller "$RECOVERY" '
   {schema_version:1,phase:"pre_removal",repository:"layervai/qurl-connector",commit_sha:$connector,
    run_id:"901",run_attempt:"2",nhp_controller_run_id:"66",nhp_controller_run_attempt:"3",
@@ -444,7 +493,7 @@ decode_journal() {
 case "$svc/$op" in
   ssm/get-parameter)
     name=$(opt --name "$@"); query=$(opt --query "$@")
-    if [[ "$name" == */active-ready-predecessors* ]]; then
+    if [[ "$name" == */active-ready-predecessors* || "$name" == */session-control-query-iam* ]]; then
       [[ $# == 9 && $1 == --name && $2 == "$name" && $3 == --with-decryption &&
          $4 == --query && $5 == "$query" && $6 == --output && $7 == text &&
          $8 == --region && $9 == us-east-2 ]] || exit 99
@@ -456,6 +505,9 @@ case "$svc/$op" in
 			elif [[ "$name" == */active-ready-predecessors ]]; then
 				[[ -s "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" ]] || { echo ParameterNotFound >&2; exit 254; }
 				cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+			elif [[ "$name" == */session-control-query-iam ]]; then
+				[[ -s "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE" ]] || { echo ParameterNotFound >&2; exit 254; }
+				cat "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
 		elif [[ "$name" == */state ]]; then
         if [[ "${FAKE_STATE_VERSION_READ_ERROR:-}" == true ]]; then
           echo "injected state version read failure" >&2
@@ -473,7 +525,7 @@ case "$svc/$op" in
     ;;
   ssm/put-parameter)
     name=$(opt --name "$@"); value=$(opt --value "$@")
-    if [[ "$name" == */active-ready-predecessors ]]; then
+    if [[ "$name" == */active-ready-predecessors || "$name" == */session-control-query-iam ]]; then
       [[ $# == 11 && $1 == --name && $2 == "$name" && $3 == --value && $4 == "$value" &&
          $5 == --type && $6 == SecureString && $7 == --key-id && $8 == alias/aws/ssm &&
          ( $9 == --overwrite || $9 == --no-overwrite ) && ${10} == --region && ${11} == us-east-2 &&
@@ -509,8 +561,23 @@ case "$svc/$op" in
 				exit 75
 			fi
 		fi
-		if [[ "$name" == */stale-target-retirement || "$name" == */active-ready-predecessors ]]; then
-				if [[ "$name" == */active-ready-predecessors ]]; then version_file=$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE; else version_file=$FAKE_JOURNAL_VERSION_FILE; fi
+		if [[ "$name" == */stale-target-retirement &&
+		      -n "${FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE:-}" &&
+		      -s "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE" ]]; then
+			query_version=$(cat "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE")
+			decoded=$(decode_journal "$value")
+			if [[ "$(jq -r '.runtime.session_control_query_iam_ref.version // empty' <<<"$decoded")" == "$query_version" ]] &&
+			   ! grep -Fxq "$query_version" "$FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE" 2>/dev/null; then
+				# The exact Query-IAM subjournal successor committed first. The
+				# main journal may only adopt that operation-derived v1/v2 ref.
+				printf '%s\n' "$query_version" >>"$FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE"
+				exit 75
+			fi
+		fi
+		if [[ "$name" == */stale-target-retirement || "$name" == */active-ready-predecessors || "$name" == */session-control-query-iam ]]; then
+				if [[ "$name" == */active-ready-predecessors ]]; then version_file=$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE
+				elif [[ "$name" == */session-control-query-iam ]]; then version_file=$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE
+				else version_file=$FAKE_JOURNAL_VERSION_FILE; fi
 			version=0; [[ ! -s "$version_file" ]] || read -r version <"$version_file"
 				version=$((version + 1))
 				printf '%s\n' "$version" >"$version_file"
@@ -528,12 +595,19 @@ case "$svc/$op" in
       # later live handoff. Do not let a successor-authored fixture state land
       # on a version reserved for the exact v28 or v30 predecessor boundary.
       if [[ "${FAKE_SKIP_PINNED_HANDOFF_VERSIONS:-}" == true &&
-            ("$next_version" == 28 || "$next_version" == 30) ]]; then
+            ("$next_version" == 28 || "$next_version" == 30 || "$next_version" == 36) ]]; then
 		next_version=$((next_version + 1))
       fi
       printf '%s\n' "$next_version" >"$FAKE_STATE_VERSION_FILE"
     fi
 	    printf 'put\t%s\n' "$name" >>"$FAKE_ACTIONS"
+		if [[ "$name" == */session-control-query-iam && -n "${FAKE_QUERY_PUT_LOST_RESPONSE_FILE:-}" ]]; then
+			query_version=$(cat "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE")
+			if ! grep -Fxq "$query_version" "$FAKE_QUERY_PUT_LOST_RESPONSE_FILE" 2>/dev/null; then
+				printf '%s\n' "$query_version" >>"$FAKE_QUERY_PUT_LOST_RESPONSE_FILE"
+				exit 75
+			fi
+		fi
 		if [[ "$name" == */state && -n "${FAKE_IAM_BOUNDARY_SNAPSHOT_DIR:-}" &&
 		      "$(jq -r '.repair.stale_target_retirement_ref // empty' <<<"$value")" != "" ]]; then
 			ref=$(jq -r .repair.stale_target_retirement_ref.version <<<"$value")
@@ -544,6 +618,7 @@ case "$svc/$op" in
 			incident_retired=$(jq -r '[.incident_targets[] | select(.status=="retired")] | length' <<<"$decoded")
 			predecessor_retired=$(jq -r '[.runtime.predecessor_targets[] | select(.status=="retired")] | length' <<<"$decoded")
 			active_ref=$(jq -cS '.runtime.ready_predecessor_ref // empty' <<<"$decoded")
+			query_ref=$(jq -cS '.runtime.session_control_query_iam_ref // empty' <<<"$decoded")
 			active_retired=0
 			if [[ -n "$active_ref" ]]; then
 				active_version=$(jq -r .version <<<"$active_ref")
@@ -561,6 +636,13 @@ case "$svc/$op" in
 			if [[ -n "$active_ref" ]]; then
 				printf '%s\n' "$active_envelope" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.active-ready-journal"
 				printf '%s\n' "$active_version" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.active-ready-journal-version"
+			fi
+			if [[ -n "$query_ref" ]]; then
+				query_version=$(jq -r .version <<<"$query_ref")
+				query_envelope=$(awk -F '\t' -v n="/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:${query_version}" \
+					'$1==n {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+				printf '%s\n' "$query_envelope" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.query-iam-journal"
+				printf '%s\n' "$query_version" >"$FAKE_IAM_BOUNDARY_SNAPSHOT_DIR/$key.query-iam-journal-version"
 			fi
 		fi
 			if [[ "$name" == */state && -s "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE" ]]; then
@@ -582,13 +664,20 @@ case "$svc/$op" in
     ;;
   ssm/describe-parameters)
     [[ $# == 8 && $1 == --parameter-filters &&
-       $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors' &&
+       ( $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors' ||
+         $2 == 'Key=Name,Option=Equals,Values=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam' ) &&
        $3 == --query && $4 == 'Parameters[].{Name:Name,Type:Type,KeyId:KeyId,Tier:Tier,DataType:DataType,Version:Version}' &&
        $5 == --output && $6 == json && $7 == --region && $8 == us-east-2 ]] || exit 99
-    [[ -s "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" ]] || exit 254
-    version=$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")
+    parameter=${2##*Values=}
+    if [[ "$parameter" == */active-ready-predecessors ]]; then
+      version_file=$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE; metadata_mode=${FAKE_ACTIVE_METADATA_MODE:-exact}
+    else
+      version_file=$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE; metadata_mode=${FAKE_QUERY_METADATA_MODE:-exact}
+    fi
+    [[ -s "$version_file" ]] || exit 254
+    version=$(cat "$version_file")
     type=SecureString key=alias/aws/ssm tier=Standard data_type=text
-    case ${FAKE_ACTIVE_METADATA_MODE:-exact} in
+    case $metadata_mode in
       exact) ;;
       wrong_type) type=String ;;
       wrong_key) key=alias/other ;;
@@ -596,11 +685,11 @@ case "$svc/$op" in
       wrong_data_type) data_type=other ;;
       wrong_version) version=$((version + 1)) ;;
       missing) printf '[]\n'; exit 0 ;;
-      extra) jq -cn --arg version "$version" '[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]'; exit 0 ;;
+      extra) jq -cn --arg name "$parameter" --arg version "$version" '[{Name:$name,Type:"SecureString",KeyId:"alias/aws/ssm",Tier:"Standard",DataType:"text",Version:($version|tonumber),Unknown:true}]'; exit 0 ;;
       *) exit 98 ;;
     esac
-    jq -cn --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
-      '[{Name:"/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors",Type:$type,
+    jq -cn --arg name "$parameter" --arg type "$type" --arg key "$key" --arg tier "$tier" --arg data "$data_type" --arg version "$version" \
+      '[{Name:$name,Type:$type,
         KeyId:$key,Tier:$tier,DataType:$data,Version:($version|tonumber)}]'
     ;;
   ssm/delete-parameter)
@@ -996,7 +1085,7 @@ seed() {
   : >"$FAKE_ACTIONS"
   : >"$FAKE_PROVENANCE_CALLS"
   rm -f "$FAKE_STATE_VERSION_FILE" "$FAKE_JOURNAL_VERSION_FILE" "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" \
-    "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
+    "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE" "$FAKE_PREDECESSOR_ORPHAN_VERSION_FILE"
   jq -cn --arg image "$ORIGINAL" --arg owner "$OWNER" '
     {schema:2,image:$image,orchestrator_sha:$image,lock_owner:$owner,phase:"old_servers_terminated",
      ac:{old_color:"blue",new_color:"green",old_asg:"layerv-nhp-sandbox-ac",new_asg:"layerv-nhp-sandbox-ac-green",old_min:3,old_max:3,old_desired:3,new_attestation:("v2|durable-aop-v1|"+$image+"|layerv/nhp-ac|sha256:2e38672ef7680c60521694c3f2a59e9a74ed8f2d56bfe1fb41a97f3040b4e279|layerv-nhp-sandbox-ac-green")},
@@ -1036,6 +1125,10 @@ decode_fixture_journal() {
 
 encode_fixture_journal() {
 	python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-stale-target-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
+}
+
+encode_query_iam_fixture_journal() {
+	python3 -c 'import base64,gzip,json,sys; raw=sys.stdin.buffer.read(); json.loads(raw); print(json.dumps({"encoding":"gzip-base64","payload":base64.b64encode(gzip.compress(raw,9,mtime=0)).decode(),"schema":"layerv.durable-aop-session-control-query-iam-journal-envelope.v1"},sort_keys=True,separators=(",",":")))'
 }
 
 read_fixture_journal() {
@@ -1156,8 +1249,23 @@ seed_live_iam_handoff() {
   printf '6\n' >"$FAKE_JOURNAL_VERSION_FILE"
 }
 
+seed_live_query_iam_handoff() {
+  local state envelope
+  seed_live_iam_handoff
+  state=$(jq -cS . "$ROOT/tests/fixtures/sandbox-schema3-query-iam-state-v36.json")
+  envelope=$(jq -cS . "$ROOT/tests/fixtures/sandbox-schema3-query-iam-journal-v14.json")
+  [[ "$(printf '%s' "$state" | sha256sum | awk '{print $1}')" == "$QUERY_IAM_HANDOFF_STATE_DIGEST" ]]
+  [[ "$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')" == "$QUERY_IAM_HANDOFF_JOURNAL_DIGEST" ]]
+  [[ "$(printf '%s' "$envelope" | decode_fixture_journal | jq -r .status)" == incident_complete ]]
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$envelope"
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:14 "$envelope"
+  printf '36\n' >"$FAKE_STATE_VERSION_FILE"
+  printf '14\n' >"$FAKE_JOURNAL_VERSION_FILE"
+}
+
 restore_iam_boundary() {
-	local key=$1 state envelope journal_version state_version active_envelope active_version
+	local key=$1 state envelope journal_version state_version active_envelope active_version query_envelope query_version
 	state=$(cat "$WORK/iam-boundaries/$key.state")
 	envelope=$(cat "$WORK/iam-boundaries/$key.journal")
 	journal_version=$(cat "$WORK/iam-boundaries/$key.journal-version")
@@ -1179,6 +1287,11 @@ restore_iam_boundary() {
 		mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
 		rm -f "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
 	fi
+	query_envelope=$(cat "$WORK/iam-boundaries/$key.query-iam-journal")
+	query_version=$(cat "$WORK/iam-boundaries/$key.query-iam-journal-version")
+	set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam "$query_envelope"
+	set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:${query_version}" "$query_envelope"
+	printf '%s\n' "$query_version" >"$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
 	set_fixture_param /sandbox/nhp/ac/green-image-tag "$RUNTIME_AC_SELECTOR"
 	set_fixture_param /sandbox/nhp/ac/green-protocol-profile "v1|durable-aop-v1|${RUNTIME}"
 	set_fixture_param /sandbox/nhp/ac/green-prepared-slot-attestation \
@@ -1196,6 +1309,7 @@ invoke() {
     CUTOVER_OWNER_PROJECTOR_SCRIPT=$WORK/helpers/owner \
     CUTOVER_STALE_TARGET_RETIRE_SCRIPT=$WORK/helpers/stale-retire \
     CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT=$WORK/helpers/delete-iam \
+    CUTOVER_SESSION_CONTROL_QUERY_IAM_SCRIPT=$WORK/helpers/query-iam \
     FAKE_METRIC_HELPER=$ROOT/.github/scripts/emit-deployment-window-metric.sh \
     CUTOVER_WAIT_REFRESH_SCRIPT=${FAKE_WAIT_HELPER:-$WORK/helpers/wait} CUTOVER_STABILITY_SECONDS=1 \
     CUTOVER_CUSTOMER_LIFECYCLE_RUN_ID=${LIFECYCLE_RUN_ID:-} CUTOVER_CUSTOMER_LIFECYCLE_RUN_ATTEMPT=${LIFECYCLE_RUN_ATTEMPT:-} \
@@ -1657,7 +1771,8 @@ if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; 
 # create the floor, or release the hard lock.
 for boundary in ac_intent-i3-p0-r0 ac_refreshing-i3-p0-r0 ready_predecessor_retiring-i3-p0-r0 \
   ready_predecessor_retiring-i3-p0-r1 ready_predecessor_retiring-i3-p0-r2; do
-  for suffix in state journal journal-version state-version active-ready-journal active-ready-journal-version; do
+  for suffix in state journal journal-version state-version active-ready-journal active-ready-journal-version \
+    query-iam-journal query-iam-journal-version; do
     [[ -s "$WORK/iam-boundaries/$boundary.$suffix" ]] || {
       echo "missing production-shaped IAM crash-boundary snapshot: $boundary.$suffix" >&2
       exit 1
@@ -1682,6 +1797,189 @@ for boundary in ac_intent-i3-p0-r0 ac_refreshing-i3-p0-r0 ready_predecessor_reti
   grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
   if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
 done
+
+# The live Query-IAM stop is exact schema-3 state v36/main journal v14 with
+# d4b6 authority, the original hard lock, no floor, and both encrypted
+# subjournals absent. The next controller first creates Query v1, then commits
+# main v15 and state v37 before it may prune policy v17 or create v22.
+export FAKE_FENCE_DRAIN_VERSION=250 FAKE_FENCE_DRAIN_CREATED_AT=1787485637766 \
+  FAKE_FENCE_DRAIN_UPDATED_AT=1787571729992
+seed_live_query_iam_handoff
+: >"$FAKE_ACTIONS"
+export FAKE_QUERY_IAM_APPLY_FAIL_ONCE=$WORK/query-iam-apply-failed
+rm -f "$FAKE_QUERY_IAM_APPLY_FAIL_ONCE"
+if query_handoff_output=$(invoke 2>&1); then
+  echo "exact v36 Query-IAM handoff unexpectedly passed the injected apply stop: $query_handoff_output" >&2
+  exit 1
+fi
+state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+[[ "$(cat "$FAKE_STATE_VERSION_FILE")" == 37 && "$(jq -r .repair.orchestrator_sha <<<"$state")" == "$RECOVERY" ]]
+[[ "$(jq -r .repair.stale_target_retirement_ref.version <<<"$state")" == 15 ]]
+journal=$(read_fixture_journal)
+[[ "$(jq -r .status <<<"$journal")" == query_iam_preparing &&
+   "$(jq -r .runtime.session_control_query_iam_ref.version <<<"$journal")" == 1 ]]
+query_envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+query_journal=$(printf '%s' "$query_envelope" | decode_fixture_journal)
+[[ "$(jq -r .status <<<"$query_journal")" == preparing && "$(jq -r .receipt <<<"$query_journal")" == null ]]
+query_plan_line=$(grep -n '^query-iam-plan$' "$FAKE_ACTIONS" | cut -d: -f1)
+query_put_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam$' "$FAKE_ACTIONS" | cut -d: -f1)
+main_put_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement$' "$FAKE_ACTIONS" | cut -d: -f1)
+state_put_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/state$' "$FAKE_ACTIONS" | cut -d: -f1)
+query_apply_line=$(grep -n '^query-iam-apply$' "$FAKE_ACTIONS" | cut -d: -f1)
+[[ "$query_plan_line" -lt "$query_put_line" && "$query_put_line" -lt "$main_put_line" &&
+   "$main_put_line" -lt "$state_put_line" && "$state_put_line" -lt "$query_apply_line" ]] || {
+  echo "Query IAM mutation ran before its exact three-layer intent" >&2
+  exit 1
+}
+if grep -Eq $'^(snapshot-active-ready-predecessors|latch-active-ready|refresh\tlayerv-nhp-sandbox-ac-green|retire-active-ready)' "$FAKE_ACTIONS"; then
+  echo "v36 Query IAM stop reached ACTIVE snapshot, latch, AC refresh, or retirement" >&2
+  exit 1
+fi
+cp "$FAKE_PARAMS" "$WORK/params.query-preparing"
+cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.query-preparing"
+cp "$FAKE_JOURNAL_VERSION_FILE" "$WORK/journal-version.query-preparing"
+cp "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE" "$WORK/query-iam-journal-version.query-preparing"
+grep -q '/layerv-nhp-sandbox/qurl-live-env-lock' "$FAKE_PARAMS"
+if grep -q '/sandbox/nhp/minimum-protocol-profile' "$FAKE_PARAMS"; then exit 1; fi
+
+unset FAKE_QUERY_IAM_APPLY_FAIL_ONCE
+if ! query_output=$(invoke 2>&1); then
+  echo "exact v36 Query-IAM replay did not converge: $query_output" >&2
+  exit 1
+fi
+grep -q 'reached repaired+owner_ready' <<<"$query_output"
+journal=$(read_fixture_journal)
+[[ "$(jq -r .status <<<"$journal")" == complete &&
+   "$(jq -r .runtime.session_control_query_iam_ref.version <<<"$journal")" == 2 ]]
+query_envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+query_journal=$(printf '%s' "$query_envelope" | decode_fixture_journal)
+[[ "$(jq -r .status <<<"$query_journal")" == ready && "$(jq -r .receipt.default_version <<<"$query_journal")" == v22 ]]
+[[ "$(grep -c '^query-iam-plan$' "$FAKE_ACTIONS")" == 1 && "$(grep -c '^query-iam-apply$' "$FAKE_ACTIONS")" == 2 ]]
+query_ready_put_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
+query_ready_main_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
+query_ready_state_line=$(grep -n $'^put\t/sandbox/nhp/cutovers/durable-aop-v1/state$' "$FAKE_ACTIONS" | sed -n '2p' | cut -d: -f1)
+snapshot_ready_line=$(grep -n '^snapshot-active-ready-predecessors$' "$FAKE_ACTIONS" | cut -d: -f1)
+[[ "$query_ready_put_line" -lt "$query_ready_main_line" && "$query_ready_main_line" -lt "$query_ready_state_line" &&
+   "$query_ready_state_line" -lt "$snapshot_ready_line" ]] || {
+  echo "ACTIVE snapshot ran before the exact Query v2/main/state receipt" >&2
+  exit 1
+}
+cp "$FAKE_PARAMS" "$WORK/params.query-handoff-current"
+cp "$FAKE_STATE_VERSION_FILE" "$WORK/state-version.query-handoff-current"
+cp "$FAKE_JOURNAL_VERSION_FILE" "$WORK/journal-version.query-handoff-current"
+cp "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" "$WORK/active-ready-journal-version.query-handoff-current"
+cp "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE" "$WORK/query-iam-journal-version.query-handoff-current"
+
+# Query subjournal metadata or live policy drift at the terminal replay is
+# read-only and cannot reach any SSM, ASG, DDB, floor, or lock mutation.
+for metadata_mode in wrong_type wrong_key wrong_tier wrong_data_type wrong_version missing extra; do
+  cp "$WORK/params.query-handoff-current" "$FAKE_PARAMS"
+  cp "$WORK/state-version.query-handoff-current" "$FAKE_STATE_VERSION_FILE"
+  cp "$WORK/journal-version.query-handoff-current" "$FAKE_JOURNAL_VERSION_FILE"
+  cp "$WORK/active-ready-journal-version.query-handoff-current" "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+  cp "$WORK/query-iam-journal-version.query-handoff-current" "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
+  export FAKE_QUERY_METADATA_MODE=$metadata_mode
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "Query IAM parameter metadata drift was accepted: $metadata_mode" >&2
+    exit 1
+  fi
+  if grep -Eq $'^(put\t|delete\t|refresh\t|snapshot-active-ready|latch-active-ready|retire)' "$FAKE_ACTIONS"; then
+    echo "Query IAM metadata drift reached a mutation: $metadata_mode" >&2
+    exit 1
+  fi
+done
+unset FAKE_QUERY_METADATA_MODE
+
+# With main/state still referencing Query v1, current Query v2 is accepted only
+# when it is the one exact operation-derived ready receipt. Wrong operation,
+# field ordering, receipt bytes, extra fields, and N+2 all fail before IAM or
+# any durable/runtime mutation.
+for orphan_mutation in wrong_action wrong_key_order wrong_receipt extra_field null_receipt n_plus_2; do
+  cp "$WORK/params.query-preparing" "$FAKE_PARAMS"
+  cp "$WORK/state-version.query-preparing" "$FAKE_STATE_VERSION_FILE"
+  cp "$WORK/journal-version.query-preparing" "$FAKE_JOURNAL_VERSION_FILE"
+  cp "$WORK/query-iam-journal-version.query-preparing" "$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
+  ready_envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" {print substr($0,index($0,"\t")+1)}' \
+    "$WORK/params.query-handoff-current")
+  ready_journal=$(printf '%s' "$ready_envelope" | decode_fixture_journal)
+  case "$orphan_mutation" in
+    wrong_action) ready_journal=$(jq -cS '.receipt.action="dynamodb:Scan"' <<<"$ready_journal") ;;
+    wrong_key_order) ready_journal=$(jq -cS '.receipt.leading_keys |= reverse' <<<"$ready_journal") ;;
+    wrong_receipt) ready_journal=$(jq -cS '.receipt.policy_sha256=("9"*64)' <<<"$ready_journal") ;;
+    extra_field) ready_journal=$(jq -cS '.receipt.extra=true' <<<"$ready_journal") ;;
+    null_receipt) ready_journal=$(jq -cS '.receipt=null' <<<"$ready_journal") ;;
+    n_plus_2) ;;
+  esac
+  ready_envelope=$(printf '%s' "$ready_journal" | encode_query_iam_fixture_journal)
+  successor=2
+  [[ "$orphan_mutation" != n_plus_2 ]] || successor=3
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam "$ready_envelope"
+  set_fixture_param "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam:${successor}" "$ready_envelope"
+  printf '%s\n' "$successor" >"$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "non-exact unreferenced Query journal successor was accepted: $orphan_mutation" >&2
+    exit 1
+  fi
+  if grep -Eq $'^(query-iam-|put\t|delete\t|refresh\t|snapshot-active-ready|latch-active-ready|retire)' "$FAKE_ACTIONS"; then
+    echo "non-exact Query successor reached an action: $orphan_mutation" >&2
+    exit 1
+  fi
+done
+
+# The exact v36/journal-v14 predecessor cannot be approximated or self-select
+# the successor. Every source/ref/version/lock/subjournal mutation rejects
+# before Query planning, IAM mutation, SSM writes, ACTIVE snapshot, or refresh.
+for mutation in state_bytes state_version ref_digest journal_bytes journal_version missing_lock changed_lock \
+  floor_present query_preexisting active_preexisting third_stored predecessor_current; do
+  seed_live_query_iam_handoff
+  state=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/state" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+  unset INVOKE_RECOVERY_SHA
+  case "$mutation" in
+    state_bytes) state=$(jq -c '.repair.ac_refresh_id="changed-refresh"' <<<"$state") ;;
+    state_version) printf '37\n' >"$FAKE_STATE_VERSION_FILE" ;;
+    ref_digest) state=$(jq -c '.repair.stale_target_retirement_ref.sha256=("9"*64)' <<<"$state") ;;
+    journal_bytes)
+      envelope=$(awk -F '\t' '$1=="/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      mutated=$(printf '%s' "$envelope" | decode_fixture_journal | jq -cS '.status="query_iam_preparing"' | encode_fixture_journal)
+      set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement "$mutated"
+      set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement:14 "$mutated"
+      ;;
+    journal_version) printf '15\n' >"$FAKE_JOURNAL_VERSION_FILE" ;;
+    missing_lock)
+      awk -F '\t' '$1!="/layerv-nhp-sandbox/qurl-live-env-lock"' "$FAKE_PARAMS" >"$FAKE_PARAMS.tmp"
+      mv "$FAKE_PARAMS.tmp" "$FAKE_PARAMS"
+      ;;
+    changed_lock)
+      lock=$(awk -F '\t' '$1=="/layerv-nhp-sandbox/qurl-live-env-lock" {print substr($0,index($0,"\t")+1)}' "$FAKE_PARAMS")
+      set_fixture_param /layerv-nhp-sandbox/qurl-live-env-lock "$(jq -c '.created_at += 1' <<<"$lock")"
+      ;;
+    floor_present) set_fixture_param /sandbox/nhp/minimum-protocol-profile durable-aop-v1 ;;
+    query_preexisting)
+      set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam '{}'
+      printf '1\n' >"$FAKE_QUERY_IAM_JOURNAL_VERSION_FILE"
+      ;;
+    active_preexisting)
+      set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors '{}'
+      printf '1\n' >"$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE"
+      ;;
+    third_stored) state=$(jq -c '.repair.orchestrator_sha=("9"*40)' <<<"$state") ;;
+    predecessor_current) export INVOKE_RECOVERY_SHA=$QUERY_IAM_HANDOFF_PREDECESSOR ;;
+  esac
+  set_fixture_param /sandbox/nhp/cutovers/durable-aop-v1/state "$state"
+  : >"$FAKE_ACTIONS"
+  if invoke >/dev/null 2>&1; then
+    echo "mutated exact v36/journal-v14 Query handoff was accepted: $mutation" >&2
+    exit 1
+  fi
+  if grep -Eq $'^(query-iam-|put\t|delete\t|refresh\t|snapshot-active-ready|latch-active-ready|retire)' "$FAKE_ACTIONS"; then
+    echo "mutated exact v36/journal-v14 Query handoff reached an action: $mutation" >&2
+    exit 1
+  fi
+done
+unset INVOKE_RECOVERY_SHA
+unset FAKE_FENCE_DRAIN_VERSION FAKE_FENCE_DRAIN_CREATED_AT FAKE_FENCE_DRAIN_UPDATED_AT
 
 # Every mutation of the exact v28/state, v6 journal, hard lock, or absent floor
 # fails before IAM planning, policy mutation, fence drain, target retirement,
@@ -1744,9 +2042,12 @@ seed_live_stale_retirement_handoff
 : >"$FAKE_ACTIONS"
 export FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE=$WORK/journal-state-crash-versions
 export FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE=$WORK/active-journal-main-ref-crash-versions
+export FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE=$WORK/query-journal-main-ref-crash-versions
+export FAKE_QUERY_PUT_LOST_RESPONSE_FILE=$WORK/query-journal-put-lost-responses
 export FAKE_SKIP_PINNED_HANDOFF_VERSIONS=true
 rm -f "$FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE" \
-  "$FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE"
+  "$FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE" "$FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE"
+rm -f "$FAKE_QUERY_PUT_LOST_RESPONSE_FILE"
 journal_crash_attempts=0
 journal_crash_complete=false
 while (( journal_crash_attempts < 80 )); do
@@ -1766,6 +2067,8 @@ while (( journal_crash_attempts < 80 )); do
 done
 unset FAKE_FAIL_STATE_ONCE_PER_JOURNAL_VERSION_FILE
 unset FAKE_FAIL_MAIN_REF_ONCE_PER_ACTIVE_VERSION_FILE
+unset FAKE_FAIL_MAIN_REF_ONCE_PER_QUERY_VERSION_FILE
+unset FAKE_QUERY_PUT_LOST_RESPONSE_FILE
 unset FAKE_SKIP_PINNED_HANDOFF_VERSIONS
 	[[ "$journal_crash_complete" == true ]] || {
 		echo "journal-put-before-state crash sequence did not converge after $journal_crash_attempts attempts at state $(cat "$FAKE_STATE_VERSION_FILE" 2>/dev/null || true), main journal $(cat "$FAKE_JOURNAL_VERSION_FILE" 2>/dev/null || true), ACTIVE journal $(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE" 2>/dev/null || true): $journal_crash_output" >&2; exit 1;
@@ -1777,8 +2080,13 @@ journal=$(read_fixture_journal)
    "$(jq -r .status <<<"$journal")" == complete &&
    "$(wc -l <"$WORK/journal-state-crash-versions" | tr -d ' ')" == "$journal_version" &&
    "$(wc -l <"$WORK/active-journal-main-ref-crash-versions" | tr -d ' ')" == \
-     "$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")" ]] || {
+     "$(cat "$FAKE_ACTIVE_READY_JOURNAL_VERSION_FILE")" &&
+   "$(sort -n -u "$WORK/query-journal-main-ref-crash-versions" | tr '\n' ' ')" == '1 2 ' ]] || {
 	echo "not every journal update was recovered through its exact state-reference crash boundary" >&2; exit 1;
+}
+[[ "$(sort -n -u "$WORK/query-journal-put-lost-responses" | tr '\n' ' ')" == '1 2 ' ]] || {
+  echo "Query IAM SSM put lost-response classification did not exercise exact v1/v2" >&2
+  exit 1
 }
 [[ "$(jq -r .runtime.fence_start.active_fence_count <<<"$journal")" == 82 &&
    "$(jq -r .runtime.fence_start.version <<<"$journal")" == 83 &&

@@ -167,6 +167,11 @@ func sandboxRecoveryJournalAuthorityWithTargets(t *testing.T, targetStatuses []s
 			PredecessorTargets:           predecessorTargets,
 			ServerRefreshOrchestratorSHA: orchestrator,
 			SessionControlIAM:            sandboxRecoverySessionControlIAMAuthority(),
+			SessionControlQueryIAMRef: &sandboxStaleTargetJournalRef{
+				Parameter: "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam",
+				Version:   2,
+				SHA256:    strings.Repeat("b", 64),
+			},
 		},
 	}
 	journalJSON := canonicalSandboxRecoveryJSON(t, journal)
@@ -858,6 +863,42 @@ func TestSandboxJournaledPredecessorRequiresExactReadySessionControlIAMAuthority
 			}
 			if len(fake.gets) != 0 || len(fake.transactions) != 0 {
 				t.Fatalf("IAM authority rejection reached DynamoDB: gets=%d transactions=%d", len(fake.gets), len(fake.transactions))
+			}
+		})
+	}
+}
+
+func TestSandboxJournaledPredecessorRequiresExactReadySessionControlQueryIAMAuthority(t *testing.T) {
+	baseState, _, baseHistorical, _ := sandboxRecoveryJournalAuthority(t, "pending", "predecessor_retiring")
+	queryRef := func(value map[string]any) map[string]any {
+		return value["runtime"].(map[string]any)["session_control_query_iam_ref"].(map[string]any)
+	}
+	tests := map[string]func(map[string]any){
+		"authority missing": func(value map[string]any) {
+			delete(value["runtime"].(map[string]any), "session_control_query_iam_ref")
+		},
+		"authority extra field": func(value map[string]any) { queryRef(value)["extra"] = true },
+		"wrong parameter": func(value map[string]any) {
+			queryRef(value)["parameter"] = "/sandbox/nhp/cutovers/durable-aop-v1/other"
+		},
+		"preparing version": func(value map[string]any) { queryRef(value)["version"] = json.Number("1") },
+		"future version":    func(value map[string]any) { queryRef(value)["version"] = json.Number("3") },
+		"invalid digest":    func(value map[string]any) { queryRef(value)["sha256"] = strings.Repeat("g", 64) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			historical := mutateSandboxRecoveryJournal(t, baseHistorical, mutate)
+			state := baseState
+			state.Value = mutateSandboxRecoveryJSON(t, state.Value, func(value map[string]any) {
+				value["repair"].(map[string]any)["stale_target_retirement_ref"].(map[string]any)["sha256"] = sandboxCanonicalDigest(historical.Value)
+			})
+			fake := newSessionControlSessionDynamoFake()
+			if _, err := retireSandboxJournaledPredecessorWithClient(context.Background(), fake, "predecessor-1",
+				state, historical, historical, time.Now); err == nil {
+				t.Fatal("non-exact recovery-role Query IAM authority was accepted")
+			}
+			if len(fake.gets) != 0 || len(fake.transactions) != 0 {
+				t.Fatalf("Query IAM authority rejection reached DynamoDB: gets=%d transactions=%d", len(fake.gets), len(fake.transactions))
 			}
 		})
 	}

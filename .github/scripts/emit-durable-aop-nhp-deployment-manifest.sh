@@ -26,9 +26,12 @@ STATE_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/state
 STALE_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/stale-target-retirement
 ACTIVE_READY_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors
 ACTIVE_READY_JOURNAL_KMS_KEY=alias/aws/ssm
+QUERY_IAM_JOURNAL_PARAM=/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam
+QUERY_IAM_JOURNAL_KMS_KEY=alias/aws/ssm
 LOCK_PARAM=/layerv-nhp-sandbox/qurl-live-env-lock
 OWNER_PROJECTOR=${CUTOVER_OWNER_PROJECTOR_SCRIPT:-$ROOT/terraform/scripts/project-qurl-sharing-customer-tier.py}
 SESSION_CONTROL_DELETE_IAM=${CUTOVER_SESSION_CONTROL_DELETE_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-delete-iam.py}
+SESSION_CONTROL_QUERY_IAM=${CUTOVER_SESSION_CONTROL_QUERY_IAM_SCRIPT:-$ROOT/.github/scripts/apply-durable-aop-session-control-query-iam.py}
 OWNER_CLIENT_ID=oScYkXhLitBPO6gBjxo4Rwyw37AdoNPy
 OWNER_SUBJECT=${OWNER_CLIENT_ID}@clients
 OWNER_EMAIL=oscykxhlitbpo6gbjxo4rwyw37adonpy-clients@machine.notify.layerv.xyz
@@ -111,6 +114,20 @@ require_active_ready_parameter_metadata() {
       .DataType == "text" and .Version == $version)
   ' >/dev/null <<<"$metadata"
 }
+require_query_iam_parameter_metadata() {
+  local expected_version=$1 metadata
+  metadata=$(aws ssm describe-parameters --parameter-filters \
+    "Key=Name,Option=Equals,Values=${QUERY_IAM_JOURNAL_PARAM}" --output json --region "$AWS_REGION")
+  jq -e --arg name "$QUERY_IAM_JOURNAL_PARAM" --arg key "$QUERY_IAM_JOURNAL_KMS_KEY" \
+    --argjson version "$expected_version" '
+    type == "object" and (keys | sort) == ["Parameters"] and (.Parameters | type == "array" and length == 1) and
+    (.Parameters[0] | type == "object" and
+      ((keys - ["ARN","LastModifiedDate","LastModifiedUser","Policies","Version"]) | sort) ==
+        ["DataType","KeyId","Name","Tier","Type"] and
+      .Name == $name and .Type == "SecureString" and .KeyId == $key and .Tier == "Standard" and
+      .DataType == "text" and .Version == $version)
+  ' >/dev/null <<<"$metadata"
+}
 get_optional() { bash "$ROOT/scripts/ssm-read-optional.sh" "$1"; }
 slot_image_param() { [[ "$3" == green ]] && printf '/%s/nhp/%s/green-image-tag\n' "$1" "$2" || printf '/%s/nhp/%s/image-tag\n' "$1" "$2"; }
 slot_asg_param() { [[ "$3" == green ]] && printf '/%s/nhp/%s/green-asg-name\n' "$1" "$2" || printf '/%s/nhp/%s/asg-name\n' "$1" "$2"; }
@@ -148,6 +165,19 @@ decode_active_ready_journal() {
 import base64, gzip, json, sys
 raw = sys.stdin.buffer.read(); value = json.loads(raw)
 if set(value) != {"encoding", "payload", "schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-active-ready-predecessor-journal-envelope.v1": raise SystemExit(1)
+if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw: raise SystemExit(1)
+decoded = gzip.decompress(base64.b64decode(value["payload"], validate=True))
+if len(decoded) > 65536: raise SystemExit(1)
+parsed = json.loads(decoded)
+if json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode() != decoded: raise SystemExit(1)
+sys.stdout.buffer.write(decoded)
+'
+}
+decode_query_iam_journal() {
+  printf '%s' "$1" | python3 -c '
+import base64, gzip, json, sys
+raw = sys.stdin.buffer.read(); value = json.loads(raw)
+if set(value) != {"encoding", "payload", "schema"} or value["encoding"] != "gzip-base64" or value["schema"] != "layerv.durable-aop-session-control-query-iam-journal-envelope.v1": raise SystemExit(1)
 if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw: raise SystemExit(1)
 decoded = gzip.decompress(base64.b64decode(value["payload"], validate=True))
 if len(decoded) > 65536: raise SystemExit(1)
@@ -333,7 +363,7 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
     ($j.runtime | type == "object" and (keys | sort) ==
       ["ac","ac_provenance","build_run_attempt","build_run_id","cell0","cell1","fence_drain","fence_start",
        "predecessor_plan","predecessor_plan_sha256","predecessor_targets","preferences","ready_predecessor_ref","runtime_manifest",
-       "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","source_sha"]) and
+       "server_provenance","server_refresh_orchestrator_sha","session_control_delete_iam","session_control_query_iam_ref","source_sha"]) and
     $j.runtime.source_sha == $runtime_source and $j.runtime.runtime_manifest == $runtime_manifest and
     $j.runtime.build_run_id == $runtime_build and $j.runtime.build_run_attempt == $runtime_attempt and
     ($j.runtime.server_provenance | type == "string") and ($j.runtime.ac_provenance | type == "string") and
@@ -345,6 +375,10 @@ jq -e --arg stale_source_version "$APPROVED_STALE_SOURCE_STATE_VERSION" \
       .parameter == "/sandbox/nhp/cutovers/durable-aop-v1/active-ready-predecessors" and
       (.version | type == "number" and . > 0 and floor == .) and
       (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+    ($j.runtime.session_control_query_iam_ref | type == "object" and
+      (keys | sort) == ["parameter","sha256","version"] and
+      .parameter == "/sandbox/nhp/cutovers/durable-aop-v1/session-control-query-iam" and
+      .version == 2 and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
     ([ $j.runtime.cell0, $j.runtime.cell1, $j.runtime.ac ] | all(
       type == "object" and (keys | sort) == ["asg","attestation","intent_sha256","prior_refresh_id","refresh_id"] and
       (.intent_sha256 | test("^[0-9a-f]{64}$")) and
@@ -358,6 +392,30 @@ IAM_RECEIPT=$(jq -cS .runtime.session_control_delete_iam.receipt <<<"$JOURNAL")
 [[ "$(jq -r .runtime.session_control_delete_iam.status <<<"$JOURNAL")" == ready &&
    "$($SESSION_CONTROL_DELETE_IAM verify --intent-json "$IAM_INTENT" | jq -cS .)" == "$IAM_RECEIPT" ]] || {
   echo "deployment producer session-control IAM authority is not live and exact" >&2
+  exit 1
+}
+QUERY_IAM_REF=$(jq -cS .runtime.session_control_query_iam_ref <<<"$JOURNAL")
+QUERY_IAM_VERSION=$(jq -r .version <<<"$QUERY_IAM_REF")
+require_query_iam_parameter_metadata "$QUERY_IAM_VERSION" || {
+  echo "deployment producer Query IAM parameter metadata is not exact" >&2
+  exit 1
+}
+QUERY_IAM_ENVELOPE=$(get_active_ready_param "${QUERY_IAM_JOURNAL_PARAM}:${QUERY_IAM_VERSION}")
+QUERY_IAM_ENVELOPE=$(jq -cS . <<<"$QUERY_IAM_ENVELOPE")
+[[ "$(get_active_ready_param_version "$QUERY_IAM_JOURNAL_PARAM")" == "$QUERY_IAM_VERSION" &&
+   "$(get_active_ready_param "$QUERY_IAM_JOURNAL_PARAM" | jq -cS .)" == "$QUERY_IAM_ENVELOPE" &&
+   ${#QUERY_IAM_ENVELOPE} -le 4096 &&
+   "$(canonical_digest "$QUERY_IAM_ENVELOPE")" == "$(jq -r .sha256 <<<"$QUERY_IAM_REF")" ]] || {
+  echo "deployment producer Query IAM journal reference is not current and exact" >&2
+  exit 1
+}
+QUERY_IAM_JOURNAL=$(decode_query_iam_journal "$QUERY_IAM_ENVELOPE")
+QUERY_IAM_INTENT=$(jq -cS .intent <<<"$QUERY_IAM_JOURNAL")
+QUERY_IAM_RECEIPT=$(jq -cS .receipt <<<"$QUERY_IAM_JOURNAL")
+[[ "$(jq -cS 'keys' <<<"$QUERY_IAM_JOURNAL")" == '["intent","receipt","status"]' &&
+   "$(jq -r .status <<<"$QUERY_IAM_JOURNAL")" == ready &&
+   "$($SESSION_CONTROL_QUERY_IAM verify --intent-json "$QUERY_IAM_INTENT" | jq -cS .)" == "$QUERY_IAM_RECEIPT" ]] || {
+  echo "deployment producer recovery-role Query authority is not live and exact" >&2
   exit 1
 }
 RUNTIME=$(jq -cS .runtime <<<"$JOURNAL")
@@ -418,6 +476,8 @@ AC_PLAN_DIGEST=$(printf 'v1\n%s\n%s\n' "$ACTIVE_READY_PLAN_DIGEST" "$ACTIVE_READ
    "$(get_param "$STATE_PARAM" | jq -cS .)" == "$STATE" &&
    "$(get_param_version "$STALE_JOURNAL_PARAM")" == "$JOURNAL_VERSION" &&
    "$(get_param "$STALE_JOURNAL_PARAM" | jq -cS .)" == "$JOURNAL_ENVELOPE" &&
+   "$(get_active_ready_param_version "$QUERY_IAM_JOURNAL_PARAM")" == "$QUERY_IAM_VERSION" &&
+   "$(get_active_ready_param "$QUERY_IAM_JOURNAL_PARAM" | jq -cS .)" == "$QUERY_IAM_ENVELOPE" &&
    "$(get_active_ready_param_version "$ACTIVE_READY_JOURNAL_PARAM")" == "$ACTIVE_READY_VERSION" &&
    "$(get_active_ready_param "$ACTIVE_READY_JOURNAL_PARAM" | jq -cS .)" == "$ACTIVE_READY_ENVELOPE" ]] || {
   echo "deployment producer three-layer recovery authority changed across its strong bracket" >&2
