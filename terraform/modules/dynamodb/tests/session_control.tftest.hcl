@@ -152,6 +152,7 @@ run "session_control_authority_is_durable_and_narrow" {
             "dynamodb:LeadingKeys" = [
               "ACTIVE#ba9c4949557b0a0b68c6354dbdec84ab68d0e9af183243ac4ac1b89cf0b0c153",
               "EVENT#*",
+              "TARGETWORK#*",
             ]
           }
           "ForAnyValue:StringEquals" = {
@@ -163,7 +164,7 @@ run "session_control_authority_is_durable_and_narrow" {
         }
       }
     )
-    error_message = "Sandbox cell0 terminal close must receive DeleteItem only inside TransactWriteItems for its exact ACTIVE partition and EVENT work partitions on the exact session-control table."
+    error_message = "Sandbox cell0 exact close and ACKED-task cleanup must receive DeleteItem only inside TransactWriteItems for the exact ACTIVE partition and EVENT/TARGETWORK partitions on the exact session-control table."
   }
 
   assert {

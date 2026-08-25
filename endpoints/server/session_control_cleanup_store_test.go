@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -87,6 +88,17 @@ func TestDynamoSessionControlCleanupAckedNormalExactCloseTask(t *testing.T) {
 		txn.TransactItems[0].ConditionCheck == nil || txn.TransactItems[1].Put == nil ||
 		txn.TransactItems[2].Delete == nil || txn.TransactItems[3].Put == nil {
 		t.Fatalf("cleanup transaction = %#v", txn)
+	}
+	// Keep the runtime partition namespace mechanically paired with the exact
+	// sandbox IAM literal in terraform/modules/dynamodb/main.tf.
+	if sessionControlOwnerPKPrefix != "TARGETWORK#" {
+		t.Fatalf("session-control owner partition prefix = %q", sessionControlOwnerPKPrefix)
+	}
+	taskDeletePK, ok := txn.TransactItems[2].Delete.Key["pk"].(*types.AttributeValueMemberS)
+	if !ok || taskDeletePK.Value != task.OwnerPK ||
+		!strings.HasPrefix(taskDeletePK.Value, sessionControlOwnerPKPrefix) ||
+		taskDeletePK.Value != sessionControlOwnerPK(task.CellID, task.ACID, task.PublicKey) {
+		t.Fatalf("cleanup task DeleteItem partition = %#v", txn.TransactItems[2].Delete.Key["pk"])
 	}
 	for _, member := range txn.TransactItems {
 		if member.Put != nil {

@@ -615,16 +615,22 @@ resource "aws_iam_policy" "dynamodb_read" {
       {
         # Terminal exact close deletes the cell-scoped ACTIVE row and, for a
         # normal close, the completed EVENT#<event-hash>/WORK row in one
-        # transaction. AWS documents that each TransactWriteItems Delete is
-        # authorized as its underlying DeleteItem, and LeadingKeys is that
-        # item's first partition key. Non-delete CONTROL/SESSION/EVENT members
-        # are therefore evaluated under their own Put/Update/ConditionCheck
-        # actions, not added to this DeleteItem key set:
+        # transaction. Boot recovery later replaces each exact ACKED close TASK
+        # under its derived TARGETWORK#<sha256> owner partition with an immutable
+        # TASKAUDIT in another transaction. AWS documents that each
+        # TransactWriteItems Delete is authorized as its underlying DeleteItem,
+        # and LeadingKeys is that item's first partition key. Non-delete
+        # CONTROL/SESSION/EVENT/TARGETWORK members are therefore evaluated under
+        # their own Put/Update/ConditionCheck actions, not added to this
+        # DeleteItem key set:
         # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
         # https://docs.aws.amazon.com/service-authorization/latest/reference/list_dynamodb.html
-        # IAM cannot require both delete keys or constrain the EVENT sort key,
-        # but this excludes direct DeleteItem, every other partition namespace,
-        # and every other cell's ACTIVE partition.
+        # IAM cannot constrain sort keys below the wildcarded EVENT and
+        # TARGETWORK partition sets. TARGETWORK therefore also covers OWNER and
+        # TASKAUDIT rows; the runtime emits only the exact TASK delete above,
+        # under its full-row transaction condition. The statement still
+        # excludes direct DeleteItem, every other partition namespace, and every
+        # other cell's ACTIVE partition.
         Sid      = "DynamoDBSessionControlTerminalCloseDelete"
         Effect   = "Allow"
         Action   = ["dynamodb:DeleteItem"]
@@ -634,6 +640,7 @@ resource "aws_iam_policy" "dynamodb_read" {
             "dynamodb:LeadingKeys" = [
               "ACTIVE#${sha256(var.cell_id)}",
               "EVENT#*",
+              "TARGETWORK#*",
             ]
           }
           "ForAnyValue:StringEquals" = {
