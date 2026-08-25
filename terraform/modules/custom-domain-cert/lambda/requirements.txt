@@ -42,6 +42,6 @@ pyrfc3339==1.1
 pytz==2024.2
 requests==2.34.2
 certifi==2024.12.14
-charset-normalizer==3.5.0
+charset-normalizer==3.5.1
 idna==3.18
 urllib3==2.7.0
