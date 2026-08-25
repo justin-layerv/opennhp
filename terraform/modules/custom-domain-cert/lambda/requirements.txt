@@ -18,7 +18,7 @@ josepy==2.2.0
 # Cryptography for key generation and certificate handling.
 # Pinned >=49.0.0 to satisfy pyOpenSSL 26.3.0 (requires cryptography>=49.0.0,<50);
 # Dependabot bumped pyOpenSSL ahead of this pin, which broke pip resolution.
-cryptography==49.0.0
+cryptography==50.0.0
 
 # DNS resolver for propagation verification
 dnspython==2.8.0
