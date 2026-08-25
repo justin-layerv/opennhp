@@ -732,6 +732,27 @@ jobs:
           python3 -m py_compile .github/scripts/check-qurl-canary-verifier-iam-plan.py
           python3 tests/scripts/test_qurl_canary_verifier_iam.py
 
+      - name: Test sandbox fixed-canary customer journey contracts
+        run: |
+          python3 -m py_compile \
+            .github/scripts/build_sandbox_fixed_canary_plan.py \
+            .github/scripts/read_sandbox_fixed_canary_runtime.py \
+            .github/scripts/run_sandbox_fixed_canary_customer_journey.py \
+            .github/scripts/sandbox_fixed_canary_authority.py \
+            .github/scripts/sandbox_fixed_canary_lifecycle_runner.py \
+            .github/scripts/verify_sandbox_qurl_customer_artifacts.py \
+            .github/scripts/verify_sandbox_qurl_service_provenance.py
+          python3 -m unittest -v \
+            tests.scripts.test_build_sandbox_fixed_canary_plan \
+            tests.scripts.test_run_sandbox_fixed_canary_customer_journey \
+            tests.scripts.test_sandbox_fixed_canary_authority \
+            tests.scripts.test_sandbox_fixed_canary_custody \
+            tests.scripts.test_sandbox_fixed_canary_lifecycle_runner \
+            tests.scripts.test_sandbox_fixed_canary_runtime_contract \
+            tests.scripts.test_sandbox_qurl_customer_workflow \
+            tests.scripts.test_verify_sandbox_qurl_customer_artifacts \
+            tests.scripts.test_verify_sandbox_qurl_service_provenance
+
       - name: Test qurl-go OTP mailbox trust and plan boundary
         run: |
           python3 -m py_compile .github/scripts/check-qurl-go-otp-mailbox-gate-plan.py

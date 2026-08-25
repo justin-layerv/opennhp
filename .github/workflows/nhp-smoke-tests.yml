@@ -1,4 +1,5 @@
 name: NHP Smoke Tests
+run-name: "NHP Smoke ${{ inputs.environment || 'sandbox' }} ${{ inputs.operation || 'nhp-smoke' }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
 
 # Reusable workflow for running NHP smoke tests against a deployed
 # sandbox or prod environment. Called by:
@@ -19,6 +20,11 @@ name: NHP Smoke Tests
 on:
   workflow_call:
     inputs:
+      operation:
+        description: 'Exact smoke operation (nhp-smoke or qurl-customer-journey)'
+        required: false
+        type: string
+        default: 'nhp-smoke'
       environment:
         description: 'Target environment (sandbox or prod)'
         required: true
@@ -43,9 +49,78 @@ on:
         required: false
         type: string
         default: ''
+      expected_nhp_source_sha:
+        description: 'Exact NHP source executed by a qURL customer journey'
+        required: false
+        type: string
+        default: ''
+      caller_repository:
+        description: 'Exact qURL artifact producer repository'
+        required: false
+        type: string
+        default: ''
+      caller_mode:
+        description: 'Caller lifecycle (active dispatch or postdeploy call)'
+        required: false
+        type: string
+        default: 'active'
+      caller_head_sha:
+        description: 'Exact qURL artifact producer source SHA'
+        required: false
+        type: string
+        default: ''
+      caller_run_id:
+        description: 'Exact qURL artifact producer Actions run ID'
+        required: false
+        type: string
+        default: ''
+      caller_run_attempt:
+        description: 'Exact qURL artifact producer Actions run attempt'
+        required: false
+        type: string
+        default: ''
+      qurl_go_source_sha:
+        description: 'Exact reviewed qurl-go source SHA'
+        required: false
+        type: string
+        default: ''
+      qurl_infra_source_sha:
+        description: 'Exact reviewed qurl-integrations-infra helper SHA'
+        required: false
+        type: string
+        default: ''
+      binary_artifact_name:
+        description: 'Caller binary artifact name'
+        required: false
+        type: string
+        default: ''
+      binary_artifact_digest:
+        description: 'Caller binary artifact GitHub digest'
+        required: false
+        type: string
+        default: ''
+      source_receipt_artifact_name:
+        description: 'Caller source receipt artifact name'
+        required: false
+        type: string
+        default: ''
+      source_receipt_artifact_digest:
+        description: 'Caller source receipt artifact GitHub digest'
+        required: false
+        type: string
+        default: ''
+      correlation_id:
+        description: 'Exact qURL caller correlation ID'
+        required: false
+        type: string
+        default: ''
     secrets:
       AWS_ROLE_ARN:
         required: true
+      OPS_ROUTINES_APP_ID:
+        required: false
+      OPS_ROUTINES_APP_PRIVATE_KEY:
+        required: false
       # Only consumed when dispatched with environment=prod (#1331).
       # Declared for actionlint; callers shouldn't pass this — wiring
       # it through workflow_call defeats the per-env role selection.
@@ -56,6 +131,14 @@ on:
   # combination without waiting for a deploy.
   workflow_dispatch:
     inputs:
+      operation:
+        description: 'Exact smoke operation'
+        required: true
+        type: choice
+        options:
+          - nhp-smoke
+          - qurl-customer-journey
+        default: nhp-smoke
       environment:
         description: 'Target environment'
         required: true
@@ -84,14 +167,148 @@ on:
         required: false
         type: string
         default: 'us-east-2'
+      expected_nhp_source_sha:
+        description: 'Exact NHP source SHA (required for qurl-customer-journey)'
+        required: false
+        type: string
+        default: ''
+      caller_repository:
+        description: 'Exact qURL artifact producer repository'
+        required: false
+        type: string
+        default: ''
+      caller_mode:
+        description: 'Caller lifecycle (active dispatch only)'
+        required: false
+        type: choice
+        options:
+          - active
+        default: active
+      caller_head_sha:
+        description: 'Exact qURL artifact producer source SHA'
+        required: false
+        type: string
+        default: ''
+      caller_run_id:
+        description: 'Exact qURL artifact producer Actions run ID'
+        required: false
+        type: string
+        default: ''
+      caller_run_attempt:
+        description: 'Exact qURL artifact producer run attempt'
+        required: false
+        type: string
+        default: ''
+      qurl_go_source_sha:
+        description: 'Exact reviewed qurl-go source SHA'
+        required: false
+        type: string
+        default: ''
+      qurl_infra_source_sha:
+        description: 'Exact reviewed qurl-integrations-infra source SHA'
+        required: false
+        type: string
+        default: ''
+      binary_artifact_name:
+        description: 'Caller binary artifact name'
+        required: false
+        type: string
+        default: ''
+      binary_artifact_digest:
+        description: 'Caller binary artifact GitHub digest'
+        required: false
+        type: string
+        default: ''
+      source_receipt_artifact_name:
+        description: 'Caller source receipt artifact name'
+        required: false
+        type: string
+        default: ''
+      source_receipt_artifact_digest:
+        description: 'Caller source receipt artifact GitHub digest'
+        required: false
+        type: string
+        default: ''
+      correlation_id:
+        description: 'Exact qURL caller correlation ID'
+        required: false
+        type: string
+        default: ''
 
 env:
   PROD_ACCOUNT_ID: '235500187906'
   SANDBOX_ACCOUNT_ID: '767397897469'
 
 jobs:
+  contract:
+    name: NHP Smoke Request Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate exact operation input union
+        env:
+          OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TIER: ${{ inputs.tier }}
+          ALLOW_SSM_PROBES: ${{ inputs.allow_ssm_probes }}
+          AWS_REGION_INPUT: ${{ inputs.aws_region }}
+          QURL_LINK_ORIGIN: ${{ inputs.qurl_link_origin }}
+          EXPECTED_NHP_SOURCE_SHA: ${{ inputs.expected_nhp_source_sha }}
+          CALLER_REPOSITORY: ${{ inputs.caller_repository }}
+          CALLER_MODE: ${{ inputs.caller_mode }}
+          CALLER_HEAD_SHA: ${{ inputs.caller_head_sha }}
+          CALLER_RUN_ID: ${{ inputs.caller_run_id }}
+          CALLER_RUN_ATTEMPT: ${{ inputs.caller_run_attempt }}
+          QURL_GO_SOURCE_SHA: ${{ inputs.qurl_go_source_sha }}
+          QURL_INFRA_SOURCE_SHA: ${{ inputs.qurl_infra_source_sha }}
+          BINARY_ARTIFACT_NAME: ${{ inputs.binary_artifact_name }}
+          BINARY_ARTIFACT_DIGEST: ${{ inputs.binary_artifact_digest }}
+          SOURCE_RECEIPT_ARTIFACT_NAME: ${{ inputs.source_receipt_artifact_name }}
+          SOURCE_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.source_receipt_artifact_digest }}
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+          NHP_EVENT: ${{ github.event_name }}
+          NHP_REF: ${{ github.ref }}
+          NHP_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          CUSTOMER_VALUES=(
+            "$EXPECTED_NHP_SOURCE_SHA" "$CALLER_REPOSITORY" "$CALLER_HEAD_SHA"
+            "$CALLER_RUN_ID" "$CALLER_RUN_ATTEMPT" "$QURL_GO_SOURCE_SHA"
+            "$QURL_INFRA_SOURCE_SHA" "$BINARY_ARTIFACT_NAME" "$BINARY_ARTIFACT_DIGEST"
+            "$SOURCE_RECEIPT_ARTIFACT_NAME" "$SOURCE_RECEIPT_ARTIFACT_DIGEST" "$CORRELATION_ID"
+          )
+          case "$OPERATION" in
+            nhp-smoke)
+              [[ "$CALLER_MODE" == active ]]
+              [[ -z "$QURL_LINK_ORIGIN" || "$QURL_LINK_ORIGIN" =~ ^https://[^[:space:]]+$ ]]
+              for VALUE in "${CUSTOMER_VALUES[@]}"; do [[ -z "$VALUE" ]]; done
+              ;;
+            qurl-customer-journey)
+              [[ "$ENVIRONMENT" == sandbox && "$TIER" == all && "$ALLOW_SSM_PROBES" == false ]]
+              [[ "$AWS_REGION_INPUT" == us-east-2 && -z "$QURL_LINK_ORIGIN" ]]
+              case "$CALLER_MODE" in
+                active)
+                  [[ "$NHP_EVENT" == workflow_dispatch && "$NHP_REF" == refs/heads/main ]]
+                  [[ "$NHP_WORKFLOW_REF" == "layervai/nhp/.github/workflows/nhp-smoke-tests.yml@refs/heads/main" ]]
+                  ;;
+                postdeploy)
+                  [[ "$NHP_EVENT" == push && "$NHP_REF" == refs/heads/main ]]
+                  [[ "$NHP_WORKFLOW_REF" == "layervai/nhp/.github/workflows/build-and-push.yml@refs/heads/main" ]]
+                  ;;
+                *) exit 1 ;;
+              esac
+              for VALUE in "${CUSTOMER_VALUES[@]}"; do [[ -n "$VALUE" ]]; done
+              ;;
+            *)
+              echo "::error::operation must be nhp-smoke or qurl-customer-journey"
+              exit 1
+              ;;
+          esac
+
   smoke-test:
     name: NHP Smoke (${{ inputs.environment }}, ${{ inputs.tier }})
+    needs: contract
+    if: inputs.operation == 'nhp-smoke'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -222,3 +439,380 @@ jobs:
           name: nhp-smoke-test-output-${{ inputs.environment }}-${{ inputs.tier }}
           path: tests/smoke/test-output.txt
           retention-days: 7
+
+  qurl-customer-journey:
+    name: NHP Sandbox qURL Customer Journey
+    needs: contract
+    if: inputs.operation == 'qurl-customer-journey'
+    runs-on: ubuntu-latest
+    # Three exact 30-minute operation generations are bounded by three
+    # 21-minute child chains; 75 minutes leaves cleanup/reconcile time while
+    # each individual qurl operation stays within its 30-minute protocol cap.
+    timeout-minutes: 75
+    environment: sandbox
+    concurrency:
+      group: sandbox-fixed-canary-journey
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      attestations: read
+    steps:
+      - name: Validate closed journey dispatch
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          AWS_REGION_INPUT: ${{ inputs.aws_region }}
+          EXPECTED_NHP_SOURCE_SHA: ${{ inputs.expected_nhp_source_sha }}
+          CALLER_REPOSITORY: ${{ inputs.caller_repository }}
+          CALLER_MODE: ${{ inputs.caller_mode }}
+          CALLER_HEAD_SHA: ${{ inputs.caller_head_sha }}
+          CALLER_RUN_ID: ${{ inputs.caller_run_id }}
+          CALLER_RUN_ATTEMPT: ${{ inputs.caller_run_attempt }}
+          QURL_GO_SOURCE_SHA: ${{ inputs.qurl_go_source_sha }}
+          QURL_INFRA_SOURCE_SHA: ${{ inputs.qurl_infra_source_sha }}
+          BINARY_ARTIFACT_NAME: ${{ inputs.binary_artifact_name }}
+          BINARY_ARTIFACT_DIGEST: ${{ inputs.binary_artifact_digest }}
+          SOURCE_RECEIPT_ARTIFACT_NAME: ${{ inputs.source_receipt_artifact_name }}
+          SOURCE_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.source_receipt_artifact_digest }}
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ENVIRONMENT" == sandbox && "$AWS_REGION_INPUT" == us-east-2 ]]
+          [[ "$EXPECTED_NHP_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CALLER_REPOSITORY" == layervai/qurl-integrations ]]
+          [[ "$CALLER_MODE" == active || "$CALLER_MODE" == postdeploy ]]
+          [[ "$CALLER_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CALLER_RUN_ID" =~ ^[1-9][0-9]*$ && "$CALLER_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$QURL_GO_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$QURL_INFRA_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BINARY_ARTIFACT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$SOURCE_RECEIPT_ARTIFACT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$BINARY_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_RECEIPT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$CORRELATION_ID" == "qurl-${CALLER_RUN_ID}-${CALLER_RUN_ATTEMPT}-${CALLER_HEAD_SHA:0:12}" ]]
+
+      - name: Checkout exact NHP source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_nhp_source_sha }}
+          fetch-depth: 1
+
+      - name: Assert exact NHP source
+        env:
+          EXPECTED_NHP_SOURCE_SHA: ${{ inputs.expected_nhp_source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_NHP_SOURCE_SHA" ]]
+          [[ "$GITHUB_SHA" == "$EXPECTED_NHP_SOURCE_SHA" ]]
+
+      - name: Mint exact qURL artifact reader token
+        id: qurl-reader-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            qurl-integrations
+            qurl-integrations-infra
+            qurl-go
+            qurl-service
+          permission-actions: read
+          permission-attestations: read
+          permission-contents: read
+
+      - name: Download and verify exact qURL artifacts
+        env:
+          GH_TOKEN: ${{ steps.qurl-reader-token.outputs.token }}
+          CALLER_REPOSITORY: ${{ inputs.caller_repository }}
+          CALLER_MODE: ${{ inputs.caller_mode }}
+          CALLER_HEAD_SHA: ${{ inputs.caller_head_sha }}
+          CALLER_RUN_ID: ${{ inputs.caller_run_id }}
+          CALLER_RUN_ATTEMPT: ${{ inputs.caller_run_attempt }}
+          EXPECTED_NHP_SOURCE_SHA: ${{ inputs.expected_nhp_source_sha }}
+          QURL_GO_SOURCE_SHA: ${{ inputs.qurl_go_source_sha }}
+          QURL_INFRA_SOURCE_SHA: ${{ inputs.qurl_infra_source_sha }}
+          BINARY_ARTIFACT_NAME: ${{ inputs.binary_artifact_name }}
+          BINARY_ARTIFACT_DIGEST: ${{ inputs.binary_artifact_digest }}
+          SOURCE_RECEIPT_ARTIFACT_NAME: ${{ inputs.source_receipt_artifact_name }}
+          SOURCE_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.source_receipt_artifact_digest }}
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PRIVATE_ROOT="/tmp/layerv-sandbox-qurl-${CALLER_RUN_ID}-${CALLER_HEAD_SHA}"
+          if [[ -e "$PRIVATE_ROOT" ]]; then
+            [[ -d "$PRIVATE_ROOT" && ! -L "$PRIVATE_ROOT" ]]
+            [[ "$(stat -c %a "$PRIVATE_ROOT")" == 700 ]]
+          else
+            mkdir -m 700 "$PRIVATE_ROOT"
+          fi
+          echo "PRIVATE_ROOT=$PRIVATE_ROOT" >>"$GITHUB_ENV"
+
+          RUN=$(gh api "repos/$CALLER_REPOSITORY/actions/runs/$CALLER_RUN_ID")
+          EVENT=$(jq -er '.event | select(. == "pull_request" or . == "push")' <<<"$RUN")
+          echo "CALLER_EVENT=$EVENT" >>"$GITHUB_ENV"
+          [[ "$(jq -er .head_sha <<<"$RUN")" == "$CALLER_HEAD_SHA" ]]
+          [[ "$(jq -er .head_repository.full_name <<<"$RUN")" == "$CALLER_REPOSITORY" ]]
+          [[ "$(jq -er .run_attempt <<<"$RUN")" == "$CALLER_RUN_ATTEMPT" ]]
+          [[ "$(jq -er .path <<<"$RUN")" == .github/workflows/cli.yml ]]
+          if [[ "$CALLER_MODE" == active ]]; then
+            [[ "$EVENT" == pull_request ]]
+            [[ "$(jq -er .status <<<"$RUN")" == in_progress && "$(jq -r .conclusion <<<"$RUN")" == null ]]
+          else
+            [[ "$CALLER_MODE" == postdeploy ]]
+            [[ "$EVENT" == push ]]
+            [[ "$(jq -er .status <<<"$RUN")" == completed && "$(jq -er .conclusion <<<"$RUN")" == success ]]
+          fi
+          if [[ "$EVENT" == push ]]; then
+            CALLER_MAIN=$(gh api "repos/$CALLER_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+            CALLER_CURRENT=$(gh api "repos/$CALLER_REPOSITORY/compare/$CALLER_HEAD_SHA...$CALLER_MAIN")
+            jq -e '.status == "ahead" or .status == "identical"' <<<"$CALLER_CURRENT" >/dev/null
+          fi
+          verify_signed_commit() {
+            local repository="$1" source_sha="$2" commit
+            commit=$(gh api "repos/$repository/commits/$source_sha")
+            jq -e --arg sha "$source_sha" \
+              '.sha == $sha and .commit.verification.verified == true and .commit.verification.reason == "valid"' \
+              <<<"$commit" >/dev/null
+          }
+          verify_signed_commit "$CALLER_REPOSITORY" "$CALLER_HEAD_SHA"
+          QURL_INTEGRATIONS_MINIMUM=$(gh api "repos/layervai/qurl-integrations/compare/78b025404be1d52e9fe9144a28812b71dcd80b96...$CALLER_HEAD_SHA")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$QURL_INTEGRATIONS_MINIMUM" >/dev/null
+          QURL_GO_MAIN=$(gh api repos/layervai/qurl-go/git/ref/heads/main --jq .object.sha)
+          QURL_GO_MINIMUM=$(gh api "repos/layervai/qurl-go/compare/c92478b3f70ff027fe7bd9c306b7a9fd96553b64...$QURL_GO_SOURCE_SHA")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$QURL_GO_MINIMUM" >/dev/null
+          QURL_GO_CURRENT=$(gh api "repos/layervai/qurl-go/compare/$QURL_GO_SOURCE_SHA...$QURL_GO_MAIN")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$QURL_GO_CURRENT" >/dev/null
+          verify_signed_commit layervai/qurl-go "$QURL_GO_SOURCE_SHA"
+          QURL_INFRA_MAIN=$(gh api repos/layervai/qurl-integrations-infra/git/ref/heads/main --jq .object.sha)
+          QURL_INFRA_MINIMUM=$(gh api "repos/layervai/qurl-integrations-infra/compare/95b33ab9fe89b9fcc7bc7d16b92892c9d526c9a3...$QURL_INFRA_SOURCE_SHA")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$QURL_INFRA_MINIMUM" >/dev/null
+          QURL_INFRA_CURRENT=$(gh api "repos/layervai/qurl-integrations-infra/compare/$QURL_INFRA_SOURCE_SHA...$QURL_INFRA_MAIN")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$QURL_INFRA_CURRENT" >/dev/null
+          verify_signed_commit layervai/qurl-integrations-infra "$QURL_INFRA_SOURCE_SHA"
+
+          gh api "repos/layervai/qurl-integrations-infra/contents/.github/scripts/prod-matched-cohort-key.py?ref=$QURL_INFRA_SOURCE_SHA" \
+            --jq .content | tr -d '\n' | base64 --decode >"$PRIVATE_ROOT/prod-matched-cohort-key.py"
+          HELPER_SHA=$(sha256sum "$PRIVATE_ROOT/prod-matched-cohort-key.py" | cut -d' ' -f1)
+          [[ "$HELPER_SHA" =~ ^[0-9a-f]{64}$ ]]
+          chmod 500 "$PRIVATE_ROOT/prod-matched-cohort-key.py"
+
+          jq -cnS --arg repository "$CALLER_REPOSITORY" --arg head "$CALLER_HEAD_SHA" \
+            --arg event "$EVENT" --argjson run_id "$CALLER_RUN_ID" --argjson run_attempt "$CALLER_RUN_ATTEMPT" \
+            --arg mode "$CALLER_MODE" \
+            '{schema:1,repository:$repository,workflow:".github/workflows/cli.yml",head_sha:$head,run_id:$run_id,run_attempt:$run_attempt,event:$event,status:(if $mode == "active" then "in_progress" else "completed" end),conclusion:(if $mode == "active" then null else "success" end)}' \
+            >"$PRIVATE_ROOT/caller-run.json"
+          jq -cnS --arg nhp "$EXPECTED_NHP_SOURCE_SHA" --arg repository "$CALLER_REPOSITORY" --arg head "$CALLER_HEAD_SHA" \
+            --arg caller_mode "$CALLER_MODE" \
+            --arg qurl_go "$QURL_GO_SOURCE_SHA" --arg infra "$QURL_INFRA_SOURCE_SHA" --arg helper_sha "$HELPER_SHA" \
+            --arg binary_name "$BINARY_ARTIFACT_NAME" --arg binary_digest "$BINARY_ARTIFACT_DIGEST" \
+            --arg receipt_name "$SOURCE_RECEIPT_ARTIFACT_NAME" --arg receipt_digest "$SOURCE_RECEIPT_ARTIFACT_DIGEST" \
+            --arg correlation "$CORRELATION_ID" --argjson run_id "$CALLER_RUN_ID" --argjson run_attempt "$CALLER_RUN_ATTEMPT" \
+            '{schema:1,operation:"qurl-customer-journey",expected_nhp_source_sha:$nhp,caller_repository:$repository,caller_mode:$caller_mode,caller_head_sha:$head,caller_run_id:$run_id,caller_run_attempt:$run_attempt,qurl_go_source_sha:$qurl_go,qurl_infra_source_sha:$infra,qurl_infra_helper_sha256:$helper_sha,binary_artifact_name:$binary_name,binary_artifact_digest:$binary_digest,source_receipt_artifact_name:$receipt_name,source_receipt_artifact_digest:$receipt_digest,correlation_id:$correlation}' \
+            >"$PRIVATE_ROOT/request.json"
+
+          ARTIFACTS=$(gh api "repos/$CALLER_REPOSITORY/actions/runs/$CALLER_RUN_ID/artifacts?per_page=100")
+          for KIND in binary source_receipt; do
+            if [[ "$KIND" == binary ]]; then NAME=$BINARY_ARTIFACT_NAME; DIGEST=$BINARY_ARTIFACT_DIGEST; else NAME=$SOURCE_RECEIPT_ARTIFACT_NAME; DIGEST=$SOURCE_RECEIPT_ARTIFACT_DIGEST; fi
+            ROW=$(jq -cer --arg name "$NAME" '[.artifacts[] | select(.name == $name)] | select(length == 1) | .[0]' <<<"$ARTIFACTS")
+            ID=$(jq -er .id <<<"$ROW")
+            jq -cnS --arg name "$NAME" --arg digest "$DIGEST" --argjson size "$(jq -er .size_in_bytes <<<"$ROW")" \
+              --argjson run_id "$CALLER_RUN_ID" --argjson expired "$(jq -er .expired <<<"$ROW")" \
+              '{schema:1,name:$name,digest:$digest,size_in_bytes:$size,run_id:$run_id,expired:$expired}' >"$PRIVATE_ROOT/$KIND-artifact.json"
+            gh api "repos/$CALLER_REPOSITORY/actions/artifacts/$ID/zip" >"$PRIVATE_ROOT/$KIND.zip"
+          done
+          chmod 600 "$PRIVATE_ROOT"/*.json "$PRIVATE_ROOT"/*.zip
+          python3 .github/scripts/verify_sandbox_qurl_customer_artifacts.py \
+            --request-file "$PRIVATE_ROOT/request.json" \
+            --caller-run-file "$PRIVATE_ROOT/caller-run.json" \
+            --binary-artifact-metadata-file "$PRIVATE_ROOT/binary-artifact.json" \
+            --source-receipt-artifact-metadata-file "$PRIVATE_ROOT/source_receipt-artifact.json" \
+            --binary-artifact-zip "$PRIVATE_ROOT/binary.zip" \
+            --source-receipt-artifact-zip "$PRIVATE_ROOT/source_receipt.zip" \
+            --output-directory "$PRIVATE_ROOT/qurl" \
+            --authority-file "$PRIVATE_ROOT/source-authority.json"
+
+
+      - name: Configure exact sandbox AWS role
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: arn:aws:iam::767397897469:role/layerv-nhp-sandbox-fixed-canary
+          aws-region: us-east-2
+          role-duration-seconds: 7200
+
+      - name: Install pinned sandbox custody AWS SDK
+        run: python3 -m pip install --disable-pip-version-check boto3==1.43.71
+
+      - name: Build stable sandbox runtime authority
+        run: |
+          set -euo pipefail
+          [[ "$(aws sts get-caller-identity --query Account --output text)" == "$SANDBOX_ACCOUNT_ID" ]]
+          [[ "$(aws sts get-caller-identity --query Arn --output text)" =~ ^arn:aws:sts::767397897469:assumed-role/layerv-nhp-sandbox-fixed-canary/ ]]
+          python3 .github/scripts/read_sandbox_fixed_canary_runtime.py \
+            --region us-east-2 \
+            --output-file "$PRIVATE_ROOT/runtime.json"
+
+      - name: Verify active NHP image provenance and operation ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ACTIVE_SERVER=$(jq -er '.active_colors.server | select(. == "blue" or . == "green")' "$PRIVATE_ROOT/runtime.json")
+          ACTIVE_AC=$(jq -er '.active_colors.ac | select(. == "blue" or . == "green")' "$PRIVATE_ROOT/runtime.json")
+          for COMPONENT in server ac relay; do
+            case "$COMPONENT" in
+              server)
+                REPOSITORY="layerv/nhp-$COMPONENT"
+                SOURCE=$(jq -er --arg color "$ACTIVE_SERVER" '.cohorts[$color].server.source_sha' "$PRIVATE_ROOT/runtime.json")
+                DIGEST=$(jq -er --arg color "$ACTIVE_SERVER" '.cohorts[$color].server.image_digest' "$PRIVATE_ROOT/runtime.json")
+                ;;
+              ac)
+                REPOSITORY="layerv/nhp-$COMPONENT"
+                SOURCE=$(jq -er --arg color "$ACTIVE_AC" '.cohorts[$color].ac.source_sha' "$PRIVATE_ROOT/runtime.json")
+                DIGEST=$(jq -er --arg color "$ACTIVE_AC" '.cohorts[$color].ac.image_digest' "$PRIVATE_ROOT/runtime.json")
+                ;;
+              relay)
+                REPOSITORY=layerv/nhp-relay
+                SOURCE=$(jq -er .relay.source_sha "$PRIVATE_ROOT/runtime.json")
+                DIGEST=$(jq -er .relay.image_digest "$PRIVATE_ROOT/runtime.json")
+                ;;
+            esac
+            COMPARE=$(gh api "repos/layervai/nhp/compare/a70e5d66dda604459b0a37ed7c634da8c8e46c3d...$SOURCE")
+            jq -e '.status == "ahead" or .status == "identical"' <<<"$COMPARE" >/dev/null
+            MANIFEST=$(aws ecr batch-get-image --region us-east-2 --repository-name "$REPOSITORY" \
+              --image-ids imageDigest="$DIGEST" --accepted-media-types application/vnd.oci.image.index.v1+json \
+              --query 'images[0].imageManifest' --output text)
+            printf '%s' "$MANIFEST" >"$PRIVATE_ROOT/$COMPONENT-image-manifest.json"
+            [[ "sha256:$(sha256sum "$PRIVATE_ROOT/$COMPONENT-image-manifest.json" | cut -d' ' -f1)" == "$DIGEST" ]]
+            gh api "repos/layervai/nhp/attestations/$DIGEST" >"$PRIVATE_ROOT/$COMPONENT-attestations.json"
+            jq -c '.attestations[].bundle' "$PRIVATE_ROOT/$COMPONENT-attestations.json" >"$PRIVATE_ROOT/$COMPONENT-attestations.jsonl"
+            gh attestation verify "$PRIVATE_ROOT/$COMPONENT-image-manifest.json" \
+              --bundle "$PRIVATE_ROOT/$COMPONENT-attestations.jsonl" \
+              --repo layervai/nhp \
+              --signer-workflow layervai/nhp/.github/workflows/build-and-push.yml \
+              --source-digest "$SOURCE" \
+              --source-ref refs/heads/main \
+              --format json >"$PRIVATE_ROOT/$COMPONENT-attestation-verification.json"
+            jq -e 'length == 1' "$PRIVATE_ROOT/$COMPONENT-attestation-verification.json" >/dev/null
+            printf '%s\n' "$SOURCE" >"$PRIVATE_ROOT/$COMPONENT-source-sha"
+          done
+          cmp "$PRIVATE_ROOT/server-source-sha" "$PRIVATE_ROOT/ac-source-sha"
+          cmp "$PRIVATE_ROOT/server-source-sha" "$PRIVATE_ROOT/relay-source-sha"
+
+      - name: Verify deployed qurl-service SLSA source and build run
+        env:
+          GH_TOKEN: ${{ steps.qurl-reader-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          IMAGE_DIGEST=$(jq -er .qurl_service.image_digest "$PRIVATE_ROOT/runtime.json")
+          SOURCE_TAG=$(jq -er .qurl_service.source_tag "$PRIVATE_ROOT/runtime.json")
+          python3 .github/scripts/verify_sandbox_qurl_service_provenance.py \
+            --region us-east-2 \
+            --repository layerv/nhp-qurl \
+            --image-index-digest "$IMAGE_DIGEST" \
+            --source-tag "$SOURCE_TAG" \
+            --output-file "$PRIVATE_ROOT/qurl-service-provenance.json"
+          SOURCE_SHA=$(jq -er .source_sha "$PRIVATE_ROOT/qurl-service-provenance.json")
+          RUN_ID=$(jq -er .build_run_id "$PRIVATE_ROOT/qurl-service-provenance.json")
+          RUN_ATTEMPT=$(jq -er .build_run_attempt "$PRIVATE_ROOT/qurl-service-provenance.json")
+          RUN=$(gh api "repos/layervai/qurl-service/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT")
+          [[ "$(jq -er .head_sha <<<"$RUN")" == "$SOURCE_SHA" ]]
+          [[ "$(jq -er .head_branch <<<"$RUN")" == main ]]
+          [[ "$(jq -er .run_attempt <<<"$RUN")" == "$RUN_ATTEMPT" ]]
+          [[ "$(jq -er .path <<<"$RUN")" == .github/workflows/build-and-deploy.yml ]]
+          [[ "$(jq -er .status <<<"$RUN")" == completed && "$(jq -er .conclusion <<<"$RUN")" == success ]]
+          MAIN_SHA=$(gh api repos/layervai/qurl-service/git/ref/heads/main --jq .object.sha)
+          COMPARE=$(gh api "repos/layervai/qurl-service/compare/$SOURCE_SHA...$MAIN_SHA")
+          jq -e '.status == "ahead" or .status == "identical"' <<<"$COMPARE" >/dev/null
+          INDEX=$(aws ecr batch-get-image --region us-east-2 --repository-name layerv/nhp-qurl \
+            --image-ids imageDigest="$IMAGE_DIGEST" --accepted-media-types application/vnd.oci.image.index.v1+json \
+            --query 'images[0].imageManifest' --output text)
+          printf '%s' "$INDEX" >"$PRIVATE_ROOT/qurl-service-image-index.json"
+          [[ "sha256:$(sha256sum "$PRIVATE_ROOT/qurl-service-image-index.json" | cut -d' ' -f1)" == "$IMAGE_DIGEST" ]]
+          gh api "repos/layervai/qurl-service/attestations/$IMAGE_DIGEST" >"$PRIVATE_ROOT/qurl-service-signed-attestations.json"
+          jq -c '.attestations[].bundle' "$PRIVATE_ROOT/qurl-service-signed-attestations.json" >"$PRIVATE_ROOT/qurl-service-signed-attestations.jsonl"
+          gh attestation verify "$PRIVATE_ROOT/qurl-service-image-index.json" \
+            --bundle "$PRIVATE_ROOT/qurl-service-signed-attestations.jsonl" \
+            --repo layervai/qurl-service \
+            --signer-workflow layervai/qurl-service/.github/workflows/build-and-deploy.yml \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref refs/heads/main \
+            --format json >"$PRIVATE_ROOT/qurl-service-signed-verification.json"
+          jq -e 'length == 1' "$PRIVATE_ROOT/qurl-service-signed-verification.json" >/dev/null
+
+      - name: Re-read exact sandbox runtime before credential mint
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/read_sandbox_fixed_canary_runtime.py \
+            --region us-east-2 \
+            --output-file "$PRIVATE_ROOT/runtime-before-mint.json"
+          cmp "$PRIVATE_ROOT/runtime.json" "$PRIVATE_ROOT/runtime-before-mint.json"
+
+      - name: Run protected direct relay and recovery customer journey
+        id: journey
+        env:
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+          CALLER_REPOSITORY: ${{ inputs.caller_repository }}
+          CALLER_HEAD_SHA: ${{ inputs.caller_head_sha }}
+          CALLER_RUN_ID: ${{ inputs.caller_run_id }}
+          CALLER_RUN_ATTEMPT: ${{ inputs.caller_run_attempt }}
+          CALLER_MODE: ${{ inputs.caller_mode }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/run_sandbox_fixed_canary_customer_journey.py \
+            --runtime-file "$PRIVATE_ROOT/runtime.json" \
+            --source-authority-file "$PRIVATE_ROOT/source-authority.json" \
+            --key-helper-file "$PRIVATE_ROOT/prod-matched-cohort-key.py" \
+            --qurl-service-provenance-file "$PRIVATE_ROOT/qurl-service-provenance.json" \
+            --private-root "$PRIVATE_ROOT" \
+            --caller-event "$CALLER_EVENT" \
+            --terminal-receipt "$PRIVATE_ROOT/terminal-receipt.json"
+
+      - name: Verify caller remained exact through terminal outcome
+        if: steps.journey.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.qurl-reader-token.outputs.token }}
+          CALLER_REPOSITORY: ${{ inputs.caller_repository }}
+          CALLER_HEAD_SHA: ${{ inputs.caller_head_sha }}
+          CALLER_RUN_ID: ${{ inputs.caller_run_id }}
+          CALLER_RUN_ATTEMPT: ${{ inputs.caller_run_attempt }}
+          CALLER_MODE: ${{ inputs.caller_mode }}
+        run: |
+          set -euo pipefail
+          RUN=$(gh api "repos/$CALLER_REPOSITORY/actions/runs/$CALLER_RUN_ID")
+          [[ "$(jq -er .head_sha <<<"$RUN")" == "$CALLER_HEAD_SHA" ]]
+          [[ "$(jq -er .run_attempt <<<"$RUN")" == "$CALLER_RUN_ATTEMPT" ]]
+          if [[ "$CALLER_MODE" == active ]]; then
+            [[ "$(jq -er .status <<<"$RUN")" == in_progress && "$(jq -r .conclusion <<<"$RUN")" == null ]]
+          else
+            [[ "$CALLER_MODE" == postdeploy ]]
+            [[ "$(jq -er .status <<<"$RUN")" == completed && "$(jq -er .conclusion <<<"$RUN")" == success ]]
+            CALLER_MAIN=$(gh api "repos/$CALLER_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+            CALLER_CURRENT=$(gh api "repos/$CALLER_REPOSITORY/compare/$CALLER_HEAD_SHA...$CALLER_MAIN")
+            jq -e '.status == "ahead" or .status == "identical"' <<<"$CALLER_CURRENT" >/dev/null
+          fi
+
+      - name: Reconcile customer authority on every exit
+        if: always() && steps.journey.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/run_sandbox_fixed_canary_customer_journey.py \
+            --operation reconcile \
+            --runtime-file "$PRIVATE_ROOT/runtime.json" \
+            --source-authority-file "$PRIVATE_ROOT/source-authority.json" \
+            --key-helper-file "$PRIVATE_ROOT/prod-matched-cohort-key.py" \
+            --qurl-service-provenance-file "$PRIVATE_ROOT/qurl-service-provenance.json" \
+            --private-root "$PRIVATE_ROOT" \
+            --caller-event "$CALLER_EVENT" \
+            --terminal-receipt "$PRIVATE_ROOT/terminal-receipt.json"
+
+      - name: Upload terminal customer journey receipt
+        if: steps.journey.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandbox-qurl-customer-journey-${{ inputs.correlation_id }}
+          path: ${{ env.PRIVATE_ROOT }}/terminal-receipt.json
+          if-no-files-found: error
+          retention-days: 30

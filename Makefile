@@ -570,6 +570,16 @@ lint-workflows:
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@python3 tests/scripts/test_no_invalid_dynamodb_transaction_actions.py
 	@python3 tests/scripts/test_qurl_canary_verifier_iam.py
+	@python3 -m unittest -v \
+		tests.scripts.test_build_sandbox_fixed_canary_plan \
+		tests.scripts.test_run_sandbox_fixed_canary_customer_journey \
+		tests.scripts.test_sandbox_fixed_canary_authority \
+		tests.scripts.test_sandbox_fixed_canary_custody \
+		tests.scripts.test_sandbox_fixed_canary_lifecycle_runner \
+		tests.scripts.test_sandbox_fixed_canary_runtime_contract \
+		tests.scripts.test_sandbox_qurl_customer_workflow \
+		tests.scripts.test_verify_sandbox_qurl_customer_artifacts \
+		tests.scripts.test_verify_sandbox_qurl_service_provenance
 	@python3 tests/scripts/test_qurl_go_otp_mailbox_gate.py
 	@python3 tests/scripts/test_prod_hub_dns.py
 	@python3 tests/scripts/test_sandbox_cell1_qurl_service_security_contract.py

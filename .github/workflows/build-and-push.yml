@@ -4898,6 +4898,119 @@ jobs:
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
+  resolve-qurl-customer-artifacts:
+    name: Resolve current qURL customer artifacts
+    needs: [deploy-sandbox-validate, nhp-smoke-sandbox]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.deploy-sandbox-validate.result == 'success' &&
+      needs.nhp-smoke-sandbox.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      caller_head_sha: ${{ steps.resolve.outputs.caller_head_sha }}
+      caller_run_id: ${{ steps.resolve.outputs.caller_run_id }}
+      caller_run_attempt: ${{ steps.resolve.outputs.caller_run_attempt }}
+      binary_artifact_digest: ${{ steps.resolve.outputs.binary_artifact_digest }}
+      source_receipt_artifact_digest: ${{ steps.resolve.outputs.source_receipt_artifact_digest }}
+      qurl_go_source_sha: ${{ steps.resolve.outputs.qurl_go_source_sha }}
+      qurl_infra_source_sha: ${{ steps.resolve.outputs.qurl_infra_source_sha }}
+      correlation_id: ${{ steps.resolve.outputs.correlation_id }}
+    steps:
+      - name: Mint exact qURL artifact reader token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: layervai
+          repositories: |
+            qurl-integrations
+            qurl-integrations-infra
+          permission-actions: read
+          permission-contents: read
+
+      - name: Resolve latest immutable successful main artifact run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          HEAD=$(gh api repos/layervai/qurl-integrations/git/ref/heads/main --jq .object.sha)
+          RUNS=$(gh api 'repos/layervai/qurl-integrations/actions/workflows/cli.yml/runs?branch=main&event=push&status=success&per_page=100')
+          RUN=''
+          while IFS= read -r CANDIDATE; do
+            CANDIDATE_HEAD=$(jq -er .head_sha <<<"$CANDIDATE")
+            if [[ "$CANDIDATE_HEAD" == "$HEAD" ]]; then
+              RUN=$CANDIDATE
+              break
+            fi
+          done < <(jq -cer '.workflow_runs | sort_by(.created_at) | reverse[] | select(.event == "push" and .status == "completed" and .conclusion == "success" and .path == ".github/workflows/cli.yml")' <<<"$RUNS")
+          [[ -n "$RUN" ]]
+          CALLER_HEAD=$(jq -er .head_sha <<<"$RUN")
+          CALLER_COMMIT=$(gh api "repos/layervai/qurl-integrations/commits/$CALLER_HEAD")
+          jq -e --arg sha "$CALLER_HEAD" \
+            '.sha == $sha and .commit.verification.verified == true and .commit.verification.reason == "valid"' \
+            <<<"$CALLER_COMMIT" >/dev/null
+          RUN_ID=$(jq -er .id <<<"$RUN")
+          RUN_ATTEMPT=$(jq -er .run_attempt <<<"$RUN")
+          ARTIFACTS=$(gh api "repos/layervai/qurl-integrations/actions/runs/$RUN_ID/artifacts?per_page=100")
+          BINARY=$(jq -cer '[.artifacts[] | select(.name == "sandbox-matched-cohort-binaries" and .expired == false)] | select(length == 1) | .[0]' <<<"$ARTIFACTS")
+          RECEIPT=$(jq -cer '[.artifacts[] | select(.name == "sandbox-matched-cohort-source-receipt" and .expired == false)] | select(length == 1) | .[0]' <<<"$ARTIFACTS")
+          BINARY_DIGEST=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$BINARY")
+          RECEIPT_DIGEST=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$RECEIPT")
+          RECEIPT_ID=$(jq -er .id <<<"$RECEIPT")
+          RECEIPT_ZIP=$(mktemp)
+          gh api "repos/layervai/qurl-integrations/actions/artifacts/$RECEIPT_ID/zip" >"$RECEIPT_ZIP"
+          [[ "sha256:$(sha256sum "$RECEIPT_ZIP" | cut -d' ' -f1)" == "$RECEIPT_DIGEST" ]]
+          [[ "$(unzip -Z1 "$RECEIPT_ZIP")" == sandbox-matched-cohort-source-receipt.json ]]
+          QURL_GO_SOURCE=$(unzip -p "$RECEIPT_ZIP" sandbox-matched-cohort-source-receipt.json | jq -er '.qurl_go_source_sha | select(test("^[0-9a-f]{40}$"))')
+          QURL_INFRA_SOURCE=$(gh api repos/layervai/qurl-integrations-infra/git/ref/heads/main --jq .object.sha)
+          CORRELATION="qurl-${RUN_ID}-${RUN_ATTEMPT}-${CALLER_HEAD:0:12}"
+          {
+            echo "caller_head_sha=$CALLER_HEAD"
+            echo "caller_run_id=$RUN_ID"
+            echo "caller_run_attempt=$RUN_ATTEMPT"
+            echo "binary_artifact_digest=$BINARY_DIGEST"
+            echo "source_receipt_artifact_digest=$RECEIPT_DIGEST"
+            echo "qurl_go_source_sha=$QURL_GO_SOURCE"
+            echo "qurl_infra_source_sha=$QURL_INFRA_SOURCE"
+            echo "correlation_id=$CORRELATION"
+          } >>"$GITHUB_OUTPUT"
+
+  qurl-customer-journey-sandbox:
+    name: qURL Customer Journey (sandbox post-deploy)
+    needs: [resolve-qurl-customer-artifacts]
+    if: needs.resolve-qurl-customer-artifacts.result == 'success'
+    uses: ./.github/workflows/nhp-smoke-tests.yml
+    with:
+      operation: qurl-customer-journey
+      environment: sandbox
+      tier: all
+      allow_ssm_probes: false
+      aws_region: us-east-2
+      expected_nhp_source_sha: ${{ github.sha }}
+      caller_repository: layervai/qurl-integrations
+      caller_mode: postdeploy
+      caller_head_sha: ${{ needs.resolve-qurl-customer-artifacts.outputs.caller_head_sha }}
+      caller_run_id: ${{ needs.resolve-qurl-customer-artifacts.outputs.caller_run_id }}
+      caller_run_attempt: ${{ needs.resolve-qurl-customer-artifacts.outputs.caller_run_attempt }}
+      qurl_go_source_sha: ${{ needs.resolve-qurl-customer-artifacts.outputs.qurl_go_source_sha }}
+      qurl_infra_source_sha: ${{ needs.resolve-qurl-customer-artifacts.outputs.qurl_infra_source_sha }}
+      binary_artifact_name: sandbox-matched-cohort-binaries
+      binary_artifact_digest: ${{ needs.resolve-qurl-customer-artifacts.outputs.binary_artifact_digest }}
+      source_receipt_artifact_name: sandbox-matched-cohort-source-receipt
+      source_receipt_artifact_digest: ${{ needs.resolve-qurl-customer-artifacts.outputs.source_receipt_artifact_digest }}
+      correlation_id: ${{ needs.resolve-qurl-customer-artifacts.outputs.correlation_id }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      OPS_ROUTINES_APP_ID: ${{ secrets.OPS_ROUTINES_APP_ID }}
+      OPS_ROUTINES_APP_PRIVATE_KEY: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+
   # ============================================================================
   # PROD DEPLOY - Handled exclusively by promote-to-prod.yml
   # Use ./scripts/trigger-prod-deploy.sh to deploy to production.
@@ -4948,6 +5061,8 @@ jobs:
       - deploy-sandbox-control
       - deploy-sandbox-validate
       - nhp-smoke-sandbox
+      - resolve-qurl-customer-artifacts
+      - qurl-customer-journey-sandbox
     # Skip Slack when the waiter was cancelled (concurrency preempt or
     # manual). The dispatched blue/green sub-workflow runs to completion
     # on its own concurrency group and emits its own SNS-routed Slack
@@ -5001,6 +5116,7 @@ jobs:
           SANDBOX_CONTROL_APPLY: ${{ needs.deploy-sandbox-control.outputs.apply_outcome }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
+          QURL_CUSTOMER_JOURNEY_RESULT: ${{ needs.qurl-customer-journey-sandbox.result }}
           # true when a new app image was built this run: either this commit
           # changed app paths, or live sandbox images lagged app changes
           # already present in HEAD and the drift gate forced a rebuild.
@@ -5201,7 +5317,7 @@ jobs:
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_RELAY") Relay → $(control_emoji) Control → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_RELAY") Relay → $(control_emoji) Control → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke → $(status_emoji "$QURL_CUSTOMER_JOURNEY_RESULT") Customer"
           fi
 
           # Determine overall status and header.
@@ -5253,7 +5369,7 @@ jobs:
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_CELL1_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_CONTROL" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_CELL1_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_CONTROL" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT" "$QURL_CUSTOMER_JOURNEY_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
@@ -5267,7 +5383,7 @@ jobs:
             # Notify entirely via the job `if:`. Only smoke needs this here,
             # because a cancelled smoke is the one case that must NOT read as
             # a benign preempt.
-            if [[ "$NHP_SMOKE_RESULT" == "cancelled" ]]; then
+            if [[ "$NHP_SMOKE_RESULT" == "cancelled" || "$QURL_CUSTOMER_JOURNEY_RESULT" == "cancelled" ]]; then
               DEPLOY_FAILED="true"
             fi
 
