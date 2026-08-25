@@ -2031,6 +2031,53 @@ def runtime_exec_policy(fn: str, operation: str) -> str:
                 "Resource": [RUNTIME_QAT1_KEY_ARN],
             }
         )
+    if spec.get("tenant_pin"):
+        statements.append(
+            {
+                "Sid": "TenantCellPinRead",
+                "Effect": "Allow",
+                "Action": ["dynamodb:GetItem"],
+                "Resource": sorted(
+                    CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["customers"]
+                ),
+                "Condition": {
+                    "ForAllValues:StringEquals": {
+                        "dynamodb:Attributes": [
+                            "auth0_subject",
+                            "assigned_cell_id",
+                        ],
+                    },
+                    "StringEqualsIfExists": {
+                        "dynamodb:Select": "SPECIFIC_ATTRIBUTES",
+                    },
+                },
+            }
+        )
+        statements.append(
+            {
+                "Sid": "TenantCellPinWrite",
+                "Effect": "Allow",
+                "Action": ["dynamodb:UpdateItem"],
+                "Resource": sorted(
+                    CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["customers"]
+                ),
+                "Condition": {
+                    "ForAllValues:StringEquals": {
+                        "dynamodb:Attributes": [
+                            "auth0_subject",
+                            "assigned_cell_id",
+                        ],
+                    },
+                    "StringEqualsIfExists": {
+                        "dynamodb:ReturnValues": [
+                            "NONE",
+                            "UPDATED_OLD",
+                            "UPDATED_NEW",
+                        ],
+                    },
+                },
+            }
+        )
     if spec.get("public_key"):
         statements.append(
             {

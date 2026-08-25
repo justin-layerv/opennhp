@@ -17,6 +17,7 @@ module "control" {
   authority_proof_mutation_controls_enabled        = var.authority_proof_mutation_controls_enabled
   authority_blue_green_alias_hold_enabled          = var.authority_blue_green_alias_hold_enabled
   authority_selector_ssm_pointer_enabled           = var.authority_selector_ssm_pointer_enabled
+  authority_tenant_pinning_enabled                 = var.authority_tenant_pinning_enabled
   authority_proof_policy_consumers_staged          = var.authority_proof_policy_consumers_staged
   authority_proof_policy_selected_color            = var.authority_proof_policy_selected_color
   authority_proof_policy_prepared_color            = var.authority_proof_policy_prepared_color

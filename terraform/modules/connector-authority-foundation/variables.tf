@@ -418,6 +418,26 @@ variable "authority_proof_mutation_controller_role_arns" {
   default     = []
 }
 
+variable "authority_tenant_pinning_enabled" {
+  description = <<-EOT
+    Durable tenant home-cell pinning for IssueAssignment. When true, the
+    IssueAssignment runtime receives CONNECTOR_AUTHORITY_TENANT_PINNING_ENABLED
+    and the customers-table pin grants (GetItem + UpdateItem on the base
+    table), so the first assignment records the tenant's cell on the Control
+    customer row (assigned_cell_id) and every later assignment for that tenant
+    honors the recorded cell. Committed per environment root: the pin is how a
+    tenant keeps its home cell once more than one cell is assignable, so a
+    multi-cell environment should not run with this off.
+
+    False is the module's dark default and the ordinary-runtime shape the
+    handler documents (a nil pin store, pure zero-write placement). The env
+    var and the IAM grants are gated on the same variable so neither can exist
+    without the other.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "operator_alarm_topic_arns" {
   description = <<-EOT
     Exact operator notification destinations for EVERY Connector Authority

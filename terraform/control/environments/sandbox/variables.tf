@@ -258,3 +258,9 @@ variable "authority_blue_green_alias_hold_enabled" {
   default     = false
   description = "Blue/green alias semantics for the Authority runtime: the selected colour holds its live version and only standby advances. Dark by default."
 }
+
+variable "authority_tenant_pinning_enabled" {
+  type        = bool
+  default     = true
+  description = "Durable tenant home-cell pinning on IssueAssignment. Committed true is the reviewed sandbox activation (qurl-service tenancy-pinning B6, deferred step 3): the merge activates it on the next control deploy."
+}

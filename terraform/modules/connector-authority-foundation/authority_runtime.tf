@@ -486,6 +486,53 @@ locals {
         Resource = [aws_kms_key.qat1_signing.arn]
       },
       ], [
+      for statement in [
+        {
+          # Durable tenant home-cell pin: a strong primary-key read of the
+          # customer row's assigned_cell_id before placement. Base table only —
+          # the pin never queries an index — and attribute-fenced so the grant
+          # cannot become a general customer-row reader: the request may
+          # reference only the partition key and the pin attribute. IfExists on
+          # Select keeps the repository's projection-only GetItem valid without
+          # demanding a Select parameter the SDK does not send.
+          Sid      = "TenantCellPinRead"
+          Effect   = "Allow"
+          Action   = ["dynamodb:GetItem"]
+          Resource = local.authority_runtime_table_resources.customers
+          Condition = {
+            "ForAllValues:StringEquals" = {
+              "dynamodb:Attributes" = [aws_dynamodb_table.customers.hash_key, "assigned_cell_id"]
+            }
+            StringEqualsIfExists = {
+              "dynamodb:Select" = "SPECIFIC_ATTRIBUTES"
+            }
+          }
+        },
+        {
+          # The single confined identity UpdateItem that records the pin. The
+          # repository writes SET assigned_cell_id = if_not_exists(...) behind
+          # attribute_exists(auth0_subject), so this grant cannot create
+          # customer rows and first-writer-wins lives in the update expression.
+          # No LeadingKeys fence: every enrolling tenant's subject is a
+          # legitimate key. The attribute fence is the meaningful boundary
+          # instead — an UpdateItem always names its attributes, so IAM confines
+          # this writer to the pin attribute even if the handler is wrong or
+          # compromised.
+          Sid      = "TenantCellPinWrite"
+          Effect   = "Allow"
+          Action   = ["dynamodb:UpdateItem"]
+          Resource = local.authority_runtime_table_resources.customers
+          Condition = {
+            "ForAllValues:StringEquals" = {
+              "dynamodb:Attributes" = [aws_dynamodb_table.customers.hash_key, "assigned_cell_id"]
+            }
+            StringEqualsIfExists = {
+              "dynamodb:ReturnValues" = ["NONE", "UPDATED_OLD", "UPDATED_NEW"]
+            }
+          }
+        },
+      ] : statement if var.authority_tenant_pinning_enabled
+      ], [
       for statement in local.authority_runtime_proof_policy_consumer_statements :
       statement if var.authority_proof_policy_consumers_staged
     ])
@@ -1057,6 +1104,12 @@ locals {
       contains(local.authority_public_key_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_ALIAS_ARN = aws_kms_alias.qat1_signing.arn
         CONNECTOR_AUTHORITY_ASSIGNMENT_KEY_KID       = tostring(var.authority_runtime_contract.qat1_kid)
+      } : {},
+      fn.operation == "issue_assignment" && var.authority_tenant_pinning_enabled ? {
+        # Rendered only while the pin store is live: absent stays the handler's
+        # documented inert default, and the matching customers-table IAM grant
+        # is gated on the same variable so env and grant cannot drift apart.
+        CONNECTOR_AUTHORITY_TENANT_PINNING_ENABLED = "true"
       } : {},
       contains(local.authority_otp_operations, fn.operation) ? {
         CONNECTOR_AUTHORITY_REDIS_ENDPOINT        = "${aws_elasticache_serverless_cache.otp.endpoint[0].address}:6379"

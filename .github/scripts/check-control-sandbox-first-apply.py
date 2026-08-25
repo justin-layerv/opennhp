@@ -1899,6 +1899,12 @@ AUTHORITY_RUNTIME_OPERATION_IAM = {
         # must keep meaning exactly "its own replay tombstone".
         "ticket_handle_write": True,
         "ticket_handle_write_actions": ("dynamodb:PutItem",),
+        # Durable tenant home-cell pin (day-0 posture, nhp #3980): a strong
+        # customers-row read before placement plus the single if_not_exists
+        # UpdateItem that records it. Two Sids so neither can widen into the
+        # other; unconditioned because every enrolling tenant's subject is a
+        # legitimate key.
+        "tenant_pin": True,
     },
     "refresh_assignment": {
         "read_tables": ("agent_keys", "connector_authority"),
@@ -6894,6 +6900,8 @@ def _check_authority_exec_role_policy(
         expected_sids.add("Qat1Sign")
     if spec.get("ticket_handle_write"):
         expected_sids.add("AuthorityTicketHandleWrite")
+    if spec.get("tenant_pin"):
+        expected_sids.update({"TenantCellPinRead", "TenantCellPinWrite"})
     if proof_policy_consumer:
         expected_sids.update({"ProofPolicyRead", "DenyProofPolicyWrite"})
     if set(by_sid) != expected_sids:
@@ -7003,6 +7011,55 @@ def _check_authority_exec_role_policy(
         "Null": {"dynamodb:LeadingKeys": "false"},
     }:
         raise ContractError(f"{fn} ordinary writes are not partition-fenced")
+
+    if spec.get("tenant_pin"):
+        # Tenant home-cell pin: exact verbs on the customers base table only,
+        # attribute-fenced to the partition key plus the pin attribute. Not a
+        # LeadingKeys fence — every enrolling tenant's subject is a legitimate
+        # key — the attribute fence is the boundary that keeps this writer
+        # from touching any other customer attribute.
+        pin_read = by_sid["TenantCellPinRead"]
+        if _authority_string_set(
+            pin_read.get("Action"), fn, "tenant-pin read Action"
+        ) != {"dynamodb:GetItem"}:
+            raise ContractError(f"{fn} tenant-pin read actions drifted")
+        if _authority_string_set(
+            pin_read.get("Resource"), fn, "tenant-pin read Resource"
+        ) != set(AUTHORITY_RUNTIME_TABLE_RESOURCES["customers"]):
+            raise ContractError(
+                f"{fn} tenant-pin read must target only the customers base table"
+            )
+        if pin_read.get("Condition") != {
+            "ForAllValues:StringEquals": {
+                "dynamodb:Attributes": ["auth0_subject", "assigned_cell_id"],
+            },
+            "StringEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"},
+        }:
+            raise ContractError(
+                f"{fn} tenant-pin read is not attribute-fenced to the pin set"
+            )
+        pin_write = by_sid["TenantCellPinWrite"]
+        if _authority_string_set(
+            pin_write.get("Action"), fn, "tenant-pin write Action"
+        ) != {"dynamodb:UpdateItem"}:
+            raise ContractError(f"{fn} tenant-pin write actions drifted")
+        if _authority_string_set(
+            pin_write.get("Resource"), fn, "tenant-pin write Resource"
+        ) != set(AUTHORITY_RUNTIME_TABLE_RESOURCES["customers"]):
+            raise ContractError(
+                f"{fn} tenant-pin write must target only the customers base table"
+            )
+        if pin_write.get("Condition") != {
+            "ForAllValues:StringEquals": {
+                "dynamodb:Attributes": ["auth0_subject", "assigned_cell_id"],
+            },
+            "StringEqualsIfExists": {
+                "dynamodb:ReturnValues": ["NONE", "UPDATED_OLD", "UPDATED_NEW"],
+            },
+        }:
+            raise ContractError(
+                f"{fn} tenant-pin write is not attribute-fenced to the pin set"
+            )
 
     unconditional_sids = {
         "LambdaVpcEni",

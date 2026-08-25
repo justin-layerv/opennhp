@@ -1211,6 +1211,95 @@ run "authority_ticket_handle_grants_exist_and_are_scoped" {
   }
 }
 
+# The tenant home-cell pin is an opt-in: with the gate on, IssueAssignment (and
+# only IssueAssignment) may read and record assigned_cell_id on the customers
+# table; with the gate off (the default) no function carries either Sid or the
+# env var, so the ordinary runtime provably cannot touch customer rows.
+run "tenant_pin_grants_follow_the_gate" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+    authority_tenant_pinning_enabled    = true
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "TenantCellPinRead" &&
+        # Exact, not contains: a wider action list is the silent widening the
+        # dedicated Sid exists to prevent.
+        statement.Action == ["dynamodb:GetItem"] &&
+        length(statement.Resource) == 1 &&
+        strcontains(statement.Resource[0], "customers") &&
+        !strcontains(statement.Resource[0], "/index/") &&
+        statement.Condition["ForAllValues:StringEquals"]["dynamodb:Attributes"] == ["auth0_subject", "assigned_cell_id"] &&
+        statement.Condition["StringEqualsIfExists"]["dynamodb:Select"] == "SPECIFIC_ATTRIBUTES"
+      ]) if fn.operation == "issue_assignment"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "issue_assignment"]) == 1
+    error_message = "With pinning enabled IssueAssignment cannot read the tenant home-cell pin."
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      anytrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        statement.Sid == "TenantCellPinWrite" &&
+        statement.Action == ["dynamodb:UpdateItem"] &&
+        length(statement.Resource) == 1 &&
+        strcontains(statement.Resource[0], "customers") &&
+        !strcontains(statement.Resource[0], "/index/") &&
+        # The attribute fence is the load-bearing boundary: an UpdateItem
+        # always names its attributes, so this confines the writer to the pin.
+        statement.Condition["ForAllValues:StringEquals"]["dynamodb:Attributes"] == ["auth0_subject", "assigned_cell_id"] &&
+        statement.Condition["StringEqualsIfExists"]["dynamodb:ReturnValues"] == ["NONE", "UPDATED_OLD", "UPDATED_NEW"]
+      ]) if fn.operation == "issue_assignment"
+    ]) && length([for k, fn in local.authority_runtime_functions : k if fn.operation == "issue_assignment"]) == 1
+    error_message = "With pinning enabled IssueAssignment cannot record the tenant home-cell pin."
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      alltrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        !contains(["TenantCellPinRead", "TenantCellPinWrite"], statement.Sid)
+      ]) if fn.operation != "issue_assignment"
+    ])
+    error_message = "A pin grant leaked onto an operation other than IssueAssignment."
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      (lookup(local.authority_runtime_environment[key], "CONNECTOR_AUTHORITY_TENANT_PINNING_ENABLED", "") == "true") == (fn.operation == "issue_assignment")
+    ])
+    error_message = "The pin env var must be rendered on exactly the IssueAssignment function when the gate is on."
+  }
+}
+
+run "tenant_pin_grants_absent_at_default" {
+  command = plan
+
+  variables {
+    authority_runtime_functions_enabled = true
+  }
+
+  assert {
+    condition = alltrue([
+      for key, fn in local.authority_runtime_functions :
+      alltrue([
+        for statement in jsondecode(aws_iam_role_policy.authority_exec[key].policy).Statement :
+        !contains(["TenantCellPinRead", "TenantCellPinWrite"], statement.Sid)
+      ]) && !contains(keys(local.authority_runtime_environment[key]), "CONNECTOR_AUTHORITY_TENANT_PINNING_ENABLED")
+    ])
+    error_message = "Pinning is opt-in: at the default no function may carry the pin grant or env var."
+  }
+}
+
 run "pointer_parameter_is_seeded_with_the_contract_colour" {
   command = plan
 

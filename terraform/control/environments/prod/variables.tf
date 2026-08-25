@@ -310,3 +310,9 @@ variable "authority_blue_green_alias_hold_enabled" {
     error_message = "authority_blue_green_alias_hold_enabled is sandbox-only while the Authority blue/green cutover is unproven."
   }
 }
+
+variable "authority_tenant_pinning_enabled" {
+  type        = bool
+  default     = true
+  description = "Durable tenant home-cell pinning on IssueAssignment. Committed true as the day-0 production value: every tenant's home cell is recorded from its first assignment, so no later migration exists when a second cell becomes assignable. Inert until the runtime gates deploy functions."
+}
